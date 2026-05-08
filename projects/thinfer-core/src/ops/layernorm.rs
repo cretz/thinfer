@@ -1,0 +1,131 @@
+use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
+#[cfg(feature = "conformance")]
+use crate::conformance::{OpSpec, OpTest, OpTestContext, TestCase, linspace, t};
+use crate::ops::WgslConfig;
+use crate::tensor::{ComputeDtype, F32};
+use crate::wgsl_with_bf16_variant;
+
+/// `y[r,i] = (x[r,i] - mean(x[r,:])) * rsqrt(var(x[r,:]) + eps)`. No affine
+/// (FinalLayer uses `elementwise_affine=False`; scale is applied outside via
+/// `bcast_affine`).
+///
+/// Layout: 0=X, 1=Out, 2=Uniform `{n_rows, dim, eps_bits, _pad}`.
+pub trait LayerNormOp {
+    const KERNEL_ID: &'static str;
+    type Dtype: ComputeDtype;
+    const X: &'static str;
+    const DIMS: &'static str;
+    const OUTPUT: &'static str;
+
+    fn wgsl(cfg: &WgslConfig) -> &'static str;
+    fn layout() -> &'static [BindingLayout];
+
+    fn workgroups(n_rows: u32) -> [u32; 3] {
+        [n_rows.div_ceil(64), 1, 1]
+    }
+}
+
+pub struct LayerNormBufs<'a> {
+    pub x: &'a BufRef,
+    pub uniform: &'a BufRef,
+    pub out: &'a BufRef,
+}
+
+pub(crate) fn dispatch_layernorm<O: LayerNormOp, B: Backend>(
+    backend: &B,
+    encoder: &mut B::CommandEncoder,
+    pipeline: &B::Pipeline,
+    bufs: &LayerNormBufs<'_>,
+    n_rows: u32,
+) -> Result<(), B::Error> {
+    let bindings = [
+        bufs.x.binding(0),
+        bufs.out.binding(1),
+        bufs.uniform.binding(2),
+    ];
+    backend.dispatch(encoder, pipeline, &bindings, O::workgroups(n_rows))
+}
+
+wgsl_with_bf16_variant!(
+    WGSL_F32,
+    WGSL_F32_BF16 = r#"
+struct U { n_rows: u32, dim: u32, eps: f32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= u.n_rows) { return; }
+    let base = row * u.dim;
+    var sum: f32 = 0.0;
+    for (var i: u32 = 0u; i < u.dim; i = i + 1u) {
+        sum = sum + x[base + i];
+    }
+    let mean = sum / f32(u.dim);
+    var sum_sq: f32 = 0.0;
+    for (var i: u32 = 0u; i < u.dim; i = i + 1u) {
+        let d = x[base + i] - mean;
+        sum_sq = sum_sq + d * d;
+    }
+    let inv = inverseSqrt(sum_sq / f32(u.dim) + u.eps);
+    for (var i: u32 = 0u; i < u.dim; i = i + 1u) {
+        out[base + i] = act_store((x[base + i] - mean) * inv);
+    }
+}
+"#
+);
+
+const LAYOUT: &[BindingLayout] = &[
+    BindingLayout {
+        slot: 0,
+        kind: BindingKind::StorageRead,
+    },
+    BindingLayout {
+        slot: 1,
+        kind: BindingKind::StorageReadWrite,
+    },
+    BindingLayout {
+        slot: 2,
+        kind: BindingKind::Uniform,
+    },
+];
+
+pub struct LayerNormF32;
+
+impl LayerNormOp for LayerNormF32 {
+    const KERNEL_ID: &'static str = "layernorm.f32";
+    type Dtype = F32;
+    const X: &'static str = "layernorm/x";
+    const DIMS: &'static str = "layernorm/dims";
+    const OUTPUT: &'static str = "layernorm/out";
+    fn wgsl(cfg: &WgslConfig) -> &'static str {
+        if cfg.bf16_quant_writes {
+            WGSL_F32_BF16
+        } else {
+            WGSL_F32
+        }
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+}
+
+#[cfg(feature = "conformance")]
+impl OpTest for LayerNormF32 {
+    fn test_cases(&self) -> Vec<TestCase> {
+        vec![TestCase {
+            name: "layernorm_basic",
+            op: OpSpec::Layernorm { eps: 1e-6 },
+            inputs: vec![t("x", [4, 16], linspace(-2.0, 2.0, false))],
+        }]
+    }
+    fn run_test<'a>(
+        &self,
+        ctx: &'a OpTestContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
+        Box::pin(ctx.run_layernorm::<LayerNormF32>())
+    }
+}

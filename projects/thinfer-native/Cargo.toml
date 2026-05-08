@@ -1,0 +1,24 @@
+[package]
+name = "thinfer-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thinfer-core = { path = "../thinfer-core" }
+tracing = { workspace = true }
+wgpu = "28"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+safetensors = "0.4"
+tokio = { version = "1", features = ["fs", "io-util", "rt"] }
+memmap2 = "0.9"
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+# Tokenizer: skip onig (Windows-hostile native dep) and progress bars;
+# fancy-regex handles GPT-style byte-level BPE (Qwen3, Llama, etc.).
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]
+half = { version = "2", features = ["bytemuck"] }

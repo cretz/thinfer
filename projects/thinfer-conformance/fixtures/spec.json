@@ -1,0 +1,861 @@
+{
+  "cases": [
+    {
+      "name": "add_basic",
+      "op": "add",
+      "inputs": [
+        {
+          "name": "a",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -2.0,
+            "hi": 2.0
+          }
+        },
+        {
+          "name": "b",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.5,
+            "hi": 1.75,
+            "flip": true
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "mul_basic",
+      "op": "mul",
+      "inputs": [
+        {
+          "name": "a",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -2.0,
+            "hi": 2.0
+          }
+        },
+        {
+          "name": "b",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.5,
+            "hi": 1.75,
+            "flip": true
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "silu_basic",
+      "op": "silu",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -4.0,
+            "hi": 4.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "silu_mul_basic",
+      "op": "silu_mul",
+      "inputs": [
+        {
+          "name": "a",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -4.0,
+            "hi": 4.0
+          }
+        },
+        {
+          "name": "b",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.5,
+            "hi": 1.75,
+            "flip": true
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "tanh_basic",
+      "op": "tanh",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -4.0,
+            "hi": 4.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "matmul_basic",
+      "op": "matmul",
+      "inputs": [
+        {
+          "name": "a",
+          "shape": [
+            4,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "b",
+          "shape": [
+            8,
+            6
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.5,
+            "hi": 1.75
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "rmsnorm_basic",
+      "op": "rmsnorm",
+      "eps": 0.000001,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -2.0,
+            "hi": 2.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.5,
+            "hi": 1.5
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "layernorm_basic",
+      "op": "layernorm",
+      "eps": 0.000001,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -2.0,
+            "hi": 2.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "softmax_basic",
+      "op": "softmax",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -2.0,
+            "hi": 2.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "rope_basic",
+      "op": "rope",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            3,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "freqs",
+          "shape": [
+            3,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.75,
+            "hi": 0.75
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "rope_halfrot_basic",
+      "op": "rope_halfrot",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            3,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "freqs",
+          "shape": [
+            3,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.75,
+            "hi": 0.75
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "sdpa_basic",
+      "op": "sdpa",
+      "scale": 0.35355338,
+      "inputs": [
+        {
+          "name": "q",
+          "shape": [
+            1,
+            4,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "k",
+          "shape": [
+            1,
+            4,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 1.5
+          }
+        },
+        {
+          "name": "v",
+          "shape": [
+            1,
+            4,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.25,
+            "hi": 0.75,
+            "flip": true
+          }
+        },
+        {
+          "name": "mask",
+          "shape": [
+            1,
+            4,
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.0,
+            "hi": 0.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "sdpa_large_d_d128",
+      "op": "sdpa",
+      "scale": 0.088388346,
+      "inputs": [
+        {
+          "name": "q",
+          "shape": [
+            1,
+            4,
+            1,
+            128
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "k",
+          "shape": [
+            1,
+            4,
+            1,
+            128
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 1.5
+          }
+        },
+        {
+          "name": "v",
+          "shape": [
+            1,
+            4,
+            1,
+            128
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.25,
+            "hi": 0.75,
+            "flip": true
+          }
+        },
+        {
+          "name": "mask",
+          "shape": [
+            1,
+            4,
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.0,
+            "hi": 0.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "sdpa_large_d_d512",
+      "op": "sdpa",
+      "scale": 0.044194173,
+      "inputs": [
+        {
+          "name": "q",
+          "shape": [
+            1,
+            2,
+            1,
+            512
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "k",
+          "shape": [
+            1,
+            2,
+            1,
+            512
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 1.5
+          }
+        },
+        {
+          "name": "v",
+          "shape": [
+            1,
+            2,
+            1,
+            512
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.25,
+            "hi": 0.75,
+            "flip": true
+          }
+        },
+        {
+          "name": "mask",
+          "shape": [
+            1,
+            2,
+            2
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.0,
+            "hi": 0.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "transpose12_basic",
+      "op": "transpose12",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            3,
+            4,
+            5
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "bcast_affine_scale",
+      "op": "bcast_affine",
+      "bias": 0.0,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "s",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "bcast_affine_one_plus_scale",
+      "op": "bcast_affine",
+      "bias": 1.0,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "s",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "bcast_fma_basic",
+      "op": "bcast_fma",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "s",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        },
+        {
+          "name": "y",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -2.0,
+            "hi": 2.0,
+            "flip": true
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "bcast_add",
+      "op": "bcast_add",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "s",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w"
+      ]
+    },
+    {
+      "name": "conv2d_3x3_pad1",
+      "op": "conv2d",
+      "kh": 3,
+      "kw": 3,
+      "pad_h": 1,
+      "pad_w": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4,
+            6,
+            6
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            3,
+            4,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv2d_1x1",
+      "op": "conv2d",
+      "kh": 1,
+      "kw": 1,
+      "pad_h": 0,
+      "pad_w": 0,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4,
+            4,
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            3,
+            4,
+            1,
+            1
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25,
+            "flip": true
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv2d_3x3_widec",
+      "op": "conv2d",
+      "kh": 3,
+      "kw": 3,
+      "pad_h": 1,
+      "pad_w": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            16,
+            4,
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            8,
+            16,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    }
+  ]
+}

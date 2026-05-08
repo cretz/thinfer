@@ -1,0 +1,400 @@
+//! Weight residency manager. Pages weights disk -> VRAM on `acquire`, evicts
+//! LRU on the GPU tier to stay under `ResidencyBudget.vram_bytes`. Returned
+//! `GpuView` pins the GPU buffer so eviction can't steal it mid-forward.
+//!
+//! No host-side `Vec<u8>` mirror: the `WeightSource` is mmap-backed, so the OS
+//! page cache is the host tier. `ResidencyBudget.ram_bytes` is ignored here;
+//! it remains on the policy struct because the CLI surface is wired through
+//! and pytorch parity defers host-side accounting to the kernel.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::backend::{Backend, BufRef};
+use crate::policy::ResidencyBudget;
+use crate::tensor::{GpuBufferId, Shape, StorageEncoding};
+use crate::weight::{DecodeError, WeightId, WeightReader, WeightSource};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WeightHandle(u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransposePolicy {
+    /// 1-D weights, biases, norm gains, pad tokens. No layout change.
+    None,
+    /// 2-D `nn.Linear` weight `[N, K]` transposed to `[K, N]` at upload. Matmul
+    /// kernel convention is `A @ B` with B in `[K, N]`.
+    Linear2D,
+}
+
+#[derive(Clone, Debug)]
+pub struct WeightMeta {
+    pub id: WeightId,
+    pub shape: Shape,
+    pub encoding: StorageEncoding,
+    pub on_disk_bytes: u64,
+    pub transpose: TransposePolicy,
+}
+
+impl WeightMeta {
+    pub fn elements(&self) -> u64 {
+        self.shape.0.iter().map(|&d| d as u64).product()
+    }
+
+    /// Bytes the weight occupies on GPU, derived from `encoding`. Bf16 packs
+    /// 2 elements per u32, padded up to u32 alignment; consumed via kernel
+    /// `load_*` helpers.
+    pub fn storage_bytes(&self) -> u64 {
+        match self.encoding {
+            StorageEncoding::Bf16 => self.elements().div_ceil(2) * 4,
+            StorageEncoding::F32 => self.elements() * 4,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ResidencyError<SE: core::fmt::Debug, BE: core::fmt::Debug> {
+    Source(SE),
+    Backend(BE),
+    Decode(DecodeError),
+    UnknownHandle(WeightHandle),
+    SizeMismatch {
+        id: WeightId,
+        expected: u64,
+        got: u64,
+    },
+    BadRank {
+        id: WeightId,
+        rank: usize,
+        wanted: &'static str,
+    },
+    /// `WeightReader::Error` is a separate associated type from
+    /// `WeightSource::Error`; stringified to avoid a third generic on every
+    /// `ResidencyError`.
+    Reader(String),
+    /// One weight's footprint exceeds its tier budget; no eviction policy can
+    /// satisfy. Caller's `ResidencyBudget` is too tight for this model.
+    BudgetTooSmall {
+        needed: u64,
+        have: u64,
+        tier: &'static str,
+    },
+}
+
+struct GpuEntry {
+    id: GpuBufferId,
+    bytes: u64,
+    pin_count: u32,
+}
+
+struct Inner {
+    metas: Vec<WeightMeta>,
+    gpu: HashMap<WeightHandle, GpuEntry>,
+    gpu_bytes: u64,
+    gpu_lru: Vec<WeightHandle>, // back == MRU
+    /// Size-class free list of GPU buffers reclaimed via eviction. Reused
+    /// before calling `backend.allocate` so eviction churn doesn't pay wgpu's
+    /// buffer-creation cost. Pytorch caching-allocator parity.
+    pool: HashMap<u64, Vec<GpuBufferId>>,
+}
+
+impl Inner {
+    fn touch(lru: &mut Vec<WeightHandle>, h: WeightHandle) {
+        if let Some(pos) = lru.iter().position(|&x| x == h) {
+            lru.remove(pos);
+        }
+        lru.push(h);
+    }
+}
+
+pub struct WeightResidency<S: WeightSource> {
+    source: S,
+    budget: ResidencyBudget,
+    inner: Mutex<Inner>,
+}
+
+impl<S: WeightSource> WeightResidency<S> {
+    pub fn new(source: S, budget: ResidencyBudget) -> Self {
+        Self {
+            source,
+            budget,
+            inner: Mutex::new(Inner {
+                metas: Vec::new(),
+                gpu: HashMap::new(),
+                gpu_bytes: 0,
+                gpu_lru: Vec::new(),
+                pool: HashMap::new(),
+            }),
+        }
+    }
+
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
+    pub fn register(&self, meta: WeightMeta) -> WeightHandle {
+        let mut g = self.inner.lock().unwrap();
+        let h = WeightHandle(g.metas.len() as u32);
+        g.metas.push(meta);
+        h
+    }
+
+    /// Page the weight up to GPU. Returns a `GpuView` that pins the buffer for
+    /// its lifetime. Drop the view to release the pin; subsequent eviction may
+    /// reclaim the buffer.
+    pub async fn acquire<'a, B: Backend>(
+        &'a self,
+        handle: WeightHandle,
+        backend: &B,
+    ) -> Result<GpuView<'a>, ResidencyError<S::Error, B::Error>> {
+        let (meta, gpu_hit) = {
+            let mut g = self.inner.lock().unwrap();
+            let meta = g
+                .metas
+                .get(handle.0 as usize)
+                .cloned()
+                .ok_or(ResidencyError::UnknownHandle(handle))?;
+            let hit = g.gpu.get_mut(&handle).map(|e| {
+                e.pin_count += 1;
+                BufRef::new(e.id, e.bytes)
+            });
+            if hit.is_some() {
+                Inner::touch(&mut g.gpu_lru, handle);
+            }
+            (meta, hit)
+        };
+        if let Some(buf) = gpu_hit {
+            tracing::trace!(
+                target: crate::trace::RESIDENCY_MOVE,
+                handle = handle.0,
+                bytes = buf.len,
+                "gpu hit"
+            );
+            return Ok(GpuView {
+                inner: &self.inner,
+                handle,
+                buf,
+            });
+        }
+
+        // GPU miss. Stream from the mmap'd source directly into the bf16-packed
+        // upload layout; no host-side cache. The temporary `Vec<u8>` lives only
+        // until `write_buffer` returns.
+        let bytes = self.read_for_gpu::<B>(&meta).await?;
+
+        let gpu_size = bytes.len() as u64;
+        if gpu_size > self.budget.vram_bytes {
+            return Err(ResidencyError::BudgetTooSmall {
+                needed: gpu_size,
+                have: self.budget.vram_bytes,
+                tier: "vram",
+            });
+        }
+        self.evict_gpu_until_fits::<B>(gpu_size, backend)?;
+        let id = {
+            let mut g = self.inner.lock().unwrap();
+            g.pool.get_mut(&gpu_size).and_then(Vec::pop)
+        };
+        let id = match id {
+            Some(id) => id,
+            None => backend
+                .allocate(gpu_size)
+                .map_err(ResidencyError::Backend)?,
+        };
+        backend
+            .write_buffer(id, 0, bytes.as_slice())
+            .map_err(ResidencyError::Backend)?;
+
+        let mut g = self.inner.lock().unwrap();
+        g.gpu.insert(
+            handle,
+            GpuEntry {
+                id,
+                bytes: gpu_size,
+                pin_count: 1,
+            },
+        );
+        g.gpu_bytes += gpu_size;
+        Inner::touch(&mut g.gpu_lru, handle);
+        Ok(GpuView {
+            inner: &self.inner,
+            handle,
+            buf: BufRef::new(id, gpu_size),
+        })
+    }
+
+    /// Stream `meta` from source into the bf16-packed GPU storage layout.
+    /// Bf16 source: passthrough (bytes are already bf16). Linear2D applies a
+    /// block-tiled u16-stride transpose. F32 source: not implemented on the
+    /// GPU path (would need a per-binding kernel flavor; add when a model
+    /// requires it). Output length matches `meta.storage_bytes()`.
+    async fn read_for_gpu<B: Backend>(
+        &self,
+        meta: &WeightMeta,
+    ) -> Result<Vec<u8>, ResidencyError<S::Error, B::Error>> {
+        if !matches!(meta.encoding, StorageEncoding::Bf16) {
+            return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
+                meta.encoding,
+            )));
+        }
+        let storage_len = meta.storage_bytes() as usize;
+        let on_disk_len = meta.on_disk_bytes as usize;
+        // For bf16 with odd element count, storage_bytes pads to u32. The disk
+        // bytes are tight (no padding); we leave the tail as zero.
+        let mut bytes = vec![0u8; storage_len];
+
+        let mut reader = self
+            .source
+            .open(&meta.id)
+            .await
+            .map_err(ResidencyError::Source)?;
+        let total = reader.len();
+        if total != meta.on_disk_bytes {
+            return Err(ResidencyError::SizeMismatch {
+                id: meta.id.clone(),
+                expected: meta.on_disk_bytes,
+                got: total,
+            });
+        }
+        // One shot read: source is mmap-backed, so this is a memcpy from the
+        // OS page cache. No chunking needed.
+        reader
+            .read_at(0, &mut bytes[..on_disk_len])
+            .await
+            .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
+
+        match meta.transpose {
+            TransposePolicy::None => Ok(bytes),
+            TransposePolicy::Linear2D => {
+                if meta.shape.0.len() != 2 {
+                    return Err(ResidencyError::BadRank {
+                        id: meta.id.clone(),
+                        rank: meta.shape.0.len(),
+                        wanted: "2D",
+                    });
+                }
+                let n = meta.shape.0[0];
+                let k = meta.shape.0[1];
+                // Block-tiled u16-stride transpose. Bf16 elements stored as
+                // u16; transpose preserves the bit pattern. n*k must equal the
+                // element count (padding only matters when odd, and 2-D linear
+                // weights never have an odd product).
+                const BLOCK: usize = 64;
+                let elts = n * k;
+                debug_assert_eq!(elts * 2, on_disk_len);
+                let mut dst = vec![0u8; storage_len];
+                let src_u16: &[u16] = bytemuck::cast_slice(&bytes[..on_disk_len]);
+                let dst_u16: &mut [u16] = bytemuck::cast_slice_mut(&mut dst[..on_disk_len]);
+                let mut br = 0usize;
+                while br < n {
+                    let br_end = (br + BLOCK).min(n);
+                    let mut bc = 0usize;
+                    while bc < k {
+                        let bc_end = (bc + BLOCK).min(k);
+                        for row in br..br_end {
+                            let src_row = &src_u16[row * k + bc..row * k + bc_end];
+                            for (col_off, &v) in src_row.iter().enumerate() {
+                                dst_u16[(bc + col_off) * n + row] = v;
+                            }
+                        }
+                        bc = bc_end;
+                    }
+                    br = br_end;
+                }
+                Ok(dst)
+            }
+        }
+    }
+
+    /// Phase-boundary eviction: free every unpinned GPU-resident weight and
+    /// drain the pool, releasing the VRAM back to wgpu. Caller's policy:
+    /// invoke between pipeline phases (post text_encode, end of denoise) so
+    /// peak VRAM is `max(phase)`, not the sum across phases. Pinned entries
+    /// (mid-forward) are skipped; they stay resident.
+    pub fn evict_all_and_free<B: Backend>(&self, backend: &B) {
+        let mut g = self.inner.lock().unwrap();
+        let victims: Vec<WeightHandle> = g
+            .gpu
+            .iter()
+            .filter(|(_, e)| e.pin_count == 0)
+            .map(|(&h, _)| h)
+            .collect();
+        for h in victims {
+            if let Some(pos) = g.gpu_lru.iter().position(|&x| x == h) {
+                g.gpu_lru.remove(pos);
+            }
+            if let Some(e) = g.gpu.remove(&h) {
+                g.gpu_bytes -= e.bytes;
+                backend.free(e.id);
+            }
+        }
+        // Drain the within-phase reuse pool too; phase boundaries are when
+        // we cash in VRAM, not when we hold extra slots warm.
+        for (_, ids) in g.pool.drain() {
+            for id in ids {
+                backend.free(id);
+            }
+        }
+    }
+
+    /// LRU eviction under `vram_bytes` pressure. Evicted buffers are pushed
+    /// onto a size-class free list in `Inner.pool` (not handed back to wgpu);
+    /// the next miss of matching size reuses them. Errors only if every
+    /// remaining resident weight is pinned (caller's working set exceeds
+    /// budget; nothing eviction can do).
+    fn evict_gpu_until_fits<B: Backend>(
+        &self,
+        needed: u64,
+        _backend: &B,
+    ) -> Result<(), ResidencyError<S::Error, B::Error>> {
+        let mut g = self.inner.lock().unwrap();
+        let mut idx = 0;
+        while g.gpu_bytes + needed > self.budget.vram_bytes {
+            let victim = loop {
+                let Some(&cand) = g.gpu_lru.get(idx) else {
+                    return Err(ResidencyError::BudgetTooSmall {
+                        needed,
+                        have: self.budget.vram_bytes - g.gpu_bytes,
+                        tier: "vram",
+                    });
+                };
+                let pinned = g.gpu.get(&cand).is_some_and(|e| e.pin_count > 0);
+                if pinned {
+                    idx += 1;
+                } else {
+                    break cand;
+                }
+            };
+            g.gpu_lru.remove(idx);
+            if let Some(e) = g.gpu.remove(&victim) {
+                g.gpu_bytes -= e.bytes;
+                g.pool.entry(e.bytes).or_default().push(e.id);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Guard pinning a weight's GPU buffer for the view's lifetime. Drop releases
+/// the pin; eviction can then reclaim the buffer on a later `acquire`.
+pub struct GpuView<'a> {
+    inner: &'a Mutex<Inner>,
+    handle: WeightHandle,
+    buf: BufRef,
+}
+
+impl GpuView<'_> {
+    pub fn buf(&self) -> BufRef {
+        self.buf
+    }
+}
+
+impl Drop for GpuView<'_> {
+    fn drop(&mut self) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(e) = g.gpu.get_mut(&self.handle) {
+            e.pin_count = e.pin_count.saturating_sub(1);
+        }
+    }
+}

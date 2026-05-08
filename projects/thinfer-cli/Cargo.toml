@@ -1,0 +1,20 @@
+[package]
+name = "thinfer-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "thinfer"
+path = "src/main.rs"
+
+[dependencies]
+thinfer-core = { path = "../thinfer-core", features = ["trace-subscriber"] }
+thinfer-native = { path = "../thinfer-native" }
+thinfer-models = { path = "../thinfer-models" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }

@@ -1,0 +1,28 @@
+{
+  "name": "thinfer",
+  "version": "0.0.0",
+  "private": true,
+  "description": "WebGPU inference engine, browser bindings.",
+  "type": "module",
+  "packageManager": "pnpm@11.0.9",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src/ scripts/",
+    "fmt": "oxfmt --write src/ scripts/",
+    "fmt:check": "oxfmt --check src/ scripts/",
+    "playwright:install": "playwright install chromium",
+    "test:web": "pnpm playwright:install && node scripts/test.ts"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "chromedriver": "^147.0.0",
+    "oxfmt": "^0.43.0",
+    "oxlint": "^1.58.0",
+    "playwright": "^1.50.0",
+    "typescript": "^6.0.2"
+  }
+}

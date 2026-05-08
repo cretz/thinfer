@@ -1,0 +1,172 @@
+use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
+#[cfg(feature = "conformance")]
+use crate::conformance::{OpSpec, OpTest, OpTestContext, TestCase, linspace, t};
+use crate::ops::{WeightDtype, WgslConfig};
+use crate::tensor::{ComputeDtype, F32};
+use crate::wgsl_with_bf16_variant;
+
+/// `y[r,i] = x[r,i] * rsqrt(mean(x[r,:]^2) + eps) * w[i]`.
+///
+/// Layout: 0=X, 1=W (per-feature gain, shape [dim]), 2=Out, 3=Uniform `{n_rows, dim, eps_bits, _pad}` (u32x4; eps is f32 bit-cast).
+pub trait RmsNormOp {
+    const KERNEL_ID: &'static str;
+    type Dtype: ComputeDtype;
+    const X: &'static str;
+    const W: &'static str;
+    const DIMS: &'static str;
+    const OUTPUT: &'static str;
+    const EPS: f32 = 1e-6;
+
+    fn wgsl(cfg: &WgslConfig) -> &'static str;
+    fn layout() -> &'static [BindingLayout];
+
+    fn workgroups(n_rows: u32) -> [u32; 3] {
+        [n_rows.div_ceil(64), 1, 1]
+    }
+}
+
+pub struct RmsNormBufs<'a> {
+    pub x: &'a BufRef,
+    pub w: &'a BufRef,
+    pub uniform: &'a BufRef,
+    pub out: &'a BufRef,
+}
+
+pub(crate) fn dispatch_rmsnorm<O: RmsNormOp, B: Backend>(
+    backend: &B,
+    encoder: &mut B::CommandEncoder,
+    pipeline: &B::Pipeline,
+    bufs: &RmsNormBufs<'_>,
+    n_rows: u32,
+) -> Result<(), B::Error> {
+    let bindings = [
+        bufs.x.binding(0),
+        bufs.w.binding(1),
+        bufs.out.binding(2),
+        bufs.uniform.binding(3),
+    ];
+    backend.dispatch(encoder, pipeline, &bindings, O::workgroups(n_rows))
+}
+
+wgsl_with_bf16_variant!(
+    WGSL_F32,
+    WGSL_F32_BF16 = r#"
+struct U { n_rows: u32, dim: u32, eps: f32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+fn load_w(i: u32) -> f32 { return w[i]; }
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= u.n_rows) { return; }
+    var sum_sq: f32 = 0.0;
+    for (var i: u32 = 0u; i < u.dim; i = i + 1u) {
+        let v = x[row * u.dim + i];
+        sum_sq = sum_sq + v * v;
+    }
+    let inv = inverseSqrt(sum_sq / f32(u.dim) + u.eps);
+    for (var i: u32 = 0u; i < u.dim; i = i + 1u) {
+        out[row * u.dim + i] = act_store(x[row * u.dim + i] * inv * load_w(i));
+    }
+}
+"#
+);
+
+wgsl_with_bf16_variant!(
+    WGSL_F32_WBF16,
+    WGSL_F32_BF16_WBF16 = r#"
+struct U { n_rows: u32, dim: u32, eps: f32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+fn load_w(i: u32) -> f32 {
+    let pair = w[i >> 1u];
+    let half = (pair >> ((i & 1u) * 16u)) & 0xFFFFu;
+    return bitcast<f32>(half << 16u);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= u.n_rows) { return; }
+    var sum_sq: f32 = 0.0;
+    for (var i: u32 = 0u; i < u.dim; i = i + 1u) {
+        let v = x[row * u.dim + i];
+        sum_sq = sum_sq + v * v;
+    }
+    let inv = inverseSqrt(sum_sq / f32(u.dim) + u.eps);
+    for (var i: u32 = 0u; i < u.dim; i = i + 1u) {
+        out[row * u.dim + i] = act_store(x[row * u.dim + i] * inv * load_w(i));
+    }
+}
+"#
+);
+
+const LAYOUT: &[BindingLayout] = &[
+    BindingLayout {
+        slot: 0,
+        kind: BindingKind::StorageRead,
+    },
+    BindingLayout {
+        slot: 1,
+        kind: BindingKind::StorageRead,
+    },
+    BindingLayout {
+        slot: 2,
+        kind: BindingKind::StorageReadWrite,
+    },
+    BindingLayout {
+        slot: 3,
+        kind: BindingKind::Uniform,
+    },
+];
+
+pub struct RmsNormF32;
+
+impl RmsNormOp for RmsNormF32 {
+    const KERNEL_ID: &'static str = "rmsnorm.f32";
+    type Dtype = F32;
+    const X: &'static str = "rmsnorm/x";
+    const W: &'static str = "rmsnorm/w";
+    const DIMS: &'static str = "rmsnorm/dims";
+    const OUTPUT: &'static str = "rmsnorm/out";
+    fn wgsl(cfg: &WgslConfig) -> &'static str {
+        match (cfg.weight_dtype, cfg.bf16_quant_writes) {
+            (WeightDtype::F32, false) => WGSL_F32,
+            (WeightDtype::F32, true) => WGSL_F32_BF16,
+            (WeightDtype::Bf16, false) => WGSL_F32_WBF16,
+            (WeightDtype::Bf16, true) => WGSL_F32_BF16_WBF16,
+        }
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+}
+
+#[cfg(feature = "conformance")]
+impl OpTest for RmsNormF32 {
+    fn test_cases(&self) -> Vec<TestCase> {
+        vec![TestCase {
+            name: "rmsnorm_basic",
+            op: OpSpec::Rmsnorm { eps: 1e-6 },
+            inputs: vec![
+                t("x", [4, 16], linspace(-2.0, 2.0, false)),
+                t("w", [16], linspace(0.5, 1.5, false)),
+            ],
+        }]
+    }
+    fn run_test<'a>(
+        &self,
+        ctx: &'a OpTestContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
+        Box::pin(ctx.run_rmsnorm::<RmsNormF32>())
+    }
+}

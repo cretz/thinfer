@@ -1,0 +1,16 @@
+[package]
+name = "thinfer-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thinfer-core = { path = "../thinfer-core" }
+tracing = { workspace = true }
+bytemuck = "1"
+png = "0.17"
+# `futures::join!` is wasm-compatible and lets thinfer-models stay free of
+# tokio. Used to overlap weight prefetch with current-layer GPU submit-await.
+futures = { version = "0.3", default-features = false, features = ["async-await"] }
