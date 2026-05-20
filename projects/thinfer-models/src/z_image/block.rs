@@ -17,10 +17,10 @@ use thinfer_core::Backend;
 use thinfer_core::backend::{BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::cache::KernelKey;
 use thinfer_core::ops::{
-    AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32, BcastFmaOp,
-    LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, RmsNormF32,
-    RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32,
-    SdpaOp, SiluF32, SiluMulF32, TanhF32, WgslConfig,
+    ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
+    BcastFmaOp, LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op,
+    RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32, ScatterPadRowsOp,
+    SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace;
@@ -109,7 +109,14 @@ impl Default for BlockMatmuls {
             proj: MatMulF32::new(blocked),
             ffn_up: MatMulF32::new(blocked),
             ffn_down: MatMulF32::new(blocked),
-            adaln: MatMulF32::new(MatMulConfig::DEFAULT),
+            // tn=2 (not DEFAULT tn=1) so AdaLN output can land in packed-bf16
+            // storage when `WgslConfig.act_dtype = Bf16`. Output cols are
+            // 6*ADALN_EMBED_DIM = 1536 (even) so pairing is clean. M=1 keeps
+            // register blocking pointless, so bm/tm stay at DEFAULT.
+            adaln: MatMulF32::new(MatMulConfig {
+                tn: 2,
+                ..MatMulConfig::DEFAULT
+            }),
         }
     }
 }
@@ -135,9 +142,18 @@ pub struct BlockPipelines {
     pub bcast_fma: WgpuPipeline,
     pub bcast_add: WgpuPipeline,
     pub scatter_pad_rows: WgpuPipeline,
+    /// On-GPU activation storage dtype for buffers compiled against this set
+    /// of pipelines. Drives byte sizing of every transient alloc through the
+    /// DiT block forward pass.
+    pub act_dtype: ActDtype,
 }
 
 impl BlockPipelines {
+    /// Bytes for `n` activation elements at this pipeline set's dtype.
+    pub fn act_bytes(&self, n: u32) -> u64 {
+        n as u64 * self.act_dtype.bytes_per_elem()
+    }
+
     pub async fn compile(backend: &WgpuBackend, cfg: &WgslConfig) -> Result<Self, WgpuError> {
         let matmuls = BlockMatmuls::default();
         let mm_layout = <MatMulF32 as MatmulOp>::layout();
@@ -241,6 +257,7 @@ impl BlockPipelines {
                     <ScatterPadRowsF32 as ScatterPadRowsOp>::layout(),
                 )
                 .await?,
+            act_dtype: cfg.act_dtype,
         })
     }
 }
@@ -388,17 +405,17 @@ impl Block {
         let b = cfg.batch as u32;
         let s = cfg.seq as u32;
 
-        let act_bytes = (rows * dim) as u64 * 4;
-        let q_bytes = (rows * hq * hd) as u64 * 4;
-        let kv_bytes = (rows * hkv * hd) as u64 * 4;
-        let hid_bytes = (rows * hid) as u64 * 4;
+        let act_bytes = pipelines.act_bytes(rows * dim);
+        let q_bytes = pipelines.act_bytes(rows * hq * hd);
+        let kv_bytes = pipelines.act_bytes(rows * hkv * hd);
+        let hid_bytes = pipelines.act_bytes(rows * hid);
 
         let ada: Option<AdaLnChunks<'wsp>> = match (cfg.modulation, &bufs.adaln, adaln_input) {
             (true, Some(w), Some(input)) => Some(self.prepare_adaln(scope, pipelines, w, input)?),
             (false, None, None) => None,
             _ => panic!("modulation/adaln_input/adaln-bufs mismatch"),
         };
-        let chunk_bytes = (b * dim) as u64 * 4;
+        let chunk_bytes = pipelines.act_bytes(b * dim);
         if let Some(a) = ada.as_ref() {
             copy_tap(scope, a.scale_msa, &taps.scale_msa, chunk_bytes)?;
             copy_tap(scope, a.gate_msa, &taps.gate_msa, chunk_bytes)?;
@@ -678,8 +695,8 @@ impl Block {
         let b = cfg.batch as u32;
         let ad = cfg.adaln_embed_dim as u32;
         let four_dim = 4 * dim;
-        let chunk_bytes = (b * dim) as u64 * 4;
-        let full_bytes = (b * four_dim) as u64 * 4;
+        let chunk_bytes = pipelines.act_bytes(b * dim);
+        let full_bytes = pipelines.act_bytes(b * four_dim);
 
         let pre = scope.alloc(full_bytes)?;
         let dims_g = scope.u32x4_uniform(b, four_dim, ad, 0)?;

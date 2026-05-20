@@ -1,9 +1,11 @@
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 #[cfg(feature = "conformance")]
-use crate::conformance::{OpSpec, OpTest, OpTestContext, TestCase, linspace, t};
-use crate::ops::WgslConfig;
+use crate::conformance::{
+    DTYPES_ACT_BF16, Dtype, OpSpec, OpTest, OpTestContext, TestCase, linspace, t,
+};
+use crate::ops::{ActDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
-use crate::wgsl_with_bf16_variant;
+use crate::{act_bf16_prelude, wgsl_with_bf16_variant};
 
 /// Fused scaled-dot-product attention with online softmax.
 ///
@@ -147,6 +149,81 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 );
 
+/// Packed-bf16 small-D sdpa. Q/K/V/Mask/Out all `array<u32>` (bf16 pairs).
+/// Compute (dot products, softmax, accumulators) stays fp32. Requires `D`
+/// even (always true: 8/128 in Z-Image+Qwen3) and `s_k` even when
+/// `has_mask != 0` (so each row's bf16 mask aligns to packed words).
+const WGSL_BF16_PACKED: &str = concat!(
+    act_bf16_prelude!(),
+    r#"
+struct U {
+    b: u32, h_q: u32, h_kv: u32, s_q: u32,
+    s_k: u32, d: u32, scale: f32, has_mask: u32,
+};
+
+@group(0) @binding(0) var<storage, read> q: array<u32>;
+@group(0) @binding(1) var<storage, read> k: array<u32>;
+@group(0) @binding(2) var<storage, read> v: array<u32>;
+@group(0) @binding(3) var<storage, read> mask: array<u32>;
+@group(0) @binding(4) var<storage, read_write> out: array<u32>;
+@group(0) @binding(5) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = u.b * u.s_q * u.h_q;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+    let hq  = idx % u.h_q;
+    let tmp = idx / u.h_q;
+    let sq  = tmp % u.s_q;
+    let bb  = tmp / u.s_q;
+    let hkv = (hq * u.h_kv) / u.h_q;
+
+    let d_w        = u.d >> 1u;
+    let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
+    let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
+    let kv_step_w  = (u.h_kv * u.d) >> 1u;
+    let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
+
+    var o: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { o[d] = 0.0; }
+    var m: f32 = bitcast<f32>(0xff800000u);
+    var l: f32 = 0.0;
+
+    for (var j = 0u; j < u.s_k; j = j + 1u) {
+        let kj_w = kv_b0_w + j * kv_step_w;
+        var dot: f32 = 0.0;
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            let qv = unpack_bf16x2(q[q_w_off + dw]);
+            let kv = unpack_bf16x2(k[kj_w + dw]);
+            dot = dot + qv.x * kv.x + qv.y * kv.y;
+        }
+        var bias: f32 = 0.0;
+        if (u.has_mask != 0u) {
+            let mw = unpack_bf16x2(mask[mask_w_base + (j >> 1u)]);
+            bias = select(mw.x, mw.y, (j & 1u) == 1u);
+        }
+        let s_j  = dot * u.scale + bias;
+        let m_new = max(m, s_j);
+        let alpha = exp(m - m_new);
+        let p_j  = exp(s_j - m_new);
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            let vv = unpack_bf16x2(v[kj_w + dw]);
+            o[dw * 2u]      = o[dw * 2u]      * alpha + p_j * vv.x;
+            o[dw * 2u + 1u] = o[dw * 2u + 1u] * alpha + p_j * vv.y;
+        }
+        l = l * alpha + p_j;
+        m = m_new;
+    }
+
+    let inv_l = 1.0 / l;
+    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+        out[q_w_off + dw] = pack_bf16x2(o[dw * 2u] * inv_l, o[dw * 2u + 1u] * inv_l);
+    }
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -186,10 +263,10 @@ impl SdpaOp for SdpaF32 {
     const DIMS: &'static str = "sdpa/dims";
     const OUTPUT: &'static str = "sdpa/out";
     fn wgsl(cfg: &WgslConfig) -> &'static str {
-        if cfg.bf16_quant_writes {
-            WGSL_F32_BF16
-        } else {
-            WGSL_F32
+        match (cfg.act_dtype, cfg.bf16_quant_writes) {
+            (ActDtype::F32, false) => WGSL_F32,
+            (ActDtype::F32, true) => WGSL_F32_BF16,
+            (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
         }
     }
     fn layout() -> &'static [BindingLayout] {
@@ -397,6 +474,9 @@ impl OpTest for SdpaF32LargeD {
 
 #[cfg(feature = "conformance")]
 impl OpTest for SdpaF32 {
+    fn dtypes(&self) -> &'static [Dtype] {
+        DTYPES_ACT_BF16
+    }
     fn test_cases(&self) -> Vec<TestCase> {
         // B=1, S_q=4, S_k=4, H_q=2, H_kv=2, D=8. scale = 1/sqrt(D).
         let scale = 1.0_f32 / 8.0_f32.sqrt();

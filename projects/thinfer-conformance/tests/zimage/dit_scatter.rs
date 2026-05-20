@@ -30,6 +30,7 @@ fn scatter_pad_rows_replaces_masked_and_preserves_others() {
         &backend,
         &WgslConfig {
             bf16_quant_writes: false,
+            act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
         },
     ))
@@ -94,6 +95,7 @@ fn scatter_pad_rows_no_op_when_mask_all_zero() {
         &backend,
         &WgslConfig {
             bf16_quant_writes: false,
+            act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
         },
     ))

@@ -38,6 +38,13 @@ pub enum Dtype {
     /// conv2d, transpose12, softmax) opt out via `OpTest::dtypes`.
     #[serde(rename = "bf16w")]
     Bf16Writes,
+    /// Packed bf16 activation storage: `array<u32>` on the GPU, 2 elems/word.
+    /// Halves activation VRAM and bandwidth. Inputs and outputs are stored as
+    /// native bf16 (2 bytes/elem) in the safetensors fixture; both sides land
+    /// on the same bf16 bit pattern so tolerance stays at fp32 levels. Ops
+    /// roll into this dtype incrementally via `OpTest::dtypes` overrides.
+    #[serde(rename = "bf16p")]
+    Bf16Packed,
 }
 
 impl Dtype {
@@ -45,6 +52,7 @@ impl Dtype {
         match self {
             Dtype::Fp32 => "fp32",
             Dtype::Bf16Writes => "bf16w",
+            Dtype::Bf16Packed => "bf16p",
         }
     }
 
@@ -53,13 +61,24 @@ impl Dtype {
         match self {
             Dtype::Fp32 => &WgslConfig::FP32,
             Dtype::Bf16Writes => &WgslConfig::BF16_QUANT_WRITES,
+            Dtype::Bf16Packed => &WgslConfig::BF16_PACKED,
+        }
+    }
+
+    /// Bytes per activation element on-disk and on-GPU for this dtype.
+    pub const fn bytes_per_elem(self) -> u64 {
+        match self {
+            Dtype::Fp32 | Dtype::Bf16Writes => 4,
+            Dtype::Bf16Packed => 2,
         }
     }
 }
 
 /// Default dtype list every bf16-capable op runs in. Fp32-only ops override
-/// `OpTest::dtypes` to `DTYPES_FP32_ONLY`.
+/// `OpTest::dtypes` to `DTYPES_FP32_ONLY`. Ops that have rolled into packed
+/// bf16 storage override to `DTYPES_ACT_BF16`.
 pub const DTYPES_DEFAULT: &[Dtype] = &[Dtype::Fp32, Dtype::Bf16Writes];
+pub const DTYPES_ACT_BF16: &[Dtype] = &[Dtype::Fp32, Dtype::Bf16Writes, Dtype::Bf16Packed];
 pub const DTYPES_FP32_ONLY: &[Dtype] = &[Dtype::Fp32];
 
 #[derive(Serialize, Clone)]
@@ -293,7 +312,7 @@ impl<'a> OpTestContext<'a> {
         let a_shape = &self.case.inputs[0].shape;
         let b_shape = &self.case.inputs[1].shape;
         let (m, k, n) = (a_shape[0] as u32, a_shape[1] as u32, b_shape[1] as u32);
-        let out_len = (m as u64) * (n as u64) * O::Dtype::SIZE as u64;
+        let out_len = (m as u64) * (n as u64) * self.dtype.bytes_per_elem();
         let u = pack_u32x4(m, n, k, 0);
         let wgsl = op.wgsl(self.dtype.wgsl_config());
         self.run_op(
@@ -705,7 +724,12 @@ pub fn registry() -> Vec<Box<dyn OpTest>> {
         Box::new(SiluF32),
         Box::new(SiluMulF32),
         Box::new(TanhF32),
-        Box::new(MatMulF32::default()),
+        // tn=2 (not the DEFAULT tn=1) so the bf16-packed variant can pack
+        // two output columns per thread. Otherwise unchanged geometry.
+        Box::new(MatMulF32::new(crate::ops::MatMulConfig {
+            tn: 2,
+            ..crate::ops::MatMulConfig::DEFAULT
+        })),
         Box::new(RmsNormF32),
         Box::new(LayerNormF32),
         Box::new(SoftmaxF32),
@@ -724,27 +748,37 @@ pub fn registry() -> Vec<Box<dyn OpTest>> {
 pub fn tol(d: Dtype) -> f32 {
     match d {
         Dtype::Fp32 => 1e-5,
-        // bf16-writes is the fp32 result RNE-rounded to bf16, then the same
-        // pytorch-side. Both sides accumulate in fp32 with identical input
-        // ordering, so the rounded results land on the same bf16 value:
-        // measured bit-exact (0.000e0) across the matrix. Keep at fp32-level
-        // tol so future kernel reorderings (e.g. tiled matmul changing
-        // accumulator order) get caught instead of silently absorbed.
+        // bf16-writes / bf16-packed: pytorch ref RNE-rounds to bf16; our
+        // shaders do the same on every activation store. Both sides land on
+        // the same bf16 bit pattern, so diff is bit-exact in practice. Keep
+        // at fp32-level tol so kernel reorderings (tiled matmul changing
+        // accumulator order, etc.) get caught instead of silently absorbed.
         Dtype::Bf16Writes => 1e-5,
+        Dtype::Bf16Packed => 1e-5,
     }
 }
 
 pub fn diff_max_abs(d: Dtype, got: &[u8], expected: &[u8]) -> f32 {
     assert_eq!(got.len(), expected.len(), "byte length mismatch");
-    // Both dtypes are stored as fp32 bytes on the wire; bf16-writes just has
-    // the values pre-rounded to bf16 by both sides.
-    let _ = d;
-    got.chunks_exact(4)
-        .zip(expected.chunks_exact(4))
-        .map(|(g, e)| {
-            let g = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-            let e = f32::from_le_bytes([e[0], e[1], e[2], e[3]]);
-            (g - e).abs()
-        })
-        .fold(0.0_f32, f32::max)
+    match d {
+        Dtype::Fp32 | Dtype::Bf16Writes => got
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .map(|(g, e)| {
+                let g = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+                let e = f32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                (g - e).abs()
+            })
+            .fold(0.0_f32, f32::max),
+        Dtype::Bf16Packed => got
+            .chunks_exact(2)
+            .zip(expected.chunks_exact(2))
+            .map(|(g, e)| {
+                // bf16 lives in the upper 16 bits of an f32 bitcast.
+                let g = f32::from_bits((u16::from_le_bytes([g[0], g[1]]) as u32) << 16);
+                let e = f32::from_bits((u16::from_le_bytes([e[0], e[1]]) as u32) << 16);
+                (g - e).abs()
+            })
+            .fold(0.0_f32, f32::max),
+    }
 }

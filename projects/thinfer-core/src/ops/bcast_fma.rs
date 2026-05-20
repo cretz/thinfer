@@ -6,10 +6,12 @@
 
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 #[cfg(feature = "conformance")]
-use crate::conformance::{OpSpec, OpTest, OpTestContext, TestCase, linspace, t};
-use crate::ops::WgslConfig;
+use crate::conformance::{
+    DTYPES_ACT_BF16, Dtype, OpSpec, OpTest, OpTestContext, TestCase, linspace, t,
+};
+use crate::ops::{ActDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
-use crate::wgsl_with_bf16_variant;
+use crate::{act_bf16_prelude, wgsl_with_bf16_variant};
 
 pub trait BcastFmaOp {
     const KERNEL_ID: &'static str;
@@ -72,6 +74,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "#
 );
 
+const WGSL_BF16_PACKED: &str = concat!(
+    act_bf16_prelude!(),
+    r#"
+struct U { c: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read> s: array<u32>;
+@group(0) @binding(2) var<storage, read> y: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out: array<u32>;
+@group(0) @binding(4) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let w = gid.y * (ng.x * 64u) + gid.x;
+    if (w >= arrayLength(&out)) { return; }
+    let xv = unpack_bf16x2(x[w]);
+    let yv = unpack_bf16x2(y[w]);
+    let c0 = (w * 2u) % u.c;
+    let sv = unpack_bf16x2(s[c0 >> 1u]);
+    out[w] = pack_bf16x2(xv.x + sv.x * yv.x, xv.y + sv.y * yv.y);
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -105,10 +131,10 @@ impl BcastFmaOp for BcastFmaF32 {
     const Y: &'static str = "bcast_fma/y";
     const OUTPUT: &'static str = "bcast_fma/out";
     fn wgsl(cfg: &WgslConfig) -> &'static str {
-        if cfg.bf16_quant_writes {
-            WGSL_F32_BF16
-        } else {
-            WGSL_F32
+        match (cfg.act_dtype, cfg.bf16_quant_writes) {
+            (ActDtype::F32, false) => WGSL_F32,
+            (ActDtype::F32, true) => WGSL_F32_BF16,
+            (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
         }
     }
     fn layout() -> &'static [BindingLayout] {
@@ -118,6 +144,9 @@ impl BcastFmaOp for BcastFmaF32 {
 
 #[cfg(feature = "conformance")]
 impl OpTest for BcastFmaF32 {
+    fn dtypes(&self) -> &'static [Dtype] {
+        DTYPES_ACT_BF16
+    }
     fn test_cases(&self) -> Vec<TestCase> {
         vec![TestCase {
             name: "bcast_fma_basic",

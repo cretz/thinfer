@@ -724,6 +724,7 @@ impl VaeDecoderPipelines {
     pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
         let cfg = &WgslConfig {
             bf16_quant_writes: false,
+            act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
         };
         Ok(Self {

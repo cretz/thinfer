@@ -111,7 +111,7 @@ impl CapEmbedder {
         bufs: &'wsp CapEmbedderBufs,
     ) -> Result<CapEmbedderIntermediateHandles<'wsp>, WgpuError> {
         let cfd = self.cfg.cap_feat_dim as u32;
-        let normed = scope.alloc((n_tokens * cfd * 4) as u64)?;
+        let normed = scope.alloc(pipelines.act_bytes(n_tokens * cfd))?;
         let rms_u = rmsnorm_uniform(scope, n_tokens, cfd, self.cfg.norm_eps)?;
         let norm_w = scope.import(&bufs.norm_weight);
         scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, cap, norm_w, rms_u, normed, n_tokens)?;
@@ -147,7 +147,7 @@ fn linear_no_bias<'wsp>(
     in_dim: u32,
     out_dim: u32,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let pre = scope.alloc((n_rows * out_dim * 4) as u64)?;
+    let pre = scope.alloc(pipelines.act_bytes(n_rows * out_dim))?;
     let dims = scope.u32x4_uniform(n_rows, out_dim, in_dim, 0)?;
     let weight = scope.import(&w.weight);
     scope.matmul(

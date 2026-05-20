@@ -10,6 +10,10 @@ Dtypes:
 - `bf16w`: fp32 ref output RNE-quantized to bf16 then back to fp32 - matches
   what our shaders emit when `WgslConfig::BF16_QUANT_WRITES` is active
   (every activation-producing store rounded through bf16).
+- `bf16p`: both inputs and outputs stored as native `torch.bfloat16` (2 bytes
+  per element). Matches `WgslConfig::BF16_PACKED`: `array<u32>` activation
+  storage with 2 elems/word. Inputs in this dtype are not the same bytes as
+  the fp32 fixture's inputs.
 """
 
 from __future__ import annotations
@@ -24,10 +28,15 @@ from safetensors.torch import save_file
 
 
 def quantize_for_dtype(t: torch.Tensor, dtype_name: str) -> torch.Tensor:
+    """Encode a fp32 tensor for the wire format the GPU buffer expects in
+    this dtype. fp32 stays fp32 bytes; bf16w stays fp32 layout with rounded
+    values; bf16p emits native 2-byte bf16."""
     if dtype_name == "fp32":
         return t
     if dtype_name == "bf16w":
         return t.to(torch.bfloat16).to(torch.float32)
+    if dtype_name == "bf16p":
+        return t.to(torch.bfloat16)
     raise ValueError(f"unknown dtype: {dtype_name}")
 
 
@@ -145,20 +154,27 @@ def main() -> None:
 
     for case in spec["cases"]:
         name = case["name"]
-        # Inputs are always fp32 on disk; bf16w only affects the `out` tensor
-        # (mirrors shader behavior: storage is fp32, only the activation write
-        # is bf16-quantized).
         inputs: dict[str, torch.Tensor] = {}
         for inp in case["inputs"]:
             inputs[inp["name"]] = make_input(inp["fill"], inp["shape"])
 
-        out_fp32 = compute_output(case["op"], case, inputs)
-
         for dtype_name in case["dtypes"]:
             bucket = by_dtype.setdefault(dtype_name, {})
-            for k, v in inputs.items():
-                bucket[f"{name}/{k}"] = v.contiguous()
-            bucket[f"{name}/out"] = quantize_for_dtype(out_fp32, dtype_name).contiguous()
+            # For bf16p, the shader reads bf16-packed inputs and unpacks to
+            # fp32 before compute. Ref pytorch mirrors that: bf16-round inputs
+            # first, recompute in fp32, then bf16-encode output. bf16w keeps
+            # inputs fp32 (storage is fp32 in that path; only writes round).
+            if dtype_name == "bf16p":
+                rounded = {k: v.to(torch.bfloat16).to(torch.float32) for k, v in inputs.items()}
+                out_fp32 = compute_output(case["op"], case, rounded)
+                for k, v in inputs.items():
+                    bucket[f"{name}/{k}"] = v.to(torch.bfloat16).contiguous()
+                bucket[f"{name}/out"] = out_fp32.to(torch.bfloat16).contiguous()
+            else:
+                out_fp32 = compute_output(case["op"], case, inputs)
+                for k, v in inputs.items():
+                    bucket[f"{name}/{k}"] = v.contiguous()
+                bucket[f"{name}/out"] = quantize_for_dtype(out_fp32, dtype_name).contiguous()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for dtype_name, tensors in by_dtype.items():

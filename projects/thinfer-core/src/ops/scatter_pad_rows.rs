@@ -15,7 +15,7 @@
 //!
 //! Layout: 0=Pad, 1=Mask, 2=Dst, 3=Uniform.
 
-use super::WgslConfig;
+use super::{ActDtype, WgslConfig};
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 use crate::tensor::{ComputeDtype, F32};
 
@@ -58,7 +58,7 @@ pub(crate) fn dispatch_scatter_pad_rows<O: ScatterPadRowsOp, B: Backend>(
     backend.dispatch(encoder, pipeline, &bindings, O::workgroups(n_elems))
 }
 
-const WGSL: &str = r#"
+const WGSL_F32: &str = r#"
 struct U { n_rows: u32, dim: u32, _pad0: u32, _pad1: u32 };
 
 @group(0) @binding(0) var<storage, read> pad: array<u32>;
@@ -77,6 +77,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let pair = pad[col >> 1u];
     let half = (pair >> ((col & 1u) * 16u)) & 0xFFFFu;
     dst[i] = bitcast<f32>(half << 16u);
+}
+"#;
+
+// Packed-bf16 path: pad and dst share the same bf16-packed layout, so the
+// kernel is a word-wise copy gated by the per-row mask. `n_elems` from the
+// caller is still the elem count; words per row = dim / 2.
+const WGSL_BF16_PACKED: &str = r#"
+struct U { n_rows: u32, dim: u32, _pad0: u32, _pad1: u32 };
+
+@group(0) @binding(0) var<storage, read> pad: array<u32>;
+@group(0) @binding(1) var<storage, read> mask: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let i = gid.y * (ng.x * 64u) + gid.x;
+    let words_per_row = u.dim >> 1u;
+    let total_words = u.n_rows * words_per_row;
+    if (i >= total_words) { return; }
+    let row = i / words_per_row;
+    if (mask[row] == 0u) { return; }
+    let col_word = i - row * words_per_row;
+    dst[i] = pad[col_word];
 }
 "#;
 
@@ -108,8 +132,11 @@ impl ScatterPadRowsOp for ScatterPadRowsF32 {
     const MASK: &'static str = "scatter_pad_rows/mask";
     const DIMS: &'static str = "scatter_pad_rows/dims";
     const OUTPUT: &'static str = "scatter_pad_rows/dst";
-    fn wgsl(_cfg: &WgslConfig) -> &'static str {
-        WGSL
+    fn wgsl(cfg: &WgslConfig) -> &'static str {
+        match cfg.act_dtype {
+            ActDtype::F32 => WGSL_F32,
+            ActDtype::Bf16 => WGSL_BF16_PACKED,
+        }
     }
     fn layout() -> &'static [BindingLayout] {
         LAYOUT

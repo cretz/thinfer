@@ -786,10 +786,11 @@ impl Qwen3Encoder {
 
         let shape = Qwen3BlockShape::default_from_config(seq);
         let block = Qwen3Block::new(shape);
-        let act_bytes = (seq * config::HIDDEN * 4) as u64;
+        let act_bytes = pipelines.act_bytes((seq * config::HIDDEN) as u32);
 
         let x_buf = scratch.alloc(act_bytes)?;
-        backend.write_buffer(x_buf.id, 0, bytes_of_f32(&embeds).as_slice())?;
+        let embed_bytes = seq::act_upload_bytes(pipelines.act_dtype, &embeds);
+        backend.write_buffer(x_buf.id, 0, &embed_bytes)?;
 
         // --- rope freqs: positions 0..seq on axis 0 ---
         let mut pos_ids = vec![0_i32; seq * 3];
@@ -801,7 +802,7 @@ impl Qwen3Encoder {
         backend.write_buffer(freqs_buf.id, 0, &freqs_bytes)?;
 
         // --- causal mask [1, seq, seq] ---
-        let mask_bytes = seq::causal_mask_bytes(seq);
+        let mask_bytes = seq::causal_mask_bytes_act(seq, pipelines.act_dtype);
         let mask_buf = scratch.alloc(mask_bytes.len() as u64)?;
         backend.write_buffer(mask_buf.id, 0, &mask_bytes)?;
 
@@ -873,10 +874,7 @@ impl Qwen3Encoder {
 
         // --- readback final-layer output ---
         let bytes = backend.read_buffer(cur.id(), 0, act_bytes).await?;
-        let mut hidden = vec![0_f32; seq * config::HIDDEN];
-        for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-            hidden[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
+        let hidden = seq::act_readback_to_f32(pipelines.act_dtype, &bytes, seq * config::HIDDEN);
         Ok(Qwen3Output { hidden, seq })
     }
 }
@@ -906,14 +904,6 @@ impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for Qwen3ForwardE
     fn from(e: ResidencyError<SE, WgpuError>) -> Self {
         Self::Residency(e)
     }
-}
-
-fn bytes_of_f32(slice: &[f32]) -> Vec<u8> {
-    let mut bytes = vec![0u8; slice.len() * 4];
-    for (i, v) in slice.iter().enumerate() {
-        bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
-    }
-    bytes
 }
 
 fn scope_rmsnorm_uniform<'wsp>(

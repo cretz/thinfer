@@ -13,7 +13,7 @@
 //! correct only because B=1 matches the block pipeline constraint.
 
 use thinfer_core::backend::{BufRef, WgpuBackend, WgpuError};
-use thinfer_core::ops::{BcastAddF32, SiluF32};
+use thinfer_core::ops::{ActDtype, BcastAddF32, SiluF32};
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{BatchBuf, BatchScope};
@@ -71,16 +71,25 @@ impl TimestepEmbedder {
     }
 
     /// Build `embed = cat(cos(t * freqs), sin(t * freqs))` in CPU memory.
-    /// `t` is the (already `t_scale`d) timestep, single value (B=1).
-    fn compute_embed(&self, t: f32) -> Vec<u8> {
+    /// `t` is the (already `t_scale`d) timestep, single value (B=1). Encoded
+    /// for the matmul's activation storage dtype: f32 LE or bf16-packed (RNE).
+    fn compute_embed(&self, t: f32, act: ActDtype) -> Vec<u8> {
         let half = self.freqs.len();
-        let mut bytes = vec![0u8; self.cfg.freq_dim * 4];
+        let stride = act.bytes_per_elem() as usize;
+        let mut bytes = vec![0u8; self.cfg.freq_dim * stride];
+        let write = |bytes: &mut [u8], idx: usize, v: f32| match act {
+            ActDtype::F32 => {
+                bytes[idx * 4..(idx + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            ActDtype::Bf16 => {
+                let h = round_f32_to_bf16(v);
+                bytes[idx * 2..(idx + 1) * 2].copy_from_slice(&h.to_le_bytes());
+            }
+        };
         for (i, &f) in self.freqs.iter().enumerate() {
             let arg = t * f;
-            let c = arg.cos();
-            let s = arg.sin();
-            bytes[i * 4..(i + 1) * 4].copy_from_slice(&c.to_le_bytes());
-            bytes[(half + i) * 4..(half + i + 1) * 4].copy_from_slice(&s.to_le_bytes());
+            write(&mut bytes, i, arg.cos());
+            write(&mut bytes, half + i, arg.sin());
         }
         bytes
     }
@@ -98,10 +107,10 @@ impl TimestepEmbedder {
         let freq = self.cfg.freq_dim as u32;
         let mid = self.cfg.mid_dim as u32;
         let outd = self.cfg.out_dim as u32;
-        let freq_bytes = (freq * 4) as u64;
-        let mid_bytes = (mid * 4) as u64;
+        let freq_bytes = pipelines.act_bytes(freq);
+        let mid_bytes = pipelines.act_bytes(mid);
 
-        let embed_bytes = self.compute_embed(t);
+        let embed_bytes = self.compute_embed(t, pipelines.act_dtype);
         debug_assert_eq!(embed_bytes.len() as u64, freq_bytes);
         let embed = scope.write_uniform(&embed_bytes)?;
 
@@ -129,7 +138,7 @@ impl TimestepEmbedder {
         scope.dispatch_op::<SiluF32>(&pipelines.silu, &[fc1], act)?;
 
         // Linear 2: [1, mid] @ [mid, out] -> [1, out]
-        let fc2_pre = scope.alloc((outd * 4) as u64)?;
+        let fc2_pre = scope.alloc(pipelines.act_bytes(outd))?;
         let dims_fc2 = scope.u32x4_uniform(1, outd, mid, 0)?;
         let fc2_w = scope.import(&bufs.fc2_weight);
         scope.matmul(
@@ -183,6 +192,21 @@ impl TEmbedderWeightHandles {
             fc2_weight: residency.acquire(self.fc2_weight, backend).await?,
             fc2_bias: residency.acquire(self.fc2_bias, backend).await?,
         })
+    }
+}
+
+/// f32 -> bf16 RNE; matches the WGSL `round_bf16` helper bit-for-bit so
+/// host-uploaded activations agree with kernel-rounded ones.
+fn round_f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let exp = (bits >> 23) & 0xff;
+    if exp == 0xff {
+        let mant = bits & 0x7f_ffff;
+        let top = (bits >> 16) as u16;
+        if mant == 0 { top } else { top | 0x0040 }
+    } else {
+        let rounding = 0x7fff + ((bits >> 16) & 1);
+        ((bits.wrapping_add(rounding)) >> 16) as u16
     }
 }
 

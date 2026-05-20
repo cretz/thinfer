@@ -99,42 +99,135 @@ impl WeightDtype {
     }
 }
 
+/// On-GPU storage layout for activation tensors (kernel inputs/outputs that
+/// are not weights). Decouples activation storage encoding from compute dtype:
+/// kernels stay fp32-compute, only the load/store path changes.
+///
+/// - `F32`: `array<f32>` storage, one element per word. Baseline.
+/// - `Bf16`: `array<u32>` storage with K=2 bf16 elements packed per word.
+///   Implies RNE rounding on every activation-producing store (the packed
+///   format is itself the rounded value).
+///
+/// Designed extensibly: the per-word element count (`elems_per_word`) covers
+/// future fp16-packed (K=2) and fp8-packed (K=4) variants. Kernels generate
+/// their main loop over K consecutive elements per thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ActDtype {
+    #[default]
+    F32,
+    Bf16,
+}
+
+impl ActDtype {
+    pub const fn bytes_per_elem(&self) -> u64 {
+        match self {
+            Self::F32 => 4,
+            Self::Bf16 => 2,
+        }
+    }
+    /// Elements packed per 4-byte storage word. Drives the per-thread output
+    /// count in elementwise kernels.
+    pub const fn elems_per_word(&self) -> u32 {
+        match self {
+            Self::F32 => 1,
+            Self::Bf16 => 2,
+        }
+    }
+    pub fn hint(&self) -> &'static str {
+        match self {
+            Self::F32 => "af32",
+            Self::Bf16 => "abf16",
+        }
+    }
+}
+
 /// Selects which compiled variant of an op's WGSL to use. Each op trait's
 /// `wgsl(&WgslConfig)` returns a single `&'static str`.
 ///
 /// `bf16_quant_writes`: round every activation-producing store to bf16 precision
-/// (RNE, NaN/inf passthrough). Compute and accumulator state stay fp32 — only
-/// the final memory write quantizes. Matches PyTorch's bf16 dtype semantics.
+/// (RNE, NaN/inf passthrough) while keeping `array<f32>` storage layout. Compute
+/// and accumulator state stay fp32. The intermediate "rounded but not packed"
+/// mode; matches PyTorch's bf16 dtype semantics for diff-against-reference.
+/// Ignored / redundant when `act_dtype == ActDtype::Bf16` (packed storage is
+/// itself the rounded value).
+///
+/// `act_dtype`: on-GPU storage layout for activation buffers. Orthogonal to
+/// `bf16_quant_writes`; `Bf16` halves activation VRAM and bandwidth. See
+/// [`ActDtype`].
 ///
 /// `weight_dtype`: on-GPU storage format for weight bindings. See
 /// [`WeightDtype`]. Ops without weight bindings ignore this.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WgslConfig {
     pub bf16_quant_writes: bool,
+    pub act_dtype: ActDtype,
     pub weight_dtype: WeightDtype,
 }
 
 impl WgslConfig {
     pub const FP32: Self = Self {
         bf16_quant_writes: false,
+        act_dtype: ActDtype::F32,
         weight_dtype: WeightDtype::F32,
     };
     pub const BF16_QUANT_WRITES: Self = Self {
         bf16_quant_writes: true,
+        act_dtype: ActDtype::F32,
         weight_dtype: WeightDtype::F32,
+    };
+    /// Packed-bf16 activation storage. Pairs with bf16 weights since this is
+    /// the production config; the conformance bf16p fixture also stores all
+    /// weight tensors as native bf16.
+    pub const BF16_PACKED: Self = Self {
+        bf16_quant_writes: false,
+        act_dtype: ActDtype::Bf16,
+        weight_dtype: WeightDtype::Bf16,
     };
 
     /// Short tag for `KernelKey` hints and pipeline-cache disambiguation.
     /// Must change whenever any cfg field changes - the same kernel id with
     /// different `WgslConfig` values needs distinct cache entries.
     pub fn hint(&self) -> &'static str {
-        match (self.bf16_quant_writes, self.weight_dtype) {
-            (false, WeightDtype::F32) => "",
-            (true, WeightDtype::F32) => "bf16q",
-            (false, WeightDtype::Bf16) => "wbf16",
-            (true, WeightDtype::Bf16) => "bf16q-wbf16",
+        match (self.bf16_quant_writes, self.act_dtype, self.weight_dtype) {
+            (false, ActDtype::F32, WeightDtype::F32) => "",
+            (true, ActDtype::F32, WeightDtype::F32) => "bf16q",
+            (false, ActDtype::F32, WeightDtype::Bf16) => "wbf16",
+            (true, ActDtype::F32, WeightDtype::Bf16) => "bf16q-wbf16",
+            (_, ActDtype::Bf16, WeightDtype::F32) => "abf16-wf32",
+            (_, ActDtype::Bf16, WeightDtype::Bf16) => "abf16",
         }
     }
+}
+
+/// WGSL prelude for packed-bf16 activation storage. Defines:
+/// - `unpack_bf16x2(w: u32) -> vec2<f32>` reads two bf16 elements from a word.
+/// - `round_bf16(x: f32) -> u32` RNE-rounds f32 to bf16 bits (low 16, NaN/inf
+///   passthrough).
+/// - `pack_bf16x2(lo: f32, hi: f32) -> u32` packs two f32 values to a word.
+///
+/// Inlined via `concat!` into every kernel whose `WgslConfig.act_dtype ==
+/// ActDtype::Bf16`. Reads stay fp32-compute; only the load/store path packs.
+/// Declared as a macro so `concat!` callers can splice it.
+#[macro_export]
+macro_rules! act_bf16_prelude {
+    () => {
+        concat!(
+            "fn unpack_bf16x2(w: u32) -> vec2<f32> {\n",
+            "  let lo = bitcast<f32>((w & 0xFFFFu) << 16u);\n",
+            "  let hi = bitcast<f32>(w & 0xFFFF0000u);\n",
+            "  return vec2<f32>(lo, hi);\n",
+            "}\n",
+            "fn round_bf16(x: f32) -> u32 {\n",
+            "  let b = bitcast<u32>(x);\n",
+            "  if ((b & 0x7F800000u) == 0x7F800000u) { return (b >> 16u) & 0xFFFFu; }\n",
+            "  let l = (b >> 16u) & 1u;\n",
+            "  return ((b + 0x7FFFu + l) >> 16u) & 0xFFFFu;\n",
+            "}\n",
+            "fn pack_bf16x2(lo: f32, hi: f32) -> u32 {\n",
+            "  return round_bf16(lo) | (round_bf16(hi) << 16u);\n",
+            "}\n",
+        )
+    };
 }
 
 /// WGSL prelude defining `act_store(x)`. Identity in the f32 path; RNE-round

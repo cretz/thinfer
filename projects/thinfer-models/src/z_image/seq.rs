@@ -19,6 +19,7 @@
 //!   attending and `-inf` for blocked. Bsz=1 full-attention is all zeros.
 
 use crate::z_image::config::SEQ_MULTI_OF;
+use thinfer_core::ops::ActDtype;
 
 #[derive(Clone, Debug)]
 pub struct PatchifyOut {
@@ -196,6 +197,14 @@ pub fn attn_mask_zero_bytes(seq: usize) -> Vec<u8> {
     vec![0u8; seq * seq * 4]
 }
 
+/// Bytes for an all-attending additive mask in the activation storage layout.
+/// F32: `seq*seq*4` zero bytes. Bf16-packed: `seq*seq*2` zero bytes (bf16(0)
+/// is also all-zero). Caller passes `seq` that is even when act is `Bf16`
+/// (every row's bf16 stream lands on whole `array<u32>` words).
+pub fn attn_mask_zero_bytes_act(seq: usize, act: ActDtype) -> Vec<u8> {
+    vec![0u8; seq * seq * act.bytes_per_elem() as usize]
+}
+
 /// Build a `[1, seq, seq]` additive causal mask: `0.0` on/below diagonal,
 /// `-inf` strictly above. Used by causal LM stacks (e.g. Qwen3 text encoder).
 pub fn causal_mask_bytes(seq: usize) -> Vec<u8> {
@@ -208,6 +217,93 @@ pub fn causal_mask_bytes(seq: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Causal mask in the activation storage layout. Bf16: each elem encoded as
+/// 2-byte bf16 (`0x0000` for 0.0, `0xff80` for -inf), little-endian in
+/// `array<u32>` packed pairs along `s_k`. `seq` must be even for the Bf16
+/// path so each row's pair stream fits a whole word.
+pub fn causal_mask_bytes_act(seq: usize, act: ActDtype) -> Vec<u8> {
+    match act {
+        ActDtype::F32 => causal_mask_bytes(seq),
+        ActDtype::Bf16 => {
+            assert!(
+                seq.is_multiple_of(2),
+                "causal_mask_bytes_act: bf16 path requires seq even (got {seq})"
+            );
+            let mut out = vec![0u8; seq * seq * 2];
+            let neg_inf_bf16: u16 = 0xff80;
+            for q in 0..seq {
+                for k in (q + 1)..seq {
+                    let off = (q * seq + k) * 2;
+                    out[off..off + 2].copy_from_slice(&neg_inf_bf16.to_le_bytes());
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Encode `slice` for upload into an activation-storage buffer.
+/// - `F32`: 4 bytes per elem little-endian.
+/// - `Bf16`: 2 bytes per elem RNE-rounded bf16; consecutive even/odd pairs
+///   land in the same `array<u32>` word (low half = even index, high half =
+///   odd index), matching `pack_bf16x2(lo, hi)` in WGSL.
+pub fn act_upload_bytes(act: ActDtype, slice: &[f32]) -> Vec<u8> {
+    match act {
+        ActDtype::F32 => {
+            let mut bytes = vec![0u8; slice.len() * 4];
+            for (i, v) in slice.iter().enumerate() {
+                bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            bytes
+        }
+        ActDtype::Bf16 => {
+            let mut bytes = vec![0u8; slice.len() * 2];
+            for (i, v) in slice.iter().enumerate() {
+                let h = round_f32_to_bf16(*v);
+                bytes[i * 2..(i + 1) * 2].copy_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        }
+    }
+}
+
+/// Decode `bytes` produced by an activation-storage readback into a `Vec<f32>`
+/// of `n_elems`. Bf16 path zero-extends the 2-byte half to f32 via `(h << 16)`.
+pub fn act_readback_to_f32(act: ActDtype, bytes: &[u8], n_elems: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n_elems];
+    match act {
+        ActDtype::F32 => {
+            debug_assert_eq!(bytes.len(), n_elems * 4);
+            for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        ActDtype::Bf16 => {
+            debug_assert_eq!(bytes.len(), n_elems * 2);
+            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+                let half = u16::from_le_bytes([chunk[0], chunk[1]]);
+                out[i] = f32::from_bits((half as u32) << 16);
+            }
+        }
+    }
+    out
+}
+
+/// f32 -> bf16 round-to-nearest-even with NaN canonicalization. Bit-identical
+/// to the WGSL `round_bf16` helper.
+pub fn round_f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let exp = (bits >> 23) & 0xff;
+    if exp == 0xff {
+        let mant = bits & 0x7f_ffff;
+        let top = (bits >> 16) as u16;
+        if mant == 0 { top } else { top | 0x0040 }
+    } else {
+        let rounding = 0x7fff + ((bits >> 16) & 1);
+        ((bits.wrapping_add(rounding)) >> 16) as u16
+    }
 }
 
 pub fn pad_len(ori_len: usize) -> usize {

@@ -10,7 +10,7 @@
 //! caller-owned `WsBuf`s; each scope `import`s them as needed.
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
-use thinfer_core::ops::ScatterPadRowsF32;
+use thinfer_core::ops::{ActDtype, ScatterPadRowsF32};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
 use thinfer_core::trace::{self, PHASE};
 use thinfer_core::weight::WeightSource;
@@ -264,10 +264,10 @@ impl ZImageDit {
         let seq_x = px.padded_len as u32;
 
         // --- 2. upload x tokens, run XEmbedder ---
-        let x_tok_bytes = bytes_of_f32(&px.tokens);
+        let x_tok_bytes = act_upload_bytes(pipelines.act_dtype, &px.tokens);
         let x_tok = scratch.alloc(x_tok_bytes.len() as u64)?;
         backend.write_buffer(x_tok.id, 0, &x_tok_bytes)?;
-        let x_act = scratch.alloc((seq_x * dim * 4) as u64)?;
+        let x_act = scratch.alloc(pipelines.act_bytes(seq_x * dim))?;
         {
             let views = self.x_embedder_handles.acquire(residency, backend).await?;
             let bufs = views.bufs();
@@ -301,17 +301,18 @@ impl ZImageDit {
         }
 
         // --- 4. rope freqs for x ---
-        let x_freqs_bytes = self.rope.lookup_bytes(&px.pos_ids);
+        let x_freqs_bytes =
+            seq::act_upload_bytes(pipelines.act_dtype, &self.rope.lookup(&px.pos_ids));
         let x_freqs = scratch.alloc(x_freqs_bytes.len() as u64)?;
         backend.write_buffer(x_freqs.id, 0, &x_freqs_bytes)?;
 
         // --- 5. x attn mask --- bsz=1 -> all zero.
-        let x_mask_bytes = seq::attn_mask_zero_bytes(px.padded_len);
+        let x_mask_bytes = seq::attn_mask_zero_bytes_act(px.padded_len, pipelines.act_dtype);
         let x_mask = scratch.alloc(x_mask_bytes.len() as u64)?;
         backend.write_buffer(x_mask.id, 0, &x_mask_bytes)?;
 
         // --- t_embedder for adaln_input ---
-        let t_emb = scratch.alloc((config::ADALN_EMBED_DIM * 4) as u64)?;
+        let t_emb = scratch.alloc(pipelines.act_bytes(config::ADALN_EMBED_DIM as u32))?;
         {
             let views = self.t_embedder_handles.acquire(residency, backend).await?;
             let bufs = views.bufs();
@@ -346,7 +347,7 @@ impl ZImageDit {
             };
             for (idx, blk) in self.noise_refiner.iter().enumerate() {
                 let _blk_scope = trace::scope!(format_args!("block.{idx}")).entered();
-                let nxt = scratch.alloc((seq_x * dim * 4) as u64)?;
+                let nxt = scratch.alloc(pipelines.act_bytes(seq_x * dim))?;
                 let views = pending
                     .take()
                     .expect("pending noise_refiner acquire missing");
@@ -402,10 +403,10 @@ impl ZImageDit {
             inputs.cap_len,
             cm.padded_len,
         );
-        let cap_in_bytes = bytes_of_f32(&cap_feats_padded);
+        let cap_in_bytes = act_upload_bytes(pipelines.act_dtype, &cap_feats_padded);
         let cap_in = scratch.alloc(cap_in_bytes.len() as u64)?;
         backend.write_buffer(cap_in.id, 0, &cap_in_bytes)?;
-        let cap_act = scratch.alloc((seq_cap * dim * 4) as u64)?;
+        let cap_act = scratch.alloc(pipelines.act_bytes(seq_cap * dim))?;
         let (cap_intermediate_normed, cap_intermediate_pre_bias) = {
             let views = self
                 .cap_embedder_handles
@@ -467,10 +468,11 @@ impl ZImageDit {
         }
 
         // --- 9. cap rope freqs + attn mask ---
-        let cap_freqs_bytes = self.rope.lookup_bytes(&cm.pos_ids);
+        let cap_freqs_bytes =
+            seq::act_upload_bytes(pipelines.act_dtype, &self.rope.lookup(&cm.pos_ids));
         let cap_freqs = scratch.alloc(cap_freqs_bytes.len() as u64)?;
         backend.write_buffer(cap_freqs.id, 0, &cap_freqs_bytes)?;
-        let cap_mask_bytes = seq::attn_mask_zero_bytes(cm.padded_len);
+        let cap_mask_bytes = seq::attn_mask_zero_bytes_act(cm.padded_len, pipelines.act_dtype);
         let cap_mask = scratch.alloc(cap_mask_bytes.len() as u64)?;
         backend.write_buffer(cap_mask.id, 0, &cap_mask_bytes)?;
 
@@ -498,7 +500,7 @@ impl ZImageDit {
                 {
                     read_into_f32(backend, &cap_cur, (seq_cap * dim) as usize, sink).await?;
                 }
-                let nxt = scratch.alloc((seq_cap * dim * 4) as u64)?;
+                let nxt = scratch.alloc(pipelines.act_bytes(seq_cap * dim))?;
                 let views = pending
                     .take()
                     .expect("pending context_refiner acquire missing");
@@ -550,9 +552,9 @@ impl ZImageDit {
 
         // --- 11. concat unified = [x; cap] ---
         let seq_u = seq_x + seq_cap;
-        let unified = scratch.alloc((seq_u * dim * 4) as u64)?;
-        let row_bytes = (dim as u64) * 4;
-        let freq_row = (head_dim as u64) * 4;
+        let unified = scratch.alloc(pipelines.act_bytes(seq_u * dim))?;
+        let row_bytes = pipelines.act_bytes(dim);
+        let freq_row = (head_dim as u64) * pipelines.act_dtype.bytes_per_elem();
         let unified_freqs = scratch.alloc(seq_u as u64 * freq_row)?;
         {
             let x_cur_ref = x_cur.as_buf_ref();
@@ -591,7 +593,7 @@ impl ZImageDit {
             read_into_f32(backend, &unified, (seq_u * dim) as usize, sink).await?;
         }
 
-        let u_mask = seq::attn_mask_zero_bytes(seq_u as usize);
+        let u_mask = seq::attn_mask_zero_bytes_act(seq_u as usize, pipelines.act_dtype);
         let unified_mask = scratch.alloc(u_mask.len() as u64)?;
         backend.write_buffer(unified_mask.id, 0, &u_mask)?;
 
@@ -620,7 +622,7 @@ impl ZImageDit {
             {
                 read_into_f32(backend, &u_cur, (seq_u * dim) as usize, sink).await?;
             }
-            let nxt = scratch.alloc((seq_u * dim * 4) as u64)?;
+            let nxt = scratch.alloc(pipelines.act_bytes(seq_u * dim))?;
             let views = pending.take().expect("pending layers acquire missing");
             let bufs = views.bufs();
             let u_cur_ref = u_cur.as_buf_ref();
@@ -669,7 +671,7 @@ impl ZImageDit {
 
         // --- 13. final layer ---
         let oc = self.final_layer.cfg.out_channels as u32;
-        let final_out = scratch.alloc((seq_u * oc * 4) as u64)?;
+        let final_out = scratch.alloc(pipelines.act_bytes(seq_u * oc))?;
         {
             let views = self.final_layer_handles.acquire(residency, backend).await?;
             let bufs = views.bufs();
@@ -695,6 +697,7 @@ impl ZImageDit {
 
         Ok(DitForwardLayout {
             final_out,
+            act_dtype: pipelines.act_dtype,
             patch_in,
             out_channels: self.final_layer.cfg.out_channels,
             image_size: (c, f, h, w),
@@ -708,23 +711,34 @@ impl ZImageDit {
 
     pub fn decode_image(&self, layout: &DitForwardLayout, bytes: &[u8]) -> DitOutput {
         let (c, f, h, w) = layout.image_size;
-        let _ = c;
-        let patch = layout.patch_in;
-        let _ = patch;
         let oc = layout.out_channels;
         let row = oc;
-        let mut tokens = Vec::<f32>::with_capacity(layout.seq_x_ori * row);
         let total_rows = layout.seq_x_padded + layout.seq_cap_padded;
-        debug_assert_eq!(bytes.len(), total_rows * row * 4);
-        for i in 0..layout.seq_x_ori {
-            for j in 0..row {
-                let idx = (i * row + j) * 4;
-                tokens.push(f32::from_le_bytes([
-                    bytes[idx],
-                    bytes[idx + 1],
-                    bytes[idx + 2],
-                    bytes[idx + 3],
-                ]));
+        let stride = layout.act_dtype.bytes_per_elem() as usize;
+        debug_assert_eq!(bytes.len(), total_rows * row * stride);
+        let mut tokens = Vec::<f32>::with_capacity(layout.seq_x_ori * row);
+        match layout.act_dtype {
+            ActDtype::F32 => {
+                for i in 0..layout.seq_x_ori {
+                    for j in 0..row {
+                        let idx = (i * row + j) * 4;
+                        tokens.push(f32::from_le_bytes([
+                            bytes[idx],
+                            bytes[idx + 1],
+                            bytes[idx + 2],
+                            bytes[idx + 3],
+                        ]));
+                    }
+                }
+            }
+            ActDtype::Bf16 => {
+                for i in 0..layout.seq_x_ori {
+                    for j in 0..row {
+                        let idx = (i * row + j) * 2;
+                        let half = u16::from_le_bytes([bytes[idx], bytes[idx + 1]]);
+                        tokens.push(f32::from_bits((half as u32) << 16));
+                    }
+                }
             }
         }
         let image = seq::unpatchify(&tokens, c, f, h, w, layout.patch_size, layout.f_patch_size);
@@ -734,6 +748,9 @@ impl ZImageDit {
 
 pub struct DitForwardLayout {
     pub final_out: WsBuf<WgpuBackend>,
+    /// Activation storage dtype the kernels were compiled for. Drives byte
+    /// stride in `decode_image` and readback length in the pipeline driver.
+    pub act_dtype: ActDtype,
     pub patch_in: usize,
     pub out_channels: usize,
     pub image_size: (usize, usize, usize, usize),
@@ -744,12 +761,45 @@ pub struct DitForwardLayout {
     pub f_patch_size: usize,
 }
 
-fn bytes_of_f32(slice: &[f32]) -> Vec<u8> {
-    let mut bytes = vec![0u8; slice.len() * 4];
-    for (i, v) in slice.iter().enumerate() {
-        bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+/// Encode `slice` for upload as activation storage. F32: 4 bytes per elem
+/// little-endian. Bf16: 2 bytes per elem, RNE-rounded; consecutive pairs land
+/// in the same `array<u32>` word when read by kernels (LE -> low half = even
+/// index, high half = odd index, matching `pack_bf16x2(lo, hi)` in WGSL).
+fn act_upload_bytes(act: ActDtype, slice: &[f32]) -> Vec<u8> {
+    match act {
+        ActDtype::F32 => {
+            let mut bytes = vec![0u8; slice.len() * 4];
+            for (i, v) in slice.iter().enumerate() {
+                bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            bytes
+        }
+        ActDtype::Bf16 => {
+            let mut bytes = vec![0u8; slice.len() * 2];
+            for (i, v) in slice.iter().enumerate() {
+                let h = round_f32_to_bf16(*v);
+                bytes[i * 2..(i + 1) * 2].copy_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        }
     }
-    bytes
+}
+
+/// f32 -> bf16 round-to-nearest-even, NaN/inf passthrough (NaN canonicalized
+/// to a quiet bf16 NaN with the sign bit preserved). Mirrors the WGSL
+/// `round_bf16` helper exactly.
+fn round_f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let exp = (bits >> 23) & 0xff;
+    if exp == 0xff {
+        // NaN or inf: keep sign+exp, force a quiet NaN payload if mantissa nonzero.
+        let mant = bits & 0x7f_ffff;
+        let top = (bits >> 16) as u16;
+        if mant == 0 { top } else { top | 0x0040 }
+    } else {
+        let rounding = 0x7fff + ((bits >> 16) & 1);
+        ((bits.wrapping_add(rounding)) >> 16) as u16
+    }
 }
 
 /// Replace masked rows in `dst` (fp32 `[n_rows, dim]`) with the single-row
@@ -773,7 +823,8 @@ pub async fn scatter_pad_rows(
         pad_mask.len(),
         n_rows
     );
-    debug_assert_eq!(dst.len, (n_rows as u64) * (dim as u64) * 4);
+    let elem_bytes = pipelines.act_dtype.bytes_per_elem();
+    debug_assert_eq!(dst.len, (n_rows as u64) * (dim as u64) * elem_bytes);
     debug_assert_eq!(pad_token.len, (dim as u64).div_ceil(2) * 4);
 
     let mask_u32: Vec<u32> = pad_mask.iter().map(|&m| m as u32).collect();
@@ -790,13 +841,17 @@ pub async fn scatter_pad_rows(
     let uniform_ref = uniform_buf.as_buf_ref();
 
     let scope = scratch.batch();
+    let dispatch_elems = match pipelines.act_dtype {
+        ActDtype::F32 => n_rows * dim,
+        ActDtype::Bf16 => n_rows * (dim / 2),
+    };
     scope.scatter_pad_rows::<ScatterPadRowsF32>(
         &pipelines.scatter_pad_rows,
         scope.import(&pad_token),
         scope.import(&mask_ref),
         scope.import(&uniform_ref),
         scope.import(&dst),
-        n_rows * dim,
+        dispatch_elems,
     )?;
     scope.submit_void().await?;
     Ok(())

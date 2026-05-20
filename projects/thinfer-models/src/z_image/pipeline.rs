@@ -60,7 +60,14 @@ pub struct ZImageModel<S: WeightSource, T: Tokenizer> {
     backend: Arc<WgpuBackend>,
     residency: WeightResidency<S>,
     tokenizer: T,
+    /// Block pipelines compiled with `BF16_PACKED`. Used by every DiT-side
+    /// consumer (XEmbedder, CapEmbedder, TimestepEmbedder, Block, FinalLayer).
     block_pipelines: BlockPipelines,
+    /// Block pipelines compiled with `BF16_QUANT_WRITES` (fp32 activation
+    /// storage + RNE writes for parity against bf16-PyTorch). Used only by the
+    /// Qwen3 text encoder, which stays on the untuned matmul/fp32-storage path
+    /// for now; bf16-packing the encoder is queued for a follow-up.
+    encoder_block_pipelines: BlockPipelines,
     dit_handles: crate::z_image::loader::LoadedDitHandles,
     encoder: Qwen3Encoder,
     encoder_handles: Qwen3Handles,
@@ -154,11 +161,14 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             "handles registered"
         );
         let t_compile = std::time::Instant::now();
-        let wgsl_cfg = WgslConfig {
+        let wgsl_cfg = WgslConfig::BF16_PACKED;
+        let block_pipelines = BlockPipelines::compile(&backend, &wgsl_cfg).await?;
+        let encoder_cfg = WgslConfig {
             bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
+            act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: WeightDtype::Bf16,
         };
-        let block_pipelines = BlockPipelines::compile(&backend, &wgsl_cfg).await?;
+        let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfg).await?;
         let vae_pipelines = VaeDecoderPipelines::compile(&backend).await?;
         tracing::info!(
             compile_ms = t_compile.elapsed().as_millis() as u64,
@@ -176,6 +186,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             residency,
             tokenizer,
             block_pipelines,
+            encoder_block_pipelines,
             dit_handles,
             encoder,
             encoder_handles,
@@ -401,7 +412,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 .encoder
                 .forward(
                     &self.backend,
-                    &self.block_pipelines,
+                    &self.encoder_block_pipelines,
                     &self.residency,
                     &*workspace,
                     &self.encoder_handles,
@@ -490,7 +501,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 .await?
             };
             let total_rows = (layout.seq_x_padded + layout.seq_cap_padded) as u64;
-            let row_bytes = (layout.out_channels as u64) * 4;
+            let row_bytes = (layout.out_channels as u64) * layout.act_dtype.bytes_per_elem();
             let bytes = {
                 let _r = trace::scope!("dit_readback", bytes = total_rows * row_bytes).entered();
                 self.backend

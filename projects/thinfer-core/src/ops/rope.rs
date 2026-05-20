@@ -1,9 +1,11 @@
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 #[cfg(feature = "conformance")]
-use crate::conformance::{OpSpec, OpTest, OpTestContext, TestCase, linspace, t};
-use crate::ops::WgslConfig;
+use crate::conformance::{
+    DTYPES_ACT_BF16, Dtype, OpSpec, OpTest, OpTestContext, TestCase, linspace, t,
+};
+use crate::ops::{ActDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
-use crate::wgsl_with_bf16_variant;
+use crate::{act_bf16_prelude, wgsl_with_bf16_variant};
 
 /// Rotary embedding via complex-pair multiply, broadcasting freqs across heads.
 ///
@@ -92,6 +94,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 );
 
+/// Packed-bf16 interleaved rope. One thread = one rotary pair = one packed
+/// word (since adjacent (re, im) elements share a word). Freqs same layout
+/// as x: per-pair (cr, ci) lives in one word at `row*pairs + pair`.
+const WGSL_BF16_PACKED: &str = concat!(
+    act_bf16_prelude!(),
+    r#"
+struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read> freqs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = u.rows * u.heads * u.pairs;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+    let pair = idx % u.pairs;
+    let rh   = idx / u.pairs;
+    let row  = rh / u.heads;
+    let xw_idx = rh  * u.pairs + pair;
+    let fw_idx = row * u.pairs + pair;
+    let xv = unpack_bf16x2(x[xw_idx]);
+    let fv = unpack_bf16x2(freqs[fw_idx]);
+    let or_ = xv.x * fv.x - xv.y * fv.y;
+    let oi  = xv.x * fv.y + xv.y * fv.x;
+    out[xw_idx] = pack_bf16x2(or_, oi);
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -121,10 +155,10 @@ impl RopeOp for RopeF32 {
     const DIMS: &'static str = "rope/dims";
     const OUTPUT: &'static str = "rope/out";
     fn wgsl(cfg: &WgslConfig) -> &'static str {
-        if cfg.bf16_quant_writes {
-            WGSL_F32_BF16
-        } else {
-            WGSL_F32
+        match (cfg.act_dtype, cfg.bf16_quant_writes) {
+            (ActDtype::F32, false) => WGSL_F32,
+            (ActDtype::F32, true) => WGSL_F32_BF16,
+            (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
         }
     }
     fn layout() -> &'static [BindingLayout] {
@@ -176,6 +210,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 );
 
+/// Packed-bf16 half-rot rope. Real (x[k]) and imag (x[k+pairs]) halves are
+/// non-adjacent, so per-thread covers 2 consecutive pairs (k=2j, k=2j+1)
+/// whose real elements share one packed word and whose imag elements share
+/// the next-half-row packed word. Requires `pairs % 2 == 0`.
+const WGSL_BF16_PACKED_HALFROT: &str = concat!(
+    act_bf16_prelude!(),
+    r#"
+struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read> freqs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pair_words = u.pairs >> 1u;
+    let total = u.rows * u.heads * pair_words;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+    let j  = idx % pair_words;
+    let rh = idx / pair_words;
+    let row = rh / u.heads;
+    let row_w_base = rh * u.pairs;
+    let xr_w = row_w_base + j;
+    let xi_w = row_w_base + pair_words + j;
+    let frow_w_base = row * u.pairs;
+    let f0 = unpack_bf16x2(freqs[frow_w_base + 2u * j]);
+    let f1 = unpack_bf16x2(freqs[frow_w_base + 2u * j + 1u]);
+    let xr = unpack_bf16x2(x[xr_w]);
+    let xi = unpack_bf16x2(x[xi_w]);
+    let or0 = xr.x * f0.x - xi.x * f0.y;
+    let or1 = xr.y * f1.x - xi.y * f1.y;
+    let oi0 = xr.x * f0.y + xi.x * f0.x;
+    let oi1 = xr.y * f1.y + xi.y * f1.x;
+    out[xr_w] = pack_bf16x2(or0, or1);
+    out[xi_w] = pack_bf16x2(oi0, oi1);
+}
+"#
+);
+
 pub struct RopeF32HalfRot;
 
 impl RopeOp for RopeF32HalfRot {
@@ -186,10 +261,10 @@ impl RopeOp for RopeF32HalfRot {
     const DIMS: &'static str = "rope_halfrot/dims";
     const OUTPUT: &'static str = "rope_halfrot/out";
     fn wgsl(cfg: &WgslConfig) -> &'static str {
-        if cfg.bf16_quant_writes {
-            WGSL_F32_HALFROT_BF16
-        } else {
-            WGSL_F32_HALFROT
+        match (cfg.act_dtype, cfg.bf16_quant_writes) {
+            (ActDtype::F32, false) => WGSL_F32_HALFROT,
+            (ActDtype::F32, true) => WGSL_F32_HALFROT_BF16,
+            (ActDtype::Bf16, _) => WGSL_BF16_PACKED_HALFROT,
         }
     }
     fn layout() -> &'static [BindingLayout] {
@@ -199,6 +274,9 @@ impl RopeOp for RopeF32HalfRot {
 
 #[cfg(feature = "conformance")]
 impl OpTest for RopeF32 {
+    fn dtypes(&self) -> &'static [Dtype] {
+        DTYPES_ACT_BF16
+    }
     fn test_cases(&self) -> Vec<TestCase> {
         vec![TestCase {
             name: "rope_basic",
@@ -219,6 +297,9 @@ impl OpTest for RopeF32 {
 
 #[cfg(feature = "conformance")]
 impl OpTest for RopeF32HalfRot {
+    fn dtypes(&self) -> &'static [Dtype] {
+        DTYPES_ACT_BF16
+    }
     fn test_cases(&self) -> Vec<TestCase> {
         vec![TestCase {
             name: "rope_halfrot_basic",

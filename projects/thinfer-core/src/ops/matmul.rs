@@ -1,7 +1,9 @@
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 #[cfg(feature = "conformance")]
-use crate::conformance::{OpSpec, OpTest, OpTestContext, TestCase, linspace, t};
-use crate::ops::{WeightDtype, WgslConfig};
+use crate::conformance::{
+    DTYPES_ACT_BF16, Dtype, OpSpec, OpTest, OpTestContext, TestCase, linspace, t,
+};
+use crate::ops::{ActDtype, WeightDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
 
 /// Tile/blocking shape for the matmul kernel. The kernel computes a
@@ -153,6 +155,32 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
     let a_loads_per_thread = tile_a_size.div_ceil(threads);
     let b_loads_per_thread = tile_b_size.div_ceil(threads);
 
+    let act_packed = cfg.act_dtype == ActDtype::Bf16;
+    if act_packed {
+        assert!(
+            tn.is_multiple_of(2),
+            "matmul packed-bf16 acts require tn % 2 == 0; got tn={tn}"
+        );
+        assert!(
+            bn.is_multiple_of(2),
+            "matmul packed-bf16 acts require bn % 2 == 0; got bn={bn}"
+        );
+    }
+    let a_elem_decl = if act_packed {
+        "@group(0) @binding(0) var<storage, read> a: array<u32>;"
+    } else {
+        "@group(0) @binding(0) var<storage, read> a: array<f32>;"
+    };
+    let out_elem_decl = if act_packed {
+        "@group(0) @binding(2) var<storage, read_write> out: array<u32>;"
+    } else {
+        "@group(0) @binding(2) var<storage, read_write> out: array<f32>;"
+    };
+    let load_a = if act_packed {
+        "fn load_a(i: u32) -> f32 {\n  let pair = a[i >> 1u];\n  let shift = (i & 1u) * 16u;\n  let half = (pair >> shift) & 0xFFFFu;\n  return bitcast<f32>(half << 16u);\n}\n"
+    } else {
+        "fn load_a(i: u32) -> f32 { return a[i]; }\n"
+    };
     let b_elem_decl = match cfg.weight_dtype {
         WeightDtype::F32 => "@group(0) @binding(1) var<storage, read> b: array<f32>;",
         WeightDtype::Bf16 => "@group(0) @binding(1) var<storage, read> b: array<u32>;",
@@ -163,22 +191,67 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
             "fn load_b(i: u32) -> f32 {\n  let pair = b[i >> 1u];\n  let shift = (i & 1u) * 16u;\n  let half = (pair >> shift) & 0xFFFFu;\n  return bitcast<f32>(half << 16u);\n}\n"
         }
     };
-    let act_store = if cfg.bf16_quant_writes {
+    let pack_helpers = if act_packed {
+        concat!(
+            "fn round_bf16(x: f32) -> u32 {\n",
+            "  let b = bitcast<u32>(x);\n",
+            "  if ((b & 0x7F800000u) == 0x7F800000u) { return (b >> 16u) & 0xFFFFu; }\n",
+            "  let l = (b >> 16u) & 1u;\n",
+            "  return ((b + 0x7FFFu + l) >> 16u) & 0xFFFFu;\n",
+            "}\n",
+            "fn pack_bf16x2(lo: f32, hi: f32) -> u32 {\n",
+            "  return round_bf16(lo) | (round_bf16(hi) << 16u);\n",
+            "}\n",
+        )
+    } else {
+        ""
+    };
+    let act_store = if cfg.bf16_quant_writes && !act_packed {
         "fn act_store(x: f32) -> f32 {\n  let b = bitcast<u32>(x);\n  if ((b & 0x7F800000u) == 0x7F800000u) { return x; }\n  let l = (b >> 16u) & 1u;\n  return bitcast<f32>((b + 0x7FFFu + l) & 0xFFFF0000u);\n}\n"
     } else {
         "fn act_store(x: f32) -> f32 { return x; }\n"
     };
 
+    let out_write_loop = if act_packed {
+        // Pair (j, j+1) into one packed word at output column c = bn0+lid.x*TN+j.
+        // c is even (bn even, TN even, lid.x*TN even). d.n is even (caller).
+        r#"
+    for (var i: u32 = 0u; i < TM; i = i + 1u) {
+        let row: u32 = bm0 + lid.y * TM + i;
+        if (row >= d.m) { continue; }
+        for (var j: u32 = 0u; j < TN; j = j + 2u) {
+            let col: u32 = bn0 + lid.x * TN + j;
+            if (col >= d.n) { continue; }
+            let widx = (row * d.n + col) >> 1u;
+            out[widx] = pack_bf16x2(acc[i * TN + j], acc[i * TN + j + 1u]);
+        }
+    }
+"#
+    } else {
+        r#"
+    for (var i: u32 = 0u; i < TM; i = i + 1u) {
+        let row: u32 = bm0 + lid.y * TM + i;
+        if (row >= d.m) { continue; }
+        for (var j: u32 = 0u; j < TN; j = j + 1u) {
+            let col: u32 = bn0 + lid.x * TN + j;
+            if (col >= d.n) { continue; }
+            out[row * d.n + col] = act_store(acc[i * TN + j]);
+        }
+    }
+"#
+    };
     format!(
         r#"
 struct Dims {{ m: u32, n: u32, k: u32, _pad: u32 }};
 
-@group(0) @binding(0) var<storage, read> a: array<f32>;
+{a_elem_decl}
 {b_elem_decl}
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+{out_elem_decl}
 @group(0) @binding(3) var<uniform> d: Dims;
 
+{load_a}
 {load_b}
+{pack_helpers}
 {act_store}
 
 const BM: u32 = {bm}u;
@@ -219,7 +292,7 @@ fn main(
                 let gc: u32 = k0 + ac;
                 var v: f32 = 0.0;
                 if (gr < d.m && gc < d.k) {{
-                    v = a[gr * d.k + gc];
+                    v = load_a(gr * d.k + gc);
                 }}
                 tile_a[idx] = v;
             }}
@@ -253,15 +326,7 @@ fn main(
         workgroupBarrier();
     }}
 
-    for (var i: u32 = 0u; i < TM; i = i + 1u) {{
-        let row: u32 = bm0 + lid.y * TM + i;
-        if (row >= d.m) {{ continue; }}
-        for (var j: u32 = 0u; j < TN; j = j + 1u) {{
-            let col: u32 = bn0 + lid.x * TN + j;
-            if (col >= d.n) {{ continue; }}
-            out[row * d.n + col] = act_store(acc[i * TN + j]);
-        }}
-    }}
+{out_write_loop}
 }}
 "#
     )
@@ -329,6 +394,9 @@ impl MatmulOp for MatMulF32 {
 
 #[cfg(feature = "conformance")]
 impl OpTest for MatMulF32 {
+    fn dtypes(&self) -> &'static [Dtype] {
+        DTYPES_ACT_BF16
+    }
     fn test_cases(&self) -> Vec<TestCase> {
         vec![TestCase {
             name: "matmul_basic",

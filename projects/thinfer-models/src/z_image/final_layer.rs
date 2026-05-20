@@ -67,12 +67,12 @@ impl FinalLayer {
         let aed = self.cfg.adaln_embed_dim as u32;
         let oc = self.cfg.out_channels as u32;
         let eps = self.cfg.norm_eps;
-        let act_bytes = (seq * dim) as u64 * 4;
-        let scale_bytes = (dim * 4) as u64;
+        let act_bytes = pipelines.act_bytes(seq * dim);
+        let scale_bytes = pipelines.act_bytes(dim);
 
         // adaLN MLP: SiLU(c) -> Linear -> [1, dim], then `1 + ...`. The bcast
         // unit absorbs the `+1` via `bcast_affine(bias=1.0)` over LN output.
-        let cs = scope.alloc((aed * 4) as u64)?;
+        let cs = scope.alloc(pipelines.act_bytes(aed))?;
         scope.dispatch_op::<SiluF32>(&pipelines.silu, &[c], cs)?;
         let pre = scope.alloc(scale_bytes)?;
         let dims_adaln = scope.u32x4_uniform(1, dim, aed, 0)?;
@@ -118,7 +118,7 @@ impl FinalLayer {
         )?;
 
         // Output projection: [S, dim] @ [dim, out_channels] + bias.
-        let pre_out = scope.alloc((seq * oc) as u64 * 4)?;
+        let pre_out = scope.alloc(pipelines.act_bytes(seq * oc))?;
         let dims_out = scope.u32x4_uniform(seq, oc, dim, 0)?;
         let lin_w = scope.import(&bufs.linear.weight);
         scope.matmul(
