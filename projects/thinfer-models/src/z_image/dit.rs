@@ -17,7 +17,7 @@ use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{Workspace, WsBuf};
 use tracing::Instrument;
 
-use crate::z_image::block::{Block, BlockConfig, BlockHandles, BlockPipelines};
+use crate::z_image::block::{Block, BlockConfig, BlockDebugTaps, BlockHandles, BlockPipelines};
 use crate::z_image::config;
 use crate::z_image::embedders::{
     CapEmbedder, CapEmbedderConfig, CapEmbedderHandles, LinearBiasHandles, XEmbedder,
@@ -80,6 +80,42 @@ pub struct DitTaps<'a> {
     pub unified_in: Option<&'a mut Vec<f32>>,
     pub last_main_layer_out: Option<&'a mut Vec<f32>>,
     pub final_layer_out: Option<&'a mut Vec<f32>>,
+    /// Per-op readbacks inside `dit.layers.0`. When `Some`, forward_taps
+    /// is called for the first main block with scratch-allocated tap
+    /// buffers, then read back to f32 here. Fields left `None` skip that
+    /// tap. Used to narrow which op first produces NaN under a new
+    /// weight encoding (e.g. Q8_0).
+    pub block0: Option<&'a mut Block0Taps>,
+}
+
+/// Per-op readbacks inside `dit.layers.0` (first DiT main block). All values
+/// are decoded to f32 regardless of the kernel's activation dtype.
+#[derive(Default)]
+pub struct Block0Taps {
+    pub adaln_input: Option<Vec<f32>>,
+    pub adaln_pre: Option<Vec<f32>>,
+    pub adaln_full: Option<Vec<f32>>,
+    pub scale_msa: Option<Vec<f32>>,
+    pub gate_msa: Option<Vec<f32>>,
+    pub scale_mlp: Option<Vec<f32>>,
+    pub gate_mlp: Option<Vec<f32>>,
+    pub attn_norm1_out: Option<Vec<f32>>,
+    pub modulated_attn_in: Option<Vec<f32>>,
+    pub attn_q: Option<Vec<f32>>,
+    pub attn_k: Option<Vec<f32>>,
+    pub attn_v: Option<Vec<f32>>,
+    pub attn_q_norm: Option<Vec<f32>>,
+    pub attn_k_norm: Option<Vec<f32>>,
+    pub attn_q_rope: Option<Vec<f32>>,
+    pub attn_k_rope: Option<Vec<f32>>,
+    pub attn_sdpa: Option<Vec<f32>>,
+    pub attn_out: Option<Vec<f32>>,
+    pub attn_norm2_out: Option<Vec<f32>>,
+    pub x_mid: Option<Vec<f32>>,
+    pub ffn_norm1_out: Option<Vec<f32>>,
+    pub modulated_ffn_in: Option<Vec<f32>>,
+    pub ffn_raw: Option<Vec<f32>>,
+    pub ffn_norm2_out: Option<Vec<f32>>,
 }
 
 /// Result of one DiT forward, ready for VAE decode.
@@ -218,14 +254,16 @@ impl ZImageDit {
     pub async fn forward<'a, S: WeightSource>(
         &self,
         backend: &WgpuBackend,
-        pipelines: &BlockPipelines,
+        main_pipelines: &BlockPipelines,
+        encoder_pipelines: &BlockPipelines,
         residency: &WeightResidency<S>,
         scratch: &Workspace<WgpuBackend>,
         inputs: &DitInputs<'a>,
     ) -> Result<DitForwardLayout, DitError<S::Error>> {
         self.forward_with_taps(
             backend,
-            pipelines,
+            main_pipelines,
+            encoder_pipelines,
             residency,
             scratch,
             inputs,
@@ -234,15 +272,29 @@ impl ZImageDit {
         .await
     }
 
+    /// `main_pipelines` is used for the 30 main DiT blocks (Q8 weights in
+    /// Q8 mode, bf16 otherwise). `encoder_pipelines` is used for
+    /// x_embedder, t_embedder, cap_embedder, noise_refiner,
+    /// context_refiner, and final_layer (always bf16 weights). Both must
+    /// share `act_dtype` so buffer sizes match across the boundary.
     pub async fn forward_with_taps<'a, S: WeightSource>(
         &self,
         backend: &WgpuBackend,
-        pipelines: &BlockPipelines,
+        main_pipelines: &BlockPipelines,
+        encoder_pipelines: &BlockPipelines,
         residency: &WeightResidency<S>,
         scratch: &Workspace<WgpuBackend>,
         inputs: &DitInputs<'a>,
         mut taps: DitTaps<'_>,
     ) -> Result<DitForwardLayout, DitError<S::Error>> {
+        debug_assert_eq!(
+            main_pipelines.act_dtype, encoder_pipelines.act_dtype,
+            "main/encoder pipelines must share act_dtype",
+        );
+        // Single alias for sizing — act_dtype is identical across the
+        // two pipeline sets, so either works. Routing of kernel pipelines
+        // is explicit at each call site below.
+        let pipelines = encoder_pipelines;
         let (c, f, h, w) = inputs.size;
         let dim = config::DIM as u32;
         let head_dim = config::HEAD_DIM;
@@ -446,6 +498,7 @@ impl ZImageDit {
                 backend,
                 &cap_intermediate_normed,
                 (seq_cap * cap_feat_dim as u32) as usize,
+                pipelines.act_dtype,
                 sink,
             )
             .await?;
@@ -455,6 +508,7 @@ impl ZImageDit {
                 backend,
                 &cap_intermediate_pre_bias,
                 (seq_cap * dim) as usize,
+                pipelines.act_dtype,
                 sink,
             )
             .await?;
@@ -475,7 +529,15 @@ impl ZImageDit {
         }
 
         if let Some(sink) = taps.cap_embedded.as_deref_mut() {
-            read_into_f32(backend, &cap_act, (seq_cap * dim) as usize, sink).await?;
+            read_into_f32_tagged(
+                backend,
+                &cap_act,
+                (seq_cap * dim) as usize,
+                pipelines.act_dtype,
+                sink,
+                "cap_embedded",
+            )
+            .await?;
         }
 
         // --- 9. cap rope freqs + attn mask ---
@@ -509,7 +571,15 @@ impl ZImageDit {
                 if idx == 1
                     && let Some(sink) = taps.ctx_refiner_0_out.as_deref_mut()
                 {
-                    read_into_f32(backend, &cap_cur, (seq_cap * dim) as usize, sink).await?;
+                    read_into_f32_tagged(
+                        backend,
+                        &cap_cur,
+                        (seq_cap * dim) as usize,
+                        pipelines.act_dtype,
+                        sink,
+                        "ctx_refiner_0_out",
+                    )
+                    .await?;
                 }
                 let nxt = scratch.alloc(pipelines.act_bytes(seq_cap * dim))?;
                 let views = pending
@@ -569,7 +639,15 @@ impl ZImageDit {
         };
 
         if let Some(sink) = taps.last_ctx_refiner_out.as_deref_mut() {
-            read_into_f32(backend, &cap_cur, (seq_cap * dim) as usize, sink).await?;
+            read_into_f32_tagged(
+                backend,
+                &cap_cur,
+                (seq_cap * dim) as usize,
+                pipelines.act_dtype,
+                sink,
+                "last_ctx_refiner_out",
+            )
+            .await?;
         }
 
         // --- 11. concat unified = [x; cap] ---
@@ -612,7 +690,15 @@ impl ZImageDit {
         }
 
         if let Some(sink) = taps.unified_in.as_deref_mut() {
-            read_into_f32(backend, &unified, (seq_u * dim) as usize, sink).await?;
+            read_into_f32_tagged(
+                backend,
+                &unified,
+                (seq_u * dim) as usize,
+                pipelines.act_dtype,
+                sink,
+                "unified_in",
+            )
+            .await?;
         }
 
         let u_mask = seq::attn_mask_zero_bytes_act(seq_u as usize, pipelines.act_dtype);
@@ -637,16 +723,51 @@ impl ZImageDit {
             if idx == 1
                 && let Some(sink) = taps.main_layer_0_out.as_deref_mut()
             {
-                read_into_f32(backend, &u_cur, (seq_u * dim) as usize, sink).await?;
+                read_into_f32_tagged(
+                    backend,
+                    &u_cur,
+                    (seq_u * dim) as usize,
+                    pipelines.act_dtype,
+                    sink,
+                    "main_layer_0_out",
+                )
+                .await?;
             }
             if idx == 15
                 && let Some(sink) = taps.main_layer_14_out.as_deref_mut()
             {
-                read_into_f32(backend, &u_cur, (seq_u * dim) as usize, sink).await?;
+                read_into_f32_tagged(
+                    backend,
+                    &u_cur,
+                    (seq_u * dim) as usize,
+                    pipelines.act_dtype,
+                    sink,
+                    "main_layer_14_out",
+                )
+                .await?;
             }
             let nxt = scratch.alloc(pipelines.act_bytes(seq_u * dim))?;
             let views = pending.take().expect("pending layers acquire missing");
             let bufs = views.bufs();
+            // Block-0 per-op tap buffers: when DIAG is on and the caller
+            // requested per-op taps on the first main block, allocate
+            // scratch sinks for each requested field and build the
+            // `BlockDebugTaps` pointing at them. The sinks must outlive
+            // the inner submit scope so we read them back below.
+            let b0_bufs = if idx == 0 {
+                taps.block0
+                    .as_deref()
+                    .map(|req| {
+                        Block0TapBufs::alloc(req, scratch, main_pipelines, seq_u, dim, blk.cfg)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let b0_block_taps = b0_bufs
+                .as_ref()
+                .map(Block0TapBufs::to_block_debug_taps)
+                .unwrap_or(BlockDebugTaps::EMPTY);
             let u_cur_ref = u_cur.as_buf_ref();
             let freqs_ref = unified_freqs.as_buf_ref();
             let mask_ref = unified_mask.as_buf_ref();
@@ -655,15 +776,16 @@ impl ZImageDit {
             let next_idx = idx + 1;
             let submit_res = {
                 let scope = scratch.batch();
-                blk.forward(
+                blk.forward_taps(
                     &scope,
-                    pipelines,
+                    main_pipelines,
                     scope.import(&u_cur_ref),
                     scope.import(&freqs_ref),
                     scope.import(&mask_ref),
                     Some(scope.import(&t_emb_ref)),
                     scope.import(&nxt_ref),
                     &bufs,
+                    &b0_block_taps,
                 )?;
                 let next_acquire = async {
                     match self.layers_handles.get(next_idx) {
@@ -695,11 +817,26 @@ impl ZImageDit {
                 s_res
             };
             submit_res?;
+            // Block-0 taps: now that the submit completed, read each
+            // populated tap buf back to the caller's `Block0Taps` slots.
+            if let (Some(tap_bufs), Some(sink)) = (b0_bufs, taps.block0.as_deref_mut()) {
+                tap_bufs
+                    .read_back(backend, pipelines.act_dtype, sink)
+                    .await?;
+            }
             u_cur = nxt;
         }
 
         if let Some(sink) = taps.last_main_layer_out.as_deref_mut() {
-            read_into_f32(backend, &u_cur, (seq_u * dim) as usize, sink).await?;
+            read_into_f32_tagged(
+                backend,
+                &u_cur,
+                (seq_u * dim) as usize,
+                pipelines.act_dtype,
+                sink,
+                "last_main_layer_out",
+            )
+            .await?;
         }
 
         // --- 13. final layer ---
@@ -725,7 +862,15 @@ impl ZImageDit {
         }
 
         if let Some(sink) = taps.final_layer_out.as_deref_mut() {
-            read_into_f32(backend, &final_out, (seq_u * oc) as usize, sink).await?;
+            read_into_f32_tagged(
+                backend,
+                &final_out,
+                (seq_u * oc) as usize,
+                pipelines.act_dtype,
+                sink,
+                "final_layer_out",
+            )
+            .await?;
         }
 
         Ok(DitForwardLayout {
@@ -890,19 +1035,241 @@ pub async fn scatter_pad_rows(
     Ok(())
 }
 
+/// Scratch-allocated tap buffers for a single block's per-op readbacks. One
+/// `WsBuf` per requested slot in [`Block0Taps`]; the buffers live in the
+/// caller's `Workspace` and survive the block-forward submit so we can read
+/// them back. Sized via `BlockPipelines::act_bytes` so packed-bf16 and f32
+/// paths share the same code.
+struct Block0TapBufs {
+    adaln_input: Option<(WsBuf<WgpuBackend>, u32)>,
+    adaln_pre: Option<(WsBuf<WgpuBackend>, u32)>,
+    adaln_full: Option<(WsBuf<WgpuBackend>, u32)>,
+    scale_msa: Option<(WsBuf<WgpuBackend>, u32)>,
+    gate_msa: Option<(WsBuf<WgpuBackend>, u32)>,
+    scale_mlp: Option<(WsBuf<WgpuBackend>, u32)>,
+    gate_mlp: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_norm1_out: Option<(WsBuf<WgpuBackend>, u32)>,
+    modulated_attn_in: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_q: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_k: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_v: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_q_norm: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_k_norm: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_q_rope: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_k_rope: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_sdpa: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_out: Option<(WsBuf<WgpuBackend>, u32)>,
+    attn_norm2_out: Option<(WsBuf<WgpuBackend>, u32)>,
+    x_mid: Option<(WsBuf<WgpuBackend>, u32)>,
+    ffn_norm1_out: Option<(WsBuf<WgpuBackend>, u32)>,
+    modulated_ffn_in: Option<(WsBuf<WgpuBackend>, u32)>,
+    ffn_raw: Option<(WsBuf<WgpuBackend>, u32)>,
+    ffn_norm2_out: Option<(WsBuf<WgpuBackend>, u32)>,
+}
+
+impl Block0TapBufs {
+    fn alloc(
+        req: &Block0Taps,
+        scratch: &Workspace<WgpuBackend>,
+        pipelines: &BlockPipelines,
+        seq_u: u32,
+        dim: u32,
+        cfg: BlockConfig,
+    ) -> Result<Self, WgpuError> {
+        let rows = seq_u; // cfg.batch=1; cfg.seq=seq_u
+        let q_elems = rows * cfg.n_heads as u32 * cfg.head_dim as u32;
+        let kv_elems = rows * cfg.n_kv_heads as u32 * cfg.head_dim as u32;
+        let dim_elems = rows * dim;
+        let mk =
+            |want: bool, n_elems: u32| -> Result<Option<(WsBuf<WgpuBackend>, u32)>, WgpuError> {
+                if want {
+                    let buf = scratch.alloc(pipelines.act_bytes(n_elems))?;
+                    Ok(Some((buf, n_elems)))
+                } else {
+                    Ok(None)
+                }
+            };
+        // AdaLN chunks are per-batch single rows of `dim`.
+        let chunk_elems = cfg.batch as u32 * dim;
+        // AdaLN pre/full are `[batch, 4*dim]`.
+        let adaln_full_elems = cfg.batch as u32 * 4 * dim;
+        // AdaLN input is `[batch, adaln_embed_dim]`.
+        let adaln_input_elems = cfg.batch as u32 * cfg.adaln_embed_dim as u32;
+        Ok(Self {
+            adaln_input: mk(req.adaln_input.is_some(), adaln_input_elems)?,
+            adaln_pre: mk(req.adaln_pre.is_some(), adaln_full_elems)?,
+            adaln_full: mk(req.adaln_full.is_some(), adaln_full_elems)?,
+            scale_msa: mk(req.scale_msa.is_some(), chunk_elems)?,
+            gate_msa: mk(req.gate_msa.is_some(), chunk_elems)?,
+            scale_mlp: mk(req.scale_mlp.is_some(), chunk_elems)?,
+            gate_mlp: mk(req.gate_mlp.is_some(), chunk_elems)?,
+            attn_norm1_out: mk(req.attn_norm1_out.is_some(), dim_elems)?,
+            modulated_attn_in: mk(req.modulated_attn_in.is_some(), dim_elems)?,
+            attn_q: mk(req.attn_q.is_some(), q_elems)?,
+            attn_k: mk(req.attn_k.is_some(), kv_elems)?,
+            attn_v: mk(req.attn_v.is_some(), kv_elems)?,
+            attn_q_norm: mk(req.attn_q_norm.is_some(), q_elems)?,
+            attn_k_norm: mk(req.attn_k_norm.is_some(), kv_elems)?,
+            attn_q_rope: mk(req.attn_q_rope.is_some(), q_elems)?,
+            attn_k_rope: mk(req.attn_k_rope.is_some(), kv_elems)?,
+            attn_sdpa: mk(req.attn_sdpa.is_some(), q_elems)?,
+            attn_out: mk(req.attn_out.is_some(), dim_elems)?,
+            attn_norm2_out: mk(req.attn_norm2_out.is_some(), dim_elems)?,
+            x_mid: mk(req.x_mid.is_some(), dim_elems)?,
+            ffn_norm1_out: mk(req.ffn_norm1_out.is_some(), dim_elems)?,
+            modulated_ffn_in: mk(req.modulated_ffn_in.is_some(), dim_elems)?,
+            ffn_raw: mk(req.ffn_raw.is_some(), dim_elems)?,
+            ffn_norm2_out: mk(req.ffn_norm2_out.is_some(), dim_elems)?,
+        })
+    }
+
+    fn to_block_debug_taps(&self) -> BlockDebugTaps {
+        let r =
+            |slot: &Option<(WsBuf<WgpuBackend>, u32)>| slot.as_ref().map(|(b, _)| b.as_buf_ref());
+        BlockDebugTaps {
+            adaln_input: r(&self.adaln_input),
+            adaln_pre: r(&self.adaln_pre),
+            adaln_full: r(&self.adaln_full),
+            scale_msa: r(&self.scale_msa),
+            gate_msa: r(&self.gate_msa),
+            scale_mlp: r(&self.scale_mlp),
+            gate_mlp: r(&self.gate_mlp),
+            attn_norm1_out: r(&self.attn_norm1_out),
+            modulated_attn_in: r(&self.modulated_attn_in),
+            attn_q: r(&self.attn_q),
+            attn_k: r(&self.attn_k),
+            attn_v: r(&self.attn_v),
+            attn_q_norm: r(&self.attn_q_norm),
+            attn_k_norm: r(&self.attn_k_norm),
+            attn_q_rope: r(&self.attn_q_rope),
+            attn_k_rope: r(&self.attn_k_rope),
+            attn_sdpa: r(&self.attn_sdpa),
+            attn_out: r(&self.attn_out),
+            attn_norm2_out: r(&self.attn_norm2_out),
+            x_mid: r(&self.x_mid),
+            ffn_norm1_out: r(&self.ffn_norm1_out),
+            modulated_ffn_in: r(&self.modulated_ffn_in),
+            ffn_raw: r(&self.ffn_raw),
+            ffn_norm2_out: r(&self.ffn_norm2_out),
+        }
+    }
+
+    async fn read_back(
+        self,
+        backend: &WgpuBackend,
+        act: ActDtype,
+        sink: &mut Block0Taps,
+    ) -> Result<(), WgpuError> {
+        macro_rules! rd {
+            ($field:ident) => {
+                if let Some((buf, n)) = self.$field {
+                    let v = sink.$field.get_or_insert_with(Vec::new);
+                    read_into_f32_tagged(
+                        backend,
+                        &buf.as_buf_ref(),
+                        n as usize,
+                        act,
+                        v,
+                        concat!("block0.", stringify!($field)),
+                    )
+                    .await?;
+                }
+            };
+        }
+        rd!(adaln_input);
+        rd!(adaln_pre);
+        rd!(adaln_full);
+        rd!(scale_msa);
+        rd!(gate_msa);
+        rd!(scale_mlp);
+        rd!(gate_mlp);
+        rd!(attn_norm1_out);
+        rd!(modulated_attn_in);
+        rd!(attn_q);
+        rd!(attn_k);
+        rd!(attn_v);
+        rd!(attn_q_norm);
+        rd!(attn_k_norm);
+        rd!(attn_q_rope);
+        rd!(attn_k_rope);
+        rd!(attn_sdpa);
+        rd!(attn_out);
+        rd!(attn_norm2_out);
+        rd!(x_mid);
+        rd!(ffn_norm1_out);
+        rd!(modulated_ffn_in);
+        rd!(ffn_raw);
+        rd!(ffn_norm2_out);
+        Ok(())
+    }
+}
+
+/// Decode a packed-bf16 or f32 GPU buffer into a Rust `Vec<f32>`. The buffer's
+/// physical byte length is `n_f32 * act.bytes_per_elem()`. Used by tap
+/// readbacks where the activation dtype is set by `BlockPipelines` at compile
+/// time and the host code wants finite-value diagnostics regardless.
 async fn read_into_f32(
     backend: &WgpuBackend,
     buf: &BufRef,
     n_f32: usize,
+    act: ActDtype,
     sink: &mut Vec<f32>,
 ) -> Result<(), WgpuError> {
+    read_into_f32_tagged(backend, buf, n_f32, act, sink, "").await
+}
+
+/// Like [`read_into_f32`] but also emits a `[TAP-RAW]` tracing line with the
+/// first/last 32 raw bytes (hex) of the readback when `tag` is non-empty and
+/// DIAG-level tracing is enabled. The hex dump is the only signal that
+/// distinguishes "buffer is 0x00 throughout" (write never landed / wrong
+/// alias) from "buffer has data but decode is wrong" (dtype/stride mismatch).
+async fn read_into_f32_tagged(
+    backend: &WgpuBackend,
+    buf: &BufRef,
+    n_f32: usize,
+    act: ActDtype,
+    sink: &mut Vec<f32>,
+    tag: &str,
+) -> Result<(), WgpuError> {
+    let bytes_per_elem = act.bytes_per_elem() as usize;
     let bytes = backend
-        .read_buffer(buf.id, buf.offset, (n_f32 * 4) as u64)
+        .read_buffer(buf.id, buf.offset, (n_f32 * bytes_per_elem) as u64)
         .await?;
+    if !tag.is_empty() && tracing::enabled!(target: trace::DIAG, tracing::Level::INFO) {
+        let n_bytes = bytes.len();
+        let head_n = 32.min(n_bytes);
+        let tail_lo = n_bytes.saturating_sub(32);
+        let to_hex = |slice: &[u8]| -> String {
+            let mut s = String::with_capacity(slice.len() * 3);
+            for (i, b) in slice.iter().enumerate() {
+                if i > 0 && i % 4 == 0 {
+                    s.push(' ');
+                }
+                s.push_str(&format!("{:02x}", b));
+            }
+            s
+        };
+        tracing::info!(
+            target: trace::DIAG,
+            "  [TAP-RAW] {tag}: act={act:?} n_bytes={n_bytes} head=[{}] tail=[{}]",
+            to_hex(&bytes[..head_n]),
+            to_hex(&bytes[tail_lo..]),
+        );
+    }
     sink.clear();
     sink.reserve(n_f32);
-    for c in bytes.chunks_exact(4) {
-        sink.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    match act {
+        ActDtype::F32 => {
+            for c in bytes.chunks_exact(4) {
+                sink.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+        }
+        ActDtype::Bf16 => {
+            for c in bytes.chunks_exact(2) {
+                let half = u16::from_le_bytes([c[0], c[1]]);
+                sink.push(f32::from_bits((half as u32) << 16));
+            }
+        }
     }
     Ok(())
 }

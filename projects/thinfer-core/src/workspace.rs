@@ -836,6 +836,38 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv_split<O: crate::ops::QkvSplitOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        input: BatchBuf<'wsp>,
+        q: BatchBuf<'wsp>,
+        k: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        n_words: u32,
+    ) -> Result<(), B::Error> {
+        let input = self.resolve(input);
+        let q = self.resolve(q);
+        let k = self.resolve(k);
+        let v = self.resolve(v);
+        let uniform = self.resolve(uniform);
+        let bufs = crate::ops::QkvSplitBufs {
+            input: &input,
+            q: &q,
+            k: &k,
+            v: &v,
+            uniform: &uniform,
+        };
+        crate::ops::dispatch_qkv_split::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_words,
+        )
+    }
+
     pub fn upsample2d_nearest<O: crate::ops::Upsample2dNearestOp>(
         &self,
         pipeline: &B::Pipeline,

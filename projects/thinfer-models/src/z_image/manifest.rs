@@ -21,6 +21,12 @@ use thinfer_core::manifest::{FileRef, ModelManifest};
 
 const REPO_DIT_BF16: &str = "dimitribarbot/Z-Image-Turbo-BF16";
 const REPO_UPSTREAM: &str = "Tongyi-MAI/Z-Image-Turbo";
+/// unsloth quantized GGUFs (DiT only). bf16 / Q8_0 / Q4_K_M / etc all live
+/// here under filenames like `z-image-turbo-Q8_0.gguf`. The DiT matmuls
+/// surface through the GGUF; norms, biases, AdaLN, and everything else
+/// stay safetensors and union over the top via
+/// `thinfer_core::format::union::UnionSource`.
+const REPO_GGUF: &str = "unsloth/Z-Image-Turbo-GGUF";
 
 pub mod role {
     /// DiT (transformer). bf16 storage, sharded across 2 safetensors files
@@ -39,6 +45,13 @@ pub mod role {
     pub const VAE: &str = "vae/decoder";
     pub const VAE_CONFIG: &str = "vae/config";
     pub const SCHEDULER_CONFIG: &str = "scheduler/config";
+    /// DiT-only GGUF, Q8_0. Pulled from unsloth and unioned with the
+    /// safetensors source so only the matmul tensors get quantized;
+    /// everything else (AdaLN, norms, embedders, refiners' non-matmul
+    /// weights) stays bf16 safetensors.
+    pub const DIT_GGUF_Q8_0: &str = "dit/gguf-q8_0";
+    /// DiT-only GGUF, Q4_K_M. Same union pattern as Q8_0.
+    pub const DIT_GGUF_Q4_K_M: &str = "dit/gguf-q4_k_m";
 }
 
 /// Compute recipe for Z-Image-Turbo. Z-Image was trained in bf16 and the
@@ -120,6 +133,14 @@ pub static MANIFEST: ModelManifest = ModelManifest {
         (
             role::VAE,
             FileRef::new(REPO_UPSTREAM, "vae/diffusion_pytorch_model.safetensors"),
+        ),
+        (
+            role::DIT_GGUF_Q8_0,
+            FileRef::new(REPO_GGUF, "z-image-turbo-Q8_0.gguf"),
+        ),
+        (
+            role::DIT_GGUF_Q4_K_M,
+            FileRef::new(REPO_GGUF, "z-image-turbo-Q4_K_M.gguf"),
         ),
     ],
 };

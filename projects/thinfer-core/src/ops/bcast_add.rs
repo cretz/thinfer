@@ -180,6 +180,12 @@ impl BcastAddOp for BcastAddF32 {
             (ActDtype::F32, true, WeightDtype::Bf16) => WGSL_F32_BF16Q_WBF16,
             (ActDtype::Bf16, _, WeightDtype::F32) => WGSL_BF16_PACKED_WF32,
             (ActDtype::Bf16, _, WeightDtype::Bf16) => WGSL_BF16_PACKED_WBF16,
+            // bcast_add operates on bias/affine vectors; norms+biases stay
+            // full-precision under any quant scheme. Quant weights flow
+            // only through matmul.
+            (_, _, WeightDtype::Quant(_)) => {
+                unreachable!("bcast_add does not consume quant weights")
+            }
         }
     }
     fn layout() -> &'static [BindingLayout] {

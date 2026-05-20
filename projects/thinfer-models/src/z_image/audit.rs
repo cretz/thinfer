@@ -128,22 +128,12 @@ pub fn expected_weights() -> Vec<Expected> {
             push(&mut out, &format!("{p}.ffn_norm2.weight"), vec![dim]);
             push(
                 &mut out,
-                &format!("{p}.attention.to_q.weight"),
-                vec![config::N_HEADS * head_dim, dim],
+                &format!("{p}.attention.qkv.weight"),
+                vec![(config::N_HEADS + 2 * config::N_KV_HEADS) * head_dim, dim],
             );
             push(
                 &mut out,
-                &format!("{p}.attention.to_k.weight"),
-                vec![config::N_KV_HEADS * head_dim, dim],
-            );
-            push(
-                &mut out,
-                &format!("{p}.attention.to_v.weight"),
-                vec![config::N_KV_HEADS * head_dim, dim],
-            );
-            push(
-                &mut out,
-                &format!("{p}.attention.to_out.0.weight"),
+                &format!("{p}.attention.out.weight"),
                 vec![dim, config::N_HEADS * head_dim],
             );
             push(

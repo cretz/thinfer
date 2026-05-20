@@ -137,10 +137,15 @@ const DECODE_SCRATCH: usize = 256 * 1024;
 
 impl ValidateState {
     fn new(encoding: StorageEncoding, elements: u64) -> Result<Self, FailReason> {
+        // Quant encodings deliberately fall through to NoDecoder: sanity
+        // is an xor-of-decoded-fp32 integrity check, and GGUF quant
+        // tensors don't have a stream-decode-to-fp32 path. Their
+        // integrity is validated by the GGUF tensor-data offset + size
+        // check at parse time.
         let expected = match encoding {
             StorageEncoding::F32 => elements * 4,
             StorageEncoding::F16 | StorageEncoding::Bf16 => elements * 2,
-            enc @ (StorageEncoding::I8 | StorageEncoding::I4) => {
+            enc @ (StorageEncoding::I8 | StorageEncoding::I4 | StorageEncoding::Quant(_)) => {
                 return Err(FailReason::NoDecoder(enc));
             }
         };
@@ -197,7 +202,10 @@ impl ValidateState {
         let decoded = match self.encoding {
             StorageEncoding::F32 => self.expected_src_bytes,
             StorageEncoding::Bf16 => self.expected_src_bytes * 2,
-            StorageEncoding::F16 | StorageEncoding::I8 | StorageEncoding::I4 => unreachable!(),
+            StorageEncoding::F16
+            | StorageEncoding::I8
+            | StorageEncoding::I4
+            | StorageEncoding::Quant(_) => unreachable!(),
         };
         Ok(decoded)
     }

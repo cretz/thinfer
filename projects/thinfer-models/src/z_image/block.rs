@@ -19,8 +19,9 @@ use thinfer_core::cache::KernelKey;
 use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
     BcastFmaOp, LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op,
-    RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32, ScatterPadRowsOp,
-    SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32, WgslConfig,
+    QkvSplitF32, QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp,
+    ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32,
+    WeightDtype, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace;
@@ -62,9 +63,9 @@ pub struct BlockWeightBufs {
     pub attention_norm2: BufRef,
     pub ffn_norm1: BufRef,
     pub ffn_norm2: BufRef,
-    pub attn_to_q: BufRef,
-    pub attn_to_k: BufRef,
-    pub attn_to_v: BufRef,
+    /// Fused upstream-canonical QKV weight (one matmul producing `[rows, 3*H]`,
+    /// then `qkv_split` peels off three contiguous `[rows, H]` slabs).
+    pub attn_qkv: BufRef,
     pub attn_to_out: BufRef,
     pub attn_norm_q: BufRef,
     pub attn_norm_k: BufRef,
@@ -87,32 +88,48 @@ pub struct BlockMatmuls {
     pub adaln: MatMulF32,
 }
 
-impl Default for BlockMatmuls {
-    fn default() -> Self {
-        // Per-kernel GPU timestamps swept across DEFAULT/8x8/32x64/2x4/
-        // 32x128/2x8/64x64/4x4/64x128/4x8/128x64/4x4: 64x64/4x4 wins.
-        // Register-blocked bigger tiles win on this iGPU until the cliff
-        // at tm*tn=32 acc regs/thread (64x128/4x8 doubled ffn ms). The
-        // worklog "iGPU is occupancy-bound, shrink WG" gotcha is *wrong*
-        // for this kernel. Hard constraint: WG threads <= 256 (WebGPU),
-        // so 128x64/4x4 is invalid (512 threads). adaln stays DEFAULT:
-        // M=1 makes register blocking pointless.
-        let blocked = MatMulConfig {
-            bm: 64,
-            bn: 64,
-            bk: 16,
-            tm: 4,
-            tn: 4,
+impl BlockMatmuls {
+    /// Per-kernel GPU timestamps swept across DEFAULT/8x8/32x64/2x4/
+    /// 32x128/2x8/64x64/4x4/64x128/4x8/128x64/4x4: 64x64/4x4 wins.
+    /// Register-blocked bigger tiles win on this iGPU until the cliff
+    /// at tm*tn=32 acc regs/thread (64x128/4x8 doubled ffn ms). The
+    /// worklog "iGPU is occupancy-bound, shrink WG" gotcha is *wrong*
+    /// for this kernel. Hard constraint: WG threads <= 256 (WebGPU),
+    /// so 128x64/4x4 is invalid (512 threads). adaln stays DEFAULT:
+    /// M=1 makes register blocking pointless.
+    ///
+    /// `bk` per matmul is selected from each kernel's `weight_dtype`
+    /// so quant schemes satisfy `bk % block_size == 0`. Bf16/f32 use
+    /// bk=16 (matches f32 acts, 16 KiB shared at bm=bn=64). Q8_0 uses
+    /// bk=block_size=32 (one block per K-step). Bigger bk costs more
+    /// per-WG shared memory which hurts occupancy on Intel iGPU more
+    /// than the reduced t-loop count saves; the WG-level B-load is
+    /// kept saturated via the cooperative dequant (TPB=4 threads per
+    /// block, see matmul.rs Quant arm).
+    pub fn for_cfgs(cfgs: &BlockWgslConfigs) -> Self {
+        let blocked_for = |wd: WeightDtype| {
+            let bk = match wd {
+                WeightDtype::Quant(k) => k.block_size(),
+                _ => 16,
+            };
+            MatMulConfig {
+                bm: 64,
+                bn: 64,
+                bk,
+                tm: 4,
+                tn: 4,
+            }
         };
         Self {
-            qkv: MatMulF32::new(blocked),
-            proj: MatMulF32::new(blocked),
-            ffn_up: MatMulF32::new(blocked),
-            ffn_down: MatMulF32::new(blocked),
+            qkv: MatMulF32::new(blocked_for(cfgs.matmul_qkv.weight_dtype)),
+            proj: MatMulF32::new(blocked_for(cfgs.matmul_proj.weight_dtype)),
+            ffn_up: MatMulF32::new(blocked_for(cfgs.matmul_ffn_up.weight_dtype)),
+            ffn_down: MatMulF32::new(blocked_for(cfgs.matmul_ffn_down.weight_dtype)),
             // tn=2 (not DEFAULT tn=1) so AdaLN output can land in packed-bf16
             // storage when `WgslConfig.act_dtype = Bf16`. Output cols are
             // 6*ADALN_EMBED_DIM = 1536 (even) so pairing is clean. M=1 keeps
-            // register blocking pointless, so bm/tm stay at DEFAULT.
+            // register blocking pointless, so bm/tm stay at DEFAULT. AdaLN
+            // weight stays bf16 even in the quant-DiT case.
             adaln: MatMulF32::new(MatMulConfig {
                 tn: 2,
                 ..MatMulConfig::DEFAULT
@@ -133,6 +150,7 @@ pub struct BlockPipelines {
     pub rope: WgpuPipeline,
     pub rope_halfrot: WgpuPipeline,
     pub sdpa: WgpuPipeline,
+    pub qkv_split: WgpuPipeline,
     pub silu: WgpuPipeline,
     pub silu_mul: WgpuPipeline,
     pub add: WgpuPipeline,
@@ -148,20 +166,77 @@ pub struct BlockPipelines {
     pub act_dtype: ActDtype,
 }
 
+/// Per-block WGSL configurations. The 5 matmul kernels can each take a
+/// distinct `WgslConfig` (so a quant `weight_dtype` can be pinned to the
+/// main projections while keeping AdaLN at bf16). Every other op shares
+/// [`Self::ops`]. All six configs must agree on `act_dtype` and
+/// `bf16_quant_writes` since they read/write the same activation buffers;
+/// the constructor validates this.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockWgslConfigs {
+    pub matmul_qkv: WgslConfig,
+    pub matmul_proj: WgslConfig,
+    pub matmul_ffn_up: WgslConfig,
+    pub matmul_ffn_down: WgslConfig,
+    pub matmul_adaln: WgslConfig,
+    pub ops: WgslConfig,
+}
+
+impl BlockWgslConfigs {
+    /// All six configs identical. Existing call sites that don't mix
+    /// weight encodings within a block use this.
+    pub fn uniform(cfg: WgslConfig) -> Self {
+        Self {
+            matmul_qkv: cfg,
+            matmul_proj: cfg,
+            matmul_ffn_up: cfg,
+            matmul_ffn_down: cfg,
+            matmul_adaln: cfg,
+            ops: cfg,
+        }
+    }
+
+    fn validate(&self) {
+        let a = self.ops.act_dtype;
+        let q = self.ops.bf16_quant_writes;
+        for c in [
+            self.matmul_qkv,
+            self.matmul_proj,
+            self.matmul_ffn_up,
+            self.matmul_ffn_down,
+            self.matmul_adaln,
+        ] {
+            assert_eq!(
+                c.act_dtype, a,
+                "BlockWgslConfigs: matmul act_dtype must match ops.act_dtype"
+            );
+            assert_eq!(
+                c.bf16_quant_writes, q,
+                "BlockWgslConfigs: matmul bf16_quant_writes must match ops"
+            );
+        }
+    }
+}
+
 impl BlockPipelines {
     /// Bytes for `n` activation elements at this pipeline set's dtype.
     pub fn act_bytes(&self, n: u32) -> u64 {
         n as u64 * self.act_dtype.bytes_per_elem()
     }
 
-    pub async fn compile(backend: &WgpuBackend, cfg: &WgslConfig) -> Result<Self, WgpuError> {
-        let matmuls = BlockMatmuls::default();
+    pub async fn compile(
+        backend: &WgpuBackend,
+        cfgs: &BlockWgslConfigs,
+    ) -> Result<Self, WgpuError> {
+        cfgs.validate();
+        let cfg = &cfgs.ops;
+        let matmuls = BlockMatmuls::for_cfgs(cfgs);
         let mm_layout = <MatMulF32 as MatmulOp>::layout();
-        let qkv_wgsl = matmuls.qkv.wgsl(cfg);
-        let proj_wgsl = matmuls.proj.wgsl(cfg);
-        let ffn_up_wgsl = matmuls.ffn_up.wgsl(cfg);
-        let ffn_down_wgsl = matmuls.ffn_down.wgsl(cfg);
-        let adaln_wgsl = matmuls.adaln.wgsl(cfg);
+        let qkv_wgsl = matmuls.qkv.wgsl(&cfgs.matmul_qkv);
+        let proj_wgsl = matmuls.proj.wgsl(&cfgs.matmul_proj);
+        let ffn_up_wgsl = matmuls.ffn_up.wgsl(&cfgs.matmul_ffn_up);
+        let ffn_down_wgsl = matmuls.ffn_down.wgsl(&cfgs.matmul_ffn_down);
+        let adaln_wgsl = matmuls.adaln.wgsl(&cfgs.matmul_adaln);
         Ok(Self {
             matmul_qkv: backend
                 .create_pipeline(&qkv_wgsl, "main", mm_layout)
@@ -212,6 +287,13 @@ impl BlockPipelines {
                     <SdpaF32 as SdpaOp>::wgsl(cfg),
                     "main",
                     <SdpaF32 as SdpaOp>::layout(),
+                )
+                .await?,
+            qkv_split: backend
+                .create_pipeline(
+                    <QkvSplitF32 as QkvSplitOp>::wgsl(cfg),
+                    "main",
+                    <QkvSplitF32 as QkvSplitOp>::layout(),
                 )
                 .await?,
             silu: backend
@@ -268,6 +350,9 @@ pub struct Block {
 
 #[derive(Default, Clone, Copy)]
 pub struct BlockDebugTaps {
+    pub adaln_input: Option<BufRef>,
+    pub adaln_pre: Option<BufRef>,
+    pub adaln_full: Option<BufRef>,
     pub scale_msa: Option<BufRef>,
     pub gate_msa: Option<BufRef>,
     pub scale_mlp: Option<BufRef>,
@@ -293,6 +378,9 @@ pub struct BlockDebugTaps {
 
 impl BlockDebugTaps {
     pub const EMPTY: Self = Self {
+        adaln_input: None,
+        adaln_pre: None,
+        adaln_full: None,
         scale_msa: None,
         gate_msa: None,
         scale_mlp: None,
@@ -333,13 +421,14 @@ impl Block {
         Self { cfg }
     }
 
-    pub fn kernel_keys() -> [KernelKey; 12] {
+    pub fn kernel_keys() -> [KernelKey; 13] {
         [
             kk(<MatMulF32 as MatmulOp>::KERNEL_ID),
             kk(<RmsNormF32 as RmsNormOp>::KERNEL_ID),
             kk(<LayerNormF32 as LayerNormOp>::KERNEL_ID),
             kk(<RopeF32 as RopeOp>::KERNEL_ID),
             kk(<SdpaF32 as SdpaOp>::KERNEL_ID),
+            kk(<QkvSplitF32 as QkvSplitOp>::KERNEL_ID),
             kk(<SiluF32 as Op>::KERNEL_ID),
             kk(<AddF32 as Op>::KERNEL_ID),
             kk(<MulF32 as Op>::KERNEL_ID),
@@ -404,6 +493,7 @@ impl Block {
         let scale = cfg.sdpa_scale();
         let b = cfg.batch as u32;
         let s = cfg.seq as u32;
+        let ad = cfg.adaln_embed_dim as u32;
 
         let act_bytes = pipelines.act_bytes(rows * dim);
         let q_bytes = pipelines.act_bytes(rows * hq * hd);
@@ -411,7 +501,10 @@ impl Block {
         let hid_bytes = pipelines.act_bytes(rows * hid);
 
         let ada: Option<AdaLnChunks<'wsp>> = match (cfg.modulation, &bufs.adaln, adaln_input) {
-            (true, Some(w), Some(input)) => Some(self.prepare_adaln(scope, pipelines, w, input)?),
+            (true, Some(w), Some(input)) => {
+                copy_tap(scope, input, &taps.adaln_input, pipelines.act_bytes(b * ad))?;
+                Some(self.prepare_adaln(scope, pipelines, w, input, taps)?)
+            }
             (false, None, None) => None,
             _ => panic!("modulation/adaln_input/adaln-bufs mismatch"),
         };
@@ -448,47 +541,48 @@ impl Block {
 
         let (q, k, v) = {
             let _g = trace::scope!("attn_qkv").entered();
+            // Z-Image upstream schema: fused QKV. n_kv_heads == n_heads, so each
+            // slab is the same `H = hq * hd = hkv * hd` columns wide and the
+            // matmul output is `[rows, 3*H]`. Other schemas (GQA: hkv < hq)
+            // would need a different split layout; assert until they're added.
+            debug_assert_eq!(
+                hq, hkv,
+                "fused QKV currently assumes hq == hkv (Z-Image); GQA needs schema rework"
+            );
+            let h = hq * hd;
+            let fused_bytes = pipelines.act_bytes(rows * 3 * h);
+            let qkv_fused = scope.alloc(fused_bytes)?;
+            let dims_qkv = scope.u32x4_uniform(rows, 3 * h, dim, 0)?;
+            let w_qkv = scope.import(&bufs.attn_qkv);
+            scope.matmul(
+                &pipelines.matmul_qkv,
+                &pipelines.matmuls.qkv,
+                attn_in,
+                w_qkv,
+                dims_qkv,
+                qkv_fused,
+                rows,
+                3 * h,
+            )?;
             let q = scope.alloc(q_bytes)?;
             let k = scope.alloc(kv_bytes)?;
             let v = scope.alloc(kv_bytes)?;
-            let dims_q = scope.u32x4_uniform(rows, hq * hd, dim, 0)?;
-            let wq = scope.import(&bufs.attn_to_q);
-            scope.matmul(
-                &pipelines.matmul_qkv,
-                &pipelines.matmuls.qkv,
-                attn_in,
-                wq,
-                dims_q,
+            let u_split = qkv_split_uniform(scope, rows, h)?;
+            let n_words = match pipelines.act_dtype {
+                ActDtype::F32 => rows * h,
+                ActDtype::Bf16 => rows * (h / 2),
+            };
+            scope.qkv_split::<QkvSplitF32>(
+                &pipelines.qkv_split,
+                qkv_fused,
                 q,
-                rows,
-                hq * hd,
+                k,
+                v,
+                u_split,
+                n_words,
             )?;
             copy_tap(scope, q, &taps.attn_q, q_bytes)?;
-            let dims_k = scope.u32x4_uniform(rows, hkv * hd, dim, 0)?;
-            let wk = scope.import(&bufs.attn_to_k);
-            scope.matmul(
-                &pipelines.matmul_qkv,
-                &pipelines.matmuls.qkv,
-                attn_in,
-                wk,
-                dims_k,
-                k,
-                rows,
-                hkv * hd,
-            )?;
             copy_tap(scope, k, &taps.attn_k, kv_bytes)?;
-            let dims_v = scope.u32x4_uniform(rows, hkv * hd, dim, 0)?;
-            let wv = scope.import(&bufs.attn_to_v);
-            scope.matmul(
-                &pipelines.matmul_qkv,
-                &pipelines.matmuls.qkv,
-                attn_in,
-                wv,
-                dims_v,
-                v,
-                rows,
-                hkv * hd,
-            )?;
             copy_tap(scope, v, &taps.attn_v, kv_bytes)?;
             (q, k, v)
         };
@@ -689,6 +783,7 @@ impl Block {
         pipelines: &BlockPipelines,
         w: &'wsp AdaLnBufs,
         adaln_input: BatchBuf<'wsp>,
+        taps: &'wsp BlockDebugTaps,
     ) -> Result<AdaLnChunks<'wsp>, WgpuError> {
         let cfg = self.cfg;
         let dim = cfg.dim as u32;
@@ -711,10 +806,12 @@ impl Block {
             b,
             four_dim,
         )?;
+        copy_tap(scope, pre, &taps.adaln_pre, full_bytes)?;
         let full = scope.alloc(full_bytes)?;
         let ab = scope.import(&w.bias);
         let ab_u = bcast_add_uniform(scope, four_dim)?;
         scope.bcast_add::<BcastAddF32>(&pipelines.bcast_add, pre, ab, ab_u, full, b * four_dim)?;
+        copy_tap(scope, full, &taps.adaln_full, full_bytes)?;
 
         let scale_msa = scope.alloc(chunk_bytes)?;
         let gate_msa_pre = scope.alloc(chunk_bytes)?;
@@ -753,9 +850,7 @@ pub struct BlockHandles {
     pub attention_norm2: WeightHandle,
     pub ffn_norm1: WeightHandle,
     pub ffn_norm2: WeightHandle,
-    pub attn_to_q: WeightHandle,
-    pub attn_to_k: WeightHandle,
-    pub attn_to_v: WeightHandle,
+    pub attn_qkv: WeightHandle,
     pub attn_to_out: WeightHandle,
     pub attn_norm_q: WeightHandle,
     pub attn_norm_k: WeightHandle,
@@ -776,9 +871,7 @@ pub struct BlockViews<'a> {
     pub attention_norm2: GpuView<'a>,
     pub ffn_norm1: GpuView<'a>,
     pub ffn_norm2: GpuView<'a>,
-    pub attn_to_q: GpuView<'a>,
-    pub attn_to_k: GpuView<'a>,
-    pub attn_to_v: GpuView<'a>,
+    pub attn_qkv: GpuView<'a>,
     pub attn_to_out: GpuView<'a>,
     pub attn_norm_q: GpuView<'a>,
     pub attn_norm_k: GpuView<'a>,
@@ -811,9 +904,7 @@ impl BlockHandles {
             attention_norm2: residency.acquire(self.attention_norm2, backend).await?,
             ffn_norm1: residency.acquire(self.ffn_norm1, backend).await?,
             ffn_norm2: residency.acquire(self.ffn_norm2, backend).await?,
-            attn_to_q: residency.acquire(self.attn_to_q, backend).await?,
-            attn_to_k: residency.acquire(self.attn_to_k, backend).await?,
-            attn_to_v: residency.acquire(self.attn_to_v, backend).await?,
+            attn_qkv: residency.acquire(self.attn_qkv, backend).await?,
             attn_to_out: residency.acquire(self.attn_to_out, backend).await?,
             attn_norm_q: residency.acquire(self.attn_norm_q, backend).await?,
             attn_norm_k: residency.acquire(self.attn_norm_k, backend).await?,
@@ -841,9 +932,7 @@ impl BlockHandles {
         residency.prefetch(self.attention_norm2, backend).await?;
         residency.prefetch(self.ffn_norm1, backend).await?;
         residency.prefetch(self.ffn_norm2, backend).await?;
-        residency.prefetch(self.attn_to_q, backend).await?;
-        residency.prefetch(self.attn_to_k, backend).await?;
-        residency.prefetch(self.attn_to_v, backend).await?;
+        residency.prefetch(self.attn_qkv, backend).await?;
         residency.prefetch(self.attn_to_out, backend).await?;
         residency.prefetch(self.attn_norm_q, backend).await?;
         residency.prefetch(self.attn_norm_k, backend).await?;
@@ -861,9 +950,7 @@ impl BlockViews<'_> {
             attention_norm2: self.attention_norm2.buf(),
             ffn_norm1: self.ffn_norm1.buf(),
             ffn_norm2: self.ffn_norm2.buf(),
-            attn_to_q: self.attn_to_q.buf(),
-            attn_to_k: self.attn_to_k.buf(),
-            attn_to_v: self.attn_to_v.buf(),
+            attn_qkv: self.attn_qkv.buf(),
             attn_to_out: self.attn_to_out.buf(),
             attn_norm_q: self.attn_norm_q.buf(),
             attn_norm_k: self.attn_norm_k.buf(),
@@ -952,6 +1039,17 @@ fn bcast_fma_uniform<'wsp>(
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
     let mut bytes = [0u8; 16];
     bytes[0..4].copy_from_slice(&c.to_le_bytes());
+    scope.write_uniform(&bytes)
+}
+
+fn qkv_split_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    rows: u32,
+    h: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&rows.to_le_bytes());
+    bytes[4..8].copy_from_slice(&h.to_le_bytes());
     scope.write_uniform(&bytes)
 }
 

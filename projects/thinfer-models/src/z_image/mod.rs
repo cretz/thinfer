@@ -7,6 +7,7 @@
 //! `thinfer-core`; this module is glue: shapes, weight-name maps, the per-block
 //! op recipe. Cross-model abstractions belong in `thinfer-core`, not here.
 
+use thinfer_core::format::union::QkvTriple;
 use thinfer_core::weight::WeightId;
 
 pub mod audit;
@@ -100,9 +101,11 @@ pub struct BlockWeights {
     pub attention_norm2: WeightId,
     pub ffn_norm1: WeightId,
     pub ffn_norm2: WeightId,
-    pub attn_to_q: WeightId,
-    pub attn_to_k: WeightId,
-    pub attn_to_v: WeightId,
+    /// Canonical upstream-schema fused QKV: `[3*hq*head_dim, dim]` in source
+    /// layout. Q rows [0, H), K rows [H, 2H), V rows [2H, 3H). GGUF Z-Image
+    /// ships this directly; split safetensors checkpoints go through
+    /// `SplitToFusedQkvSource` upstream of the loader.
+    pub attn_qkv: WeightId,
     pub attn_to_out: WeightId,
     pub attn_norm_q: WeightId,
     pub attn_norm_k: WeightId,
@@ -129,10 +132,8 @@ impl BlockWeights {
             attention_norm2: id("attention_norm2.weight"),
             ffn_norm1: id("ffn_norm1.weight"),
             ffn_norm2: id("ffn_norm2.weight"),
-            attn_to_q: id("attention.to_q.weight"),
-            attn_to_k: id("attention.to_k.weight"),
-            attn_to_v: id("attention.to_v.weight"),
-            attn_to_out: id("attention.to_out.0.weight"),
+            attn_qkv: id("attention.qkv.weight"),
+            attn_to_out: id("attention.out.weight"),
             attn_norm_q: id("attention.norm_q.weight"),
             attn_norm_k: id("attention.norm_k.weight"),
             ffn_w1: id("feed_forward.w1.weight"),
@@ -235,4 +236,60 @@ impl Default for ModelWeights {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Every QKV triple in a Z-Image DiT, paired with the canonical fused id the
+/// engine asks for. Pass to `SplitToFusedQkvSource::new` over a safetensors
+/// source that ships split `to_q`/`to_k`/`to_v` (dimitribarbot's checkpoint).
+/// Sources that already ship the fused entry (`unsloth/Z-Image-Turbo-GGUF`)
+/// bypass the adapter or simply have no matching split entries to fuse.
+/// Renames every block's split `attention.to_out.0.weight` (dimitribarbot
+/// safetensors schema) to canonical `attention.out.weight` (upstream /
+/// unsloth GGUF schema). Pass to `RenamedSource::new` over a safetensors
+/// source so the engine can ask for the canonical id everywhere.
+pub fn dit_to_out_renames() -> std::collections::HashMap<WeightId, WeightId> {
+    let mut out =
+        std::collections::HashMap::with_capacity(config::N_LAYERS + 2 * config::N_REFINER_LAYERS);
+    for kind in [
+        BlockKind::Main,
+        BlockKind::NoiseRefiner,
+        BlockKind::ContextRefiner,
+    ] {
+        let n = match kind {
+            BlockKind::Main => config::N_LAYERS,
+            BlockKind::NoiseRefiner | BlockKind::ContextRefiner => config::N_REFINER_LAYERS,
+        };
+        for i in 0..n {
+            let p = format!("{}.{}", kind.prefix(), i);
+            out.insert(
+                WeightId(format!("{p}.attention.to_out.0.weight")),
+                WeightId(format!("{p}.attention.out.weight")),
+            );
+        }
+    }
+    out
+}
+
+pub fn dit_qkv_triples() -> Vec<QkvTriple> {
+    let mut out = Vec::with_capacity(config::N_LAYERS + 2 * config::N_REFINER_LAYERS);
+    for kind in [
+        BlockKind::Main,
+        BlockKind::NoiseRefiner,
+        BlockKind::ContextRefiner,
+    ] {
+        let n = match kind {
+            BlockKind::Main => config::N_LAYERS,
+            BlockKind::NoiseRefiner | BlockKind::ContextRefiner => config::N_REFINER_LAYERS,
+        };
+        for i in 0..n {
+            let p = format!("{}.{}", kind.prefix(), i);
+            out.push(QkvTriple {
+                fused: WeightId(format!("{p}.attention.qkv.weight")),
+                q: WeightId(format!("{p}.attention.to_q.weight")),
+                k: WeightId(format!("{p}.attention.to_k.weight")),
+                v: WeightId(format!("{p}.attention.to_v.weight")),
+            });
+        }
+    }
+    out
 }

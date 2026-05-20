@@ -246,6 +246,15 @@ impl WgpuBackend {
                     max_storage_buffers_per_shader_stage: 8,
                     max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
                     max_buffer_size: adapter_limits.max_buffer_size,
+                    // Request the adapter's max workgroup-storage. The
+                    // downlevel default is 16 KiB which caps the matmul
+                    // tile_a + tile_b sum and forces small `bk` on Q8
+                    // (block_size=32). Most desktop adapters report 32+
+                    // KiB; web baseline stays at 16 KiB (downlevel) so
+                    // the matmul kernel must still build at 16 KiB-fit
+                    // configs - this just unlocks bigger tiles on native.
+                    max_compute_workgroup_storage_size: adapter_limits
+                        .max_compute_workgroup_storage_size,
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 memory_hints: wgpu::MemoryHints::default(),

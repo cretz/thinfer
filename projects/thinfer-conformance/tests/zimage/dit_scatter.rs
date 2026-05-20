@@ -14,7 +14,7 @@ use std::sync::Arc;
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
 use thinfer_core::ops::WgslConfig;
 use thinfer_core::workspace::Workspace;
-use thinfer_models::z_image::block::BlockPipelines;
+use thinfer_models::z_image::block::{BlockPipelines, BlockWgslConfigs};
 use thinfer_models::z_image::dit::scatter_pad_rows;
 
 const N_ROWS: usize = 5;
@@ -28,11 +28,11 @@ fn scatter_pad_rows_replaces_masked_and_preserves_others() {
     let workspace = Workspace::new(backend.clone());
     let pipelines = pollster::block_on(BlockPipelines::compile(
         &backend,
-        &WgslConfig {
+        &BlockWgslConfigs::uniform(WgslConfig {
             bf16_quant_writes: false,
             act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
-        },
+        }),
     ))
     .expect("compile block pipelines");
 
@@ -93,11 +93,11 @@ fn scatter_pad_rows_no_op_when_mask_all_zero() {
     let workspace = Workspace::new(backend.clone());
     let pipelines = pollster::block_on(BlockPipelines::compile(
         &backend,
-        &WgslConfig {
+        &BlockWgslConfigs::uniform(WgslConfig {
             bf16_quant_writes: false,
             act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
-        },
+        }),
     ))
     .expect("compile block pipelines");
 

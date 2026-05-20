@@ -85,7 +85,17 @@ def main() -> int:
         "--png-dir",
         type=Path,
         default=None,
-        help="If set, save py.png (post-processed) and py_vae_rgb.png (raw VAE output) here.",
+        help="If set, save the py PNG here (filename via --png-filename).",
+    )
+    p.add_argument(
+        "--png-filename",
+        default="py.png",
+        help=(
+            "Filename for the dumped py PNG inside --png-dir. The rust "
+            "side stamps the variant slug here (e.g. py_safetensors.png "
+            "/ py_gguf_q8_0.png) so multiple e2e variants can share the "
+            "same png dir."
+        ),
     )
     p.add_argument(
         "--vae-diag-dir",
@@ -323,8 +333,9 @@ def main() -> int:
                 chw = raw.reshape(c, h, w)
                 interleaved = ((np.clip(chw, -1.0, 1.0) + 1.0) * 127.5).round().astype("uint8")
                 interleaved = np.transpose(interleaved, (1, 2, 0))
-                Image.fromarray(interleaved).save(str(args.png_dir / "py.png"))
-                print(f"wrote {args.png_dir / 'py.png'}", flush=True)
+                out_png = args.png_dir / args.png_filename
+                Image.fromarray(interleaved).save(str(out_png))
+                print(f"wrote {out_png}", flush=True)
 
     for p_ in (starting_path, pre_vae_path, vae_rgb_path):
         if p_.exists():

@@ -44,6 +44,9 @@ pub enum StorageEncoding {
     Bf16,
     I8,
     I4,
+    /// GGUF-style block-quantized storage. Carries the scheme; layout
+    /// constants live on [`crate::quant::QuantKind`].
+    Quant(crate::quant::QuantKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

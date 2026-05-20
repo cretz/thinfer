@@ -4,4 +4,6 @@
 //! `thinfer-web` from OPFS). Format parsers live here so both targets share
 //! one implementation per format.
 
+pub mod gguf;
 pub mod safetensors;
+pub mod union;

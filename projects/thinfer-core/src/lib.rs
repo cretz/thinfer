@@ -9,6 +9,7 @@ pub mod module;
 pub mod ops;
 pub mod pipeline;
 pub mod policy;
+pub mod quant;
 pub mod residency;
 pub mod runtime;
 pub mod sanity;

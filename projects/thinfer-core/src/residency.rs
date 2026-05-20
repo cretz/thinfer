@@ -55,6 +55,7 @@ impl WeightMeta {
         match self.encoding {
             StorageEncoding::Bf16 => self.elements().div_ceil(2) * 4,
             StorageEncoding::F32 => self.elements() * 4,
+            StorageEncoding::Quant(k) => k.bytes_for_elements(self.elements()),
             _ => 0,
         }
     }
@@ -103,7 +104,15 @@ struct Inner {
     /// Size-class free list of GPU buffers reclaimed via eviction. Reused
     /// before calling `backend.allocate` so eviction churn doesn't pay wgpu's
     /// buffer-creation cost. Pytorch caching-allocator parity.
+    ///
+    /// Pool buffers are still wgpu-allocated and still charged to
+    /// `VramCategory::Weights` in the mem account — they're "weights that
+    /// just aren't bound to any handle right now". `pool_bytes` mirrors
+    /// the sum, so the eviction predicate can include them when computing
+    /// VRAM pressure (otherwise the pool grows unbounded under mixed
+    /// size classes and the true peak overshoots the budget).
     pool: HashMap<u64, Vec<GpuBufferId>>,
+    pool_bytes: u64,
 }
 
 impl Inner {
@@ -132,6 +141,7 @@ impl<S: WeightSource> WeightResidency<S> {
                 gpu_bytes: 0,
                 gpu_lru: Vec::new(),
                 pool: HashMap::new(),
+                pool_bytes: 0,
             }),
         }
     }
@@ -214,7 +224,11 @@ impl<S: WeightSource> WeightResidency<S> {
         self.evict_gpu_until_fits::<B>(gpu_size, backend)?;
         let id = {
             let mut g = self.inner.lock().unwrap();
-            g.pool.get_mut(&gpu_size).and_then(Vec::pop)
+            let popped = g.pool.get_mut(&gpu_size).and_then(Vec::pop);
+            if popped.is_some() {
+                g.pool_bytes -= gpu_size;
+            }
+            popped
         };
         let id = match id {
             Some(id) => id,
@@ -244,16 +258,28 @@ impl<S: WeightSource> WeightResidency<S> {
         })
     }
 
-    /// Stream `meta` from source into the bf16-packed GPU storage layout.
-    /// Bf16 source: passthrough (bytes are already bf16). Linear2D applies a
-    /// block-tiled u16-stride transpose. F32 source: not implemented on the
-    /// GPU path (would need a per-binding kernel flavor; add when a model
-    /// requires it). Output length matches `meta.storage_bytes()`.
+    /// Stream `meta` from source into the GPU storage layout.
+    /// Bf16 source: passthrough (bytes are already bf16). `Linear2D` applies a
+    /// block-tiled u16-stride transpose. Quant (GGUF Q-block) source: byte
+    /// passthrough; GGUF stores `[N, K]` block-major already, so Linear2D is
+    /// rejected. F32 source: not implemented on the GPU path (would need a
+    /// per-binding kernel flavor; add when a model requires it). Output length
+    /// matches `meta.storage_bytes()`.
     async fn read_for_gpu<B: Backend>(
         &self,
         meta: &WeightMeta,
     ) -> Result<Vec<u8>, ResidencyError<S::Error, B::Error>> {
-        if !matches!(meta.encoding, StorageEncoding::Bf16) {
+        if !matches!(
+            meta.encoding,
+            StorageEncoding::Bf16 | StorageEncoding::Quant(_)
+        ) {
+            return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
+                meta.encoding,
+            )));
+        }
+        if matches!(meta.encoding, StorageEncoding::Quant(_))
+            && !matches!(meta.transpose, TransposePolicy::None)
+        {
             return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
                 meta.encoding,
             )));
@@ -261,7 +287,8 @@ impl<S: WeightSource> WeightResidency<S> {
         let storage_len = meta.storage_bytes() as usize;
         let on_disk_len = meta.on_disk_bytes as usize;
         // For bf16 with odd element count, storage_bytes pads to u32. The disk
-        // bytes are tight (no padding); we leave the tail as zero.
+        // bytes are tight (no padding); we leave the tail as zero. Quant
+        // tensors satisfy `storage_bytes == on_disk_bytes` by construction.
         let mut bytes = vec![0u8; storage_len];
 
         let mut reader = self
@@ -377,18 +404,24 @@ impl<S: WeightSource> WeightResidency<S> {
                 backend.free(id);
             }
         }
+        g.pool_bytes = 0;
     }
 
     /// LRU eviction under `vram_bytes` pressure. Evicted buffers are pushed
-    /// onto a size-class free list in `Inner.pool` (not handed back to wgpu);
-    /// the next miss of matching size reuses them. Errors only if every
-    /// remaining resident weight is pinned (caller's working set exceeds
-    /// budget; nothing eviction can do).
+    /// onto a size-class free list in `Inner.pool`; the next miss of
+    /// matching size reuses them. Under further pressure pool buffers are
+    /// freed back to wgpu (the pool is a *cache*, not a reservation).
+    /// Errors only if every remaining resident weight is pinned AND the
+    /// pool is empty (caller's working set exceeds budget).
     ///
-    /// Predicate: `weights_after + non_weights_floor + needed <= vram_bytes`,
-    /// where `non_weights_floor = max(workspace_reserve, mem.vram_non_weights_current())`.
-    /// The reserve prevents weights from squatting on the whole budget and
-    /// forcing workspace allocs into eviction-induced thrash.
+    /// Predicate: `gpu_bytes + pool_bytes + needed + non_weights_floor
+    /// <= vram_bytes`, where `non_weights_floor =
+    /// max(workspace_reserve, mem.vram_non_weights_current())`. Pool
+    /// buffers count: they're still wgpu-allocated and still charged
+    /// to the weights category in the mem account, so omitting them
+    /// lets the true peak overshoot the budget when allocation traffic
+    /// fragments across size classes (e.g. Q8 quant weights interleaved
+    /// with bf16 fallback tensors).
     fn evict_gpu_until_fits<B: Backend>(
         &self,
         needed: u64,
@@ -403,29 +436,51 @@ impl<S: WeightSource> WeightResidency<S> {
                 .workspace_reserve
                 .max(mem.vram_non_weights_current());
             let ceiling = self.budget.vram_bytes.saturating_sub(non_weights_floor);
-            if g.gpu_bytes + needed <= ceiling {
+            if g.gpu_bytes + g.pool_bytes + needed <= ceiling {
                 break;
             }
+            // Strategy: evict an unpinned LRU resident weight if any
+            // remain; that buffer joins the pool so the next match
+            // reuses it. If there's no unpinned resident left to
+            // evict, free one pool buffer instead.
             let victim = loop {
-                let Some(&cand) = g.gpu_lru.get(idx) else {
-                    return Err(ResidencyError::BudgetTooSmall {
-                        needed,
-                        have: ceiling.saturating_sub(g.gpu_bytes),
-                        tier: "vram",
-                    });
-                };
+                if idx >= g.gpu_lru.len() {
+                    break None;
+                }
+                let cand = g.gpu_lru[idx];
                 let pinned = g.gpu.get(&cand).is_some_and(|e| e.pin_count > 0);
                 if pinned {
                     idx += 1;
                 } else {
-                    break cand;
+                    break Some(cand);
                 }
             };
-            g.gpu_lru.remove(idx);
-            if let Some(e) = g.gpu.remove(&victim) {
-                g.gpu_bytes -= e.bytes;
-                g.pool.entry(e.bytes).or_default().push(e.id);
+            if let Some(v) = victim {
+                g.gpu_lru.remove(idx);
+                if let Some(e) = g.gpu.remove(&v) {
+                    g.gpu_bytes -= e.bytes;
+                    g.pool_bytes += e.bytes;
+                    g.pool.entry(e.bytes).or_default().push(e.id);
+                }
+                continue;
             }
+            // No unpinned resident weight available; spill a pool entry
+            // back to wgpu instead. Pool ordering doesn't matter — pop
+            // from whichever size class has any entry. If even the pool
+            // is empty, we can't make room.
+            let freed = {
+                let Some((&size, ids)) = g.pool.iter_mut().find(|(_, v)| !v.is_empty()) else {
+                    return Err(ResidencyError::BudgetTooSmall {
+                        needed,
+                        have: ceiling.saturating_sub(g.gpu_bytes + g.pool_bytes),
+                        tier: "vram",
+                    });
+                };
+                let id = ids.pop().expect("filtered to non-empty");
+                (size, id)
+            };
+            g.pool_bytes -= freed.0;
+            backend.free(freed.1);
         }
         Ok(())
     }

@@ -5,11 +5,17 @@ use std::sync::Arc;
 
 use clap::{Args, Subcommand, ValueEnum};
 use thinfer_core::backend::{PowerPreference, WgpuBackend, WgpuConfig};
+use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::format::safetensors::ShardedSafetensorsSource;
+use thinfer_core::format::union::{
+    QuantOnlySource, RenamedSource, SplitToFusedQkvSource, UnionSource,
+};
 use thinfer_core::manifest::{FileRef, ModelManifest};
 use thinfer_core::policy::{ResidencyBudget, parse_bytes};
 use thinfer_core::residency::WeightResidency;
+use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::trace::DIAG;
+use thinfer_core::weight::WeightSource;
 use thinfer_models::z_image::manifest::role as zrole;
 use thinfer_models::z_image::pipeline::{GenerationParams, ZImageModel};
 use thinfer_native::tokenizer::HfTokenizer;
@@ -67,6 +73,12 @@ pub struct GenerateImage {
     /// Skip the TTY consent prompt and download missing weight files.
     #[arg(long, default_value_t = false)]
     pub download_as_needed: bool,
+    /// Optional path to a DiT GGUF file (e.g. `unsloth/Z-Image-Turbo-GGUF`).
+    /// When set, the DiT matmul weights are pulled from the GGUF file
+    /// (Q8_0 / Q4_K etc); norms, biases, AdaLN, and the rest of the model
+    /// stay safetensors.
+    #[arg(long)]
+    pub dit_gguf: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -179,6 +191,15 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
     let source = ShardedSafetensorsSource::open(weight_openers)
         .await
         .map_err(|e| format!("parse sharded safetensors: {e:?}"))?;
+    // Z-Image canonical schema is fused `attention.qkv.weight`. Checkpoints
+    // that ship split `to_q`/`to_k`/`to_v` (dimitribarbot) flow through this
+    // adapter; checkpoints with a fused entry already see the adapter as a
+    // passthrough.
+    let source = SplitToFusedQkvSource::new(source, thinfer_models::z_image::dit_qkv_triples());
+    // dimitribarbot publishes `attention.to_out.0.weight`; engine asks for
+    // canonical `attention.out.weight` (matches unsloth GGUF schema).
+    let source =
+        RenamedSource::with_passthrough(source, thinfer_models::z_image::dit_to_out_renames());
 
     let tokenizer_path = resolve_role(zrole::TOKENIZER_JSON)?;
     let tokenizer = HfTokenizer::from_path(&tokenizer_path)
@@ -198,7 +219,6 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
         "generate start",
     );
 
-    let residency = WeightResidency::new(source, budget);
     let backend = {
         let _s = tracing::info_span!("wgpu_init").entered();
         let cfg = WgpuConfig {
@@ -225,24 +245,51 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
     // THINFER_TRACE is set (same gate that enables the rollup table in
     // main.rs, so a single env var turns on the full report).
     let backend_for_stats = std::env::var_os("THINFER_TRACE").map(|_| Arc::clone(&backend));
-    let model = {
-        let _s = tracing::info_span!("model_load").entered();
-        ZImageModel::load(backend, residency, tokenizer)
-            .await
-            .map_err(|e| format!("model load: {e:?}"))?
-    };
 
     let seed = args.seed.unwrap_or_else(random_seed);
-    let png = model
-        .generate(&GenerationParams {
-            prompt: args.prompt,
-            height: args.height,
-            width: args.width,
-            steps: args.steps,
-            seed,
-        })
-        .await
-        .map_err(|e| format!("generate: {e:?}"))?;
+    let gen_params = GenerationParams {
+        prompt: args.prompt,
+        height: args.height,
+        width: args.width,
+        steps: args.steps,
+        seed,
+    };
+    let png = match args.dit_gguf.as_ref() {
+        None => {
+            let residency = WeightResidency::new(source, budget);
+            load_and_generate(backend, residency, tokenizer, &gen_params).await?
+        }
+        Some(path) => {
+            let opener = MmapFileOpener::new(path)
+                .await
+                .map_err(|e| format!("open gguf {}: {e}", path.display()))?;
+            let gguf = GgufSource::open(opener)
+                .await
+                .map_err(|e| format!("parse gguf {}: {e:?}", path.display()))?;
+            // GGUF (unsloth Z-Image-Turbo) ships upstream canonical names
+            // including fused `attention.qkv.weight`; no rename needed.
+            // safetensors fallback supplies AdaLN/biases/norms under the
+            // same canonical names. unsloth's file Q8-quantizes the
+            // main-layer AdaLN modulation weights too, but the engine
+            // keeps AdaLN as bf16 (see pipeline.rs::dit_adaln_cfg), so
+            // we hide AdaLN ids from the GGUF side to fall through.
+            let unioned = UnionSource::new(
+                QuantOnlySource::with_allowed_substrings(
+                    gguf,
+                    &[
+                        ".attention.qkv.weight",
+                        ".attention.out.weight",
+                        ".feed_forward.w1.weight",
+                        ".feed_forward.w2.weight",
+                        ".feed_forward.w3.weight",
+                    ],
+                ),
+                source,
+            );
+            let residency = WeightResidency::new(unioned, budget);
+            load_and_generate(backend, residency, tokenizer, &gen_params).await?
+        }
+    };
     tokio::fs::write(&args.output, &png)
         .await
         .map_err(|e| format!("write {}: {e}", args.output.display()))?;
@@ -267,6 +314,24 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+async fn load_and_generate<S: WeightSource, T: Tokenizer>(
+    backend: Arc<WgpuBackend>,
+    residency: WeightResidency<S>,
+    tokenizer: T,
+    params: &GenerationParams,
+) -> Result<Vec<u8>, String> {
+    let model = {
+        let _s = tracing::info_span!("model_load").entered();
+        ZImageModel::load(backend, residency, tokenizer)
+            .await
+            .map_err(|e| format!("model load: {e:?}"))?
+    };
+    model
+        .generate(params)
+        .await
+        .map_err(|e| format!("generate: {e:?}"))
 }
 
 fn fmt_mib(bytes: u64) -> String {

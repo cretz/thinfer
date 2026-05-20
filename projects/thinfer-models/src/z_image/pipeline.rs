@@ -18,13 +18,14 @@ use std::sync::Arc;
 use thinfer_core::backend::{Backend, WgpuBackend, WgpuError};
 use thinfer_core::ops::{WeightDtype, WgslConfig};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
+use thinfer_core::tensor::StorageEncoding;
 use thinfer_core::tokenizer::{Tokenizer, TokenizerError};
 use thinfer_core::trace;
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 
-use crate::z_image::block::BlockPipelines;
-use crate::z_image::dit::{DitInputs, DitShape, ZImageDit};
+use crate::z_image::block::{BlockPipelines, BlockWgslConfigs};
+use crate::z_image::dit::{Block0Taps, DitInputs, DitShape, DitTaps, ZImageDit};
 use crate::z_image::loader::{LoadError, register_dit_handles};
 use crate::z_image::scheduler::FlowMatchEulerScheduler;
 use crate::z_image::text_encoder::{
@@ -68,10 +69,25 @@ pub struct ZImageModel<S: WeightSource, T: Tokenizer> {
     /// Qwen3 text encoder, which stays on the untuned matmul/fp32-storage path
     /// for now; bf16-packing the encoder is queued for a follow-up.
     encoder_block_pipelines: BlockPipelines,
+    /// Block pipelines for the DiT-side encoder ops (x/t/cap embedders, noise
+    /// and context refiners, final_layer). Shares `act_dtype` with
+    /// `block_pipelines` (their outputs feed directly into the main loop) but
+    /// keeps `weight_dtype = Bf16` because refiners/embedders aren't quantized
+    /// even in the GGUF path.
+    dit_encoder_block_pipelines: BlockPipelines,
     dit_handles: crate::z_image::loader::LoadedDitHandles,
     encoder: Qwen3Encoder,
     encoder_handles: Qwen3Handles,
     vae: VaeDecoder,
+    /// Dtype the four main DiT matmul kernels were compiled against -
+    /// `Bf16` when the source returned bf16 (or any non-quant encoding),
+    /// `Quant(k)` when the source returned a GGUF-style quant scheme. Set
+    /// once at `load()` from the `layers.0.attention.qkv.weight` probe;
+    /// exposed via `dit_matmul_weight()` so callers (notably the
+    /// e2e_parity GGUF variant) can assert the GGUF source actually
+    /// supplied the matmul tensors instead of silently falling through
+    /// to the safetensors side of a `UnionSource`.
+    dit_matmul_weight: WeightDtype,
 }
 
 #[derive(Debug)]
@@ -161,14 +177,88 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             "handles registered"
         );
         let t_compile = std::time::Instant::now();
-        let wgsl_cfg = WgslConfig::BF16_PACKED;
-        let block_pipelines = BlockPipelines::compile(&backend, &wgsl_cfg).await?;
-        let encoder_cfg = WgslConfig {
+        // Detect whether the DiT-side matmul tensors arrived as GGUF
+        // quant (e.g. Q8_0) or stayed bf16. Peek the canonical fused QKV
+        // tensor (`layers.0.attention.qkv.weight`) in the source catalog. If
+        // it's quant, the 4 main matmul kernels are compiled with that
+        // scheme; AdaLN stays bf16 (its weights are too small to amortize
+        // dequant and we keep them in safetensors regardless).
+        let dit_matmul_weight = {
+            let probe =
+                crate::z_image::BlockWeights::new(crate::z_image::BlockKind::Main, 0).attn_qkv;
+            match residency
+                .source()
+                .catalog()
+                .get(&probe)
+                .and_then(|e| e.encoding)
+            {
+                Some(StorageEncoding::Quant(k)) => WeightDtype::Quant(k),
+                _ => WeightDtype::Bf16,
+            }
+        };
+        // Quant weights run with F32 acts: dequant inside the matmul kernel
+        // emits f32, accumulates in f32; storing intermediates as packed-bf16
+        // between block boundaries is a workspace-shrink hack tied to the
+        // bf16-weight path and is the wrong intermediate format for the
+        // quant path. When SHADER_F16 lands, Quant acts go to native F16
+        // (matmul dequant -> f16 storage, f32 accumulators) and the packed-
+        // bf16 workaround retires. Bf16 weights stay on the production
+        // BF16_PACKED path - bf16 acts are bit-clean with bf16 weights.
+        // AdaLN matmul keeps Bf16 weights but follows the block's act dtype
+        // (the `BlockWgslConfigs` invariant requires all matmuls and ops to
+        // agree on act_dtype + bf16_quant_writes).
+        let (dit_main_matmul_cfg, dit_adaln_cfg, dit_ops_cfg) = match dit_matmul_weight {
+            WeightDtype::Quant(_) => {
+                let acts_f32_main = WgslConfig {
+                    bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
+                    act_dtype: thinfer_core::ops::ActDtype::F32,
+                    weight_dtype: dit_matmul_weight,
+                };
+                let acts_f32_bf16w = WgslConfig {
+                    bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
+                    act_dtype: thinfer_core::ops::ActDtype::F32,
+                    weight_dtype: WeightDtype::Bf16,
+                };
+                (acts_f32_main, acts_f32_bf16w, acts_f32_bf16w)
+            }
+            _ => {
+                let main = WgslConfig {
+                    weight_dtype: dit_matmul_weight,
+                    ..WgslConfig::BF16_PACKED
+                };
+                (main, WgslConfig::BF16_PACKED, WgslConfig::BF16_PACKED)
+            }
+        };
+        let dit_cfgs = BlockWgslConfigs {
+            matmul_qkv: dit_main_matmul_cfg,
+            matmul_proj: dit_main_matmul_cfg,
+            matmul_ffn_up: dit_main_matmul_cfg,
+            matmul_ffn_down: dit_main_matmul_cfg,
+            matmul_adaln: dit_adaln_cfg,
+            ops: dit_ops_cfg,
+        };
+        tracing::info!(?dit_matmul_weight, "DiT block matmul weight dtype");
+        let block_pipelines = BlockPipelines::compile(&backend, &dit_cfgs).await?;
+        // Qwen3 text encoder pipelines: fp32 acts + bf16 weights, untuned
+        // matmul path. Independent of the DiT path's dtype choice.
+        let encoder_cfgs = BlockWgslConfigs::uniform(WgslConfig {
             bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
             act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: WeightDtype::Bf16,
-        };
-        let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfg).await?;
+        });
+        let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfgs).await?;
+        // DiT-side encoder ops (x/t/cap embedders + refiners + final_layer):
+        // must share `act_dtype` with the main DiT loop because their outputs
+        // feed directly into the main layers' activation buffers. Weights
+        // stay bf16 — refiners/embedders are never quantized in the GGUF
+        // path that quantizes the main matmuls.
+        let dit_encoder_cfgs = BlockWgslConfigs::uniform(WgslConfig {
+            bf16_quant_writes: dit_main_matmul_cfg.bf16_quant_writes,
+            act_dtype: dit_main_matmul_cfg.act_dtype,
+            weight_dtype: WeightDtype::Bf16,
+        });
+        let dit_encoder_block_pipelines =
+            BlockPipelines::compile(&backend, &dit_encoder_cfgs).await?;
         let vae_pipelines = VaeDecoderPipelines::compile(&backend).await?;
         tracing::info!(
             compile_ms = t_compile.elapsed().as_millis() as u64,
@@ -187,11 +277,22 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             tokenizer,
             block_pipelines,
             encoder_block_pipelines,
+            dit_encoder_block_pipelines,
             dit_handles,
             encoder,
             encoder_handles,
             vae,
+            dit_matmul_weight,
         })
+    }
+
+    /// Dtype the four main DiT matmul kernels picked up at load time -
+    /// `Bf16` for the safetensors path, `Quant(k)` when a GGUF source
+    /// surfaced the matmul tensors. Lets tests assert the GGUF union
+    /// actually fed the DiT rather than silently falling through to
+    /// the safetensors side.
+    pub fn dit_matmul_weight(&self) -> WeightDtype {
+        self.dit_matmul_weight
     }
 
     /// Run the full pipeline. Returns PNG bytes; the caller writes them to
@@ -493,17 +594,297 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 patch_size: PATCH_SIZE,
                 f_patch_size: F_PATCH_SIZE,
             };
+            // DiT taps: when DIAG tracing is enabled, capture intermediate
+            // f32 readbacks at well-defined points inside `dit.forward` and
+            // print per-tap NaN/finite/min/max/mean stats. Sinks are allocated
+            // only when DIAG fires, so the non-diag path stays zero-cost.
+            // Useful for narrowing the first NaN-producing op when a new
+            // weight encoding (Q8_0, future Q4_K) breaks parity.
+            let diag = tracing::enabled!(target: trace::DIAG, tracing::Level::INFO);
+            let mut tap_main0: Vec<f32> = Vec::new();
+            let mut tap_main14: Vec<f32> = Vec::new();
+            let mut tap_unified: Vec<f32> = Vec::new();
+            let mut tap_last_main: Vec<f32> = Vec::new();
+            let mut tap_final: Vec<f32> = Vec::new();
+            let mut tap_ctx0: Vec<f32> = Vec::new();
+            let mut tap_last_ctx: Vec<f32> = Vec::new();
+            let mut tap_cap_emb: Vec<f32> = Vec::new();
+            // Block-0 per-op taps: request all of them so we can pinpoint
+            // the first NaN-producing op inside the first main DiT block.
+            // Setting Some(Vec::new()) flags the field; the engine fills it.
+            let mut block0_taps = Block0Taps {
+                adaln_input: Some(Vec::new()),
+                adaln_pre: Some(Vec::new()),
+                adaln_full: Some(Vec::new()),
+                scale_msa: Some(Vec::new()),
+                gate_msa: Some(Vec::new()),
+                scale_mlp: Some(Vec::new()),
+                gate_mlp: Some(Vec::new()),
+                attn_norm1_out: Some(Vec::new()),
+                modulated_attn_in: Some(Vec::new()),
+                attn_q: Some(Vec::new()),
+                attn_k: Some(Vec::new()),
+                attn_v: Some(Vec::new()),
+                attn_q_norm: Some(Vec::new()),
+                attn_k_norm: Some(Vec::new()),
+                attn_q_rope: Some(Vec::new()),
+                attn_k_rope: Some(Vec::new()),
+                attn_sdpa: Some(Vec::new()),
+                attn_out: Some(Vec::new()),
+                attn_norm2_out: Some(Vec::new()),
+                x_mid: Some(Vec::new()),
+                ffn_norm1_out: Some(Vec::new()),
+                modulated_ffn_in: Some(Vec::new()),
+                ffn_raw: Some(Vec::new()),
+                ffn_norm2_out: Some(Vec::new()),
+            };
             let layout = {
                 let _f = trace::scope!("dit_forward").entered();
-                dit.forward(
-                    &self.backend,
-                    &self.block_pipelines,
-                    &self.residency,
-                    &*workspace,
-                    &inputs,
-                )
-                .await?
+                if diag {
+                    let taps = DitTaps {
+                        cap_embedded: Some(&mut tap_cap_emb),
+                        ctx_refiner_0_out: Some(&mut tap_ctx0),
+                        last_ctx_refiner_out: Some(&mut tap_last_ctx),
+                        unified_in: Some(&mut tap_unified),
+                        main_layer_0_out: Some(&mut tap_main0),
+                        main_layer_14_out: Some(&mut tap_main14),
+                        last_main_layer_out: Some(&mut tap_last_main),
+                        final_layer_out: Some(&mut tap_final),
+                        block0: Some(&mut block0_taps),
+                        ..DitTaps::default()
+                    };
+                    dit.forward_with_taps(
+                        &self.backend,
+                        &self.block_pipelines,
+                        &self.dit_encoder_block_pipelines,
+                        &self.residency,
+                        &*workspace,
+                        &inputs,
+                        taps,
+                    )
+                    .await?
+                } else {
+                    dit.forward(
+                        &self.backend,
+                        &self.block_pipelines,
+                        &self.dit_encoder_block_pipelines,
+                        &self.residency,
+                        &*workspace,
+                        &inputs,
+                    )
+                    .await?
+                }
             };
+            if diag {
+                let print = |label: &str, v: &[f32]| {
+                    if v.is_empty() {
+                        return;
+                    }
+                    // Whole-buffer stats. Split nan / +inf / -inf / exact-zero
+                    // so "all zero" vs "bf16 0x0000" vs "stale NaN" vs "+inf
+                    // saturation" are distinguishable in the log; the previous
+                    // single `nan/inf` counter hid the bf16-readback bug.
+                    let mut nan = 0usize;
+                    let mut pinf = 0usize;
+                    let mut ninf = 0usize;
+                    let mut zeros = 0usize;
+                    let mut min = f32::INFINITY;
+                    let mut max = f32::NEG_INFINITY;
+                    let mut sum_abs = 0.0f64;
+                    let mut n_fin = 0usize;
+                    for &x in v {
+                        if x.is_nan() {
+                            nan += 1;
+                            continue;
+                        }
+                        if x == f32::INFINITY {
+                            pinf += 1;
+                            continue;
+                        }
+                        if x == f32::NEG_INFINITY {
+                            ninf += 1;
+                            continue;
+                        }
+                        if x == 0.0 {
+                            zeros += 1;
+                        }
+                        n_fin += 1;
+                        if x < min {
+                            min = x;
+                        }
+                        if x > max {
+                            max = x;
+                        }
+                        sum_abs += x.abs() as f64;
+                    }
+                    let mean_abs = if n_fin > 0 {
+                        sum_abs / n_fin as f64
+                    } else {
+                        0.0
+                    };
+                    // 4-bucket mean_abs along the buffer axis. Exposes
+                    // first-half / second-half asymmetry (under-dispatch, byte
+                    // miscount, slab-order swap) that a whole-buffer mean
+                    // averages away.
+                    let n = v.len();
+                    let mut b_means = [0.0f64; 4];
+                    for bi in 0..4 {
+                        let lo = bi * n / 4;
+                        let hi = (bi + 1) * n / 4;
+                        let mut s = 0.0f64;
+                        let mut c = 0usize;
+                        for &x in &v[lo..hi] {
+                            if x.is_finite() {
+                                s += x.abs() as f64;
+                                c += 1;
+                            }
+                        }
+                        b_means[bi] = if c > 0 { s / c as f64 } else { 0.0 };
+                    }
+                    // Head / tail samples expose structural patterns: e.g.
+                    // bf16 0x0000 reads exactly 0.0; bf16 0xffff reads NaN;
+                    // an upload-byte-order bug usually shows mirrored values.
+                    let head_n = 8.min(n);
+                    let tail_lo = n.saturating_sub(8);
+                    tracing::info!(
+                        target: trace::DIAG,
+                        "  [DIT-TAP] step{i} {label}: len={n} nan={nan} +inf={pinf} -inf={ninf} \
+                         zeros={zeros} min={:.4e} max={:.4e} mean_abs={:.4e} \
+                         buckets=[{:.4e},{:.4e},{:.4e},{:.4e}] head={:?} tail={:?}",
+                        min, max, mean_abs,
+                        b_means[0], b_means[1], b_means[2], b_means[3],
+                        &v[..head_n], &v[tail_lo..],
+                    );
+                };
+                // Per-row bucketed mean_abs for matmul-output taps. The
+                // whole-buffer mean averages a magnitude blow-up across all
+                // rows; bucketing by row exposes whether the blow-up is
+                // uniform (weight-scale / dequant issue) vs concentrated in
+                // a contiguous row range (under-dispatch / stride bug) vs
+                // alternating (interleaved-write bug).
+                let print_rows = |label: &str, v: &[f32], rows: usize, cols: usize| {
+                    if v.is_empty() || rows == 0 || cols == 0 || v.len() != rows * cols {
+                        return;
+                    }
+                    let nb = 8usize.min(rows);
+                    let mut bm = vec![0.0f64; nb];
+                    for bi in 0..nb {
+                        let r_lo = bi * rows / nb;
+                        let r_hi = (bi + 1) * rows / nb;
+                        let mut s = 0.0f64;
+                        let mut c = 0usize;
+                        for r in r_lo..r_hi {
+                            for x in &v[r * cols..(r + 1) * cols] {
+                                if x.is_finite() {
+                                    s += x.abs() as f64;
+                                    c += 1;
+                                }
+                            }
+                        }
+                        bm[bi] = if c > 0 { s / c as f64 } else { 0.0 };
+                    }
+                    tracing::info!(
+                        target: trace::DIAG,
+                        "  [DIT-TAP-ROWS] step{i} {label}: rows={rows} cols={cols} row_buckets={bm:?}",
+                    );
+                };
+                print("cap_embedded", &tap_cap_emb);
+                print("ctx_refiner_0_out", &tap_ctx0);
+                print("last_ctx_refiner_out", &tap_last_ctx);
+                print("unified_in (pre main layer 0)", &tap_unified);
+                print("main_layer_0_out", &tap_main0);
+                print("main_layer_14_out", &tap_main14);
+                print("last_main_layer_out", &tap_last_main);
+                print("final_layer_out", &tap_final);
+                // Per-op narrowing within main layer block 0.
+                let b0 = &block0_taps;
+                if let Some(v) = &b0.adaln_input {
+                    print("block0.adaln_input", v);
+                }
+                if let Some(v) = &b0.adaln_pre {
+                    print("block0.adaln_pre (matmul out)", v);
+                }
+                if let Some(v) = &b0.adaln_full {
+                    print("block0.adaln_full (post bias)", v);
+                }
+                if let Some(v) = &b0.scale_msa {
+                    print("block0.scale_msa", v);
+                }
+                if let Some(v) = &b0.gate_msa {
+                    print("block0.gate_msa", v);
+                }
+                if let Some(v) = &b0.scale_mlp {
+                    print("block0.scale_mlp", v);
+                }
+                if let Some(v) = &b0.gate_mlp {
+                    print("block0.gate_mlp", v);
+                }
+                if let Some(v) = &b0.attn_norm1_out {
+                    print("block0.attn_norm1_out", v);
+                }
+                if let Some(v) = &b0.modulated_attn_in {
+                    print("block0.modulated_attn_in", v);
+                }
+                // Row/col dims for matmul-output taps within block 0.
+                // `dim` is the unified-stream channel count, `head_dim` is
+                // per-head, `n_heads` is the attention head count. These
+                // are config constants (z_image::config) — not runtime-only
+                // — so importing them here for per-row bucketing is cheap.
+                let dim = crate::z_image::config::DIM;
+                let head_dim = crate::z_image::config::HEAD_DIM;
+                let n_heads = crate::z_image::config::N_HEADS;
+                let ffn_hidden = crate::z_image::config::FFN_HIDDEN;
+                let seq_u = shape.seq_x + shape.seq_cap;
+                if let Some(v) = &b0.attn_q {
+                    print("block0.attn_q", v);
+                    print_rows("block0.attn_q", v, seq_u * n_heads, head_dim);
+                }
+                if let Some(v) = &b0.attn_k {
+                    print("block0.attn_k", v);
+                }
+                if let Some(v) = &b0.attn_v {
+                    print("block0.attn_v", v);
+                }
+                if let Some(v) = &b0.attn_q_norm {
+                    print("block0.attn_q_norm", v);
+                }
+                if let Some(v) = &b0.attn_k_norm {
+                    print("block0.attn_k_norm", v);
+                }
+                if let Some(v) = &b0.attn_q_rope {
+                    print("block0.attn_q_rope", v);
+                }
+                if let Some(v) = &b0.attn_k_rope {
+                    print("block0.attn_k_rope", v);
+                }
+                if let Some(v) = &b0.attn_sdpa {
+                    print("block0.attn_sdpa", v);
+                }
+                if let Some(v) = &b0.attn_out {
+                    print("block0.attn_out", v);
+                    print_rows("block0.attn_out", v, seq_u, dim);
+                }
+                if let Some(v) = &b0.attn_norm2_out {
+                    print("block0.attn_norm2_out", v);
+                }
+                if let Some(v) = &b0.x_mid {
+                    print("block0.x_mid", v);
+                }
+                if let Some(v) = &b0.ffn_norm1_out {
+                    print("block0.ffn_norm1_out", v);
+                }
+                if let Some(v) = &b0.modulated_ffn_in {
+                    print("block0.modulated_ffn_in", v);
+                }
+                if let Some(v) = &b0.ffn_raw {
+                    print("block0.ffn_raw", v);
+                    print_rows("block0.ffn_raw", v, seq_u, dim);
+                }
+                let _ = ffn_hidden;
+                if let Some(v) = &b0.ffn_norm2_out {
+                    print("block0.ffn_norm2_out", v);
+                }
+            }
             let total_rows = (layout.seq_x_padded + layout.seq_cap_padded) as u64;
             let row_bytes = (layout.out_channels as u64) * layout.act_dtype.bytes_per_elem();
             let bytes = {

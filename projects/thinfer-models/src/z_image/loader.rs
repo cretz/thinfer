@@ -97,9 +97,7 @@ fn register_block<S: WeightSource>(
         attention_norm2: register_passthrough(residency, &w.attention_norm2)?,
         ffn_norm1: register_passthrough(residency, &w.ffn_norm1)?,
         ffn_norm2: register_passthrough(residency, &w.ffn_norm2)?,
-        attn_to_q: register_linear(residency, &w.attn_to_q)?,
-        attn_to_k: register_linear(residency, &w.attn_to_k)?,
-        attn_to_v: register_linear(residency, &w.attn_to_v)?,
+        attn_qkv: register_linear(residency, &w.attn_qkv)?,
         attn_to_out: register_linear(residency, &w.attn_to_out)?,
         attn_norm_q: register_passthrough(residency, &w.attn_norm_q)?,
         attn_norm_k: register_passthrough(residency, &w.attn_norm_k)?,
@@ -175,7 +173,37 @@ pub(crate) fn register_linear<S: WeightSource>(
     residency: &WeightResidency<S>,
     id: &WeightId,
 ) -> Result<WeightHandle, LoadError> {
-    register_one(residency, id, TransposePolicy::Linear2D)
+    let entry = residency
+        .source()
+        .catalog()
+        .get(id)
+        .ok_or_else(|| LoadError::UnknownWeight(id.clone()))?;
+    let encoding = entry.encoding.ok_or_else(|| LoadError::Undecodable {
+        id: id.clone(),
+        encoding: None,
+        label: entry.encoding_label.clone(),
+    })?;
+    // Linear weight tensors: bf16 (transposed to [K, N]) or GGUF quant
+    // (already block-major [N, K], no transpose). fp16/i8/i4 not supported
+    // here yet.
+    let (encoding, transpose) = match encoding {
+        StorageEncoding::Bf16 | StorageEncoding::F32 => (encoding, TransposePolicy::Linear2D),
+        StorageEncoding::Quant(_) => (encoding, TransposePolicy::None),
+        _ => {
+            return Err(LoadError::Undecodable {
+                id: id.clone(),
+                encoding: Some(encoding),
+                label: entry.encoding_label.clone(),
+            });
+        }
+    };
+    Ok(residency.register(WeightMeta {
+        id: id.clone(),
+        shape: entry.shape.clone(),
+        encoding,
+        on_disk_bytes: entry.size,
+        transpose,
+    }))
 }
 
 pub(crate) fn register_passthrough<S: WeightSource>(

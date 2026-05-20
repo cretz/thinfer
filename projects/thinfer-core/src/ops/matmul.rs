@@ -107,7 +107,7 @@ pub struct MatmulBufs<'a> {
     pub out: &'a BufRef,
 }
 
-pub(crate) fn dispatch_matmul<O: MatmulOp, B: Backend>(
+pub fn dispatch_matmul<O: MatmulOp, B: Backend>(
     backend: &B,
     encoder: &mut B::CommandEncoder,
     pipeline: &B::Pipeline,
@@ -141,6 +141,15 @@ pub(crate) fn dispatch_matmul<O: MatmulOp, B: Backend>(
 ///   (NaN/inf passthrough). Compute and accumulators stay fp32.
 fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
     c.validate();
+    if let WeightDtype::Quant(k) = cfg.weight_dtype {
+        assert!(
+            c.bk.is_multiple_of(k.block_size()),
+            "matmul Quant({:?}) requires bk ({}) % block_size ({}) == 0",
+            k,
+            c.bk,
+            k.block_size()
+        );
+    }
     let bm = c.bm;
     let bn = c.bn;
     let bk = c.bk;
@@ -184,12 +193,18 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
     let b_elem_decl = match cfg.weight_dtype {
         WeightDtype::F32 => "@group(0) @binding(1) var<storage, read> b: array<f32>;",
         WeightDtype::Bf16 => "@group(0) @binding(1) var<storage, read> b: array<u32>;",
+        WeightDtype::Quant(k) => k.storage_decl(1),
     };
     let load_b = match cfg.weight_dtype {
-        WeightDtype::F32 => "fn load_b(i: u32) -> f32 { return b[i]; }\n",
+        WeightDtype::F32 => "fn load_b(i: u32) -> f32 { return b[i]; }\n".to_string(),
         WeightDtype::Bf16 => {
-            "fn load_b(i: u32) -> f32 {\n  let pair = b[i >> 1u];\n  let shift = (i & 1u) * 16u;\n  let half = (pair >> shift) & 0xFFFFu;\n  return bitcast<f32>(half << 16u);\n}\n"
+            "fn load_b(i: u32) -> f32 {\n  let pair = b[i >> 1u];\n  let shift = (i & 1u) * 16u;\n  let half = (pair >> shift) & 0xFFFFu;\n  return bitcast<f32>(half << 16u);\n}\n".to_string()
         }
+        // Quant path: no per-element load_b. The block-cooperative
+        // loader emitted into the kernel body dequants whole blocks
+        // straight into tile_b. We only need the dequant helpers
+        // (f16_bits_to_f32, b_byte, sext_i8, load_b_block_<scheme>).
+        WeightDtype::Quant(k) => k.load_b_block_fn(),
     };
     let pack_helpers = if act_packed {
         concat!(
@@ -210,6 +225,92 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
         "fn act_store(x: f32) -> f32 {\n  let b = bitcast<u32>(x);\n  if ((b & 0x7F800000u) == 0x7F800000u) { return x; }\n  let l = (b >> 16u) & 1u;\n  return bitcast<f32>((b + 0x7FFFu + l) & 0xFFFF0000u);\n}\n"
     } else {
         "fn act_store(x: f32) -> f32 { return x; }\n"
+    };
+
+    // Build the inner B-load loop. F32/Bf16 use the original per-cell
+    // cooperative load. Quant uses a block-cooperative path: B is
+    // viewed as [N, K] in N-major blocks; each thread dequants whole
+    // blocks straight into tile_b.
+    let b_load_loop = match cfg.weight_dtype {
+        WeightDtype::F32 | WeightDtype::Bf16 => format!(
+            r#"        for (var s: u32 = 0u; s < {b_loads_per_thread}u; s = s + 1u) {{
+            let idx: u32 = s * THREADS + tid;
+            if (idx < BK * BN) {{
+                let br: u32 = idx / BN;
+                let bc: u32 = idx % BN;
+                let gr: u32 = k0 + br;
+                let gc: u32 = bn0 + bc;
+                var v: f32 = 0.0;
+                if (gr < d.k && gc < d.n) {{
+                    v = load_b(gr * d.n + gc);
+                }}
+                tile_b[idx] = v;
+            }}
+        }}
+"#
+        ),
+        WeightDtype::Quant(k) => {
+            let bs = k.block_size();
+            let bpb = k.bytes_per_block();
+            let scale_call = k.block_scale_call();
+            let elem_call = k.block_elem_call();
+            assert!(
+                bk.is_multiple_of(bs),
+                "bk={bk} must be multiple of block_size={bs}"
+            );
+            let bk_chunks = bk / bs;
+            let block_slots = bk_chunks * bn;
+            // TPB = threads-per-block in the cooperative dequant. Pick
+            // the largest power-of-2 factor of `bs` that brings the
+            // total slot count up to (but not over) THREADS, so the WG
+            // saturates the B-load without any thread doing redundant
+            // work. When `block_slots >= threads` already, TPB=1
+            // (current single-thread-per-block behavior).
+            let mut tpb: u32 = 1;
+            while tpb * 2 <= bs && tpb * 2 * block_slots <= threads {
+                tpb *= 2;
+            }
+            let elems_per_thread = bs / tpb;
+            let slot_threads = block_slots * tpb;
+            let slots_per_thread = slot_threads.div_ceil(threads);
+            format!(
+                r#"        // Quant B load, cooperative across TPB={tpb} threads per
+        // block. B is viewed as [N, K] in N-major blocks
+        // (block_size={bs}, bytes_per_block={bpb}). BK_CHUNKS = BK / BS
+        // = {bk_chunks}. Each (kc, bc) block is dequanted by TPB threads,
+        // each handling {elems_per_thread} contiguous elements; the f16
+        // scale is read once per thread (tiny) and shared via local var.
+        {{
+            let blocks_per_row: u32 = d.k / {bs}u;
+            for (var s: u32 = 0u; s < {slots_per_thread}u; s = s + 1u) {{
+                let slot: u32 = s * THREADS + tid;
+                if (slot < {slot_threads}u) {{
+                    let block_slot: u32 = slot / {tpb}u;
+                    let st: u32 = slot % {tpb}u;
+                    let kc: u32 = block_slot / BN;
+                    let bc: u32 = block_slot % BN;
+                    let n: u32 = bn0 + bc;
+                    let block_k_outer: u32 = t * {bk_chunks}u + kc;
+                    let base_elem: u32 = st * {elems_per_thread}u;
+                    if (n < d.n && block_k_outer < blocks_per_row) {{
+                        let global_block_idx: u32 = n * blocks_per_row + block_k_outer;
+                        let byte0: u32 = global_block_idx * {bpb}u;
+                        let scale: f32 = {scale_call}(byte0);
+                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 1u) {{
+                            tile_b[(kc * {bs}u + base_elem + i) * BN + bc] =
+                                {elem_call}(byte0, scale, base_elem + i);
+                        }}
+                    }} else {{
+                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 1u) {{
+                            tile_b[(kc * {bs}u + base_elem + i) * BN + bc] = 0.0;
+                        }}
+                    }}
+                }}
+            }}
+        }}
+"#
+            )
+        }
     };
 
     let out_write_loop = if act_packed {
@@ -297,20 +398,7 @@ fn main(
                 tile_a[idx] = v;
             }}
         }}
-        for (var s: u32 = 0u; s < {b_loads_per_thread}u; s = s + 1u) {{
-            let idx: u32 = s * THREADS + tid;
-            if (idx < BK * BN) {{
-                let br: u32 = idx / BN;
-                let bc: u32 = idx % BN;
-                let gr: u32 = k0 + br;
-                let gc: u32 = bn0 + bc;
-                var v: f32 = 0.0;
-                if (gr < d.k && gc < d.n) {{
-                    v = load_b(gr * d.n + gc);
-                }}
-                tile_b[idx] = v;
-            }}
-        }}
+{b_load_loop}
         workgroupBarrier();
 
         for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {{

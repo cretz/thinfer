@@ -512,8 +512,11 @@ mod sub_impl {
     /// layer is only added when `THINFER_TRACE=verbose` (or `v` / `2`) to keep
     /// silent runs quiet.
     ///
-    /// Panics if a global subscriber is already installed. Callers that wire
-    /// their own subscriber should call `rollup_layer_from_env` and compose.
+    /// Returns `Some(handle)` for the first caller in a process; subsequent
+    /// callers (e.g. a second `#[test]` in the same binary) get `None` because
+    /// the global subscriber is already installed. Production binaries call
+    /// this exactly once; tests that need the handle should fall back to
+    /// running their assertions without the rollup dump.
     pub fn init_from_env() -> Option<RollupHandle> {
         let val = std::env::var("THINFER_TRACE").ok()?;
         let rollup = RollupLayer::new();
@@ -521,7 +524,7 @@ mod sub_impl {
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let verbose = matches!(val.as_str(), "verbose" | "v" | "2");
-        if verbose {
+        let installed = if verbose {
             let fmt_layer = fmt::layer()
                 .with_writer(std::io::stderr)
                 .with_target(true)
@@ -530,11 +533,16 @@ mod sub_impl {
                 .with(env_filter)
                 .with(rollup)
                 .with(fmt_layer)
-                .init();
+                .try_init()
+                .is_ok()
         } else {
-            Registry::default().with(env_filter).with(rollup).init();
-        }
-        Some(handle)
+            Registry::default()
+                .with(env_filter)
+                .with(rollup)
+                .try_init()
+                .is_ok()
+        };
+        if installed { Some(handle) } else { None }
     }
 
     /// Like `init_from_env` but yields the layer for the caller to compose

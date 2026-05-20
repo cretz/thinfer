@@ -10,6 +10,7 @@ pub mod group_norm;
 pub mod layernorm;
 pub mod matmul;
 pub mod mul;
+pub mod qkv_split;
 pub mod rmsnorm;
 pub mod rope;
 pub mod scatter_pad_rows;
@@ -34,9 +35,10 @@ pub(crate) use group_norm::dispatch_group_norm;
 pub use group_norm::{GroupNormBufs, GroupNormF32, GroupNormOp};
 pub(crate) use layernorm::dispatch_layernorm;
 pub use layernorm::{LayerNormBufs, LayerNormF32, LayerNormOp};
-pub(crate) use matmul::dispatch_matmul;
-pub use matmul::{MatMulConfig, MatMulF32, MatmulBufs, MatmulOp};
+pub use matmul::{MatMulConfig, MatMulF32, MatmulBufs, MatmulOp, dispatch_matmul};
 pub use mul::MulF32;
+pub(crate) use qkv_split::dispatch_qkv_split;
+pub use qkv_split::{QkvSplitBufs, QkvSplitF32, QkvSplitOp};
 pub(crate) use rmsnorm::dispatch_rmsnorm;
 pub use rmsnorm::{RmsNormBufs, RmsNormF32, RmsNormOp};
 pub(crate) use rope::dispatch_rope;
@@ -88,6 +90,9 @@ pub enum WeightDtype {
     #[default]
     F32,
     Bf16,
+    /// Block-quantized weight (GGUF lineage). The scheme carries layout
+    /// constants + WGSL helpers via [`crate::quant::QuantKind`].
+    Quant(crate::quant::QuantKind),
 }
 
 impl WeightDtype {
@@ -95,6 +100,9 @@ impl WeightDtype {
         match self {
             Self::F32 => "wf32",
             Self::Bf16 => "wbf16",
+            Self::Quant(crate::quant::QuantKind::Q8_0) => "wq80",
+            Self::Quant(crate::quant::QuantKind::Q4_0) => "wq40",
+            Self::Quant(crate::quant::QuantKind::Q4_K) => "wq4k",
         }
     }
 }
@@ -187,15 +195,37 @@ impl WgslConfig {
     /// Short tag for `KernelKey` hints and pipeline-cache disambiguation.
     /// Must change whenever any cfg field changes - the same kernel id with
     /// different `WgslConfig` values needs distinct cache entries.
-    pub fn hint(&self) -> &'static str {
-        match (self.bf16_quant_writes, self.act_dtype, self.weight_dtype) {
+    ///
+    /// Quant variants short-circuit through the component hint to keep the
+    /// match arm count linear instead of cartesian. Existing legacy strings
+    /// for the F32/Bf16 cartesian are preserved verbatim so prior pipeline
+    /// cache keys remain stable.
+    pub fn hint(&self) -> String {
+        if let WeightDtype::Quant(_) = self.weight_dtype {
+            // Quant-weights kernels: combine component hints. bf16_quant_writes
+            // is meaningful only when act_dtype is F32.
+            let q = if self.bf16_quant_writes && self.act_dtype == ActDtype::F32 {
+                "bf16q-"
+            } else {
+                ""
+            };
+            return format!(
+                "{}{}-{}",
+                q,
+                self.act_dtype.hint(),
+                self.weight_dtype.hint()
+            );
+        }
+        let legacy = match (self.bf16_quant_writes, self.act_dtype, self.weight_dtype) {
             (false, ActDtype::F32, WeightDtype::F32) => "",
             (true, ActDtype::F32, WeightDtype::F32) => "bf16q",
             (false, ActDtype::F32, WeightDtype::Bf16) => "wbf16",
             (true, ActDtype::F32, WeightDtype::Bf16) => "bf16q-wbf16",
             (_, ActDtype::Bf16, WeightDtype::F32) => "abf16-wf32",
             (_, ActDtype::Bf16, WeightDtype::Bf16) => "abf16",
-        }
+            (_, _, WeightDtype::Quant(_)) => unreachable!("handled above"),
+        };
+        legacy.to_string()
     }
 }
 

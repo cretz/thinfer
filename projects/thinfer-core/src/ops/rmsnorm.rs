@@ -184,6 +184,9 @@ impl RmsNormOp for RmsNormF32 {
             (ActDtype::Bf16, WeightDtype::F32, _) => {
                 panic!("rmsnorm: packed-bf16 acts with fp32 weights not implemented")
             }
+            (_, WeightDtype::Quant(_), _) => {
+                unreachable!("rmsnorm does not consume quant weights")
+            }
         }
     }
     fn layout() -> &'static [BindingLayout] {

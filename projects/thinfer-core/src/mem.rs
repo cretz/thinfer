@@ -69,12 +69,10 @@ impl Counter {
         let now = self.current.fetch_add(n, Ordering::Relaxed) + n;
         let mut peak = self.peak.load(Ordering::Relaxed);
         while now > peak {
-            match self.peak.compare_exchange_weak(
-                peak,
-                now,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .peak
+                .compare_exchange_weak(peak, now, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(p) => peak = p,
             }
@@ -88,12 +86,9 @@ impl Counter {
         let new = prev.saturating_sub(n);
         // Best-effort CAS - racy concurrent subs are tolerated; tests use
         // either single-threaded paths or the CAS retry below.
-        let _ = self.current.compare_exchange(
-            prev,
-            new,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let _ = self
+            .current
+            .compare_exchange(prev, new, Ordering::Relaxed, Ordering::Relaxed);
     }
     fn current(&self) -> u64 {
         self.current.load(Ordering::Relaxed)
