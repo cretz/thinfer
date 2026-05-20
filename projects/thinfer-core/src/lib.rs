@@ -4,6 +4,7 @@ pub mod backend;
 pub mod cache;
 pub mod format;
 pub mod manifest;
+pub mod mem;
 pub mod module;
 pub mod ops;
 pub mod pipeline;

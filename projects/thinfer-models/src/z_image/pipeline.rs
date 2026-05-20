@@ -428,8 +428,12 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             out
         };
         // Phase boundary: text encoder weights are dead for the rest of this
-        // call. Evict to the residency pool so DiT acquires reuse the slots.
+        // call. Evict to the residency pool so DiT acquires reuse the slots,
+        // and drain the workspace pool so size classes from text_encode
+        // (cap-shaped) don't sit live in VRAM while DiT allocates its own
+        // (image-token-shaped) working set.
         self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
 
         // 3. Initial noise: [16, 1, h_lat, w_lat] standard normal.
         let n_lat = C_LATENT * h_lat * w_lat;
@@ -577,8 +581,11 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         }
 
         // Phase boundary: DiT block weights are dead until next inference.
-        // Evict so VAE decode's allocations reuse the pool's slots.
+        // Evict so VAE decode's allocations reuse the pool's slots, and drain
+        // workspace size classes so DiT's bigger activation buffers aren't
+        // held idle while VAE allocates its own.
         self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
         Ok((sample, h_lat, w_lat))
     }
 }

@@ -147,6 +147,27 @@ impl<B: Backend> Workspace<B> {
         }
     }
 
+    /// Drop every idle buffer in the pool, freeing the underlying GPU
+    /// allocations back to the backend. Phase-boundary use: call between
+    /// text_encode -> DiT -> VAE so size classes from the prior phase don't
+    /// sit live in VRAM while the next phase allocates its own working set.
+    /// In-flight `WsBuf` rentals are unaffected; only buffers currently in
+    /// the free-list drop.
+    pub fn drain_pool(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let mut total = 0usize;
+        for (_class, mut bufs) in inner.free.drain() {
+            total += bufs.len();
+            // OwnedBuffer::drop calls backend.free, releasing VRAM accounting.
+            bufs.clear();
+        }
+        tracing::info!(
+            target: trace::WS,
+            op = "drain_pool",
+            freed = total as u64,
+        );
+    }
+
     /// Total idle buffers currently sitting in the pool's free-list. Test /
     /// diagnostics only.
     pub fn free_count(&self) -> usize {
@@ -910,6 +931,7 @@ mod tests {
     struct MockBackend {
         next: std::cell::Cell<u64>,
         allocated: std::cell::RefCell<std::collections::HashSet<GpuBufferId>>,
+        mem: Arc<crate::mem::MemAccount>,
     }
 
     impl MockBackend {
@@ -917,6 +939,7 @@ mod tests {
             Self {
                 next: std::cell::Cell::new(1),
                 allocated: Default::default(),
+                mem: crate::mem::MemAccount::new(),
             }
         }
         fn live(&self) -> usize {
@@ -936,6 +959,9 @@ mod tests {
         }
         fn free(&self, id: GpuBufferId) {
             self.allocated.borrow_mut().remove(&id);
+        }
+        fn mem_account(&self) -> &Arc<crate::mem::MemAccount> {
+            &self.mem
         }
         fn write_buffer(&self, _: GpuBufferId, _: u64, _: &[u8]) -> Result<(), ()> {
             Ok(())

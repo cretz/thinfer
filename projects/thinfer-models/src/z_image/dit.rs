@@ -381,10 +381,21 @@ impl ZImageDit {
                             None => Ok(None),
                         }
                     };
+                    let prefetch_after = async {
+                        match self.noise_refiner_handles.get(idx + 2) {
+                            Some(h) => {
+                                let span = tracing::debug_span!(target: PHASE, "dit.prefetch", phase = "noise_refiner", idx = idx + 2);
+                                h.prefetch(residency, backend).instrument(span).await
+                            }
+                            None => Ok(()),
+                        }
+                    };
                     let submit_fut = scope.submit_void().instrument(
                         tracing::debug_span!(target: PHASE, "dit.submit", phase = "noise_refiner", idx),
                     );
-                    let (s_res, n_res) = futures::join!(submit_fut, next_acquire);
+                    let (s_res, n_res, p_res) =
+                        futures::join!(submit_fut, next_acquire, prefetch_after);
+                    p_res?;
                     pending = n_res?;
                     s_res
                 };
@@ -533,10 +544,21 @@ impl ZImageDit {
                             None => Ok(None),
                         }
                     };
+                    let prefetch_after = async {
+                        match self.context_refiner_handles.get(idx + 2) {
+                            Some(h) => {
+                                let span = tracing::debug_span!(target: PHASE, "dit.prefetch", phase = "context_refiner", idx = idx + 2);
+                                h.prefetch(residency, backend).instrument(span).await
+                            }
+                            None => Ok(()),
+                        }
+                    };
                     let submit_fut = scope.submit_void().instrument(
                         tracing::debug_span!(target: PHASE, "dit.submit", phase = "context_refiner", idx),
                     );
-                    let (s_res, n_res) = futures::join!(submit_fut, next_acquire);
+                    let (s_res, n_res, p_res) =
+                        futures::join!(submit_fut, next_acquire, prefetch_after);
+                    p_res?;
                     pending = n_res?;
                     s_res
                 };
@@ -654,10 +676,21 @@ impl ZImageDit {
                         None => Ok(None),
                     }
                 };
+                let prefetch_after = async {
+                    match self.layers_handles.get(idx + 2) {
+                        Some(h) => {
+                            let span = tracing::debug_span!(target: PHASE, "dit.prefetch", phase = "layers", idx = idx + 2);
+                            h.prefetch(residency, backend).instrument(span).await
+                        }
+                        None => Ok(()),
+                    }
+                };
                 let submit_fut = scope.submit_void().instrument(
                     tracing::debug_span!(target: PHASE, "dit.submit", phase = "layers", idx),
                 );
-                let (s_res, n_res) = futures::join!(submit_fut, next_acquire);
+                let (s_res, n_res, p_res) =
+                    futures::join!(submit_fut, next_acquire, prefetch_after);
+                p_res?;
                 pending = n_res?;
                 s_res
             };

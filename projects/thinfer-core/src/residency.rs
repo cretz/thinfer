@@ -1,16 +1,23 @@
 //! Weight residency manager. Pages weights disk -> VRAM on `acquire`, evicts
-//! LRU on the GPU tier to stay under `ResidencyBudget.vram_bytes`. Returned
-//! `GpuView` pins the GPU buffer so eviction can't steal it mid-forward.
+//! LRU on the GPU tier to keep VRAM total under `ResidencyBudget.vram_bytes`.
+//! Returned `GpuView` pins the GPU buffer so eviction can't steal it
+//! mid-forward.
 //!
 //! No host-side `Vec<u8>` mirror: the `WeightSource` is mmap-backed, so the OS
-//! page cache is the host tier. `ResidencyBudget.ram_bytes` is ignored here;
-//! it remains on the policy struct because the CLI surface is wired through
-//! and pytorch parity defers host-side accounting to the kernel.
+//! page cache is the host tier and `ResidencyBudget.ram_bytes` is enforced at
+//! the upload-staging level, not here.
+//!
+//! Eviction predicate uses the shared `MemAccount` (workspace + staging
+//! counters): weights are evicted until
+//! `weights_current + needed + max(workspace_reserve, non_weights_current)
+//! <= vram_bytes`. This is the "soft floor" that prevents weights from
+//! filling the entire budget and forcing every workspace alloc into churn.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::backend::{Backend, BufRef};
+use crate::mem::{RamCategory, RamCharge, VramCategory};
 use crate::policy::ResidencyBudget;
 use crate::tensor::{GpuBufferId, Shape, StorageEncoding};
 use crate::weight::{DecodeError, WeightId, WeightReader, WeightSource};
@@ -180,14 +187,27 @@ impl<S: WeightSource> WeightResidency<S> {
 
         // GPU miss. Stream from the mmap'd source directly into the bf16-packed
         // upload layout; no host-side cache. The temporary `Vec<u8>` lives only
-        // until `write_buffer` returns.
+        // until `write_buffer` returns - tracked as RAM Upload so the budget
+        // sees this transient peak.
+        let _upload_charge = RamCharge::new(
+            backend.mem_account().clone(),
+            RamCategory::Upload,
+            meta.storage_bytes(),
+        );
         let bytes = self.read_for_gpu::<B>(&meta).await?;
 
         let gpu_size = bytes.len() as u64;
-        if gpu_size > self.budget.vram_bytes {
+        // Single weight must fit under the dynamic ceiling (full budget less
+        // the workspace reserve). Evict everything else first wouldn't help if
+        // even one weight is structurally too large.
+        let single_ceiling = self
+            .budget
+            .vram_bytes
+            .saturating_sub(self.budget.workspace_reserve);
+        if gpu_size > single_ceiling {
             return Err(ResidencyError::BudgetTooSmall {
                 needed: gpu_size,
-                have: self.budget.vram_bytes,
+                have: single_ceiling,
                 tier: "vram",
             });
         }
@@ -199,7 +219,7 @@ impl<S: WeightSource> WeightResidency<S> {
         let id = match id {
             Some(id) => id,
             None => backend
-                .allocate(gpu_size)
+                .allocate_in(gpu_size, VramCategory::Weights)
                 .map_err(ResidencyError::Backend)?,
         };
         backend
@@ -307,6 +327,27 @@ impl<S: WeightSource> WeightResidency<S> {
         }
     }
 
+    /// Load `handle` to GPU without pinning. Used to overlap upload work for
+    /// block N+2 with the join of `submit(N) || acquire(N+1)`. On completion
+    /// the weight is in `Gpu` state at MRU; a later `acquire` is a hit.
+    ///
+    /// Idempotent for in-flight callers: a second `prefetch` of an already-
+    /// resident handle just touches LRU. No fire-and-forget semantics; caller
+    /// drives the future via `join!` against work that progresses anyway
+    /// (typical: the next `submit_void` await). This keeps the API executor-
+    /// neutral - no `spawn` requirement on wasm.
+    pub async fn prefetch<B: Backend>(
+        &self,
+        handle: WeightHandle,
+        backend: &B,
+    ) -> Result<(), ResidencyError<S::Error, B::Error>> {
+        // Same code path as acquire, then drop the view. Net effect: entry
+        // is in Gpu state with pin_count=0 at MRU.
+        let view = self.acquire(handle, backend).await?;
+        drop(view);
+        Ok(())
+    }
+
     /// Phase-boundary eviction: free every unpinned GPU-resident weight and
     /// drain the pool, releasing the VRAM back to wgpu. Caller's policy:
     /// invoke between pipeline phases (post text_encode, end of denoise) so
@@ -343,19 +384,33 @@ impl<S: WeightSource> WeightResidency<S> {
     /// the next miss of matching size reuses them. Errors only if every
     /// remaining resident weight is pinned (caller's working set exceeds
     /// budget; nothing eviction can do).
+    ///
+    /// Predicate: `weights_after + non_weights_floor + needed <= vram_bytes`,
+    /// where `non_weights_floor = max(workspace_reserve, mem.vram_non_weights_current())`.
+    /// The reserve prevents weights from squatting on the whole budget and
+    /// forcing workspace allocs into eviction-induced thrash.
     fn evict_gpu_until_fits<B: Backend>(
         &self,
         needed: u64,
-        _backend: &B,
+        backend: &B,
     ) -> Result<(), ResidencyError<S::Error, B::Error>> {
+        let mem = backend.mem_account();
         let mut g = self.inner.lock().unwrap();
         let mut idx = 0;
-        while g.gpu_bytes + needed > self.budget.vram_bytes {
+        loop {
+            let non_weights_floor = self
+                .budget
+                .workspace_reserve
+                .max(mem.vram_non_weights_current());
+            let ceiling = self.budget.vram_bytes.saturating_sub(non_weights_floor);
+            if g.gpu_bytes + needed <= ceiling {
+                break;
+            }
             let victim = loop {
                 let Some(&cand) = g.gpu_lru.get(idx) else {
                     return Err(ResidencyError::BudgetTooSmall {
                         needed,
-                        have: self.budget.vram_bytes - g.gpu_bytes,
+                        have: ceiling.saturating_sub(g.gpu_bytes),
                         tier: "vram",
                     });
                 };

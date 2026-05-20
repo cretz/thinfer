@@ -112,9 +112,15 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
 
     let ram_bytes = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
     let vram_bytes = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
+    // Workspace reserve: 25% of vram_bytes by default. Holds back enough VRAM
+    // for non-weight buffers (workspace + staging) so weights can't squat on
+    // the whole budget and force every activation alloc to evict-and-reload.
+    // Tunable knob; the e2e_parity test uses a more aggressive value.
+    let workspace_reserve = vram_bytes / 4;
     let budget = ResidencyBudget {
         ram_bytes,
         vram_bytes,
+        workspace_reserve,
     };
 
     let manifest = args.model.manifest();
@@ -214,6 +220,11 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
                 .map_err(|e| format!("wgpu init: {e:?}"))?,
         )
     };
+    // Clone for end-of-run stats reporting; ZImageModel::load takes
+    // ownership of one Arc, we keep the other to read mem snapshots when
+    // THINFER_TRACE is set (same gate that enables the rollup table in
+    // main.rs, so a single env var turns on the full report).
+    let backend_for_stats = std::env::var_os("THINFER_TRACE").map(|_| Arc::clone(&backend));
     let model = {
         let _s = tracing::info_span!("model_load").entered();
         ZImageModel::load(backend, residency, tokenizer)
@@ -236,7 +247,34 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
         .await
         .map_err(|e| format!("write {}: {e}", args.output.display()))?;
     tracing::info!(target: DIAG, path = %args.output.display(), bytes = png.len(), "wrote output");
+    if let Some(b) = backend_for_stats {
+        let snap = thinfer_core::backend::Backend::mem_account(&*b).snapshot();
+        eprintln!(
+            "[mem] vram TRUE_PEAK={} / budget {} | per-cat peaks: weights={} workspace={} staging={}",
+            fmt_mib(snap.vram_total_peak),
+            fmt_mib(vram_bytes),
+            fmt_mib(snap.vram_weights.1),
+            fmt_mib(snap.vram_workspace.1),
+            fmt_mib(snap.vram_staging.1),
+        );
+        eprintln!(
+            "[mem] ram  TRUE_PEAK={} / budget {} | per-cat peaks: upload={} readback={} other={}",
+            fmt_mib(snap.ram_total_peak),
+            fmt_mib(ram_bytes),
+            fmt_mib(snap.ram_upload.1),
+            fmt_mib(snap.ram_readback.1),
+            fmt_mib(snap.ram_other.1),
+        );
+    }
     Ok(())
+}
+
+fn fmt_mib(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.2}GiB", bytes as f64 / (1u64 << 30) as f64)
+    } else {
+        format!("{:.1}MiB", bytes as f64 / (1u64 << 20) as f64)
+    }
 }
 
 /// Non-cryptographic seed for `--seed`-omitted runs. Mixes nanos and pid so

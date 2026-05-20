@@ -823,6 +823,35 @@ impl BlockHandles {
             adaln,
         })
     }
+
+    /// Load every weight in this block to GPU without pinning. Drives all
+    /// per-tensor uploads serially within this future, but the future as a
+    /// whole runs concurrently with the previous block's GPU submit when the
+    /// caller `join!`s it.
+    pub async fn prefetch<S: WeightSource>(
+        &self,
+        residency: &WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<(), ResidencyError<S::Error, WgpuError>> {
+        if let Some(a) = &self.adaln {
+            residency.prefetch(a.weight, backend).await?;
+            residency.prefetch(a.bias, backend).await?;
+        }
+        residency.prefetch(self.attention_norm1, backend).await?;
+        residency.prefetch(self.attention_norm2, backend).await?;
+        residency.prefetch(self.ffn_norm1, backend).await?;
+        residency.prefetch(self.ffn_norm2, backend).await?;
+        residency.prefetch(self.attn_to_q, backend).await?;
+        residency.prefetch(self.attn_to_k, backend).await?;
+        residency.prefetch(self.attn_to_v, backend).await?;
+        residency.prefetch(self.attn_to_out, backend).await?;
+        residency.prefetch(self.attn_norm_q, backend).await?;
+        residency.prefetch(self.attn_norm_k, backend).await?;
+        residency.prefetch(self.ffn_w1, backend).await?;
+        residency.prefetch(self.ffn_w2, backend).await?;
+        residency.prefetch(self.ffn_w3, backend).await?;
+        Ok(())
+    }
 }
 
 impl BlockViews<'_> {

@@ -1,5 +1,6 @@
 use crate::backend::poll::WgpuPoll;
 use crate::backend::{Backend, Binding, BindingKind, BindingLayout};
+use crate::mem::{MemAccount, VramCategory, VramCharge};
 use crate::tensor::GpuBufferId;
 use crate::trace;
 use core::future::Future;
@@ -11,7 +12,7 @@ pub struct WgpuBackend {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     next_id: Mutex<u64>,
-    buffers: Mutex<HashMap<GpuBufferId, Arc<wgpu::Buffer>>>,
+    buffers: Mutex<HashMap<GpuBufferId, BufferEntry>>,
     poll: WgpuPoll,
     /// Monotonic submit ordinal. Used to tag validation errors and buffer
     /// lifecycle traces so failures can be attributed to a specific submit.
@@ -31,6 +32,21 @@ pub struct WgpuBackend {
     /// allocation point; on wasm the handler may fire asynchronously and the
     /// per-submit scopes catch what slips past.
     uncaptured: Arc<Mutex<Option<wgpu::Error>>>,
+    /// Shared memory accountant. Backend charges `Staging` directly for
+    /// internal readback/timestamp buffers; the default `allocate(bytes)`
+    /// charges `Workspace`. Residency calls `allocate_in(bytes, Weights)`
+    /// explicitly. Buffer-id -> (bytes, category) is recorded so `free` can
+    /// release to the right counter without the caller re-specifying.
+    mem: Arc<MemAccount>,
+}
+
+/// Entry in `WgpuBackend.buffers`. The `cat` is recorded at allocate so
+/// `free` can release bytes to the counter that originally charged them,
+/// without the caller having to thread category through every drop path.
+struct BufferEntry {
+    buf: Arc<wgpu::Buffer>,
+    cat: VramCategory,
+    bytes: u64,
 }
 
 #[derive(Debug)]
@@ -103,6 +119,9 @@ struct PendingTimestamps {
     period_ns: f32,
     _query_set: wgpu::QuerySet,
     _resolve_buf: wgpu::Buffer,
+    /// Releases the Staging VRAM charge for both timestamp buffers when the
+    /// pending payload drops (after readback or on submit failure).
+    _charge: VramCharge,
 }
 
 /// Map the timestamp staging buffer, decode u64 tick pairs, and emit one
@@ -276,6 +295,7 @@ impl WgpuBackend {
             rbe_ordinal: AtomicU64::new(0),
             uncaptured,
             timestamps,
+            mem: MemAccount::new(),
         })
     }
 
@@ -284,8 +304,59 @@ impl WgpuBackend {
             .lock()
             .unwrap()
             .get(&id)
-            .cloned()
+            .map(|e| Arc::clone(&e.buf))
             .ok_or(WgpuError::UnknownBuffer(id))
+    }
+
+    /// Categorized allocation. Bumps `mem` under `cat` and records the
+    /// category on the buffer so `free` refunds the same counter. The
+    /// `Backend::allocate(bytes)` blanket charges `Workspace`; callers that
+    /// know better (residency) call this with `Weights`, internal staging
+    /// uses `Staging`.
+    pub fn allocate_in(&self, bytes: u64, cat: VramCategory) -> Result<GpuBufferId, WgpuError> {
+        let _ = self.uncaptured.lock().unwrap().take();
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        if let Some(err) = self.uncaptured.lock().unwrap().take() {
+            tracing::error!(
+                target: trace::WGPU_ERR,
+                kind = "alloc",
+                bytes = bytes,
+                cat = cat.label(),
+                error = %err,
+            );
+            return Err(WgpuError::Allocate { bytes, source: err });
+        }
+        let id = {
+            let mut n = self.next_id.lock().unwrap();
+            let id = GpuBufferId(*n);
+            *n += 1;
+            id
+        };
+        self.mem.charge_vram(cat, bytes);
+        self.buffers.lock().unwrap().insert(
+            id,
+            BufferEntry {
+                buf: Arc::new(buf),
+                cat,
+                bytes,
+            },
+        );
+        tracing::info!(
+            target: trace::BUF,
+            op = "alloc",
+            id = id.0,
+            bytes = bytes,
+            cat = cat.label(),
+        );
+        Ok(id)
     }
 
     /// Stage a readback inside the caller's encoder. The caller submits that
@@ -313,6 +384,7 @@ impl WgpuBackend {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        let staging_charge = VramCharge::new(Arc::clone(&self.mem), VramCategory::Staging, len);
         encoder.copy_buffer_to_buffer(&src_buf, offset, &staging, 0, len);
         let scope = scope_guard.pop();
         let guard = self.poll.poll_guard();
@@ -327,6 +399,7 @@ impl WgpuBackend {
         );
         Ok(async move {
             let _guard = guard;
+            let _staging_charge = staging_charge;
             if let Some(err) = scope.await {
                 tracing::error!(
                     target: trace::RBE,
@@ -368,56 +441,34 @@ impl Backend for WgpuBackend {
     type Pipeline = WgpuPipeline;
 
     fn allocate(&self, bytes: u64) -> Result<GpuBufferId, Self::Error> {
-        // Drain any stale uncaptured error before the call so a failure here
-        // is attributable to THIS create_buffer, not an earlier sync op.
-        let _ = self.uncaptured.lock().unwrap().take();
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        if let Some(err) = self.uncaptured.lock().unwrap().take() {
-            tracing::error!(
-                target: trace::WGPU_ERR,
-                kind = "alloc",
-                bytes = bytes,
-                error = %err,
-            );
-            return Err(WgpuError::Allocate { bytes, source: err });
-        }
-        let id = {
-            let mut n = self.next_id.lock().unwrap();
-            let id = GpuBufferId(*n);
-            *n += 1;
-            id
-        };
-        self.buffers.lock().unwrap().insert(id, Arc::new(buf));
-        tracing::info!(
-            target: trace::BUF,
-            op = "alloc",
-            id = id.0,
-            bytes = bytes,
-        );
-        Ok(id)
+        // Trait blanket charges Workspace. Residency calls `allocate_in`
+        // directly to charge Weights; staging stays internal to the backend.
+        WgpuBackend::allocate_in(self, bytes, VramCategory::Workspace)
+    }
+
+    fn allocate_in(&self, bytes: u64, cat: VramCategory) -> Result<GpuBufferId, Self::Error> {
+        WgpuBackend::allocate_in(self, bytes, cat)
+    }
+
+    fn mem_account(&self) -> &Arc<MemAccount> {
+        &self.mem
     }
 
     fn free(&self, id: GpuBufferId) {
-        let bytes = self
-            .buffers
-            .lock()
-            .unwrap()
-            .remove(&id)
-            .map(|b| b.size())
-            .unwrap_or(0);
+        let entry = self.buffers.lock().unwrap().remove(&id);
+        let (bytes, cat) = match entry {
+            Some(e) => {
+                self.mem.release_vram(e.cat, e.bytes);
+                (e.bytes, Some(e.cat))
+            }
+            None => (0, None),
+        };
         tracing::info!(
             target: trace::BUF,
             op = "free",
             id = id.0,
             bytes = bytes,
+            cat = cat.map(|c| c.label()).unwrap_or("unknown"),
         );
     }
 
@@ -581,6 +632,9 @@ impl Backend for WgpuBackend {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
+            // One charge covers both buffers; both live for the same scope.
+            let _ts_charge =
+                VramCharge::new(Arc::clone(&self.mem), VramCategory::Staging, bytes * 2);
             encoder
                 .enc
                 .resolve_query_set(&ts.query_set, 0..used_slots, &resolve_buf, 0);
@@ -596,6 +650,7 @@ impl Backend for WgpuBackend {
                 period_ns: self.timestamps.as_ref().map(|c| c.period_ns).unwrap_or(1.0),
                 _query_set: ts.query_set,
                 _resolve_buf: resolve_buf,
+                _charge: _ts_charge,
             })
         });
         let validation_guard = device.push_error_scope(wgpu::ErrorFilter::Validation);

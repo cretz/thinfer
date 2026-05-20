@@ -1,5 +1,7 @@
+use crate::mem::{MemAccount, VramCategory};
 use crate::tensor::GpuBufferId;
 use core::future::Future;
+use std::sync::Arc;
 
 mod poll;
 pub mod wgpu;
@@ -65,7 +67,20 @@ pub trait Backend: 'static {
     type Pipeline;
 
     fn allocate(&self, bytes: u64) -> Result<GpuBufferId, Self::Error>;
+    /// Categorized allocation. Default implementation ignores the category
+    /// (test mocks). Real backends override to attribute the bytes to the
+    /// right `MemAccount` counter so eviction policy and budget assertions
+    /// see the correct picture.
+    fn allocate_in(&self, bytes: u64, _cat: VramCategory) -> Result<GpuBufferId, Self::Error> {
+        self.allocate(bytes)
+    }
     fn free(&self, id: GpuBufferId);
+
+    /// Shared memory accountant. Backends own one `MemAccount` for their
+    /// lifetime; this hands out a clone of the `Arc` so residency, workspace,
+    /// and budget assertions see the same counters. Test mocks hold a
+    /// throwaway `MemAccount` in a field.
+    fn mem_account(&self) -> &Arc<MemAccount>;
 
     /// Host bytes → GPU buffer. Test inputs and host-resident weights land here.
     /// JS-heap weights on web go through a backend-specific path that bypasses
