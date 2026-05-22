@@ -86,6 +86,10 @@ pub struct DitTaps<'a> {
     /// tap. Used to narrow which op first produces NaN under a new
     /// weight encoding (e.g. Q8_0).
     pub block0: Option<&'a mut Block0Taps>,
+    /// Per-op readbacks inside `context_refiner.0` (first ctx-refiner block,
+    /// modulation=false). Same struct as [`Block0Taps`]; adaln_* fields stay
+    /// `None`-shaped after the run since this block has no adaln path.
+    pub ctx_block0: Option<&'a mut Block0Taps>,
 }
 
 /// Per-op readbacks inside `dit.layers.0` (first DiT main block). All values
@@ -591,9 +595,25 @@ impl ZImageDit {
                 let mask_ref = cap_mask.as_buf_ref();
                 let nxt_ref = nxt.as_buf_ref();
                 let next_idx = idx + 1;
+                // Allocate per-op tap bufs only for ctx_refiner block 0 and
+                // only when the caller requested ctx_block0. Sized against
+                // the ctx-refiner block's own seq (= seq_cap), not seq_u.
+                let cb0_bufs = if idx == 0
+                    && let Some(req) = taps.ctx_block0.as_deref()
+                {
+                    Some(Block0TapBufs::alloc(
+                        req, scratch, pipelines, seq_cap, dim, blk.cfg,
+                    )?)
+                } else {
+                    None
+                };
+                let cb0_block_taps = cb0_bufs
+                    .as_ref()
+                    .map(Block0TapBufs::to_block_debug_taps)
+                    .unwrap_or(BlockDebugTaps::EMPTY);
                 let submit_res = {
                     let scope = scratch.batch();
-                    blk.forward(
+                    blk.forward_taps(
                         &scope,
                         pipelines,
                         scope.import(&cap_cur_ref),
@@ -602,6 +622,7 @@ impl ZImageDit {
                         None,
                         scope.import(&nxt_ref),
                         &bufs,
+                        &cb0_block_taps,
                     )?;
                     let next_acquire = async {
                         match self.context_refiner_handles.get(next_idx) {
@@ -633,6 +654,11 @@ impl ZImageDit {
                     s_res
                 };
                 submit_res?;
+                if let (Some(tap_bufs), Some(sink)) = (cb0_bufs, taps.ctx_block0.as_deref_mut()) {
+                    tap_bufs
+                        .read_back(backend, pipelines.act_dtype, sink)
+                        .await?;
+                }
                 cap_cur = nxt;
             }
             cap_cur
@@ -918,6 +944,15 @@ impl ZImageDit {
                     }
                 }
             }
+            ActDtype::F16 => {
+                for i in 0..layout.seq_x_ori {
+                    for j in 0..row {
+                        let idx = (i * row + j) * 2;
+                        let bits = u16::from_le_bytes([bytes[idx], bytes[idx + 1]]);
+                        tokens.push(half::f16::from_bits(bits).to_f32());
+                    }
+                }
+            }
         }
         let image = seq::unpatchify(&tokens, c, f, h, w, layout.patch_size, layout.f_patch_size);
         DitOutput { image }
@@ -956,6 +991,14 @@ fn act_upload_bytes(act: ActDtype, slice: &[f32]) -> Vec<u8> {
             let mut bytes = vec![0u8; slice.len() * 2];
             for (i, v) in slice.iter().enumerate() {
                 let h = round_f32_to_bf16(*v);
+                bytes[i * 2..(i + 1) * 2].copy_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        }
+        ActDtype::F16 => {
+            let mut bytes = vec![0u8; slice.len() * 2];
+            for (i, v) in slice.iter().enumerate() {
+                let h = half::f16::from_f32(*v).to_bits();
                 bytes[i * 2..(i + 1) * 2].copy_from_slice(&h.to_le_bytes());
             }
             bytes
@@ -1021,7 +1064,7 @@ pub async fn scatter_pad_rows(
     let scope = scratch.batch();
     let dispatch_elems = match pipelines.act_dtype {
         ActDtype::F32 => n_rows * dim,
-        ActDtype::Bf16 => n_rows * (dim / 2),
+        ActDtype::Bf16 | ActDtype::F16 => n_rows * (dim / 2),
     };
     scope.scatter_pad_rows::<ScatterPadRowsF32>(
         &pipelines.scatter_pad_rows,
@@ -1268,6 +1311,12 @@ async fn read_into_f32_tagged(
             for c in bytes.chunks_exact(2) {
                 let half = u16::from_le_bytes([c[0], c[1]]);
                 sink.push(f32::from_bits((half as u32) << 16));
+            }
+        }
+        ActDtype::F16 => {
+            for c in bytes.chunks_exact(2) {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                sink.push(half::f16::from_bits(bits).to_f32());
             }
         }
     }

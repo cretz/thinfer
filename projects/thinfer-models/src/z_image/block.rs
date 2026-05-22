@@ -570,7 +570,7 @@ impl Block {
             let u_split = qkv_split_uniform(scope, rows, h)?;
             let n_words = match pipelines.act_dtype {
                 ActDtype::F32 => rows * h,
-                ActDtype::Bf16 => rows * (h / 2),
+                ActDtype::Bf16 | ActDtype::F16 => rows * (h / 2),
             };
             scope.qkv_split::<QkvSplitF32>(
                 &pipelines.qkv_split,

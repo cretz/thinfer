@@ -24,6 +24,13 @@ pub struct WgpuBackend {
     /// `period_ns` is the queue's timestamp tick length (multiply tick deltas
     /// by this to get ns of GPU time).
     timestamps: Option<TimestampCfg>,
+    /// True when the adapter exposed `Features::SHADER_F16` and we successfully
+    /// requested it on the device. Drives the model layer's choice of
+    /// activation dtype: when set, the Q8 path compiles kernels with
+    /// `ActDtype::F16` (native `vec2<f16>` storage); when unset, it falls
+    /// back to `ActDtype::F32`. Bf16-weight production path is unaffected
+    /// either way.
+    shader_f16: bool,
     /// Sink for uncaptured errors. The wgpu uncaptured handler stores the
     /// FIRST error received here (later ones are eprintln'd but not stored,
     /// so the root cause isn't shadowed by its own cascade). Drained at sync
@@ -233,11 +240,20 @@ impl WgpuBackend {
                 "WgpuConfig.timestamps requested but adapter lacks TIMESTAMP_QUERY; per-dispatch gpu_ms unavailable",
             );
         }
-        let required_features = if request_ts {
-            wgpu::Features::TIMESTAMP_QUERY
-        } else {
-            wgpu::Features::empty()
-        };
+        // SHADER_F16 is the wgpu feature backing WGSL `enable f16;` (native
+        // `f16` / `vec2<f16>` scalar/vector types in storage and compute).
+        // Chrome/Edge expose this on WebGPU; Firefox is WIP. Request opportun-
+        // istically — when the adapter exposes it we light up the F16 acts
+        // path in the Q8 pipeline; when it doesn't we fall back to F32 acts.
+        // Bf16 path is unaffected either way (it doesn't read f16 storage).
+        let adapter_has_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
+        let mut required_features = wgpu::Features::empty();
+        if request_ts {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        if adapter_has_f16 {
+            required_features |= wgpu::Features::SHADER_F16;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thinfer"),
@@ -273,6 +289,7 @@ impl WgpuBackend {
             driver = %info.driver,
             driver_info = %info.driver_info,
             device_type = ?info.device_type,
+            shader_f16 = adapter_has_f16,
             "wgpu adapter",
         );
         let uncaptured: Arc<Mutex<Option<wgpu::Error>>> = Arc::new(Mutex::new(None));
@@ -304,8 +321,16 @@ impl WgpuBackend {
             rbe_ordinal: AtomicU64::new(0),
             uncaptured,
             timestamps,
+            shader_f16: adapter_has_f16,
             mem: MemAccount::new(),
         })
+    }
+
+    /// Whether the device was created with `Features::SHADER_F16` (WGSL
+    /// native `f16` / `vec2<f16>`). Consumers (model layer) gate their
+    /// activation dtype choice on this.
+    pub fn supports_shader_f16(&self) -> bool {
+        self.shader_f16
     }
 
     fn get_buffer(&self, id: GpuBufferId) -> Result<Arc<wgpu::Buffer>, WgpuError> {

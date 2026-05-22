@@ -2,15 +2,17 @@
 
 ## Current state
 
-Q8 e2e parity passes (numerical clean: step0/step1 `above_tol=0/16384`,
-vae_rgb diffs match bf16 baseline). VRAM TRUE_PEAK 1.48 GiB / 2 GiB budget.
-Wall: Q8 diffusion ~65 s, bf16 ~47 s on iGPU low-power.
-
-Q8 is slower than bf16 because acts run as F32 (precision-deliberate, not
-bf16-packed). For QKV shape at bm=bn=64: tile_a reads ~2.8 GiB vs bf16's
-~1.4 GiB. B-bandwidth advantage (~0.7 GiB saved) doesn't cover the
-A-bandwidth penalty (~1.4 GiB added). Net, Q8 reads more bytes per
-matmul than bf16.
+Q8 path lit up with native `SHADER_F16` activations:
+- `ActDtype::F16` added (sibling of `Bf16`); storage `array<vec2<f16>>`.
+- `WgpuBackend::supports_shader_f16()` requests `Features::SHADER_F16`
+  opportunistically; falls back to `ActDtype::F32` when unavailable.
+- Pipeline.rs Quant arm picks F16 acts when the feature is live.
+- All ops (matmul, sdpa small+large-D, rmsnorm, layernorm, rope+halfrot,
+  qkv_split, scatter_pad_rows, silu, silu_mul, add, mul, tanh,
+  bcast_affine, bcast_fma, bcast_add x{wf32, wbf16}) gained F16 variants.
+- Pointwise ops compute in native `vec2<f16>` (silu/silu_mul/add/mul/tanh
+  /bcast_fma/qkv_split/scatter_pad_rows). Reductions widen to f32
+  internally and narrow on write (matmul / sdpa / rms / layer norm).
 
 ## Locked design decisions (carry forward)
 
@@ -46,36 +48,190 @@ matmul than bf16.
   classes (Q8 quant interleaved with bf16 fallback tensors) cause peak
   weights to drift above the budget non-deterministically.
 
-## Next session: Q8 acts on shader-f16
+## Next
 
-`Features::SHADER_F16` is a wgpu feature, web + native (Chrome/Edge ship
-the browser `"shader-f16"` GPU feature; Firefox WIP). Runtime-gate via
-`adapter.features().contains(SHADER_F16)`; WGSL needs `enable f16;` at
-top.
+F16 NaN bug is fixed. e2e_parity passes for both `gguf_q8_0` and
+`safetensors` variants with shader-f16 acts.
 
-Plan:
-1. **Add `ActDtype::F16`** sibling of `Bf16`. Packed via WGSL `f16` native
-   storage (not the u32-bitcast hack). One f16 per 2 bytes; matmul read
-   path widens to f32 inline for compute, write path narrows from f32 to
-   f16. f32 accumulators stay f32 (no precision regression vs bf16-packed).
-2. **Backend opt-in.** Request `SHADER_F16` when adapter has it; fall back
-   to `ActDtype::F32` for Q8 when unavailable. Bf16 path is unaffected.
-3. **Pipeline wiring.** Quant arm in `pipeline.rs` picks F16 acts when
-   the feature is live. `BlockWgslConfigs` invariant (matmul + ops agree
-   on act_dtype) extends naturally.
-4. **Op kernel migrations.** Every ops kernel (rmsnorm, layernorm, sdpa,
-   rope, qkv_split, silu/silu_mul, bcast_*, scatter_pad_rows) gets an
-   F16 variant alongside F32/Bf16 packed. Bulk of the work.
-5. **Expected payoff.** Workspace footprint halves (~1.38 GiB → ~700 MiB),
-   tile_a bandwidth matches bf16-packed. Combined with Q8's smaller B,
-   Q8 should land *under* bf16 wall.
+Tier 1 matmul perf done: tile_a + tile_b in `vec2<f16>` shared memory,
+K-paired inner loop (kk steps by 2, one vec2 load = 2 FMAs). Halves
+shared-mem pressure on the F16 path, halves shared-mem read bandwidth
+in the inner loop. Accumulator stays f32 so no precision delta. Q8
+cooperative dequant writes directly to vec2<f16> tile_b slots; bf16/f32
+weight loads also pair along K. Bf16/f32 act paths are unchanged.
 
-## Backlog (after shader-f16)
+Q8+F16 step time on Arc 140T iGPU (low power, 512x512, 2 steps):
+- 30.5 s/step -> 14.4 s/step (-53%).
+- FFN gpu_disp -62%, QKV gpu_disp -62%, SDPA unchanged.
+- Now 2.8x faster than bf16 per step.
 
-- **Asymmetric matmul tiles** for non-square shapes (e.g. `bm=32, bn=128`
-  for QKV `M=1024 N=11520`). Reduces tile_a reads at the cost of more
-  shared mem (~20 KiB > web baseline 16 KiB; needs per-target tile
-  config). Only worth pursuing if shader-f16 doesn't fully close the gap.
+Tier 1 conformance + e2e_parity (gguf_q8_0 + safetensors) all pass.
+
+Remaining perf tiers (in priority order):
+
+1. **Tier 2 - asymmetric matmul tiles per shape.** QKV (N=11520) and
+   FFN up (N=10240) are wide-N: bm=32,bn=128 likely wins. FFN down
+   (K=10240) is wide-K: bm=128,bn=32 likely wins. Per-matmul tile
+   in `BlockMatmuls`.
+2. **Tier 4 - residency.** Pin small per-block weights (AdaLN, norms,
+   biases). Raise per-machine VRAM ceiling above 4 GB so Q8 main DiT
+   (~6 GB) goes fully resident. Audit `prefetch_after` actually
+   overlaps GPU compute (Vulkan single-queue may serialize).
+3. **Tier 3 - kernel fusions.** silu_mul into ffn_w1/w3 writes;
+   rmsnorm into following matmul; residual `add` into prior matmul.
+4. **Tier 5 - exotics.** Subgroup matrix intrinsics on Arc (XMX);
+   persistent kernels. Only if 2-4 don't get us to target.
+
+### The NaN bug (resolved; kept for context)
+
+Fix: saturated-narrow at the matmul F16 storage write site
+(`thinfer-core/src/ops/matmul.rs`). The accumulator pair clamps to
+`+/- 65504.0` before the `vec2<f16>(vec2<f32>(...))` cast. This stops
+the proj-matmul overflow without changing model semantics (padding rows
+remain fully-attended per upstream `transformer.py`); padding-row
+outputs become saturated-but-finite instead of inf-then-NaN, real image
+rows attending to padding incur only a small F16 precision delta.
+
+Per-op taps for ctx_refiner block 0 (`DitTaps::ctx_block0`) are wired
+and remain useful for future F16 narrowing; kept in place.
+
+### Original NaN signature (read this before re-debugging)
+
+First narrowing of the NaN source from `THINFER_TRACE=verbose` DIT-TAP:
+
+- `t_emb` -> `AdaLN matmul` -> `AdaLN bcast_add` -> `scale_msa, gate_msa,
+  scale_mlp, gate_mlp`: ALL clean (post-matmul, post-bias, post-tanh).
+  AdaLN side of the f16 path works.
+- `cap_embedded` (post cap_embedder = rmsnorm + matmul + bcast_add):
+  CLEAN (no NaN, 32 rows x 3840 dim, magnitudes ~0.1).
+- `ctx_refiner_0_out` (after one Block.forward modulation=false on
+  cap_embedded): **17 of 32 rows are NaN**, exactly the tail rows
+  15..31. Clean rows 0..14. NaN bit pattern is `0xfe00` repeated
+  (negative quiet NaN). That's a f32 -NaN narrowed to f16 — somewhere
+  a kernel computes -NaN in f32 (`0 * -inf`? `inf - inf`?) and
+  `vec2<f16>(...)` narrows it.
+- `last_ctx_refiner_out`: 100% NaN (block 1 propagates).
+- `unified_in` and `main_layer_0_out`: 100% NaN.
+
+Per-op taps inside ctx_refiner block 0 are NOT instrumented (DitTaps only
+captures main block 0). That's the missing diagnostic — the bug is in
+exactly one of these ops, but we can't see which:
+
+```
+rmsnorm(x) -> matmul(qkv) -> qkv_split -> rmsnorm(q,k) -> rope(q,k)
+  -> sdpa -> matmul(proj) -> rmsnorm -> add -> rmsnorm
+  -> matmul(w1), matmul(w3) -> silu_mul -> matmul(w2) -> rmsnorm -> add
+```
+
+### Verified clean (do NOT re-suspect these)
+
+- Adapter requests `SHADER_F16` and gets it on Intel Arc 140T.
+- Pipeline.rs Quant arm picks `ActDtype::F16`.
+- `cap_embedded` is clean -> rmsnorm F16+wbf16, matmul F16+wbf16, and
+  bcast_add F16+wbf16 ALL produce correct values at cap_embedder shape
+  (n_rows=32, dim=3840). Same kernels run inside ctx_refiner block 0.
+- t_emb/AdaLN path -> AdaLN matmul (F16+wbf16), bcast_add (F16+wbf16),
+  tanh (F16) all clean.
+
+### Root cause (narrowed via ctx_block0 per-op taps)
+
+Per-op taps in `context_refiner.0` (added via `DitTaps::ctx_block0`,
+mirrors `block0` for the modulation=false path) pinpoint the first
+non-finite as `attn_out` (attention output projection matmul):
+
+- attn_norm1_out, attn_q/k/v, attn_q_norm/k_norm, attn_q_rope/k_rope,
+  attn_sdpa: all clean (no nan, no inf).
+- attn_out: `nan=0 +inf=17 -inf=17`, max=6.4e4, min=-4.5e4. F16 max is
+  65504; proj output saturates to inf at 34 positions, all in the
+  padding-row tail (row buckets show finite mass concentrated in
+  rows 0..14 and explosion in rows 15..31).
+- attn_norm2_out: `nan=34 zeros=65246`. RmsNorm over a row containing
+  inf yields `sum_sq=inf -> rsqrt=0 -> finite*0=0` at finite positions
+  and `inf*0=NaN` at the inf positions. This is where the NaN bit
+  pattern `0xfe00` is born (negative qNaN = the canonical f16 result
+  of inf*0). Residual + ffn propagate NaN through rows 15..31.
+
+Why padding rows specifically: cap_embedder maps an all-zero input
+(text-encoder padding) to the bias vector identically across all
+padding rows (rmsnorm passes zero; matmul of zero is zero; +bias).
+Identical input gives identical Q across heads, uniform softmax,
+attn_sdpa = mean(values) per head. Combined with the proj weight
+matrix this happens to land magnitudes > 65504 for these specific
+rows. F32 represents the same values without overflow, which is
+why the F32 path looked "fine" even though it was also producing
+junk values at padding rows (those rows are not used post-DiT).
+
+Sdpa is exonerated. Don't audit softmax; the bug is downstream.
+
+### Next: fix the F16 overflow
+
+Per-op taps for ctx_refiner block 0 are now wired (`ctx_block0` field
+on `DitTaps`, allocation via existing `Block0TapBufs`, prints alongside
+`block0.*` in `pipeline.rs`). Use them after any fix to confirm.
+
+Candidates for the fix:
+
+1. **Mask cap padding out of attention** (proper-model-correctness
+   fix). `cap_mask` is currently `attn_mask_zero_bytes_act` (full
+   attention). If padding key columns are set to -inf, real-query rows
+   wouldn't average in padding values, and (this is the bit that
+   matters here) padding-query rows would output zero (softmax of all
+   -inf is undefined - guard with q-row mask too, or just live with
+   garbage on padding-output rows). This is the cleanest fix but
+   requires upstream parity: does Z-Image actually mask cap padding?
+   The fact that F32 path is bit-clean against the reference suggests
+   reference also runs unmasked.
+2. **Clamp matmul output to F16 finite range** before f16-narrow on
+   write. Cheap, targeted, but a band-aid.
+3. **Keep proj-matmul accumulator route as F32-storage out**, then
+   narrow only after the subsequent rmsnorm. Requires either fusion
+   or a one-shot "rmsnorm-of-f32-buffer-with-f16-weights" variant.
+4. **Zero padding rows in the cap stream** after cap_embedder, before
+   the refiner. The model can't have learned anything useful from
+   constant-bias padding rows, and zeroing them keeps F16 in range.
+   Risk: this changes numerics on the legitimate-but-unused rows in a
+   way the reference (which keeps them populated) wouldn't, so the
+   parity-cap-block test would diverge for those rows. Acceptable if
+   we mask them out at compare time.
+
+Recommend: option 4 (zero pad rows after cap_embedder), then verify
+parity on non-padding rows only. It's the lowest-blast-radius change
+and addresses the root cause (don't process garbage through F16-range-
+sensitive ops). Option 1 is "more right" but requires upstream
+behavioral parity confirmation.
+
+### Files touched (the F16 surface)
+
+- `thinfer-core/src/ops/mod.rs` — `ActDtype::F16`, `act_f16_prelude!`,
+  `WgslConfig::F16_NATIVE_WBF16`, hint() update.
+- `thinfer-core/src/backend/wgpu.rs` — `Features::SHADER_F16` request,
+  `supports_shader_f16()`.
+- `thinfer-core/src/ops/{matmul, rmsnorm, layernorm, sdpa, rope,
+  qkv_split, scatter_pad_rows, silu, silu_mul, add, mul, tanh,
+  bcast_affine, bcast_fma, bcast_add}.rs` — F16 variants.
+- `thinfer-models/src/z_image/pipeline.rs` — Quant arm picks F16 when
+  `backend.supports_shader_f16()`.
+- `thinfer-models/src/z_image/{dit, seq, t_embedder, block}.rs` —
+  upload/readback F16 cases, dispatch counts.
+- `thinfer-models/Cargo.toml` — added `half = "2"`.
+
+### Deferred (after F16 works)
+
+- **Matmul tile_a in `vec2<f16>` shared memory.** Currently tile_a stays
+  f32 even on the F16 path (only the global load/store narrows). Moving
+  tile_a to vec2<f16> halves shared-memory pressure (16 KiB -> 8 KiB at
+  bm=bn=64/bk=32), enabling bigger tiles on iGPU and freeing headroom on
+  the 16 KiB web baseline. Inner loop widens f16->f32 at register-load
+  time; accumulator stays f32.
+- **Asymmetric matmul tiles** for non-square shapes (bm=32, bn=128 for
+  QKV `M=1024 N=11520`). Only worth pursuing if the shared-mem tile
+  shrink above doesn't already close the wall vs bf16.
+- **e2e numerical tolerance**: f16 storage is lossier than the bf16
+  baseline, so the existing tolerance may need a small bump once the
+  NaN is fixed and we get a real comparison.
+
+## Backlog
+
 - **Operator fusion** (norm+matmul, silu+mul into single kernels) to
   eliminate inter-kernel acts traffic.
 - **Sub-allocator** for residency pool: slab-based with free-list

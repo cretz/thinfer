@@ -196,30 +196,43 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 _ => WeightDtype::Bf16,
             }
         };
-        // Quant weights run with F32 acts: dequant inside the matmul kernel
-        // emits f32, accumulates in f32; storing intermediates as packed-bf16
-        // between block boundaries is a workspace-shrink hack tied to the
-        // bf16-weight path and is the wrong intermediate format for the
-        // quant path. When SHADER_F16 lands, Quant acts go to native F16
-        // (matmul dequant -> f16 storage, f32 accumulators) and the packed-
-        // bf16 workaround retires. Bf16 weights stay on the production
-        // BF16_PACKED path - bf16 acts are bit-clean with bf16 weights.
-        // AdaLN matmul keeps Bf16 weights but follows the block's act dtype
-        // (the `BlockWgslConfigs` invariant requires all matmuls and ops to
-        // agree on act_dtype + bf16_quant_writes).
+        // Activation dtype selection for the Quant matmul path:
+        // - When the adapter exposes `SHADER_F16`, use `ActDtype::F16`:
+        //   native `vec2<f16>` storage halves activation VRAM and bandwidth
+        //   vs F32, pointwise kernels run as native f16 SIMD, and the
+        //   matmul dequant narrows f32 accumulators to f16 on write.
+        // - Otherwise fall back to `ActDtype::F32` — the safe baseline.
+        // Bf16 acts on the Quant path are intentionally NOT chosen: bf16's
+        // 7-bit mantissa loses precision at every kernel boundary in a way
+        // f16 (10 bits) does not, and the bf16-packed workaround was tied
+        // to bit-clean parity with bf16 weights.
+        //
+        // AdaLN matmul keeps Bf16 weights but follows the block's chosen
+        // act dtype (the `BlockWgslConfigs` invariant requires all matmuls
+        // and ops to agree on act_dtype + bf16_quant_writes).
         let (dit_main_matmul_cfg, dit_adaln_cfg, dit_ops_cfg) = match dit_matmul_weight {
             WeightDtype::Quant(_) => {
-                let acts_f32_main = WgslConfig {
+                let quant_act_dtype = if backend.supports_shader_f16() {
+                    thinfer_core::ops::ActDtype::F16
+                } else {
+                    thinfer_core::ops::ActDtype::F32
+                };
+                tracing::info!(
+                    ?quant_act_dtype,
+                    shader_f16 = backend.supports_shader_f16(),
+                    "DiT quant matmul activation dtype",
+                );
+                let main = WgslConfig {
                     bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
-                    act_dtype: thinfer_core::ops::ActDtype::F32,
+                    act_dtype: quant_act_dtype,
                     weight_dtype: dit_matmul_weight,
                 };
-                let acts_f32_bf16w = WgslConfig {
+                let bf16w = WgslConfig {
                     bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
-                    act_dtype: thinfer_core::ops::ActDtype::F32,
+                    act_dtype: quant_act_dtype,
                     weight_dtype: WeightDtype::Bf16,
                 };
-                (acts_f32_main, acts_f32_bf16w, acts_f32_bf16w)
+                (main, bf16w, bf16w)
             }
             _ => {
                 let main = WgslConfig {
@@ -638,6 +651,29 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 ffn_raw: Some(Vec::new()),
                 ffn_norm2_out: Some(Vec::new()),
             };
+            // ctx_refiner block 0 per-op taps. modulation=false so the
+            // adaln_* / scale_* / gate_* fields stay empty after the run;
+            // request only the ops that actually fire on this block.
+            let mut ctx_block0_taps = Block0Taps {
+                attn_norm1_out: Some(Vec::new()),
+                modulated_attn_in: Some(Vec::new()),
+                attn_q: Some(Vec::new()),
+                attn_k: Some(Vec::new()),
+                attn_v: Some(Vec::new()),
+                attn_q_norm: Some(Vec::new()),
+                attn_k_norm: Some(Vec::new()),
+                attn_q_rope: Some(Vec::new()),
+                attn_k_rope: Some(Vec::new()),
+                attn_sdpa: Some(Vec::new()),
+                attn_out: Some(Vec::new()),
+                attn_norm2_out: Some(Vec::new()),
+                x_mid: Some(Vec::new()),
+                ffn_norm1_out: Some(Vec::new()),
+                modulated_ffn_in: Some(Vec::new()),
+                ffn_raw: Some(Vec::new()),
+                ffn_norm2_out: Some(Vec::new()),
+                ..Block0Taps::default()
+            };
             let layout = {
                 let _f = trace::scope!("dit_forward").entered();
                 if diag {
@@ -651,6 +687,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                         last_main_layer_out: Some(&mut tap_last_main),
                         final_layer_out: Some(&mut tap_final),
                         block0: Some(&mut block0_taps),
+                        ctx_block0: Some(&mut ctx_block0_taps),
                         ..DitTaps::default()
                     };
                     dit.forward_with_taps(
@@ -883,6 +920,74 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 let _ = ffn_hidden;
                 if let Some(v) = &b0.ffn_norm2_out {
                     print("block0.ffn_norm2_out", v);
+                }
+                // ctx_refiner block 0 per-op narrowing. modulation=false so
+                // adaln_*/scale_*/gate_* slots are empty by design; only the
+                // path ops are printed. Row-bucketing uses seq_cap so the
+                // padding-row tail (text padding) splits out from real rows.
+                let cb0 = &ctx_block0_taps;
+                let seq_cap = shape.seq_cap;
+                if let Some(v) = &cb0.attn_norm1_out {
+                    print("ctx_block0.attn_norm1_out", v);
+                    print_rows("ctx_block0.attn_norm1_out", v, seq_cap, dim);
+                }
+                if let Some(v) = &cb0.modulated_attn_in {
+                    print("ctx_block0.modulated_attn_in", v);
+                }
+                if let Some(v) = &cb0.attn_q {
+                    print("ctx_block0.attn_q", v);
+                    print_rows("ctx_block0.attn_q", v, seq_cap * n_heads, head_dim);
+                }
+                if let Some(v) = &cb0.attn_k {
+                    print("ctx_block0.attn_k", v);
+                }
+                if let Some(v) = &cb0.attn_v {
+                    print("ctx_block0.attn_v", v);
+                }
+                if let Some(v) = &cb0.attn_q_norm {
+                    print("ctx_block0.attn_q_norm", v);
+                    print_rows("ctx_block0.attn_q_norm", v, seq_cap * n_heads, head_dim);
+                }
+                if let Some(v) = &cb0.attn_k_norm {
+                    print("ctx_block0.attn_k_norm", v);
+                }
+                if let Some(v) = &cb0.attn_q_rope {
+                    print("ctx_block0.attn_q_rope", v);
+                    print_rows("ctx_block0.attn_q_rope", v, seq_cap * n_heads, head_dim);
+                }
+                if let Some(v) = &cb0.attn_k_rope {
+                    print("ctx_block0.attn_k_rope", v);
+                }
+                if let Some(v) = &cb0.attn_sdpa {
+                    print("ctx_block0.attn_sdpa", v);
+                    print_rows("ctx_block0.attn_sdpa", v, seq_cap * n_heads, head_dim);
+                }
+                if let Some(v) = &cb0.attn_out {
+                    print("ctx_block0.attn_out", v);
+                    print_rows("ctx_block0.attn_out", v, seq_cap, dim);
+                }
+                if let Some(v) = &cb0.attn_norm2_out {
+                    print("ctx_block0.attn_norm2_out", v);
+                    print_rows("ctx_block0.attn_norm2_out", v, seq_cap, dim);
+                }
+                if let Some(v) = &cb0.x_mid {
+                    print("ctx_block0.x_mid", v);
+                    print_rows("ctx_block0.x_mid", v, seq_cap, dim);
+                }
+                if let Some(v) = &cb0.ffn_norm1_out {
+                    print("ctx_block0.ffn_norm1_out", v);
+                    print_rows("ctx_block0.ffn_norm1_out", v, seq_cap, dim);
+                }
+                if let Some(v) = &cb0.modulated_ffn_in {
+                    print("ctx_block0.modulated_ffn_in", v);
+                }
+                if let Some(v) = &cb0.ffn_raw {
+                    print("ctx_block0.ffn_raw", v);
+                    print_rows("ctx_block0.ffn_raw", v, seq_cap, dim);
+                }
+                if let Some(v) = &cb0.ffn_norm2_out {
+                    print("ctx_block0.ffn_norm2_out", v);
+                    print_rows("ctx_block0.ffn_norm2_out", v, seq_cap, dim);
                 }
             }
             let total_rows = (layout.seq_x_padded + layout.seq_cap_padded) as u64;

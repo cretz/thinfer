@@ -5,7 +5,7 @@ use crate::conformance::{
 };
 use crate::ops::{ActDtype, WeightDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
-use crate::{act_bf16_prelude, wgsl_with_bf16_variant};
+use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
 
 /// `y[r,i] = x[r,i] * rsqrt(mean(x[r,:]^2) + eps) * w[i]`.
 ///
@@ -146,6 +146,82 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 );
 
+// F16 acts + bf16-packed weights. Storage halves vs f32-acts; the row
+// reduction widens to f32 because squared sums over D=3840 elements
+// overflow f16 and lose mantissa precision faster than the result
+// tolerates. Compute `x * inv` and `* w` in f32, narrow to vec2<f16> on
+// write — this is the standard f16-IO / f32-accum pattern.
+const WGSL_F16_PACKED_WBF16: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { n_rows: u32, dim: u32, eps: f32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+fn load_w_pair(wi: u32) -> vec2<f32> {
+    let pair = w[wi];
+    let lo = bitcast<f32>((pair & 0xFFFFu) << 16u);
+    let hi = bitcast<f32>(pair & 0xFFFF0000u);
+    return vec2<f32>(lo, hi);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= u.n_rows) { return; }
+    let dim_w = u.dim >> 1u;
+    let row_base = row * dim_w;
+    var sum_sq: f32 = 0.0;
+    for (var wi: u32 = 0u; wi < dim_w; wi = wi + 1u) {
+        let v: vec2<f32> = vec2<f32>(x[row_base + wi]);
+        sum_sq = sum_sq + v.x * v.x + v.y * v.y;
+    }
+    let inv = inverseSqrt(sum_sq / f32(u.dim) + u.eps);
+    for (var wi: u32 = 0u; wi < dim_w; wi = wi + 1u) {
+        let v: vec2<f32> = vec2<f32>(x[row_base + wi]);
+        let wv = load_w_pair(wi);
+        out[row_base + wi] = vec2<f16>(vec2<f32>(v.x * inv * wv.x, v.y * inv * wv.y));
+    }
+}
+"#
+);
+
+// F16 acts + f32 weights. Only exercised when an f32 RMSNorm weight gets
+// paired with the F16 path; less common than wbf16 but kept exhaustive.
+const WGSL_F16_PACKED_WF32: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { n_rows: u32, dim: u32, eps: f32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= u.n_rows) { return; }
+    let dim_w = u.dim >> 1u;
+    let row_base = row * dim_w;
+    var sum_sq: f32 = 0.0;
+    for (var wi: u32 = 0u; wi < dim_w; wi = wi + 1u) {
+        let v: vec2<f32> = vec2<f32>(x[row_base + wi]);
+        sum_sq = sum_sq + v.x * v.x + v.y * v.y;
+    }
+    let inv = inverseSqrt(sum_sq / f32(u.dim) + u.eps);
+    for (var wi: u32 = 0u; wi < dim_w; wi = wi + 1u) {
+        let v: vec2<f32> = vec2<f32>(x[row_base + wi]);
+        let i0 = wi * 2u;
+        out[row_base + wi] = vec2<f16>(vec2<f32>(v.x * inv * w[i0], v.y * inv * w[i0 + 1u]));
+    }
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -184,6 +260,8 @@ impl RmsNormOp for RmsNormF32 {
             (ActDtype::Bf16, WeightDtype::F32, _) => {
                 panic!("rmsnorm: packed-bf16 acts with fp32 weights not implemented")
             }
+            (ActDtype::F16, WeightDtype::Bf16, _) => WGSL_F16_PACKED_WBF16,
+            (ActDtype::F16, WeightDtype::F32, _) => WGSL_F16_PACKED_WF32,
             (_, WeightDtype::Quant(_), _) => {
                 unreachable!("rmsnorm does not consume quant weights")
             }

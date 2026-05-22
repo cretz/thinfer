@@ -5,7 +5,7 @@ use crate::conformance::{
 };
 use crate::ops::{ActDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
-use crate::{act_bf16_prelude, wgsl_with_bf16_variant};
+use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
 
 /// Fused scaled-dot-product attention with online softmax.
 ///
@@ -224,6 +224,82 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 );
 
+// F16 small-D sdpa. Q/K/V/Mask/Out all `array<vec2<f16>>`. Dot products,
+// softmax (m/l/p/alpha), and per-key V-accumulation stay f32 — softmax
+// `exp(s_j)` saturates f16 once scores exceed ~11.1, and the online
+// renormalization mixes magnitudes across keys in a way that loses bits
+// in f16. Same numerical contract as bf16-packed.
+const WGSL_F16_PACKED: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U {
+    b: u32, h_q: u32, h_kv: u32, s_q: u32,
+    s_k: u32, d: u32, scale: f32, has_mask: u32,
+};
+
+@group(0) @binding(0) var<storage, read> q: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> k: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read> v: array<vec2<f16>>;
+@group(0) @binding(3) var<storage, read> mask: array<vec2<f16>>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(5) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = u.b * u.s_q * u.h_q;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+    let hq  = idx % u.h_q;
+    let tmp = idx / u.h_q;
+    let sq  = tmp % u.s_q;
+    let bb  = tmp / u.s_q;
+    let hkv = (hq * u.h_kv) / u.h_q;
+
+    let d_w        = u.d >> 1u;
+    let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
+    let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
+    let kv_step_w  = (u.h_kv * u.d) >> 1u;
+    let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
+
+    var o: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { o[d] = 0.0; }
+    var m: f32 = bitcast<f32>(0xff800000u);
+    var l: f32 = 0.0;
+
+    for (var j = 0u; j < u.s_k; j = j + 1u) {
+        let kj_w = kv_b0_w + j * kv_step_w;
+        var dot: f32 = 0.0;
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            let qv: vec2<f32> = vec2<f32>(q[q_w_off + dw]);
+            let kv: vec2<f32> = vec2<f32>(k[kj_w + dw]);
+            dot = dot + qv.x * kv.x + qv.y * kv.y;
+        }
+        var bias: f32 = 0.0;
+        if (u.has_mask != 0u) {
+            let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (j >> 1u)]);
+            bias = select(mw.x, mw.y, (j & 1u) == 1u);
+        }
+        let s_j  = dot * u.scale + bias;
+        let m_new = max(m, s_j);
+        let alpha = exp(m - m_new);
+        let p_j  = exp(s_j - m_new);
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            let vv: vec2<f32> = vec2<f32>(v[kj_w + dw]);
+            o[dw * 2u]      = o[dw * 2u]      * alpha + p_j * vv.x;
+            o[dw * 2u + 1u] = o[dw * 2u + 1u] * alpha + p_j * vv.y;
+        }
+        l = l * alpha + p_j;
+        m = m_new;
+    }
+
+    let inv_l = 1.0 / l;
+    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+        out[q_w_off + dw] = vec2<f16>(vec2<f32>(o[dw * 2u] * inv_l, o[dw * 2u + 1u] * inv_l));
+    }
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -267,6 +343,7 @@ impl SdpaOp for SdpaF32 {
             (ActDtype::F32, false) => WGSL_F32,
             (ActDtype::F32, true) => WGSL_F32_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
+            (ActDtype::F16, _) => WGSL_F16_PACKED,
         }
     }
     fn layout() -> &'static [BindingLayout] {
@@ -405,6 +482,135 @@ fn main(
 "#
 );
 
+// F16 large-D sdpa. Used only if a future F16-acts pipeline drives the
+// VAE mid-block self-attention (currently VAE stays on the bf16/f32 path,
+// so this is unexercised — but keeping the match arms exhaustive avoids
+// silent storage-type mismatches if VAE ever opts in).
+const WGSL_LARGE_D_F16: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U {
+    b: u32, h_q: u32, h_kv: u32, s_q: u32,
+    s_k: u32, d: u32, scale: f32, has_mask: u32,
+};
+
+@group(0) @binding(0) var<storage, read> q: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> k: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read> v: array<vec2<f16>>;
+@group(0) @binding(3) var<storage, read> mask: array<vec2<f16>>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(5) var<uniform> u: U;
+
+const WG: u32 = 128u;
+const MAX_LOCAL_D: u32 = 4u;
+
+var<workgroup> shared_red: array<f32, 128>;
+var<workgroup> shared_scalar: array<f32, 4>;
+
+@compute @workgroup_size(128)
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let total = u.b * u.s_q * u.h_q;
+    let row = wgid.x;
+    if (row >= total) { return; }
+    let t = lid.x;
+
+    let hq  = row % u.h_q;
+    let tmp = row / u.h_q;
+    let sq  = tmp % u.s_q;
+    let bb  = tmp / u.s_q;
+    let hkv = (hq * u.h_kv) / u.h_q;
+
+    let d_w        = u.d >> 1u;
+    let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
+    let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
+    let kv_step_w  = (u.h_kv * u.d) >> 1u;
+    let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
+
+    // d_per (in elements) must be even since D is even and WG divides D.
+    // d_per_w (in words) = d_per / 2.
+    let d_per = u.d / WG;
+    let d_per_w = d_per >> 1u;
+    let d_off_w = t * d_per_w;
+
+    var q_local: array<f32, 4>;
+    for (var i = 0u; i < d_per_w; i = i + 1u) {
+        let qv: vec2<f32> = vec2<f32>(q[q_w_off + d_off_w + i]);
+        q_local[i * 2u]      = qv.x;
+        q_local[i * 2u + 1u] = qv.y;
+    }
+    var o_local: array<f32, 4>;
+    for (var i = 0u; i < d_per; i = i + 1u) {
+        o_local[i] = 0.0;
+    }
+
+    if (t == 0u) {
+        shared_scalar[0] = bitcast<f32>(0xff800000u);
+        shared_scalar[1] = 0.0;
+    }
+    workgroupBarrier();
+
+    for (var j = 0u; j < u.s_k; j = j + 1u) {
+        let kj_w = kv_b0_w + j * kv_step_w;
+        var partial: f32 = 0.0;
+        for (var i = 0u; i < d_per_w; i = i + 1u) {
+            let kv: vec2<f32> = vec2<f32>(k[kj_w + d_off_w + i]);
+            partial = partial + q_local[i * 2u] * kv.x + q_local[i * 2u + 1u] * kv.y;
+        }
+        shared_red[t] = partial;
+        workgroupBarrier();
+
+        var stride: u32 = WG / 2u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) {
+                shared_red[t] = shared_red[t] + shared_red[t + stride];
+            }
+            workgroupBarrier();
+            stride = stride / 2u;
+        }
+
+        if (t == 0u) {
+            let dot   = shared_red[0];
+            var bias: f32 = 0.0;
+            if (u.has_mask != 0u) {
+                let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (j >> 1u)]);
+                bias = select(mw.x, mw.y, (j & 1u) == 1u);
+            }
+            let s_j   = dot * u.scale + bias;
+            let m_cur = shared_scalar[0];
+            let l_cur = shared_scalar[1];
+            let m_new = max(m_cur, s_j);
+            let alpha = exp(m_cur - m_new);
+            let p_j   = exp(s_j - m_new);
+            shared_scalar[0] = m_new;
+            shared_scalar[1] = l_cur * alpha + p_j;
+            shared_scalar[2] = p_j;
+            shared_scalar[3] = alpha;
+        }
+        workgroupBarrier();
+
+        let alpha = shared_scalar[3];
+        let p_j   = shared_scalar[2];
+        for (var i = 0u; i < d_per_w; i = i + 1u) {
+            let vv: vec2<f32> = vec2<f32>(v[kj_w + d_off_w + i]);
+            o_local[i * 2u]      = o_local[i * 2u]      * alpha + p_j * vv.x;
+            o_local[i * 2u + 1u] = o_local[i * 2u + 1u] * alpha + p_j * vv.y;
+        }
+    }
+
+    let inv_l = 1.0 / shared_scalar[1];
+    for (var i = 0u; i < d_per_w; i = i + 1u) {
+        out[q_w_off + d_off_w + i] = vec2<f16>(vec2<f32>(
+            o_local[i * 2u] * inv_l, o_local[i * 2u + 1u] * inv_l
+        ));
+    }
+}
+"#
+);
+
 pub struct SdpaF32LargeD;
 
 impl SdpaOp for SdpaF32LargeD {
@@ -419,10 +625,16 @@ impl SdpaOp for SdpaF32LargeD {
     const MAX_D: u32 = 512;
 
     fn wgsl(cfg: &WgslConfig) -> &'static str {
-        if cfg.bf16_quant_writes {
-            WGSL_LARGE_D_F32_BF16
-        } else {
-            WGSL_LARGE_D_F32
+        match cfg.act_dtype {
+            ActDtype::F32 if cfg.bf16_quant_writes => WGSL_LARGE_D_F32_BF16,
+            ActDtype::F32 => WGSL_LARGE_D_F32,
+            // VAE currently uses F32 acts; the F16 large-D path exists so
+            // future opt-in (e.g. f16 VAE mid-block) gets a real kernel
+            // instead of a silent storage-dtype mismatch.
+            ActDtype::F16 => WGSL_LARGE_D_F16,
+            ActDtype::Bf16 => {
+                panic!("sdpa_large_d: bf16-packed acts variant not implemented (VAE is f32)")
+            }
         }
     }
     fn layout() -> &'static [BindingLayout] {

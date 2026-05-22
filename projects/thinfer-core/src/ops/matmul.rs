@@ -164,29 +164,64 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
     let a_loads_per_thread = tile_a_size.div_ceil(threads);
     let b_loads_per_thread = tile_b_size.div_ceil(threads);
 
-    let act_packed = cfg.act_dtype == ActDtype::Bf16;
+    let act_bf16 = cfg.act_dtype == ActDtype::Bf16;
+    let act_f16 = cfg.act_dtype == ActDtype::F16;
+    let act_packed = act_bf16 || act_f16;
+    // F16-tiles path: when the activation dtype is native f16, both tile_a
+    // and tile_b live in shared memory as `vec2<f16>` (one slot = 2
+    // K-adjacent elements). This halves shared-mem pressure vs the f32
+    // tiles used elsewhere, halves the shared-mem read bandwidth in the
+    // inner loop (one slot read = 2 multiplies), and keeps the f32
+    // accumulator so K-reduction precision is unchanged. K-pair indexing
+    // requires bk even and the loads/dequants to emit aligned pairs.
+    let tiles_f16 = act_f16;
+    if tiles_f16 {
+        assert!(
+            bk.is_multiple_of(2),
+            "f16 tiles require bk % 2 == 0 (got bk={bk})"
+        );
+    }
+    let tile_a_pairs = tile_a_size / 2;
+    let tile_b_pairs = tile_b_size / 2;
+    let a_pair_loads_per_thread = tile_a_pairs.div_ceil(threads);
+    let b_pair_loads_per_thread = tile_b_pairs.div_ceil(threads);
     if act_packed {
         assert!(
             tn.is_multiple_of(2),
-            "matmul packed-bf16 acts require tn % 2 == 0; got tn={tn}"
+            "matmul packed acts require tn % 2 == 0; got tn={tn}"
         );
         assert!(
             bn.is_multiple_of(2),
-            "matmul packed-bf16 acts require bn % 2 == 0; got bn={bn}"
+            "matmul packed acts require bn % 2 == 0; got bn={bn}"
         );
     }
-    let a_elem_decl = if act_packed {
+    // `enable f16;` directive only when the f16-acts path is in play. It must
+    // precede every other declaration in the WGSL source, so emit it first.
+    let f16_prelude = if act_f16 { "enable f16;\n" } else { "" };
+    let a_elem_decl = if act_bf16 {
         "@group(0) @binding(0) var<storage, read> a: array<u32>;"
+    } else if act_f16 {
+        "@group(0) @binding(0) var<storage, read> a: array<vec2<f16>>;"
     } else {
         "@group(0) @binding(0) var<storage, read> a: array<f32>;"
     };
-    let out_elem_decl = if act_packed {
+    let out_elem_decl = if act_bf16 {
         "@group(0) @binding(2) var<storage, read_write> out: array<u32>;"
+    } else if act_f16 {
+        "@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;"
     } else {
         "@group(0) @binding(2) var<storage, read_write> out: array<f32>;"
     };
-    let load_a = if act_packed {
+    // `load_a(i)` returns one f32 activation regardless of storage dtype.
+    // tile_a stays f32 (matmul accumulators must be f32 — see the K=10240
+    // FFN row reductions; an f16 tile_a would only save shared memory
+    // while costing precision at every workgroup boundary).
+    let load_a = if act_bf16 {
         "fn load_a(i: u32) -> f32 {\n  let pair = a[i >> 1u];\n  let shift = (i & 1u) * 16u;\n  let half = (pair >> shift) & 0xFFFFu;\n  return bitcast<f32>(half << 16u);\n}\n"
+    } else if act_f16 {
+        // i indexes a single f16 element. Two elements share one vec2<f16>
+        // word — fetch the word, widen to vec2<f32>, pick the lane.
+        "fn load_a(i: u32) -> f32 {\n  let pair: vec2<f32> = vec2<f32>(a[i >> 1u]);\n  return select(pair.x, pair.y, (i & 1u) == 1u);\n}\n"
     } else {
         "fn load_a(i: u32) -> f32 { return a[i]; }\n"
     };
@@ -206,7 +241,9 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
         // (f16_bits_to_f32, b_byte, sext_i8, load_b_block_<scheme>).
         WeightDtype::Quant(k) => k.load_b_block_fn(),
     };
-    let pack_helpers = if act_packed {
+    // Output packing helpers. bf16-packed needs `pack_bf16x2`; f16 acts use
+    // the native `vec2<f16>(...)` constructor at the write site, no helper.
+    let pack_helpers = if act_bf16 {
         concat!(
             "fn round_bf16(x: f32) -> u32 {\n",
             "  let b = bitcast<u32>(x);\n",
@@ -230,8 +267,29 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
     // Build the inner B-load loop. F32/Bf16 use the original per-cell
     // cooperative load. Quant uses a block-cooperative path: B is
     // viewed as [N, K] in N-major blocks; each thread dequants whole
-    // blocks straight into tile_b.
+    // blocks straight into tile_b. When `tiles_f16` is on, each slot is
+    // a `vec2<f16>` covering two K-adjacent elements (br, br+1) for the
+    // same N column, so the load iterates pairs instead of cells.
     let b_load_loop = match cfg.weight_dtype {
+        WeightDtype::F32 | WeightDtype::Bf16 if tiles_f16 => format!(
+            r#"        for (var s: u32 = 0u; s < {b_pair_loads_per_thread}u; s = s + 1u) {{
+            let pair_idx: u32 = s * THREADS + tid;
+            if (pair_idx < (BK * BN) / 2u) {{
+                let br_pair: u32 = pair_idx / BN;
+                let bc: u32 = pair_idx % BN;
+                let gr0: u32 = k0 + br_pair * 2u;
+                let gc: u32 = bn0 + bc;
+                var lo: f32 = 0.0;
+                var hi: f32 = 0.0;
+                if (gc < d.n) {{
+                    if (gr0 < d.k) {{ lo = load_b(gr0 * d.n + gc); }}
+                    if (gr0 + 1u < d.k) {{ hi = load_b((gr0 + 1u) * d.n + gc); }}
+                }}
+                tile_b[br_pair * BN + bc] = vec2<f16>(vec2<f32>(lo, hi));
+            }}
+        }}
+"#
+        ),
         WeightDtype::F32 | WeightDtype::Bf16 => format!(
             r#"        for (var s: u32 = 0u; s < {b_loads_per_thread}u; s = s + 1u) {{
             let idx: u32 = s * THREADS + tid;
@@ -273,6 +331,47 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
             let elems_per_thread = bs / tpb;
             let slot_threads = block_slots * tpb;
             let slots_per_thread = slot_threads.div_ceil(threads);
+            if tiles_f16 {
+                assert!(
+                    elems_per_thread.is_multiple_of(2),
+                    "f16 tiles + Quant require elems_per_thread % 2 == 0 \
+                     (got {elems_per_thread}; bs={bs}, tpb={tpb})"
+                );
+            }
+            let inner_dequant = if tiles_f16 {
+                format!(
+                    r#"                        // Pair adjacent K elements (i, i+1) into one vec2<f16>
+                        // slot. base_elem and elems_per_thread are both even (asserted at
+                        // codegen) so pairs align with the K-pair shared-memory layout.
+                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 2u) {{
+                            let k_lo: u32 = kc * {bs}u + base_elem + i;
+                            let lo: f32 = {elem_call}(byte0, scale, base_elem + i);
+                            let hi: f32 = {elem_call}(byte0, scale, base_elem + i + 1u);
+                            tile_b[(k_lo >> 1u) * BN + bc] = vec2<f16>(vec2<f32>(lo, hi));
+                        }}"#
+                )
+            } else {
+                format!(
+                    r#"                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 1u) {{
+                            tile_b[(kc * {bs}u + base_elem + i) * BN + bc] =
+                                {elem_call}(byte0, scale, base_elem + i);
+                        }}"#
+                )
+            };
+            let oob_dequant = if tiles_f16 {
+                format!(
+                    r#"                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 2u) {{
+                            let k_lo: u32 = kc * {bs}u + base_elem + i;
+                            tile_b[(k_lo >> 1u) * BN + bc] = vec2<f16>(0.0, 0.0);
+                        }}"#
+                )
+            } else {
+                format!(
+                    r#"                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 1u) {{
+                            tile_b[(kc * {bs}u + base_elem + i) * BN + bc] = 0.0;
+                        }}"#
+                )
+            };
             format!(
                 r#"        // Quant B load, cooperative across TPB={tpb} threads per
         // block. B is viewed as [N, K] in N-major blocks
@@ -296,14 +395,9 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
                         let global_block_idx: u32 = n * blocks_per_row + block_k_outer;
                         let byte0: u32 = global_block_idx * {bpb}u;
                         let scale: f32 = {scale_call}(byte0);
-                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 1u) {{
-                            tile_b[(kc * {bs}u + base_elem + i) * BN + bc] =
-                                {elem_call}(byte0, scale, base_elem + i);
-                        }}
+{inner_dequant}
                     }} else {{
-                        for (var i: u32 = 0u; i < {elems_per_thread}u; i = i + 1u) {{
-                            tile_b[(kc * {bs}u + base_elem + i) * BN + bc] = 0.0;
-                        }}
+{oob_dequant}
                     }}
                 }}
             }}
@@ -313,7 +407,7 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
         }
     };
 
-    let out_write_loop = if act_packed {
+    let out_write_loop = if act_bf16 {
         // Pair (j, j+1) into one packed word at output column c = bn0+lid.x*TN+j.
         // c is even (bn even, TN even, lid.x*TN even). d.n is even (caller).
         r#"
@@ -325,6 +419,38 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
             if (col >= d.n) { continue; }
             let widx = (row * d.n + col) >> 1u;
             out[widx] = pack_bf16x2(acc[i * TN + j], acc[i * TN + j + 1u]);
+        }
+    }
+"#
+    } else if act_f16 {
+        // Same pairing as bf16-packed, but typed `vec2<f16>` writes. The
+        // f32 accumulator pair narrows to f16 at the storage boundary.
+        //
+        // Saturated narrow: clamp to the f16 finite range (+-65504.0) before
+        // the f16 cast so out-of-range accumulator values land at the f16
+        // maxima instead of +-inf. Without this clamp, F16 attention-output
+        // projection at constant-input rows (cap/x padding rows fed the
+        // learned pad_token) overflows on Z-Image proj weights, then the
+        // downstream rmsnorm computes `rsqrt(inf) = 0` and `inf * 0 = NaN`,
+        // poisoning every later attention because attn-key/value rows go
+        // NaN. Upstream model semantics expect attendance on padding rows
+        // (transformer.py: `attn_mask[i, :seq_len] = 1` includes inner
+        // SEQ_MULTI_OF padding), so masking them is wrong; saturating the
+        // F16 narrow is the correct precision-loss-vs-NaN trade-off, since
+        // padding rows are discarded post-DiT and image rows attending to
+        // saturated padding values incur only a small F16 precision delta
+        // (still bounded by the F16 mantissa).
+        r#"
+    for (var i: u32 = 0u; i < TM; i = i + 1u) {
+        let row: u32 = bm0 + lid.y * TM + i;
+        if (row >= d.m) { continue; }
+        for (var j: u32 = 0u; j < TN; j = j + 2u) {
+            let col: u32 = bn0 + lid.x * TN + j;
+            if (col >= d.n) { continue; }
+            let widx = (row * d.n + col) >> 1u;
+            let lo = clamp(acc[i * TN + j], -65504.0, 65504.0);
+            let hi = clamp(acc[i * TN + j + 1u], -65504.0, 65504.0);
+            out[widx] = vec2<f16>(vec2<f32>(lo, hi));
         }
     }
 "#
@@ -341,8 +467,88 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
     }
 "#
     };
+    let (tile_a_decl, tile_b_decl, a_load_loop, inner_loop) = if tiles_f16 {
+        // Shared-mem tiles in vec2<f16>: each slot covers two K-adjacent
+        // elements for one (row, col) of the output tile. A-load iterates
+        // pairs along K; inner loop steps kk by 2 and FMAs both lanes.
+        let tile_a_decl = format!(
+            "var<workgroup> tile_a: array<vec2<f16>, {tile_a_pairs}u>;"
+        );
+        let tile_b_decl = format!(
+            "var<workgroup> tile_b: array<vec2<f16>, {tile_b_pairs}u>;"
+        );
+        let a_load_loop = format!(
+            r#"        for (var s: u32 = 0u; s < {a_pair_loads_per_thread}u; s = s + 1u) {{
+            let pair_idx: u32 = s * THREADS + tid;
+            if (pair_idx < (BM * BK) / 2u) {{
+                let ar: u32 = pair_idx / (BK / 2u);
+                let ac_pair: u32 = pair_idx % (BK / 2u);
+                let gr: u32 = bm0 + ar;
+                let gc0: u32 = k0 + ac_pair * 2u;
+                var lo: f32 = 0.0;
+                var hi: f32 = 0.0;
+                if (gr < d.m) {{
+                    if (gc0 < d.k) {{ lo = load_a(gr * d.k + gc0); }}
+                    if (gc0 + 1u < d.k) {{ hi = load_a(gr * d.k + gc0 + 1u); }}
+                }}
+                tile_a[ar * (BK / 2u) + ac_pair] = vec2<f16>(vec2<f32>(lo, hi));
+            }}
+        }}
+"#
+        );
+        // K-pair inner loop. `av_pair` is loaded once per (i, kk2) and reused
+        // across the TN-wide register block, halving shared-mem traffic vs
+        // the scalar-kk path. Accumulator stays f32 so no precision delta.
+        let inner_loop = r#"        for (var kk2: u32 = 0u; kk2 < BK / 2u; kk2 = kk2 + 1u) {
+            for (var i: u32 = 0u; i < TM; i = i + 1u) {
+                let a_row: u32 = lid.y * TM + i;
+                let av_pair: vec2<f32> = vec2<f32>(tile_a[a_row * (BK / 2u) + kk2]);
+                for (var j: u32 = 0u; j < TN; j = j + 1u) {
+                    let b_col: u32 = lid.x * TN + j;
+                    let bv_pair: vec2<f32> = vec2<f32>(tile_b[kk2 * BN + b_col]);
+                    acc[i * TN + j] = acc[i * TN + j]
+                        + av_pair.x * bv_pair.x
+                        + av_pair.y * bv_pair.y;
+                }
+            }
+        }
+"#.to_string();
+        (tile_a_decl, tile_b_decl, a_load_loop, inner_loop)
+    } else {
+        let tile_a_decl = format!("var<workgroup> tile_a: array<f32, {tile_a_size}u>;");
+        let tile_b_decl = format!("var<workgroup> tile_b: array<f32, {tile_b_size}u>;");
+        let a_load_loop = format!(
+            r#"        for (var s: u32 = 0u; s < {a_loads_per_thread}u; s = s + 1u) {{
+            let idx: u32 = s * THREADS + tid;
+            if (idx < BM * BK) {{
+                let ar: u32 = idx / BK;
+                let ac: u32 = idx % BK;
+                let gr: u32 = bm0 + ar;
+                let gc: u32 = k0 + ac;
+                var v: f32 = 0.0;
+                if (gr < d.m && gc < d.k) {{
+                    v = load_a(gr * d.k + gc);
+                }}
+                tile_a[idx] = v;
+            }}
+        }}
+"#
+        );
+        let inner_loop = r#"        for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {
+            for (var i: u32 = 0u; i < TM; i = i + 1u) {
+                let a_row: u32 = lid.y * TM + i;
+                let av: f32 = tile_a[a_row * BK + kk];
+                for (var j: u32 = 0u; j < TN; j = j + 1u) {
+                    let b_col: u32 = lid.x * TN + j;
+                    acc[i * TN + j] = acc[i * TN + j] + av * tile_b[kk * BN + b_col];
+                }
+            }
+        }
+"#.to_string();
+        (tile_a_decl, tile_b_decl, a_load_loop, inner_loop)
+    };
     format!(
-        r#"
+        r#"{f16_prelude}
 struct Dims {{ m: u32, n: u32, k: u32, _pad: u32 }};
 
 {a_elem_decl}
@@ -364,8 +570,8 @@ const WG_X: u32 = {wg_x}u;
 const WG_Y: u32 = {wg_y}u;
 const THREADS: u32 = {threads}u;
 
-var<workgroup> tile_a: array<f32, {tile_a_size}u>;
-var<workgroup> tile_b: array<f32, {tile_b_size}u>;
+{tile_a_decl}
+{tile_b_decl}
 
 @compute @workgroup_size({wg_x}, {wg_y}, 1)
 fn main(
@@ -384,33 +590,11 @@ fn main(
     for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {{
         let k0: u32 = t * BK;
 
-        for (var s: u32 = 0u; s < {a_loads_per_thread}u; s = s + 1u) {{
-            let idx: u32 = s * THREADS + tid;
-            if (idx < BM * BK) {{
-                let ar: u32 = idx / BK;
-                let ac: u32 = idx % BK;
-                let gr: u32 = bm0 + ar;
-                let gc: u32 = k0 + ac;
-                var v: f32 = 0.0;
-                if (gr < d.m && gc < d.k) {{
-                    v = load_a(gr * d.k + gc);
-                }}
-                tile_a[idx] = v;
-            }}
-        }}
+{a_load_loop}
 {b_load_loop}
         workgroupBarrier();
 
-        for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {{
-            for (var i: u32 = 0u; i < TM; i = i + 1u) {{
-                let a_row: u32 = lid.y * TM + i;
-                let av: f32 = tile_a[a_row * BK + kk];
-                for (var j: u32 = 0u; j < TN; j = j + 1u) {{
-                    let b_col: u32 = lid.x * TN + j;
-                    acc[i * TN + j] = acc[i * TN + j] + av * tile_b[kk * BN + b_col];
-                }}
-            }}
-        }}
+{inner_loop}
         workgroupBarrier();
     }}
 

@@ -4,7 +4,6 @@
 //! `x [N, C]`. Plain `add` only works when `len(x) == len(s)` (single-row
 //! escape hatch); this op covers `N > 1`.
 
-use crate::act_bf16_prelude;
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 #[cfg(feature = "conformance")]
 use crate::conformance::{
@@ -12,6 +11,7 @@ use crate::conformance::{
 };
 use crate::ops::{ActDtype, WeightDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
+use crate::{act_bf16_prelude, act_f16_prelude};
 
 pub trait BcastAddOp {
     const KERNEL_ID: &'static str;
@@ -145,6 +145,59 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "#
 );
 
+// Native f16 path, f32-weight bias. `s` is fp32 bias storage; narrow the
+// two f32 reads to f16 and do the add in vec2<f16>.
+const WGSL_F16_PACKED_WF32: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { c: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> s: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let w = gid.y * (ng.x * 64u) + gid.x;
+    if (w >= arrayLength(&out)) { return; }
+    let c0 = (w * 2u) % u.c;
+    let sv: vec2<f16> = vec2<f16>(f16(s[c0]), f16(s[c0 + 1u]));
+    out[w] = x[w] + sv;
+}
+"#
+);
+
+// Native f16 path, bf16-weight bias. `s` is bf16-packed (the DiT AdaLN
+// path); unpack to f32 pair, narrow to vec2<f16>, do the add native.
+const WGSL_F16_PACKED_WBF16: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { c: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> s: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+fn unpack_bf16x2_f32(w: u32) -> vec2<f32> {
+    let lo = bitcast<f32>((w & 0xFFFFu) << 16u);
+    let hi = bitcast<f32>(w & 0xFFFF0000u);
+    return vec2<f32>(lo, hi);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let w = gid.y * (ng.x * 64u) + gid.x;
+    if (w >= arrayLength(&out)) { return; }
+    let c0 = (w * 2u) % u.c;
+    let sv_f32 = unpack_bf16x2_f32(s[c0 >> 1u]);
+    let sv: vec2<f16> = vec2<f16>(sv_f32);
+    out[w] = x[w] + sv;
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -180,6 +233,8 @@ impl BcastAddOp for BcastAddF32 {
             (ActDtype::F32, true, WeightDtype::Bf16) => WGSL_F32_BF16Q_WBF16,
             (ActDtype::Bf16, _, WeightDtype::F32) => WGSL_BF16_PACKED_WF32,
             (ActDtype::Bf16, _, WeightDtype::Bf16) => WGSL_BF16_PACKED_WBF16,
+            (ActDtype::F16, _, WeightDtype::F32) => WGSL_F16_PACKED_WF32,
+            (ActDtype::F16, _, WeightDtype::Bf16) => WGSL_F16_PACKED_WBF16,
             // bcast_add operates on bias/affine vectors; norms+biases stay
             // full-precision under any quant scheme. Quant weights flow
             // only through matmul.

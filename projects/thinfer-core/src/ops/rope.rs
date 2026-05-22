@@ -5,7 +5,7 @@ use crate::conformance::{
 };
 use crate::ops::{ActDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
-use crate::{act_bf16_prelude, wgsl_with_bf16_variant};
+use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
 
 /// Rotary embedding via complex-pair multiply, broadcasting freqs across heads.
 ///
@@ -126,6 +126,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 );
 
+// Native f16 interleaved rope. Freqs follow the act dtype: in the F16 path
+// the RopeEmbedder uploads f16-packed freqs. Pair-rotation is two muls and
+// two add/subs in vec2<f16> — well within f16 dynamic range (|cos|<=1).
+const WGSL_F16_PACKED: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> freqs: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = u.rows * u.heads * u.pairs;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+    let pair = idx % u.pairs;
+    let rh   = idx / u.pairs;
+    let row  = rh / u.heads;
+    let xw_idx = rh  * u.pairs + pair;
+    let fw_idx = row * u.pairs + pair;
+    let xv: vec2<f16> = x[xw_idx];
+    let fv: vec2<f16> = freqs[fw_idx];
+    out[xw_idx] = vec2<f16>(xv.x * fv.x - xv.y * fv.y, xv.x * fv.y + xv.y * fv.x);
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -159,6 +189,7 @@ impl RopeOp for RopeF32 {
             (ActDtype::F32, false) => WGSL_F32,
             (ActDtype::F32, true) => WGSL_F32_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
+            (ActDtype::F16, _) => WGSL_F16_PACKED,
         }
     }
     fn layout() -> &'static [BindingLayout] {
@@ -251,6 +282,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 );
 
+// Native f16 half-rot. Real/imag halves live `pair_words` apart; per-thread
+// covers two consecutive pairs whose real elements share one f16 pair word
+// and imag elements share another. Requires `pairs % 2 == 0`.
+const WGSL_F16_PACKED_HALFROT: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> freqs: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pair_words = u.pairs >> 1u;
+    let total = u.rows * u.heads * pair_words;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+    let j  = idx % pair_words;
+    let rh = idx / pair_words;
+    let row = rh / u.heads;
+    let row_w_base = rh * u.pairs;
+    let xr_w = row_w_base + j;
+    let xi_w = row_w_base + pair_words + j;
+    let frow_w_base = row * u.pairs;
+    let f0: vec2<f16> = freqs[frow_w_base + 2u * j];
+    let f1: vec2<f16> = freqs[frow_w_base + 2u * j + 1u];
+    let xr: vec2<f16> = x[xr_w];
+    let xi: vec2<f16> = x[xi_w];
+    out[xr_w] = vec2<f16>(xr.x * f0.x - xi.x * f0.y, xr.y * f1.x - xi.y * f1.y);
+    out[xi_w] = vec2<f16>(xr.x * f0.y + xi.x * f0.x, xr.y * f1.y + xi.y * f1.x);
+}
+"#
+);
+
 pub struct RopeF32HalfRot;
 
 impl RopeOp for RopeF32HalfRot {
@@ -265,6 +332,7 @@ impl RopeOp for RopeF32HalfRot {
             (ActDtype::F32, false) => WGSL_F32_HALFROT,
             (ActDtype::F32, true) => WGSL_F32_HALFROT_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED_HALFROT,
+            (ActDtype::F16, _) => WGSL_F16_PACKED_HALFROT,
         }
     }
     fn layout() -> &'static [BindingLayout] {

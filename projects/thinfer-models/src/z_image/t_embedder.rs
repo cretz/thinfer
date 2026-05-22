@@ -85,6 +85,10 @@ impl TimestepEmbedder {
                 let h = round_f32_to_bf16(v);
                 bytes[idx * 2..(idx + 1) * 2].copy_from_slice(&h.to_le_bytes());
             }
+            ActDtype::F16 => {
+                let h = half::f16::from_f32(v).to_bits();
+                bytes[idx * 2..(idx + 1) * 2].copy_from_slice(&h.to_le_bytes());
+            }
         };
         for (i, &f) in self.freqs.iter().enumerate() {
             let arg = t * f;

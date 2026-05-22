@@ -115,6 +115,15 @@ impl WeightDtype {
 /// - `Bf16`: `array<u32>` storage with K=2 bf16 elements packed per word.
 ///   Implies RNE rounding on every activation-producing store (the packed
 ///   format is itself the rounded value).
+/// - `F16`: `array<vec2<f16>>` native storage. 4-byte stride (same as
+///   Bf16-packed) but typed — kernels read `vec2<f16>` directly, no
+///   bitcast. Requires the wgpu `SHADER_F16` feature (WGSL `enable f16;`).
+///   Pure-pointwise ops compute in `vec2<f16>` for native SIMD throughput
+///   on Apple Silicon / Intel Xe / vec2-aware discrete GPUs. Ops that
+///   reduce (matmul, sdpa, rmsnorm, layernorm) widen to f32 internally —
+///   f16 mantissa (10 bits) loses too many bits across K=3840 / K=10240
+///   dot products and softmax `exp()` saturates at ~65504. The widen
+///   happens at the reduction boundary, not at every op boundary.
 ///
 /// Designed extensibly: the per-word element count (`elems_per_word`) covers
 /// future fp16-packed (K=2) and fp8-packed (K=4) variants. Kernels generate
@@ -124,6 +133,7 @@ pub enum ActDtype {
     #[default]
     F32,
     Bf16,
+    F16,
 }
 
 impl ActDtype {
@@ -131,6 +141,7 @@ impl ActDtype {
         match self {
             Self::F32 => 4,
             Self::Bf16 => 2,
+            Self::F16 => 2,
         }
     }
     /// Elements packed per 4-byte storage word. Drives the per-thread output
@@ -139,13 +150,21 @@ impl ActDtype {
         match self {
             Self::F32 => 1,
             Self::Bf16 => 2,
+            Self::F16 => 2,
         }
     }
     pub fn hint(&self) -> &'static str {
         match self {
             Self::F32 => "af32",
             Self::Bf16 => "abf16",
+            Self::F16 => "af16",
         }
+    }
+    /// True when this dtype implies packed `array<u32>` storage (two elements
+    /// per word). Drives kernel-side dispatch shape decisions that are shared
+    /// between Bf16-packed and F16-packed paths.
+    pub const fn is_packed(&self) -> bool {
+        matches!(self, Self::Bf16 | Self::F16)
     }
 }
 
@@ -191,6 +210,16 @@ impl WgslConfig {
         act_dtype: ActDtype::Bf16,
         weight_dtype: WeightDtype::Bf16,
     };
+    /// Native f16 activation storage (`array<vec2<f16>>`), bf16 weights.
+    /// Used when SHADER_F16 is available; pairs naturally with the Quant
+    /// matmul path (dequant -> f32 accum -> narrow to f16) and with the
+    /// bf16-weight ops in the DiT block (adaLN matmul, refiners,
+    /// embedders, norms, biases).
+    pub const F16_NATIVE_WBF16: Self = Self {
+        bf16_quant_writes: false,
+        act_dtype: ActDtype::F16,
+        weight_dtype: WeightDtype::Bf16,
+    };
 
     /// Short tag for `KernelKey` hints and pipeline-cache disambiguation.
     /// Must change whenever any cfg field changes - the same kernel id with
@@ -223,6 +252,12 @@ impl WgslConfig {
             (true, ActDtype::F32, WeightDtype::Bf16) => "bf16q-wbf16",
             (_, ActDtype::Bf16, WeightDtype::F32) => "abf16-wf32",
             (_, ActDtype::Bf16, WeightDtype::Bf16) => "abf16",
+            // F16 acts: bf16_quant_writes is meaningless (storage is itself
+            // f16-rounded). The same hint covers both `bf16_quant_writes`
+            // values. Pair across the two weight types we exercise (F32
+            // and Bf16); F16+Quant is handled by the Quant branch above.
+            (_, ActDtype::F16, WeightDtype::F32) => "af16-wf32",
+            (_, ActDtype::F16, WeightDtype::Bf16) => "af16-wbf16",
             (_, _, WeightDtype::Quant(_)) => unreachable!("handled above"),
         };
         legacy.to_string()
@@ -238,6 +273,29 @@ impl WgslConfig {
 /// Inlined via `concat!` into every kernel whose `WgslConfig.act_dtype ==
 /// ActDtype::Bf16`. Reads stay fp32-compute; only the load/store path packs.
 /// Declared as a macro so `concat!` callers can splice it.
+/// WGSL prelude for native f16 activation storage. Emits:
+/// - `enable f16;` directive (must precede every other declaration).
+/// - `unpack_f16x2_f32(v: vec2<f16>) -> vec2<f32>` — widen for mixed-dtype
+///   compute (e.g. f16 act + bf16 weight bias add).
+/// - `pack_f32_to_f16x2(lo: f32, hi: f32) -> vec2<f16>` — narrow at the
+///   reduction boundary (matmul output, sdpa output).
+///
+/// Pure-pointwise kernels (silu, mul, add, tanh, bcast_fma, silu_mul,
+/// qkv_split, scatter_pad_rows) do NOT widen — they compute in `vec2<f16>`
+/// directly for native SIMD throughput on Apple Silicon / Intel Xe / vec2-
+/// aware discrete GPUs. The widen helpers are only used by ops that mix
+/// f16 activations with bf16 weights or that reduce internally.
+#[macro_export]
+macro_rules! act_f16_prelude {
+    () => {
+        concat!(
+            "enable f16;\n",
+            "fn unpack_f16x2_f32(v: vec2<f16>) -> vec2<f32> { return vec2<f32>(v); }\n",
+            "fn pack_f32_to_f16x2(lo: f32, hi: f32) -> vec2<f16> { return vec2<f16>(f16(lo), f16(hi)); }\n",
+        )
+    };
+}
+
 #[macro_export]
 macro_rules! act_bf16_prelude {
     () => {

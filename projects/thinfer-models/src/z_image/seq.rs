@@ -241,6 +241,22 @@ pub fn causal_mask_bytes_act(seq: usize, act: ActDtype) -> Vec<u8> {
             }
             out
         }
+        ActDtype::F16 => {
+            assert!(
+                seq.is_multiple_of(2),
+                "causal_mask_bytes_act: f16 path requires seq even (got {seq})"
+            );
+            let mut out = vec![0u8; seq * seq * 2];
+            // IEEE binary16 -inf is `0xfc00`.
+            let neg_inf_f16: u16 = 0xfc00;
+            for q in 0..seq {
+                for k in (q + 1)..seq {
+                    let off = (q * seq + k) * 2;
+                    out[off..off + 2].copy_from_slice(&neg_inf_f16.to_le_bytes());
+                }
+            }
+            out
+        }
     }
 }
 
@@ -266,6 +282,16 @@ pub fn act_upload_bytes(act: ActDtype, slice: &[f32]) -> Vec<u8> {
             }
             bytes
         }
+        ActDtype::F16 => {
+            // IEEE binary16. `half::f16::from_f32` uses RNE; matches the
+            // WGSL `f16(...)` constructor's rounding mode.
+            let mut bytes = vec![0u8; slice.len() * 2];
+            for (i, v) in slice.iter().enumerate() {
+                let h = half::f16::from_f32(*v).to_bits();
+                bytes[i * 2..(i + 1) * 2].copy_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        }
     }
 }
 
@@ -285,6 +311,13 @@ pub fn act_readback_to_f32(act: ActDtype, bytes: &[u8], n_elems: usize) -> Vec<f
             for (i, chunk) in bytes.chunks_exact(2).enumerate() {
                 let half = u16::from_le_bytes([chunk[0], chunk[1]]);
                 out[i] = f32::from_bits((half as u32) << 16);
+            }
+        }
+        ActDtype::F16 => {
+            debug_assert_eq!(bytes.len(), n_elems * 2);
+            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                out[i] = half::f16::from_bits(bits).to_f32();
             }
         }
     }

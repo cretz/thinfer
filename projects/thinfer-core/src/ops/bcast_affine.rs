@@ -15,7 +15,7 @@ use crate::conformance::{
 };
 use crate::ops::{ActDtype, WgslConfig};
 use crate::tensor::{ComputeDtype, F32};
-use crate::{act_bf16_prelude, wgsl_with_bf16_variant};
+use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
 
 pub trait BcastAffineOp {
     const KERNEL_ID: &'static str;
@@ -99,6 +99,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "#
 );
 
+// Native f16 path. `s` is a per-call gate/scale vector (acts, not weights);
+// when act_dtype is F16 the modulation chunks are f16-packed alongside x/out.
+// `bias` is an f32 uniform — narrow to f16 once per thread, then native
+// vec2<f16> compute.
+const WGSL_F16_PACKED: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { c: u32, bias: f32, _pad0: u32, _pad1: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> s: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let w = gid.y * (ng.x * 64u) + gid.x;
+    if (w >= arrayLength(&out)) { return; }
+    let xv: vec2<f16> = x[w];
+    let c0 = (w * 2u) % u.c;
+    let sv: vec2<f16> = s[c0 >> 1u];
+    let bias_h: f16 = f16(u.bias);
+    let bias_v: vec2<f16> = vec2<f16>(bias_h, bias_h);
+    out[w] = xv * (sv + bias_v);
+}
+"#
+);
+
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
         slot: 0,
@@ -131,6 +159,7 @@ impl BcastAffineOp for BcastAffineF32 {
             (ActDtype::F32, false) => WGSL_F32,
             (ActDtype::F32, true) => WGSL_F32_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
+            (ActDtype::F16, _) => WGSL_F16_PACKED,
         }
     }
     fn layout() -> &'static [BindingLayout] {
