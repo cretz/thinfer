@@ -1,14 +1,18 @@
 use crate::backend::{Backend, Binding, BindingLayout, BufRef};
 use crate::tensor::ComputeDtype;
 
+pub mod act_quant;
 pub mod add;
 pub mod bcast_add;
 pub mod bcast_affine;
 pub mod bcast_fma;
 pub mod conv2d;
+pub mod dequant;
+pub mod dequant_i8;
 pub mod group_norm;
 pub mod layernorm;
 pub mod matmul;
+pub mod matmul_i8;
 pub mod mul;
 pub mod qkv_split;
 pub mod rmsnorm;
@@ -31,6 +35,7 @@ pub(crate) use bcast_fma::dispatch_bcast_fma;
 pub use bcast_fma::{BcastFmaBufs, BcastFmaF32, BcastFmaOp};
 pub(crate) use conv2d::dispatch_conv2d;
 pub use conv2d::{Conv2dBufs, Conv2dF32, Conv2dOp};
+pub use dequant::{DequantBufs, dispatch_dequant};
 pub(crate) use group_norm::dispatch_group_norm;
 pub use group_norm::{GroupNormBufs, GroupNormF32, GroupNormOp};
 pub(crate) use layernorm::dispatch_layernorm;
@@ -49,6 +54,7 @@ pub(crate) use sdpa::dispatch_sdpa;
 pub use sdpa::{SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp};
 pub use silu::SiluF32;
 pub use silu_mul::SiluMulF32;
+#[cfg(feature = "conformance")]
 pub(crate) use softmax::dispatch_softmax;
 pub use softmax::{SoftmaxBufs, SoftmaxF32, SoftmaxOp};
 pub use tanh::TanhF32;
@@ -90,6 +96,15 @@ pub enum WeightDtype {
     #[default]
     F32,
     Bf16,
+    /// Native f16 weight storage (`array<vec2<f16>>`, paired along K). Used as
+    /// the dense workspace target for the dequant-once Quant path when the
+    /// adapter exposes `SHADER_F16`. Two K-adjacent elements per word, matching
+    /// the F16-act `tile_b` layout so the matmul B-load skips the
+    /// bf16-unpack -> f32 -> f16-narrow round-trip the Bf16 workspace forces.
+    /// Magnitude-unsafe for raw bf16-trained safetensors (Z-Image values
+    /// exceed 65504); only set when the upstream producer (dequant kernel)
+    /// guarantees in-range values, e.g. Q-block scales.
+    F16,
     /// Block-quantized weight (GGUF lineage). The scheme carries layout
     /// constants + WGSL helpers via [`crate::quant::QuantKind`].
     Quant(crate::quant::QuantKind),
@@ -100,9 +115,12 @@ impl WeightDtype {
         match self {
             Self::F32 => "wf32",
             Self::Bf16 => "wbf16",
+            Self::F16 => "wf16",
             Self::Quant(crate::quant::QuantKind::Q8_0) => "wq80",
             Self::Quant(crate::quant::QuantKind::Q4_0) => "wq40",
             Self::Quant(crate::quant::QuantKind::Q4_K) => "wq4k",
+            Self::Quant(crate::quant::QuantKind::Q5_K) => "wq5k",
+            Self::Quant(crate::quant::QuantKind::Q6_K) => "wq6k",
         }
     }
 }
@@ -258,6 +276,9 @@ impl WgslConfig {
             // and Bf16); F16+Quant is handled by the Quant branch above.
             (_, ActDtype::F16, WeightDtype::F32) => "af16-wf32",
             (_, ActDtype::F16, WeightDtype::Bf16) => "af16-wbf16",
+            (_, ActDtype::F16, WeightDtype::F16) => "af16-wf16",
+            (_, ActDtype::F32, WeightDtype::F16) => "af32-wf16",
+            (_, ActDtype::Bf16, WeightDtype::F16) => "abf16-wf16",
             (_, _, WeightDtype::Quant(_)) => unreachable!("handled above"),
         };
         legacy.to_string()

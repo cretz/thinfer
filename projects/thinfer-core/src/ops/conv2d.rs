@@ -194,6 +194,7 @@ impl Conv2dOp for Conv2dF32 {
             WeightDtype::Bf16 => WGSL_F32_WBF16,
             // conv2d is VAE-only (full-precision path); GGUF quants live
             // in DiT matmuls.
+            WeightDtype::F16 => unreachable!("conv2d does not consume f16 weights"),
             WeightDtype::Quant(_) => unreachable!("conv2d does not consume quant weights"),
         }
     }

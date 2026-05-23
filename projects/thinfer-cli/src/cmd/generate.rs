@@ -44,8 +44,9 @@ pub enum GenerateCmd {
 /// pull from there instead of hardcoded constants on the args struct.
 #[derive(Args)]
 pub struct GenerateImage {
-    /// Model identifier. Only `zimage-turbo` is wired up today.
-    #[arg(long, default_value_t = ModelId::ZImageTurbo, value_enum)]
+    /// Model identifier. Defaults to `zimage-turbo-q8` (Q8_0 DiT, ~2.8x
+    /// faster per step than bf16 on iGPUs with SHADER_F16).
+    #[arg(long, default_value_t = ModelId::ZImageTurboQ8, value_enum)]
     pub model: ModelId,
     #[arg(long)]
     pub prompt: String,
@@ -73,24 +74,40 @@ pub struct GenerateImage {
     /// Skip the TTY consent prompt and download missing weight files.
     #[arg(long, default_value_t = false)]
     pub download_as_needed: bool,
-    /// Optional path to a DiT GGUF file (e.g. `unsloth/Z-Image-Turbo-GGUF`).
-    /// When set, the DiT matmul weights are pulled from the GGUF file
-    /// (Q8_0 / Q4_K etc); norms, biases, AdaLN, and the rest of the model
-    /// stay safetensors.
-    #[arg(long)]
-    pub dit_gguf: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ModelId {
-    #[value(name = "zimage-turbo")]
-    ZImageTurbo,
+    /// Z-Image-Turbo with Q8_0 DiT matmul weights (unsloth GGUF). Rest of
+    /// the model stays bf16 safetensors.
+    #[value(name = "zimage-turbo-q8")]
+    ZImageTurboQ8,
+    /// Z-Image-Turbo with Q4_K_M DiT matmul weights (unsloth GGUF). Halves
+    /// DiT VRAM/bandwidth vs Q8_0 at production-grade quality. Rest of the
+    /// model stays bf16 safetensors. (Q4_K_M is Q4_K + Q6_K mixed; engine
+    /// support in progress.)
+    #[value(name = "zimage-turbo-q4")]
+    ZImageTurboQ4,
+    /// Z-Image-Turbo with bf16 DiT weights (dimitribarbot safetensors).
+    #[value(name = "zimage-turbo-bf16")]
+    ZImageTurboBf16,
 }
 
 impl ModelId {
     fn manifest(self) -> &'static ModelManifest {
         match self {
-            ModelId::ZImageTurbo => &thinfer_models::z_image::manifest::MANIFEST,
+            ModelId::ZImageTurboQ8 | ModelId::ZImageTurboQ4 | ModelId::ZImageTurboBf16 => {
+                &thinfer_models::z_image::manifest::MANIFEST
+            }
+        }
+    }
+
+    /// Role of the GGUF file to union over the safetensors source, if any.
+    fn dit_gguf_role(self) -> Option<&'static str> {
+        match self {
+            ModelId::ZImageTurboQ8 => Some(zrole::DIT_GGUF_Q8_0),
+            ModelId::ZImageTurboQ4 => Some(zrole::DIT_GGUF_Q4_K_M),
+            ModelId::ZImageTurboBf16 => None,
         }
     }
 }
@@ -98,7 +115,9 @@ impl ModelId {
 impl std::fmt::Display for ModelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModelId::ZImageTurbo => f.write_str("zimage-turbo"),
+            ModelId::ZImageTurboQ8 => f.write_str("zimage-turbo-q8"),
+            ModelId::ZImageTurboQ4 => f.write_str("zimage-turbo-q4"),
+            ModelId::ZImageTurboBf16 => f.write_str("zimage-turbo-bf16"),
         }
     }
 }
@@ -136,6 +155,7 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
     };
 
     let manifest = args.model.manifest();
+    let dit_gguf_role = args.model.dit_gguf_role();
     // Weight shards (safetensors, merged into one ShardedSafetensorsSource)
     // and tokenizer JSON live in the manifest. As future loaders land they
     // join the relevant list here; nothing else in CLI needs to change.
@@ -151,6 +171,7 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
     let all_files: Vec<FileRef> = weight_roles
         .iter()
         .chain(aux_roles.iter())
+        .chain(dit_gguf_role.iter())
         .map(|r| {
             *manifest
                 .get(r)
@@ -221,6 +242,11 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
 
     let backend = {
         let _s = tracing::info_span!("wgpu_init").entered();
+        // Default `HighPerformance` (not `None`) because Vulkan drivers treat
+        // an unset preference as a background-priority hint: on Intel Arc
+        // iGPU this clamps clocks / shrinks the subgroup_size range, slowing
+        // DiT by ~2.5x. Users who explicitly want thin-hardware-friendly
+        // scheduling can set `THINFER_POWER_PREF=low`.
         let cfg = WgpuConfig {
             power_preference: match std::env::var("THINFER_POWER_PREF")
                 .ok()
@@ -230,7 +256,8 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
             {
                 Some("high" | "highperformance" | "discrete") => PowerPreference::HighPerformance,
                 Some("low" | "lowpower" | "integrated") => PowerPreference::LowPower,
-                _ => PowerPreference::None,
+                Some("none") => PowerPreference::None,
+                _ => PowerPreference::HighPerformance,
             },
             timestamps: std::env::var("THINFER_TRACE").is_ok(),
         };
@@ -254,13 +281,14 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
         steps: args.steps,
         seed,
     };
-    let png = match args.dit_gguf.as_ref() {
+    let png = match dit_gguf_role {
         None => {
             let residency = WeightResidency::new(source, budget);
             load_and_generate(backend, residency, tokenizer, &gen_params).await?
         }
-        Some(path) => {
-            let opener = MmapFileOpener::new(path)
+        Some(role) => {
+            let path = resolve_role(role)?;
+            let opener = MmapFileOpener::new(&path)
                 .await
                 .map_err(|e| format!("open gguf {}: {e}", path.display()))?;
             let gguf = GgufSource::open(opener)

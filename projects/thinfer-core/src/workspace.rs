@@ -460,6 +460,36 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         self.backend.submit(enc).await?;
         Ok(())
     }
+
+    /// Like `submit_void`, but returns the completion future synchronously
+    /// without awaiting it. The caller drives the await on its own schedule
+    /// (typically: keep a depth-K ring of in-flight submits to overlap CPU
+    /// encoding of block N+1 with GPU execution of block N).
+    ///
+    /// Critical contract: `backend.submit` already calls `queue.submit`
+    /// eagerly in its synchronous prelude, so the GPU work is in-flight as
+    /// soon as this function returns. The returned future awaits the
+    /// completion fence + error-scope drain. The scope's guards are moved
+    /// into the future's frame so pool reuse is suppressed until completion.
+    ///
+    /// Hazard the caller must respect: any caller-owned `WsBuf` that the
+    /// dispatches in this scope still reference (i.e. imported via
+    /// `scope.import`) must also be held alive until the returned future
+    /// resolves. The scope only tracks buffers it allocated itself.
+    pub fn submit_deferred(self) -> impl core::future::Future<Output = Result<(), B::Error>> {
+        let enc = self
+            .encoder
+            .into_inner()
+            .expect("BatchScope encoder already taken");
+        let guards = self.guards.into_inner();
+        // backend.submit's synchronous prelude calls queue.submit; the
+        // returned future just awaits completion + error scopes.
+        let fut = self.backend.submit(enc);
+        async move {
+            let _g = guards;
+            fut.await
+        }
+    }
 }
 
 // Per-op dispatch methods on BatchScope. Thin forwarders to the free
@@ -500,6 +530,150 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             &mut self.encoder_mut(),
             pipeline,
             op,
+            &bufs,
+            m,
+            n,
+        )
+    }
+
+    /// Dispatch a quant-weight dequant pass: read Q4_K/Q5_K/Q6_K/Q8_0/Q4_0
+    /// blocks from `b_quant` and write a dense bf16-packed `[N, K]` tensor
+    /// into `b_dense`. Caller-provided `dims` uniform is `(n, k, _, _)`.
+    /// Used by the DiT layer forward to materialize weights once per matmul
+    /// site, eliminating the 4x in-matmul re-dequant of the same B columns.
+    pub fn dequant(
+        &self,
+        pipeline: &B::Pipeline,
+        scheme: crate::quant::QuantKind,
+        b_quant: BatchBuf<'wsp>,
+        b_dense: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), B::Error> {
+        let b_quant = self.resolve(b_quant);
+        let b_dense = self.resolve(b_dense);
+        let dims = self.resolve(dims);
+        let bufs = crate::ops::DequantBufs {
+            b_quant: &b_quant,
+            b_dense: &b_dense,
+            dims: &dims,
+        };
+        crate::ops::dispatch_dequant(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            scheme,
+            &bufs,
+            n,
+            k,
+        )
+    }
+
+    /// Dispatch the activation int8 quantizer: read `[M, K]` f16 acts and
+    /// write `[M, K]` packed int8 + `[M, K/32]` f32 scales. Caller-provided
+    /// `dims` uniform is `(m, k, _, _)`. Pairs with [`Self::matmul_i8`].
+    pub fn act_quant(
+        &self,
+        pipeline: &B::Pipeline,
+        a: BatchBuf<'wsp>,
+        out_i8: BatchBuf<'wsp>,
+        out_scale: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        m: u32,
+        k: u32,
+    ) -> Result<(), B::Error> {
+        let a = self.resolve(a);
+        let out_i8 = self.resolve(out_i8);
+        let out_scale = self.resolve(out_scale);
+        let dims = self.resolve(dims);
+        let bufs = crate::ops::act_quant::ActQuantBufs {
+            a: &a,
+            out_i8: &out_i8,
+            out_scale: &out_scale,
+            dims: &dims,
+        };
+        crate::ops::act_quant::dispatch_act_quant(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            m,
+            k,
+        )
+    }
+
+    /// Dispatch the I8 dequant pass: read Q-block weights and write
+    /// `[N, K]` packed int8 + `[N, K/32]` f32 scales. Pairs with
+    /// [`Self::matmul_i8`].
+    pub fn dequant_i8(
+        &self,
+        pipeline: &B::Pipeline,
+        scheme: crate::quant::QuantKind,
+        b_quant: BatchBuf<'wsp>,
+        b_i8: BatchBuf<'wsp>,
+        b_scale: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), B::Error> {
+        let b_quant = self.resolve(b_quant);
+        let b_i8 = self.resolve(b_i8);
+        let b_scale = self.resolve(b_scale);
+        let dims = self.resolve(dims);
+        let bufs = crate::ops::dequant_i8::DequantI8Bufs {
+            b_quant: &b_quant,
+            b_i8: &b_i8,
+            b_scale: &b_scale,
+            dims: &dims,
+        };
+        crate::ops::dequant_i8::dispatch_dequant_i8(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            scheme,
+            &bufs,
+            n,
+            k,
+        )
+    }
+
+    /// DP4A matmul. A and B are `[M, K]` / `[N, K]` packed int8 (4 per u32)
+    /// with per-(row, K/32) f32 scale buffers; output is `[M, N]` paired
+    /// `vec2<f16>`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_i8(
+        &self,
+        pipeline: &B::Pipeline,
+        cfg: &crate::ops::matmul_i8::MatMulI8Config,
+        a: BatchBuf<'wsp>,
+        a_scale: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        b_scale: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let a = self.resolve(a);
+        let a_scale = self.resolve(a_scale);
+        let b = self.resolve(b);
+        let b_scale = self.resolve(b_scale);
+        let out = self.resolve(out);
+        let dims = self.resolve(dims);
+        let bufs = crate::ops::matmul_i8::MatMulI8Bufs {
+            a: &a,
+            a_scale: &a_scale,
+            b: &b,
+            b_scale: &b_scale,
+            out: &out,
+            dims: &dims,
+        };
+        crate::ops::matmul_i8::dispatch_matmul_i8(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            cfg,
             &bufs,
             m,
             n,

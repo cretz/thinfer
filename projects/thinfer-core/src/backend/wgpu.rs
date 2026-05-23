@@ -31,6 +31,27 @@ pub struct WgpuBackend {
     /// back to `ActDtype::F32`. Bf16-weight production path is unaffected
     /// either way.
     shader_f16: bool,
+    /// True when the WebGPU/WGSL `packed_4x8_integer_dot_product` language
+    /// extension is available (queried via `Instance::wgsl_language_features`).
+    /// Gates the DP4A matmul path (int8 acts + int8 weights + `dot4I8Packed`
+    /// inner loop). Native wgpu lowers to SPIR-V SDot/UDot (backed by
+    /// `VK_KHR_shader_integer_dot_product` on Vulkan, native DP4A on D3D12/
+    /// Metal, software fallback otherwise). On WebGPU/browser this requires
+    /// Chrome/Edge desktop; Firefox/Safari may not expose it yet.
+    packed_int_dot: bool,
+    /// True when the adapter exposes `Features::SUBGROUP` and we requested it
+    /// on the device. Drives the `use_subgroup` flag on the DP4A matmul:
+    /// when set, the inner loop loads `tile_a` / `tile_a_scale` through
+    /// `subgroupBroadcastFirst` so the backend can collapse N per-lane
+    /// shared-mem reads into one fetch + broadcast across the subgroup.
+    /// Native-only feature in wgpu 28 (no WebGPU exposure yet); falls back
+    /// to plain shared-mem reads when absent.
+    subgroups: bool,
+    /// Reported subgroup-size range from the adapter. Logged at construction
+    /// for diagnostic visibility; the matmul kernel itself does not rely on
+    /// a specific size (the broadcast hint is correct for any size).
+    subgroup_min_size: u32,
+    subgroup_max_size: u32,
     /// Sink for uncaptured errors. The wgpu uncaptured handler stores the
     /// FIRST error received here (later ones are eprintln'd but not stored,
     /// so the root cause isn't shadowed by its own cascade). Drained at sync
@@ -78,6 +99,10 @@ pub enum WgpuError {
     ReadbackRejected {
         ordinal: u64,
         message: String,
+    },
+    PipelineCreate {
+        entry: String,
+        source: wgpu::Error,
     },
 }
 
@@ -211,6 +236,16 @@ impl WgpuBackend {
 
     pub async fn new_with_config(cfg: WgpuConfig) -> Result<Self, WgpuError> {
         let instance = wgpu::Instance::default();
+        // WGSL `packed_4x8_integer_dot_product` extension probe. Queried on
+        // the instance because it's a WGSL-language feature, not a device
+        // feature - the same wgpu instance can serve devices that vary in
+        // backend, but the WGSL frontend is shared. naga 28 implements it
+        // natively (emits `enable packed_4x8_integer_dot_product;` and the
+        // `dot4I8Packed` / `dot4U8Packed` builtins). Drives the DP4A matmul
+        // path selection in `pipeline.rs`.
+        let packed_int_dot = instance
+            .wgsl_language_features()
+            .contains(wgpu::WgslLanguageFeatures::Packed4x8IntegerDotProduct);
         let power_preference = match cfg.power_preference {
             PowerPreference::HighPerformance => wgpu::PowerPreference::HighPerformance,
             PowerPreference::LowPower => wgpu::PowerPreference::LowPower,
@@ -247,12 +282,21 @@ impl WgpuBackend {
         // path in the Q8 pipeline; when it doesn't we fall back to F32 acts.
         // Bf16 path is unaffected either way (it doesn't read f16 storage).
         let adapter_has_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
+        // `Features::SUBGROUP` exposes `subgroupBroadcastFirst`, `subgroupShuffle`,
+        // `subgroup_size` / `subgroup_invocation_id` builtins. Native-only in
+        // wgpu 28 (browser WebGPU has subgroups in the spec but wgpu's web
+        // backend doesn't surface the feature flag yet). Drives the
+        // `MatMulI8Config.use_subgroup` flag on the DP4A matmul pipeline.
+        let adapter_has_subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
         let mut required_features = wgpu::Features::empty();
         if request_ts {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
         if adapter_has_f16 {
             required_features |= wgpu::Features::SHADER_F16;
+        }
+        if adapter_has_subgroups {
+            required_features |= wgpu::Features::SUBGROUP;
         }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -280,6 +324,8 @@ impl WgpuBackend {
             .await
             .map_err(WgpuError::DeviceRequest)?;
         let info = adapter.get_info();
+        let subgroup_min_size = info.subgroup_min_size;
+        let subgroup_max_size = info.subgroup_max_size;
         tracing::info!(
             target: trace::ADAPTER,
             name = %info.name,
@@ -290,6 +336,10 @@ impl WgpuBackend {
             driver_info = %info.driver_info,
             device_type = ?info.device_type,
             shader_f16 = adapter_has_f16,
+            packed_int_dot = packed_int_dot,
+            subgroups = adapter_has_subgroups,
+            subgroup_min_size = subgroup_min_size,
+            subgroup_max_size = subgroup_max_size,
             "wgpu adapter",
         );
         let uncaptured: Arc<Mutex<Option<wgpu::Error>>> = Arc::new(Mutex::new(None));
@@ -322,8 +372,21 @@ impl WgpuBackend {
             uncaptured,
             timestamps,
             shader_f16: adapter_has_f16,
+            packed_int_dot,
+            subgroups: adapter_has_subgroups,
+            subgroup_min_size,
+            subgroup_max_size,
             mem: MemAccount::new(),
         })
+    }
+
+    /// Whether the WGSL `packed_4x8_integer_dot_product` language extension
+    /// is exposed by this instance (native: always via naga; web: gated by
+    /// the browser's WebGPU implementation). Drives the DP4A matmul path
+    /// selection in the Quant pipeline; when false, the model layer falls
+    /// back to the F16-workspace path.
+    pub fn supports_packed_int_dot(&self) -> bool {
+        self.packed_int_dot
     }
 
     /// Whether the device was created with `Features::SHADER_F16` (WGSL
@@ -331,6 +394,24 @@ impl WgpuBackend {
     /// activation dtype choice on this.
     pub fn supports_shader_f16(&self) -> bool {
         self.shader_f16
+    }
+
+    /// Whether the device was created with `Features::SUBGROUP` (WGSL
+    /// `subgroupBroadcastFirst` / `subgroupShuffle` / `subgroup_size` /
+    /// `subgroup_invocation_id` builtins). Drives `MatMulI8Config.use_subgroup`
+    /// on the DP4A matmul pipeline. Adapter-reported subgroup-size range is
+    /// also exposed for callers that want to log or branch on it.
+    pub fn supports_subgroups(&self) -> bool {
+        self.subgroups
+    }
+
+    /// Adapter-reported subgroup size range. Both values come from
+    /// `wgpu::AdapterInfo`; on devices with a single subgroup width
+    /// `min == max`. Always populated even when `supports_subgroups`
+    /// is false (the WGSL builtins are gated by the feature, not the
+    /// range).
+    pub fn subgroup_size_range(&self) -> (u32, u32) {
+        (self.subgroup_min_size, self.subgroup_max_size)
     }
 
     fn get_buffer(&self, id: GpuBufferId) -> Result<Arc<wgpu::Buffer>, WgpuError> {
@@ -759,10 +840,21 @@ impl Backend for WgpuBackend {
         let layout: Vec<BindingLayout> = layout.to_vec();
         async move {
             tracing::debug!(target: crate::trace::COMPILE, %entry, "wgsl compile");
+            // Push a validation scope around shader-module creation so WGSL
+            // parse/validation failures surface in the returned PipelineCreate
+            // error instead of disappearing into the uncaptured-error handler
+            // (which only logs and requires RUST_LOG=wgpu=error to see).
+            // Naga produces a fully-formatted error message including line
+            // numbers and the offending span; threading it back as `source`
+            // makes shader bugs debuggable from the program's error output.
+            let module_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: None,
+                label: Some(&entry),
                 source: wgpu::ShaderSource::Wgsl(wgsl.into()),
             });
+            if let Some(err) = module_scope.pop().await {
+                return Err(WgpuError::PipelineCreate { entry, source: err });
+            }
             let entries: Vec<wgpu::BindGroupLayoutEntry> = layout
                 .iter()
                 .map(|l| wgpu::BindGroupLayoutEntry {
@@ -793,6 +885,7 @@ impl Backend for WgpuBackend {
                 bind_group_layouts: &[&bgl],
                 immediate_size: 0,
             });
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: None,
                 layout: Some(&pl),
@@ -801,6 +894,9 @@ impl Backend for WgpuBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+            if let Some(err) = scope.pop().await {
+                return Err(WgpuError::PipelineCreate { entry, source: err });
+            }
             Ok(WgpuPipeline {
                 pipeline,
                 bind_group_layout: bgl,

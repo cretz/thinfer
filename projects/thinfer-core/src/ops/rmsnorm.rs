@@ -262,6 +262,9 @@ impl RmsNormOp for RmsNormF32 {
             }
             (ActDtype::F16, WeightDtype::Bf16, _) => WGSL_F16_PACKED_WBF16,
             (ActDtype::F16, WeightDtype::F32, _) => WGSL_F16_PACKED_WF32,
+            (_, WeightDtype::F16, _) => {
+                unreachable!("rmsnorm does not consume f16 weights (workspace-only dtype)")
+            }
             (_, WeightDtype::Quant(_), _) => {
                 unreachable!("rmsnorm does not consume quant weights")
             }

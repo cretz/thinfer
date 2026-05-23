@@ -238,6 +238,9 @@ impl BcastAddOp for BcastAddF32 {
             // bcast_add operates on bias/affine vectors; norms+biases stay
             // full-precision under any quant scheme. Quant weights flow
             // only through matmul.
+            (_, _, WeightDtype::F16) => {
+                unreachable!("bcast_add does not consume f16 weights (workspace-only dtype)")
+            }
             (_, _, WeightDtype::Quant(_)) => {
                 unreachable!("bcast_add does not consume quant weights")
             }

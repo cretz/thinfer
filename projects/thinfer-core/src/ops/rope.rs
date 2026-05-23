@@ -29,7 +29,12 @@ pub trait RopeOp {
     fn layout() -> &'static [BindingLayout];
 
     fn workgroups(rows: u32, heads: u32, pairs: u32) -> [u32; 3] {
-        [(rows * heads * pairs).div_ceil(64), 1, 1]
+        // Kernels read `gid.y * (ng.x * 64u) + gid.x` so workgroup counts
+        // > 65535 spill to Y. At 1024x1024 default-resolution, seq_x = 4096
+        // and n_heads = 30 give rows*heads*pairs/64 = 30720 per dispatch on
+        // the DiT main path; the noise-refiner's per-axis rope can push
+        // that past the 65535 cap, hence the spill.
+        super::linear_workgroups(rows * heads * pairs, 64)
     }
 }
 
@@ -74,9 +79,9 @@ struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
 @group(0) @binding(3) var<uniform> u: U;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
     let total = u.rows * u.heads * u.pairs;
-    let idx = gid.x;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
     if (idx >= total) { return; }
     let pair = idx % u.pairs;
     let rh   = idx / u.pairs;
@@ -108,9 +113,9 @@ struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
 @group(0) @binding(3) var<uniform> u: U;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
     let total = u.rows * u.heads * u.pairs;
-    let idx = gid.x;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
     if (idx >= total) { return; }
     let pair = idx % u.pairs;
     let rh   = idx / u.pairs;
@@ -140,9 +145,9 @@ struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
 @group(0) @binding(3) var<uniform> u: U;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
     let total = u.rows * u.heads * u.pairs;
-    let idx = gid.x;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
     if (idx >= total) { return; }
     let pair = idx % u.pairs;
     let rh   = idx / u.pairs;
@@ -220,9 +225,9 @@ struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
 @group(0) @binding(3) var<uniform> u: U;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
     let total = u.rows * u.heads * u.pairs;
-    let idx = gid.x;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
     if (idx >= total) { return; }
     let pair = idx % u.pairs;
     let rh   = idx / u.pairs;
@@ -256,10 +261,10 @@ struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
 @group(0) @binding(3) var<uniform> u: U;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
     let pair_words = u.pairs >> 1u;
     let total = u.rows * u.heads * pair_words;
-    let idx = gid.x;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
     if (idx >= total) { return; }
     let j  = idx % pair_words;
     let rh = idx / pair_words;
@@ -296,10 +301,10 @@ struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
 @group(0) @binding(3) var<uniform> u: U;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
     let pair_words = u.pairs >> 1u;
     let total = u.rows * u.heads * pair_words;
-    let idx = gid.x;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
     if (idx >= total) { return; }
     let j  = idx % pair_words;
     let rh = idx / pair_words;

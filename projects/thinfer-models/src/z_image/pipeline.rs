@@ -61,9 +61,14 @@ pub struct ZImageModel<S: WeightSource, T: Tokenizer> {
     backend: Arc<WgpuBackend>,
     residency: WeightResidency<S>,
     tokenizer: T,
-    /// Block pipelines compiled with `BF16_PACKED`. Used by every DiT-side
-    /// consumer (XEmbedder, CapEmbedder, TimestepEmbedder, Block, FinalLayer).
-    block_pipelines: BlockPipelines,
+    /// Per-main-layer block pipelines. Each entry holds the five matmul
+    /// kernels (qkv, proj, ffn_up, ffn_down, adaln) compiled with the
+    /// encoding probed from that layer's weights. For a uniform-encoding
+    /// file (Q8_0, bf16) all entries are identical and the WgpuPipeline
+    /// cache deduplicates the compiled WGSL behind them; for mixed
+    /// Q4_K_M files the per-(layer, slot) encoding selects the right
+    /// kernel at dispatch time.
+    block_pipelines: Vec<BlockPipelines>,
     /// Block pipelines compiled with `BF16_QUANT_WRITES` (fp32 activation
     /// storage + RNE writes for parity against bf16-PyTorch). Used only by the
     /// Qwen3 text encoder, which stays on the untuned matmul/fp32-storage path
@@ -183,19 +188,39 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // it's quant, the 4 main matmul kernels are compiled with that
         // scheme; AdaLN stays bf16 (its weights are too small to amortize
         // dequant and we keep them in safetensors regardless).
-        let dit_matmul_weight = {
-            let probe =
-                crate::z_image::BlockWeights::new(crate::z_image::BlockKind::Main, 0).attn_qkv;
+        // Per-(layer, slot) encoding probe. Z-Image-Turbo Q4_K_M files
+        // ship mixed quant per layer: the first/last two layers use one
+        // scheme (e.g. Q6_K for qkv) while the other 28 use another
+        // (e.g. Q5_K). For uniform-quant files (Q8_0, bf16) all probes
+        // return the same encoding and the WgpuPipeline cache collapses
+        // the compiled kernels.
+        let probe_slot = |id: &thinfer_core::weight::WeightId| -> WeightDtype {
             match residency
                 .source()
                 .catalog()
-                .get(&probe)
+                .get(id)
                 .and_then(|e| e.encoding)
             {
                 Some(StorageEncoding::Quant(k)) => WeightDtype::Quant(k),
                 _ => WeightDtype::Bf16,
             }
         };
+        let mut per_layer_weights: Vec<[WeightDtype; 4]> =
+            Vec::with_capacity(crate::z_image::config::N_LAYERS);
+        for li in 0..crate::z_image::config::N_LAYERS {
+            let bw = crate::z_image::BlockWeights::new(crate::z_image::BlockKind::Main, li);
+            per_layer_weights.push([
+                probe_slot(&bw.attn_qkv),
+                probe_slot(&bw.attn_to_out),
+                probe_slot(&bw.ffn_w1),
+                probe_slot(&bw.ffn_w2),
+            ]);
+        }
+        // Layer-0 qkv encoding is the headline matmul weight reported via
+        // `dit_matmul_weight()`. Used by tests to assert the GGUF source
+        // actually supplied the matmul tensors and (for Q4_K_M) to pick
+        // the right tolerance band.
+        let dit_matmul_weight = per_layer_weights[0][0];
         // Activation dtype selection for the Quant matmul path:
         // - When the adapter exposes `SHADER_F16`, use `ActDtype::F16`:
         //   native `vec2<f16>` storage halves activation VRAM and bandwidth
@@ -210,48 +235,76 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // AdaLN matmul keeps Bf16 weights but follows the block's chosen
         // act dtype (the `BlockWgslConfigs` invariant requires all matmuls
         // and ops to agree on act_dtype + bf16_quant_writes).
-        let (dit_main_matmul_cfg, dit_adaln_cfg, dit_ops_cfg) = match dit_matmul_weight {
-            WeightDtype::Quant(_) => {
-                let quant_act_dtype = if backend.supports_shader_f16() {
+        // Whether the file is "quant-flavored" overall — true as long as
+        // any main-layer matmul slot probed as Quant. Activation dtype is
+        // chosen once for the whole DiT: F16 when shader-f16 is available
+        // and any quant kernel is present (bf16 storage at f16 boundaries
+        // would lose precision relative to a native f16 path); F32
+        // baseline otherwise. The choice is uniform across all layers so
+        // activation buffers feeding one layer into the next stay
+        // type-consistent.
+        let any_quant = per_layer_weights
+            .iter()
+            .any(|slots| slots.iter().any(|s| matches!(s, WeightDtype::Quant(_))));
+        let (quant_act_dtype, ops_template_bf16w): (thinfer_core::ops::ActDtype, WgslConfig) =
+            if any_quant {
+                let a = if backend.supports_shader_f16() {
                     thinfer_core::ops::ActDtype::F16
                 } else {
                     thinfer_core::ops::ActDtype::F32
                 };
                 tracing::info!(
-                    ?quant_act_dtype,
+                    ?a,
                     shader_f16 = backend.supports_shader_f16(),
                     "DiT quant matmul activation dtype",
                 );
-                let main = WgslConfig {
-                    bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
-                    act_dtype: quant_act_dtype,
-                    weight_dtype: dit_matmul_weight,
-                };
                 let bf16w = WgslConfig {
                     bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
-                    act_dtype: quant_act_dtype,
+                    act_dtype: a,
                     weight_dtype: WeightDtype::Bf16,
                 };
-                (main, bf16w, bf16w)
-            }
-            _ => {
-                let main = WgslConfig {
-                    weight_dtype: dit_matmul_weight,
+                (a, bf16w)
+            } else {
+                (thinfer_core::ops::ActDtype::Bf16, WgslConfig::BF16_PACKED)
+            };
+        // Build per-layer configs. Within each layer the four main slots
+        // (qkv, proj, ffn_up, ffn_down) carry their probed weight dtype;
+        // adaln stays bf16; ops template is uniform.
+        let mut block_pipelines: Vec<BlockPipelines> =
+            Vec::with_capacity(crate::z_image::config::N_LAYERS);
+        let mk_main = |wd: WeightDtype| -> WgslConfig {
+            if any_quant {
+                WgslConfig {
+                    bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
+                    act_dtype: quant_act_dtype,
+                    weight_dtype: wd,
+                }
+            } else {
+                WgslConfig {
+                    weight_dtype: wd,
                     ..WgslConfig::BF16_PACKED
-                };
-                (main, WgslConfig::BF16_PACKED, WgslConfig::BF16_PACKED)
+                }
             }
         };
-        let dit_cfgs = BlockWgslConfigs {
-            matmul_qkv: dit_main_matmul_cfg,
-            matmul_proj: dit_main_matmul_cfg,
-            matmul_ffn_up: dit_main_matmul_cfg,
-            matmul_ffn_down: dit_main_matmul_cfg,
-            matmul_adaln: dit_adaln_cfg,
-            ops: dit_ops_cfg,
-        };
-        tracing::info!(?dit_matmul_weight, "DiT block matmul weight dtype");
-        let block_pipelines = BlockPipelines::compile(&backend, &dit_cfgs).await?;
+        for slots in &per_layer_weights {
+            let cfgs = BlockWgslConfigs {
+                matmul_qkv: mk_main(slots[0]),
+                matmul_proj: mk_main(slots[1]),
+                matmul_ffn_up: mk_main(slots[2]),
+                matmul_ffn_down: mk_main(slots[3]),
+                matmul_adaln: ops_template_bf16w,
+                ops: ops_template_bf16w,
+            };
+            block_pipelines.push(BlockPipelines::compile(&backend, &cfgs).await?);
+        }
+        // Headline "main matmul cfg" for downstream encoder/ops sizing.
+        // act_dtype + bf16_quant_writes are uniform across all layers so
+        // any entry works; use layer 0's qkv slot.
+        let dit_main_matmul_cfg = mk_main(per_layer_weights[0][0]);
+        tracing::info!(
+            ?dit_matmul_weight,
+            "DiT block matmul weight dtype (layer 0 qkv probe)"
+        );
         // Qwen3 text encoder pipelines: fp32 acts + bf16 weights, untuned
         // matmul path. Independent of the DiT path's dtype choice.
         let encoder_cfgs = BlockWgslConfigs::uniform(WgslConfig {
@@ -337,10 +390,9 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     w_lat,
                 )
                 .await?;
-            tracing::info!(
-                elapsed_ms = t.elapsed().as_millis() as u64,
-                "vae decode done"
-            );
+            let vae_ms = t.elapsed().as_millis() as u64;
+            tracing::info!(elapsed_ms = vae_ms, "vae decode done");
+            eprintln!("[thinfer] vae_decode: {:.2}s", vae_ms as f64 / 1000.0);
             out
         };
 
@@ -387,11 +439,9 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             let _s = tracing::debug_span!("png_encode").entered();
             encode_png(&rgb, params.width, params.height).map_err(GenerateError::Png)?
         };
-        tracing::info!(
-            elapsed_ms = t_gen.elapsed().as_millis() as u64,
-            png_bytes = png.len(),
-            "generate done"
-        );
+        let gen_ms = t_gen.elapsed().as_millis() as u64;
+        tracing::info!(elapsed_ms = gen_ms, png_bytes = png.len(), "generate done");
+        eprintln!("[thinfer] total: {:.2}s", gen_ms as f64 / 1000.0);
         Ok(png)
     }
 
@@ -534,11 +584,9 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     &token_ids,
                 )
                 .await?;
-            tracing::info!(
-                elapsed_ms = t.elapsed().as_millis() as u64,
-                seq = out.seq,
-                "text encode done"
-            );
+            let text_ms = t.elapsed().as_millis() as u64;
+            tracing::info!(elapsed_ms = text_ms, seq = out.seq, "text encode done");
+            eprintln!("[thinfer] text_encode: {:.2}s", text_ms as f64 / 1000.0);
             out
         };
         // Phase boundary: text encoder weights are dead for the rest of this
@@ -765,7 +813,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     // averages away.
                     let n = v.len();
                     let mut b_means = [0.0f64; 4];
-                    for bi in 0..4 {
+                    for (bi, b) in b_means.iter_mut().enumerate() {
                         let lo = bi * n / 4;
                         let hi = (bi + 1) * n / 4;
                         let mut s = 0.0f64;
@@ -776,7 +824,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                                 c += 1;
                             }
                         }
-                        b_means[bi] = if c > 0 { s / c as f64 } else { 0.0 };
+                        *b = if c > 0 { s / c as f64 } else { 0.0 };
                     }
                     // Head / tail samples expose structural patterns: e.g.
                     // bf16 0x0000 reads exactly 0.0; bf16 0xffff reads NaN;
@@ -805,7 +853,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     }
                     let nb = 8usize.min(rows);
                     let mut bm = vec![0.0f64; nb];
-                    for bi in 0..nb {
+                    for (bi, b) in bm.iter_mut().enumerate() {
                         let r_lo = bi * rows / nb;
                         let r_hi = (bi + 1) * rows / nb;
                         let mut s = 0.0f64;
@@ -818,7 +866,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                                 }
                             }
                         }
-                        bm[bi] = if c > 0 { s / c as f64 } else { 0.0 };
+                        *b = if c > 0 { s / c as f64 } else { 0.0 };
                     }
                     tracing::info!(
                         target: trace::DIAG,
@@ -1060,9 +1108,13 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     sab = smax.abs().max(smin.abs()),
                 );
             }
-            tracing::info!(
-                elapsed_ms = t_step.elapsed().as_millis() as u64,
-                "step done"
+            let step_ms = t_step.elapsed().as_millis() as u64;
+            tracing::info!(elapsed_ms = step_ms, "step done");
+            eprintln!(
+                "[thinfer] step {}/{}: dit={:.2}s",
+                i + 1,
+                params.steps,
+                step_ms as f64 / 1000.0,
             );
         }
 

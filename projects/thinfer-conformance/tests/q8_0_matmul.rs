@@ -63,6 +63,7 @@ async fn run_one(m: u32, n: u32, k: u32, seed: u64) -> (Vec<f32>, Vec<f32>) {
             bk: 32,
             tm: 1,
             tn: 1,
+            b_nmajor: false,
         },
     )
     .await
@@ -231,6 +232,7 @@ fn q8_0_matmul_prod_geom_qkv_f32_acts() {
         bk: 32,
         tm: 4,
         tn: 4,
+        b_nmajor: false,
     };
     let (got, exp) = pollster::block_on(run_one_with_cfg(1024, 11520, 3840, 0xC0DE_BABE, cfg));
     let nan_count = got.iter().filter(|x| !x.is_finite()).count();
@@ -254,6 +256,7 @@ fn q8_0_matmul_prod_geom_ffn_up_f32_acts() {
         bk: 32,
         tm: 4,
         tn: 4,
+        b_nmajor: false,
     };
     let (got, exp) = pollster::block_on(run_one_with_cfg(1024, 15360, 3840, 0xFFEE_BEEF, cfg));
     let nan_count = got.iter().filter(|x| !x.is_finite()).count();
@@ -276,6 +279,7 @@ fn q8_0_matmul_prod_geom_ffn_down_f32_acts() {
         bk: 32,
         tm: 4,
         tn: 4,
+        b_nmajor: false,
     };
     let (got, exp) = pollster::block_on(run_one_with_cfg(1024, 3840, 15360, 0xFAB0_BEEF, cfg));
     let nan_count = got.iter().filter(|x| !x.is_finite()).count();
@@ -298,7 +302,7 @@ fn q8_0_matmul_prod_geom_ffn_down_f32_acts() {
 /// bf16 is ~3.9e-3 of magnitude).
 #[test]
 fn q8_0_matmul_bf16_acts() {
-    let (got, exp) = pollster::block_on(run_one_bf16_acts(16, 16, 64, 0xABCD_EF));
+    let (got, exp) = pollster::block_on(run_one_bf16_acts(16, 16, 64, 0x00AB_CDEF));
     let max_abs_ref = exp.iter().copied().map(f32::abs).fold(0f32, f32::max);
     let tol = (5e-3 * max_abs_ref).max(1e-4);
     let (max_err, idx) = max_abs_diff(&got, &exp);
@@ -374,6 +378,7 @@ async fn run_one_bf16_acts(m: u32, n: u32, k: u32, seed: u64) -> (Vec<f32>, Vec<
         bk: 32,
         tm: 1,
         tn: 2,
+        b_nmajor: false,
     });
     let wgsl = op.wgsl(&cfg);
     let pipeline = backend

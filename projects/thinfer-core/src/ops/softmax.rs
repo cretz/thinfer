@@ -1,5 +1,7 @@
 use super::WgslConfig;
-use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
+#[cfg(feature = "conformance")]
+use crate::backend::Backend;
+use crate::backend::{BindingKind, BindingLayout, BufRef};
 #[cfg(feature = "conformance")]
 use crate::conformance::{
     DTYPES_FP32_ONLY, Dtype, OpSpec, OpTest, OpTestContext, TestCase, linspace, t,
@@ -33,6 +35,7 @@ pub struct SoftmaxBufs<'a> {
     pub out: &'a BufRef,
 }
 
+#[cfg(feature = "conformance")]
 pub(crate) fn dispatch_softmax<O: SoftmaxOp, B: Backend>(
     backend: &B,
     encoder: &mut B::CommandEncoder,

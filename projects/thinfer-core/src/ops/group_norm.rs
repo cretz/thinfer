@@ -178,6 +178,7 @@ impl GroupNormOp for GroupNormF32 {
         match cfg.weight_dtype {
             WeightDtype::F32 => WGSL_F32,
             WeightDtype::Bf16 => WGSL_F32_WBF16,
+            WeightDtype::F16 => unreachable!("group_norm does not consume f16 weights"),
             WeightDtype::Quant(_) => unreachable!("group_norm does not consume quant weights"),
         }
     }

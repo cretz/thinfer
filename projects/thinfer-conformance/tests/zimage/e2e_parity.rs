@@ -106,6 +106,7 @@ struct Tolerances {
 enum Variant {
     Safetensors,
     GgufQ8_0,
+    GgufQ4_K_M,
 }
 
 impl Variant {
@@ -113,6 +114,7 @@ impl Variant {
         match self {
             Variant::Safetensors => "safetensors",
             Variant::GgufQ8_0 => "gguf_q8_0",
+            Variant::GgufQ4_K_M => "gguf_q4_k_m",
         }
     }
 
@@ -122,6 +124,7 @@ impl Variant {
         match self {
             Variant::Safetensors => None,
             Variant::GgufQ8_0 => Some(role::DIT_GGUF_Q8_0),
+            Variant::GgufQ4_K_M => Some(role::DIT_GGUF_Q4_K_M),
         }
     }
 
@@ -135,6 +138,11 @@ impl Variant {
         match self {
             Variant::Safetensors => WeightDtype::Bf16,
             Variant::GgufQ8_0 => WeightDtype::Quant(QuantKind::Q8_0),
+            // Q4_K_M is per-(layer, slot) mixed Q4_K + Q5_K + Q6_K.
+            // The probe tensor (`layers.0.attention.qkv.weight`) is Q6_K
+            // per llama.cpp's "2 special layers" convention (first+last
+            // layer's qkv promoted from Q5_K to Q6_K).
+            Variant::GgufQ4_K_M => WeightDtype::Quant(QuantKind::Q6_K),
         }
     }
 
@@ -163,6 +171,15 @@ impl Variant {
                 vae_rgb: 98_304,
                 vae_diag: 256,
             },
+            // Q4_K_M is 4-bit but uses 8 sub-block scales per super-block
+            // (vs Q4_0's one) so per-element error stays much closer to Q8_0
+            // than to Q4_0. First-run baseline; tighten after a clean run.
+            Variant::GgufQ4_K_M => Tolerances {
+                step_prev_sample: 12_288,
+                pre_vae: 12_288,
+                vae_rgb: 147_456,
+                vae_diag: 512,
+            },
         }
     }
 }
@@ -187,6 +204,11 @@ async fn e2e_parity_for_safetensors() {
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_parity_for_gguf_q8_0() {
     run(Variant::GgufQ8_0).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn e2e_parity_for_gguf_q4_k_m() {
+    run(Variant::GgufQ4_K_M).await;
 }
 
 async fn run(variant: Variant) {
@@ -350,6 +372,10 @@ async fn run(variant: Variant) {
         workspace_reserve: 1 << 30,
     };
 
+    // Default `HighPerformance` to mirror CLI. Unset Vulkan power-pref hints
+    // are interpreted as background-priority by the driver on Intel iGPUs
+    // (~2.5x slower DiT, narrower subgroup_size range). Tests that need to
+    // exercise the LowPower path set `THINFER_POWER_PREF=low`.
     let cfg = WgpuConfig {
         power_preference: match std::env::var("THINFER_POWER_PREF")
             .ok()
@@ -359,7 +385,8 @@ async fn run(variant: Variant) {
         {
             Some("high" | "highperformance" | "discrete") => PowerPreference::HighPerformance,
             Some("low" | "lowpower" | "integrated") => PowerPreference::LowPower,
-            _ => PowerPreference::None,
+            Some("none") => PowerPreference::None,
+            _ => PowerPreference::HighPerformance,
         },
         timestamps: std::env::var("THINFER_TRACE").is_ok(),
     };

@@ -9,6 +9,11 @@
 //! Workspace activations persist across submits within one DiT forward as
 //! caller-owned `WsBuf`s; each scope `import`s them as needed.
 
+use std::collections::VecDeque;
+
+use std::future::Future;
+use std::pin::Pin;
+
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
 use thinfer_core::ops::{ActDtype, ScatterPadRowsF32};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
@@ -17,7 +22,9 @@ use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{Workspace, WsBuf};
 use tracing::Instrument;
 
-use crate::z_image::block::{Block, BlockConfig, BlockDebugTaps, BlockHandles, BlockPipelines};
+use crate::z_image::block::{
+    Block, BlockConfig, BlockDebugTaps, BlockHandles, BlockPipelines, BlockViews,
+};
 use crate::z_image::config;
 use crate::z_image::embedders::{
     CapEmbedder, CapEmbedderConfig, CapEmbedderHandles, LinearBiasHandles, XEmbedder,
@@ -258,7 +265,7 @@ impl ZImageDit {
     pub async fn forward<'a, S: WeightSource>(
         &self,
         backend: &WgpuBackend,
-        main_pipelines: &BlockPipelines,
+        main_pipelines: &[BlockPipelines],
         encoder_pipelines: &BlockPipelines,
         residency: &WeightResidency<S>,
         scratch: &Workspace<WgpuBackend>,
@@ -284,7 +291,7 @@ impl ZImageDit {
     pub async fn forward_with_taps<'a, S: WeightSource>(
         &self,
         backend: &WgpuBackend,
-        main_pipelines: &BlockPipelines,
+        main_pipelines: &[BlockPipelines],
         encoder_pipelines: &BlockPipelines,
         residency: &WeightResidency<S>,
         scratch: &Workspace<WgpuBackend>,
@@ -292,7 +299,12 @@ impl ZImageDit {
         mut taps: DitTaps<'_>,
     ) -> Result<DitForwardLayout, DitError<S::Error>> {
         debug_assert_eq!(
-            main_pipelines.act_dtype, encoder_pipelines.act_dtype,
+            main_pipelines.len(),
+            self.layers.len(),
+            "main_pipelines must hold one BlockPipelines per main layer",
+        );
+        debug_assert_eq!(
+            main_pipelines[0].act_dtype, encoder_pipelines.act_dtype,
             "main/encoder pipelines must share act_dtype",
         );
         // Single alias for sizing — act_dtype is identical across the
@@ -744,8 +756,46 @@ impl ZImageDit {
                     .await?,
             )
         };
+        // Depth-K ring of in-flight per-block submits. Each slot owns
+        // (completion-future, hold-bag). The hold-bag keeps the prior
+        // `u_cur` WsBuf and the block's acquired `BlockViews` alive until
+        // the GPU finishes consuming them; otherwise pool reuse could
+        // recycle the buffer or eviction could drop the weight pin while
+        // the submit is still pending.
+        //
+        // K=2: one in-flight submit + one queued = the most overlap this
+        // iGPU actually delivers. The earlier K=4 setting was based on a
+        // theoretical "driver sees N+3 upload ahead of N compute" model,
+        // but the smoke trace shows `queue.submit` itself blocks for
+        // ~2.6s once the device is saturated, so depth beyond 2 does not
+        // overlap anything in practice. Meanwhile pinned BlockViews are
+        // unevictable, so each ring slot consumes one block's weight
+        // footprint against the residency budget. At K=4 + concurrent
+        // next-acquire + idx+2 prefetch + current-iteration views, peak
+        // simultaneous pinned blocks reached ~7, which blew the 2 GiB
+        // e2e_parity test budget once a 41 MiB weight needed to load.
+        const SUBMIT_DEPTH: usize = 2;
+        #[allow(clippy::type_complexity)]
+        let mut pending_submits: VecDeque<(
+            Pin<Box<dyn Future<Output = Result<(), WgpuError>> + '_>>,
+            WsBuf<WgpuBackend>,
+            BlockViews<'_>,
+        )> = VecDeque::new();
         for (idx, blk) in self.layers.iter().enumerate() {
             let _blk_scope = trace::scope!(format_args!("block.{idx}")).entered();
+            // Cap simultaneous pinned BlockViews before adding more.
+            // Drain to len < SUBMIT_DEPTH so that after this iteration's
+            // push_back the ring sits at exactly SUBMIT_DEPTH. Peak pinned
+            // during this iter then = SUBMIT_DEPTH (ring after push) +
+            // 1 (`views` for the current block, will be moved into ring) +
+            // 1 (concurrent `next_acquire` for idx+1) = SUBMIT_DEPTH+2.
+            // Previously this drain ran AFTER acquire, which let the peak
+            // reach SUBMIT_DEPTH + current views + acquire + prefetch =
+            // SUBMIT_DEPTH+3 and overflowed the e2e_parity 2 GiB budget.
+            while pending_submits.len() >= SUBMIT_DEPTH {
+                let (fut, _prev, _v) = pending_submits.pop_front().unwrap();
+                fut.await?;
+            }
             if idx == 1
                 && let Some(sink) = taps.main_layer_0_out.as_deref_mut()
             {
@@ -784,7 +834,14 @@ impl ZImageDit {
                 taps.block0
                     .as_deref()
                     .map(|req| {
-                        Block0TapBufs::alloc(req, scratch, main_pipelines, seq_u, dim, blk.cfg)
+                        Block0TapBufs::alloc(
+                            req,
+                            scratch,
+                            &main_pipelines[idx],
+                            seq_u,
+                            dim,
+                            blk.cfg,
+                        )
                     })
                     .transpose()?
             } else {
@@ -800,57 +857,81 @@ impl ZImageDit {
             let t_emb_ref = t_emb.as_buf_ref();
             let nxt_ref = nxt.as_buf_ref();
             let next_idx = idx + 1;
-            let submit_res = {
-                let scope = scratch.batch();
-                blk.forward_taps(
-                    &scope,
-                    main_pipelines,
-                    scope.import(&u_cur_ref),
-                    scope.import(&freqs_ref),
-                    scope.import(&mask_ref),
-                    Some(scope.import(&t_emb_ref)),
-                    scope.import(&nxt_ref),
-                    &bufs,
-                    &b0_block_taps,
-                )?;
-                let next_acquire = async {
-                    match self.layers_handles.get(next_idx) {
-                        Some(h) => {
-                            let span = tracing::debug_span!(target: PHASE, "dit.acquire", phase = "layers", idx = next_idx);
-                            Ok::<_, ResidencyError<S::Error, WgpuError>>(Some(
-                                h.acquire(residency, backend).instrument(span).await?,
-                            ))
-                        }
-                        None => Ok(None),
+            // Diag-tap fast path bypass: when block-0 per-op taps are
+            // requested, read_back must observe THIS block's writes via the
+            // same WsBufs the scope owned, so we cannot move that scope's
+            // guards into a deferred future. Fall back to sync submit for
+            // this iteration. (Production runs never set b0_bufs.)
+            let needs_sync = b0_bufs.is_some();
+            let scope = scratch.batch();
+            blk.forward_taps(
+                &scope,
+                &main_pipelines[idx],
+                scope.import(&u_cur_ref),
+                scope.import(&freqs_ref),
+                scope.import(&mask_ref),
+                Some(scope.import(&t_emb_ref)),
+                scope.import(&nxt_ref),
+                &bufs,
+                &b0_block_taps,
+            )?;
+            // Acquire the next block's weights concurrently with this
+            // block's GPU work. No idx+2 prefetch: under tight residency
+            // budgets a third pinned block during this iter overflows
+            // (the next iter's drain-at-top will issue the idx+2 acquire
+            // on schedule anyway).
+            let next_acquire = async {
+                match self.layers_handles.get(next_idx) {
+                    Some(h) => {
+                        let span = tracing::debug_span!(target: PHASE, "dit.acquire", phase = "layers", idx = next_idx);
+                        Ok::<_, ResidencyError<S::Error, WgpuError>>(Some(
+                            h.acquire(residency, backend).instrument(span).await?,
+                        ))
                     }
-                };
-                let prefetch_after = async {
-                    match self.layers_handles.get(idx + 2) {
-                        Some(h) => {
-                            let span = tracing::debug_span!(target: PHASE, "dit.prefetch", phase = "layers", idx = idx + 2);
-                            h.prefetch(residency, backend).instrument(span).await
-                        }
-                        None => Ok(()),
-                    }
-                };
+                    None => Ok(None),
+                }
+            };
+            if needs_sync {
+                // Drain any in-flight submits first so the read_back we're
+                // about to do observes a quiet queue; then sync-submit and
+                // read taps before moving on.
+                while let Some((fut, _prev, _v)) = pending_submits.pop_front() {
+                    fut.await?;
+                }
                 let submit_fut = scope.submit_void().instrument(
                     tracing::debug_span!(target: PHASE, "dit.submit", phase = "layers", idx),
                 );
-                let (s_res, n_res, p_res) =
-                    futures::join!(submit_fut, next_acquire, prefetch_after);
-                p_res?;
+                let (s_res, n_res) = futures::join!(submit_fut, next_acquire);
                 pending = n_res?;
-                s_res
-            };
-            submit_res?;
-            // Block-0 taps: now that the submit completed, read each
-            // populated tap buf back to the caller's `Block0Taps` slots.
-            if let (Some(tap_bufs), Some(sink)) = (b0_bufs, taps.block0.as_deref_mut()) {
-                tap_bufs
-                    .read_back(backend, pipelines.act_dtype, sink)
-                    .await?;
+                s_res?;
+                if let (Some(tap_bufs), Some(sink)) = (b0_bufs, taps.block0.as_deref_mut()) {
+                    tap_bufs
+                        .read_back(backend, pipelines.act_dtype, sink)
+                        .await?;
+                }
+                u_cur = nxt;
+                // Keep `views` alive for the duration of forward_taps; it
+                // drops here. Sync submit already awaited GPU completion,
+                // so weight pins are free to release.
+                drop(views);
+            } else {
+                // Pipelined path: scope.submit_deferred() runs
+                // backend.submit's synchronous prelude (queue.submit
+                // happens here), returning a completion future. Move the
+                // future plus the buffers it transitively depends on
+                // (prior u_cur, the block's BlockViews) into the ring.
+                // The ring is bounded by the drain-at-top above, so no
+                // trailing pop here.
+                let submit_fut = scope.submit_deferred();
+                pending = next_acquire.await?;
+                let prev_u = std::mem::replace(&mut u_cur, nxt);
+                pending_submits.push_back((Box::pin(submit_fut), prev_u, views));
             }
-            u_cur = nxt;
+        }
+        // Drain remaining in-flight submits before any downstream read or
+        // the final_layer encoder consumes `u_cur`.
+        while let Some((fut, _prev, _v)) = pending_submits.pop_front() {
+            fut.await?;
         }
 
         if let Some(sink) = taps.last_main_layer_out.as_deref_mut() {

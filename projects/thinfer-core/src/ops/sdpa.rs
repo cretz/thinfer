@@ -390,10 +390,11 @@ var<workgroup> shared_scalar: array<f32, 4>;
 @compute @workgroup_size(128)
 fn main(
     @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(num_workgroups) ng: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let total = u.b * u.s_q * u.h_q;
-    let row = wgid.x;
+    let row = wgid.y * ng.x + wgid.x;
     if (row >= total) { return; }
     let t = lid.x;
 
@@ -510,10 +511,11 @@ var<workgroup> shared_scalar: array<f32, 4>;
 @compute @workgroup_size(128)
 fn main(
     @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(num_workgroups) ng: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let total = u.b * u.s_q * u.h_q;
-    let row = wgid.x;
+    let row = wgid.y * ng.x + wgid.x;
     if (row >= total) { return; }
     let t = lid.x;
 
@@ -641,7 +643,9 @@ impl SdpaOp for SdpaF32LargeD {
         LAYOUT
     }
     fn workgroups(b: u32, s_q: u32, h_q: u32) -> [u32; 3] {
-        [b * s_q * h_q, 1, 1]
+        // One workgroup per query row (kernel uses `wgid.x + wgid.y * ng.x`
+        // to recover the linear row index, so values > 65535 spill to Y).
+        super::linear_workgroups(b * s_q * h_q, 1)
     }
 }
 

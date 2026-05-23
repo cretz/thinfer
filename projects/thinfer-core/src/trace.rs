@@ -524,24 +524,28 @@ mod sub_impl {
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let verbose = matches!(val.as_str(), "verbose" | "v" | "2");
-        let installed = if verbose {
-            let fmt_layer = fmt::layer()
+        // At any non-empty THINFER_TRACE we install the fmt layer so adapter
+        // / pipeline / dispatch events print to stderr. Span-close noise
+        // (per-dispatch CLOSE events) is gated to verbose because it floods
+        // the stream; at THINFER_TRACE=1 only event!() calls render.
+        let fmt_layer = if verbose {
+            fmt::layer()
                 .with_writer(std::io::stderr)
                 .with_target(true)
-                .with_span_events(fmt::format::FmtSpan::CLOSE);
-            Registry::default()
-                .with(env_filter)
-                .with(rollup)
-                .with(fmt_layer)
-                .try_init()
-                .is_ok()
+                .with_span_events(fmt::format::FmtSpan::CLOSE)
+                .boxed()
         } else {
-            Registry::default()
-                .with(env_filter)
-                .with(rollup)
-                .try_init()
-                .is_ok()
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .boxed()
         };
+        let installed = Registry::default()
+            .with(env_filter)
+            .with(rollup)
+            .with(fmt_layer)
+            .try_init()
+            .is_ok();
         if installed { Some(handle) } else { None }
     }
 

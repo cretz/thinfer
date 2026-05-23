@@ -50,6 +50,10 @@ pub mod role {
     /// everything else (AdaLN, norms, embedders, refiners' non-matmul
     /// weights) stays bf16 safetensors.
     pub const DIT_GGUF_Q8_0: &str = "dit/gguf-q8_0";
+    /// DiT-only GGUF, Q4_0. Same union pattern as Q8_0; halves the
+    /// weight footprint (4-bit nibbles vs 8-bit ints, same 32-elem
+    /// block geometry) and halves load bandwidth.
+    pub const DIT_GGUF_Q4_0: &str = "dit/gguf-q4_0";
     /// DiT-only GGUF, Q4_K_M. Same union pattern as Q8_0.
     pub const DIT_GGUF_Q4_K_M: &str = "dit/gguf-q4_k_m";
 }
@@ -137,6 +141,10 @@ pub static MANIFEST: ModelManifest = ModelManifest {
         (
             role::DIT_GGUF_Q8_0,
             FileRef::new(REPO_GGUF, "z-image-turbo-Q8_0.gguf"),
+        ),
+        (
+            role::DIT_GGUF_Q4_0,
+            FileRef::new(REPO_GGUF, "z-image-turbo-Q4_0.gguf"),
         ),
         (
             role::DIT_GGUF_Q4_K_M,

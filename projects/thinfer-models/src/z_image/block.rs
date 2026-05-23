@@ -107,10 +107,29 @@ impl BlockMatmuls {
     /// kept saturated via the cooperative dequant (TPB=4 threads per
     /// block, see matmul.rs Quant arm).
     pub fn for_cfgs(cfgs: &BlockWgslConfigs) -> Self {
-        let blocked_for = |wd: WeightDtype| {
-            let bk = match wd {
+        // bk per matmul. Bf16/f32 use bk=16. Q8_0 uses bk=32 (= block_size,
+        // one block per K-step). K-family (Q4_K/Q5_K/Q6_K, block_size=256)
+        // uses bk=64 via SUB-BLOCK dequant: 4 K-strips per 256-block per
+        // column, full 256-thread WG saturated during dequant
+        // (TPB=4, slot_threads=4*64=256). bk=128 was measured 13% slower
+        // (TPB=2 → only 128 threads do dequant work, half occupancy).
+        let bk_for = |wd: WeightDtype| -> u32 {
+            match wd {
+                WeightDtype::Quant(k) if k.block_size() >= 128 => 64,
                 WeightDtype::Quant(k) => k.block_size(),
                 _ => 16,
+            }
+        };
+        // Square 64x64/4x4 across all weight dtypes. K-family at bk=64
+        // f16 tiles: shared = (64+64)*64*2 = 16 KiB, half budget.
+        // When weight is Quant, the layer pre-dequants to a bf16 dense
+        // N-major workspace; the matmul reads via the bf16 path with
+        // `b_nmajor=true`, so we pick bk for the Bf16 case (bk=16) and
+        // set b_nmajor on the config.
+        let square = |wd: WeightDtype| {
+            let (bk, b_nmajor) = match wd {
+                WeightDtype::Quant(_) => (16, true),
+                _ => (bk_for(wd), false),
             };
             MatMulConfig {
                 bm: 64,
@@ -118,13 +137,28 @@ impl BlockMatmuls {
                 bk,
                 tm: 4,
                 tn: 4,
+                b_nmajor,
             }
         };
+        // Wide-K 128x32/4x4 for FFN-down (K=10240). Quant goes through
+        // the dequant-once path same as `square`, so it uses 64x64 + bf16
+        // bk=16 + b_nmajor=true. Non-quant uses the wide-K shape.
+        let wide_k = |wd: WeightDtype| match wd {
+            WeightDtype::Quant(_) => square(wd),
+            _ => MatMulConfig {
+                bm: 128,
+                bn: 32,
+                bk: bk_for(wd),
+                tm: 4,
+                tn: 4,
+                b_nmajor: false,
+            },
+        };
         Self {
-            qkv: MatMulF32::new(blocked_for(cfgs.matmul_qkv.weight_dtype)),
-            proj: MatMulF32::new(blocked_for(cfgs.matmul_proj.weight_dtype)),
-            ffn_up: MatMulF32::new(blocked_for(cfgs.matmul_ffn_up.weight_dtype)),
-            ffn_down: MatMulF32::new(blocked_for(cfgs.matmul_ffn_down.weight_dtype)),
+            qkv: MatMulF32::new(square(cfgs.matmul_qkv.weight_dtype)),
+            proj: MatMulF32::new(square(cfgs.matmul_proj.weight_dtype)),
+            ffn_up: MatMulF32::new(square(cfgs.matmul_ffn_up.weight_dtype)),
+            ffn_down: MatMulF32::new(wide_k(cfgs.matmul_ffn_down.weight_dtype)),
             // tn=2 (not DEFAULT tn=1) so AdaLN output can land in packed-bf16
             // storage when `WgslConfig.act_dtype = Bf16`. Output cols are
             // 6*ADALN_EMBED_DIM = 1536 (even) so pairing is clean. M=1 keeps
@@ -138,6 +172,16 @@ impl BlockMatmuls {
     }
 }
 
+/// One dequant-once-per-matmul step. Carries the pipeline plus the source
+/// scheme (needed by dispatch to know block_size for workgroup count).
+/// Present when the layer's weight for that matmul site is Quant; the matmul
+/// pipeline alongside it is built with `weight_dtype = Bf16, b_nmajor = true`
+/// so it reads the dense dequanted workspace.
+pub struct DequantStep {
+    pub pipeline: WgpuPipeline,
+    pub scheme: thinfer_core::quant::QuantKind,
+}
+
 pub struct BlockPipelines {
     pub matmuls: BlockMatmuls,
     pub matmul_qkv: WgpuPipeline,
@@ -145,6 +189,38 @@ pub struct BlockPipelines {
     pub matmul_ffn_up: WgpuPipeline,
     pub matmul_ffn_down: WgpuPipeline,
     pub matmul_adaln: WgpuPipeline,
+    /// Per-site dequant pre-pass. `Some` iff the corresponding matmul's
+    /// weight_dtype is Quant. When present, the layer forward dequants the
+    /// quant weight into a workspace buffer, then runs the bf16-nmajor
+    /// matmul against the dense workspace. None means the matmul reads its
+    /// weight buffer directly (bf16 or f32 path).
+    pub dequant_qkv: Option<DequantStep>,
+    pub dequant_proj: Option<DequantStep>,
+    pub dequant_ffn_up: Option<DequantStep>,
+    pub dequant_ffn_down: Option<DequantStep>,
+    /// DP4A int8 path: per-Quant-site `(dequant_i8 pipeline + scheme,
+    /// matmul_i8 pipeline)`. `Some` iff the backend exposes
+    /// `WgslLanguageFeatures::Packed4x8IntegerDotProduct` AND the site's
+    /// weight is Quant. Takes precedence over `dequant_<site>` when present:
+    /// `block.rs` forward chooses I8 path when these are Some, falling back
+    /// to the F16-workspace dequant path otherwise. Lean and independent;
+    /// the legacy F16 matmul pipeline (`matmul_<site>` below) is still
+    /// compiled in this case but goes unused on the I8 site.
+    pub dequant_i8_qkv: Option<DequantStep>,
+    pub dequant_i8_proj: Option<DequantStep>,
+    pub dequant_i8_ffn_up: Option<DequantStep>,
+    pub dequant_i8_ffn_down: Option<DequantStep>,
+    pub matmul_i8_qkv: Option<WgpuPipeline>,
+    pub matmul_i8_proj: Option<WgpuPipeline>,
+    pub matmul_i8_ffn_up: Option<WgpuPipeline>,
+    pub matmul_i8_ffn_down: Option<WgpuPipeline>,
+    /// Shared activation-quantizer pipeline (f16 acts -> packed i8 + per-(M,
+    /// K/32) f32 scale). One pipeline serves every Quant matmul site since
+    /// the kernel is K-agnostic. `Some` when any I8 site is in use.
+    pub act_quant: Option<WgpuPipeline>,
+    /// Tile shape for the DP4A matmul (`matmul_i8_<site>` pipelines were
+    /// built with this cfg). Same shape for all sites today (DEFAULT).
+    pub matmul_i8_cfg: thinfer_core::ops::matmul_i8::MatMulI8Config,
     pub rmsnorm: WgpuPipeline,
     pub layernorm: WgpuPipeline,
     pub rope: WgpuPipeline,
@@ -232,11 +308,144 @@ impl BlockPipelines {
         let cfg = &cfgs.ops;
         let matmuls = BlockMatmuls::for_cfgs(cfgs);
         let mm_layout = <MatMulF32 as MatmulOp>::layout();
-        let qkv_wgsl = matmuls.qkv.wgsl(&cfgs.matmul_qkv);
-        let proj_wgsl = matmuls.proj.wgsl(&cfgs.matmul_proj);
-        let ffn_up_wgsl = matmuls.ffn_up.wgsl(&cfgs.matmul_ffn_up);
-        let ffn_down_wgsl = matmuls.ffn_down.wgsl(&cfgs.matmul_ffn_down);
+        // When weight_dtype is Quant, the matmul pipeline is built against a
+        // pre-dequanted dense workspace (see `BlockMatmuls::for_cfgs`
+        // square/wide_k closures: those configs already set b_nmajor=true).
+        // Override weight_dtype for the matmul WGSL build to the workspace's
+        // storage dtype, and compile a parallel dequant pipeline matching.
+        //
+        // Workspace target tracks act_dtype: F16 acts pair with the native
+        // f16 workspace (zero-conversion B-load fast path); F32/Bf16 acts
+        // fall back to the bf16-packed workspace. The act_dtype is uniform
+        // across the block by construction (pipeline.rs picks one per DiT).
+        let dequant_target = if cfg.act_dtype == ActDtype::F16 {
+            thinfer_core::ops::dequant::DequantTarget::F16
+        } else {
+            thinfer_core::ops::dequant::DequantTarget::Bf16
+        };
+        let workspace_weight_dtype = match dequant_target {
+            thinfer_core::ops::dequant::DequantTarget::F16 => WeightDtype::F16,
+            thinfer_core::ops::dequant::DequantTarget::Bf16 => WeightDtype::Bf16,
+        };
+        let matmul_cfg_for = |cfg: WgslConfig| -> WgslConfig {
+            if matches!(cfg.weight_dtype, WeightDtype::Quant(_)) {
+                WgslConfig {
+                    weight_dtype: workspace_weight_dtype,
+                    ..cfg
+                }
+            } else {
+                cfg
+            }
+        };
+        let qkv_mm_cfg = matmul_cfg_for(cfgs.matmul_qkv);
+        let proj_mm_cfg = matmul_cfg_for(cfgs.matmul_proj);
+        let ffn_up_mm_cfg = matmul_cfg_for(cfgs.matmul_ffn_up);
+        let ffn_down_mm_cfg = matmul_cfg_for(cfgs.matmul_ffn_down);
+        let qkv_wgsl = matmuls.qkv.wgsl(&qkv_mm_cfg);
+        let proj_wgsl = matmuls.proj.wgsl(&proj_mm_cfg);
+        let ffn_up_wgsl = matmuls.ffn_up.wgsl(&ffn_up_mm_cfg);
+        let ffn_down_wgsl = matmuls.ffn_down.wgsl(&ffn_down_mm_cfg);
         let adaln_wgsl = matmuls.adaln.wgsl(&cfgs.matmul_adaln);
+        // Build dequant pipelines for sites whose source weight is Quant.
+        let dq_layout = thinfer_core::ops::dequant::layout();
+        let build_dq = async |wd: WeightDtype| -> Result<Option<DequantStep>, WgpuError> {
+            match wd {
+                WeightDtype::Quant(scheme) => {
+                    let wgsl = thinfer_core::ops::dequant::build_wgsl(scheme, dequant_target);
+                    let pipeline = backend.create_pipeline(&wgsl, "main", dq_layout).await?;
+                    Ok(Some(DequantStep { pipeline, scheme }))
+                }
+                _ => Ok(None),
+            }
+        };
+        let dequant_qkv = build_dq(cfgs.matmul_qkv.weight_dtype).await?;
+        let dequant_proj = build_dq(cfgs.matmul_proj.weight_dtype).await?;
+        let dequant_ffn_up = build_dq(cfgs.matmul_ffn_up.weight_dtype).await?;
+        let dequant_ffn_down = build_dq(cfgs.matmul_ffn_down.weight_dtype).await?;
+        // DP4A int8 path. Gated on the WGSL packed_4x8_integer_dot_product
+        // language feature (queried on the wgpu Instance). When present we
+        // build a per-site (dequant_i8, matmul_i8) pair for each Quant
+        // matmul; block.rs forward dispatches act_quant -> dequant_i8 ->
+        // matmul_i8 (DP4A) and skips the F16-dequant matmul path. When
+        // absent (Firefox WebGPU WIP, some Safari, older drivers), these
+        // stay None and the F16-dequant path above runs unchanged. The
+        // DP4A path also requires SHADER_F16 because the matmul output is
+        // paired vec2<f16> (matching the rest of the F16-act DiT block);
+        // when SHADER_F16 is absent, the I8 path is also disabled.
+        let use_dp4a = backend.supports_packed_int_dot()
+            && backend.supports_shader_f16()
+            && cfg.act_dtype == ActDtype::F16;
+        // Subgroup-aware tile_a / tile_a_scale reads on the DP4A inner loop.
+        // Pure WGSL-level optimization gated by `Features::SUBGROUP`; the
+        // kernel emits a runtime branch on `subgroup_size` so any device
+        // exposing the feature (Intel/NVIDIA/AMD on native; mobile/desktop
+        // when wgpu's web backend wires it through) gets the broadcast or
+        // shuffle path. Numerically identical to the non-subgroup branch.
+        let i8_cfg = thinfer_core::ops::matmul_i8::MatMulI8Config {
+            use_subgroup: backend.supports_subgroups(),
+            ..thinfer_core::ops::matmul_i8::MatMulI8Config::DEFAULT
+        };
+        let (sg_min, sg_max) = backend.subgroup_size_range();
+        tracing::info!(
+            target: thinfer_core::trace::ADAPTER,
+            use_dp4a = use_dp4a,
+            matmul_i8_bm = i8_cfg.bm,
+            matmul_i8_bn = i8_cfg.bn,
+            matmul_i8_tm = i8_cfg.tm,
+            matmul_i8_tn = i8_cfg.tn,
+            matmul_i8_use_subgroup = i8_cfg.use_subgroup,
+            shader_f16 = backend.supports_shader_f16(),
+            packed_int_dot = backend.supports_packed_int_dot(),
+            subgroups = backend.supports_subgroups(),
+            subgroup_min_size = sg_min,
+            subgroup_max_size = sg_max,
+            act_dtype = ?cfg.act_dtype,
+            "z-image block pipeline config",
+        );
+        let dq_i8_layout = thinfer_core::ops::dequant_i8::layout();
+        let mm_i8_layout = thinfer_core::ops::matmul_i8::layout();
+        let build_i8 = async |wd: WeightDtype| -> Result<
+            (Option<DequantStep>, Option<WgpuPipeline>),
+            WgpuError,
+        > {
+            if !use_dp4a {
+                return Ok((None, None));
+            }
+            match wd {
+                WeightDtype::Quant(scheme) => {
+                    let dq_wgsl = thinfer_core::ops::dequant_i8::build_wgsl(scheme);
+                    let dq_pipe = backend
+                        .create_pipeline(&dq_wgsl, "main", dq_i8_layout)
+                        .await?;
+                    let mm_wgsl = thinfer_core::ops::matmul_i8::build_wgsl(&i8_cfg);
+                    let mm_pipe = backend
+                        .create_pipeline(&mm_wgsl, "main", mm_i8_layout)
+                        .await?;
+                    Ok((Some(DequantStep { pipeline: dq_pipe, scheme }), Some(mm_pipe)))
+                }
+                _ => Ok((None, None)),
+            }
+        };
+        let (dequant_i8_qkv, matmul_i8_qkv) = build_i8(cfgs.matmul_qkv.weight_dtype).await?;
+        let (dequant_i8_proj, matmul_i8_proj) = build_i8(cfgs.matmul_proj.weight_dtype).await?;
+        let (dequant_i8_ffn_up, matmul_i8_ffn_up) =
+            build_i8(cfgs.matmul_ffn_up.weight_dtype).await?;
+        let (dequant_i8_ffn_down, matmul_i8_ffn_down) =
+            build_i8(cfgs.matmul_ffn_down.weight_dtype).await?;
+        let any_i8 = matmul_i8_qkv.is_some()
+            || matmul_i8_proj.is_some()
+            || matmul_i8_ffn_up.is_some()
+            || matmul_i8_ffn_down.is_some();
+        let act_quant = if any_i8 {
+            let wgsl = thinfer_core::ops::act_quant::build_wgsl();
+            Some(
+                backend
+                    .create_pipeline(&wgsl, "main", thinfer_core::ops::act_quant::layout())
+                    .await?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             matmul_qkv: backend
                 .create_pipeline(&qkv_wgsl, "main", mm_layout)
@@ -253,6 +462,20 @@ impl BlockPipelines {
             matmul_adaln: backend
                 .create_pipeline(&adaln_wgsl, "main", mm_layout)
                 .await?,
+            dequant_qkv,
+            dequant_proj,
+            dequant_ffn_up,
+            dequant_ffn_down,
+            dequant_i8_qkv,
+            dequant_i8_proj,
+            dequant_i8_ffn_up,
+            dequant_i8_ffn_down,
+            matmul_i8_qkv,
+            matmul_i8_proj,
+            matmul_i8_ffn_up,
+            matmul_i8_ffn_down,
+            act_quant,
+            matmul_i8_cfg: i8_cfg,
             matmuls,
             rmsnorm: backend
                 .create_pipeline(
@@ -554,16 +777,74 @@ impl Block {
             let qkv_fused = scope.alloc(fused_bytes)?;
             let dims_qkv = scope.u32x4_uniform(rows, 3 * h, dim, 0)?;
             let w_qkv = scope.import(&bufs.attn_qkv);
-            scope.matmul(
-                &pipelines.matmul_qkv,
-                &pipelines.matmuls.qkv,
-                attn_in,
-                w_qkv,
-                dims_qkv,
-                qkv_fused,
-                rows,
-                3 * h,
-            )?;
+            let n_qkv = 3 * h;
+            match (
+                &pipelines.act_quant,
+                &pipelines.dequant_i8_qkv,
+                &pipelines.matmul_i8_qkv,
+            ) {
+                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
+                    let a_i8 = scope.alloc(rows as u64 * dim as u64)?;
+                    let a_sc = scope.alloc(rows as u64 * (dim / 32) as u64 * 4)?;
+                    let b_i8 = scope.alloc(n_qkv as u64 * dim as u64)?;
+                    let b_sc = scope.alloc(n_qkv as u64 * (dim / 32) as u64 * 4)?;
+                    let aq_dims = scope.u32x4_uniform(rows, dim, 0, 0)?;
+                    let dq_dims = scope.u32x4_uniform(n_qkv, dim, 0, 0)?;
+                    scope.act_quant(aq, attn_in, a_i8, a_sc, aq_dims, rows, dim)?;
+                    scope.dequant_i8(
+                        &dq_i8.pipeline,
+                        dq_i8.scheme,
+                        w_qkv,
+                        b_i8,
+                        b_sc,
+                        dq_dims,
+                        n_qkv,
+                        dim,
+                    )?;
+                    scope.matmul_i8(
+                        mm_i8,
+                        &pipelines.matmul_i8_cfg,
+                        a_i8,
+                        a_sc,
+                        b_i8,
+                        b_sc,
+                        qkv_fused,
+                        dims_qkv,
+                        rows,
+                        n_qkv,
+                    )?;
+                }
+                _ => {
+                    let w_qkv_in = match &pipelines.dequant_qkv {
+                        Some(dq) => {
+                            let dense_bytes = n_qkv as u64 * dim as u64 * 2;
+                            let dense = scope.alloc(dense_bytes)?;
+                            let dq_dims = scope.u32x4_uniform(n_qkv, dim, 0, 0)?;
+                            scope.dequant(
+                                &dq.pipeline,
+                                dq.scheme,
+                                w_qkv,
+                                dense,
+                                dq_dims,
+                                n_qkv,
+                                dim,
+                            )?;
+                            dense
+                        }
+                        None => w_qkv,
+                    };
+                    scope.matmul(
+                        &pipelines.matmul_qkv,
+                        &pipelines.matmuls.qkv,
+                        attn_in,
+                        w_qkv_in,
+                        dims_qkv,
+                        qkv_fused,
+                        rows,
+                        n_qkv,
+                    )?;
+                }
+            }
             let q = scope.alloc(q_bytes)?;
             let k = scope.alloc(kv_bytes)?;
             let v = scope.alloc(kv_bytes)?;
@@ -631,16 +912,73 @@ impl Block {
             let proj = scope.alloc(act_bytes)?;
             let dims_proj = scope.u32x4_uniform(rows, dim, hq * hd, 0)?;
             let wo = scope.import(&bufs.attn_to_out);
-            scope.matmul(
-                &pipelines.matmul_proj,
-                &pipelines.matmuls.proj,
-                sa,
-                wo,
-                dims_proj,
-                proj,
-                rows,
-                dim,
-            )?;
+            let k_proj = hq * hd;
+            match (
+                &pipelines.act_quant,
+                &pipelines.dequant_i8_proj,
+                &pipelines.matmul_i8_proj,
+            ) {
+                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
+                    let a_i8 = scope.alloc(rows as u64 * k_proj as u64)?;
+                    let a_sc = scope.alloc(rows as u64 * (k_proj / 32) as u64 * 4)?;
+                    let b_i8 = scope.alloc(dim as u64 * k_proj as u64)?;
+                    let b_sc = scope.alloc(dim as u64 * (k_proj / 32) as u64 * 4)?;
+                    let aq_dims = scope.u32x4_uniform(rows, k_proj, 0, 0)?;
+                    let dq_dims = scope.u32x4_uniform(dim, k_proj, 0, 0)?;
+                    scope.act_quant(aq, sa, a_i8, a_sc, aq_dims, rows, k_proj)?;
+                    scope.dequant_i8(
+                        &dq_i8.pipeline,
+                        dq_i8.scheme,
+                        wo,
+                        b_i8,
+                        b_sc,
+                        dq_dims,
+                        dim,
+                        k_proj,
+                    )?;
+                    scope.matmul_i8(
+                        mm_i8,
+                        &pipelines.matmul_i8_cfg,
+                        a_i8,
+                        a_sc,
+                        b_i8,
+                        b_sc,
+                        proj,
+                        dims_proj,
+                        rows,
+                        dim,
+                    )?;
+                }
+                _ => {
+                    let wo_in = match &pipelines.dequant_proj {
+                        Some(dq) => {
+                            let dense = scope.alloc(dim as u64 * k_proj as u64 * 2)?;
+                            let dq_dims = scope.u32x4_uniform(dim, k_proj, 0, 0)?;
+                            scope.dequant(
+                                &dq.pipeline,
+                                dq.scheme,
+                                wo,
+                                dense,
+                                dq_dims,
+                                dim,
+                                k_proj,
+                            )?;
+                            dense
+                        }
+                        None => wo,
+                    };
+                    scope.matmul(
+                        &pipelines.matmul_proj,
+                        &pipelines.matmuls.proj,
+                        sa,
+                        wo_in,
+                        dims_proj,
+                        proj,
+                        rows,
+                        dim,
+                    )?;
+                }
+            }
             copy_tap(scope, proj, &taps.attn_out, act_bytes)?;
 
             let t2 = scope.alloc(act_bytes)?;
@@ -692,29 +1030,112 @@ impl Block {
             let h1 = scope.alloc(hid_bytes)?;
             let h3 = scope.alloc(hid_bytes)?;
             let dims_ffn1 = scope.u32x4_uniform(rows, hid, dim, 0)?;
-            let w1 = scope.import(&bufs.ffn_w1);
-            scope.matmul(
-                &pipelines.matmul_ffn_up,
-                &pipelines.matmuls.ffn_up,
-                ffn_in,
-                w1,
-                dims_ffn1,
-                h1,
-                rows,
-                hid,
-            )?;
             let dims_ffn3 = scope.u32x4_uniform(rows, hid, dim, 0)?;
+            let w1 = scope.import(&bufs.ffn_w1);
             let w3 = scope.import(&bufs.ffn_w3);
-            scope.matmul(
-                &pipelines.matmul_ffn_up,
-                &pipelines.matmuls.ffn_up,
-                ffn_in,
-                w3,
-                dims_ffn3,
-                h3,
-                rows,
-                hid,
-            )?;
+            match (
+                &pipelines.act_quant,
+                &pipelines.dequant_i8_ffn_up,
+                &pipelines.matmul_i8_ffn_up,
+            ) {
+                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
+                    let a_i8 = scope.alloc(rows as u64 * dim as u64)?;
+                    let a_sc = scope.alloc(rows as u64 * (dim / 32) as u64 * 4)?;
+                    let aq_dims = scope.u32x4_uniform(rows, dim, 0, 0)?;
+                    let dq_dims = scope.u32x4_uniform(hid, dim, 0, 0)?;
+                    // Single act_quant of ffn_in, reused by both w1 and w3
+                    // matmuls — identical input, two consumers.
+                    scope.act_quant(aq, ffn_in, a_i8, a_sc, aq_dims, rows, dim)?;
+                    let b1_i8 = scope.alloc(hid as u64 * dim as u64)?;
+                    let b1_sc = scope.alloc(hid as u64 * (dim / 32) as u64 * 4)?;
+                    scope.dequant_i8(
+                        &dq_i8.pipeline,
+                        dq_i8.scheme,
+                        w1,
+                        b1_i8,
+                        b1_sc,
+                        dq_dims,
+                        hid,
+                        dim,
+                    )?;
+                    scope.matmul_i8(
+                        mm_i8,
+                        &pipelines.matmul_i8_cfg,
+                        a_i8,
+                        a_sc,
+                        b1_i8,
+                        b1_sc,
+                        h1,
+                        dims_ffn1,
+                        rows,
+                        hid,
+                    )?;
+                    let b3_i8 = scope.alloc(hid as u64 * dim as u64)?;
+                    let b3_sc = scope.alloc(hid as u64 * (dim / 32) as u64 * 4)?;
+                    scope.dequant_i8(
+                        &dq_i8.pipeline,
+                        dq_i8.scheme,
+                        w3,
+                        b3_i8,
+                        b3_sc,
+                        dq_dims,
+                        hid,
+                        dim,
+                    )?;
+                    scope.matmul_i8(
+                        mm_i8,
+                        &pipelines.matmul_i8_cfg,
+                        a_i8,
+                        a_sc,
+                        b3_i8,
+                        b3_sc,
+                        h3,
+                        dims_ffn3,
+                        rows,
+                        hid,
+                    )?;
+                }
+                _ => {
+                    let w1_in = match &pipelines.dequant_ffn_up {
+                        Some(dq) => {
+                            let dense = scope.alloc(hid as u64 * dim as u64 * 2)?;
+                            let dq_dims = scope.u32x4_uniform(hid, dim, 0, 0)?;
+                            scope.dequant(&dq.pipeline, dq.scheme, w1, dense, dq_dims, hid, dim)?;
+                            dense
+                        }
+                        None => w1,
+                    };
+                    scope.matmul(
+                        &pipelines.matmul_ffn_up,
+                        &pipelines.matmuls.ffn_up,
+                        ffn_in,
+                        w1_in,
+                        dims_ffn1,
+                        h1,
+                        rows,
+                        hid,
+                    )?;
+                    let w3_in = match &pipelines.dequant_ffn_up {
+                        Some(dq) => {
+                            let dense = scope.alloc(hid as u64 * dim as u64 * 2)?;
+                            let dq_dims = scope.u32x4_uniform(hid, dim, 0, 0)?;
+                            scope.dequant(&dq.pipeline, dq.scheme, w3, dense, dq_dims, hid, dim)?;
+                            dense
+                        }
+                        None => w3,
+                    };
+                    scope.matmul(
+                        &pipelines.matmul_ffn_up,
+                        &pipelines.matmuls.ffn_up,
+                        ffn_in,
+                        w3_in,
+                        dims_ffn3,
+                        h3,
+                        rows,
+                        hid,
+                    )?;
+                }
+            }
 
             let h13 = scope.alloc(hid_bytes)?;
             scope.dispatch_op::<SiluMulF32>(&pipelines.silu_mul, &[h1, h3], h13)?;
@@ -722,16 +1143,64 @@ impl Block {
             let h2 = scope.alloc(act_bytes)?;
             let dims_ffn2 = scope.u32x4_uniform(rows, dim, hid, 0)?;
             let w2 = scope.import(&bufs.ffn_w2);
-            scope.matmul(
-                &pipelines.matmul_ffn_down,
-                &pipelines.matmuls.ffn_down,
-                h13,
-                w2,
-                dims_ffn2,
-                h2,
-                rows,
-                dim,
-            )?;
+            match (
+                &pipelines.act_quant,
+                &pipelines.dequant_i8_ffn_down,
+                &pipelines.matmul_i8_ffn_down,
+            ) {
+                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
+                    let a_i8 = scope.alloc(rows as u64 * hid as u64)?;
+                    let a_sc = scope.alloc(rows as u64 * (hid / 32) as u64 * 4)?;
+                    let b_i8 = scope.alloc(dim as u64 * hid as u64)?;
+                    let b_sc = scope.alloc(dim as u64 * (hid / 32) as u64 * 4)?;
+                    let aq_dims = scope.u32x4_uniform(rows, hid, 0, 0)?;
+                    let dq_dims = scope.u32x4_uniform(dim, hid, 0, 0)?;
+                    scope.act_quant(aq, h13, a_i8, a_sc, aq_dims, rows, hid)?;
+                    scope.dequant_i8(
+                        &dq_i8.pipeline,
+                        dq_i8.scheme,
+                        w2,
+                        b_i8,
+                        b_sc,
+                        dq_dims,
+                        dim,
+                        hid,
+                    )?;
+                    scope.matmul_i8(
+                        mm_i8,
+                        &pipelines.matmul_i8_cfg,
+                        a_i8,
+                        a_sc,
+                        b_i8,
+                        b_sc,
+                        h2,
+                        dims_ffn2,
+                        rows,
+                        dim,
+                    )?;
+                }
+                _ => {
+                    let w2_in = match &pipelines.dequant_ffn_down {
+                        Some(dq) => {
+                            let dense = scope.alloc(dim as u64 * hid as u64 * 2)?;
+                            let dq_dims = scope.u32x4_uniform(dim, hid, 0, 0)?;
+                            scope.dequant(&dq.pipeline, dq.scheme, w2, dense, dq_dims, dim, hid)?;
+                            dense
+                        }
+                        None => w2,
+                    };
+                    scope.matmul(
+                        &pipelines.matmul_ffn_down,
+                        &pipelines.matmuls.ffn_down,
+                        h13,
+                        w2_in,
+                        dims_ffn2,
+                        h2,
+                        rows,
+                        dim,
+                    )?;
+                }
+            }
             copy_tap(scope, h2, &taps.ffn_raw, act_bytes)?;
 
             let t4 = scope.alloc(act_bytes)?;

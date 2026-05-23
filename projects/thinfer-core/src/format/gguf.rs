@@ -263,6 +263,8 @@ pub fn encoding_from_ggml_type(t: u32) -> Option<StorageEncoding> {
         2 => Some(StorageEncoding::Quant(QuantKind::Q4_0)),
         8 => Some(StorageEncoding::Quant(QuantKind::Q8_0)),
         12 => Some(StorageEncoding::Quant(QuantKind::Q4_K)),
+        13 => Some(StorageEncoding::Quant(QuantKind::Q5_K)),
+        14 => Some(StorageEncoding::Quant(QuantKind::Q6_K)),
         30 => Some(StorageEncoding::Bf16),
         _ => None,
     }
