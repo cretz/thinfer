@@ -155,6 +155,44 @@ impl QuantKind {
     }
 }
 
+/// CPU-side Q8_0 encoder over bf16 source bytes. Used by the load-time
+/// transcode path (`WeightMeta::transcode`): tensors stored bf16 in the
+/// file but consumed through the quant matmul path get requantized once
+/// at upload.
+///
+/// Source is row-major `[N, K]` bf16 with `K % 32 == 0`, so 32-element
+/// blocks never straddle rows and the tensor encodes as one flat block
+/// stream. Output is the GGUF/llama.cpp `block_q8_0` layout verbatim
+/// (`f16 d` + `i8 qs[32]` = 34 bytes), exactly what `dequant_i8` and the
+/// matmul B-load WGSL consume. Quantization matches llama.cpp
+/// `quantize_row_q8_0_ref`: `d = amax / 127`, `q = round(x / d)`.
+pub fn encode_q8_0_from_bf16(src: &[u8], dst: &mut [u8]) {
+    const SRC_BLOCK: usize = 64; // 32 bf16 elements
+    const DST_BLOCK: usize = 34;
+    assert!(
+        src.len().is_multiple_of(SRC_BLOCK),
+        "bf16 source must be whole 32-element blocks"
+    );
+    let blocks = src.len() / SRC_BLOCK;
+    assert_eq!(dst.len(), blocks * DST_BLOCK, "dst must be q8_0-sized");
+    for (s, o) in src
+        .chunks_exact(SRC_BLOCK)
+        .zip(dst.chunks_exact_mut(DST_BLOCK))
+    {
+        let mut x = [0f32; 32];
+        for (xi, p) in x.iter_mut().zip(s.chunks_exact(2)) {
+            *xi = half::bf16::from_bits(u16::from_le_bytes([p[0], p[1]])).to_f32();
+        }
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        o[..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        for (qo, &v) in o[2..].iter_mut().zip(x.iter()) {
+            *qo = (v * id).round() as i8 as u8;
+        }
+    }
+}
+
 /// Common WGSL prelude shared by every scheme: f16-bits to f32 and a
 /// byte-extraction helper over the `array<u32>` B buffer. Each scheme's
 /// WGSL string starts with this so the same kernel never sees two
@@ -1035,5 +1073,41 @@ mod tests {
         let mut out = [0f32; 256];
         dequantize_block_q6_k(&blk, &mut out);
         approx(out[0], -29.0, 1e-6);
+    }
+
+    /// encode_q8_0_from_bf16 -> dequantize_block_q8_0 roundtrip: error per
+    /// element bounded by half a quant step (d/2) plus the f16 rounding of
+    /// the stored scale (up to 127 * d * 2^-11, since q is computed against
+    /// the f32 scale exactly as llama.cpp's quantize_row_q8_0_ref does).
+    #[test]
+    fn encode_q8_0_roundtrip() {
+        let vals: Vec<f32> = (0..64).map(|i| ((i as f32) - 31.5) * 0.37).collect();
+        let mut src = Vec::with_capacity(vals.len() * 2);
+        for &v in &vals {
+            src.extend_from_slice(&half::bf16::from_f32(v).to_bits().to_le_bytes());
+        }
+        let mut q = vec![0u8; 2 * 34];
+        encode_q8_0_from_bf16(&src, &mut q);
+        for (bi, blk) in q.chunks_exact(34).enumerate() {
+            let mut out = [0f32; 32];
+            dequantize_block_q8_0(blk, &mut out);
+            let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+            for (i, &got) in out.iter().enumerate() {
+                let want = half::bf16::from_f32(vals[bi * 32 + i]).to_f32();
+                assert!(
+                    (got - want).abs() <= d * (0.5 + 127.0 / 2048.0) + 1e-6,
+                    "block {bi} elem {i}: got {got}, want {want}, d {d}"
+                );
+            }
+        }
+    }
+
+    /// All-zero input encodes to d=0, q=0 (no NaN from 0/0).
+    #[test]
+    fn encode_q8_0_zero_block() {
+        let src = vec![0u8; 64];
+        let mut q = vec![0u8; 34];
+        encode_q8_0_from_bf16(&src, &mut q);
+        assert!(q.iter().all(|&b| b == 0));
     }
 }

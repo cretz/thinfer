@@ -195,6 +195,7 @@ impl RopeOp for RopeF32 {
             (ActDtype::F32, true) => WGSL_F32_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
             (ActDtype::F16, _) => WGSL_F16_PACKED,
+            (ActDtype::I8, _) => unreachable!("ActDtype::I8 is never a block-level act dtype"),
         }
     }
     fn layout() -> &'static [BindingLayout] {
@@ -338,6 +339,9 @@ impl RopeOp for RopeF32HalfRot {
             (ActDtype::F32, true) => WGSL_F32_HALFROT_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED_HALFROT,
             (ActDtype::F16, _) => WGSL_F16_PACKED_HALFROT,
+            (ActDtype::I8, _) => unreachable!(
+                "ActDtype::I8 halfrot is not implemented - Qwen3 (the only halfrot consumer) is not an I8 target per worklog"
+            ),
         }
     }
     fn layout() -> &'static [BindingLayout] {

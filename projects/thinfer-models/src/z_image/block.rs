@@ -20,13 +20,13 @@ use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
     BcastFmaOp, LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op,
     QkvSplitF32, QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp,
-    ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32,
+    ScatterPadRowsF32, ScatterPadRowsOp, SdpaF16Sg, SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32,
     WeightDtype, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace;
 use thinfer_core::weight::WeightSource;
-use thinfer_core::workspace::{BatchBuf, BatchScope};
+use thinfer_core::workspace::{BatchBuf, BatchScope, ScopePacker};
 
 #[derive(Clone, Copy, Debug)]
 pub struct BlockConfig {
@@ -215,17 +215,35 @@ pub struct BlockPipelines {
     pub matmul_i8_ffn_up: Option<WgpuPipeline>,
     pub matmul_i8_ffn_down: Option<WgpuPipeline>,
     /// Shared activation-quantizer pipeline (f16 acts -> packed i8 + per-(M,
-    /// K/32) f32 scale). One pipeline serves every Quant matmul site since
-    /// the kernel is K-agnostic. `Some` when any I8 site is in use.
+    /// K/32) f32 params). One pipeline serves every Quant matmul site since
+    /// the kernel is K-agnostic. `Some` when any DP4A matmul site is in use
+    /// (the matmul-site transcode) or when `sdpa_i8` is built (the post-rope
+    /// q/k/v quantize).
     pub act_quant: Option<WgpuPipeline>,
     /// Tile shape for the DP4A matmul (`matmul_i8_<site>` pipelines were
     /// built with this cfg). Same shape for all sites today (DEFAULT).
     pub matmul_i8_cfg: thinfer_core::ops::matmul_i8::MatMulI8Config,
+    /// I8-acts × bf16-weights matmul. Compiled when this pipeline set has
+    /// `act_dtype = I8` AND at least one main-matmul site's weight is Bf16
+    /// (the DiT refiners, t_embedder under I8 routing). One pipeline serves
+    /// every applicable site since the kernel is K-agnostic.
+    pub matmul_i8_bf16: Option<WgpuPipeline>,
+    pub matmul_i8_bf16_cfg: thinfer_core::ops::matmul_i8_bf16::MatMulI8Bf16Config,
+    /// bf16-block-sum precompute, paired with `matmul_i8_bf16`. Produces
+    /// `b_sum[n, t] = Σ_{k in block t} b[n, k]` (f32) per dispatch into
+    /// scope; consumed by matmul_i8_bf16 as the asymmetric correction-term
+    /// factor on bf16 weights.
+    pub bf16_block_sum: Option<WgpuPipeline>,
     pub rmsnorm: WgpuPipeline,
     pub layernorm: WgpuPipeline,
     pub rope: WgpuPipeline,
     pub rope_halfrot: WgpuPipeline,
     pub sdpa: WgpuPipeline,
+    /// Subgroup small-D sdpa (`SdpaF16Sg`). `Some` iff F16 acts AND the
+    /// backend exposes subgroups with min size >= 8. Dispatch prefers it
+    /// when `head_dim % 32 == 0 && head_dim <= 128`, else falls back to
+    /// `sdpa`.
+    pub sdpa_sg: Option<WgpuPipeline>,
     pub qkv_split: WgpuPipeline,
     pub silu: WgpuPipeline,
     pub silu_mul: WgpuPipeline,
@@ -236,6 +254,16 @@ pub struct BlockPipelines {
     pub bcast_fma: WgpuPipeline,
     pub bcast_add: WgpuPipeline,
     pub scatter_pad_rows: WgpuPipeline,
+    /// Opt-in i8 attention (the only i8 activation storage outside matmul
+    /// internals). `Some` iff `BlockWgslConfigs::i8_sdpa`. When enabled the
+    /// forward quantizes q/k/v once after the F16 rope (`act_quant` into
+    /// fused `[data || scale]` pairs), runs `sdpa_i8`, and feeds its paired
+    /// output straight into the attn-proj matmul A-side. Everything else
+    /// (residual carry, norms, modulate, FFN glue) stays dense at
+    /// `act_dtype`: per-32-block i8 of the residual stream is numerically
+    /// unsound (outlier channels annihilate their block neighbors and the
+    /// error compounds across all 30 blocks; see worklog 2026-06-04).
+    pub sdpa_i8: Option<WgpuPipeline>,
     /// On-GPU activation storage dtype for buffers compiled against this set
     /// of pipelines. Drives byte sizing of every transient alloc through the
     /// DiT block forward pass.
@@ -256,11 +284,15 @@ pub struct BlockWgslConfigs {
     pub matmul_ffn_down: WgslConfig,
     pub matmul_adaln: WgslConfig,
     pub ops: WgslConfig,
+    /// Opt-in i8 attention: quantize q/k/v once post-rope, run `sdpa_i8`,
+    /// feed its paired output to the proj matmul A-side. Requires F16 ops
+    /// (SHADER_F16). Never affects the residual carry or elementwise ops.
+    pub i8_sdpa: bool,
 }
 
 impl BlockWgslConfigs {
-    /// All six configs identical. Existing call sites that don't mix
-    /// weight encodings within a block use this.
+    /// All six configs identical, i8_sdpa off. Existing call sites that
+    /// don't mix weight encodings within a block use this.
     pub fn uniform(cfg: WgslConfig) -> Self {
         Self {
             matmul_qkv: cfg,
@@ -269,12 +301,23 @@ impl BlockWgslConfigs {
             matmul_ffn_down: cfg,
             matmul_adaln: cfg,
             ops: cfg,
+            i8_sdpa: false,
         }
     }
 
     fn validate(&self) {
         let a = self.ops.act_dtype;
         let q = self.ops.bf16_quant_writes;
+        // I8 is a matmul/sdpa-internal storage form, never a block-wide ops
+        // dtype: per-32-block i8 of the residual stream is numerically
+        // unsound (outlier channels; see worklog 2026-06-04).
+        assert_ne!(
+            a,
+            ActDtype::I8,
+            "BlockWgslConfigs: ActDtype::I8 is not a valid ops act_dtype"
+        );
+        // All five matmuls share the block act_dtype: their outputs and
+        // inputs are block-stream activations.
         for c in [
             self.matmul_qkv,
             self.matmul_proj,
@@ -291,6 +334,13 @@ impl BlockWgslConfigs {
                 "BlockWgslConfigs: matmul bf16_quant_writes must match ops"
             );
         }
+        if self.i8_sdpa {
+            assert_eq!(
+                a,
+                ActDtype::F16,
+                "BlockWgslConfigs: i8_sdpa requires F16 ops (sdpa_i8 reads/writes f16-scaled pairs)"
+            );
+        }
     }
 }
 
@@ -300,12 +350,25 @@ impl BlockPipelines {
         n as u64 * self.act_dtype.bytes_per_elem()
     }
 
+    /// Bytes for the per-(rows, dim/32) f32 params buffer that pairs with an
+    /// i8-quantized `rows * dim` activation (sdpa_i8 I/O, matmul-site
+    /// transcode scratch).
+    pub fn i8_scale_bytes(rows: u32, dim: u32) -> u64 {
+        ActDtype::I8.scale_bytes(rows as u64, dim as u64)
+    }
+
+    /// True iff this pipeline set runs the opt-in i8 attention path.
+    pub fn i8_sdpa(&self) -> bool {
+        self.sdpa_i8.is_some()
+    }
+
     pub async fn compile(
         backend: &WgpuBackend,
         cfgs: &BlockWgslConfigs,
     ) -> Result<Self, WgpuError> {
         cfgs.validate();
         let cfg = &cfgs.ops;
+        let cfg_compat = cfg;
         let matmuls = BlockMatmuls::for_cfgs(cfgs);
         let mm_layout = <MatMulF32 as MatmulOp>::layout();
         // When weight_dtype is Quant, the matmul pipeline is built against a
@@ -386,9 +449,14 @@ impl BlockPipelines {
             ..thinfer_core::ops::matmul_i8::MatMulI8Config::DEFAULT
         };
         let (sg_min, sg_max) = backend.subgroup_size_range();
+        // Subgroup small-D sdpa: cluster lanes must not straddle a subgroup,
+        // which holds for any subgroup size that is a multiple of CL=8.
+        let use_sdpa_sg =
+            cfg.act_dtype == ActDtype::F16 && backend.supports_subgroups() && sg_min >= 8;
         tracing::info!(
             target: thinfer_core::trace::ADAPTER,
             use_dp4a = use_dp4a,
+            sdpa_use_subgroup = use_sdpa_sg,
             matmul_i8_bm = i8_cfg.bm,
             matmul_i8_bn = i8_cfg.bn,
             matmul_i8_tm = i8_cfg.tm,
@@ -432,15 +500,62 @@ impl BlockPipelines {
             build_i8(cfgs.matmul_ffn_up.weight_dtype).await?;
         let (dequant_i8_ffn_down, matmul_i8_ffn_down) =
             build_i8(cfgs.matmul_ffn_down.weight_dtype).await?;
-        let any_i8 = matmul_i8_qkv.is_some()
-            || matmul_i8_proj.is_some()
-            || matmul_i8_ffn_up.is_some()
-            || matmul_i8_ffn_down.is_some();
-        let act_quant = if any_i8 {
+        // act_quant serves two consumers: the matmul-site dense->paired
+        // transcode on every DP4A site, and the post-rope q/k/v quantize
+        // when i8 attention is enabled.
+        let any_quant_site = [
+            cfgs.matmul_qkv.weight_dtype,
+            cfgs.matmul_proj.weight_dtype,
+            cfgs.matmul_ffn_up.weight_dtype,
+            cfgs.matmul_ffn_down.weight_dtype,
+        ]
+        .iter()
+        .any(|wd| matches!(wd, WeightDtype::Quant(_)));
+        let act_quant = if (use_dp4a && any_quant_site) || cfgs.i8_sdpa {
             let wgsl = thinfer_core::ops::act_quant::build_wgsl();
             Some(
                 backend
                     .create_pipeline(&wgsl, "main", thinfer_core::ops::act_quant::layout())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let sdpa_i8 = if cfgs.i8_sdpa {
+            let wgsl = thinfer_core::ops::sdpa_i8::build_wgsl();
+            Some(
+                backend
+                    .create_pipeline(&wgsl, "main", thinfer_core::ops::sdpa_i8::layout())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        // Paired-acts × bf16 weights mixed matmul. Only the attn-proj site
+        // can see a paired A-side (the sdpa_i8 output); built when i8_sdpa
+        // is on AND that site keeps Bf16 weights.
+        let needs_i8_bf16 =
+            cfgs.i8_sdpa && matches!(cfgs.matmul_proj.weight_dtype, WeightDtype::Bf16);
+        let i8_bf16_cfg = thinfer_core::ops::matmul_i8_bf16::MatMulI8Bf16Config::DEFAULT;
+        let matmul_i8_bf16 = if needs_i8_bf16 {
+            let wgsl = thinfer_core::ops::matmul_i8_bf16::build_wgsl(&i8_bf16_cfg);
+            Some(
+                backend
+                    .create_pipeline(&wgsl, "main", thinfer_core::ops::matmul_i8_bf16::layout())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        // Pair the bf16-block-sum precompute with the i8×bf16 matmul. The
+        // sum carries the asymmetric correction-term factor and is computed
+        // per dispatch into scope (mirrors dequant_i8 producing b_qsum for
+        // the Quant-weight path).
+        let bf16_block_sum = if needs_i8_bf16 {
+            let wgsl = thinfer_core::ops::bf16_block_sum::build_wgsl();
+            Some(
+                backend
+                    .create_pipeline(&wgsl, "main", thinfer_core::ops::bf16_block_sum::layout())
                     .await?,
             )
         } else {
@@ -476,92 +591,109 @@ impl BlockPipelines {
             matmul_i8_ffn_down,
             act_quant,
             matmul_i8_cfg: i8_cfg,
+            matmul_i8_bf16,
+            matmul_i8_bf16_cfg: i8_bf16_cfg,
+            bf16_block_sum,
             matmuls,
             rmsnorm: backend
                 .create_pipeline(
-                    <RmsNormF32 as RmsNormOp>::wgsl(cfg),
+                    <RmsNormF32 as RmsNormOp>::wgsl(cfg_compat),
                     "main",
                     <RmsNormF32 as RmsNormOp>::layout(),
                 )
                 .await?,
             layernorm: backend
                 .create_pipeline(
-                    <LayerNormF32 as LayerNormOp>::wgsl(cfg),
+                    <LayerNormF32 as LayerNormOp>::wgsl(cfg_compat),
                     "main",
                     <LayerNormF32 as LayerNormOp>::layout(),
                 )
                 .await?,
             rope: backend
                 .create_pipeline(
-                    <RopeF32 as RopeOp>::wgsl(cfg),
+                    <RopeF32 as RopeOp>::wgsl(cfg_compat),
                     "main",
                     <RopeF32 as RopeOp>::layout(),
                 )
                 .await?,
             rope_halfrot: backend
                 .create_pipeline(
-                    <RopeF32HalfRot as RopeOp>::wgsl(cfg),
+                    <RopeF32HalfRot as RopeOp>::wgsl(cfg_compat),
                     "main",
                     <RopeF32HalfRot as RopeOp>::layout(),
                 )
                 .await?,
             sdpa: backend
                 .create_pipeline(
-                    <SdpaF32 as SdpaOp>::wgsl(cfg),
+                    <SdpaF32 as SdpaOp>::wgsl(cfg_compat),
                     "main",
                     <SdpaF32 as SdpaOp>::layout(),
                 )
                 .await?,
+            sdpa_sg: if use_sdpa_sg {
+                Some(
+                    backend
+                        .create_pipeline(
+                            <SdpaF16Sg as SdpaOp>::wgsl(cfg_compat),
+                            "main",
+                            <SdpaF16Sg as SdpaOp>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
             qkv_split: backend
                 .create_pipeline(
-                    <QkvSplitF32 as QkvSplitOp>::wgsl(cfg),
+                    <QkvSplitF32 as QkvSplitOp>::wgsl(cfg_compat),
                     "main",
                     <QkvSplitF32 as QkvSplitOp>::layout(),
                 )
                 .await?,
             silu: backend
-                .create_pipeline(SiluF32::wgsl(cfg), "main", SiluF32::layout())
+                .create_pipeline(SiluF32::wgsl(cfg_compat), "main", SiluF32::layout())
                 .await?,
             silu_mul: backend
-                .create_pipeline(SiluMulF32::wgsl(cfg), "main", SiluMulF32::layout())
+                .create_pipeline(SiluMulF32::wgsl(cfg_compat), "main", SiluMulF32::layout())
                 .await?,
             add: backend
-                .create_pipeline(AddF32::wgsl(cfg), "main", AddF32::layout())
+                .create_pipeline(AddF32::wgsl(cfg_compat), "main", AddF32::layout())
                 .await?,
             mul: backend
-                .create_pipeline(MulF32::wgsl(cfg), "main", MulF32::layout())
+                .create_pipeline(MulF32::wgsl(cfg_compat), "main", MulF32::layout())
                 .await?,
             tanh: backend
-                .create_pipeline(TanhF32::wgsl(cfg), "main", TanhF32::layout())
+                .create_pipeline(TanhF32::wgsl(cfg_compat), "main", TanhF32::layout())
                 .await?,
             bcast_affine: backend
                 .create_pipeline(
-                    <BcastAffineF32 as BcastAffineOp>::wgsl(cfg),
+                    <BcastAffineF32 as BcastAffineOp>::wgsl(cfg_compat),
                     "main",
                     <BcastAffineF32 as BcastAffineOp>::layout(),
                 )
                 .await?,
             bcast_fma: backend
                 .create_pipeline(
-                    <BcastFmaF32 as BcastFmaOp>::wgsl(cfg),
+                    <BcastFmaF32 as BcastFmaOp>::wgsl(cfg_compat),
                     "main",
                     <BcastFmaF32 as BcastFmaOp>::layout(),
                 )
                 .await?,
             bcast_add: backend
                 .create_pipeline(
-                    <BcastAddF32 as BcastAddOp>::wgsl(cfg),
+                    <BcastAddF32 as BcastAddOp>::wgsl(cfg_compat),
                     "main",
                     <BcastAddF32 as BcastAddOp>::layout(),
                 )
                 .await?,
             scatter_pad_rows: backend
                 .create_pipeline(
-                    <ScatterPadRowsF32 as ScatterPadRowsOp>::wgsl(cfg),
+                    <ScatterPadRowsF32 as ScatterPadRowsOp>::wgsl(cfg_compat),
                     "main",
                     <ScatterPadRowsF32 as ScatterPadRowsOp>::layout(),
                 )
                 .await?,
+            sdpa_i8,
             act_dtype: cfg.act_dtype,
         })
     }
@@ -571,7 +703,17 @@ pub struct Block {
     pub cfg: BlockConfig,
 }
 
-#[derive(Default, Clone, Copy)]
+/// Reference pair for an activation-bearing tap. Under I8 ops the caller
+/// must populate `scale` with a `(rows, dim/32) * 4`-byte BufRef; under
+/// non-I8 modes `scale` is `None` and only `data` is meaningful. Mirrors
+/// `ActBufRef` at the BlockDebugTaps surface.
+#[derive(Clone)]
+pub struct ActTapBufRef {
+    pub data: BufRef,
+    pub scale: Option<BufRef>,
+}
+
+#[derive(Default, Clone)]
 pub struct BlockDebugTaps {
     pub adaln_input: Option<BufRef>,
     pub adaln_pre: Option<BufRef>,
@@ -580,23 +722,63 @@ pub struct BlockDebugTaps {
     pub gate_msa: Option<BufRef>,
     pub scale_mlp: Option<BufRef>,
     pub gate_mlp: Option<BufRef>,
-    pub attn_norm1_out: Option<BufRef>,
-    pub modulated_attn_in: Option<BufRef>,
-    pub attn_q: Option<BufRef>,
-    pub attn_k: Option<BufRef>,
-    pub attn_v: Option<BufRef>,
-    pub attn_q_norm: Option<BufRef>,
-    pub attn_k_norm: Option<BufRef>,
-    pub attn_q_rope: Option<BufRef>,
-    pub attn_k_rope: Option<BufRef>,
-    pub attn_sdpa: Option<BufRef>,
-    pub attn_out: Option<BufRef>,
-    pub attn_norm2_out: Option<BufRef>,
-    pub x_mid: Option<BufRef>,
-    pub ffn_norm1_out: Option<BufRef>,
-    pub modulated_ffn_in: Option<BufRef>,
-    pub ffn_raw: Option<BufRef>,
-    pub ffn_norm2_out: Option<BufRef>,
+    pub attn_norm1_out: Option<ActTapBufRef>,
+    pub modulated_attn_in: Option<ActTapBufRef>,
+    pub attn_q: Option<ActTapBufRef>,
+    pub attn_k: Option<ActTapBufRef>,
+    pub attn_v: Option<ActTapBufRef>,
+    pub attn_q_norm: Option<ActTapBufRef>,
+    pub attn_k_norm: Option<ActTapBufRef>,
+    pub attn_q_rope: Option<ActTapBufRef>,
+    pub attn_k_rope: Option<ActTapBufRef>,
+    pub attn_sdpa: Option<ActTapBufRef>,
+    pub attn_out: Option<ActTapBufRef>,
+    pub attn_norm2_out: Option<ActTapBufRef>,
+    pub x_mid: Option<ActTapBufRef>,
+    pub ffn_norm1_out: Option<ActTapBufRef>,
+    pub modulated_ffn_in: Option<ActTapBufRef>,
+    pub ffn_raw: Option<ActTapBufRef>,
+    pub ffn_norm2_out: Option<ActTapBufRef>,
+    /// Pre-act_quant snapshot of the f16 qkv matmul scratch. Single buffer,
+    /// no paired scale (the scratch is dense f16 sized `rows * n_qkv * 2`
+    /// bytes). Only populated under I8 modes where act_quant is the next op.
+    pub attn_qkv_f16_pre_quant: Option<BufRef>,
+    /// Same idea for the attention output projection scratch
+    /// (`rows * dim * 2` f16 bytes).
+    pub attn_proj_f16_pre_quant: Option<BufRef>,
+    /// Pre-act_quant f16 scratch from FFN w1 matmul (`rows * hid * 2` bytes).
+    pub ffn_h1_f16_pre_quant: Option<BufRef>,
+    /// Pre-act_quant f16 scratch from FFN w3 matmul (`rows * hid * 2` bytes).
+    pub ffn_h3_f16_pre_quant: Option<BufRef>,
+    /// Pre-act_quant f16 scratch from FFN w2 matmul (`rows * dim * 2` bytes).
+    pub ffn_h2_f16_pre_quant: Option<BufRef>,
+    /// DIAG: raw byte snapshot of `sa.data` (sdpa output paired data) at the
+    /// proj matmul input, for offline decode against `attn_sdpa`. Size set
+    /// by Block0TapBufs allocator (a few KiB).
+    pub proj_sa_data_head: Option<BufRef>,
+    /// DIAG: raw byte snapshot of `sa.scale` (sdpa output paired scale).
+    pub proj_sa_scale_head: Option<BufRef>,
+    /// DIAG: raw byte snapshot of dequanted W_o i8 (first cols x first K).
+    pub proj_wo_b_i8_head: Option<BufRef>,
+    /// DIAG: raw byte snapshot of W_o b_scale (first cols x first K-blocks).
+    pub proj_wo_b_scale_head: Option<BufRef>,
+    /// DIAG: raw byte snapshots at the QKV-matmul site (block-26 audit).
+    /// `qkv_attn_in_data_head` is the i8 acts going INTO matmul_i8;
+    /// `qkv_attn_in_params_head` is the paired (s,z) vec2<f16>;
+    /// `qkv_b_i8_head`/`qkv_b_scale_head`/`qkv_b_qsum_head` are the
+    /// dequant_i8 outputs (weight i8, weight f16 scale per K-block,
+    /// weight f32 qsum per K-block).
+    pub qkv_attn_in_data_head: Option<BufRef>,
+    pub qkv_attn_in_params_head: Option<BufRef>,
+    pub qkv_b_i8_head: Option<BufRef>,
+    pub qkv_b_scale_head: Option<BufRef>,
+    pub qkv_b_qsum_head: Option<BufRef>,
+    /// DIAG: per-K-block GPU trace from `matmul_i8` for ONE target cell
+    /// (block-26 audit). Hardcoded target inside `forward_taps_packed`
+    /// (`m=287, n=255` Q col). Layout: (k/32) K-blocks * 8 f32 (= 960 f32
+    /// at dim=3840) + 16-f32 probe area. Per block: (sa, za, sb, qsum, dot,
+    /// main, corr, acc_running).
+    pub qkv_dbg_trace_head: Option<BufRef>,
 }
 
 impl BlockDebugTaps {
@@ -625,6 +807,21 @@ impl BlockDebugTaps {
         modulated_ffn_in: None,
         ffn_raw: None,
         ffn_norm2_out: None,
+        attn_qkv_f16_pre_quant: None,
+        attn_proj_f16_pre_quant: None,
+        ffn_h1_f16_pre_quant: None,
+        ffn_h3_f16_pre_quant: None,
+        ffn_h2_f16_pre_quant: None,
+        proj_sa_data_head: None,
+        proj_sa_scale_head: None,
+        proj_wo_b_i8_head: None,
+        proj_wo_b_scale_head: None,
+        qkv_attn_in_data_head: None,
+        qkv_attn_in_params_head: None,
+        qkv_b_i8_head: None,
+        qkv_b_scale_head: None,
+        qkv_b_qsum_head: None,
+        qkv_dbg_trace_head: None,
     };
 }
 
@@ -667,11 +864,11 @@ impl Block {
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
-        x_in: BatchBuf<'wsp>,
+        x_in: ActBuf<'wsp>,
         freqs_in: BatchBuf<'wsp>,
         mask_in: BatchBuf<'wsp>,
         adaln_input: Option<BatchBuf<'wsp>>,
-        y_out: BatchBuf<'wsp>,
+        y_out: ActBuf<'wsp>,
         bufs: &'wsp BlockWeightBufs,
     ) -> Result<(), WgpuError> {
         self.forward_taps(
@@ -692,13 +889,13 @@ impl Block {
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
-        x_in: BatchBuf<'wsp>,
+        x_in: ActBuf<'wsp>,
         freqs_in: BatchBuf<'wsp>,
         mask_in: BatchBuf<'wsp>,
         adaln_input: Option<BatchBuf<'wsp>>,
-        y_out: BatchBuf<'wsp>,
+        y_out: ActBuf<'wsp>,
         bufs: &'wsp BlockWeightBufs,
-        taps: &'wsp BlockDebugTaps,
+        taps: &BlockDebugTaps,
     ) -> Result<(), WgpuError> {
         debug_assert_eq!(
             self.cfg.modulation,
@@ -718,278 +915,224 @@ impl Block {
         let s = cfg.seq as u32;
         let ad = cfg.adaln_embed_dim as u32;
 
-        let act_bytes = pipelines.act_bytes(rows * dim);
-        let q_bytes = pipelines.act_bytes(rows * hq * hd);
-        let kv_bytes = pipelines.act_bytes(rows * hkv * hd);
-        let hid_bytes = pipelines.act_bytes(rows * hid);
-
+        // AdaLN prep: produces F32 chunks under I8 ops, otherwise act-dtype
+        // chunks. Each chunk is `b * dim` elements of the AdaLN-output dtype.
         let ada: Option<AdaLnChunks<'wsp>> = match (cfg.modulation, &bufs.adaln, adaln_input) {
             (true, Some(w), Some(input)) => {
-                copy_tap(scope, input, &taps.adaln_input, pipelines.act_bytes(b * ad))?;
-                Some(self.prepare_adaln(scope, pipelines, w, input, taps)?)
+                copy_tap(
+                    scope,
+                    input,
+                    taps.adaln_input.as_ref(),
+                    pipelines.act_bytes(b * ad),
+                )?;
+                Some(self.prepare_adaln(scope, pipelines, *w, input, taps)?)
             }
             (false, None, None) => None,
             _ => panic!("modulation/adaln_input/adaln-bufs mismatch"),
         };
-        let chunk_bytes = pipelines.act_bytes(b * dim);
+        let chunk_bytes = adaln_chunk_bytes(pipelines, b, dim);
         if let Some(a) = ada.as_ref() {
-            copy_tap(scope, a.scale_msa, &taps.scale_msa, chunk_bytes)?;
-            copy_tap(scope, a.gate_msa, &taps.gate_msa, chunk_bytes)?;
-            copy_tap(scope, a.scale_mlp, &taps.scale_mlp, chunk_bytes)?;
-            copy_tap(scope, a.gate_mlp, &taps.gate_mlp, chunk_bytes)?;
+            copy_tap(scope, a.scale_msa, taps.scale_msa.as_ref(), chunk_bytes)?;
+            copy_tap(scope, a.gate_msa, taps.gate_msa.as_ref(), chunk_bytes)?;
+            copy_tap(scope, a.scale_mlp, taps.scale_mlp.as_ref(), chunk_bytes)?;
+            copy_tap(scope, a.gate_mlp, taps.gate_mlp.as_ref(), chunk_bytes)?;
         }
 
-        let t1 = scope.alloc(act_bytes)?;
-        let u_rmsnorm_pre = rmsnorm_uniform(scope, rows, dim, eps)?;
-        let an1 = scope.import(&bufs.attention_norm1);
-        scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, x_in, an1, u_rmsnorm_pre, t1, rows)?;
-        copy_tap(scope, t1, &taps.attn_norm1_out, act_bytes)?;
-        let attn_in: BatchBuf<'wsp> = match ada.as_ref() {
+        // ==================== Attention: pre-norm + modulate ====================
+        let t1 = alloc_act(scope, pipelines, rows, dim)?;
+        let an1 = scope.import_copy(bufs.attention_norm1);
+        op_rmsnorm(scope, pipelines, x_in, an1, t1, rows, dim, eps)?;
+        copy_tap_act(
+            scope,
+            pipelines,
+            t1,
+            taps.attn_norm1_out.as_ref(),
+            rows,
+            dim,
+        )?;
+        let attn_in: ActBuf<'wsp> = match ada.as_ref() {
             Some(a) => {
-                let dst = scope.alloc(act_bytes)?;
-                let u_ba = bcast_affine_uniform(scope, dim, 1.0)?;
-                scope.bcast_affine::<BcastAffineF32>(
-                    &pipelines.bcast_affine,
-                    t1,
-                    a.scale_msa,
-                    u_ba,
-                    dst,
-                    rows * dim,
-                )?;
+                let dst = alloc_act(scope, pipelines, rows, dim)?;
+                op_bcast_affine(scope, pipelines, t1, a.scale_msa, dst, rows, dim, 1.0)?;
                 dst
             }
             None => t1,
         };
-        copy_tap(scope, attn_in, &taps.modulated_attn_in, act_bytes)?;
+        copy_tap_act(
+            scope,
+            pipelines,
+            attn_in,
+            taps.modulated_attn_in.as_ref(),
+            rows,
+            dim,
+        )?;
 
+        // ==================== Attention: fused QKV matmul + split ====================
         let (q, k, v) = {
             let _g = trace::scope!("attn_qkv").entered();
-            // Z-Image upstream schema: fused QKV. n_kv_heads == n_heads, so each
-            // slab is the same `H = hq * hd = hkv * hd` columns wide and the
-            // matmul output is `[rows, 3*H]`. Other schemas (GQA: hkv < hq)
-            // would need a different split layout; assert until they're added.
             debug_assert_eq!(
                 hq, hkv,
                 "fused QKV currently assumes hq == hkv (Z-Image); GQA needs schema rework"
             );
             let h = hq * hd;
-            let fused_bytes = pipelines.act_bytes(rows * 3 * h);
-            let qkv_fused = scope.alloc(fused_bytes)?;
-            let dims_qkv = scope.u32x4_uniform(rows, 3 * h, dim, 0)?;
-            let w_qkv = scope.import(&bufs.attn_qkv);
             let n_qkv = 3 * h;
-            match (
-                &pipelines.act_quant,
-                &pipelines.dequant_i8_qkv,
-                &pipelines.matmul_i8_qkv,
-            ) {
-                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
-                    let a_i8 = scope.alloc(rows as u64 * dim as u64)?;
-                    let a_sc = scope.alloc(rows as u64 * (dim / 32) as u64 * 4)?;
-                    let b_i8 = scope.alloc(n_qkv as u64 * dim as u64)?;
-                    let b_sc = scope.alloc(n_qkv as u64 * (dim / 32) as u64 * 4)?;
-                    let aq_dims = scope.u32x4_uniform(rows, dim, 0, 0)?;
-                    let dq_dims = scope.u32x4_uniform(n_qkv, dim, 0, 0)?;
-                    scope.act_quant(aq, attn_in, a_i8, a_sc, aq_dims, rows, dim)?;
-                    scope.dequant_i8(
-                        &dq_i8.pipeline,
-                        dq_i8.scheme,
-                        w_qkv,
-                        b_i8,
-                        b_sc,
-                        dq_dims,
-                        n_qkv,
-                        dim,
-                    )?;
-                    scope.matmul_i8(
-                        mm_i8,
-                        &pipelines.matmul_i8_cfg,
-                        a_i8,
-                        a_sc,
-                        b_i8,
-                        b_sc,
-                        qkv_fused,
-                        dims_qkv,
-                        rows,
-                        n_qkv,
-                    )?;
-                }
-                _ => {
-                    let w_qkv_in = match &pipelines.dequant_qkv {
-                        Some(dq) => {
-                            let dense_bytes = n_qkv as u64 * dim as u64 * 2;
-                            let dense = scope.alloc(dense_bytes)?;
-                            let dq_dims = scope.u32x4_uniform(n_qkv, dim, 0, 0)?;
-                            scope.dequant(
-                                &dq.pipeline,
-                                dq.scheme,
-                                w_qkv,
-                                dense,
-                                dq_dims,
-                                n_qkv,
-                                dim,
-                            )?;
-                            dense
-                        }
-                        None => w_qkv,
-                    };
-                    scope.matmul(
-                        &pipelines.matmul_qkv,
-                        &pipelines.matmuls.qkv,
-                        attn_in,
-                        w_qkv_in,
-                        dims_qkv,
-                        qkv_fused,
-                        rows,
-                        n_qkv,
-                    )?;
-                }
-            }
-            let q = scope.alloc(q_bytes)?;
-            let k = scope.alloc(kv_bytes)?;
-            let v = scope.alloc(kv_bytes)?;
-            let u_split = qkv_split_uniform(scope, rows, h)?;
-            let n_words = match pipelines.act_dtype {
-                ActDtype::F32 => rows * h,
-                ActDtype::Bf16 | ActDtype::F16 => rows * (h / 2),
-            };
-            scope.qkv_split::<QkvSplitF32>(
-                &pipelines.qkv_split,
-                qkv_fused,
-                q,
-                k,
-                v,
-                u_split,
-                n_words,
+            let qkv_scratch = alloc_matmul_out_buf(scope, pipelines, rows * n_qkv)?;
+            let dims_qkv = scope.u32x4_uniform(rows, n_qkv, dim, 0)?;
+            let w_qkv = scope.import_copy(bufs.attn_qkv);
+            self.dispatch_matmul_site(
+                scope,
+                pipelines,
+                attn_in,
+                w_qkv,
+                qkv_scratch,
+                dims_qkv,
+                pipelines.matmul_i8_qkv.as_ref(),
+                pipelines.dequant_i8_qkv.as_ref(),
+                pipelines.dequant_qkv.as_ref(),
+                &pipelines.matmul_qkv,
+                &pipelines.matmuls.qkv,
+                rows,
+                n_qkv,
+                dim,
             )?;
-            copy_tap(scope, q, &taps.attn_q, q_bytes)?;
-            copy_tap(scope, k, &taps.attn_k, kv_bytes)?;
-            copy_tap(scope, v, &taps.attn_v, kv_bytes)?;
+            // Telemetry: snapshot the raw matmul output (kept for parity
+            // tooling continuity; identical to the qkv output stream).
+            if let Some(dst) = taps.attn_qkv_f16_pre_quant {
+                let dst_b = scope.import_copy(dst);
+                let bytes = pipelines.act_bytes(rows * n_qkv);
+                scope.copy_buffer_to_buffer(qkv_scratch, 0, dst_b, 0, bytes)?;
+            }
+            let qkv_fused = ActBuf::dense(qkv_scratch);
+            let q = alloc_act(scope, pipelines, rows, h)?;
+            let k = alloc_act(scope, pipelines, rows, h)?;
+            let v = alloc_act(scope, pipelines, rows, h)?;
+            op_qkv_split(scope, pipelines, qkv_fused, q, k, v, rows, h)?;
+            copy_tap_act(scope, pipelines, q, taps.attn_q.as_ref(), rows, h)?;
+            copy_tap_act(scope, pipelines, k, taps.attn_k.as_ref(), rows, h)?;
+            copy_tap_act(scope, pipelines, v, taps.attn_v.as_ref(), rows, h)?;
             (q, k, v)
         };
 
+        // ==================== Attention: q/k norm + rope + sdpa ====================
         let sa = {
             let _g = trace::scope!("attn_sdpa").entered();
-            let qn = scope.alloc(q_bytes)?;
-            let kn = scope.alloc(kv_bytes)?;
-            let u_rms_q = rmsnorm_uniform(scope, rows * hq, hd, eps)?;
-            let nq = scope.import(&bufs.attn_norm_q);
-            scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, q, nq, u_rms_q, qn, rows * hq)?;
-            copy_tap(scope, qn, &taps.attn_q_norm, q_bytes)?;
-            let u_rms_k = rmsnorm_uniform(scope, rows * hkv, hd, eps)?;
-            let nk = scope.import(&bufs.attn_norm_k);
-            scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, k, nk, u_rms_k, kn, rows * hkv)?;
-            copy_tap(scope, kn, &taps.attn_k_norm, kv_bytes)?;
-
-            let qr = scope.alloc(q_bytes)?;
-            let kr = scope.alloc(kv_bytes)?;
-            let pairs = hd / 2;
-            let u_rope_q = scope.u32x4_uniform(rows, hq, pairs, 0)?;
-            scope.rope::<RopeF32>(&pipelines.rope, qn, freqs_in, u_rope_q, qr, rows, hq, pairs)?;
-            copy_tap(scope, qr, &taps.attn_q_rope, q_bytes)?;
-            let u_rope_k = scope.u32x4_uniform(rows, hkv, pairs, 0)?;
-            scope.rope::<RopeF32>(
-                &pipelines.rope,
-                kn,
-                freqs_in,
-                u_rope_k,
-                kr,
-                rows,
-                hkv,
-                pairs,
+            let qn = alloc_act(scope, pipelines, rows * hq, hd)?;
+            let kn = alloc_act(scope, pipelines, rows * hkv, hd)?;
+            let nq = scope.import_copy(bufs.attn_norm_q);
+            op_rmsnorm(scope, pipelines, q, nq, qn, rows * hq, hd, eps)?;
+            copy_tap_act(
+                scope,
+                pipelines,
+                qn,
+                taps.attn_q_norm.as_ref(),
+                rows * hq,
+                hd,
             )?;
-            copy_tap(scope, kr, &taps.attn_k_rope, kv_bytes)?;
+            let nk = scope.import_copy(bufs.attn_norm_k);
+            op_rmsnorm(scope, pipelines, k, nk, kn, rows * hkv, hd, eps)?;
+            copy_tap_act(
+                scope,
+                pipelines,
+                kn,
+                taps.attn_k_norm.as_ref(),
+                rows * hkv,
+                hd,
+            )?;
 
-            let sa = scope.alloc(q_bytes)?;
-            let u_sdpa = sdpa_uniform(scope, b, hq, hkv, s, s, hd, scale, 1)?;
-            scope.sdpa::<SdpaF32>(&pipelines.sdpa, qr, kr, v, mask_in, u_sdpa, sa, b, s, hq)?;
-            copy_tap(scope, sa, &taps.attn_sdpa, q_bytes)?;
+            let qr = alloc_act(scope, pipelines, rows, hq * hd)?;
+            let kr = alloc_act(scope, pipelines, rows, hkv * hd)?;
+            op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+            copy_tap_act(
+                scope,
+                pipelines,
+                qr,
+                taps.attn_q_rope.as_ref(),
+                rows,
+                hq * hd,
+            )?;
+            op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+            copy_tap_act(
+                scope,
+                pipelines,
+                kr,
+                taps.attn_k_rope.as_ref(),
+                rows,
+                hkv * hd,
+            )?;
+
+            // i8 attention opt-in: quantize q/k/v ONCE, post-rope, into the
+            // fused paired sdpa_i8 I/O slots. Otherwise sdpa runs dense.
+            let (qx, kx, vx, sa) = if pipelines.i8_sdpa() {
+                (
+                    quant_for_sdpa(scope, pipelines, qr, rows, hq * hd)?,
+                    quant_for_sdpa(scope, pipelines, kr, rows, hkv * hd)?,
+                    quant_for_sdpa(scope, pipelines, v, rows, hq * hd)?,
+                    alloc_act_sdpa_io(scope, pipelines, rows, hq * hd)?,
+                )
+            } else {
+                (qr, kr, v, alloc_act(scope, pipelines, rows, hq * hd)?)
+            };
+            op_sdpa(
+                scope, pipelines, qx, kx, vx, mask_in, sa, b, s, s, hq, hkv, hd, scale, 1,
+            )?;
+            copy_tap_act(scope, pipelines, sa, taps.attn_sdpa.as_ref(), rows, hq * hd)?;
             sa
         };
 
+        // ==================== Attention: out projection + post-norm ====================
         let t2 = {
             let _g = trace::scope!("attn_proj").entered();
-            let proj = scope.alloc(act_bytes)?;
-            let dims_proj = scope.u32x4_uniform(rows, dim, hq * hd, 0)?;
-            let wo = scope.import(&bufs.attn_to_out);
             let k_proj = hq * hd;
-            match (
-                &pipelines.act_quant,
-                &pipelines.dequant_i8_proj,
-                &pipelines.matmul_i8_proj,
-            ) {
-                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
-                    let a_i8 = scope.alloc(rows as u64 * k_proj as u64)?;
-                    let a_sc = scope.alloc(rows as u64 * (k_proj / 32) as u64 * 4)?;
-                    let b_i8 = scope.alloc(dim as u64 * k_proj as u64)?;
-                    let b_sc = scope.alloc(dim as u64 * (k_proj / 32) as u64 * 4)?;
-                    let aq_dims = scope.u32x4_uniform(rows, k_proj, 0, 0)?;
-                    let dq_dims = scope.u32x4_uniform(dim, k_proj, 0, 0)?;
-                    scope.act_quant(aq, sa, a_i8, a_sc, aq_dims, rows, k_proj)?;
-                    scope.dequant_i8(
-                        &dq_i8.pipeline,
-                        dq_i8.scheme,
-                        wo,
-                        b_i8,
-                        b_sc,
-                        dq_dims,
-                        dim,
-                        k_proj,
-                    )?;
-                    scope.matmul_i8(
-                        mm_i8,
-                        &pipelines.matmul_i8_cfg,
-                        a_i8,
-                        a_sc,
-                        b_i8,
-                        b_sc,
-                        proj,
-                        dims_proj,
-                        rows,
-                        dim,
-                    )?;
-                }
-                _ => {
-                    let wo_in = match &pipelines.dequant_proj {
-                        Some(dq) => {
-                            let dense = scope.alloc(dim as u64 * k_proj as u64 * 2)?;
-                            let dq_dims = scope.u32x4_uniform(dim, k_proj, 0, 0)?;
-                            scope.dequant(
-                                &dq.pipeline,
-                                dq.scheme,
-                                wo,
-                                dense,
-                                dq_dims,
-                                dim,
-                                k_proj,
-                            )?;
-                            dense
-                        }
-                        None => wo,
-                    };
-                    scope.matmul(
-                        &pipelines.matmul_proj,
-                        &pipelines.matmuls.proj,
-                        sa,
-                        wo_in,
-                        dims_proj,
-                        proj,
-                        rows,
-                        dim,
-                    )?;
-                }
+            let proj_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
+            let dims_proj = scope.u32x4_uniform(rows, dim, k_proj, 0)?;
+            let wo = scope.import_copy(bufs.attn_to_out);
+            self.dispatch_matmul_site_diag(
+                scope,
+                pipelines,
+                sa,
+                wo,
+                proj_scratch,
+                dims_proj,
+                pipelines.matmul_i8_proj.as_ref(),
+                pipelines.dequant_i8_proj.as_ref(),
+                pipelines.dequant_proj.as_ref(),
+                &pipelines.matmul_proj,
+                &pipelines.matmuls.proj,
+                rows,
+                dim,
+                k_proj,
+                None,
+                None,
+                taps.proj_wo_b_i8_head,
+                taps.proj_wo_b_scale_head,
+                None,
+                None,
+                None,
+            )?;
+            if let Some(dst) = taps.attn_proj_f16_pre_quant {
+                let dst_b = scope.import_copy(dst);
+                let bytes = pipelines.act_bytes(rows * dim);
+                scope.copy_buffer_to_buffer(proj_scratch, 0, dst_b, 0, bytes)?;
             }
-            copy_tap(scope, proj, &taps.attn_out, act_bytes)?;
+            let proj = ActBuf::dense(proj_scratch);
+            copy_tap_act(scope, pipelines, proj, taps.attn_out.as_ref(), rows, dim)?;
 
-            let t2 = scope.alloc(act_bytes)?;
-            let u_rms_post = rmsnorm_uniform(scope, rows, dim, eps)?;
-            let an2 = scope.import(&bufs.attention_norm2);
-            scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, proj, an2, u_rms_post, t2, rows)?;
-            copy_tap(scope, t2, &taps.attn_norm2_out, act_bytes)?;
+            let t2 = alloc_act(scope, pipelines, rows, dim)?;
+            let an2 = scope.import_copy(bufs.attention_norm2);
+            op_rmsnorm(scope, pipelines, proj, an2, t2, rows, dim, eps)?;
+            copy_tap_act(
+                scope,
+                pipelines,
+                t2,
+                taps.attn_norm2_out.as_ref(),
+                rows,
+                dim,
+            )?;
             t2
         };
 
-        let x1 = scope.alloc(act_bytes)?;
+        // ==================== Residual 1 ====================
+        let x1 = alloc_act(scope, pipelines, rows, dim)?;
         self.residual(
             scope,
             pipelines,
@@ -997,220 +1140,110 @@ impl Block {
             t2,
             ada.as_ref().map(|a| a.gate_msa),
             x1,
-            rows * dim,
+            rows,
             dim,
         )?;
-        copy_tap(scope, x1, &taps.x_mid, act_bytes)?;
+        copy_tap_act(scope, pipelines, x1, taps.x_mid.as_ref(), rows, dim)?;
 
+        // ==================== FFN: pre-norm + modulate ====================
         let t4 = {
             let _g = trace::scope!("ffn").entered();
-            let t3 = scope.alloc(act_bytes)?;
-            let u_rms_ffn1 = rmsnorm_uniform(scope, rows, dim, eps)?;
-            let fn1 = scope.import(&bufs.ffn_norm1);
-            scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, x1, fn1, u_rms_ffn1, t3, rows)?;
-            copy_tap(scope, t3, &taps.ffn_norm1_out, act_bytes)?;
-            let ffn_in: BatchBuf<'wsp> = match ada.as_ref() {
+            let t3 = alloc_act(scope, pipelines, rows, dim)?;
+            let fn1 = scope.import_copy(bufs.ffn_norm1);
+            op_rmsnorm(scope, pipelines, x1, fn1, t3, rows, dim, eps)?;
+            copy_tap_act(scope, pipelines, t3, taps.ffn_norm1_out.as_ref(), rows, dim)?;
+            let ffn_in: ActBuf<'wsp> = match ada.as_ref() {
                 Some(a) => {
-                    let dst = scope.alloc(act_bytes)?;
-                    let u_ba = bcast_affine_uniform(scope, dim, 1.0)?;
-                    scope.bcast_affine::<BcastAffineF32>(
-                        &pipelines.bcast_affine,
-                        t3,
-                        a.scale_mlp,
-                        u_ba,
-                        dst,
-                        rows * dim,
-                    )?;
+                    let dst = alloc_act(scope, pipelines, rows, dim)?;
+                    op_bcast_affine(scope, pipelines, t3, a.scale_mlp, dst, rows, dim, 1.0)?;
                     dst
                 }
                 None => t3,
             };
-            copy_tap(scope, ffn_in, &taps.modulated_ffn_in, act_bytes)?;
+            copy_tap_act(
+                scope,
+                pipelines,
+                ffn_in,
+                taps.modulated_ffn_in.as_ref(),
+                rows,
+                dim,
+            )?;
 
-            let h1 = scope.alloc(hid_bytes)?;
-            let h3 = scope.alloc(hid_bytes)?;
+            // ==================== FFN: w1 + w3 + silu_mul ====================
+            let h1_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hid)?;
+            let h3_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hid)?;
             let dims_ffn1 = scope.u32x4_uniform(rows, hid, dim, 0)?;
             let dims_ffn3 = scope.u32x4_uniform(rows, hid, dim, 0)?;
-            let w1 = scope.import(&bufs.ffn_w1);
-            let w3 = scope.import(&bufs.ffn_w3);
-            match (
-                &pipelines.act_quant,
-                &pipelines.dequant_i8_ffn_up,
-                &pipelines.matmul_i8_ffn_up,
-            ) {
-                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
-                    let a_i8 = scope.alloc(rows as u64 * dim as u64)?;
-                    let a_sc = scope.alloc(rows as u64 * (dim / 32) as u64 * 4)?;
-                    let aq_dims = scope.u32x4_uniform(rows, dim, 0, 0)?;
-                    let dq_dims = scope.u32x4_uniform(hid, dim, 0, 0)?;
-                    // Single act_quant of ffn_in, reused by both w1 and w3
-                    // matmuls — identical input, two consumers.
-                    scope.act_quant(aq, ffn_in, a_i8, a_sc, aq_dims, rows, dim)?;
-                    let b1_i8 = scope.alloc(hid as u64 * dim as u64)?;
-                    let b1_sc = scope.alloc(hid as u64 * (dim / 32) as u64 * 4)?;
-                    scope.dequant_i8(
-                        &dq_i8.pipeline,
-                        dq_i8.scheme,
-                        w1,
-                        b1_i8,
-                        b1_sc,
-                        dq_dims,
-                        hid,
-                        dim,
-                    )?;
-                    scope.matmul_i8(
-                        mm_i8,
-                        &pipelines.matmul_i8_cfg,
-                        a_i8,
-                        a_sc,
-                        b1_i8,
-                        b1_sc,
-                        h1,
-                        dims_ffn1,
-                        rows,
-                        hid,
-                    )?;
-                    let b3_i8 = scope.alloc(hid as u64 * dim as u64)?;
-                    let b3_sc = scope.alloc(hid as u64 * (dim / 32) as u64 * 4)?;
-                    scope.dequant_i8(
-                        &dq_i8.pipeline,
-                        dq_i8.scheme,
-                        w3,
-                        b3_i8,
-                        b3_sc,
-                        dq_dims,
-                        hid,
-                        dim,
-                    )?;
-                    scope.matmul_i8(
-                        mm_i8,
-                        &pipelines.matmul_i8_cfg,
-                        a_i8,
-                        a_sc,
-                        b3_i8,
-                        b3_sc,
-                        h3,
-                        dims_ffn3,
-                        rows,
-                        hid,
-                    )?;
-                }
-                _ => {
-                    let w1_in = match &pipelines.dequant_ffn_up {
-                        Some(dq) => {
-                            let dense = scope.alloc(hid as u64 * dim as u64 * 2)?;
-                            let dq_dims = scope.u32x4_uniform(hid, dim, 0, 0)?;
-                            scope.dequant(&dq.pipeline, dq.scheme, w1, dense, dq_dims, hid, dim)?;
-                            dense
-                        }
-                        None => w1,
-                    };
-                    scope.matmul(
-                        &pipelines.matmul_ffn_up,
-                        &pipelines.matmuls.ffn_up,
-                        ffn_in,
-                        w1_in,
-                        dims_ffn1,
-                        h1,
-                        rows,
-                        hid,
-                    )?;
-                    let w3_in = match &pipelines.dequant_ffn_up {
-                        Some(dq) => {
-                            let dense = scope.alloc(hid as u64 * dim as u64 * 2)?;
-                            let dq_dims = scope.u32x4_uniform(hid, dim, 0, 0)?;
-                            scope.dequant(&dq.pipeline, dq.scheme, w3, dense, dq_dims, hid, dim)?;
-                            dense
-                        }
-                        None => w3,
-                    };
-                    scope.matmul(
-                        &pipelines.matmul_ffn_up,
-                        &pipelines.matmuls.ffn_up,
-                        ffn_in,
-                        w3_in,
-                        dims_ffn3,
-                        h3,
-                        rows,
-                        hid,
-                    )?;
-                }
-            }
+            let w1 = scope.import_copy(bufs.ffn_w1);
+            let w3 = scope.import_copy(bufs.ffn_w3);
+            self.dispatch_matmul_site(
+                scope,
+                pipelines,
+                ffn_in,
+                w1,
+                h1_scratch,
+                dims_ffn1,
+                pipelines.matmul_i8_ffn_up.as_ref(),
+                pipelines.dequant_i8_ffn_up.as_ref(),
+                pipelines.dequant_ffn_up.as_ref(),
+                &pipelines.matmul_ffn_up,
+                &pipelines.matmuls.ffn_up,
+                rows,
+                hid,
+                dim,
+            )?;
+            self.dispatch_matmul_site(
+                scope,
+                pipelines,
+                ffn_in,
+                w3,
+                h3_scratch,
+                dims_ffn3,
+                pipelines.matmul_i8_ffn_up.as_ref(),
+                pipelines.dequant_i8_ffn_up.as_ref(),
+                pipelines.dequant_ffn_up.as_ref(),
+                &pipelines.matmul_ffn_up,
+                &pipelines.matmuls.ffn_up,
+                rows,
+                hid,
+                dim,
+            )?;
+            let h1 = ActBuf::dense(h1_scratch);
+            let h3 = ActBuf::dense(h3_scratch);
+            let h13 = alloc_act(scope, pipelines, rows, hid)?;
+            op_silu_mul(scope, pipelines, h1, h3, h13)?;
 
-            let h13 = scope.alloc(hid_bytes)?;
-            scope.dispatch_op::<SiluMulF32>(&pipelines.silu_mul, &[h1, h3], h13)?;
-
-            let h2 = scope.alloc(act_bytes)?;
+            // ==================== FFN: w2 + post-norm ====================
+            let h2_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
             let dims_ffn2 = scope.u32x4_uniform(rows, dim, hid, 0)?;
-            let w2 = scope.import(&bufs.ffn_w2);
-            match (
-                &pipelines.act_quant,
-                &pipelines.dequant_i8_ffn_down,
-                &pipelines.matmul_i8_ffn_down,
-            ) {
-                (Some(aq), Some(dq_i8), Some(mm_i8)) => {
-                    let a_i8 = scope.alloc(rows as u64 * hid as u64)?;
-                    let a_sc = scope.alloc(rows as u64 * (hid / 32) as u64 * 4)?;
-                    let b_i8 = scope.alloc(dim as u64 * hid as u64)?;
-                    let b_sc = scope.alloc(dim as u64 * (hid / 32) as u64 * 4)?;
-                    let aq_dims = scope.u32x4_uniform(rows, hid, 0, 0)?;
-                    let dq_dims = scope.u32x4_uniform(dim, hid, 0, 0)?;
-                    scope.act_quant(aq, h13, a_i8, a_sc, aq_dims, rows, hid)?;
-                    scope.dequant_i8(
-                        &dq_i8.pipeline,
-                        dq_i8.scheme,
-                        w2,
-                        b_i8,
-                        b_sc,
-                        dq_dims,
-                        dim,
-                        hid,
-                    )?;
-                    scope.matmul_i8(
-                        mm_i8,
-                        &pipelines.matmul_i8_cfg,
-                        a_i8,
-                        a_sc,
-                        b_i8,
-                        b_sc,
-                        h2,
-                        dims_ffn2,
-                        rows,
-                        dim,
-                    )?;
-                }
-                _ => {
-                    let w2_in = match &pipelines.dequant_ffn_down {
-                        Some(dq) => {
-                            let dense = scope.alloc(dim as u64 * hid as u64 * 2)?;
-                            let dq_dims = scope.u32x4_uniform(dim, hid, 0, 0)?;
-                            scope.dequant(&dq.pipeline, dq.scheme, w2, dense, dq_dims, dim, hid)?;
-                            dense
-                        }
-                        None => w2,
-                    };
-                    scope.matmul(
-                        &pipelines.matmul_ffn_down,
-                        &pipelines.matmuls.ffn_down,
-                        h13,
-                        w2_in,
-                        dims_ffn2,
-                        h2,
-                        rows,
-                        dim,
-                    )?;
-                }
-            }
-            copy_tap(scope, h2, &taps.ffn_raw, act_bytes)?;
+            let w2 = scope.import_copy(bufs.ffn_w2);
+            self.dispatch_matmul_site(
+                scope,
+                pipelines,
+                h13,
+                w2,
+                h2_scratch,
+                dims_ffn2,
+                pipelines.matmul_i8_ffn_down.as_ref(),
+                pipelines.dequant_i8_ffn_down.as_ref(),
+                pipelines.dequant_ffn_down.as_ref(),
+                &pipelines.matmul_ffn_down,
+                &pipelines.matmuls.ffn_down,
+                rows,
+                dim,
+                hid,
+            )?;
+            let h2 = ActBuf::dense(h2_scratch);
+            copy_tap_act(scope, pipelines, h2, taps.ffn_raw.as_ref(), rows, dim)?;
 
-            let t4 = scope.alloc(act_bytes)?;
-            let u_rms_ffn2 = rmsnorm_uniform(scope, rows, dim, eps)?;
-            let fn2 = scope.import(&bufs.ffn_norm2);
-            scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, h2, fn2, u_rms_ffn2, t4, rows)?;
-            copy_tap(scope, t4, &taps.ffn_norm2_out, act_bytes)?;
+            let t4 = alloc_act(scope, pipelines, rows, dim)?;
+            let fn2 = scope.import_copy(bufs.ffn_norm2);
+            op_rmsnorm(scope, pipelines, h2, fn2, t4, rows, dim, eps)?;
+            copy_tap_act(scope, pipelines, t4, taps.ffn_norm2_out.as_ref(), rows, dim)?;
             t4
         };
 
+        // ==================== Residual 2 (writes y_out) ====================
         self.residual(
             scope,
             pipelines,
@@ -1218,9 +1251,617 @@ impl Block {
             t4,
             ada.as_ref().map(|a| a.gate_mlp),
             y_out,
-            rows * dim,
+            rows,
             dim,
         )?;
+
+        Ok(())
+    }
+
+    /// Estimated peak workspace bytes per phase for the packer.
+    ///
+    /// Phases:
+    ///  - 0: AttnPreQkv (rmsnorm + optional AdaLN prep + optional modulate +
+    ///    qkv matmul + qkv_split). Carries q, k, v (+ ada chunks).
+    ///  - 1: AttnSdpaProj (sdpa norms+rope+sdpa + attn_proj matmul + post-norm
+    ///    + residual1). Carries x1 (+ scale_mlp, gate_mlp).
+    ///  - 2: Ffn1 (ffn-norm + optional modulate + w1 + w3 + silu_mul).
+    ///    Carries h13, x1 (+ gate_mlp).
+    ///  - 3: Ffn2 (w2 + ffn-norm-post + residual2). Writes y_out.
+    ///
+    /// Each phase's value is the SUM of every workspace alloc made inside its
+    /// scope (BatchScope holds all guards until submit, so peak = sum).
+    /// Conservative upper bound — assumes worst-case matmul path per site
+    /// based on which pipeline fields are populated (DP4A > dequant-once > bf16).
+    pub fn phase_peaks(&self, pipelines: &BlockPipelines) -> [u64; 4] {
+        let cfg = self.cfg;
+        let rows = cfg.rows() as u64;
+        let dim = cfg.dim as u64;
+        let hd = cfg.head_dim as u64;
+        let hq = cfg.n_heads as u64;
+        let hkv = cfg.n_kv_heads as u64;
+        let hid = cfg.ffn_hidden as u64;
+        let b = cfg.batch as u64;
+        let h = hq * hd;
+        let abe = pipelines.act_dtype.bytes_per_elem();
+        let i8_sdpa = pipelines.i8_sdpa();
+        // Dense activation / matmul-output scratch bytes.
+        let act_b = |m: u64, d: u64| -> u64 { m * d * abe };
+        // Fused paired sdpa_i8 I/O slot: packed i8 data + per-block scale.
+        let sdpa_pair_b = |m: u64, d: u64| -> u64 { m * d + m * (d / 32) * 4 };
+        // Matmul-site additional allocs (inside `dispatch_matmul_site`).
+        // DP4A: b dequant (i8 + scale + qsum) plus the dense->paired A-side
+        // transcode (skipped when A arrives paired, but counted always as a
+        // conservative upper bound).
+        let mm_site =
+            |m: u64, n: u64, k: u64, mm_i8_available: bool, dq_dense_available: bool| -> u64 {
+                if mm_i8_available && pipelines.act_quant.is_some() {
+                    let b_side = n * k + 2 * (n * (k / 32) * 4);
+                    let a_side = m * k + m * (k / 32) * 4;
+                    b_side + a_side
+                } else if dq_dense_available {
+                    n * k * 2
+                } else {
+                    0
+                }
+            };
+        let act = act_b(rows, dim);
+        let q_b = act_b(rows, h);
+        let kv_b = act_b(rows, hkv * hd);
+        let hid_b = act_b(rows, hid);
+        let modulated = cfg.modulation;
+        let chunk_b = b * dim * abe;
+        let ada_full_b = b * 4 * dim * abe;
+        // AdaLN prep allocs: pre + full + 6 * chunk (scale_msa, gate_msa_pre,
+        // scale_mlp, gate_mlp_pre, gate_msa, gate_mlp). All live through phase 1.
+        let ada_full = if modulated {
+            2 * ada_full_b + 6 * chunk_b
+        } else {
+            0
+        };
+
+        // Phase 0: ada_full + t1 + (modulate?attn_in:0) + qkv_scratch + q + 2*kv + mm_site
+        let p0 = ada_full
+            + act
+            + if modulated { act } else { 0 }
+            + act_b(rows, 3 * h)
+            + mm_site(
+                rows,
+                3 * h,
+                dim,
+                pipelines.matmul_i8_qkv.is_some(),
+                pipelines.dequant_qkv.is_some(),
+            )
+            + q_b
+            + 2 * kv_b;
+
+        // Phase 1: qn + kn + qr + kr + sa + (i8_sdpa? 3 quant pairs + paired
+        // sa) + proj_scratch + mm_site + t2 + x1
+        let sdpa_extra = if i8_sdpa {
+            2 * sdpa_pair_b(rows, h) + sdpa_pair_b(rows, hkv * hd) + sdpa_pair_b(rows, h)
+        } else {
+            0
+        };
+        let p1 = q_b
+            + kv_b
+            + q_b
+            + kv_b
+            + if i8_sdpa { 0 } else { q_b }
+            + sdpa_extra
+            + act_b(rows, dim)
+            + mm_site(
+                rows,
+                dim,
+                h,
+                pipelines.matmul_i8_proj.is_some(),
+                pipelines.dequant_proj.is_some(),
+            )
+            + act
+            + act;
+
+        // Phase 2: t3 + (modulate?ffn_in:0) + 2*hid_scratch + 2*mm_site +
+        // h13. Two separate b dequants under DP4A (w1, w3 differ).
+        let p2 = act
+            + if modulated { act } else { 0 }
+            + 2 * act_b(rows, hid)
+            + 2 * mm_site(
+                rows,
+                hid,
+                dim,
+                pipelines.matmul_i8_ffn_up.is_some(),
+                pipelines.dequant_ffn_up.is_some(),
+            )
+            + hid_b;
+
+        // Phase 3: h2_scratch + mm_site + t4
+        let p3 = act_b(rows, dim)
+            + mm_site(
+                rows,
+                dim,
+                hid,
+                pipelines.matmul_i8_ffn_down.is_some(),
+                pipelines.dequant_ffn_down.is_some(),
+            )
+            + act;
+
+        [p0, p1, p2, p3]
+    }
+
+    /// Packer-driven variant of [`Self::forward_taps`]. Inputs are `BufRef`s
+    /// (re-imported into each sub-scope as needed) and the work is sliced
+    /// into 4 phases. The packer cuts a scope whenever the next phase's
+    /// estimated peak workspace would push live bytes past its budget;
+    /// otherwise consecutive phases share a scope (zero overhead at small
+    /// dims). See [`Self::phase_peaks`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_taps_packed<'wsp>(
+        &self,
+        packer: &mut ScopePacker<'wsp, WgpuBackend>,
+        pipelines: &BlockPipelines,
+        x_in_ref: ActBufRef,
+        freqs_in_ref: BufRef,
+        mask_in_ref: BufRef,
+        adaln_input_ref: Option<BufRef>,
+        y_out_ref: ActBufRef,
+        bufs: &BlockWeightBufs,
+        taps: &BlockDebugTaps,
+    ) -> Result<(), WgpuError> {
+        debug_assert_eq!(
+            self.cfg.modulation,
+            bufs.adaln.is_some(),
+            "adaln bufs presence must match cfg.modulation"
+        );
+        let cfg = self.cfg;
+        let rows = cfg.rows() as u32;
+        let dim = cfg.dim as u32;
+        let hd = cfg.head_dim as u32;
+        let hq = cfg.n_heads as u32;
+        let hkv = cfg.n_kv_heads as u32;
+        let hid = cfg.ffn_hidden as u32;
+        let eps = cfg.norm_eps;
+        let scale = cfg.sdpa_scale();
+        let b = cfg.batch as u32;
+        let s = cfg.seq as u32;
+        let ad = cfg.adaln_embed_dim as u32;
+        let h = hq * hd;
+        let chunk_bytes = adaln_chunk_bytes(pipelines, b, dim);
+        let peaks = self.phase_peaks(pipelines);
+        packer.charge(peaks[0]);
+        let modulated = cfg.modulation;
+
+        // ============================ Phase 0 (attn pre + qkv) ============================
+        let p1_in: Vec<BatchBuf<'wsp>> = {
+            let _g = trace::scope!("attn_qkv").entered();
+            let scope = packer.scope();
+            let x_in = import_act_ref(scope, x_in_ref);
+
+            let ada: Option<AdaLnChunks<'wsp>> = match (modulated, &bufs.adaln, adaln_input_ref) {
+                (true, Some(w), Some(input_ref)) => {
+                    let input = scope.import_copy(input_ref);
+                    copy_tap(
+                        scope,
+                        input,
+                        taps.adaln_input.as_ref(),
+                        pipelines.act_bytes(b * ad),
+                    )?;
+                    Some(self.prepare_adaln(scope, pipelines, *w, input, taps)?)
+                }
+                (false, None, None) => None,
+                _ => panic!("modulation/adaln_input/adaln-bufs mismatch"),
+            };
+            if let Some(a) = ada.as_ref() {
+                copy_tap(scope, a.scale_msa, taps.scale_msa.as_ref(), chunk_bytes)?;
+                copy_tap(scope, a.gate_msa, taps.gate_msa.as_ref(), chunk_bytes)?;
+                copy_tap(scope, a.scale_mlp, taps.scale_mlp.as_ref(), chunk_bytes)?;
+                copy_tap(scope, a.gate_mlp, taps.gate_mlp.as_ref(), chunk_bytes)?;
+            }
+
+            let t1 = alloc_act(scope, pipelines, rows, dim)?;
+            let an1 = scope.import_copy(bufs.attention_norm1);
+            op_rmsnorm(scope, pipelines, x_in, an1, t1, rows, dim, eps)?;
+            copy_tap_act(
+                scope,
+                pipelines,
+                t1,
+                taps.attn_norm1_out.as_ref(),
+                rows,
+                dim,
+            )?;
+            let attn_in: ActBuf<'wsp> = match ada.as_ref() {
+                Some(a) => {
+                    let dst = alloc_act(scope, pipelines, rows, dim)?;
+                    op_bcast_affine(scope, pipelines, t1, a.scale_msa, dst, rows, dim, 1.0)?;
+                    dst
+                }
+                None => t1,
+            };
+            copy_tap_act(
+                scope,
+                pipelines,
+                attn_in,
+                taps.modulated_attn_in.as_ref(),
+                rows,
+                dim,
+            )?;
+
+            debug_assert_eq!(
+                hq, hkv,
+                "fused QKV currently assumes hq == hkv (Z-Image); GQA needs schema rework"
+            );
+            let n_qkv = 3 * h;
+            let qkv_scratch = alloc_matmul_out_buf(scope, pipelines, rows * n_qkv)?;
+            let dims_qkv = scope.u32x4_uniform(rows, n_qkv, dim, 0)?;
+            let w_qkv = scope.import_copy(bufs.attn_qkv);
+            // DIAG block-26 matmul_i8 audit: the i8 acts actually consumed by
+            // matmul_i8 (a_i8/a_params, captured post-transcode inside
+            // dispatch_matmul_site_diag) and the dequant_i8 outputs (b_i8,
+            // b_scale, b_qsum) so the e2e_parity test can CPU-recompute one
+            // output element from the actual bytes.
+            self.dispatch_matmul_site_diag(
+                scope,
+                pipelines,
+                attn_in,
+                w_qkv,
+                qkv_scratch,
+                dims_qkv,
+                pipelines.matmul_i8_qkv.as_ref(),
+                pipelines.dequant_i8_qkv.as_ref(),
+                pipelines.dequant_qkv.as_ref(),
+                &pipelines.matmul_qkv,
+                &pipelines.matmuls.qkv,
+                rows,
+                n_qkv,
+                dim,
+                taps.qkv_attn_in_data_head,
+                taps.qkv_attn_in_params_head,
+                taps.qkv_b_i8_head,
+                taps.qkv_b_scale_head,
+                taps.qkv_b_qsum_head,
+                taps.qkv_dbg_trace_head,
+                // Hardcoded trace target. NOTE: must be a cell that exists in
+                // THIS dispatch: m < rows (288 at 256x256), n < 3*dim. The
+                // prior (323, 255) target silently matched NO workgroup.
+                taps.qkv_dbg_trace_head.map(|_| (287u32, 255u32)),
+            )?;
+            // Telemetry: snapshot the raw matmul output (kept for parity
+            // tooling continuity; identical to the qkv output stream).
+            if let Some(dst) = taps.attn_qkv_f16_pre_quant {
+                let dst_b = scope.import_copy(dst);
+                let bytes = pipelines.act_bytes(rows * n_qkv);
+                scope.copy_buffer_to_buffer(qkv_scratch, 0, dst_b, 0, bytes)?;
+            }
+            let qkv_fused = ActBuf::dense(qkv_scratch);
+            let q = alloc_act(scope, pipelines, rows, h)?;
+            let k = alloc_act(scope, pipelines, rows, h)?;
+            let v = alloc_act(scope, pipelines, rows, h)?;
+            op_qkv_split(scope, pipelines, qkv_fused, q, k, v, rows, h)?;
+            copy_tap_act(scope, pipelines, q, taps.attn_q.as_ref(), rows, h)?;
+            copy_tap_act(scope, pipelines, k, taps.attn_k.as_ref(), rows, h)?;
+            copy_tap_act(scope, pipelines, v, taps.attn_v.as_ref(), rows, h)?;
+            let mut carry: Vec<BatchBuf<'wsp>> = Vec::new();
+            q.push_carry(&mut carry);
+            k.push_carry(&mut carry);
+            v.push_carry(&mut carry);
+            if let Some(a) = ada {
+                carry.push(a.scale_msa);
+                carry.push(a.gate_msa);
+                carry.push(a.scale_mlp);
+                carry.push(a.gate_mlp);
+            }
+            carry
+        };
+
+        // ---- Advance to phase 1 (sdpa + proj + residual1) ----
+        let p1_carry = packer.advance(&p1_in, peaks[1])?;
+        let mut idx = 0usize;
+        let q = pop_act(&p1_carry, &mut idx);
+        let k = pop_act(&p1_carry, &mut idx);
+        let v = pop_act(&p1_carry, &mut idx);
+        // Ada chunks follow as flat BatchBufs.
+        let gate_msa = if modulated {
+            Some(p1_carry[idx + 1])
+        } else {
+            None
+        };
+        let scale_mlp_p1 = if modulated {
+            Some(p1_carry[idx + 2])
+        } else {
+            None
+        };
+        let gate_mlp_p1 = if modulated {
+            Some(p1_carry[idx + 3])
+        } else {
+            None
+        };
+
+        // ============================ Phase 1 (sdpa + proj + residual1) ============================
+        let p2_in: Vec<BatchBuf<'wsp>> = {
+            let scope = packer.scope();
+            let x_in = import_act_ref(scope, x_in_ref);
+            let freqs_in = scope.import_copy(freqs_in_ref);
+            let mask_in = scope.import_copy(mask_in_ref);
+
+            let sa = {
+                let _g = trace::scope!("attn_sdpa").entered();
+                let qn = alloc_act(scope, pipelines, rows * hq, hd)?;
+                let kn = alloc_act(scope, pipelines, rows * hkv, hd)?;
+                let nq = scope.import_copy(bufs.attn_norm_q);
+                op_rmsnorm(scope, pipelines, q, nq, qn, rows * hq, hd, eps)?;
+                copy_tap_act(
+                    scope,
+                    pipelines,
+                    qn,
+                    taps.attn_q_norm.as_ref(),
+                    rows * hq,
+                    hd,
+                )?;
+                let nk = scope.import_copy(bufs.attn_norm_k);
+                op_rmsnorm(scope, pipelines, k, nk, kn, rows * hkv, hd, eps)?;
+                copy_tap_act(
+                    scope,
+                    pipelines,
+                    kn,
+                    taps.attn_k_norm.as_ref(),
+                    rows * hkv,
+                    hd,
+                )?;
+
+                let qr = alloc_act(scope, pipelines, rows, hq * hd)?;
+                let kr = alloc_act(scope, pipelines, rows, hkv * hd)?;
+                op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+                copy_tap_act(
+                    scope,
+                    pipelines,
+                    qr,
+                    taps.attn_q_rope.as_ref(),
+                    rows,
+                    hq * hd,
+                )?;
+                op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+                copy_tap_act(
+                    scope,
+                    pipelines,
+                    kr,
+                    taps.attn_k_rope.as_ref(),
+                    rows,
+                    hkv * hd,
+                )?;
+
+                // i8 attention opt-in: quantize q/k/v ONCE, post-rope, into
+                // fused paired sdpa_i8 I/O slots. Otherwise sdpa runs dense.
+                let (qx, kx, vx, sa) = if pipelines.i8_sdpa() {
+                    (
+                        quant_for_sdpa(scope, pipelines, qr, rows, hq * hd)?,
+                        quant_for_sdpa(scope, pipelines, kr, rows, hkv * hd)?,
+                        quant_for_sdpa(scope, pipelines, v, rows, hq * hd)?,
+                        alloc_act_sdpa_io(scope, pipelines, rows, hq * hd)?,
+                    )
+                } else {
+                    (qr, kr, v, alloc_act(scope, pipelines, rows, hq * hd)?)
+                };
+                op_sdpa(
+                    scope, pipelines, qx, kx, vx, mask_in, sa, b, s, s, hq, hkv, hd, scale, 1,
+                )?;
+                copy_tap_act(scope, pipelines, sa, taps.attn_sdpa.as_ref(), rows, hq * hd)?;
+                sa
+            };
+
+            let t2 = {
+                let _g = trace::scope!("attn_proj").entered();
+                let k_proj = hq * hd;
+                let proj_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
+                let dims_proj = scope.u32x4_uniform(rows, dim, k_proj, 0)?;
+                let wo = scope.import_copy(bufs.attn_to_out);
+                self.dispatch_matmul_site_diag(
+                    scope,
+                    pipelines,
+                    sa,
+                    wo,
+                    proj_scratch,
+                    dims_proj,
+                    pipelines.matmul_i8_proj.as_ref(),
+                    pipelines.dequant_i8_proj.as_ref(),
+                    pipelines.dequant_proj.as_ref(),
+                    &pipelines.matmul_proj,
+                    &pipelines.matmuls.proj,
+                    rows,
+                    dim,
+                    k_proj,
+                    None,
+                    None,
+                    taps.proj_wo_b_i8_head,
+                    taps.proj_wo_b_scale_head,
+                    None,
+                    None,
+                    None,
+                )?;
+                if let Some(dst) = taps.attn_proj_f16_pre_quant {
+                    let dst_b = scope.import_copy(dst);
+                    let bytes = pipelines.act_bytes(rows * dim);
+                    scope.copy_buffer_to_buffer(proj_scratch, 0, dst_b, 0, bytes)?;
+                }
+                // DIAG sa raw heads (paired only under i8_sdpa).
+                if let Some(ss) = sa.scale {
+                    if let Some(dst) = taps.proj_sa_data_head {
+                        let dst_b = scope.import_copy(dst);
+                        scope.copy_buffer_to_buffer(sa.data, 0, dst_b, 0, dst.len)?;
+                    }
+                    if let Some(dst) = taps.proj_sa_scale_head {
+                        let dst_b = scope.import_copy(dst);
+                        scope.copy_buffer_to_buffer(ss, 0, dst_b, 0, dst.len)?;
+                    }
+                }
+                let proj = ActBuf::dense(proj_scratch);
+                copy_tap_act(scope, pipelines, proj, taps.attn_out.as_ref(), rows, dim)?;
+
+                let t2 = alloc_act(scope, pipelines, rows, dim)?;
+                let an2 = scope.import_copy(bufs.attention_norm2);
+                op_rmsnorm(scope, pipelines, proj, an2, t2, rows, dim, eps)?;
+                copy_tap_act(
+                    scope,
+                    pipelines,
+                    t2,
+                    taps.attn_norm2_out.as_ref(),
+                    rows,
+                    dim,
+                )?;
+                t2
+            };
+
+            let x1 = alloc_act(scope, pipelines, rows, dim)?;
+            self.residual(scope, pipelines, x_in, t2, gate_msa, x1, rows, dim)?;
+            copy_tap_act(scope, pipelines, x1, taps.x_mid.as_ref(), rows, dim)?;
+
+            let mut carry: Vec<BatchBuf<'wsp>> = Vec::new();
+            x1.push_carry(&mut carry);
+            if let (Some(s), Some(g)) = (scale_mlp_p1, gate_mlp_p1) {
+                carry.push(s);
+                carry.push(g);
+            }
+            carry
+        };
+
+        // ---- Advance to phase 2 (ffn1) ----
+        let p2_carry = packer.advance(&p2_in, peaks[2])?;
+        let mut idx = 0usize;
+        let x1 = pop_act(&p2_carry, &mut idx);
+        let scale_mlp = if modulated { Some(p2_carry[idx]) } else { None };
+        let gate_mlp_p2 = if modulated {
+            Some(p2_carry[idx + 1])
+        } else {
+            None
+        };
+
+        // ============================ Phase 2 (ffn1) ============================
+        let p3_in: Vec<BatchBuf<'wsp>> = {
+            let _g = trace::scope!("ffn1").entered();
+            let scope = packer.scope();
+            let t3 = alloc_act(scope, pipelines, rows, dim)?;
+            let fn1 = scope.import_copy(bufs.ffn_norm1);
+            op_rmsnorm(scope, pipelines, x1, fn1, t3, rows, dim, eps)?;
+            copy_tap_act(scope, pipelines, t3, taps.ffn_norm1_out.as_ref(), rows, dim)?;
+            let ffn_in: ActBuf<'wsp> = match scale_mlp {
+                Some(sm) => {
+                    let dst = alloc_act(scope, pipelines, rows, dim)?;
+                    op_bcast_affine(scope, pipelines, t3, sm, dst, rows, dim, 1.0)?;
+                    dst
+                }
+                None => t3,
+            };
+            copy_tap_act(
+                scope,
+                pipelines,
+                ffn_in,
+                taps.modulated_ffn_in.as_ref(),
+                rows,
+                dim,
+            )?;
+
+            let h1_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hid)?;
+            let h3_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hid)?;
+            let dims_ffn1 = scope.u32x4_uniform(rows, hid, dim, 0)?;
+            let dims_ffn3 = scope.u32x4_uniform(rows, hid, dim, 0)?;
+            let w1 = scope.import_copy(bufs.ffn_w1);
+            let w3 = scope.import_copy(bufs.ffn_w3);
+            self.dispatch_matmul_site(
+                scope,
+                pipelines,
+                ffn_in,
+                w1,
+                h1_scratch,
+                dims_ffn1,
+                pipelines.matmul_i8_ffn_up.as_ref(),
+                pipelines.dequant_i8_ffn_up.as_ref(),
+                pipelines.dequant_ffn_up.as_ref(),
+                &pipelines.matmul_ffn_up,
+                &pipelines.matmuls.ffn_up,
+                rows,
+                hid,
+                dim,
+            )?;
+            self.dispatch_matmul_site(
+                scope,
+                pipelines,
+                ffn_in,
+                w3,
+                h3_scratch,
+                dims_ffn3,
+                pipelines.matmul_i8_ffn_up.as_ref(),
+                pipelines.dequant_i8_ffn_up.as_ref(),
+                pipelines.dequant_ffn_up.as_ref(),
+                &pipelines.matmul_ffn_up,
+                &pipelines.matmuls.ffn_up,
+                rows,
+                hid,
+                dim,
+            )?;
+            if let Some(dst) = taps.ffn_h1_f16_pre_quant {
+                let dst_b = scope.import_copy(dst);
+                let bytes = pipelines.act_bytes(rows * hid);
+                scope.copy_buffer_to_buffer(h1_scratch, 0, dst_b, 0, bytes)?;
+            }
+            if let Some(dst) = taps.ffn_h3_f16_pre_quant {
+                let dst_b = scope.import_copy(dst);
+                let bytes = pipelines.act_bytes(rows * hid);
+                scope.copy_buffer_to_buffer(h3_scratch, 0, dst_b, 0, bytes)?;
+            }
+            let h1 = ActBuf::dense(h1_scratch);
+            let h3 = ActBuf::dense(h3_scratch);
+            let h13 = alloc_act(scope, pipelines, rows, hid)?;
+            op_silu_mul(scope, pipelines, h1, h3, h13)?;
+            let mut carry: Vec<BatchBuf<'wsp>> = Vec::new();
+            h13.push_carry(&mut carry);
+            x1.push_carry(&mut carry);
+            if let Some(g) = gate_mlp_p2 {
+                carry.push(g);
+            }
+            carry
+        };
+
+        // ---- Advance to phase 3 (ffn2 + residual2) ----
+        let p3_carry = packer.advance(&p3_in, peaks[3])?;
+        let mut idx = 0usize;
+        let h13 = pop_act(&p3_carry, &mut idx);
+        let x1 = pop_act(&p3_carry, &mut idx);
+        let gate_mlp = if modulated { Some(p3_carry[idx]) } else { None };
+
+        // ============================ Phase 3 (ffn2 + residual2) ============================
+        {
+            let _g = trace::scope!("ffn2").entered();
+            let scope = packer.scope();
+            let h2_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
+            let dims_ffn2 = scope.u32x4_uniform(rows, dim, hid, 0)?;
+            let w2 = scope.import_copy(bufs.ffn_w2);
+            self.dispatch_matmul_site(
+                scope,
+                pipelines,
+                h13,
+                w2,
+                h2_scratch,
+                dims_ffn2,
+                pipelines.matmul_i8_ffn_down.as_ref(),
+                pipelines.dequant_i8_ffn_down.as_ref(),
+                pipelines.dequant_ffn_down.as_ref(),
+                &pipelines.matmul_ffn_down,
+                &pipelines.matmuls.ffn_down,
+                rows,
+                dim,
+                hid,
+            )?;
+            if let Some(dst) = taps.ffn_h2_f16_pre_quant {
+                let dst_b = scope.import_copy(dst);
+                let bytes = pipelines.act_bytes(rows * dim);
+                scope.copy_buffer_to_buffer(h2_scratch, 0, dst_b, 0, bytes)?;
+            }
+            let h2 = ActBuf::dense(h2_scratch);
+            copy_tap_act(scope, pipelines, h2, taps.ffn_raw.as_ref(), rows, dim)?;
+            let t4 = alloc_act(scope, pipelines, rows, dim)?;
+            let fn2 = scope.import_copy(bufs.ffn_norm2);
+            op_rmsnorm(scope, pipelines, h2, fn2, t4, rows, dim, eps)?;
+            copy_tap_act(scope, pipelines, t4, taps.ffn_norm2_out.as_ref(), rows, dim)?;
+            let y_out = import_act_ref(scope, y_out_ref);
+            self.residual(scope, pipelines, x1, t4, gate_mlp, y_out, rows, dim)?;
+        }
 
         Ok(())
     }
@@ -1230,41 +1871,288 @@ impl Block {
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
-        x: BatchBuf<'wsp>,
-        y: BatchBuf<'wsp>,
+        x: ActBuf<'wsp>,
+        y: ActBuf<'wsp>,
         gate: Option<BatchBuf<'wsp>>,
-        out: BatchBuf<'wsp>,
-        n_elems: u32,
+        out: ActBuf<'wsp>,
+        rows: u32,
         dim: u32,
     ) -> Result<(), WgpuError> {
         match gate {
-            Some(g) => {
-                let u = bcast_fma_uniform(scope, dim)?;
-                scope.bcast_fma::<BcastFmaF32>(&pipelines.bcast_fma, x, g, y, u, out, n_elems)
-            }
-            None => scope.dispatch_op::<AddF32>(&pipelines.add, &[x, y], out),
+            Some(g) => op_bcast_fma(scope, pipelines, x, g, y, out, rows, dim),
+            None => op_add(scope, pipelines, x, y, out),
         }
+    }
+
+    /// Dispatch one matmul site at the right level of the path stack:
+    ///   - DP4A (`weight` is Quant + adapter has DP4A): act_quant the dense
+    ///     `a.data` to (i8, params) — or consume `a`'s pair directly when it
+    ///     is already paired (sdpa_i8 output) — dequant weight; matmul_i8.
+    ///   - Paired `a` + Bf16 weight: matmul_i8_bf16 mixed kernel.
+    ///   - Non-DP4A but Quant weight: dequant once to dense; standard matmul.
+    ///   - Non-Quant weight: standard matmul direct on weight buffer.
+    ///
+    /// `out_scratch` receives the raw matmul output, always dense at the
+    /// block act dtype (the DP4A kernels write f16 == the F16 act dtype they
+    /// are gated on). Wrap it with `ActBuf::dense` to feed the next op.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_matmul_site<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &BlockPipelines,
+        a: ActBuf<'wsp>,
+        b_weight: BatchBuf<'wsp>,
+        out_scratch: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        matmul_i8: Option<&WgpuPipeline>,
+        dequant_i8: Option<&DequantStep>,
+        dequant_dense: Option<&DequantStep>,
+        matmul_pipeline: &WgpuPipeline,
+        matmul_op: &MatMulF32,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), WgpuError> {
+        self.dispatch_matmul_site_diag(
+            scope,
+            pipelines,
+            a,
+            b_weight,
+            out_scratch,
+            dims,
+            matmul_i8,
+            dequant_i8,
+            dequant_dense,
+            matmul_pipeline,
+            matmul_op,
+            m,
+            n,
+            k,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_matmul_site_diag<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &BlockPipelines,
+        a: ActBuf<'wsp>,
+        b_weight: BatchBuf<'wsp>,
+        out_scratch: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        matmul_i8: Option<&WgpuPipeline>,
+        dequant_i8: Option<&DequantStep>,
+        dequant_dense: Option<&DequantStep>,
+        matmul_pipeline: &WgpuPipeline,
+        matmul_op: &MatMulF32,
+        m: u32,
+        n: u32,
+        k: u32,
+        diag_a_i8_head: Option<BufRef>,
+        diag_a_params_head: Option<BufRef>,
+        diag_b_i8_head: Option<BufRef>,
+        diag_b_scale_head: Option<BufRef>,
+        diag_b_qsum_head: Option<BufRef>,
+        diag_dbg_trace_head: Option<BufRef>,
+        diag_dbg_target: Option<(u32, u32)>,
+    ) -> Result<(), WgpuError> {
+        // DP4A path: matmul_i8 + (paired or transcoded) input.
+        if let (Some(mm_i8), Some(dq_i8), Some(aq)) =
+            (matmul_i8, dequant_i8, pipelines.act_quant.as_ref())
+        {
+            // Dequant the quant weight into (i8, scale, qsum). `qsum[n, t] =
+            // Σ_{k in block} qb[n, k]` carries the asymmetric correction-term
+            // factor consumed by matmul_i8 to subtract the activation zero-
+            // point bias from the DP4A main path.
+            let b_i8 = scope.alloc(n as u64 * k as u64)?;
+            let b_sc = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
+            let b_qs = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
+            let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+            scope.dequant_i8(
+                &dq_i8.pipeline,
+                dq_i8.scheme,
+                b_weight,
+                b_i8,
+                b_sc,
+                b_qs,
+                dq_dims,
+                n,
+                k,
+            )?;
+            if let Some(dst) = diag_b_i8_head {
+                let dst_b = scope.import_copy(dst);
+                let n = dst.len.min(b_i8.len());
+                scope.copy_buffer_to_buffer(b_i8, 0, dst_b, 0, n)?;
+            }
+            if let Some(dst) = diag_b_scale_head {
+                let dst_b = scope.import_copy(dst);
+                let n = dst.len.min(b_sc.len());
+                scope.copy_buffer_to_buffer(b_sc, 0, dst_b, 0, n)?;
+            }
+            if let Some(dst) = diag_b_qsum_head {
+                let dst_b = scope.import_copy(dst);
+                let n = dst.len.min(b_qs.len());
+                scope.copy_buffer_to_buffer(b_qs, 0, dst_b, 0, n)?;
+            }
+            // Acquire (a_i8, a_params) — direct from `a` when it is already
+            // paired (sdpa_i8 output feeding proj), else transcode via
+            // act_quant from the dense `a.data` buffer.
+            let (a_i8, a_p) = match a.scale {
+                Some(s) => (a.data, s),
+                None => {
+                    let a_i8 = scope.alloc(m as u64 * k as u64)?;
+                    let a_p = scope.alloc(m as u64 * (k as u64 / 32) * 4)?;
+                    let aq_dims = scope.u32x4_uniform(m, k, 0, 0)?;
+                    scope.act_quant(aq, a.data, a_i8, a_p, aq_dims, m, k)?;
+                    (a_i8, a_p)
+                }
+            };
+            // DIAG: raw byte snapshots of the i8 acts actually consumed by
+            // matmul_i8 (block-26 audit). Captured here, post-transcode, so
+            // the audit sees the true A-side regardless of input form.
+            if let Some(dst) = diag_a_i8_head {
+                let dst_b = scope.import_copy(dst);
+                let n = dst.len.min(a_i8.len());
+                scope.copy_buffer_to_buffer(a_i8, 0, dst_b, 0, n)?;
+            }
+            if let Some(dst) = diag_a_params_head {
+                let dst_b = scope.import_copy(dst);
+                let n = dst.len.min(a_p.len());
+                scope.copy_buffer_to_buffer(a_p, 0, dst_b, 0, n)?;
+            }
+            // DIAG trace bindings for the new (slot 7) per-K-block dbg_out
+            // and (slot 8) dbg uniform. When `diag_dbg_target` is None the
+            // dbg uniform sets `enable = 0` and the kernel takes no trace
+            // path. With Some, dbg_out is sized for k/32 * 8 f32s; that
+            // single thread writes the trace and we copy dbg_out into the
+            // diag head buffer right after the matmul dispatch.
+            let dbg_target = diag_dbg_target.unwrap_or((0, 0));
+            let dbg = scope.u32x4_uniform(
+                dbg_target.0,
+                dbg_target.1,
+                diag_dbg_target.is_some() as u32,
+                0,
+            )?;
+            // Bind the trace head DIRECTLY as slot 7 (no intermediate alloc +
+            // copy: removes one suspect from the writes-don't-land chain).
+            // Pre-fill with sentinel -777.0 so the readback distinguishes
+            // "kernel never wrote index i" (sentinel) from "readback hit a
+            // different buffer" (garbage, no sentinel anywhere).
+            let dbg_out = if let Some(dst) = diag_dbg_trace_head {
+                let h = scope.import_copy(dst);
+                let sentinel: Vec<u8> =
+                    std::iter::repeat_n((-777.0f32).to_le_bytes(), (dst.len / 4) as usize)
+                        .flatten()
+                        .collect();
+                scope.write_bytes(h, 0, &sentinel)?;
+                h
+            } else {
+                scope.alloc(4)?
+            };
+            scope.matmul_i8(
+                mm_i8,
+                &pipelines.matmul_i8_cfg,
+                a_i8,
+                a_p,
+                b_i8,
+                b_sc,
+                b_qs,
+                out_scratch,
+                dims,
+                dbg_out,
+                dbg,
+                m,
+                n,
+            )?;
+            return Ok(());
+        }
+        // Paired acts × bf16 weights mixed matmul: the proj site consuming
+        // sdpa_i8's paired output when its weight stays at full bf16. The
+        // kernel consumes the pair directly — no act_quant transcode, no
+        // bf16-dequant scratch — and writes vec2<f16> like matmul_i8.
+        if a.scale.is_some()
+            && matmul_i8.is_none()
+            && let Some(mm_bf16) = pipelines.matmul_i8_bf16.as_ref()
+        {
+            let (a_i8, a_p) = a.paired_unchecked();
+            // Precompute b_sum[n, t] from the bf16 weight. Same architectural
+            // pattern as dequant_i8 → b_qsum on the Quant path.
+            let bsum_pipe = pipelines
+                .bf16_block_sum
+                .as_ref()
+                .expect("bf16_block_sum pipeline must be built when matmul_i8_bf16 is built");
+            let b_sum = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
+            let bsum_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+            scope.bf16_block_sum(bsum_pipe, b_weight, b_sum, bsum_dims, n, k)?;
+            scope.matmul_i8_bf16(
+                mm_bf16,
+                &pipelines.matmul_i8_bf16_cfg,
+                a_i8,
+                a_p,
+                b_weight,
+                b_sum,
+                out_scratch,
+                dims,
+                m,
+                n,
+            )?;
+            return Ok(());
+        }
+        // Non-DP4A, non-mixed path: the dense matmul reads either the raw
+        // weight buffer (non-quant) or a pre-dequanted workspace (Quant
+        // weight, F16-fallback path). A paired A-side cannot fall through
+        // here — it requires one of the i8-consuming paths above.
+        debug_assert!(
+            a.scale.is_none(),
+            "paired A-side requires the DP4A or mixed-bf16 matmul path; dispatch_matmul_site fell through"
+        );
+        let b_dense = match dequant_dense {
+            Some(dq) => {
+                let dense = scope.alloc(n as u64 * k as u64 * 2)?;
+                let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+                scope.dequant(&dq.pipeline, dq.scheme, b_weight, dense, dq_dims, n, k)?;
+                dense
+            }
+            None => b_weight,
+        };
+        scope.matmul(
+            matmul_pipeline,
+            matmul_op,
+            a.data,
+            b_dense,
+            dims,
+            out_scratch,
+            m,
+            n,
+        )
     }
 
     fn prepare_adaln<'wsp>(
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
-        w: &'wsp AdaLnBufs,
+        w: AdaLnBufs,
         adaln_input: BatchBuf<'wsp>,
-        taps: &'wsp BlockDebugTaps,
+        taps: &BlockDebugTaps,
     ) -> Result<AdaLnChunks<'wsp>, WgpuError> {
         let cfg = self.cfg;
         let dim = cfg.dim as u32;
         let b = cfg.batch as u32;
         let ad = cfg.adaln_embed_dim as u32;
         let four_dim = 4 * dim;
-        let chunk_bytes = pipelines.act_bytes(b * dim);
-        let full_bytes = pipelines.act_bytes(b * four_dim);
+        let chunk_bytes = adaln_chunk_bytes(pipelines, b, dim);
+        let full_bytes = adaln_full_bytes(pipelines, b, dim);
 
         let pre = scope.alloc(full_bytes)?;
         let dims_g = scope.u32x4_uniform(b, four_dim, ad, 0)?;
-        let aw = scope.import(&w.weight);
+        let aw = scope.import_copy(w.weight);
         scope.matmul(
             &pipelines.matmul_adaln,
             &pipelines.matmuls.adaln,
@@ -1275,12 +2163,12 @@ impl Block {
             b,
             four_dim,
         )?;
-        copy_tap(scope, pre, &taps.adaln_pre, full_bytes)?;
+        copy_tap(scope, pre, taps.adaln_pre.as_ref(), full_bytes)?;
         let full = scope.alloc(full_bytes)?;
-        let ab = scope.import(&w.bias);
+        let ab = scope.import_copy(w.bias);
         let ab_u = bcast_add_uniform(scope, four_dim)?;
         scope.bcast_add::<BcastAddF32>(&pipelines.bcast_add, pre, ab, ab_u, full, b * four_dim)?;
-        copy_tap(scope, full, &taps.adaln_full, full_bytes)?;
+        copy_tap(scope, full, taps.adaln_full.as_ref(), full_bytes)?;
 
         let scale_msa = scope.alloc(chunk_bytes)?;
         let gate_msa_pre = scope.alloc(chunk_bytes)?;
@@ -1311,6 +2199,387 @@ struct AdaLnChunks<'wsp> {
     gate_msa: BatchBuf<'wsp>,
     scale_mlp: BatchBuf<'wsp>,
     gate_mlp: BatchBuf<'wsp>,
+}
+
+/// Paired-or-dense activation handle threaded through the DiT block.
+///
+/// In F16/F32/Bf16 ops modes `scale` is `None` and `data` is the activation
+/// itself. In I8 ops mode `data` holds the packed `array<u32>` of i8 values
+/// and `scale` is `Some` holding the per-`(rows, dim/32)` f32 scale buffer.
+/// Every transient residual-stream allocation, every model input, every
+/// model output is wrapped this way so the block forward branches once on
+/// dtype (inside the op-wrappers below) rather than at every call site.
+#[derive(Clone, Copy)]
+pub struct ActBuf<'wsp> {
+    pub data: BatchBuf<'wsp>,
+    pub scale: Option<BatchBuf<'wsp>>,
+}
+
+impl<'wsp> ActBuf<'wsp> {
+    pub fn dense(data: BatchBuf<'wsp>) -> Self {
+        Self { data, scale: None }
+    }
+    pub fn paired(data: BatchBuf<'wsp>, scale: BatchBuf<'wsp>) -> Self {
+        Self {
+            data,
+            scale: Some(scale),
+        }
+    }
+    /// Push the data and (if i8) scale BatchBufs of this ActBuf into a packer
+    /// carry vec, in that order. Inverse of `pop_act`.
+    fn push_carry(self, carry: &mut Vec<BatchBuf<'wsp>>) {
+        carry.push(self.data);
+        if let Some(s) = self.scale {
+            carry.push(s);
+        }
+    }
+    /// Unwrap into (data, scale) asserting paired mode. Panics if not paired.
+    #[inline]
+    fn paired_unchecked(self) -> (BatchBuf<'wsp>, BatchBuf<'wsp>) {
+        (
+            self.data,
+            self.scale
+                .expect("ActBuf: expected paired (I8) but got dense"),
+        )
+    }
+}
+
+/// BufRef pair mirroring `ActBuf` shape. Callers of `forward_taps_packed`
+/// pass `ActBufRef::dense` under non-I8 modes and `ActBufRef::paired` under
+/// I8 (paired plumbing lands when dit.rs allocates the scale companion).
+#[derive(Clone, Copy)]
+pub struct ActBufRef {
+    pub data: BufRef,
+    pub scale: Option<BufRef>,
+}
+
+impl ActBufRef {
+    pub fn dense(data: BufRef) -> Self {
+        Self { data, scale: None }
+    }
+    pub fn paired(data: BufRef, scale: BufRef) -> Self {
+        Self {
+            data,
+            scale: Some(scale),
+        }
+    }
+}
+
+/// Import an `ActBufRef` into the given scope.
+fn import_act_ref<'wsp>(scope: &BatchScope<'wsp, WgpuBackend>, r: ActBufRef) -> ActBuf<'wsp> {
+    ActBuf::dense(scope.import_copy(r.data))
+}
+
+/// Pop one ActBuf out of a packer carry vec, advancing `idx`. Mirrors
+/// `ActBuf::push_carry` (phase-crossing acts are always dense).
+fn pop_act<'wsp>(carry: &[BatchBuf<'wsp>], idx: &mut usize) -> ActBuf<'wsp> {
+    let data = carry[*idx];
+    *idx += 1;
+    ActBuf::dense(data)
+}
+
+/// Allocate a dense ActBuf sized for `rows * dim` activation elements.
+fn alloc_act<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    rows: u32,
+    dim: u32,
+) -> Result<ActBuf<'wsp>, WgpuError> {
+    Ok(ActBuf::dense(scope.alloc(pipelines.act_bytes(rows * dim))?))
+}
+
+/// Allocate an ActBuf for an sdpa_i8 input/output slot. The data half is
+/// packed i8 (`rows * dim` bytes); data and scale halves are co-located in
+/// one underlying buffer via `alloc_pair` (data at offset 0, scale right
+/// after) so `sdpa_i8` can bind both halves through one storage binding per
+/// role (it derives the scale word-offset in-kernel from B/S/H/D).
+fn alloc_act_sdpa_io<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    _pipelines: &BlockPipelines,
+    rows: u32,
+    dim: u32,
+) -> Result<ActBuf<'wsp>, WgpuError> {
+    let (_fused, data, scale) = scope.alloc_pair(
+        rows as u64 * dim as u64,
+        BlockPipelines::i8_scale_bytes(rows, dim),
+    )?;
+    Ok(ActBuf {
+        data,
+        scale: Some(scale),
+    })
+}
+
+/// Quantize a dense F16 act into a fused paired sdpa_i8 I/O slot via
+/// `act_quant`. Only called when `pipelines.i8_sdpa()`.
+fn quant_for_sdpa<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    src: ActBuf<'wsp>,
+    rows: u32,
+    dim: u32,
+) -> Result<ActBuf<'wsp>, WgpuError> {
+    let dst = alloc_act_sdpa_io(scope, pipelines, rows, dim)?;
+    let (dd, ds) = dst.paired_unchecked();
+    let aq = pipelines
+        .act_quant
+        .as_ref()
+        .expect("act_quant pipeline must be built when sdpa_i8 is");
+    let u = scope.u32x4_uniform(rows, dim, 0, 0)?;
+    scope.act_quant(aq, src.data, dd, ds, u, rows, dim)?;
+    Ok(dst)
+}
+
+// ============================================================================
+// Per-op ActBuf wrappers. All elementwise/norm/rope/split ops run dense at
+// the block act dtype; only `op_sdpa` branches (i8 attention opt-in).
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn op_rmsnorm<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    src: ActBuf<'wsp>,
+    w: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+) -> Result<(), WgpuError> {
+    let u = rmsnorm_uniform(scope, rows, dim, eps)?;
+    scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, src.data, w, u, dst.data, rows)
+}
+
+fn op_silu_mul<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    a: ActBuf<'wsp>,
+    b: ActBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+) -> Result<(), WgpuError> {
+    scope.dispatch_op::<SiluMulF32>(&pipelines.silu_mul, &[a.data, b.data], dst.data)
+}
+
+fn op_add<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    a: ActBuf<'wsp>,
+    b: ActBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+) -> Result<(), WgpuError> {
+    scope.dispatch_op::<AddF32>(&pipelines.add, &[a.data, b.data], dst.data)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn op_bcast_affine<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    x: ActBuf<'wsp>,
+    s: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    dim: u32,
+    bias: f32,
+) -> Result<(), WgpuError> {
+    let u = bcast_affine_uniform(scope, dim, bias)?;
+    scope.bcast_affine::<BcastAffineF32>(
+        &pipelines.bcast_affine,
+        x.data,
+        s,
+        u,
+        dst.data,
+        rows * dim,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn op_bcast_fma<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    x: ActBuf<'wsp>,
+    s: BatchBuf<'wsp>,
+    y: ActBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    dim: u32,
+) -> Result<(), WgpuError> {
+    {
+        let u = bcast_fma_uniform(scope, dim)?;
+        scope.bcast_fma::<BcastFmaF32>(
+            &pipelines.bcast_fma,
+            x.data,
+            s,
+            y.data,
+            u,
+            dst.data,
+            rows * dim,
+        )
+    }
+}
+
+fn op_qkv_split<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    src: ActBuf<'wsp>,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    rows: u32,
+    h: u32,
+) -> Result<(), WgpuError> {
+    let n_words = match pipelines.act_dtype {
+        ActDtype::F32 => rows * h,
+        ActDtype::Bf16 | ActDtype::F16 => rows * (h / 2),
+        ActDtype::I8 => unreachable!("I8 is never a block act_dtype"),
+    };
+    let u = qkv_split_uniform(scope, rows, h)?;
+    scope.qkv_split::<QkvSplitF32>(
+        &pipelines.qkv_split,
+        src.data,
+        q.data,
+        k.data,
+        v.data,
+        u,
+        n_words,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn op_rope<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    src: ActBuf<'wsp>,
+    freqs: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+) -> Result<(), WgpuError> {
+    let pairs = head_dim / 2;
+    let u = scope.u32x4_uniform(rows, heads, pairs, 0)?;
+    scope.rope::<RopeF32>(
+        &pipelines.rope,
+        src.data,
+        freqs,
+        u,
+        dst.data,
+        rows,
+        heads,
+        pairs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn op_sdpa<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    s_k: u32,
+    h_q: u32,
+    h_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    has_mask: u32,
+) -> Result<(), WgpuError> {
+    let u = sdpa_uniform(scope, b, h_q, h_kv, s_q, s_k, head_dim, scale, has_mask)?;
+    if let Some(sdpa_i8) = pipelines.sdpa_i8.as_ref() {
+        let (qd, qs) = q.paired_unchecked();
+        let (kd, ks) = k.paired_unchecked();
+        let (vd, vs) = v.paired_unchecked();
+        let (dd, ds) = dst.paired_unchecked();
+        let q_fused = scope.fuse_pair(qd, qs);
+        let k_fused = scope.fuse_pair(kd, ks);
+        let v_fused = scope.fuse_pair(vd, vs);
+        let o_fused = scope.fuse_pair(dd, ds);
+        scope.sdpa_i8(
+            sdpa_i8, q_fused, k_fused, v_fused, mask, o_fused, u, b, s_q, h_q, head_dim,
+        )
+    } else if let Some(sdpa_sg) = pipelines
+        .sdpa_sg
+        .as_ref()
+        .filter(|_| head_dim.is_multiple_of(32) && head_dim <= 128)
+    {
+        scope.sdpa::<SdpaF16Sg>(
+            sdpa_sg, q.data, k.data, v.data, mask, u, dst.data, b, s_q, h_q,
+        )
+    } else {
+        scope.sdpa::<SdpaF32>(
+            &pipelines.sdpa,
+            q.data,
+            k.data,
+            v.data,
+            mask,
+            u,
+            dst.data,
+            b,
+            s_q,
+            h_q,
+        )
+    }
+}
+
+/// Copy-tap an ActBuf into an `ActTapBufRef`. Dense sources copy
+/// `act_bytes`; paired sources (sdpa_i8 I/O) copy the packed-i8 data plus
+/// the scale companion (the tap must carry a matching scale BufRef). Cheap
+/// no-op when `tap` is `None`.
+fn copy_tap_act<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    src: ActBuf<'wsp>,
+    tap: Option<&ActTapBufRef>,
+    rows: u32,
+    dim: u32,
+) -> Result<(), WgpuError> {
+    let Some(t) = tap else {
+        return Ok(());
+    };
+    let dst_d = scope.import_copy(t.data);
+    match src.scale {
+        None => {
+            scope.copy_buffer_to_buffer(src.data, 0, dst_d, 0, pipelines.act_bytes(rows * dim))?;
+        }
+        Some(ss) => {
+            scope.copy_buffer_to_buffer(src.data, 0, dst_d, 0, rows as u64 * dim as u64)?;
+            let ts = t
+                .scale
+                .expect("copy_tap_act: paired source needs a paired tap (sdpa_i8 slots)");
+            let dst_s = scope.import_copy(ts);
+            scope.copy_buffer_to_buffer(
+                ss,
+                0,
+                dst_s,
+                0,
+                BlockPipelines::i8_scale_bytes(rows, dim),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Byte size of one AdaLN chunk (`b * dim` elements at the block act dtype).
+fn adaln_chunk_bytes(pipelines: &BlockPipelines, b: u32, dim: u32) -> u64 {
+    pipelines.act_bytes(b * dim)
+}
+
+/// Byte size of the AdaLN matmul + post-bias `full` tensor (`b * 4*dim`).
+fn adaln_full_bytes(pipelines: &BlockPipelines, b: u32, dim: u32) -> u64 {
+    pipelines.act_bytes(b * 4 * dim)
+}
+
+/// Allocate the scratch buffer that a matmul writes its raw output into
+/// (always the native act dtype; the DP4A kernels write f16 == the F16 act
+/// dtype they are gated on).
+fn alloc_matmul_out_buf<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    n_elems: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    scope.alloc(pipelines.act_bytes(n_elems))
 }
 
 #[derive(Clone, Debug)]
@@ -1437,11 +2706,11 @@ impl BlockViews<'_> {
 fn copy_tap<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     src: BatchBuf<'wsp>,
-    dst: &'wsp Option<BufRef>,
+    dst: Option<&BufRef>,
     bytes: u64,
 ) -> Result<(), WgpuError> {
-    if let Some(d) = dst.as_ref() {
-        let d_h = scope.import(d);
+    if let Some(d) = dst {
+        let d_h = scope.import_copy(*d);
         scope.copy_buffer_to_buffer(src, 0, d_h, 0, bytes)?;
     }
     Ok(())

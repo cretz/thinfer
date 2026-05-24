@@ -235,6 +235,9 @@ impl BcastAddOp for BcastAddF32 {
             (ActDtype::Bf16, _, WeightDtype::Bf16) => WGSL_BF16_PACKED_WBF16,
             (ActDtype::F16, _, WeightDtype::F32) => WGSL_F16_PACKED_WF32,
             (ActDtype::F16, _, WeightDtype::Bf16) => WGSL_F16_PACKED_WBF16,
+            (ActDtype::I8, _, WeightDtype::F32) | (ActDtype::I8, _, WeightDtype::Bf16) => {
+                unreachable!("ActDtype::I8 is never a block-level act dtype")
+            }
             // bcast_add operates on bias/affine vectors; norms+biases stay
             // full-precision under any quant scheme. Quant weights flow
             // only through matmul.

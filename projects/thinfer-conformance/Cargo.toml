@@ -16,6 +16,7 @@ thinfer-core = { path = "../thinfer-core", features = ["conformance", "trace-sub
 serde_json = "1"
 
 [dev-dependencies]
+half = "2"
 pollster = "0.4"
 safetensors = "0.4"
 tempfile = "3"

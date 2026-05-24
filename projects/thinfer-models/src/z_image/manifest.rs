@@ -67,11 +67,70 @@ pub mod role {
 pub struct ZImageRecipe {
     /// RNE-quantize every activation-producing store to bf16 in-shader.
     pub bf16_quant_writes: bool,
+    /// Opt into int8 attention on the main DiT blocks: q/k/v quantized once
+    /// post-rope (per-32-block i8 + f32 params), `sdpa_i8` fused kernel,
+    /// paired output fed straight into the attn-proj matmul. Halves
+    /// attention bandwidth at large sequence lengths. Only engages when the
+    /// adapter exposes SHADER_F16 + the matmul path is Quant (Q8/Q4_K_M
+    /// etc). Never touches the residual carry or elementwise ops: those
+    /// stay dense F16 (per-32-block i8 of the carry is numerically unsound;
+    /// outlier channels, see worklog 2026-06-04).
+    pub i8_sdpa: bool,
 }
 
 pub static RECIPE: ZImageRecipe = ZImageRecipe {
     bf16_quant_writes: true,
+    i8_sdpa: false,
 };
+
+thread_local! {
+    /// Per-thread recipe override. Set by tests that need to flip one
+    /// `RECIPE` field for a single model build (e.g. `i8_sdpa = true` in the
+    /// i8-sdpa e2e parity variant). Reads via `current_recipe()` fall back
+    /// to `RECIPE` when no override is active. Not for production code -
+    /// production reads `RECIPE` directly to keep dtype semantics a
+    /// compile-time-stable model property.
+    static RECIPE_OVERRIDE: core::cell::RefCell<Option<ZImageRecipe>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// RAII guard: install a recipe override on the current thread for the
+/// guard's lifetime, restore the previous override on drop. Used by tests
+/// that need to flip one `RECIPE` field around a model load + run.
+pub struct RecipeOverrideGuard {
+    prev: Option<ZImageRecipe>,
+}
+
+impl RecipeOverrideGuard {
+    pub fn install(r: ZImageRecipe) -> Self {
+        let prev = RECIPE_OVERRIDE.with(|c| c.borrow_mut().replace(r));
+        Self { prev }
+    }
+}
+
+impl Drop for RecipeOverrideGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        RECIPE_OVERRIDE.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Active recipe on the current thread. Use this everywhere a recipe field
+/// is consulted at pipeline-build time so a test override actually lands.
+pub fn current_recipe() -> ZImageRecipe {
+    RECIPE_OVERRIDE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|r| ZImageRecipe {
+                bf16_quant_writes: r.bf16_quant_writes,
+                i8_sdpa: r.i8_sdpa,
+            })
+            .unwrap_or(ZImageRecipe {
+                bf16_quant_writes: RECIPE.bf16_quant_writes,
+                i8_sdpa: RECIPE.i8_sdpa,
+            })
+    })
+}
 
 /// M1 manifest. DiT is the bf16 sharded transformer from `dimitribarbot`. Text
 /// encoder, tokenizer, VAE come from upstream `Tongyi-MAI`. Other roles get

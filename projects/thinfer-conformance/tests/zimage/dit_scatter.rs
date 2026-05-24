@@ -11,10 +11,11 @@
 
 use std::sync::Arc;
 
+use thinfer_core::arbiter::MemArbiter;
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
 use thinfer_core::ops::WgslConfig;
 use thinfer_core::workspace::Workspace;
-use thinfer_models::z_image::block::{BlockPipelines, BlockWgslConfigs};
+use thinfer_models::z_image::block::{ActBufRef, BlockPipelines, BlockWgslConfigs};
 use thinfer_models::z_image::dit::scatter_pad_rows;
 
 const N_ROWS: usize = 5;
@@ -25,7 +26,7 @@ fn scatter_pad_rows_replaces_masked_and_preserves_others() {
     let backend = Arc::new(
         pollster::block_on(WgpuBackend::new()).expect("wgpu adapter unavailable for tests"),
     );
-    let workspace = Workspace::new(backend.clone());
+    let workspace = Workspace::new(backend.clone(), MemArbiter::unlimited());
     let pipelines = pollster::block_on(BlockPipelines::compile(
         &backend,
         &BlockWgslConfigs::uniform(WgslConfig {
@@ -90,7 +91,7 @@ fn scatter_pad_rows_no_op_when_mask_all_zero() {
     let backend = Arc::new(
         pollster::block_on(WgpuBackend::new()).expect("wgpu adapter unavailable for tests"),
     );
-    let workspace = Workspace::new(backend.clone());
+    let workspace = Workspace::new(backend.clone(), MemArbiter::unlimited());
     let pipelines = pollster::block_on(BlockPipelines::compile(
         &backend,
         &BlockWgslConfigs::uniform(WgslConfig {
@@ -151,7 +152,7 @@ fn run(
         backend,
         pipelines,
         workspace,
-        dst,
+        ActBufRef::dense(dst),
         pad_token,
         N_ROWS as u32,
         ROW_ELEMS as u32,

@@ -106,6 +106,10 @@ impl Op for SiluMulF32 {
             (ActDtype::F32, true) => WGSL_F32_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
             (ActDtype::F16, _) => WGSL_F16_PACKED,
+            // Under the per-K=32 i8 contract the 10240-elem FFN intermediate
+            // is i8-supported (32-elem block fits trivially in regs - the
+            // old per-row design's shared-mem ceiling no longer applies).
+            (ActDtype::I8, _) => unreachable!("ActDtype::I8 is never a block-level act dtype"),
         }
     }
     fn layout() -> &'static [BindingLayout] {

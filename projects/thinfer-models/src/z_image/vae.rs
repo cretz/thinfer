@@ -25,9 +25,9 @@
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::cache::KernelKey;
 use thinfer_core::ops::{
-    AddF32, BcastAddF32, BcastAddOp, Conv2dF32, Conv2dOp, GroupNormF32, GroupNormOp, MatMulF32,
-    MatmulOp, Op, SdpaF32LargeD, SdpaOp, SiluF32, Transpose12F32, Transpose12Op,
-    Upsample2dNearestF32, Upsample2dNearestOp, WgslConfig,
+    ActDtype, AddF32, BcastAddF32, BcastAddOp, Conv2dConfig, Conv2dF32, Conv2dOp, GroupNormF32,
+    GroupNormOp, MatMulConfig, MatMulF32, MatmulOp, Op, SdpaF32LargeD, SdpaOp, SiluF32,
+    Transpose12F32, Transpose12Op, Upsample2dNearestF32, Upsample2dNearestOp, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace::{self, PHASE};
@@ -699,11 +699,59 @@ fn reg_mid_attention<S: WeightSource>(
 // Pipeline cache + forward driver
 // ============================================================================
 
+/// One compiled conv2d variant: pipeline + the op (tile config) it was
+/// built from. The decoder holds one instance per tile-shape regime.
+pub struct ConvPipeline {
+    pub pipeline: WgpuPipeline,
+    pub op: Conv2dF32,
+}
+
+impl ConvPipeline {
+    async fn compile(
+        backend: &WgpuBackend,
+        cfg: &WgslConfig,
+        tile: Conv2dConfig,
+    ) -> Result<Self, WgpuError> {
+        let op = Conv2dF32::new(tile);
+        let pipeline = backend
+            .create_pipeline(&op.wgsl(cfg), "main", <Conv2dF32 as Conv2dOp>::layout())
+            .await?;
+        Ok(Self { pipeline, op })
+    }
+}
+
+/// Wide-spatial conv tile: large `M = Hout*Wout` with cout >= 64 (the 256/512
+/// image-space resnet convs). Fatter bn raises arithmetic intensity per
+/// gathered im2col element.
+const CONV_TILE_WIDE: Conv2dConfig = Conv2dConfig {
+    bm: 64,
+    bn: 128,
+    bk: 32,
+    tm: 4,
+    tn: 8,
+};
+/// Small-N conv tile: conv_out (cout=3). The default bm=64 tile would idle
+/// 15/16 of each workgroup's rows.
+const CONV_TILE_SMALL_N: Conv2dConfig = Conv2dConfig {
+    bm: 4,
+    bn: 128,
+    bk: 32,
+    tm: 1,
+    tn: 2,
+};
+
 /// WGSL pipelines needed by the VAE decoder forward. Built once at runtime
 /// init (or lazily on first decode). Does not (yet) include matmul/sdpa for
 /// the mid-block self-attention - see `decoder_forward` for the TODO.
 pub struct VaeDecoderPipelines {
-    pub conv2d: WgpuPipeline,
+    /// Activation storage dtype: F16 when the device has `SHADER_F16`, else
+    /// F32. Weights are bf16 either way. All reductions stay f32 in-kernel.
+    pub act_dtype: ActDtype,
+    /// Bytes per activation element (2 or 4).
+    pub act_size: u64,
+    pub conv2d: ConvPipeline,
+    pub conv2d_wide: ConvPipeline,
+    pub conv2d_small_n: ConvPipeline,
     pub group_norm: WgpuPipeline,
     pub silu: WgpuPipeline,
     pub upsample: WgpuPipeline,
@@ -717,24 +765,39 @@ pub struct VaeDecoderPipelines {
     pub transpose12: WgpuPipeline,
 }
 
+/// Mid-block linear matmul tile (tokens x 512 @ 512 x 512). tn must be even
+/// for the f16-act tiles path; the same config serves the f32 fallback.
+const VAE_MATMUL_CFG: MatMulConfig = MatMulConfig {
+    bm: 64,
+    bn: 64,
+    bk: 16,
+    tm: 4,
+    tn: 4,
+    b_nmajor: false,
+};
+
 impl VaeDecoderPipelines {
-    /// Compile every WGSL pipeline the VAE decoder dispatches. VAE compute
-    /// runs fp32 (pytorch keeps VAE in fp32 even with `--dtype bf16`), but
-    /// weights are stored bf16 on-GPU to halve VRAM.
+    /// Compile every WGSL pipeline the VAE decoder dispatches. Activations
+    /// run f16 when the device supports `SHADER_F16` (reductions stay f32
+    /// in-kernel; stores saturate at +-65504), f32 otherwise. Weights are
+    /// stored bf16 on-GPU to halve VRAM either way.
     pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
+        let act_dtype = if backend.supports_shader_f16() {
+            thinfer_core::ops::ActDtype::F16
+        } else {
+            thinfer_core::ops::ActDtype::F32
+        };
         let cfg = &WgslConfig {
             bf16_quant_writes: false,
-            act_dtype: thinfer_core::ops::ActDtype::F32,
+            act_dtype,
             weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
         };
         Ok(Self {
-            conv2d: backend
-                .create_pipeline(
-                    <Conv2dF32 as Conv2dOp>::wgsl(cfg),
-                    "main",
-                    <Conv2dF32 as Conv2dOp>::layout(),
-                )
-                .await?,
+            act_dtype,
+            act_size: act_dtype.bytes_per_elem(),
+            conv2d: ConvPipeline::compile(backend, cfg, Conv2dConfig::DEFAULT).await?,
+            conv2d_wide: ConvPipeline::compile(backend, cfg, CONV_TILE_WIDE).await?,
+            conv2d_small_n: ConvPipeline::compile(backend, cfg, CONV_TILE_SMALL_N).await?,
             group_norm: backend
                 .create_pipeline(
                     <GroupNormF32 as GroupNormOp>::wgsl(cfg),
@@ -756,12 +819,12 @@ impl VaeDecoderPipelines {
                 .create_pipeline(AddF32::wgsl(cfg), "main", AddF32::layout())
                 .await?,
             matmul: {
-                let op = MatMulF32::default();
+                let op = MatMulF32::new(VAE_MATMUL_CFG);
                 backend
                     .create_pipeline(&op.wgsl(cfg), "main", <MatMulF32 as MatmulOp>::layout())
                     .await?
             },
-            matmul_op: MatMulF32::default(),
+            matmul_op: MatMulF32::new(VAE_MATMUL_CFG),
             bcast_add: backend
                 .create_pipeline(
                     <BcastAddF32 as BcastAddOp>::wgsl(cfg),
@@ -889,8 +952,8 @@ pub struct ActShape {
 }
 
 impl ActShape {
-    fn bytes(self) -> u64 {
-        (self.b * self.c * self.h * self.w) as u64 * 4
+    fn bytes(self, act_size: u64) -> u64 {
+        (self.b * self.c * self.h * self.w) as u64 * act_size
     }
     fn elems(self) -> u32 {
         self.b * self.c * self.h * self.w
@@ -921,7 +984,7 @@ fn conv2d_forward<'wsp>(
         h: h_out,
         w: w_out,
     };
-    let out = scope.alloc(out_shape.bytes())?;
+    let out = scope.alloc(out_shape.bytes(pipelines.act_size))?;
     let u = conv2d_uniform(
         scope,
         (in_shape.b, in_shape.c, in_shape.h, in_shape.w),
@@ -930,7 +993,27 @@ fn conv2d_forward<'wsp>(
     )?;
     let w = scope.import(&weights.weight);
     let bias = scope.import(&weights.bias);
-    scope.conv2d::<Conv2dF32>(&pipelines.conv2d, x_in, w, bias, u, out, out_shape.elems())?;
+    let m_spatial = h_out * w_out;
+    // Tile-regime selection: see CONV_TILE_WIDE / CONV_TILE_SMALL_N.
+    let conv = if cout <= 4 {
+        &pipelines.conv2d_small_n
+    } else if m_spatial >= 65536 && cout >= 64 {
+        &pipelines.conv2d_wide
+    } else {
+        &pipelines.conv2d
+    };
+    scope.conv2d(
+        &conv.pipeline,
+        &conv.op,
+        x_in,
+        w,
+        bias,
+        u,
+        out,
+        cout,
+        m_spatial,
+        in_shape.b,
+    )?;
     Ok((out, out_shape))
 }
 
@@ -941,7 +1024,7 @@ fn group_norm_forward<'wsp>(
     shape: ActShape,
     weights: &'wsp GroupNormBufs,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let out = scope.alloc(shape.bytes())?;
+    let out = scope.alloc(shape.bytes(pipelines.act_size))?;
     let u = group_norm_uniform(
         scope,
         shape.b,
@@ -971,7 +1054,7 @@ fn silu_forward<'wsp>(
     x_in: BatchBuf<'wsp>,
     shape: ActShape,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let out = scope.alloc(shape.bytes())?;
+    let out = scope.alloc(shape.bytes(pipelines.act_size))?;
     scope.dispatch_op::<SiluF32>(&pipelines.silu, &[x_in], out)?;
     Ok(out)
 }
@@ -983,7 +1066,7 @@ fn add_forward<'wsp>(
     b: BatchBuf<'wsp>,
     shape: ActShape,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let out = scope.alloc(shape.bytes())?;
+    let out = scope.alloc(shape.bytes(pipelines.act_size))?;
     scope.dispatch_op::<AddF32>(&pipelines.add, &[a, b], out)?;
     Ok(out)
 }
@@ -1058,7 +1141,7 @@ fn linear_bias_forward<'wsp>(
     in_dim: u32,
     out_dim: u32,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let out_bytes = (rows * out_dim) as u64 * 4;
+    let out_bytes = (rows * out_dim) as u64 * pipelines.act_size;
     let pre = scope.alloc(out_bytes)?;
     let dims = scope.u32x4_uniform(rows, out_dim, in_dim, 0)?;
     let w_b = scope.import(&w.weight);
@@ -1114,7 +1197,7 @@ fn mid_attention_forward<'wsp>(
 
     let normed = group_norm_forward(scope, pipelines, x_in, in_shape, &bufs.group_norm)?;
 
-    let tokens_bytes = (b * hw * c) as u64 * 4;
+    let tokens_bytes = (b * hw * c) as u64 * pipelines.act_size;
     let tokens = scope.alloc(tokens_bytes)?;
     let t12_u_fwd = transpose12_uniform(scope, b, c, hw, 1)?;
     scope.transpose12::<Transpose12F32>(
@@ -1175,7 +1258,7 @@ fn upsample_forward<'wsp>(
         h: shape.h * 2,
         w: shape.w * 2,
     };
-    let out = scope.alloc(out_shape.bytes())?;
+    let out = scope.alloc(out_shape.bytes(pipelines.act_size))?;
     let u = upsample_uniform(scope, shape.b, shape.c, shape.h, shape.w)?;
     scope.upsample2d_nearest::<Upsample2dNearestF32>(
         &pipelines.upsample,
@@ -1199,23 +1282,51 @@ fn resnet_forward<'wsp>(
 ) -> Result<(BatchBuf<'wsp>, ActShape), WgpuError> {
     let h0 = group_norm_forward(scope, pipelines, x_in, in_shape, &bufs.norm1)?;
     if !prefix.is_empty() {
-        stage_diag(scope, diag, &format!("{prefix}.h0"), h0, in_shape)?;
+        stage_diag(
+            scope,
+            pipelines.act_size,
+            diag,
+            &format!("{prefix}.h0"),
+            h0,
+            in_shape,
+        )?;
     }
     let h1 = silu_forward(scope, pipelines, h0, in_shape)?;
     let (h2, h2_shape) =
         conv2d_forward(scope, pipelines, h1, in_shape, &bufs.conv1, out_c, 3, 3, 1)?;
     if !prefix.is_empty() {
-        stage_diag(scope, diag, &format!("{prefix}.h2"), h2, h2_shape)?;
+        stage_diag(
+            scope,
+            pipelines.act_size,
+            diag,
+            &format!("{prefix}.h2"),
+            h2,
+            h2_shape,
+        )?;
     }
     let h3 = group_norm_forward(scope, pipelines, h2, h2_shape, &bufs.norm2)?;
     if !prefix.is_empty() {
-        stage_diag(scope, diag, &format!("{prefix}.h3"), h3, h2_shape)?;
+        stage_diag(
+            scope,
+            pipelines.act_size,
+            diag,
+            &format!("{prefix}.h3"),
+            h3,
+            h2_shape,
+        )?;
     }
     let h4 = silu_forward(scope, pipelines, h3, h2_shape)?;
     let (h5, h5_shape) =
         conv2d_forward(scope, pipelines, h4, h2_shape, &bufs.conv2, out_c, 3, 3, 1)?;
     if !prefix.is_empty() {
-        stage_diag(scope, diag, &format!("{prefix}.h5"), h5, h5_shape)?;
+        stage_diag(
+            scope,
+            pipelines.act_size,
+            diag,
+            &format!("{prefix}.h5"),
+            h5,
+            h5_shape,
+        )?;
     }
     let skip = match &bufs.conv_shortcut {
         Some(cs) => {
@@ -1225,7 +1336,14 @@ fn resnet_forward<'wsp>(
         None => x_in,
     };
     if !prefix.is_empty() {
-        stage_diag(scope, diag, &format!("{prefix}.skip"), skip, h5_shape)?;
+        stage_diag(
+            scope,
+            pipelines.act_size,
+            diag,
+            &format!("{prefix}.skip"),
+            skip,
+            h5_shape,
+        )?;
     }
     let out = add_forward(scope, pipelines, skip, h5, h5_shape)?;
     Ok((out, h5_shape))
@@ -1305,6 +1423,7 @@ const STAGE_DIAG_MAX_BYTES: u64 = 1024;
 
 fn stage_diag<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
+    act_size: u64,
     diag: &mut Option<&mut Vec<StagedReadback>>,
     label: &str,
     buf: BatchBuf<'wsp>,
@@ -1313,7 +1432,7 @@ fn stage_diag<'wsp>(
     let Some(sink) = diag.as_deref_mut() else {
         return Ok(());
     };
-    let bytes = shape.bytes().min(STAGE_DIAG_MAX_BYTES);
+    let bytes = shape.bytes(act_size).min(STAGE_DIAG_MAX_BYTES);
     let fut = scope.read_buffer_via_encoder(buf, 0, bytes)?;
     sink.push((label.to_string(), shape, Box::pin(fut)));
     Ok(())
@@ -1352,7 +1471,6 @@ async fn decoder_back(
     // alive across the next scope so its WsBuf doesn't return to the pool
     // while the next scope still imports it. Drops at function end.
     let mut _carry: Option<WsBuf<WgpuBackend>> = None;
-    let mut is_first_block = true;
 
     for (i, ub) in bufs.up_blocks.iter().enumerate() {
         let _scope_guard = trace::scope!(format!("up_block.{i}")).entered();
@@ -1365,73 +1483,151 @@ async fn decoder_back(
             w: if has_up { cur_shape.w * 2 } else { cur_shape.w },
         };
         let next_carry = workspace
-            .alloc(next_shape.bytes())
+            .alloc(next_shape.bytes(pipelines.act_size))
             .map_err(VaeForwardError::Wgpu)?;
         let next_carry_ref = next_carry.as_buf_ref();
 
-        {
-            let scope = workspace.batch();
-            let cur_buf = scope.import(&cur_ref);
-            let mut x: BatchBuf<'_> = cur_buf;
-            let mut s: ActShape = cur_shape;
-            if is_first_block {
-                stage_diag(&scope, &mut diag, "front_in", x, s).map_err(VaeForwardError::Wgpu)?;
-                is_first_block = false;
-            }
-            for (j, resnet) in ub.resnets.iter().enumerate() {
-                let probe_prefix = if diag.is_some() {
-                    format!("up{i}.resnet{j}")
+        // Sub-scope per resnet (and per upsample+up_conv if present) so each
+        // sub-step's intermediates return to the workspace pool before the
+        // next one allocates. At 512+ image dims the up_block.2/up_block.3
+        // working set otherwise pins many 100-MiB activations in one scope
+        // and trips wgpu device-lost. Pattern mirrors the per-up_block carry
+        // one level deeper: `_sub_in_carry` holds the prior sub-step's output
+        // across the scope boundary; reassignment drops it back to the pool.
+        let mut sub_in_ref = cur_ref;
+        let mut sub_in_shape = cur_shape;
+        let mut _sub_in_carry: Option<WsBuf<WgpuBackend>> = None;
+        let n_steps = ub.resnets.len() + usize::from(has_up);
+        for step in 0..n_steps {
+            let is_last = step + 1 == n_steps;
+            let is_upsample_step = has_up && is_last;
+            let step_out_shape = if is_upsample_step {
+                next_shape
+            } else {
+                ActShape {
+                    b: sub_in_shape.b,
+                    c: out_c,
+                    h: sub_in_shape.h,
+                    w: sub_in_shape.w,
+                }
+            };
+            // Last step writes directly into the pre-allocated `next_carry`;
+            // middle steps get a fresh carry that survives one iter and then
+            // drops when reassigned below.
+            let (step_dst_ref, step_dst_keepalive) = if is_last {
+                (next_carry_ref, None)
+            } else {
+                let c = workspace
+                    .alloc(step_out_shape.bytes(pipelines.act_size))
+                    .map_err(VaeForwardError::Wgpu)?;
+                let r = c.as_buf_ref();
+                (r, Some(c))
+            };
+
+            {
+                let scope = workspace.batch();
+                let x_in = scope.import(&sub_in_ref);
+                if i == 0 && step == 0 {
+                    stage_diag(
+                        &scope,
+                        pipelines.act_size,
+                        &mut diag,
+                        "front_in",
+                        x_in,
+                        sub_in_shape,
+                    )
+                    .map_err(VaeForwardError::Wgpu)?;
+                }
+                let (out_buf, _out_s) = if is_upsample_step {
+                    let up_conv = ub.upsampler_conv.as_ref().expect("has_up implies up_conv");
+                    let (xu, shape_u) = upsample_forward(&scope, pipelines, x_in, sub_in_shape)?;
+                    stage_diag(
+                        &scope,
+                        pipelines.act_size,
+                        &mut diag,
+                        &format!("up{i}.upsample"),
+                        xu,
+                        shape_u,
+                    )
+                    .map_err(VaeForwardError::Wgpu)?;
+                    let (xc, shape_c) =
+                        conv2d_forward(&scope, pipelines, xu, shape_u, up_conv, out_c, 3, 3, 1)?;
+                    stage_diag(
+                        &scope,
+                        pipelines.act_size,
+                        &mut diag,
+                        &format!("up{i}.upconv"),
+                        xc,
+                        shape_c,
+                    )
+                    .map_err(VaeForwardError::Wgpu)?;
+                    (xc, shape_c)
                 } else {
-                    String::new()
+                    let j = step;
+                    let resnet = &ub.resnets[j];
+                    let probe_prefix = if diag.is_some() {
+                        format!("up{i}.resnet{j}")
+                    } else {
+                        String::new()
+                    };
+                    let (r_buf, r_shape) = resnet_forward(
+                        &scope,
+                        pipelines,
+                        x_in,
+                        sub_in_shape,
+                        out_c,
+                        resnet,
+                        &mut diag,
+                        &probe_prefix,
+                    )?;
+                    stage_diag(
+                        &scope,
+                        pipelines.act_size,
+                        &mut diag,
+                        &format!("up{i}.resnet{j}"),
+                        r_buf,
+                        r_shape,
+                    )
+                    .map_err(VaeForwardError::Wgpu)?;
+                    (r_buf, r_shape)
                 };
-                let (r_buf, r_shape) = resnet_forward(
-                    &scope,
-                    pipelines,
-                    x,
-                    s,
-                    out_c,
-                    resnet,
-                    &mut diag,
-                    &probe_prefix,
-                )?;
-                stage_diag(
-                    &scope,
-                    &mut diag,
-                    &format!("up{i}.resnet{j}"),
-                    r_buf,
-                    r_shape,
-                )
-                .map_err(VaeForwardError::Wgpu)?;
-                x = r_buf;
-                s = r_shape;
-            }
-            if let Some(up_conv) = &ub.upsampler_conv {
-                let (xu, shape_u) = upsample_forward(&scope, pipelines, x, s)?;
-                stage_diag(&scope, &mut diag, &format!("up{i}.upsample"), xu, shape_u)
+                let dst_buf = scope.import(&step_dst_ref);
+                scope
+                    .copy_buffer_to_buffer(
+                        out_buf,
+                        0,
+                        dst_buf,
+                        0,
+                        step_out_shape.bytes(pipelines.act_size),
+                    )
                     .map_err(VaeForwardError::Wgpu)?;
-                let (xc, shape_c) =
-                    conv2d_forward(&scope, pipelines, xu, shape_u, up_conv, out_c, 3, 3, 1)?;
-                stage_diag(&scope, &mut diag, &format!("up{i}.upconv"), xc, shape_c)
+                scope
+                    .submit_void()
+                    .instrument(tracing::debug_span!(
+                        target: PHASE,
+                        "vae.submit",
+                        phase = "up_block_step",
+                        idx = i,
+                        step = step,
+                    ))
+                    .await
                     .map_err(VaeForwardError::Wgpu)?;
-                x = xc;
-                s = shape_c;
             }
-            debug_assert_eq!(s.b, next_shape.b);
-            debug_assert_eq!(s.c, next_shape.c);
-            debug_assert_eq!(s.h, next_shape.h);
-            debug_assert_eq!(s.w, next_shape.w);
-            let carry_buf = scope.import(&next_carry_ref);
-            scope
-                .copy_buffer_to_buffer(x, 0, carry_buf, 0, next_shape.bytes())
-                .map_err(VaeForwardError::Wgpu)?;
-            scope
-                .submit_void()
-                .instrument(
-                    tracing::debug_span!(target: PHASE, "vae.submit", phase = "up_block", idx = i),
-                )
-                .await
-                .map_err(VaeForwardError::Wgpu)?;
+
+            sub_in_ref = step_dst_ref;
+            sub_in_shape = step_out_shape;
+            // Reassigning drops the previous middle-step carry back to the
+            // pool. Last step has `None` here; the surviving handle is
+            // `next_carry`, which moves into `_carry` below.
+            if !is_last {
+                _sub_in_carry = step_dst_keepalive;
+            }
         }
+        debug_assert_eq!(sub_in_shape.b, next_shape.b);
+        debug_assert_eq!(sub_in_shape.c, next_shape.c);
+        debug_assert_eq!(sub_in_shape.h, next_shape.h);
+        debug_assert_eq!(sub_in_shape.w, next_shape.w);
+
         _carry = Some(next_carry);
         cur_ref = next_carry_ref;
         cur_shape = next_shape;
@@ -1444,11 +1640,25 @@ async fn decoder_back(
         let cur_buf = scope.import(&cur_ref);
         let img_buf = scope.import(image_out);
         let h_gn = group_norm_forward(&scope, pipelines, cur_buf, cur_shape, &bufs.conv_norm_out)?;
-        stage_diag(&scope, &mut diag, "conv_norm_out", h_gn, cur_shape)
-            .map_err(VaeForwardError::Wgpu)?;
+        stage_diag(
+            &scope,
+            pipelines.act_size,
+            &mut diag,
+            "conv_norm_out",
+            h_gn,
+            cur_shape,
+        )
+        .map_err(VaeForwardError::Wgpu)?;
         let h_silu = silu_forward(&scope, pipelines, h_gn, cur_shape)?;
-        stage_diag(&scope, &mut diag, "silu_out", h_silu, cur_shape)
-            .map_err(VaeForwardError::Wgpu)?;
+        stage_diag(
+            &scope,
+            pipelines.act_size,
+            &mut diag,
+            "silu_out",
+            h_silu,
+            cur_shape,
+        )
+        .map_err(VaeForwardError::Wgpu)?;
 
         let out_c = config::OUT_CHANNELS as u32;
         let out_shape = ActShape {
@@ -1465,14 +1675,18 @@ async fn decoder_back(
         )?;
         let w = scope.import(&bufs.conv_out.weight);
         let bias = scope.import(&bufs.conv_out.bias);
-        scope.conv2d::<Conv2dF32>(
-            &pipelines.conv2d,
+        // conv_out is cout=3: small-N tile regime.
+        scope.conv2d(
+            &pipelines.conv2d_small_n.pipeline,
+            &pipelines.conv2d_small_n.op,
             h_silu,
             w,
             bias,
             u,
             img_buf,
-            out_shape.elems(),
+            out_c,
+            out_shape.h * out_shape.w,
+            cur_shape.b,
         )?;
         scope
             .submit_void()
@@ -1510,7 +1724,7 @@ pub async fn decoder_forward(
         w: w_in,
     };
     let front_carry = workspace
-        .alloc(front_shape.bytes())
+        .alloc(front_shape.bytes(pipelines.act_size))
         .map_err(VaeForwardError::Wgpu)?;
     let front_carry_ref = front_carry.as_buf_ref();
     {
@@ -1518,9 +1732,18 @@ pub async fn decoder_forward(
         let lat = scope.import(latents_in);
         let f_out = scope.import(&front_carry_ref);
         let (front_buf, fshape) = decoder_front(&scope, pipelines, cfg, bufs, lat)?;
-        debug_assert_eq!(fshape.bytes(), front_shape.bytes());
+        debug_assert_eq!(
+            fshape.bytes(pipelines.act_size),
+            front_shape.bytes(pipelines.act_size)
+        );
         scope
-            .copy_buffer_to_buffer(front_buf, 0, f_out, 0, front_shape.bytes())
+            .copy_buffer_to_buffer(
+                front_buf,
+                0,
+                f_out,
+                0,
+                front_shape.bytes(pipelines.act_size),
+            )
             .map_err(VaeForwardError::Wgpu)?;
         scope
             .submit_void()
@@ -1652,8 +1875,9 @@ pub async fn decoder_forward_tiled(
     // ---------------- Front: conv_in + mid_block on full latent ----------------
     // mid_out is allocated raw (outside the workspace pool) because it has to
     // survive across the front BatchScope and into each per-tile back pass.
+    let act_size = pipelines.act_size;
     let mid_elems = (b * MID_CHANNELS * h_in * w_in) as u64;
-    let mid_bytes = mid_elems * 4;
+    let mid_bytes = mid_elems * act_size;
     let mid_id = backend.allocate(mid_bytes).map_err(VaeForwardError::Wgpu)?;
     let mid_buf_ref = BufRef::new(mid_id, mid_bytes);
 
@@ -1682,8 +1906,9 @@ pub async fn decoder_forward_tiled(
         .await
         .map_err(VaeForwardError::Wgpu)?;
     backend.free(mid_id);
-    let mid_host = bytes_to_f32_vec(&mid_host_bytes);
-    debug_assert_eq!(mid_host.len(), mid_elems as usize);
+    // Kept as raw act-dtype bytes: the tile slicer below copies rows
+    // byte-wise and re-uploads without a host dtype round-trip.
+    debug_assert_eq!(mid_host_bytes.len() as u64, mid_elems * act_size);
 
     // ---------------- Tile loop ----------------
     let tile = tile_cfg.latent_tile;
@@ -1709,17 +1934,22 @@ pub async fn decoder_forward_tiled(
             let tile_w = tile.min(w_in - lx);
 
             // ---- Slice mid_out -> host tile bytes (CHW contiguous) ----
+            // Byte-wise row copies in the act dtype; no host dtype round-trip.
+            let asz = act_size as usize;
             let tile_in_elems = (b * MID_CHANNELS * tile_h * tile_w) as usize;
-            let mut tile_in_host = vec![0.0_f32; tile_in_elems];
+            let mut tile_in_host = vec![0u8; tile_in_elems * asz];
             for c in 0..MID_CHANNELS {
                 for dy in 0..tile_h {
-                    let src_row = (c as usize) * (h_in as usize) * (w_in as usize)
+                    let src_row = ((c as usize) * (h_in as usize) * (w_in as usize)
                         + ((ly + dy) as usize) * (w_in as usize)
-                        + (lx as usize);
-                    let dst_row = (c as usize) * (tile_h as usize) * (tile_w as usize)
-                        + (dy as usize) * (tile_w as usize);
-                    tile_in_host[dst_row..dst_row + tile_w as usize]
-                        .copy_from_slice(&mid_host[src_row..src_row + tile_w as usize]);
+                        + (lx as usize))
+                        * asz;
+                    let dst_row = ((c as usize) * (tile_h as usize) * (tile_w as usize)
+                        + (dy as usize) * (tile_w as usize))
+                        * asz;
+                    let row_bytes = (tile_w as usize) * asz;
+                    tile_in_host[dst_row..dst_row + row_bytes]
+                        .copy_from_slice(&mid_host_bytes[src_row..src_row + row_bytes]);
                 }
             }
 
@@ -1727,15 +1957,15 @@ pub async fn decoder_forward_tiled(
             // bind their BufRefs in locals BEFORE the scope so `scope.import`
             // can borrow them for `'wsp`.
             let tile_front_in = workspace
-                .alloc((tile_in_elems as u64) * 4)
+                .alloc((tile_in_elems as u64) * act_size)
                 .map_err(VaeForwardError::Wgpu)?;
             backend
-                .write_buffer(tile_front_in.id(), 0, f32_slice_as_bytes(&tile_in_host))
+                .write_buffer(tile_front_in.id(), 0, &tile_in_host)
                 .map_err(VaeForwardError::Wgpu)?;
 
             let tile_img_h = tile_h * config::VAE_SCALE_FACTOR as u32;
             let tile_img_w = tile_w * config::VAE_SCALE_FACTOR as u32;
-            let tile_img_bytes = (b * out_c * tile_img_h * tile_img_w) as u64 * 4;
+            let tile_img_bytes = (b * out_c * tile_img_h * tile_img_w) as u64 * act_size;
             let tile_image_out = workspace
                 .alloc(tile_img_bytes)
                 .map_err(VaeForwardError::Wgpu)?;
@@ -1774,7 +2004,7 @@ pub async fn decoder_forward_tiled(
                 .instrument(tracing::debug_span!(target: PHASE, "vae.readback", phase = "tile", idx = tile_idx))
                 .await
                 .map_err(VaeForwardError::Wgpu)?;
-            let tile_img_host = bytes_to_f32_vec(&tile_img_host_bytes);
+            let tile_img_host = act_bytes_to_f32_vec(act_size, &tile_img_host_bytes);
             // tile_front_in / tile_image_out drop at end of iter -> back to pool.
 
             // Drain per-tile diag samples into the caller's sink. For
@@ -1791,7 +2021,7 @@ pub async fn decoder_forward_tiled(
                     sink.push(VaeStageSample {
                         label,
                         shape,
-                        head: bytes_to_f32_vec(&bytes),
+                        head: act_bytes_to_f32_vec(act_size, &bytes),
                     });
                 }
                 // Also dump a head sample of the per-tile final image_out
@@ -1867,6 +2097,31 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     out
+}
+
+/// Act-dtype-aware readback conversion: `act_size == 2` decodes f16, else f32.
+fn act_bytes_to_f32_vec(act_size: u64, bytes: &[u8]) -> Vec<f32> {
+    if act_size == 2 {
+        bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    } else {
+        bytes_to_f32_vec(bytes)
+    }
+}
+
+/// Act-dtype-aware upload conversion: `act_size == 2` encodes f16, else f32.
+fn f32s_to_act_bytes(act_size: u64, vals: &[f32]) -> Vec<u8> {
+    if act_size == 2 {
+        let mut out = Vec::with_capacity(vals.len() * 2);
+        for v in vals {
+            out.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+        }
+        out
+    } else {
+        f32_slice_as_bytes(vals).to_vec()
+    }
 }
 
 fn f32_slice_as_bytes(s: &[f32]) -> &[u8] {
@@ -1967,9 +2222,9 @@ impl VaeDecoder {
             .iter()
             .map(|z| z / config::SCALING_FACTOR + config::SHIFT_FACTOR)
             .collect();
-        let bytes = f32_slice_as_bytes(&scaled);
+        let bytes = f32s_to_act_bytes(self.pipelines.act_size, &scaled);
         let latents_buf = scratch.alloc(bytes.len() as u64)?;
-        backend.write_buffer(latents_buf.id, 0, bytes)?;
+        backend.write_buffer(latents_buf.id, 0, &bytes)?;
         let cfg = VaeForwardConfig {
             batch: 1,
             h_in,
@@ -2022,9 +2277,9 @@ impl VaeDecoder {
             .iter()
             .map(|z| z / config::SCALING_FACTOR + config::SHIFT_FACTOR)
             .collect();
-        let bytes = f32_slice_as_bytes(&scaled);
+        let bytes = f32s_to_act_bytes(self.pipelines.act_size, &scaled);
         let latents_buf = scratch.alloc(bytes.len() as u64)?;
-        backend.write_buffer(latents_buf.id, 0, bytes)?;
+        backend.write_buffer(latents_buf.id, 0, &bytes)?;
         let cfg = VaeForwardConfig {
             batch: 1,
             h_in,

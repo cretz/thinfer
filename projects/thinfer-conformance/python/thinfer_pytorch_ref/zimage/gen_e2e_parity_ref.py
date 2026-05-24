@@ -54,7 +54,8 @@ def _summarize(label: str, t: torch.Tensor) -> None:
     a = t.detach().to(torch.float32).cpu().numpy().ravel()
     print(
         f"  [PY-DUMP] {label}: len={a.size} min={a.min():.5e} "
-        f"max={a.max():.5e} max_abs={abs(a).max():.5e} mean={a.mean():.5e}",
+        f"max={a.max():.5e} max_abs={abs(a).max():.5e} mean={a.mean():.5e} "
+        f"mean_abs={abs(a).mean():.5e}",
         flush=True,
     )
 
@@ -290,6 +291,212 @@ def main() -> int:
             f"{sum(1 for ub in dec.up_blocks if getattr(ub, 'upsamplers', None))} upsamplers + conv_norm_out + conv_out",
             flush=True,
         )
+
+    # --- DIAG: hook transformer.layers[0] (main DiT block 0) attention to
+    # capture sdpa output (input to to_out[0]) and projection output
+    # (output of to_out[0]) so the I8-acts engine can A/B against these.
+    # Fires once per step; we print the first step's numbers.
+    block0 = pipe.transformer.layers[0]
+    diag_state = {"sdpa_in_printed": False, "attn_out_printed": False, "block_in_printed": False}
+
+    def _to_out_pre_hook(_m, args_in):
+        if diag_state["sdpa_in_printed"]:
+            return
+        diag_state["sdpa_in_printed"] = True
+        x = args_in[0]
+        _summarize("PYDIAG block0.attn_sdpa (input to to_out[0])", x)
+
+    def _to_out_post_hook(_m, _i, output):
+        if diag_state["attn_out_printed"]:
+            return
+        diag_state["attn_out_printed"] = True
+        _summarize("PYDIAG block0.attn_out (output of to_out[0])", output)
+
+    def _block_pre_hook(_m, args_in):
+        if diag_state["block_in_printed"]:
+            return
+        diag_state["block_in_printed"] = True
+        _summarize("PYDIAG block0.input (x before block forward)", args_in[0])
+
+    block0.attention.to_out[0].register_forward_pre_hook(_to_out_pre_hook)
+    block0.attention.to_out[0].register_forward_hook(_to_out_post_hook)
+    block0.register_forward_pre_hook(_block_pre_hook)
+
+    # --- DIAG: per-stage probes matching engine-side `[DIT-PROBE] NN_xxx`
+    # labels so the two sides can be A/B'd by grepping the same suffix.
+    # Each hook fires once (first step only) to keep log volume bounded.
+    pydiag_fired: dict[str, bool] = {}
+
+    # DIAG: every PYDIAG label now also writes a `py_<label>.bin` so the
+    # rust side can per-cell linfit it. Volume is bounded (each label
+    # fires once on step 0, biggest tensors are seq_u*dim=1.1M f32 ~ 4MB).
+    def _mk_once_post(label: str):
+        def _hook(_m, _inp, output):
+            if pydiag_fired.get(label):
+                return
+            pydiag_fired[label] = True
+            t = output[0] if isinstance(output, tuple) else output
+            if isinstance(t, torch.Tensor):
+                _summarize(f"PYDIAG {label}", t)
+                _dump(t, args.out / f"py_{label}.bin")
+
+        return _hook
+
+    def _mk_once_pre(label: str, arg_idx: int = 0):
+        def _hook(_m, args_in):
+            if pydiag_fired.get(label):
+                return
+            pydiag_fired[label] = True
+            t = args_in[arg_idx]
+            if isinstance(t, torch.Tensor):
+                _summarize(f"PYDIAG {label}", t)
+                _dump(t, args.out / f"py_{label}.bin")
+
+        return _hook
+
+    xf = pipe.transformer
+    if hasattr(xf, "x_embedder"):
+        xf.x_embedder.register_forward_hook(_mk_once_post("01_x_embedder_out"))
+    if hasattr(xf, "cap_embedder"):
+        xf.cap_embedder.register_forward_hook(_mk_once_post("05_cap_embedder_out"))
+    if hasattr(xf, "noise_refiner"):
+        for i, blk in enumerate(xf.noise_refiner):
+            blk.register_forward_hook(_mk_once_post(f"04_noise_refiner_block{i}_out"))
+    if hasattr(xf, "context_refiner"):
+        for i, blk in enumerate(xf.context_refiner):
+            blk.register_forward_hook(_mk_once_post(f"07_context_refiner_block{i}_out"))
+    if hasattr(xf, "layers"):
+        # 08_unified_in == input to layers[0] (i.e. the concatenated x;cap).
+        xf.layers[0].register_forward_pre_hook(_mk_once_pre("08_unified_in_pre_main_block0"))
+        # Every main block residual output (post-block, full residual).
+        # 30 dumps + linfit at each gives a per-block slope curve; the
+        # first block where slope deviates from 1.0 localizes the bug.
+        for n in range(len(xf.layers)):
+            xf.layers[n].register_forward_hook(_mk_once_post(f"09_main_block{n}_out"))
+        # Intra-block per-op dumps at block 0 (start), block 14 (mid)
+        # and blocks 25-29 (already bisecting). Block 0 and block 29
+        # are the new ones; gives us slope-per-op at start AND end of
+        # the stack so we can tell whether per-op shrink is uniform
+        # (compounding bug) or grows with block index (data-dependent).
+        for n in (0, 14, 25, 26, 27, 28, 29):
+            if n < len(xf.layers):
+                blk = xf.layers[n]
+                blk.attention.register_forward_hook(
+                    _mk_once_post(f"09_main_block{n}_attn_out")
+                )
+                blk.feed_forward.register_forward_hook(
+                    _mk_once_post(f"09_main_block{n}_ffn_out")
+                )
+                if hasattr(blk, "adaLN_modulation"):
+                    blk.adaLN_modulation.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_adaln_mod")
+                    )
+                # Intra-attention bisect: modulated_attn_in (pre), to_q/k/v
+                # outputs (post-projection, pre-rope/sdpa), to_out[0] (post
+                # o_proj — equals attn_out, included for sanity).
+                blk.attention.register_forward_pre_hook(
+                    _mk_once_pre(f"09_main_block{n}_modulated_attn_in")
+                )
+                attn = blk.attention
+                if hasattr(attn, "to_q"):
+                    attn.to_q.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_to_q")
+                    )
+                if hasattr(attn, "to_k"):
+                    attn.to_k.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_to_k")
+                    )
+                if hasattr(attn, "to_v"):
+                    attn.to_v.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_to_v")
+                    )
+                if hasattr(attn, "to_out"):
+                    attn.to_out[0].register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_to_out0")
+                    )
+                    # to_out[0] is the o_proj Linear; its INPUT is the
+                    # post-sdpa (head-merged) tensor. Capturing it lets us
+                    # compare py's sdpa output against ours attn_sdpa and
+                    # decide whether the attn_out bias originates in sdpa
+                    # vs. in the o_proj matmul_i8.
+                    attn.to_out[0].register_forward_pre_hook(
+                        _mk_once_pre(f"09_main_block{n}_to_out0_in")
+                    )
+                # RMSNorm probes to mirror our attn_norm2_out / ffn_norm1_out
+                # / ffn_norm2_out taps. Matches the residual-path values we
+                # already capture on the I8 side.
+                if hasattr(blk, "attention_norm2"):
+                    blk.attention_norm2.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_attn_norm2_out")
+                    )
+                if hasattr(blk, "ffn_norm1"):
+                    blk.ffn_norm1.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_ffn_norm1_out")
+                    )
+                    # ffn_norm1's INPUT is x_mid (the post-attention residual
+                    # add: x + gate_msa * attn_norm2(attn_out)). Capturing it
+                    # isolates the residual-add step in the per-op chain --
+                    # the i8 engine re-quantizes the sum there.
+                    blk.ffn_norm1.register_forward_pre_hook(
+                        _mk_once_pre(f"09_main_block{n}_x_mid")
+                    )
+                if hasattr(blk, "ffn_norm2"):
+                    blk.ffn_norm2.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_ffn_norm2_out")
+                    )
+                # Intra-FFN: modulated_ffn_in (pre), w1/w3 (parallel gate +
+                # up projections), w2 is the final output and == ffn_out.
+                blk.feed_forward.register_forward_pre_hook(
+                    _mk_once_pre(f"09_main_block{n}_modulated_ffn_in")
+                )
+                ff = blk.feed_forward
+                if hasattr(ff, "w1"):
+                    ff.w1.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_ffn_w1")
+                    )
+                if hasattr(ff, "w3"):
+                    ff.w3.register_forward_hook(
+                        _mk_once_post(f"09_main_block{n}_ffn_w3")
+                    )
+        last = len(xf.layers) - 1
+        xf.layers[last].register_forward_hook(_mk_once_post("10_main_block29_out_post_drain"))
+
+    # DIAG: dump the FULL last-main-block residual and final_layer_out as
+    # binary tensors so the rust side can per-cell linfit them. Without
+    # this, slope-vs-pyref can only be computed at the scheduler output;
+    # we want to localize whether the slope appears in block 29's
+    # residual or only after final_layer.
+    def _mk_once_post_dump(label: str):
+        fired = {"v": False}
+        def _hook(_m, _inp, output):
+            if fired["v"]:
+                return
+            fired["v"] = True
+            t = output[0] if isinstance(output, tuple) else output
+            _summarize(f"PYDIAG {label}", t)
+            _dump(t, args.out / f"py_{label}.bin")
+        return _hook
+
+    if hasattr(xf, "layers") and len(xf.layers) > 0:
+        last = len(xf.layers) - 1
+        xf.layers[last].register_forward_hook(
+            _mk_once_post_dump("10_main_block29_full")
+        )
+    if hasattr(xf, "final_layer"):
+        xf.final_layer.register_forward_hook(
+            _mk_once_post_dump("11_final_layer_full")
+        )
+    elif hasattr(xf, "all_final_layer"):
+        for k, m in xf.all_final_layer.items():
+            m.register_forward_hook(_mk_once_post_dump("11_final_layer_full"))
+    if hasattr(xf, "final_layer"):
+        xf.final_layer.register_forward_hook(_mk_once_post("11_final_layer_out"))
+    elif hasattr(xf, "all_final_layer"):
+        # Z-Image diffusers exposes `all_final_layer` as a ModuleDict keyed by
+        # resolution-bucket; register on every entry so whichever one fires
+        # produces the probe.
+        for k, m in xf.all_final_layer.items():
+            m.register_forward_hook(_mk_once_post("11_final_layer_out"))
 
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
     t1 = time.time()

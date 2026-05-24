@@ -1,200 +1,228 @@
 # Worklog
 
-## Current state
+## Current state (2026-06-05, VAE overhaul: implicit-GEMM conv + parallel GN + f16 acts)
 
-Live regime: **DP4A int8 matmul** when adapter exposes
-`Packed4x8IntegerDotProduct` + `SHADER_F16`; F16-workspace path is the
-fallback. Per matmul site the layer forward runs
-act_quant -> dequant_i8 -> matmul_i8: A is quantized to packed i8 +
-per-(M, K/32) f32 scale; B is dequanted from K-quants / Q8_0 / Q4_0 to
-the same packed i8 + scale layout; the inner loop is
-`sum_s dot4I8Packed(av, bv)` -> i32 scaled by `a_scale * b_scale` at
-every K=32 sub-block.
+VAE decoder 46.3s -> 3.9s at 768 (4 tiles x ~0.97s, was 11.55s/tile). VAE
+is no longer a wall item (~4% of an 8-step run). Three changes:
 
-matmul_i8 now also does:
-- **Loop reorder** (`av` hoisted outside the `j` loop, per-(j) dots
-  accumulate into a register array, scaled once after `s`). Always-on,
-  numerically identical to pre-reorder; cuts shared-mem reads from
-  `2*TM*TN*BK_U32` to `TM*BK_U32 + TM*TN*BK_U32`.
-- **Subgroup-aware `tile_a` reads** when adapter exposes
-  `Features::SUBGROUP`. Universal kernel branches on the runtime
-  `subgroup_size` builtin: `subgroupBroadcastFirst` when
-  `subgroup_size <= wg_x`, `subgroupShuffle(v, sg_id - lid_x)` when
-  `subgroup_size > wg_x`. Correct for any size; on devices with fixed
-  size the compiler folds the branch. Workgroup is declared
-  `@workgroup_size(THREADS, 1, 1)` because naga 28 rejects
-  `subgroup_invocation_id` on multi-dim WGs; `lid_x`, `lid_y` derived
-  from `local_invocation_index`.
+1. conv2d rewritten as implicit GEMM (`weight[Cout,K] @ im2col[K,M]`,
+   im2col never materialized; output lands NCHW, coalesced spatial
+   stores/gathers). Configurable `Conv2dConfig` tiles, explicit-scalar
+   register blocks. Three regimes in `VaeDecoderPipelines`: default
+   64/64/32/4/4, wide (bn=128/tn=8, m>=65536 && cout>=64), small-N
+   (bm=4, cout<=4 i.e. conv_out). Old one-thread-per-output kernel gone.
+2. group_norm rewritten: one WORKGROUP (256 threads) per (b,group) row,
+   shared-mem tree reduction (was 1 thread/row serial scans - the hidden
+   up_block.3 killer at 512x512).
+3. VAE acts f16 when device has SHADER_F16 (F32 path = fallback).
+   Reductions f32 in-kernel; stores saturate +-65504; host edges convert
+   via `half` (latent upload, mid/tile readbacks); tile slicing stays in
+   raw act bytes. New f16 variants: group_norm/upsample/transpose12;
+   mid-block matmul moved to 64/64/16/4/4 tile (old 16x16 default is
+   illegal for f16 tiles: tn%2).
 
-e2e_parity_for_gguf_q4_k_m VERIFIED PASSING.
+- Per tile: up0 0.6->0.07s, up1 2.8->0.30s, up2 3.9->0.33s,
+  up3 3.9->0.23s, tail 0.32->0.009s. 768 q4 e2e wall 91.7->46.5s.
+- TRUE_PEAK 2.00GiB exact (workspace peak 1.91->1.72GiB from f16).
+- Pyref q8 256: PASS; conv_out slope 1.009842 (f32 baseline 1.009814),
+  latent slope 1.008233 rel 2.53% - f16 invisible at output. Early-stage
+  taps (up0/up1) show f16 rounding above tol counts but wash out by up2.
+- Conformance 40/40 incl. 2 new conv2d cases (multitile edges, batch-2).
+- Scratch logs: smoke-768-vae-baseline.log (pre-conv-rewrite),
+  smoke-768-igemm-baseline.log (igemm f32), smoke.log (GN+f16+regimes).
 
-Measurements (Q4_K_M, 2 diffusion steps, 256x256):
+## Prior state (2026-06-05, matmul_i8 vec4 tile loads)
 
-- **Intel Arc 140T iGPU, `LowPower`**: diffusion_steps 33.7 s ->
-  16.86 s/step. Per-block sample ~952 ms. Subgroup size [8, 32]
-  (variable). Subgroup + reorder vs prior F16-workspace baseline:
-  `-5% diffusion_steps`, `-11% per-block`.
-- **NVIDIA RTX 5070 Laptop, `HighPerformance`**: diffusion_steps
-  13.54 s -> **6.77 s/step**. Subgroup size 32 (fixed). Per-block
-  sample 324 ms.
-- `text_encode` unchanged (bf16 safetensors path, not on matmul_i8).
+matmul_i8 round 3 part 1: A/B bindings re-viewed as array<vec4<u32>>;
+tile loads are one coalesced 16B load per thread (was 4 scalar u32 loads
+with div/mod each). Safe because one K=32 sub-block row is 2 vec4s
+(never straddles rows), K%32==0 keeps binding sizes 16B-divisible.
 
-`PowerPreference::None` maps to `LowPower` behavior on Vulkan
-(driver treats unset as background-priority hint). CLI + e2e_parity
-defaults flipped to `HighPerformance`; explicit `THINFER_POWER_PREF=low`
-to exercise thin-hardware path.
+- Main-block matmul GPU (sum, 2 steps, q4_k_m 768): 13153 -> 11798ms
+  (-10.3%); ffn2/attn_qkv -12.4%, ffn1 -7.8%, attn_proj -11.1%.
+- diffusion_steps wall 22.7 -> 21.2s (-6.7%). TRUE_PEAK 2.00GiB exact.
+- Conformance matmul_i8 6/6, matmul_i8_bf16 4/4. Pyref q8 256:
+  13/16384 latent cells out of tol, slope 1.0084 rel 2.5% - identical
+  to pre-change baseline (numerically transparent).
+- Untried from round-3 list: BK=64, tn bump (occupancy risk each).
 
-Adapter logging surfaces caps at startup whenever
-`THINFER_TRACE` is set (any value): adapter name, backend,
-shader_f16, packed_int_dot, subgroups, subgroup_size range. Plus a
-per-block-build line with the actual `matmul_i8_use_subgroup` flag so
-test runs can confirm the optimization path is active.
+## Prior state (cross-section submit ring)
 
-## Next attack: cooperative matrix (subgroup matrix)
+dit_forward now runs ONE depth-2 deferred-submit ring across all sections
+(noise_refiner, cap glue, context_refiner, main layers) instead of sync
+submit_void at every section boundary. Hold-bags are type-erased
+(`RingHold` blanket trait); `BatchScope::import_copy` used at deferred
+sites (caller's hold-bag keeps views alive). Perf-NEUTRAL (q4_k_m 768:
+steps 22.7s vs 21.8s baseline, within session noise; TRUE_PEAK still
+2.00GiB; test passes). Kept for structure: proper pipelining, no forced
+drains at section boundaries.
 
-The DP4A inner loop is now memory-coherent (loop reorder) and
-subgroup-broadcast-clean. Further wins from the same shape are likely
-sub-2%. The next structural step up is **cooperative matrix** ops:
-WebGPU's `chromium-experimental-subgroup-matrix` extension exposes
-`subgroupMatrixMultiplyAccumulate` (NVIDIA WMMA, Intel XMX, AMD WMMA
-underneath) — 4x4xK matrix MACs per instruction vs DP4A's 1x4 dot
-product, ~4-8x throughput on hardware that supports it.
+Key finding: the "step-boundary burp" (old Next item a) is DEAD. The
+section-start gaps were GPU-busy time (196MB/block weight-upload copies
+ride the queue ahead of dispatches), not CPU fence waits. What survives:
+~260ms/step of queue.submit() blocking at layer-loop start (block.3
+ordinals, 50-110ms each, near-empty cmdbufs) - driver/staging-belt
+backpressure, not our fences. Steps are otherwise upload-bandwidth +
+matmul bound (wb_ms 20-80ms per block, every step, from 2GiB eviction
+churn).
 
-Status: behind a Chrome flag today; wgpu doesn't yet surface it
-either. When it lands, the dispatch is the new matmul_i8 inner loop
-(replace the `s,j` register-blocked DP4A loop with one `coopMatMul`
-call per K=32 sub-block). Geometry will need to match the matrix
-shape the extension exposes (probably 16x16x16 or 8x8x32 — TBD).
+## Prior state (refiner Q8_0 transcode)
 
-Until then, secondary attacks (all measure-or-die):
-1. **Async submit / pipelined finish**. Rollup occasionally shows
-   `submit_ms` outliers (~880 ms) while next dispatch sits idle. If we
-   can issue the next submit before the previous finishes, sustained
-   throughput improves.
-2. **Q4_K_M for Qwen3 text encoder**. Encoder is 14 s of ~17 s wall on
-   the discrete card (worse share than on iGPU). Same dequant_i8 +
-   matmul_i8 path applies; need a Q4_K_M Qwen3 GGUF (find or build).
-3. **Q8_0 fast path in `dequant_i8`**. Q8_0 is already i8+scale on disk;
-   skip the f32 round-trip. Low priority — dequant cost is small.
+Refiner matmuls moved off the bf16 path: unsloth GGUFs (Q8_0 AND Q4_K_M)
+store all 28 refiner matmul tensors as BF16, so refiners were paying the
+untuned bf16 matmul plus 354-362MB/block weight re-uploads. Landed a
+load-time bf16 -> Q8_0 transcode (`WeightMeta::transcode` +
+`encode_q8_0_from_bf16`, llama.cpp quantize_row_q8_0 semantics) so
+refiner qkv/out/w1/w2/w3 ride the DP4A matmul_i8 path:
+
+- e2e 768 q4_k_m 2-step: 94.97 -> 88.30s (~3.3s/step).
+- noise_refiner GPU: ~1.04s -> ~474ms/step; context_refiner 45 -> 32ms.
+- refiner weight upload: 362 -> 196MB/block (~660MB/step less).
+- Pyref parity q8 at 256: 13/16384 latent cells out of tol (was 14),
+  slope 1.0084 rel 2.5% (was 1.009 / 2.4%). Conformance 40/40.
+
+Prior round (sdpa subgroup rewrite + matmul_i8 register blocking tm=8):
+block 1121 -> 259ms, ~2.9 TFLOPS eff on matmul_i8 (still ~3x from DP4A
+ceiling). 768 e2e passes at default 2G/2G (TRUE_PEAK 2047MiB).
+
+## Next (priority order)
+
+1. **DiT round 2** (in expected-value order):
+   (a) matmul_i8 round 3: vec4 B-loads, possible BK=64, tn bump.
+   (b) queue.submit() stalls at layer-loop start (~260ms/step, 50-110ms
+       per call on near-empty cmdbufs): driver/staging backpressure;
+       suspect wgpu staging belt or outstanding-copy throttle.
+   (c) upload churn: every main block re-uploads ~200MB/step at 2GiB
+       budget; structural fix is smaller weights (Q4 main already) or
+       smarter residency, not eager-release.
+2. **Text encoder to llama.cpp-grade**: Qwen3 ~17.8s (F32 acts + bf16
+   weights, untuned matmul) - now the biggest single wall item. Target:
+   GGUF-quantized encoder weights + F16 acts + the same DP4A matmul path
+   the DiT uses. The refiner transcode machinery applies directly
+   (encoder linears are bf16 safetensors; K%32==0 holds).
+3. VAE leftovers (low priority now): conv tile sweep (bk, wide-regime
+   thresholds), mid-block front still untimed separately, single-shot
+   `decoder_forward` is dead code (no callers) - delete or keep?
+4. Cleanup/backlog: tighten e2e tolerances to measured baselines;
+   revisit sdpa_i8 quality (run the i8_sdpa variant; if noisy,
+   K-smoothing a la SageAttention); arbiter eviction churn at 256.
+
+## Invariants (current architecture)
+
+- **VRAM budget has one owner**: `MemArbiter` (thinfer-core/src/arbiter.rs),
+  created by `WeightResidency::new`, shared into every `Workspace`. Net-new
+  allocs call `ensure_headroom`; the reclaim chain runs in priority order
+  (idle workspace pool -> evictable weights -> unpinned ring slots). No
+  peer-to-peer spill hooks; lock order strictly arbiter -> client.
+- Budget is a ceiling target: chain-dry overshoot is traced
+  (target=thinfer::arbiter) and caught by the e2e TRUE_PEAK assert, not a
+  hard alloc error. Structural too-big-for-budget weights still error.
+- Weight acquire under pressure recycles the oldest unpinned SAME-SIZE
+  resident's buffer in place (no free+alloc); with headroom it allocates
+  fresh so large budgets build full residency. Residency's size-class pool
+  is gone.
+- e2e TRUE_PEAK now lands exactly at 2.00GiB/2.00GiB (q8 + q4); parity
+  unchanged (q8 latent slope 1.009 rel 2.4%, q4 0.976 rel 9.3%).
+- ActDtype::I8 is NEVER a block-wide ops dtype (`BlockWgslConfigs::validate`
+  asserts). Residual carry, norms, modulate, FFN glue: dense at act dtype.
+- Matmul boundary: `dispatch_matmul_site` accepts dense (act_quant
+  transcode inside, DP4A) or paired A-side (sdpa_i8 output -> proj direct).
+- **Weight transcode**: `WeightMeta::transcode = Some(Q8_0)` requantizes
+  bf16 [N, K] (K%32==0) into GGUF-native Q8_0 blocks at upload, no
+  transpose. Applied to refiner matmuls iff any main-layer matmul is
+  file-quant (`refiner_transcode_target`); `ZImageModel::load` mirrors the
+  decision in the dit-encoder pipeline cfgs. Q8_0 target regardless of the
+  main scheme. Embedder/final_layer set split back out to pure bf16.
+- `i8_sdpa` (recipe, default off): main DiT blocks only; requires
+  SHADER_F16 + quant path. sdpa_i8 I/O slots are fused `[i8 data || scale]`
+  pairs via `alloc_pair`; data half is `rows*dim` BYTES (not act_bytes).
+- act_quant pipeline is built when `(use_dp4a && any quant site) || i8_sdpa`.
+- matmul_i8_bf16 built only for `i8_sdpa && proj weight == Bf16`.
+- AdaLN, freqs, masks: plain act dtype (no per-domain overrides remain).
+- Surviving i8 kernels: act_quant, dequant_i8, matmul_i8, matmul_i8_bf16,
+  bf16_block_sum, sdpa_i8. matmul_i8 keeps the slot-7/8 dbg trace
+  bindings (LAYOUT=9; disabled via dbg.enable=0 in production).
+- No eprintln in library code: stage timing is tracing::info, diag dumps
+  are target=DIAG and tap-gated. CLI without THINFER_TRACE prints nothing.
+
+## Diag instrumentation (opt-in)
+
+- `THINFER_E2E_STEP0_DIAG=1` enables the step-0 localization taps
+  (damage-zone per-op taps + block-26 matmul byte audit). Off by default:
+  the tap buffers pin ~300 MiB and bust the 2 GiB budget.
+- Block-26 audit byte heads are captured INSIDE dispatch_matmul_site_diag
+  post-transcode (works for dense and paired A). CPU oracles live in
+  e2e_parity.rs (`audit_block26_matmul_i8`, `audit_qkv_segment_slopes`).
+- Paired taps exist only for `attn_sdpa` under i8_sdpa (ActTapBuf.scale).
+
+## Locked design decisions
+
+- **i8 activation storage is matmul/sdpa-internal only.** Per-32-block i8
+  cannot carry DiT residuals (fixed outlier channels ~3000x median; error
+  re-injected per block and compounds). Matches llama.cpp (Q8_1 at matmul
+  input only) / TRT-LLM (FP8 in GEMM only) practice. Do not revisit.
+- **DP4A matmul** auto-on for `Packed4x8IntegerDotProduct + SHADER_F16 +
+  F16 acts + Quant weight`. Tile bm=bn=64, tm=tn=4; subgroup runtime-branch.
+- **Sdpa flash-attn small-D**: `SdpaF16Sg` BR=16 BC=32 WG=128 CL=8 (16 KiB
+  shared) on F16+subgroups; legacy BR=64/WG=64 one-thread-per-row kernel
+  is the non-subgroup / non-F16 / D>128 fallback.
+- **Kernel register rule**: no dynamically-indexed local arrays in hot
+  loops (naga/NV spill to local memory); unroll via codegen with explicit
+  scalars (matmul_i8) or explicit vec4 vars (sdpa).
+- **Dequant-once per matmul site** on the non-DP4A fallback.
+- **Four pipeline-set split** (main / encoder / dit_encoder / dit_embedder;
+  embedder set now identical to dit_encoder).
+- **GGUF parser range-fetch-first**, B viewed `[N, K]` N-major.
+- **PowerPreference::HighPerformance** CLI/e2e default.
+- **VAE per-resnet sub-submits**; **SUBMIT_DEPTH=2** static;
+  **WEIGHT_RING_SLOTS=4**; matmul WGSL <= 32 KiB workgroup storage.
 
 ## What NOT to do (tested + rejected)
 
-- **Weight prepack `(b_i8, b_scale)` per matmul site.** -0.3% noise;
-  6.56 GiB prepacked footprint blew the 2 GiB VRAM ceiling. matmul_i8
-  dominates ~89% of block.x — eliminating the dequant_i8 dispatch saves
-  nothing.
-- **Dual-matmul + silu_mul fusion (FFN super-kernel).** Regressed Q8
-  +5.7%, Q4_K_M +3.5%. Doubled tile_b shared-mem + doubled per-thread
-  accumulators drops occupancy on Intel iGPU; dispatch saving is sub-1%.
-- **QKV+RoPE fused, flash-attn + proj fused.** Same class as above.
-- **Larger M tiles (bm=128).** `tm*tn=32` is the register cliff on
-  Intel iGPU; 64x128/4x8 doubled FFN ms pre-dequant-once. Re-measure
-  under DP4A if you retry; do not extrapolate.
-- **LUT dequant.** Per-thread LUT init overwhelms per-elem saves; ~2x
-  worse without `state_cache`. Skip.
-- **One-shot tile/bk sweeps** without a structural change. DP4A pins
-  BK=32 anyway.
-- **Further dtype-narrowing on f16-path.** Inner loop is i32-ALU under
-  DP4A now; not f32/f16.
-- **`HighPerformance` as the only knob.** Picks the discrete GPU when
-  present; iGPU is still the thin-hardware target and gets only modest
-  wins from the inner-loop work above. Structural wins (coopmat,
-  async submit) are device-portable; "use the bigger card" isn't.
-
-## Locked design decisions (carry forward)
-
-- **DP4A matmul (auto-opt-in).** Gated on
-  `WgslLanguageFeatures::Packed4x8IntegerDotProduct + SHADER_F16 +
-  ActDtype::F16`. Three WGSL kernels: `ops/act_quant.rs`,
-  `ops/dequant_i8.rs`, `ops/matmul_i8.rs`. matmul_i8 default tile
-  `bm=bn=64, tm=tn=4`. Output paired `vec2<f16>`.
-- **`MatMulI8Config.use_subgroup`** auto-on when
-  `Features::SUBGROUP` is exposed; runtime-branched shader covers all
-  subgroup sizes. Layout change: flat `@workgroup_size(THREADS, 1, 1)`.
-- **Dequant-once per matmul site (Quant only).** F16-workspace fallback
-  path. Workspace dtype follows `act_dtype`.
-- **`WeightDtype::F16`.** Paired `array<vec2<f16>>`; only valid for
-  dequant-once workspaces.
-- **`MatMulConfig.b_nmajor`.** N-major B-load on bf16-workspace path.
-- **K-quant `bk` and `bs` divisor-aligned.** `bk%bs==0 || bs%bk==0`.
-- **Quant DiT acts pinned to `ActDtype::F16`** when SHADER_F16
-  available, else F32.
-- **Three pipeline-set split.** `block_pipelines`,
-  `dit_encoder_block_pipelines`, `encoder_block_pipelines`. Refiners
-  /embedders never quantized.
-- **GGUF parser is range-fetch-first.**
-- **B viewed `[N, K]` N-major in matmul.** GGUF native layout.
-- **Saturated-narrow at f16 store sites.** Clamp +-65504 before f16 cast.
-- **Residency pool counts against VRAM ceiling.**
-- **Matmul WGSL fits in 32 KiB workgroup storage.** Hard `assert!`.
-- **Pipeline validation errors surface through `PipelineCreate`.**
-  `WgpuBackend::create_shader_module` wraps `push_error_scope` /
-  `pop_error_scope`.
-- **`PowerPreference::HighPerformance` is the CLI/e2e default**;
-  `None` aliases to `HighPerformance`. Explicit `low` for thin-hw runs.
-
-## Conformance coverage for DP4A ops
-
-`thinfer-conformance/tests/{act_quant_i8,dequant_i8,matmul_i8}.rs`:
-- Per-op pipeline-build tests (catch WGSL parse/validate regressions).
-- Numerical round-trip vs scalar Rust reference.
-- matmul_i8 has 6 cases: small / multi-block-K / default-tile
-  x (use_subgroup={false, true}). The subgroup variants skip cleanly
-  when adapter lacks `Features::SUBGROUP`; `try_run` prints adapter
-  caps so you can verify which path ran.
-
-## Q4_K_M file encoding map (unsloth z-image-turbo-Q4_K_M.gguf)
-
-- ggml types: 12=Q4_K, 13=Q5_K, 14=Q6_K, 30=bf16
-- attn.qkv.weight: 2 Q6_K + 28 Q5_K (special = first+last)
-- attn.out.weight: 2 Q5_K + 28 Q4_K
-- ffn.w1.weight / ffn.w3.weight: 2 Q5_K + 28 Q4_K
-- ffn.w2.weight (FFN-down): 30 Q6_K
-- adaLN_modulation.0.weight: filtered by `QuantOnlySource`, bf16 wins
+- i8 residual carry / i8 elementwise acts (see locked decision above).
+- BC=64 sdpa packed variants (occupancy collapse).
+- Mapped-staging same-encoder copy; dedicated submit per upload;
+  elastic SUBMIT_DEPTH=3; static workspace reserve; weight prepack.
+- Dual-matmul+silu_mul / QKV+RoPE / flash-attn+proj fusions (regressed).
+- Larger M tiles (bm=128); LUT dequant; raising VRAM budget as a "fix".
+- Q8_0 dequant_i8 pass-through specialization (bit-identical, zero gain).
 
 ## Conventions
 
 - Rope: DiT interleaved `rope`; Qwen3 half-rot `rope_halfrot`.
-- Sdpa: fused, `D <= MAX_D = 128`.
-- Matmul kernel: `a @ b` with B `[K, N]`. PyTorch `nn.Linear [N, K]`
-  uploaded transposed; **GGUF `[N, K]` natively, no transpose at load.**
-- Z-Image text-encoder stops at Qwen3 `hidden_states[-2]`.
-- DiT `decode_image` passes raw latent `c` to `seq::unpatchify`.
-- SDPA mask `[B, S_q, S_k]` additive.
-- VAE: `(z/scaling) + shift` internal; SCALING=0.3611, SHIFT=0.1159.
-  Tiled tile=64, overlap=8, one submit per tile.
-- fp32 tol 1e-5. `cfg(test)` per-crate.
+- Matmul `a @ b`, B `[K, N]`; nn.Linear uploaded transposed; GGUF native.
+- Z-Image text encoder stops at Qwen3 `hidden_states[-2]`.
+- VAE: `(z/scaling) + shift`; SCALING=0.3611, SHIFT=0.1159; tile=64 ovl=8.
 - WIP branch flow: `git add ... && git commit --amend --no-edit &&
-  git push --force-with-lease`. No new commits on `initial-work` unless
-  asked.
-- WebGPU dispatch caps at 65535/dim.
-- `THINFER_TRACE=1` enables tracing rollup + fmt-layer stderr output.
-  `THINFER_TRACE=verbose` also adds span-close events.
-- `Workspace::drain_pool()` at phase boundaries.
-
-## Perf backlog (deferred)
-
-- Fit DiT fully resident, lower workspace_reserve from `/4` to fixed
-  ~512 MiB.
-- Sub-allocator for residency pool (slab-based, free-list).
-- Bf16-clean VAE up_blocks.
-- Per-model gen defaults via `ModelId::defaults()`.
-- Lift `ZImageRecipe` to engine-agnostic `ComputeRecipe`.
-- e2e_parity NaN-loose assertion bug.
-- Tighten e2e parity tol when bf16-clean VAE up_blocks lands.
-- VAE tiled quality knobs (overlap bump, halo-exchange per-layer).
-- CLI download per-decile progress.
-- Q8_0 dequant_i8 near-memcpy fast path.
+  git push --force-with-lease`.
+- `THINFER_TRACE=1` rollup + fmt stderr; `=verbose` adds span-close.
 
 ## Memorized commands
 
-- Conformance: `cargo test --release -p thinfer-conformance --features
-  conformance ops_match_pytorch_reference -- --nocapture`
-- DP4A op conformance:
-  `cargo test --release -p thinfer-conformance --features conformance
-   --test act_quant_i8 --test dequant_i8 --test matmul_i8`
-- e2e_parity (defaults to HighPerformance now; add `THINFER_POWER_PREF=low`
-  to force thin-hw path):
-  `THINFER_TRACE=verbose THINFER_E2E_PNG_DIR=<dir> cargo test --release
-   -p thinfer-conformance --features zimage-e2e e2e_parity_for_ --
-   --nocapture --test-threads=1`
+- **e2e parity q8 (with pyref)**: `THINFER_TRACE=verbose
+  THINFER_E2E_PNG_DIR=/c/work/personal/thinfer/scratch/png_staging
+  THINFER_POWER_PREF=high cargo test --release -p thinfer-conformance
+  --features zimage-e2e e2e_parity_for_gguf_q8_0 -- --skip i8_sdpa
+  --nocapture --test-threads=1 2>&1 | tee
+  /c/work/personal/thinfer/scratch/smoke.log`
+  (drop the `--skip` and use `..._i8_sdpa` / `..._q4_k_m` for variants;
+  NOTE: `--exact` does NOT work with unqualified test names - it matches
+  nothing and exits 0 vacuously. Verify the `e2e-parity[...]: starting`
+  line + a non-zero passed count.)
+- **Step-0 localization diag**: add `THINFER_E2E_STEP0_DIAG=1` (needs
+  budget headroom; busts 2 GiB).
+- **Conformance**: `cargo test --release -p thinfer-conformance
+  --features conformance -- --test-threads=1`
+- **768x768 (no pyref)**: add `THINFER_E2E_SKIP_PYREF=1
+  THINFER_E2E_DIMS=768x768`.
+- **Perf runs**: ALWAYS add `RUST_LOG="info,thinfer::diag=warn"` - the
+  DIAG readback probes gate on the env filter, not the trace level, so
+  any THINFER_TRACE setting fires them and serializes every block.
+  `THINFER_E2E_BUDGET_GB=N` overrides the 2G default (residency A/B).
+- Perf log series in scratch/: smoke-768-ring-baseline.log (submit ring,
+  pre-vec4), current smoke.log = vec4 tile loads (q4_k_m 768).
+  smoke-pyref-q8.log = post-vec4 pyref parity at 256.
+- CLI wall reference: q4 768x768 8-step, 5G/5G budgets: 1m30.5s
+  (2026-06-05, post-VAE-overhaul; was 2m11.8s post-vec4, ~2.5m before).
+- CLI default model flipped q8 -> q4 (2026-06-05): visual quality
+  confirmed acceptable (capybara/lighthouse 768 renders clean).

@@ -219,11 +219,13 @@ fn q8_0_matmul_rectangular() {
     assert_close(&got, &exp, 96);
 }
 
-/// Production geometry for the fused QKV matmul in Z-Image DiT (hidden=3840,
-/// 3*hidden=11520, image seq for 512x512 ≈ 1024 tokens) at the production
-/// register-blocked tile shape (`bm=bn=64, tm=tn=4, bk=32`) with F32 acts.
-/// If unit-test scale passes but this NaNs, the bug is in the K-tile loop,
-/// the block-cooperative loader, or large-N dispatch path.
+/// Production-N/K geometry for the fused QKV matmul in Z-Image DiT
+/// (hidden=3840, 3*hidden=11520) at the production register-blocked tile
+/// shape (`bm=bn=64, tm=tn=4, bk=32`) with F32 acts. M is held at 64 (one
+/// bm tile) since prod seqlen (~1024 tokens) scales only the CPU reference
+/// without exercising new dispatch paths. If unit-test scale passes but
+/// this NaNs, the bug is in the K-tile loop, the block-cooperative loader,
+/// or large-N dispatch path.
 #[test]
 fn q8_0_matmul_prod_geom_qkv_f32_acts() {
     let cfg = MatMulConfig {
@@ -234,7 +236,7 @@ fn q8_0_matmul_prod_geom_qkv_f32_acts() {
         tn: 4,
         b_nmajor: false,
     };
-    let (got, exp) = pollster::block_on(run_one_with_cfg(1024, 11520, 3840, 0xC0DE_BABE, cfg));
+    let (got, exp) = pollster::block_on(run_one_with_cfg(64, 11520, 3840, 0xC0DE_BABE, cfg));
     let nan_count = got.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
         nan_count,
@@ -245,9 +247,9 @@ fn q8_0_matmul_prod_geom_qkv_f32_acts() {
     assert_close(&got, &exp, 3840);
 }
 
-/// Production geometry for the FFN-up matmul (`[hidden, 4*hidden]` =
-/// `[3840, 15360]`, M=1024). Larger N stresses output workgroup tiling more
-/// than QKV.
+/// Production-N/K geometry for the FFN-up matmul (`[hidden, 4*hidden]` =
+/// `[3840, 15360]`). Larger N stresses output workgroup tiling more
+/// than QKV. M=64 (see qkv variant for why).
 #[test]
 fn q8_0_matmul_prod_geom_ffn_up_f32_acts() {
     let cfg = MatMulConfig {
@@ -258,7 +260,7 @@ fn q8_0_matmul_prod_geom_ffn_up_f32_acts() {
         tn: 4,
         b_nmajor: false,
     };
-    let (got, exp) = pollster::block_on(run_one_with_cfg(1024, 15360, 3840, 0xFFEE_BEEF, cfg));
+    let (got, exp) = pollster::block_on(run_one_with_cfg(64, 15360, 3840, 0xFFEE_BEEF, cfg));
     let nan_count = got.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
         nan_count,
@@ -269,8 +271,8 @@ fn q8_0_matmul_prod_geom_ffn_up_f32_acts() {
     assert_close(&got, &exp, 3840);
 }
 
-/// Production geometry for the FFN-down matmul (`[4*hidden, hidden]` =
-/// `[15360, 3840]`, M=1024). Larger K stresses the per-K-step block load.
+/// Production-N/K geometry for the FFN-down matmul (`[4*hidden, hidden]` =
+/// `[15360, 3840]`). Larger K stresses the per-K-step block load. M=64.
 #[test]
 fn q8_0_matmul_prod_geom_ffn_down_f32_acts() {
     let cfg = MatMulConfig {
@@ -281,7 +283,7 @@ fn q8_0_matmul_prod_geom_ffn_down_f32_acts() {
         tn: 4,
         b_nmajor: false,
     };
-    let (got, exp) = pollster::block_on(run_one_with_cfg(1024, 3840, 15360, 0xFAB0_BEEF, cfg));
+    let (got, exp) = pollster::block_on(run_one_with_cfg(64, 3840, 15360, 0xFAB0_BEEF, cfg));
     let nan_count = got.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
         nan_count,

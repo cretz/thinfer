@@ -52,7 +52,11 @@ pub trait SdpaOp {
     fn layout() -> &'static [BindingLayout];
 
     fn workgroups(b: u32, s_q: u32, h_q: u32) -> [u32; 3] {
-        [(b * s_q * h_q).div_ceil(64), 1, 1]
+        // FlashAttention tiling: one workgroup per (b, hq, q_tile),
+        // BR=64 Q rows per workgroup. Grid [ceil(S_q/64), H_q, B].
+        // Both H_q and B are small (≤ 16 / 1), so the 65535/dim cap is
+        // hit only by the x-axis: 65535 * 64 = 4.2M Q rows.
+        [s_q.div_ceil(64), h_q, b]
     }
 }
 
@@ -85,6 +89,15 @@ pub(crate) fn dispatch_sdpa<O: SdpaOp, B: Backend>(
     backend.dispatch(encoder, pipeline, &bindings, O::workgroups(b, s_q, h_q))
 }
 
+// FlashAttention-style tiled sdpa. One workgroup per (b, hq, q_tile) where
+// q_tile groups BR=64 consecutive Q rows. Each thread owns one Q row in
+// registers; K/V are streamed in BC=32-row tiles into workgroup-shared
+// memory and reused by all BR threads. Online softmax keeps (m, l, O) in
+// per-thread registers across K-tile iterations. One barrier per K-tile
+// instead of zero-but-thread-serial — global K/V traffic drops by BR=64x.
+//
+// Workgroup grid: [ceil(S_q/64), H_q, B] (set by `workgroups()` below).
+// Shared storage: BC*MAX_D * (f32 K + f32 V) = 32*128*4*2 = 32 KiB.
 wgsl_with_bf16_variant!(
     WGSL_F32,
     WGSL_F32_BF16 = r#"
@@ -100,50 +113,98 @@ struct U {
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> u: U;
 
+const BR: u32 = 64u;
+const BC: u32 = 32u;
+const WG: u32 = 64u;
 const MAX_D: u32 = 128u;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = u.b * u.s_q * u.h_q;
-    let idx = gid.x;
-    if (idx >= total) { return; }
-    let hq  = idx % u.h_q;
-    let tmp = idx / u.h_q;
-    let sq  = tmp % u.s_q;
-    let bb  = tmp / u.s_q;
-    let hkv = (hq * u.h_kv) / u.h_q;
+var<workgroup> k_tile: array<f32, 4096>; // BC * MAX_D
+var<workgroup> v_tile: array<f32, 4096>;
 
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let t  = lid.x;
+    let qt = wgid.x;
+    let hq = wgid.y;
+    let bb = wgid.z;
+    let sq = qt * BR + t;
+    let valid = sq < u.s_q;
+
+    let hkv = (hq * u.h_kv) / u.h_q;
     let q_off    = ((bb * u.s_q + sq) * u.h_q + hq) * u.d;
     let kv_b0    = (bb * u.s_k * u.h_kv + hkv) * u.d;
     let kv_step  = u.h_kv * u.d;
     let mask_base = (bb * u.s_q + sq) * u.s_k;
 
-    var o: array<f32, 128>;
-    for (var d = 0u; d < u.d; d = d + 1u) { o[d] = 0.0; }
-    var m: f32 = bitcast<f32>(0xff800000u); // -inf
-    var l: f32 = 0.0;
-
-    for (var j = 0u; j < u.s_k; j = j + 1u) {
-        let kj = kv_b0 + j * kv_step;
-        var dot: f32 = 0.0;
+    var q_local: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { q_local[d] = 0.0; }
+    if (valid) {
         for (var d = 0u; d < u.d; d = d + 1u) {
-            dot = dot + q[q_off + d] * k[kj + d];
+            q_local[d] = q[q_off + d];
         }
-        let bias = select(0.0, mask[mask_base + j], u.has_mask != 0u);
-        let s_j  = dot * u.scale + bias;
-        let m_new = max(m, s_j);
-        let alpha = exp(m - m_new);
-        let p_j  = exp(s_j - m_new);
-        for (var d = 0u; d < u.d; d = d + 1u) {
-            o[d] = o[d] * alpha + p_j * v[kj + d];
-        }
-        l = l * alpha + p_j;
-        m = m_new;
     }
 
-    let inv_l = 1.0 / l;
-    for (var d = 0u; d < u.d; d = d + 1u) {
-        out[q_off + d] = act_store(o[d] * inv_l);
+    var o_local: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { o_local[d] = 0.0; }
+    var m: f32 = bitcast<f32>(0xff800000u);
+    var l: f32 = 0.0;
+
+    let n_tiles = (u.s_k + BC - 1u) / BC;
+    let elems_per_tile = BC * u.d;
+    let per_thread = elems_per_tile / WG;
+
+    for (var kt = 0u; kt < n_tiles; kt = kt + 1u) {
+        let kc_base = kt * BC;
+
+        for (var i = 0u; i < per_thread; i = i + 1u) {
+            let idx = i * WG + t;
+            let kc  = idx / u.d;
+            let dd  = idx % u.d;
+            let key_global = kc_base + kc;
+            var kv: f32 = 0.0;
+            var vv: f32 = 0.0;
+            if (key_global < u.s_k) {
+                let base = kv_b0 + key_global * kv_step + dd;
+                kv = k[base];
+                vv = v[base];
+            }
+            k_tile[idx] = kv;
+            v_tile[idx] = vv;
+        }
+        workgroupBarrier();
+
+        if (valid) {
+            for (var kc = 0u; kc < BC; kc = kc + 1u) {
+                let key_global = kc_base + kc;
+                if (key_global < u.s_k) {
+                    var dot: f32 = 0.0;
+                    for (var dd = 0u; dd < u.d; dd = dd + 1u) {
+                        dot = dot + q_local[dd] * k_tile[kc * u.d + dd];
+                    }
+                    let bias = select(0.0, mask[mask_base + key_global], u.has_mask != 0u);
+                    let s_j  = dot * u.scale + bias;
+                    let m_new = max(m, s_j);
+                    let alpha = exp(m - m_new);
+                    let p_j   = exp(s_j - m_new);
+                    for (var dd = 0u; dd < u.d; dd = dd + 1u) {
+                        o_local[dd] = o_local[dd] * alpha + p_j * v_tile[kc * u.d + dd];
+                    }
+                    l = l * alpha + p_j;
+                    m = m_new;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if (valid) {
+        let inv_l = 1.0 / l;
+        for (var d = 0u; d < u.d; d = d + 1u) {
+            out[q_off + d] = act_store(o_local[d] * inv_l);
+        }
     }
 }
 "#
@@ -153,6 +214,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Compute (dot products, softmax, accumulators) stays fp32. Requires `D`
 /// even (always true: 8/128 in Z-Image+Qwen3) and `s_k` even when
 /// `has_mask != 0` (so each row's bf16 mask aligns to packed words).
+/// Tiled flash-attention layout — see WGSL_F32 above for the shared design.
 const WGSL_BF16_PACKED: &str = concat!(
     act_bf16_prelude!(),
     r#"
@@ -168,57 +230,110 @@ struct U {
 @group(0) @binding(4) var<storage, read_write> out: array<u32>;
 @group(0) @binding(5) var<uniform> u: U;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = u.b * u.s_q * u.h_q;
-    let idx = gid.x;
-    if (idx >= total) { return; }
-    let hq  = idx % u.h_q;
-    let tmp = idx / u.h_q;
-    let sq  = tmp % u.s_q;
-    let bb  = tmp / u.s_q;
-    let hkv = (hq * u.h_kv) / u.h_q;
+const BR: u32 = 64u;
+const BC: u32 = 32u;
+const WG: u32 = 64u;
+const MAX_DW: u32 = 64u;
 
+// Shared at 16 KiB/tile to keep 2 workgroups/SM (32 KiB+ collapses to 1/SM
+// on Ada and similar; BC=64 measured ~85% slower on a 5070 768x768).
+var<workgroup> k_tile: array<u32, 2048>; // BC * MAX_DW
+var<workgroup> v_tile: array<u32, 2048>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let t  = lid.x;
+    let qt = wgid.x;
+    let hq = wgid.y;
+    let bb = wgid.z;
+    let sq = qt * BR + t;
+    let valid = sq < u.s_q;
+
+    let hkv = (hq * u.h_kv) / u.h_q;
     let d_w        = u.d >> 1u;
     let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
     let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
     let kv_step_w  = (u.h_kv * u.d) >> 1u;
     let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
 
-    var o: array<f32, 128>;
-    for (var d = 0u; d < u.d; d = d + 1u) { o[d] = 0.0; }
+    var q_local: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { q_local[d] = 0.0; }
+    if (valid) {
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            let qv = unpack_bf16x2(q[q_w_off + dw]);
+            q_local[dw * 2u]      = qv.x;
+            q_local[dw * 2u + 1u] = qv.y;
+        }
+    }
+
+    var o_local: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { o_local[d] = 0.0; }
     var m: f32 = bitcast<f32>(0xff800000u);
     var l: f32 = 0.0;
 
-    for (var j = 0u; j < u.s_k; j = j + 1u) {
-        let kj_w = kv_b0_w + j * kv_step_w;
-        var dot: f32 = 0.0;
-        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
-            let qv = unpack_bf16x2(q[q_w_off + dw]);
-            let kv = unpack_bf16x2(k[kj_w + dw]);
-            dot = dot + qv.x * kv.x + qv.y * kv.y;
+    let n_tiles = (u.s_k + BC - 1u) / BC;
+    let words_per_tile = BC * d_w;
+    let per_thread = words_per_tile / WG;
+
+    for (var kt = 0u; kt < n_tiles; kt = kt + 1u) {
+        let kc_base = kt * BC;
+
+        for (var i = 0u; i < per_thread; i = i + 1u) {
+            let idx = i * WG + t;
+            let kc  = idx / d_w;
+            let dw  = idx % d_w;
+            let key_global = kc_base + kc;
+            var kw: u32 = 0u;
+            var vw: u32 = 0u;
+            if (key_global < u.s_k) {
+                let base = kv_b0_w + key_global * kv_step_w + dw;
+                kw = k[base];
+                vw = v[base];
+            }
+            k_tile[idx] = kw;
+            v_tile[idx] = vw;
         }
-        var bias: f32 = 0.0;
-        if (u.has_mask != 0u) {
-            let mw = unpack_bf16x2(mask[mask_w_base + (j >> 1u)]);
-            bias = select(mw.x, mw.y, (j & 1u) == 1u);
+        workgroupBarrier();
+
+        if (valid) {
+            for (var kc = 0u; kc < BC; kc = kc + 1u) {
+                let key_global = kc_base + kc;
+                if (key_global < u.s_k) {
+                    var dot: f32 = 0.0;
+                    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+                        let kv = unpack_bf16x2(k_tile[kc * d_w + dw]);
+                        dot = dot + q_local[dw * 2u] * kv.x + q_local[dw * 2u + 1u] * kv.y;
+                    }
+                    var bias: f32 = 0.0;
+                    if (u.has_mask != 0u) {
+                        let mw = unpack_bf16x2(mask[mask_w_base + (key_global >> 1u)]);
+                        bias = select(mw.x, mw.y, (key_global & 1u) == 1u);
+                    }
+                    let s_j  = dot * u.scale + bias;
+                    let m_new = max(m, s_j);
+                    let alpha = exp(m - m_new);
+                    let p_j   = exp(s_j - m_new);
+                    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+                        let vv = unpack_bf16x2(v_tile[kc * d_w + dw]);
+                        o_local[dw * 2u]      = o_local[dw * 2u]      * alpha + p_j * vv.x;
+                        o_local[dw * 2u + 1u] = o_local[dw * 2u + 1u] * alpha + p_j * vv.y;
+                    }
+                    l = l * alpha + p_j;
+                    m = m_new;
+                }
+            }
         }
-        let s_j  = dot * u.scale + bias;
-        let m_new = max(m, s_j);
-        let alpha = exp(m - m_new);
-        let p_j  = exp(s_j - m_new);
-        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
-            let vv = unpack_bf16x2(v[kj_w + dw]);
-            o[dw * 2u]      = o[dw * 2u]      * alpha + p_j * vv.x;
-            o[dw * 2u + 1u] = o[dw * 2u + 1u] * alpha + p_j * vv.y;
-        }
-        l = l * alpha + p_j;
-        m = m_new;
+        workgroupBarrier();
     }
 
-    let inv_l = 1.0 / l;
-    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
-        out[q_w_off + dw] = pack_bf16x2(o[dw * 2u] * inv_l, o[dw * 2u + 1u] * inv_l);
+    if (valid) {
+        let inv_l = 1.0 / l;
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            out[q_w_off + dw] = pack_bf16x2(o_local[dw * 2u] * inv_l, o_local[dw * 2u + 1u] * inv_l);
+        }
     }
 }
 "#
@@ -229,6 +344,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // `exp(s_j)` saturates f16 once scores exceed ~11.1, and the online
 // renormalization mixes magnitudes across keys in a way that loses bits
 // in f16. Same numerical contract as bf16-packed.
+// Tiled flash-attention layout — see WGSL_F32 above for the shared design.
 const WGSL_F16_PACKED: &str = concat!(
     act_f16_prelude!(),
     r#"
@@ -244,61 +360,265 @@ struct U {
 @group(0) @binding(4) var<storage, read_write> out: array<vec2<f16>>;
 @group(0) @binding(5) var<uniform> u: U;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = u.b * u.s_q * u.h_q;
-    let idx = gid.x;
-    if (idx >= total) { return; }
-    let hq  = idx % u.h_q;
-    let tmp = idx / u.h_q;
-    let sq  = tmp % u.s_q;
-    let bb  = tmp / u.s_q;
-    let hkv = (hq * u.h_kv) / u.h_q;
+const BR: u32 = 64u;
+const BC: u32 = 32u;
+const WG: u32 = 64u;
+const MAX_DW: u32 = 64u;
 
+// Shared at 16 KiB/tile to keep 2 workgroups/SM (32 KiB+ collapses to 1/SM
+// on Ada and similar; BC=64 measured ~85% slower on a 5070 768x768).
+var<workgroup> k_tile: array<vec2<f16>, 2048>; // BC * MAX_DW
+var<workgroup> v_tile: array<vec2<f16>, 2048>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let t  = lid.x;
+    let qt = wgid.x;
+    let hq = wgid.y;
+    let bb = wgid.z;
+    let sq = qt * BR + t;
+    let valid = sq < u.s_q;
+
+    let hkv = (hq * u.h_kv) / u.h_q;
     let d_w        = u.d >> 1u;
     let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
     let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
     let kv_step_w  = (u.h_kv * u.d) >> 1u;
     let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
 
-    var o: array<f32, 128>;
-    for (var d = 0u; d < u.d; d = d + 1u) { o[d] = 0.0; }
+    var q_local: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { q_local[d] = 0.0; }
+    if (valid) {
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            let qv: vec2<f32> = vec2<f32>(q[q_w_off + dw]);
+            q_local[dw * 2u]      = qv.x;
+            q_local[dw * 2u + 1u] = qv.y;
+        }
+    }
+
+    var o_local: array<f32, 128>;
+    for (var d = 0u; d < u.d; d = d + 1u) { o_local[d] = 0.0; }
     var m: f32 = bitcast<f32>(0xff800000u);
     var l: f32 = 0.0;
 
-    for (var j = 0u; j < u.s_k; j = j + 1u) {
-        let kj_w = kv_b0_w + j * kv_step_w;
-        var dot: f32 = 0.0;
-        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
-            let qv: vec2<f32> = vec2<f32>(q[q_w_off + dw]);
-            let kv: vec2<f32> = vec2<f32>(k[kj_w + dw]);
-            dot = dot + qv.x * kv.x + qv.y * kv.y;
+    let n_tiles = (u.s_k + BC - 1u) / BC;
+    let words_per_tile = BC * d_w;
+    let per_thread = words_per_tile / WG;
+
+    for (var kt = 0u; kt < n_tiles; kt = kt + 1u) {
+        let kc_base = kt * BC;
+
+        for (var i = 0u; i < per_thread; i = i + 1u) {
+            let idx = i * WG + t;
+            let kc  = idx / d_w;
+            let dw  = idx % d_w;
+            let key_global = kc_base + kc;
+            var kw: vec2<f16> = vec2<f16>(f16(0.0), f16(0.0));
+            var vw: vec2<f16> = vec2<f16>(f16(0.0), f16(0.0));
+            if (key_global < u.s_k) {
+                let base = kv_b0_w + key_global * kv_step_w + dw;
+                kw = k[base];
+                vw = v[base];
+            }
+            k_tile[idx] = kw;
+            v_tile[idx] = vw;
         }
-        var bias: f32 = 0.0;
-        if (u.has_mask != 0u) {
-            let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (j >> 1u)]);
-            bias = select(mw.x, mw.y, (j & 1u) == 1u);
+        workgroupBarrier();
+
+        if (valid) {
+            for (var kc = 0u; kc < BC; kc = kc + 1u) {
+                let key_global = kc_base + kc;
+                if (key_global < u.s_k) {
+                    var dot: f32 = 0.0;
+                    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+                        let kv: vec2<f32> = vec2<f32>(k_tile[kc * d_w + dw]);
+                        dot = dot + q_local[dw * 2u] * kv.x + q_local[dw * 2u + 1u] * kv.y;
+                    }
+                    var bias: f32 = 0.0;
+                    if (u.has_mask != 0u) {
+                        let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (key_global >> 1u)]);
+                        bias = select(mw.x, mw.y, (key_global & 1u) == 1u);
+                    }
+                    let s_j  = dot * u.scale + bias;
+                    let m_new = max(m, s_j);
+                    let alpha = exp(m - m_new);
+                    let p_j   = exp(s_j - m_new);
+                    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+                        let vv: vec2<f32> = vec2<f32>(v_tile[kc * d_w + dw]);
+                        o_local[dw * 2u]      = o_local[dw * 2u]      * alpha + p_j * vv.x;
+                        o_local[dw * 2u + 1u] = o_local[dw * 2u + 1u] * alpha + p_j * vv.y;
+                    }
+                    l = l * alpha + p_j;
+                    m = m_new;
+                }
+            }
         }
-        let s_j  = dot * u.scale + bias;
-        let m_new = max(m, s_j);
-        let alpha = exp(m - m_new);
-        let p_j  = exp(s_j - m_new);
-        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
-            let vv: vec2<f32> = vec2<f32>(v[kj_w + dw]);
-            o[dw * 2u]      = o[dw * 2u]      * alpha + p_j * vv.x;
-            o[dw * 2u + 1u] = o[dw * 2u + 1u] * alpha + p_j * vv.y;
-        }
-        l = l * alpha + p_j;
-        m = m_new;
+        workgroupBarrier();
     }
 
-    let inv_l = 1.0 / l;
-    for (var dw = 0u; dw < d_w; dw = dw + 1u) {
-        out[q_w_off + dw] = vec2<f16>(vec2<f32>(o[dw * 2u] * inv_l, o[dw * 2u + 1u] * inv_l));
+    if (valid) {
+        let inv_l = 1.0 / l;
+        for (var dw = 0u; dw < d_w; dw = dw + 1u) {
+            out[q_w_off + dw] = vec2<f16>(vec2<f32>(o_local[dw * 2u] * inv_l, o_local[dw * 2u + 1u] * inv_l));
+        }
     }
 }
 "#
 );
+
+// F16 subgroup sdpa. Same flash layout as WGSL_F16_PACKED but each Q row is
+// owned by a CL=8-lane cluster instead of one thread: D is split across the
+// cluster (vec4<f16> slices, max 4 per lane at D=128), the per-key dot is
+// cluster-reduced with three subgroupShuffleXor hops, and every lane then
+// replicates the online-softmax scalars (m, l, p_j, alpha) locally - no
+// shared-memory round trip, no barrier in the inner loop. This removes the
+// per-thread `array<f32, 128>` q/o state of the one-thread-one-row kernel,
+// which spills to local memory at D=128 and made sdpa memory-latency-bound
+// (~0.22 TFLOPS effective at 768x768; llama.cpp's Vulkan flash_attn.comp
+// uses the same D_split + subgroupShuffleXor decomposition).
+//
+// Tail keys (s_k not a multiple of BC) are folded branchlessly: their score
+// is forced to -FLT_MAX so p_j = 0 and the shuffle stays in uniform control
+// flow. Cluster lanes never straddle a subgroup (lid%8 == sg_lane%8 for any
+// subgroup size that is a multiple of 8); the build site gates on
+// subgroup_min_size >= 8.
+//
+// Constraints: D % 32 == 0 (each lane handles D/8 elements as D/32 vec4s),
+// D <= 128. Grid [ceil(S_q/16), H_q, B].
+// Shared: BC * MAX_DV4 * 8 bytes * 2 = 16 KiB (2+ workgroups/SM).
+// NOTE: no `enable subgroups;` - naga implements the subgroup builtins but
+// rejects the enable directive itself (gfx-rs/wgpu#5555); matmul_i8 relies
+// on the same behavior.
+const WGSL_F16_SG: &str = r#"enable f16;
+
+struct U {
+    b: u32, h_q: u32, h_kv: u32, s_q: u32,
+    s_k: u32, d: u32, scale: f32, has_mask: u32,
+};
+
+@group(0) @binding(0) var<storage, read> q: array<vec4<f16>>;
+@group(0) @binding(1) var<storage, read> k: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read> v: array<vec4<f16>>;
+@group(0) @binding(3) var<storage, read> mask: array<vec2<f16>>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f16>>;
+@group(0) @binding(5) var<uniform> u: U;
+
+const BR: u32 = 16u;      // Q rows per workgroup
+const BC: u32 = 32u;      // keys per shared tile
+const WG: u32 = 128u;
+const CL: u32 = 8u;       // lanes per Q row (D split)
+const MAX_DV4: u32 = 32u; // vec4s per row at D=128
+const NEG_MAX: f32 = -3.402823e38;
+
+var<workgroup> k_tile: array<vec4<f16>, 1024>; // BC * MAX_DV4
+var<workgroup> v_tile: array<vec4<f16>, 1024>;
+
+@compute @workgroup_size(128)
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let t    = lid.x;
+    let row  = t / CL;
+    let lane = t % CL;
+    let sq    = wgid.x * BR + row;
+    let hq    = wgid.y;
+    let bb    = wgid.z;
+    let valid = sq < u.s_q;
+    let sq_c  = min(sq, u.s_q - 1u);
+
+    let hkv     = (hq * u.h_kv) / u.h_q;
+    let d_v4    = u.d >> 2u;
+    let n_l     = d_v4 / CL; // vec4s per lane: 1..4
+    let q_off   = (((bb * u.s_q + sq_c) * u.h_q + hq) * u.d) >> 2u;
+    let kv_b0   = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 2u;
+    let kv_step = (u.h_kv * u.d) >> 2u;
+    let mask_w_base = ((bb * u.s_q + sq_c) * u.s_k) >> 1u;
+    let l_off   = lane * n_l;
+
+    var q0 = vec4<f32>();
+    var q1 = vec4<f32>();
+    var q2 = vec4<f32>();
+    var q3 = vec4<f32>();
+    q0 = vec4<f32>(q[q_off + l_off]);
+    if (n_l > 1u) { q1 = vec4<f32>(q[q_off + l_off + 1u]); }
+    if (n_l > 2u) { q2 = vec4<f32>(q[q_off + l_off + 2u]); }
+    if (n_l > 3u) { q3 = vec4<f32>(q[q_off + l_off + 3u]); }
+
+    var o0 = vec4<f32>();
+    var o1 = vec4<f32>();
+    var o2 = vec4<f32>();
+    var o3 = vec4<f32>();
+    var m: f32 = NEG_MAX;
+    var l: f32 = 0.0;
+
+    let n_tiles = (u.s_k + BC - 1u) / BC;
+    let v4_per_tile = BC * d_v4;
+
+    for (var kt = 0u; kt < n_tiles; kt = kt + 1u) {
+        let kc_base = kt * BC;
+
+        for (var idx = t; idx < v4_per_tile; idx = idx + WG) {
+            let kc = idx / d_v4;
+            let dv = idx % d_v4;
+            let key_global = kc_base + kc;
+            var kw = vec4<f16>();
+            var vw = vec4<f16>();
+            if (key_global < u.s_k) {
+                let base = kv_b0 + key_global * kv_step + dv;
+                kw = k[base];
+                vw = v[base];
+            }
+            k_tile[idx] = kw;
+            v_tile[idx] = vw;
+        }
+        workgroupBarrier();
+
+        for (var kc = 0u; kc < BC; kc = kc + 1u) {
+            let key_global = kc_base + kc;
+            let tb = kc * d_v4 + l_off;
+
+            var part = dot(q0, vec4<f32>(k_tile[tb]));
+            if (n_l > 1u) { part = part + dot(q1, vec4<f32>(k_tile[tb + 1u])); }
+            if (n_l > 2u) { part = part + dot(q2, vec4<f32>(k_tile[tb + 2u])); }
+            if (n_l > 3u) { part = part + dot(q3, vec4<f32>(k_tile[tb + 3u])); }
+            // Cluster reduce: after 3 xor hops every lane holds the full dot.
+            part = part + subgroupShuffleXor(part, 1u);
+            part = part + subgroupShuffleXor(part, 2u);
+            part = part + subgroupShuffleXor(part, 4u);
+
+            var bias: f32 = 0.0;
+            if (u.has_mask != 0u) {
+                let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (key_global >> 1u)]);
+                bias = select(mw.x, mw.y, (key_global & 1u) == 1u);
+            }
+            // Tail keys score -FLT_MAX -> p_j = 0, alpha = 1: no-op fold.
+            let s_j = select(NEG_MAX, part * u.scale + bias, key_global < u.s_k);
+            let m_new = max(m, s_j);
+            let alpha = exp(m - m_new);
+            let p_j   = exp(s_j - m_new);
+            o0 = o0 * alpha + p_j * vec4<f32>(v_tile[tb]);
+            if (n_l > 1u) { o1 = o1 * alpha + p_j * vec4<f32>(v_tile[tb + 1u]); }
+            if (n_l > 2u) { o2 = o2 * alpha + p_j * vec4<f32>(v_tile[tb + 2u]); }
+            if (n_l > 3u) { o3 = o3 * alpha + p_j * vec4<f32>(v_tile[tb + 3u]); }
+            l = l * alpha + p_j;
+            m = m_new;
+        }
+        workgroupBarrier();
+    }
+
+    if (valid) {
+        let inv_l = 1.0 / l;
+        out[q_off + l_off] = vec4<f16>(o0 * inv_l);
+        if (n_l > 1u) { out[q_off + l_off + 1u] = vec4<f16>(o1 * inv_l); }
+        if (n_l > 2u) { out[q_off + l_off + 2u] = vec4<f16>(o2 * inv_l); }
+        if (n_l > 3u) { out[q_off + l_off + 3u] = vec4<f16>(o3 * inv_l); }
+    }
+}
+"#;
 
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
@@ -344,10 +664,44 @@ impl SdpaOp for SdpaF32 {
             (ActDtype::F32, true) => WGSL_F32_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
             (ActDtype::F16, _) => WGSL_F16_PACKED,
+            (ActDtype::I8, _) => unreachable!("ActDtype::I8 is never a block-level act dtype"),
         }
     }
     fn layout() -> &'static [BindingLayout] {
         LAYOUT
+    }
+}
+
+/// Subgroup small-D variant of [`SdpaF32`]: F16 acts only, D % 32 == 0,
+/// D <= 128. Build sites gate on `supports_subgroups()` and
+/// `subgroup_size_range().0 >= 8`; dispatch sites fall back to [`SdpaF32`]
+/// when the D constraint doesn't hold.
+pub struct SdpaF16Sg;
+
+impl SdpaOp for SdpaF16Sg {
+    const KERNEL_ID: &'static str = "sdpa_sg.f16";
+    type Dtype = F32;
+    const Q: &'static str = "sdpa/q";
+    const K: &'static str = "sdpa/k";
+    const V: &'static str = "sdpa/v";
+    const MASK: &'static str = "sdpa/mask";
+    const DIMS: &'static str = "sdpa/dims";
+    const OUTPUT: &'static str = "sdpa/out";
+
+    fn wgsl(cfg: &WgslConfig) -> &'static str {
+        assert_eq!(
+            cfg.act_dtype,
+            ActDtype::F16,
+            "sdpa_sg: F16 acts only (build site gates on the F16 pipeline set)"
+        );
+        WGSL_F16_SG
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+    fn workgroups(b: u32, s_q: u32, h_q: u32) -> [u32; 3] {
+        // BR=16 Q rows per workgroup (8-lane cluster per row, WG=128).
+        [s_q.div_ceil(16), h_q, b]
     }
 }
 
@@ -636,6 +990,11 @@ impl SdpaOp for SdpaF32LargeD {
             ActDtype::F16 => WGSL_LARGE_D_F16,
             ActDtype::Bf16 => {
                 panic!("sdpa_large_d: bf16-packed acts variant not implemented (VAE is f32)")
+            }
+            ActDtype::I8 => {
+                // VAE never gets I8 acts (per worklog: VAE I8 explicitly out of
+                // scope - different shape regime, tile-bounded working set).
+                unreachable!("sdpa_large_d: ActDtype::I8 not supported (VAE stays F32)")
             }
         }
     }

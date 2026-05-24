@@ -1,4 +1,4 @@
-use super::{WeightDtype, WgslConfig};
+use super::{ActDtype, WeightDtype, WgslConfig};
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 use crate::tensor::{ComputeDtype, F32};
 
@@ -13,9 +13,10 @@ use crate::tensor::{ComputeDtype, F32};
 /// - `bias:   [C]` (affine offset, always present)
 /// - `out:    [B, C, H, W]`
 ///
-/// One thread per `(b, group)` row. Two passes (mean, variance) for numerical
-/// stability vs `E[X^2] - E[X]^2`. Slow at full VAE resolution; planned
-/// follow-up is workgroup-per-row parallel reduction.
+/// One WORKGROUP (256 threads) per `(b, group)` row: threads stride the
+/// group's `(C/G)*H*W` elements, partial sums tree-reduce in shared memory.
+/// Two passes (mean, variance) for numerical stability vs `E[X^2] - E[X]^2`.
+/// Reductions and normalize math are f32 regardless of act dtype.
 ///
 /// Layout: 0=X, 1=Weight, 2=Bias, 3=Out, 4=Uniform.
 pub trait GroupNormOp {
@@ -31,7 +32,7 @@ pub trait GroupNormOp {
     fn layout() -> &'static [BindingLayout];
 
     fn workgroups(n_rows: u32) -> [u32; 3] {
-        [n_rows.div_ceil(64), 1, 1]
+        [n_rows, 1, 1]
     }
 }
 
@@ -65,14 +66,34 @@ macro_rules! group_norm_body {
         r#"
 struct U { b: u32, c: u32, g: u32, h: u32, w: u32, eps: f32, _pad0: u32, _pad1: u32 };
 
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<uniform> u: U;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
+const WG: u32 = 256u;
+var<workgroup> partial: array<f32, 256u>;
+
+fn reduce_sum(tid: u32) -> f32 {
+    workgroupBarrier();
+    var stride: u32 = WG / 2u;
+    while (stride > 0u) {
+        if (tid < stride) {
+            partial[tid] = partial[tid] + partial[tid + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let total = partial[0];
+    workgroupBarrier();
+    return total;
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let row = wid.x;
     if (row >= u.b * u.g) { return; }
+    let tid = lid.x;
     let bi = row / u.g;
     let gi = row - bi * u.g;
     let c_per_g = u.c / u.g;
@@ -81,28 +102,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let group_base = bi * (u.c * hw) + gi * (c_per_g * hw);
 
     var sum: f32 = 0.0;
-    for (var i: u32 = 0u; i < n_elems; i = i + 1u) {
-        sum = sum + x[group_base + i];
+    for (var i: u32 = tid; i < n_elems; i = i + WG) {
+        sum = sum + load_x(group_base + i);
     }
-    let mean = sum / f32(n_elems);
+    partial[tid] = sum;
+    let mean = reduce_sum(tid) / f32(n_elems);
 
     var sum_sq: f32 = 0.0;
-    for (var i: u32 = 0u; i < n_elems; i = i + 1u) {
-        let d = x[group_base + i] - mean;
+    for (var i: u32 = tid; i < n_elems; i = i + WG) {
+        let d = load_x(group_base + i) - mean;
         sum_sq = sum_sq + d * d;
     }
-    let inv = inverseSqrt(sum_sq / f32(n_elems) + u.eps);
+    partial[tid] = sum_sq;
+    let inv = inverseSqrt(reduce_sum(tid) / f32(n_elems) + u.eps);
 
-    for (var ic: u32 = 0u; ic < c_per_g; ic = ic + 1u) {
-        let ch = gi * c_per_g + ic;
+    for (var i: u32 = tid; i < n_elems; i = i + WG) {
+        let ch = gi * c_per_g + i / hw;
         let scale = load_weight(ch) * inv;
         let offset = load_bias(ch) - mean * scale;
-        let ch_base = group_base + ic * hw;
-        for (var j: u32 = 0u; j < hw; j = j + 1u) {
-            out[ch_base + j] = act_store(x[ch_base + j] * scale + offset);
-        }
+        store_out(group_base + i, load_x(group_base + i) * scale + offset);
     }
 }
+"#
+    };
+}
+
+macro_rules! group_norm_acts_f32 {
+    () => {
+        r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+fn load_x(i: u32) -> f32 { return x[i]; }
+fn store_out(i: u32, v: f32) { out[i] = v; }
+"#
+    };
+}
+
+// Native-f16 act storage; scalar element loads (group rows have arbitrary
+// element alignment). Reductions stay f32; saturated narrow at the store.
+macro_rules! group_norm_acts_f16 {
+    () => {
+        r#"enable f16;
+@group(0) @binding(0) var<storage, read> x: array<f16>;
+@group(0) @binding(3) var<storage, read_write> out: array<f16>;
+fn load_x(i: u32) -> f32 { return f32(x[i]); }
+fn store_out(i: u32, v: f32) { out[i] = f16(clamp(v, -65504.0, 65504.0)); }
 "#
     };
 }
@@ -133,12 +177,21 @@ fn load_bias(i: u32) -> f32 { return unpack_bf16(bias[i >> 1u], i); }
     };
 }
 
-crate::weight_op_wgsl_no_bf16q! {
-    (WGSL_F32, WGSL_F32_WBF16);
-    body = group_norm_body!();
-    f32_bindings = group_norm_f32_bindings!();
-    bf16_bindings = group_norm_bf16_bindings!();
-}
+const WGSL_F32: &str = concat!(
+    group_norm_acts_f32!(),
+    group_norm_f32_bindings!(),
+    group_norm_body!()
+);
+const WGSL_F32_WBF16: &str = concat!(
+    group_norm_acts_f32!(),
+    group_norm_bf16_bindings!(),
+    group_norm_body!()
+);
+const WGSL_F16_WBF16: &str = concat!(
+    group_norm_acts_f16!(),
+    group_norm_bf16_bindings!(),
+    group_norm_body!()
+);
 
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
@@ -175,11 +228,11 @@ impl GroupNormOp for GroupNormF32 {
     const OUTPUT: &'static str = "group_norm/out";
     fn wgsl(cfg: &WgslConfig) -> &'static str {
         assert!(!cfg.bf16_quant_writes);
-        match cfg.weight_dtype {
-            WeightDtype::F32 => WGSL_F32,
-            WeightDtype::Bf16 => WGSL_F32_WBF16,
-            WeightDtype::F16 => unreachable!("group_norm does not consume f16 weights"),
-            WeightDtype::Quant(_) => unreachable!("group_norm does not consume quant weights"),
+        match (cfg.act_dtype, cfg.weight_dtype) {
+            (ActDtype::F32, WeightDtype::F32) => WGSL_F32,
+            (ActDtype::F32, WeightDtype::Bf16) => WGSL_F32_WBF16,
+            (ActDtype::F16, WeightDtype::Bf16) => WGSL_F16_WBF16,
+            (a, w) => unreachable!("group_norm unsupported (act={a:?}, weight={w:?})"),
         }
     }
     fn layout() -> &'static [BindingLayout] {

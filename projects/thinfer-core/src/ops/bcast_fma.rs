@@ -161,6 +161,7 @@ impl BcastFmaOp for BcastFmaF32 {
             (ActDtype::F32, true) => WGSL_F32_BF16,
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
             (ActDtype::F16, _) => WGSL_F16_PACKED,
+            (ActDtype::I8, _) => unreachable!("ActDtype::I8 is never a block-level act dtype"),
         }
     }
     fn layout() -> &'static [BindingLayout] {

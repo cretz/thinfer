@@ -1,5 +1,6 @@
 // thinfer-core: engine logic, no platform-specific dependencies. Must build on wasm.
 
+pub mod arbiter;
 pub mod backend;
 pub mod cache;
 pub mod format;

@@ -60,6 +60,10 @@ pub const WS: &str = "thinfer::ws";
 /// ("record" | "complete" | "rejected"), `ordinal`, `len` / `err`.
 pub const RBE: &str = "thinfer::rbe";
 
+/// Memory-budget arbiter reclaim chain. Fields: `op` ("reclaim" | "overshoot"),
+/// `source` (reclaimer label), `want`, `freed` / `bytes`, `over`.
+pub const ARBITER: &str = "thinfer::arbiter";
+
 /// wgpu adapter info emitted once at backend construction. Fields: `name`,
 /// `vendor`, `device`, `backend`, `driver`, `driver_info`, `device_type`.
 pub const ADAPTER: &str = "thinfer::adapter";

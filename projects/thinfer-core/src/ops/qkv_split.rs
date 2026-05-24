@@ -181,6 +181,7 @@ impl QkvSplitOp for QkvSplitF32 {
             ActDtype::F32 => WGSL_F32,
             ActDtype::Bf16 => WGSL_BF16_PACKED,
             ActDtype::F16 => WGSL_F16_PACKED,
+            ActDtype::I8 => unreachable!("ActDtype::I8 is never a block-level act dtype"),
         }
     }
     fn layout() -> &'static [BindingLayout] {

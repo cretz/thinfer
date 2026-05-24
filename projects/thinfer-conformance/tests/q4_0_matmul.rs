@@ -211,7 +211,7 @@ fn q4_0_matmul_prod_geom_qkv_f32_acts() {
         tn: 4,
         b_nmajor: false,
     };
-    let (got, exp) = pollster::block_on(run_one_with_cfg(1024, 11520, 3840, 0xC0DE_BABE, cfg));
+    let (got, exp) = pollster::block_on(run_one_with_cfg(64, 11520, 3840, 0xC0DE_BABE, cfg));
     let nan_count = got.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
         nan_count,

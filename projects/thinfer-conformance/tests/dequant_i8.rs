@@ -29,14 +29,17 @@ fn pack_dims_u32x4(n: u32, k: u32) -> [u8; 16] {
 
 /// CPU reference matching the kernel's per-sub-block i8 quantization rule:
 /// for each (n, k/32) sub-block of `b_deq[N, K]`, find absmax, scale = absmax/127,
-/// then round each element to i8 (clamped to [-127, 127]).
-fn cpu_dequant_i8_ref(b_deq: &[f32], n: u32, k: u32) -> (Vec<i8>, Vec<f32>) {
+/// then round each element to i8 (clamped to [-127, 127]). Also emits the
+/// per-block sum of i8 values (`b_qsum`, the asymmetric-acts correction
+/// factor consumed by matmul_i8).
+fn cpu_dequant_i8_ref(b_deq: &[f32], n: u32, k: u32) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
     assert!(k.is_multiple_of(32));
     let n = n as usize;
     let k = k as usize;
     let blocks = k / 32;
     let mut i8_out = vec![0i8; n * k];
     let mut scale_out = vec![0f32; n * blocks];
+    let mut qsum_out = vec![0f32; n * blocks];
     for ni in 0..n {
         for sb in 0..blocks {
             let off = ni * k + sb * 32;
@@ -45,25 +48,29 @@ fn cpu_dequant_i8_ref(b_deq: &[f32], n: u32, k: u32) -> (Vec<i8>, Vec<f32>) {
             let scale = absmax / 127.0;
             scale_out[ni * blocks + sb] = scale;
             let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            let mut s: i32 = 0;
             for (i, &v) in block.iter().enumerate() {
                 let q = (v * inv).round().clamp(-127.0, 127.0) as i32;
                 i8_out[off + i] = q as i8;
+                s += q;
             }
+            qsum_out[ni * blocks + sb] = s as f32;
         }
     }
-    (i8_out, scale_out)
+    (i8_out, scale_out, qsum_out)
 }
 
+#[allow(clippy::type_complexity)]
 async fn run_one(
     scheme: QuantKind,
     n: u32,
     k: u32,
     b_q: &[u8],
     b_deq: &[f32],
-) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<f32>) {
+) -> (Vec<i8>, Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>, Vec<f32>) {
     let bs = scheme.block_size();
     assert!(k.is_multiple_of(bs), "K must be multiple of block_size");
-    let (exp_i8, exp_scale) = cpu_dequant_i8_ref(b_deq, n, k);
+    let (exp_i8, exp_scale, exp_qsum) = cpu_dequant_i8_ref(b_deq, n, k);
 
     let backend = WgpuBackend::new().await.expect("wgpu adapter");
     let wgsl = build_wgsl(scheme);
@@ -79,12 +86,15 @@ async fn run_one(
     };
     let b_buf = alloc_with(b_q);
     let dims_buf = alloc_with(&pack_dims_u32x4(n, k));
-    let i8_len = (n as u64) * (k as u64); // 1 byte per i8 elem
+    let i8_len = (n as u64) * (k as u64);
     let scale_len = (n as u64) * (k as u64 / 32) * 4;
+    let qsum_len = scale_len;
     let i8_id = backend.allocate(i8_len).expect("alloc i8");
     let scale_id = backend.allocate(scale_len).expect("alloc scale");
+    let qsum_id = backend.allocate(qsum_len).expect("alloc qsum");
     let i8_buf = BufRef::new(i8_id, i8_len);
     let scale_buf = BufRef::new(scale_id, scale_len);
+    let qsum_buf = BufRef::new(qsum_id, qsum_len);
 
     let mut enc = backend.create_command_encoder();
     dispatch_dequant_i8(
@@ -96,6 +106,7 @@ async fn run_one(
             b_quant: &b_buf,
             b_i8: &i8_buf,
             b_scale: &scale_buf,
+            b_qsum: &qsum_buf,
             dims: &dims_buf,
         },
         n,
@@ -117,13 +128,22 @@ async fn run_one(
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
+    let qsum_bytes = backend
+        .read_buffer(qsum_id, 0, qsum_len)
+        .await
+        .expect("read qsum");
+    let got_qsum: Vec<f32> = qsum_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
 
     backend.free(b_buf.id);
     backend.free(dims_buf.id);
     backend.free(i8_id);
     backend.free(scale_id);
+    backend.free(qsum_id);
 
-    (got_i8, got_scale, exp_i8, exp_scale)
+    (got_i8, got_scale, got_qsum, exp_i8, exp_scale, exp_qsum)
 }
 
 fn pipeline_build_check(scheme: QuantKind) {
@@ -188,13 +208,22 @@ fn dequant_i8_q8_0_numeric() {
     // Reference: dequant the same bytes back to f32, then i8-quantize.
     let mut b_deq = vec![0f32; (n * k) as usize];
     dequantize_row_q8_0(&b_q, &mut b_deq);
-    let (got_i8, got_scale, exp_i8, exp_scale) =
+    let (got_i8, got_scale, got_qsum, exp_i8, exp_scale, exp_qsum) =
         pollster::block_on(run_one(QuantKind::Q8_0, n, k, &b_q, &b_deq));
     assert_eq!(got_scale.len(), exp_scale.len());
     for (i, (g, e)) in got_scale.iter().zip(&exp_scale).enumerate() {
         assert!(
             (g - e).abs() <= 1e-5 * e.abs().max(1e-6),
             "scale[{i}] gpu={g} cpu={e}"
+        );
+    }
+    // qsum: small i8-sum integers; exact match expected (kernel sums i32 and
+    // narrows to f32 — losslessly within range).
+    assert_eq!(got_qsum.len(), exp_qsum.len());
+    for (i, (g, e)) in got_qsum.iter().zip(&exp_qsum).enumerate() {
+        assert!(
+            (g - e).abs() <= 1.0,
+            "qsum[{i}] gpu={g} cpu={e} (>1 ULP off from CPU ref)"
         );
     }
     let mismatches: usize = got_i8
@@ -228,13 +257,18 @@ fn dequant_i8_q4_0_numeric() {
     }
     let mut b_deq = vec![0f32; (n * k) as usize];
     dequantize_row_q4_0(&b_q, &mut b_deq);
-    let (got_i8, got_scale, exp_i8, exp_scale) =
+    let (got_i8, got_scale, got_qsum, exp_i8, exp_scale, exp_qsum) =
         pollster::block_on(run_one(QuantKind::Q4_0, n, k, &b_q, &b_deq));
     for (i, (g, e)) in got_scale.iter().zip(&exp_scale).enumerate() {
         assert!(
             (g - e).abs() <= 1e-5 * e.abs().max(1e-6),
             "scale[{i}] gpu={g} cpu={e}"
         );
+    }
+    // Q4_0: i8 cells can be off by ±1 ULP from the rounding-tie ambiguity
+    // inherited from the Q4 dequant. Sum of 32 such errors bounded at ±32.
+    for (i, (g, e)) in got_qsum.iter().zip(&exp_qsum).enumerate() {
+        assert!((g - e).abs() <= 32.0, "qsum[{i}] gpu={g} cpu={e}");
     }
     let mismatches: usize = got_i8
         .iter()

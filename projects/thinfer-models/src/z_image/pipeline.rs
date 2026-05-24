@@ -15,6 +15,7 @@
 //!   DiT patch size is 2 on top of VAE's 8).
 
 use std::sync::Arc;
+use thinfer_core::arbiter::{MemArbiter, RECLAIM_EVICTABLE_WEIGHTS};
 use thinfer_core::backend::{Backend, WgpuBackend, WgpuError};
 use thinfer_core::ops::{WeightDtype, WgslConfig};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
@@ -57,6 +58,80 @@ pub struct GenerationParams {
     pub seed: u64,
 }
 
+/// DIAG sinks for step-0 only: captures the chain of intermediate
+/// tensors between the DiT residual stream out of block N-1 and the
+/// scheduler's `prev_sample`. Used by the parity test to linfit each
+/// stage against pyref and localize where the slope-shrink appears.
+#[derive(Default)]
+pub struct Step0LocalizationTaps {
+    /// Residual stream after block N-1, full `seq_u * dim` f32.
+    pub last_main: Vec<f32>,
+    /// `final_layer` output, full `seq_u * oc` f32.
+    pub final_layer: Vec<f32>,
+    /// Scheduler input at step 0: post-unpatchify, post-negation
+    /// `[c_latent * h_lat * w_lat]` f32. Equivalent to the model's
+    /// velocity estimate that the Euler step consumes.
+    pub model_output_post_neg: Vec<f32>,
+    /// `sigmas[1] - sigmas[0]` -- needed to back-derive pyref's
+    /// velocity at step 0 from `prev_sample - starting_latents`.
+    pub dt_step0: f32,
+    /// Full residual stream after every main block (length 30, one
+    /// `seq_u * dim` f32 vec per block). Used to plot per-block slope
+    /// vs pyref and localize the first block where slope deviates.
+    pub per_block_residual: Vec<Vec<f32>>,
+    /// Per-op intermediates at main block 0 and block N-1. Same fields
+    /// as the engine's `Block0Taps`; populated only at step 0.
+    pub block0: Block0LocalTaps,
+    pub block_last: Block0LocalTaps,
+    /// Per-op intermediates at "damage zone" main blocks. Engine-side
+    /// `extra_blocks` populates each `(idx, Block0LocalTaps)`. The
+    /// parity test pre-fills the block indices it wants instrumented
+    /// (typically 24..29) before the denoise call.
+    pub damage_zone: Vec<(usize, Block0LocalTaps)>,
+}
+
+/// Per-op intermediates inside a DiT main block, decoded to f32. Each
+/// `Vec<f32>` is full-tensor; empty when the engine didn't populate the
+/// matching `Block0Taps` field (kernel doesn't fire in this branch).
+#[derive(Default)]
+pub struct Block0LocalTaps {
+    pub adaln_input: Vec<f32>,
+    pub adaln_pre: Vec<f32>,
+    pub adaln_full: Vec<f32>,
+    pub scale_msa: Vec<f32>,
+    pub gate_msa: Vec<f32>,
+    pub scale_mlp: Vec<f32>,
+    pub gate_mlp: Vec<f32>,
+    pub attn_norm1_out: Vec<f32>,
+    pub modulated_attn_in: Vec<f32>,
+    pub attn_q: Vec<f32>,
+    pub attn_k: Vec<f32>,
+    pub attn_v: Vec<f32>,
+    pub attn_q_norm: Vec<f32>,
+    pub attn_k_norm: Vec<f32>,
+    pub attn_q_rope: Vec<f32>,
+    pub attn_k_rope: Vec<f32>,
+    pub attn_sdpa: Vec<f32>,
+    pub attn_out: Vec<f32>,
+    pub attn_norm2_out: Vec<f32>,
+    pub x_mid: Vec<f32>,
+    pub ffn_norm1_out: Vec<f32>,
+    pub modulated_ffn_in: Vec<f32>,
+    pub ffn_raw: Vec<f32>,
+    pub ffn_norm2_out: Vec<f32>,
+    /// QKV-site byte snapshots for the matmul_i8 audit. Empty unless the
+    /// corresponding `Block0Taps` byte-head fields were requested.
+    pub qkv_attn_in_data_head: Vec<u8>,
+    pub qkv_attn_in_params_head: Vec<u8>,
+    pub qkv_b_i8_head: Vec<u8>,
+    pub qkv_b_scale_head: Vec<u8>,
+    pub qkv_b_qsum_head: Vec<u8>,
+    pub qkv_dbg_trace_head: Vec<u8>,
+    /// QKV-site f16 matmul output, decoded to f32. Mirrors `attn_qkv_f16_pre_quant`
+    /// already used at block0 / block_last, exposed here for damage-zone audit.
+    pub attn_qkv_f16_pre_quant: Vec<f32>,
+}
+
 pub struct ZImageModel<S: WeightSource, T: Tokenizer> {
     backend: Arc<WgpuBackend>,
     residency: WeightResidency<S>,
@@ -80,6 +155,10 @@ pub struct ZImageModel<S: WeightSource, T: Tokenizer> {
     /// keeps `weight_dtype = Bf16` because refiners/embedders aren't quantized
     /// even in the GGUF path.
     dit_encoder_block_pipelines: BlockPipelines,
+    /// Pipeline set for the dense-input front-door ops: `XEmbedder` /
+    /// `CapEmbedder` (their inputs are dense F32 uploaded patches / cap
+    /// features) and `FinalLayer`. Mirrors `dit_encoder_block_pipelines`.
+    dit_embedder_block_pipelines: BlockPipelines,
     dit_handles: crate::z_image::loader::LoadedDitHandles,
     encoder: Qwen3Encoder,
     encoder_handles: Qwen3Handles,
@@ -174,7 +253,19 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         tokenizer: T,
     ) -> Result<Self, ModelLoadError> {
         let t0 = std::time::Instant::now();
-        let dit_handles = register_dit_handles(&residency)?;
+        // Weights join the VRAM arbiter's reclaim chain: workspace growth
+        // can evict prefetch-warmed (unpinned) residents instead of
+        // overshooting the budget. The inverse direction (weights evicting
+        // idle workspace) is registered by each `Workspace::new`.
+        residency.arbiter().register(
+            RECLAIM_EVICTABLE_WEIGHTS,
+            residency.reclaimer(Arc::clone(&backend)),
+        );
+        // Refiner matmuls ship bf16 in the unsloth GGUFs; when the main
+        // path is quant-flavored, requantize them to Q8_0 at upload so
+        // they ride the quant matmul path (see `refiner_transcode_target`).
+        let refiner_transcode = crate::z_image::loader::refiner_transcode_target(&residency);
+        let dit_handles = register_dit_handles(&residency, refiner_transcode)?;
         let encoder_handles = register_qwen3_handles(&residency)?;
         let vae_handles = register_vae_decoder_handles(&residency)?;
         tracing::debug!(
@@ -248,6 +339,10 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             .any(|slots| slots.iter().any(|s| matches!(s, WeightDtype::Quant(_))));
         let (quant_act_dtype, ops_template_bf16w): (thinfer_core::ops::ActDtype, WgslConfig) =
             if any_quant {
+                // SHADER_F16 -> F16 acts (the production path); no
+                // SHADER_F16 -> F32 fallback. I8 is never a block-wide act
+                // dtype: it exists only inside matmul sites (DP4A act_quant
+                // transcode) and the opt-in i8 attention below.
                 let a = if backend.supports_shader_f16() {
                     thinfer_core::ops::ActDtype::F16
                 } else {
@@ -259,7 +354,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     "DiT quant matmul activation dtype",
                 );
                 let bf16w = WgslConfig {
-                    bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
+                    bf16_quant_writes: crate::z_image::manifest::current_recipe().bf16_quant_writes,
                     act_dtype: a,
                     weight_dtype: WeightDtype::Bf16,
                 };
@@ -267,6 +362,13 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             } else {
                 (thinfer_core::ops::ActDtype::Bf16, WgslConfig::BF16_PACKED)
             };
+        // i8 attention: opt-in via `RECIPE.i8_sdpa`, requires SHADER_F16 and
+        // the Quant path. Main DiT blocks only — the refiners/encoder run
+        // short context sequences where i8 attention buys nothing.
+        let i8_sdpa = crate::z_image::manifest::current_recipe().i8_sdpa
+            && any_quant
+            && backend.supports_shader_f16();
+        tracing::info!(i8_sdpa, "DiT i8 attention opt-in");
         // Build per-layer configs. Within each layer the four main slots
         // (qkv, proj, ffn_up, ffn_down) carry their probed weight dtype;
         // adaln stays bf16; ops template is uniform.
@@ -275,7 +377,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         let mk_main = |wd: WeightDtype| -> WgslConfig {
             if any_quant {
                 WgslConfig {
-                    bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
+                    bf16_quant_writes: crate::z_image::manifest::current_recipe().bf16_quant_writes,
                     act_dtype: quant_act_dtype,
                     weight_dtype: wd,
                 }
@@ -286,14 +388,16 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 }
             }
         };
+        let matmul_adaln_cfg = ops_template_bf16w;
         for slots in &per_layer_weights {
             let cfgs = BlockWgslConfigs {
                 matmul_qkv: mk_main(slots[0]),
                 matmul_proj: mk_main(slots[1]),
                 matmul_ffn_up: mk_main(slots[2]),
                 matmul_ffn_down: mk_main(slots[3]),
-                matmul_adaln: ops_template_bf16w,
+                matmul_adaln: matmul_adaln_cfg,
                 ops: ops_template_bf16w,
+                i8_sdpa,
             };
             block_pipelines.push(BlockPipelines::compile(&backend, &cfgs).await?);
         }
@@ -308,23 +412,55 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // Qwen3 text encoder pipelines: fp32 acts + bf16 weights, untuned
         // matmul path. Independent of the DiT path's dtype choice.
         let encoder_cfgs = BlockWgslConfigs::uniform(WgslConfig {
-            bf16_quant_writes: crate::z_image::manifest::RECIPE.bf16_quant_writes,
+            bf16_quant_writes: crate::z_image::manifest::current_recipe().bf16_quant_writes,
             act_dtype: thinfer_core::ops::ActDtype::F32,
             weight_dtype: WeightDtype::Bf16,
         });
         let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfgs).await?;
         // DiT-side encoder ops (x/t/cap embedders + refiners + final_layer):
         // must share `act_dtype` with the main DiT loop because their outputs
-        // feed directly into the main layers' activation buffers. Weights
-        // stay bf16 — refiners/embedders are never quantized in the GGUF
-        // path that quantizes the main matmuls.
-        let dit_encoder_cfgs = BlockWgslConfigs::uniform(WgslConfig {
+        // feed directly into the main layers' activation buffers. Refiner
+        // matmuls follow the loader's transcode decision (bf16-in-file
+        // requantized to Q8_0 on the quant path); everything else stays bf16.
+        let dit_encoder_ops = WgslConfig {
             bf16_quant_writes: dit_main_matmul_cfg.bf16_quant_writes,
             act_dtype: dit_main_matmul_cfg.act_dtype,
             weight_dtype: WeightDtype::Bf16,
-        });
+        };
+        // Refiner blocks consume this set's qkv/proj/ffn slots; t_embedder
+        // only touches the adaln slot, which stays bf16.
+        let refiner_matmul_cfg = match refiner_transcode {
+            Some(k) => WgslConfig {
+                weight_dtype: WeightDtype::Quant(k),
+                ..dit_encoder_ops
+            },
+            None => dit_encoder_ops,
+        };
+        let dit_encoder_cfgs = BlockWgslConfigs {
+            matmul_qkv: refiner_matmul_cfg,
+            matmul_proj: refiner_matmul_cfg,
+            matmul_ffn_up: refiner_matmul_cfg,
+            matmul_ffn_down: refiner_matmul_cfg,
+            matmul_adaln: matmul_adaln_cfg,
+            ops: dit_encoder_ops,
+            i8_sdpa: false,
+        };
         let dit_encoder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_encoder_cfgs).await?;
+        // Embedder/final_layer front-door set: same ops/act dtype as the
+        // dit-encoder set but all matmul slots stay bf16 (embedder and
+        // final-layer linears are never transcoded).
+        let dit_embedder_cfgs = BlockWgslConfigs {
+            matmul_qkv: dit_encoder_ops,
+            matmul_proj: dit_encoder_ops,
+            matmul_ffn_up: dit_encoder_ops,
+            matmul_ffn_down: dit_encoder_ops,
+            matmul_adaln: matmul_adaln_cfg,
+            ops: dit_encoder_ops,
+            i8_sdpa: false,
+        };
+        let dit_embedder_block_pipelines =
+            BlockPipelines::compile(&backend, &dit_embedder_cfgs).await?;
         let vae_pipelines = VaeDecoderPipelines::compile(&backend).await?;
         tracing::info!(
             compile_ms = t_compile.elapsed().as_millis() as u64,
@@ -344,6 +480,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             block_pipelines,
             encoder_block_pipelines,
             dit_encoder_block_pipelines,
+            dit_embedder_block_pipelines,
             dit_handles,
             encoder,
             encoder_handles,
@@ -361,6 +498,13 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         self.dit_matmul_weight
     }
 
+    /// The VRAM budget arbiter shared by every client. Callers that build
+    /// their own `Workspace` (e2e tests) must construct it with this so the
+    /// budget has a single owner.
+    pub fn arbiter(&self) -> &Arc<MemArbiter> {
+        self.residency.arbiter()
+    }
+
     /// Run the full pipeline. Returns PNG bytes; the caller writes them to
     /// disk (CLI) or to a `Blob` (web) without touching model internals.
     pub async fn generate(
@@ -368,9 +512,12 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         params: &GenerationParams,
     ) -> Result<Vec<u8>, GenerateError<S::Error>> {
         let t_gen = std::time::Instant::now();
-        let mut workspace = Workspace::new(Arc::clone(&self.backend));
+        let mut workspace = Workspace::new(
+            Arc::clone(&self.backend),
+            Arc::clone(self.residency.arbiter()),
+        );
         let (sample, h_lat, w_lat) = self
-            .denoise_with(params, None, &mut workspace, None)
+            .denoise_with(params, None, &mut workspace, None, None)
             .await?;
 
         // VAE decode -> RGB CHW fp32 in [-1, 1]. Workspace carries over from
@@ -392,7 +539,6 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 .await?;
             let vae_ms = t.elapsed().as_millis() as u64;
             tracing::info!(elapsed_ms = vae_ms, "vae decode done");
-            eprintln!("[thinfer] vae_decode: {:.2}s", vae_ms as f64 / 1000.0);
             out
         };
 
@@ -441,7 +587,6 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         };
         let gen_ms = t_gen.elapsed().as_millis() as u64;
         tracing::info!(elapsed_ms = gen_ms, png_bytes = png.len(), "generate done");
-        eprintln!("[thinfer] total: {:.2}s", gen_ms as f64 / 1000.0);
         Ok(png)
     }
 
@@ -519,6 +664,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         initial_noise: Option<&[f32]>,
         workspace: &mut Workspace<WgpuBackend>,
         mut step_dumps: Option<&mut Vec<Vec<f32>>>,
+        mut step0_taps: Option<&mut Step0LocalizationTaps>,
     ) -> Result<(Vec<f32>, usize, usize), GenerateError<S::Error>> {
         if let Some(sink) = step_dumps.as_deref_mut() {
             sink.clear();
@@ -586,7 +732,6 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 .await?;
             let text_ms = t.elapsed().as_millis() as u64;
             tracing::info!(elapsed_ms = text_ms, seq = out.seq, "text encode done");
-            eprintln!("[thinfer] text_encode: {:.2}s", text_ms as f64 / 1000.0);
             out
         };
         // Phase boundary: text encoder weights are dead for the rest of this
@@ -661,7 +806,11 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             // only when DIAG fires, so the non-diag path stays zero-cost.
             // Useful for narrowing the first NaN-producing op when a new
             // weight encoding (Q8_0, future Q4_K) breaks parity.
-            let diag = tracing::enabled!(target: trace::DIAG, tracing::Level::INFO);
+            // Force diag for step 0 when the localization sink was requested,
+            // even with TRACE off, so the test captures last_main / final
+            // without needing THINFER_TRACE.
+            let want_step0 = i == 0 && step0_taps.is_some();
+            let diag = want_step0 || tracing::enabled!(target: trace::DIAG, tracing::Level::INFO);
             let mut tap_main0: Vec<f32> = Vec::new();
             let mut tap_main14: Vec<f32> = Vec::new();
             let mut tap_unified: Vec<f32> = Vec::new();
@@ -698,7 +847,115 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 modulated_ffn_in: Some(Vec::new()),
                 ffn_raw: Some(Vec::new()),
                 ffn_norm2_out: Some(Vec::new()),
+                attn_qkv_f16_pre_quant: Some(Vec::new()),
+                attn_proj_f16_pre_quant: Some(Vec::new()),
+                ffn_h1_f16_pre_quant: Some(Vec::new()),
+                ffn_h3_f16_pre_quant: Some(Vec::new()),
+                ffn_h2_f16_pre_quant: Some(Vec::new()),
+                proj_sa_data_head: Some(Vec::new()),
+                proj_sa_scale_head: Some(Vec::new()),
+                proj_wo_b_i8_head: Some(Vec::new()),
+                proj_wo_b_scale_head: Some(Vec::new()),
+                ..Block0Taps::default()
             };
+            // Last-main-block per-op taps: same five pre-quant captures so
+            // we can compare per-quant-event slope at block 0 vs block N-1.
+            // If loss-per-event grows from block 0 to block N-1 then the
+            // bug is data-dependent (heavy tails amplify f16 narrowing);
+            // if loss-per-event is constant then it's uniform compounding.
+            // Mirror block 0's full intra-op request so we get the same
+            // per-op slope info at block 29. Required to tell apart (a)
+            // per-op shrink that grows with block index (data-dependent)
+            // vs (b) uniform per-op shrink (compounding bug).
+            let mut block_last_taps = Block0Taps {
+                adaln_input: Some(Vec::new()),
+                adaln_pre: Some(Vec::new()),
+                adaln_full: Some(Vec::new()),
+                scale_msa: Some(Vec::new()),
+                gate_msa: Some(Vec::new()),
+                scale_mlp: Some(Vec::new()),
+                gate_mlp: Some(Vec::new()),
+                attn_norm1_out: Some(Vec::new()),
+                modulated_attn_in: Some(Vec::new()),
+                attn_q: Some(Vec::new()),
+                attn_k: Some(Vec::new()),
+                attn_v: Some(Vec::new()),
+                attn_q_norm: Some(Vec::new()),
+                attn_k_norm: Some(Vec::new()),
+                attn_q_rope: Some(Vec::new()),
+                attn_k_rope: Some(Vec::new()),
+                attn_sdpa: Some(Vec::new()),
+                attn_out: Some(Vec::new()),
+                attn_norm2_out: Some(Vec::new()),
+                x_mid: Some(Vec::new()),
+                ffn_norm1_out: Some(Vec::new()),
+                modulated_ffn_in: Some(Vec::new()),
+                ffn_raw: Some(Vec::new()),
+                ffn_norm2_out: Some(Vec::new()),
+                attn_qkv_f16_pre_quant: Some(Vec::new()),
+                attn_proj_f16_pre_quant: Some(Vec::new()),
+                ffn_h1_f16_pre_quant: Some(Vec::new()),
+                ffn_h3_f16_pre_quant: Some(Vec::new()),
+                ffn_h2_f16_pre_quant: Some(Vec::new()),
+                ..Block0Taps::default()
+            };
+            // Per-block full-residual sink. Engine fills index `b` with
+            // the post-block-`b` residual stream (f32, seq_u*dim).
+            let mut per_block_residual: Vec<Vec<f32>> = Vec::new();
+            // Damage-zone per-op taps. Only fires at step 0 when the
+            // localization sink is requested. Block indices are chosen
+            // around the slope-shrink zone (blocks 24-28); block 26 also
+            // gets QKV-site byte-head taps for the matmul_i8 audit.
+            let damage_zone_indices: &[usize] = if want_step0 {
+                &[24, 25, 26, 27, 28]
+            } else {
+                &[]
+            };
+            let mut damage_zone_taps: Vec<(usize, Block0Taps)> = damage_zone_indices
+                .iter()
+                .map(|&b| {
+                    let mut taps = Block0Taps {
+                        adaln_input: Some(Vec::new()),
+                        adaln_pre: Some(Vec::new()),
+                        adaln_full: Some(Vec::new()),
+                        scale_msa: Some(Vec::new()),
+                        gate_msa: Some(Vec::new()),
+                        scale_mlp: Some(Vec::new()),
+                        gate_mlp: Some(Vec::new()),
+                        attn_norm1_out: Some(Vec::new()),
+                        modulated_attn_in: Some(Vec::new()),
+                        attn_q: Some(Vec::new()),
+                        attn_k: Some(Vec::new()),
+                        attn_v: Some(Vec::new()),
+                        attn_q_norm: Some(Vec::new()),
+                        attn_k_norm: Some(Vec::new()),
+                        attn_q_rope: Some(Vec::new()),
+                        attn_k_rope: Some(Vec::new()),
+                        attn_sdpa: Some(Vec::new()),
+                        attn_out: Some(Vec::new()),
+                        attn_norm2_out: Some(Vec::new()),
+                        x_mid: Some(Vec::new()),
+                        ffn_norm1_out: Some(Vec::new()),
+                        modulated_ffn_in: Some(Vec::new()),
+                        ffn_raw: Some(Vec::new()),
+                        ffn_norm2_out: Some(Vec::new()),
+                        attn_qkv_f16_pre_quant: Some(Vec::new()),
+                        ..Block0Taps::default()
+                    };
+                    if b == 26 {
+                        // Block-26 only: byte-level matmul_i8 audit at the
+                        // QKV site. e2e_parity CPU-recomputes one output
+                        // element from these bytes.
+                        taps.qkv_attn_in_data_head = Some(Vec::new());
+                        taps.qkv_attn_in_params_head = Some(Vec::new());
+                        taps.qkv_b_i8_head = Some(Vec::new());
+                        taps.qkv_b_scale_head = Some(Vec::new());
+                        taps.qkv_b_qsum_head = Some(Vec::new());
+                        taps.qkv_dbg_trace_head = Some(Vec::new());
+                    }
+                    (b, taps)
+                })
+                .collect();
             // ctx_refiner block 0 per-op taps. modulation=false so the
             // adaln_* / scale_* / gate_* fields stay empty after the run;
             // request only the ops that actually fire on this block.
@@ -736,12 +993,24 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                         final_layer_out: Some(&mut tap_final),
                         block0: Some(&mut block0_taps),
                         ctx_block0: Some(&mut ctx_block0_taps),
+                        block_last: Some(&mut block_last_taps),
+                        extra_blocks: if want_step0 && !damage_zone_taps.is_empty() {
+                            Some(damage_zone_taps.as_mut_slice())
+                        } else {
+                            None
+                        },
+                        per_main_block_residual: if want_step0 {
+                            Some(&mut per_block_residual)
+                        } else {
+                            None
+                        },
                         ..DitTaps::default()
                     };
                     dit.forward_with_taps(
                         &self.backend,
                         &self.block_pipelines,
                         &self.dit_encoder_block_pipelines,
+                        &self.dit_embedder_block_pipelines,
                         &self.residency,
                         &*workspace,
                         &inputs,
@@ -753,6 +1022,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                         &self.backend,
                         &self.block_pipelines,
                         &self.dit_encoder_block_pipelines,
+                        &self.dit_embedder_block_pipelines,
                         &self.residency,
                         &*workspace,
                         &inputs,
@@ -969,6 +1239,103 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 if let Some(v) = &b0.ffn_norm2_out {
                     print("block0.ffn_norm2_out", v);
                 }
+                // Per-quant-event loss probe on pre-act_quant f16 matmul
+                // outputs. For each event, print stats AND run a host
+                // simulation of the act_quant -> dequant round-trip using
+                // both f16 params (current GPU path) and f32 params
+                // (hypothesis: param narrowing is the slope source). The
+                // slope-per-event lets us check whether 30-block
+                // compounding explains the ~0.938 latent slope.
+                let roundtrip = |label: &str, v: &[f32]| {
+                    if v.is_empty() || (seq_u as usize) == 0 {
+                        return;
+                    }
+                    let inner = v.len() / (seq_u as usize);
+                    if inner == 0 || !inner.is_multiple_of(32) {
+                        return;
+                    }
+                    crate::z_image::seq::diag_quant_roundtrip_loss(label, v, seq_u as usize, inner);
+                };
+                if let Some(v) = &b0.attn_qkv_f16_pre_quant {
+                    print("block0.attn_qkv_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block0.qkv_pre_quant", v);
+                }
+                if let Some(v) = &b0.attn_proj_f16_pre_quant {
+                    print("block0.attn_proj_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block0.proj_pre_quant", v);
+                }
+                if let Some(v) = &b0.ffn_h1_f16_pre_quant {
+                    print("block0.ffn_h1_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block0.ffn_h1_pre_quant", v);
+                }
+                if let Some(v) = &b0.ffn_h3_f16_pre_quant {
+                    print("block0.ffn_h3_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block0.ffn_h3_pre_quant", v);
+                }
+                if let Some(v) = &b0.ffn_h2_f16_pre_quant {
+                    print("block0.ffn_h2_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block0.ffn_h2_pre_quant", v);
+                }
+                // Same five events at the LAST main block. If per-event
+                // slope_f16 is uniformly e.g. ~0.998 here, compounding
+                // alone explains the observed final-latent slope. If
+                // block_last is meaningfully worse than block0, the
+                // bug is data-dependent (heavy-tail amplification).
+                let bn = &block_last_taps;
+                if let Some(v) = &bn.attn_qkv_f16_pre_quant {
+                    print("block_last.attn_qkv_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block_last.qkv_pre_quant", v);
+                }
+                if let Some(v) = &bn.attn_proj_f16_pre_quant {
+                    print("block_last.attn_proj_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block_last.proj_pre_quant", v);
+                }
+                if let Some(v) = &bn.ffn_h1_f16_pre_quant {
+                    print("block_last.ffn_h1_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block_last.ffn_h1_pre_quant", v);
+                }
+                if let Some(v) = &bn.ffn_h3_f16_pre_quant {
+                    print("block_last.ffn_h3_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block_last.ffn_h3_pre_quant", v);
+                }
+                if let Some(v) = &bn.ffn_h2_f16_pre_quant {
+                    print("block_last.ffn_h2_f16_pre_quant", v);
+                    roundtrip("DIAG_QUANT_LOSS block_last.ffn_h2_pre_quant", v);
+                }
+                // DIAG raw byte heads. Print as hex chunks + decoded views.
+                fn print_i8_head(label: &str, bytes: &[u8]) {
+                    let n = bytes.len().min(64);
+                    let i8s: Vec<i8> = bytes[..n].iter().map(|&b| b as i8).collect();
+                    let hex: String = bytes[..n.min(32)]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    tracing::info!(target: "thinfer::diag", "[DIAG-RAW] {label}: n_bytes={} head_i8={:?} hex32={}", bytes.len(), i8s, hex);
+                }
+                fn print_f32_head(label: &str, bytes: &[u8]) {
+                    let n_f32 = bytes.len() / 4;
+                    let take = n_f32.min(16);
+                    let mut vals = Vec::with_capacity(take);
+                    for i in 0..take {
+                        let off = i * 4;
+                        let arr = [bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]];
+                        vals.push(f32::from_le_bytes(arr));
+                    }
+                    tracing::info!(target: "thinfer::diag", "[DIAG-RAW] {label}: n_bytes={} head_f32={:?}", bytes.len(), vals);
+                }
+                if let Some(v) = &b0.proj_sa_data_head {
+                    print_i8_head("block0.proj_sa_data_head", v);
+                }
+                if let Some(v) = &b0.proj_sa_scale_head {
+                    print_f32_head("block0.proj_sa_scale_head", v);
+                }
+                if let Some(v) = &b0.proj_wo_b_i8_head {
+                    print_i8_head("block0.proj_wo_b_i8_head", v);
+                }
+                if let Some(v) = &b0.proj_wo_b_scale_head {
+                    print_f32_head("block0.proj_wo_b_scale_head", v);
+                }
                 // ctx_refiner block 0 per-op narrowing. modulation=false so
                 // adaln_*/scale_*/gate_* slots are empty by design; only the
                 // path ops are printed. Row-bucketing uses seq_cap so the
@@ -1093,6 +1460,23 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     sab = smax.abs().max(smin.abs()),
                 );
             }
+            if i == 0
+                && let Some(sink) = step0_taps.as_deref_mut()
+            {
+                sink.last_main = std::mem::take(&mut tap_last_main);
+                sink.final_layer = std::mem::take(&mut tap_final);
+                sink.model_output_post_neg = out.image.clone();
+                sink.dt_step0 = scheduler.sigmas()[i + 1] - scheduler.sigmas()[i];
+                sink.per_block_residual = std::mem::take(&mut per_block_residual);
+                copy_block_taps(&block0_taps, &mut sink.block0);
+                copy_block_taps(&block_last_taps, &mut sink.block_last);
+                sink.damage_zone.clear();
+                for (b, t) in &damage_zone_taps {
+                    let mut local = Block0LocalTaps::default();
+                    copy_block_taps(t, &mut local);
+                    sink.damage_zone.push((*b, local));
+                }
+            }
             scheduler.step(i, &out.image, &mut sample);
             if let Some(sink) = step_dumps.as_deref_mut() {
                 sink.push(sample.clone());
@@ -1109,12 +1493,11 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 );
             }
             let step_ms = t_step.elapsed().as_millis() as u64;
-            tracing::info!(elapsed_ms = step_ms, "step done");
-            eprintln!(
-                "[thinfer] step {}/{}: dit={:.2}s",
-                i + 1,
-                params.steps,
-                step_ms as f64 / 1000.0,
+            tracing::info!(
+                elapsed_ms = step_ms,
+                step = i + 1,
+                steps = params.steps,
+                "step done"
             );
         }
 
@@ -1126,6 +1509,46 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         workspace.drain_pool();
         Ok((sample, h_lat, w_lat))
     }
+}
+
+/// Copy populated `Block0Taps` fields (engine-side, `Option<Vec<f32>>`)
+/// into the test-side `Block0LocalTaps` (plain `Vec<f32>`). Used to
+/// hand block-0 / block-29 per-op intermediates back to the test for
+/// per-op linfit comparison.
+fn copy_block_taps(src: &Block0Taps, dst: &mut Block0LocalTaps) {
+    let take = |o: &Option<Vec<f32>>| o.clone().unwrap_or_default();
+    dst.adaln_input = take(&src.adaln_input);
+    dst.adaln_pre = take(&src.adaln_pre);
+    dst.adaln_full = take(&src.adaln_full);
+    dst.scale_msa = take(&src.scale_msa);
+    dst.gate_msa = take(&src.gate_msa);
+    dst.scale_mlp = take(&src.scale_mlp);
+    dst.gate_mlp = take(&src.gate_mlp);
+    dst.attn_norm1_out = take(&src.attn_norm1_out);
+    dst.modulated_attn_in = take(&src.modulated_attn_in);
+    dst.attn_q = take(&src.attn_q);
+    dst.attn_k = take(&src.attn_k);
+    dst.attn_v = take(&src.attn_v);
+    dst.attn_q_norm = take(&src.attn_q_norm);
+    dst.attn_k_norm = take(&src.attn_k_norm);
+    dst.attn_q_rope = take(&src.attn_q_rope);
+    dst.attn_k_rope = take(&src.attn_k_rope);
+    dst.attn_sdpa = take(&src.attn_sdpa);
+    dst.attn_out = take(&src.attn_out);
+    dst.attn_norm2_out = take(&src.attn_norm2_out);
+    dst.x_mid = take(&src.x_mid);
+    dst.ffn_norm1_out = take(&src.ffn_norm1_out);
+    dst.modulated_ffn_in = take(&src.modulated_ffn_in);
+    dst.ffn_raw = take(&src.ffn_raw);
+    dst.ffn_norm2_out = take(&src.ffn_norm2_out);
+    dst.attn_qkv_f16_pre_quant = take(&src.attn_qkv_f16_pre_quant);
+    let take_bytes = |o: &Option<Vec<u8>>| o.clone().unwrap_or_default();
+    dst.qkv_attn_in_data_head = take_bytes(&src.qkv_attn_in_data_head);
+    dst.qkv_attn_in_params_head = take_bytes(&src.qkv_attn_in_params_head);
+    dst.qkv_b_i8_head = take_bytes(&src.qkv_b_i8_head);
+    dst.qkv_b_scale_head = take_bytes(&src.qkv_b_scale_head);
+    dst.qkv_b_qsum_head = take_bytes(&src.qkv_b_qsum_head);
+    dst.qkv_dbg_trace_head = take_bytes(&src.qkv_dbg_trace_head);
 }
 
 /// CHW fp32 in `[-1, 1]` -> interleaved RGB u8 -> PNG bytes. Single allocation

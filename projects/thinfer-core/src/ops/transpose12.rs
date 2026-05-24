@@ -1,4 +1,4 @@
-use super::WgslConfig;
+use super::{ActDtype, WgslConfig};
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 #[cfg(feature = "conformance")]
 use crate::conformance::{
@@ -46,11 +46,11 @@ pub(crate) fn dispatch_transpose12<O: Transpose12Op, B: Backend>(
     backend.dispatch(encoder, pipeline, &bindings, O::workgroups(total))
 }
 
-const WGSL: &str = r#"
+macro_rules! transpose12_body {
+    () => {
+        r#"
 struct U { d0: u32, d1: u32, d2: u32, d3: u32 };
 
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> u: U;
 
 @compute @workgroup_size(64)
@@ -68,7 +68,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let in_idx = ((a0 * u.d1 + b1) * u.d2 + c2) * u.d3 + d3;
     out[idx] = x[in_idx];
 }
-"#;
+"#
+    };
+}
+
+const WGSL_F32: &str = concat!(
+    r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+"#,
+    transpose12_body!()
+);
+
+// Native-f16 acts: pure permutation, scalar f16 element access.
+const WGSL_F16: &str = concat!(
+    r#"enable f16;
+@group(0) @binding(0) var<storage, read> x: array<f16>;
+@group(0) @binding(1) var<storage, read_write> out: array<f16>;
+"#,
+    transpose12_body!()
+);
 
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
@@ -95,7 +114,10 @@ impl Transpose12Op for Transpose12F32 {
     const OUTPUT: &'static str = "transpose12/out";
     fn wgsl(cfg: &WgslConfig) -> &'static str {
         assert!(!cfg.bf16_quant_writes);
-        WGSL
+        match cfg.act_dtype {
+            ActDtype::F16 => WGSL_F16,
+            _ => WGSL_F32,
+        }
     }
     fn layout() -> &'static [BindingLayout] {
         LAYOUT

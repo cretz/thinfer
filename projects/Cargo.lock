@@ -2312,6 +2312,7 @@ dependencies = [
 name = "thinfer-conformance"
 version = "0.0.0"
 dependencies = [
+ "half",
  "pollster",
  "safetensors",
  "serde_json",

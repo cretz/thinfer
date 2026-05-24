@@ -871,6 +871,114 @@
       "dtypes": [
         "fp32"
       ]
+    },
+    {
+      "name": "conv2d_3x3_multitile",
+      "op": "conv2d",
+      "kh": 3,
+      "kw": 3,
+      "pad_h": 1,
+      "pad_w": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            24,
+            11,
+            13
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            70,
+            24,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.05,
+            "hi": 0.05
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            70
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv2d_3x3_batch2",
+      "op": "conv2d",
+      "kh": 3,
+      "kw": 3,
+      "pad_h": 1,
+      "pad_w": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            4,
+            5,
+            5
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            6,
+            4,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            6
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
     }
   ]
 }

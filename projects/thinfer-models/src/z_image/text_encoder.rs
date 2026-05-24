@@ -279,6 +279,7 @@ fn register_one<S: WeightSource>(
         encoding,
         on_disk_bytes: entry.size,
         transpose,
+        transcode: None,
     }))
 }
 

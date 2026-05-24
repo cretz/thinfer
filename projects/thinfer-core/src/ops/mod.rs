@@ -1,11 +1,20 @@
 use crate::backend::{Backend, Binding, BindingLayout, BufRef};
 use crate::tensor::ComputeDtype;
 
+/// Block size for I8 activation scale granularity. One `(scale_f16, zero_f16)`
+/// parameter pair per `BK_I8`-element chunk along the dim axis (4 bytes per
+/// block, matching the old f32-scale-only layout, but now carrying both an
+/// asymmetric scale and zero point - llama.cpp Q8_1 style). Matches
+/// `matmul_i8`'s `BK=32` so producer kernels emit matmul-ready params
+/// directly (no transcode).
+pub const BK_I8: u32 = 32;
+
 pub mod act_quant;
 pub mod add;
 pub mod bcast_add;
 pub mod bcast_affine;
 pub mod bcast_fma;
+pub mod bf16_block_sum;
 pub mod conv2d;
 pub mod dequant;
 pub mod dequant_i8;
@@ -13,12 +22,14 @@ pub mod group_norm;
 pub mod layernorm;
 pub mod matmul;
 pub mod matmul_i8;
+pub mod matmul_i8_bf16;
 pub mod mul;
 pub mod qkv_split;
 pub mod rmsnorm;
 pub mod rope;
 pub mod scatter_pad_rows;
 pub mod sdpa;
+pub mod sdpa_i8;
 pub mod silu;
 pub mod silu_mul;
 pub mod softmax;
@@ -34,7 +45,7 @@ pub use bcast_affine::{BcastAffineBufs, BcastAffineF32, BcastAffineOp};
 pub(crate) use bcast_fma::dispatch_bcast_fma;
 pub use bcast_fma::{BcastFmaBufs, BcastFmaF32, BcastFmaOp};
 pub(crate) use conv2d::dispatch_conv2d;
-pub use conv2d::{Conv2dBufs, Conv2dF32, Conv2dOp};
+pub use conv2d::{Conv2dBufs, Conv2dConfig, Conv2dF32, Conv2dOp};
 pub use dequant::{DequantBufs, dispatch_dequant};
 pub(crate) use group_norm::dispatch_group_norm;
 pub use group_norm::{GroupNormBufs, GroupNormF32, GroupNormOp};
@@ -51,7 +62,7 @@ pub use rope::{RopeBufs, RopeF32, RopeF32HalfRot, RopeOp};
 pub(crate) use scatter_pad_rows::dispatch_scatter_pad_rows;
 pub use scatter_pad_rows::{ScatterPadRowsBufs, ScatterPadRowsF32, ScatterPadRowsOp};
 pub(crate) use sdpa::dispatch_sdpa;
-pub use sdpa::{SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp};
+pub use sdpa::{SdpaBufs, SdpaF16Sg, SdpaF32, SdpaF32LargeD, SdpaOp};
 pub use silu::SiluF32;
 pub use silu_mul::SiluMulF32;
 #[cfg(feature = "conformance")]
@@ -152,6 +163,33 @@ pub enum ActDtype {
     F32,
     Bf16,
     F16,
+    /// Packed int8 activation storage (`array<u32>`, 4 i8 elements per word)
+    /// paired with a sibling per-(rows, dim/`BK_I8`) parameter buffer
+    /// `array<vec2<f16>>` carrying `(scale_f16, zero_f16)` per block
+    /// (llama.cpp Q8_1-style asymmetric). Same total bytes as the old
+    /// scale-only layout (4 B per block); halves activation VRAM versus
+    /// F16/Bf16.
+    ///
+    /// Cross-op contract: every i8 activation binding is a pair
+    /// `(data: array<u32>, params: array<vec2<f16>>)` where `params.len() ==
+    /// rows * (dim / BK_I8)`. Each `params[i]` is `vec2<f16>(scale, zero)`;
+    /// dequant is `q * scale + zero`. Producer kernels emit matmul-ready
+    /// params directly, so there is no transcode at the matmul boundary.
+    /// The same granularity flows through pointwise, reduction, qkv-split,
+    /// rope, and sdpa.
+    ///
+    /// Asymmetric (not symmetric amax-only) so the heavy-tailed late-block
+    /// residual stream does not accumulate RTNE bias across 30 DiT blocks;
+    /// symmetric quant is unbiased on symmetric distributions but biased on
+    /// skewed ones (the bias compounds through the residual and matmul
+    /// per-column mean asymmetry, degrading the output by block 28).
+    ///
+    /// Only valid when the adapter exposes `Packed4x8IntegerDotProduct` and
+    /// `SHADER_F16` (the latter for vec2<f16> mask in sdpa_i8), and only
+    /// when weights are also Quant (the DP4A matmul path) - F32/Bf16/F16
+    /// weight paths don't benefit and would accumulate quant noise for no
+    /// VRAM win.
+    I8,
 }
 
 impl ActDtype {
@@ -160,6 +198,7 @@ impl ActDtype {
             Self::F32 => 4,
             Self::Bf16 => 2,
             Self::F16 => 2,
+            Self::I8 => 1,
         }
     }
     /// Elements packed per 4-byte storage word. Drives the per-thread output
@@ -169,6 +208,7 @@ impl ActDtype {
             Self::F32 => 1,
             Self::Bf16 => 2,
             Self::F16 => 2,
+            Self::I8 => 4,
         }
     }
     pub fn hint(&self) -> &'static str {
@@ -176,13 +216,40 @@ impl ActDtype {
             Self::F32 => "af32",
             Self::Bf16 => "abf16",
             Self::F16 => "af16",
+            Self::I8 => "ai8",
         }
     }
-    /// True when this dtype implies packed `array<u32>` storage (two elements
-    /// per word). Drives kernel-side dispatch shape decisions that are shared
-    /// between Bf16-packed and F16-packed paths.
+    /// True when this dtype implies packed `array<u32>` storage (multiple
+    /// elements per word). Drives kernel-side dispatch shape decisions that
+    /// are shared across Bf16-packed, F16-packed, and I8-packed paths.
     pub const fn is_packed(&self) -> bool {
-        matches!(self, Self::Bf16 | Self::F16)
+        matches!(self, Self::Bf16 | Self::F16 | Self::I8)
+    }
+    /// Size of the paired per-(rows, dim/`BK_I8`) f32 scale buffer for an
+    /// `[rows, dim]` activation. Zero for non-I8 dtypes (scale is implicit
+    /// in the storage encoding). For I8, one f32 scale per 32-element block
+    /// per row, matching the cross-op contract.
+    pub const fn scale_bytes(&self, rows: u64, dim: u64) -> u64 {
+        match self {
+            Self::I8 => {
+                let bk = BK_I8 as u64;
+                assert!(dim.is_multiple_of(bk), "I8 dim must be multiple of BK_I8");
+                rows * (dim / bk) * 4
+            }
+            _ => 0,
+        }
+    }
+    /// Scale-buffer element count (f32 elements) for an `[rows, dim]` I8
+    /// activation. Convenience over `scale_bytes / 4`.
+    pub const fn scale_len(&self, rows: u64, dim: u64) -> u64 {
+        match self {
+            Self::I8 => {
+                let bk = BK_I8 as u64;
+                assert!(dim.is_multiple_of(bk), "I8 dim must be multiple of BK_I8");
+                rows * (dim / bk)
+            }
+            _ => 0,
+        }
     }
 }
 
@@ -238,6 +305,15 @@ impl WgslConfig {
         act_dtype: ActDtype::F16,
         weight_dtype: WeightDtype::Bf16,
     };
+    /// Packed-i8 activation storage with per-row f16 scale, paired with bf16
+    /// weights (in-block bf16 ops: adaLN modulation, biases, refiners). The
+    /// matmul Quant-weight pairing is constructed dynamically at the call
+    /// site via `WgslConfig { act_dtype: I8, weight_dtype: Quant(kind), .. }`.
+    pub const I8_PACKED_WBF16: Self = Self {
+        bf16_quant_writes: false,
+        act_dtype: ActDtype::I8,
+        weight_dtype: WeightDtype::Bf16,
+    };
 
     /// Short tag for `KernelKey` hints and pipeline-cache disambiguation.
     /// Must change whenever any cfg field changes - the same kernel id with
@@ -279,6 +355,13 @@ impl WgslConfig {
             (_, ActDtype::F16, WeightDtype::F16) => "af16-wf16",
             (_, ActDtype::F32, WeightDtype::F16) => "af32-wf16",
             (_, ActDtype::Bf16, WeightDtype::F16) => "abf16-wf16",
+            // I8 acts: bf16_quant_writes is meaningless (i8 storage is itself
+            // lossy and recomputes scale at every producing store). Pair
+            // across the non-Quant weight dtypes; I8+Quant routes through the
+            // Quant branch above.
+            (_, ActDtype::I8, WeightDtype::F32) => "ai8-wf32",
+            (_, ActDtype::I8, WeightDtype::Bf16) => "ai8-wbf16",
+            (_, ActDtype::I8, WeightDtype::F16) => "ai8-wf16",
             (_, _, WeightDtype::Quant(_)) => unreachable!("handled above"),
         };
         legacy.to_string()
@@ -306,6 +389,77 @@ impl WgslConfig {
 /// directly for native SIMD throughput on Apple Silicon / Intel Xe / vec2-
 /// aware discrete GPUs. The widen helpers are only used by ops that mix
 /// f16 activations with bf16 weights or that reduce internally.
+/// WGSL prelude for packed-i8 activation storage with per-block
+/// `(scale_f16, zero_f16)` params (llama.cpp Q8_1-style asymmetric quant).
+/// Emits `enable f16;` so kernels can declare the params buffer as
+/// `array<vec2<f16>>` directly. Helpers:
+/// - `unpack_i8x4_aff(w: u32, p: vec2<f16>) -> vec4<f32>` - sign-extend 4
+///   packed bytes and reconstruct `q * scale + zero`.
+/// - `params_from_minmax(mn: f32, mx: f32) -> vec2<f16>` - build
+///   `(scale, zero)` such that x=mn maps to q=-127 and x=mx maps to q=+127.
+///   `scale = (mx-mn)/254` (signed-i8 [-127, 127] range, 254 levels keeps
+///   DP4A `dot4I8Packed` overflow-safe). Degenerate range emits a tiny
+///   non-zero scale + zero=mn so dequant returns mn (no NaN from zero scale).
+/// - `pack_f32x4_aff_to_i8(v: vec4<f32>, p: vec2<f16>) -> u32` - saturating
+///   round-to-nearest of `(x - zero) / scale`, clamped to `[-127, 127]`.
+///
+/// Per-block (min, max) REDUCTION is kernel-specific (depends on workgroup
+/// shape and how the workgroup spans rows/blocks). It does NOT live in the
+/// prelude. Each producing op runs its own reduction then calls
+/// `params_from_minmax` + `pack_f32x4_aff_to_i8`.
+#[macro_export]
+macro_rules! act_i8_prelude {
+    () => {
+        concat!(
+            "enable f16;\n",
+            "fn unpack_i8x4_aff(w: u32, p: vec2<f16>) -> vec4<f32> {\n",
+            "  let b0 = i32(w << 24u) >> 24u;\n",
+            "  let b1 = i32(w << 16u) >> 24u;\n",
+            "  let b2 = i32(w <<  8u) >> 24u;\n",
+            "  let b3 = i32(w       ) >> 24u;\n",
+            "  let s = f32(p.x);\n",
+            "  let z = f32(p.y);\n",
+            "  return vec4<f32>(f32(b0), f32(b1), f32(b2), f32(b3)) * s + vec4<f32>(z);\n",
+            "}\n",
+            "fn params_from_minmax(mn: f32, mx: f32) -> vec2<f16> {\n",
+            "  let range = mx - mn;\n",
+            "  let s = select(range / 254.0, 1.0e-30, range <= 0.0);\n",
+            "  let z = mn + 127.0 * s;\n",
+            "  return vec2<f16>(f16(s), f16(z));\n",
+            "}\n",
+            "fn pack_f32x4_aff_to_i8(v: vec4<f32>, p: vec2<f16>) -> u32 {\n",
+            "  let s = f32(p.x);\n",
+            "  let z = f32(p.y);\n",
+            "  let inv = 1.0 / s;\n",
+            "  let q = clamp(round((v - vec4<f32>(z)) * inv), vec4<f32>(-127.0), vec4<f32>(127.0));\n",
+            "  let b0 = u32(i32(q.x)) & 0xFFu;\n",
+            "  let b1 = u32(i32(q.y)) & 0xFFu;\n",
+            "  let b2 = u32(i32(q.z)) & 0xFFu;\n",
+            "  let b3 = u32(i32(q.w)) & 0xFFu;\n",
+            "  return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);\n",
+            "}\n",
+            // f32-arg variants for kernels (e.g. sdpa_i8) whose fused buffer
+            // is bound as `array<u32>` and reads params via unpack2x16float.
+            "fn unpack_i8x4_aff_raw(w: u32, s: f32, z: f32) -> vec4<f32> {\n",
+            "  let b0 = i32(w << 24u) >> 24u;\n",
+            "  let b1 = i32(w << 16u) >> 24u;\n",
+            "  let b2 = i32(w <<  8u) >> 24u;\n",
+            "  let b3 = i32(w       ) >> 24u;\n",
+            "  return vec4<f32>(f32(b0), f32(b1), f32(b2), f32(b3)) * s + vec4<f32>(z);\n",
+            "}\n",
+            "fn pack_f32x4_aff_to_i8_raw(v: vec4<f32>, s: f32, z: f32) -> u32 {\n",
+            "  let inv = 1.0 / s;\n",
+            "  let q = clamp(round((v - vec4<f32>(z)) * inv), vec4<f32>(-127.0), vec4<f32>(127.0));\n",
+            "  let b0 = u32(i32(q.x)) & 0xFFu;\n",
+            "  let b1 = u32(i32(q.y)) & 0xFFu;\n",
+            "  let b2 = u32(i32(q.z)) & 0xFFu;\n",
+            "  let b3 = u32(i32(q.w)) & 0xFFu;\n",
+            "  return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);\n",
+            "}\n",
+        )
+    };
+}
+
 #[macro_export]
 macro_rules! act_f16_prelude {
     () => {
@@ -395,22 +549,6 @@ macro_rules! weight_op_wgsl {
         $vis const $bf16q: &str = concat!($crate::act_store_bf16q!(), $f32b, $body);
         $vis const $wbf16: &str = concat!($crate::act_store_f32!(), $bf16b, $body);
         $vis const $bf16q_wbf16: &str = concat!($crate::act_store_bf16q!(), $bf16b, $body);
-    };
-}
-
-/// Like `weight_op_wgsl!` but omits the `bf16_quant_writes` variants. For ops
-/// (conv2d, group_norm) whose outputs are not activations crossing the bf16
-/// quantization boundary — their `wgsl()` asserts `!bf16_quant_writes`.
-#[macro_export]
-macro_rules! weight_op_wgsl_no_bf16q {
-    (
-        $vis:vis ($f32:ident, $wbf16:ident);
-        body = $body:expr;
-        f32_bindings = $f32b:expr;
-        bf16_bindings = $bf16b:expr;
-    ) => {
-        $vis const $f32: &str = concat!($crate::act_store_f32!(), $f32b, $body);
-        $vis const $wbf16: &str = concat!($crate::act_store_f32!(), $bf16b, $body);
     };
 }
 

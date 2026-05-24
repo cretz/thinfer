@@ -72,7 +72,9 @@ impl TimestepEmbedder {
 
     /// Build `embed = cat(cos(t * freqs), sin(t * freqs))` in CPU memory.
     /// `t` is the (already `t_scale`d) timestep, single value (B=1). Encoded
-    /// for the matmul's activation storage dtype: f32 LE or bf16-packed (RNE).
+    /// for the AdaLN matmul's activation dtype: f32 LE under I8 (matmul_adaln
+    /// is F32-overridden); bf16/f16-packed (RNE) otherwise. `I8` is never
+    /// the effective AdaLN dtype.
     fn compute_embed(&self, t: f32, act: ActDtype) -> Vec<u8> {
         let half = self.freqs.len();
         let stride = act.bytes_per_elem() as usize;
@@ -89,6 +91,9 @@ impl TimestepEmbedder {
                 let h = half::f16::from_f32(v).to_bits();
                 bytes[idx * 2..(idx + 1) * 2].copy_from_slice(&h.to_le_bytes());
             }
+            ActDtype::I8 => unreachable!(
+                "t_embedder always operates in the AdaLN-effective dtype (F32 under I8), never raw I8"
+            ),
         };
         for (i, &f) in self.freqs.iter().enumerate() {
             let arg = t * f;
@@ -111,8 +116,11 @@ impl TimestepEmbedder {
         let freq = self.cfg.freq_dim as u32;
         let mid = self.cfg.mid_dim as u32;
         let outd = self.cfg.out_dim as u32;
+        // t_embedder runs entirely at the block act dtype.
         let freq_bytes = pipelines.act_bytes(freq);
         let mid_bytes = pipelines.act_bytes(mid);
+        let bcast_add_pipe = &pipelines.bcast_add;
+        let silu_pipe = &pipelines.silu;
 
         let embed_bytes = self.compute_embed(t, pipelines.act_dtype);
         debug_assert_eq!(embed_bytes.len() as u64, freq_bytes);
@@ -135,11 +143,11 @@ impl TimestepEmbedder {
         let fc1 = scope.alloc(mid_bytes)?;
         let fc1_b = scope.import(&bufs.fc1_bias);
         let fc1_ba_u = bcast_add_uniform(scope, mid)?;
-        scope.bcast_add::<BcastAddF32>(&pipelines.bcast_add, fc1_pre, fc1_b, fc1_ba_u, fc1, mid)?;
+        scope.bcast_add::<BcastAddF32>(bcast_add_pipe, fc1_pre, fc1_b, fc1_ba_u, fc1, mid)?;
 
         // SiLU
         let act = scope.alloc(mid_bytes)?;
-        scope.dispatch_op::<SiluF32>(&pipelines.silu, &[fc1], act)?;
+        scope.dispatch_op::<SiluF32>(silu_pipe, &[fc1], act)?;
 
         // Linear 2: [1, mid] @ [mid, out] -> [1, out]
         let fc2_pre = scope.alloc(pipelines.act_bytes(outd))?;
@@ -157,14 +165,7 @@ impl TimestepEmbedder {
         )?;
         let fc2_b = scope.import(&bufs.fc2_bias);
         let fc2_ba_u = bcast_add_uniform(scope, outd)?;
-        scope.bcast_add::<BcastAddF32>(
-            &pipelines.bcast_add,
-            fc2_pre,
-            fc2_b,
-            fc2_ba_u,
-            out,
-            outd,
-        )?;
+        scope.bcast_add::<BcastAddF32>(bcast_add_pipe, fc2_pre, fc2_b, fc2_ba_u, out, outd)?;
         Ok(())
     }
 }

@@ -5,21 +5,12 @@
 /// *full-picture* totals: VRAM covers weights + workspace + staging, RAM
 /// covers all engine-controlled host buffers (mmap page cache is OS-managed
 /// and not counted). The residency manager evicts weights to keep the total
-/// under `vram_bytes`, deferring to `workspace_reserve` so it doesn't burn
-/// the entire budget on weights and force workspace into churn.
+/// under `vram_bytes`, using *current* live workspace + staging as the
+/// dynamic floor (no static reserve carve-out).
 #[derive(Clone, Copy, Debug)]
 pub struct ResidencyBudget {
     pub ram_bytes: u64,
     pub vram_bytes: u64,
-    /// Bytes the residency manager treats as "spoken for" by workspace +
-    /// staging even when those counters are currently lower. Acts as a soft
-    /// floor: weights are evicted to keep
-    /// `weights_current + max(workspace_reserve, non_weights_current) <=
-    /// vram_bytes`. Set this to roughly the expected peak non-weight
-    /// footprint of the heaviest phase; under-sizing it makes the first
-    /// phase that exceeds the reserve thrash weights, over-sizing it leaves
-    /// VRAM idle.
-    pub workspace_reserve: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]

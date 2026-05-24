@@ -44,9 +44,9 @@ pub enum GenerateCmd {
 /// pull from there instead of hardcoded constants on the args struct.
 #[derive(Args)]
 pub struct GenerateImage {
-    /// Model identifier. Defaults to `zimage-turbo-q8` (Q8_0 DiT, ~2.8x
-    /// faster per step than bf16 on iGPUs with SHADER_F16).
-    #[arg(long, default_value_t = ModelId::ZImageTurboQ8, value_enum)]
+    /// Model identifier. Defaults to `zimage-turbo-q4` (Q4_K_M DiT: ~half
+    /// the VRAM/bandwidth of Q8_0 at visually-confirmed-acceptable quality).
+    #[arg(long, default_value_t = ModelId::ZImageTurboQ4, value_enum)]
     pub model: ModelId,
     #[arg(long)]
     pub prompt: String,
@@ -143,15 +143,9 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
 
     let ram_bytes = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
     let vram_bytes = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
-    // Workspace reserve: 25% of vram_bytes by default. Holds back enough VRAM
-    // for non-weight buffers (workspace + staging) so weights can't squat on
-    // the whole budget and force every activation alloc to evict-and-reload.
-    // Tunable knob; the e2e_parity test uses a more aggressive value.
-    let workspace_reserve = vram_bytes / 4;
     let budget = ResidencyBudget {
         ram_bytes,
         vram_bytes,
-        workspace_reserve,
     };
 
     let manifest = args.model.manifest();

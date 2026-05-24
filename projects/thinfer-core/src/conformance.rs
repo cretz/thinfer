@@ -601,7 +601,7 @@ impl<'a> OpTestContext<'a> {
         .await
     }
 
-    pub async fn run_conv2d<O: Conv2dOp>(&self) -> Vec<u8> {
+    pub async fn run_conv2d<O: Conv2dOp>(&self, op: O) -> Vec<u8> {
         let (kh, kw, pad_h, pad_w, stride_h, stride_w) = match self.case.op {
             OpSpec::Conv2d {
                 kh,
@@ -637,7 +637,7 @@ impl<'a> OpTestContext<'a> {
             u[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         self.run_op(
-            O::wgsl(self.dtype.wgsl_config()),
+            &op.wgsl(self.dtype.wgsl_config()),
             O::layout,
             Some(&u),
             out_len,
@@ -646,6 +646,7 @@ impl<'a> OpTestContext<'a> {
                     bk,
                     e,
                     p,
+                    &op,
                     &Conv2dBufs {
                         x: &ins[0],
                         w: &ins[1],
@@ -653,7 +654,9 @@ impl<'a> OpTestContext<'a> {
                         uniform: uf.as_ref().unwrap(),
                         out: &out,
                     },
-                    n_out,
+                    cout,
+                    h_out * w_out,
+                    b,
                 )
             },
         )
@@ -741,7 +744,7 @@ pub fn registry() -> Vec<Box<dyn OpTest>> {
         Box::new(BcastAffineF32),
         Box::new(BcastFmaF32),
         Box::new(BcastAddF32),
-        Box::new(Conv2dF32),
+        Box::new(Conv2dF32::default_op()),
     ]
 }
 

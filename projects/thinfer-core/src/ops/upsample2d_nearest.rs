@@ -1,4 +1,4 @@
-use super::WgslConfig;
+use super::{ActDtype, WgslConfig};
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
 use crate::tensor::{ComputeDtype, F32};
 
@@ -48,11 +48,11 @@ pub(crate) fn dispatch_upsample2d_nearest<O: Upsample2dNearestOp, B: Backend>(
     backend.dispatch(encoder, pipeline, &bindings, O::workgroups(n_out_elems))
 }
 
-const WGSL: &str = r#"
+macro_rules! upsample_body {
+    () => {
+        r#"
 struct U { b: u32, c: u32, h_in: u32, w_in: u32 };
 
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> u: U;
 
 @compute @workgroup_size(64)
@@ -77,7 +77,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let in_idx = bi * (u.c * u.h_in * u.w_in) + ci * (u.h_in * u.w_in) + hi * u.w_in + wi;
     out[i] = x[in_idx];
 }
-"#;
+"#
+    };
+}
+
+const WGSL_F32: &str = concat!(
+    r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+"#,
+    upsample_body!()
+);
+
+// Native-f16 acts: pure gather/copy, scalar f16 element access (the 2x
+// duplication makes paired access awkward; bandwidth still halves).
+const WGSL_F16: &str = concat!(
+    r#"enable f16;
+@group(0) @binding(0) var<storage, read> x: array<f16>;
+@group(0) @binding(1) var<storage, read_write> out: array<f16>;
+"#,
+    upsample_body!()
+);
 
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
@@ -104,7 +124,10 @@ impl Upsample2dNearestOp for Upsample2dNearestF32 {
     const OUTPUT: &'static str = "upsample2d_nearest/out";
     fn wgsl(cfg: &WgslConfig) -> &'static str {
         assert!(!cfg.bf16_quant_writes);
-        WGSL
+        match cfg.act_dtype {
+            ActDtype::F16 => WGSL_F16,
+            _ => WGSL_F32,
+        }
     }
     fn layout() -> &'static [BindingLayout] {
         LAYOUT

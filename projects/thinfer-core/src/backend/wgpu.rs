@@ -19,6 +19,12 @@ pub struct WgpuBackend {
     submit_ordinal: AtomicU64,
     /// Monotonic ordinal for `read_buffer_via_encoder` calls. Gray-PNG diag.
     rbe_ordinal: AtomicU64,
+    /// Bytes / calls / nanos accumulated in `write_buffer` since the last
+    /// `submit`. Reset inside `submit`. Diag for distinguishing host-side
+    /// staging-belt back-pressure from in-submit translation cost.
+    wb_bytes_since_submit: AtomicU64,
+    wb_calls_since_submit: AtomicU64,
+    wb_ns_since_submit: AtomicU64,
     /// Per-dispatch GPU timing. `Some` only when `WgpuConfig.timestamps` was
     /// requested AND the adapter exposes `Features::TIMESTAMP_QUERY`.
     /// `period_ns` is the queue's timestamp tick length (multiply tick deltas
@@ -83,6 +89,16 @@ pub enum WgpuError {
     DeviceRequest(wgpu::RequestDeviceError),
     UnknownBuffer(GpuBufferId),
     BufferMap(wgpu::BufferAsyncError),
+    /// `map_async` failed with `BufferAsyncError`, plus any wgpu errors we
+    /// could attribute to the readback path: drained `uncaptured` sink and
+    /// fresh validation/oom/internal scopes pushed around the map. The plain
+    /// `BufferAsyncError` is opaque; this variant surfaces what actually went
+    /// wrong (TDR, validation, etc.) so we don't have to RUST_LOG-rerun.
+    BufferMapWithCause {
+        ordinal: u64,
+        async_err: wgpu::BufferAsyncError,
+        causes: Vec<String>,
+    },
     /// `create_buffer` was rejected by the driver. Drained from the
     /// uncaptured-error sink at the allocation point so the first failure
     /// stops the cascade of "Buffer invalid" follow-ons. Match the inner
@@ -369,6 +385,9 @@ impl WgpuBackend {
             poll,
             submit_ordinal: AtomicU64::new(0),
             rbe_ordinal: AtomicU64::new(0),
+            wb_bytes_since_submit: AtomicU64::new(0),
+            wb_calls_since_submit: AtomicU64::new(0),
+            wb_ns_since_submit: AtomicU64::new(0),
             uncaptured,
             timestamps,
             shader_f16: adapter_has_f16,
@@ -489,6 +508,7 @@ impl WgpuBackend {
         let src_buf = self.get_buffer(src)?;
         let src_size = src_buf.size();
         let ord = self.rbe_ordinal.fetch_add(1, Ordering::Relaxed);
+        let uncaptured = Arc::clone(&self.uncaptured);
         // Validation scope around just this copy, so any record-time rejection
         // is attributable to THIS readback and not an earlier dispatch.
         let scope_guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -533,9 +553,19 @@ impl WgpuBackend {
                 let _ = tx.send(r);
             });
             tracing::debug!(target: crate::trace::PHASE, "rbe.await");
-            rx.await
-                .expect("map_async sender dropped")
-                .map_err(WgpuError::BufferMap)?;
+            let map_result = rx.await.expect("map_async sender dropped");
+            if let Err(async_err) = map_result {
+                let mut causes: Vec<String> = Vec::new();
+                if let Some(e) = uncaptured.lock().unwrap().take() {
+                    tracing::error!(target: trace::RBE, op = "map_uncaptured", ordinal = ord, error = %e);
+                    causes.push(format!("uncaptured: {e}"));
+                }
+                return Err(WgpuError::BufferMapWithCause {
+                    ordinal: ord,
+                    async_err,
+                    causes,
+                });
+            }
             tracing::debug!(target: crate::trace::PHASE, "rbe.mapped");
             let data = staging.slice(..).get_mapped_range().to_vec();
             staging.unmap();
@@ -594,7 +624,13 @@ impl Backend for WgpuBackend {
         src: &[u8],
     ) -> Result<(), Self::Error> {
         let buf = self.get_buffer(dst)?;
+        let t0 = std::time::Instant::now();
         self.queue.write_buffer(&buf, dst_offset, src);
+        let ns = t0.elapsed().as_nanos() as u64;
+        self.wb_ns_since_submit.fetch_add(ns, Ordering::Relaxed);
+        self.wb_bytes_since_submit
+            .fetch_add(src.len() as u64, Ordering::Relaxed);
+        self.wb_calls_since_submit.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -771,6 +807,10 @@ impl Backend for WgpuBackend {
         let validation_guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let oom_guard = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let internal_guard = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let wb_bytes = self.wb_bytes_since_submit.swap(0, Ordering::Relaxed);
+        let wb_calls = self.wb_calls_since_submit.swap(0, Ordering::Relaxed);
+        let wb_ns = self.wb_ns_since_submit.swap(0, Ordering::Relaxed);
+        let wb_ms = (wb_ns as f64) / 1.0e6;
         let t_finish = std::time::Instant::now();
         let cmdbuf = encoder.enc.finish();
         let finish_ms = t_finish.elapsed().as_secs_f64() * 1000.0;
@@ -813,6 +853,9 @@ impl Backend for WgpuBackend {
                 finish_ms = finish_ms,
                 submit_call_ms = submit_call_ms,
                 gpu_ms = gpu_ms,
+                wb_ms = wb_ms,
+                wb_calls = wb_calls,
+                wb_bytes = wb_bytes,
                 n_errs = errs.len() as u32,
             );
             if let Some(pt) = pending_ts {
