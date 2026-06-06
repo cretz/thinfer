@@ -149,7 +149,12 @@ fn main(
 
     var o_local: array<f32, 128>;
     for (var d = 0u; d < u.d; d = d + 1u) { o_local[d] = 0.0; }
-    var m: f32 = bitcast<f32>(0xff800000u);
+    // Large-negative finite f32, not -inf: Tint (browser WebGPU) rejects
+    // const-exprs evaluating to -inf (bitcast<f32>(0xff800000u)) and ALSO
+    // out-of-range decimals like -3.4028235e38 (Rust's f32::MIN print is
+    // a hair beyond max-finite as an exact decimal); naga accepts both.
+    // Equivalent as a running-max init.
+    var m: f32 = -3.4e38;
     var l: f32 = 0.0;
 
     let n_tiles = (u.s_k + BC - 1u) / BC;
@@ -271,7 +276,12 @@ fn main(
 
     var o_local: array<f32, 128>;
     for (var d = 0u; d < u.d; d = d + 1u) { o_local[d] = 0.0; }
-    var m: f32 = bitcast<f32>(0xff800000u);
+    // Large-negative finite f32, not -inf: Tint (browser WebGPU) rejects
+    // const-exprs evaluating to -inf (bitcast<f32>(0xff800000u)) and ALSO
+    // out-of-range decimals like -3.4028235e38 (Rust's f32::MIN print is
+    // a hair beyond max-finite as an exact decimal); naga accepts both.
+    // Equivalent as a running-max init.
+    var m: f32 = -3.4e38;
     var l: f32 = 0.0;
 
     let n_tiles = (u.s_k + BC - 1u) / BC;
@@ -401,7 +411,12 @@ fn main(
 
     var o_local: array<f32, 128>;
     for (var d = 0u; d < u.d; d = d + 1u) { o_local[d] = 0.0; }
-    var m: f32 = bitcast<f32>(0xff800000u);
+    // Large-negative finite f32, not -inf: Tint (browser WebGPU) rejects
+    // const-exprs evaluating to -inf (bitcast<f32>(0xff800000u)) and ALSO
+    // out-of-range decimals like -3.4028235e38 (Rust's f32::MIN print is
+    // a hair beyond max-finite as an exact decimal); naga accepts both.
+    // Equivalent as a running-max init.
+    var m: f32 = -3.4e38;
     var l: f32 = 0.0;
 
     let n_tiles = (u.s_k + BC - 1u) / BC;
@@ -778,7 +793,7 @@ fn main(
     }
 
     if (t == 0u) {
-        shared_scalar[0] = bitcast<f32>(0xff800000u); // m = -inf
+        shared_scalar[0] = -3.4e38; // m running-max init (in-range finite; see note at sdpa var m)
         shared_scalar[1] = 0.0;                       // l
     }
     workgroupBarrier();
@@ -903,7 +918,7 @@ fn main(
     }
 
     if (t == 0u) {
-        shared_scalar[0] = bitcast<f32>(0xff800000u);
+        shared_scalar[0] = -3.4e38; // m running-max init (in-range finite; see note at sdpa var m)
         shared_scalar[1] = 0.0;
     }
     workgroupBarrier();

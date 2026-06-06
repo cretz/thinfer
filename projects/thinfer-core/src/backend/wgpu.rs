@@ -1,5 +1,5 @@
 use crate::backend::poll::WgpuPoll;
-use crate::backend::{Backend, Binding, BindingKind, BindingLayout};
+use crate::backend::{Backend, Binding, BindingKind, BindingLayout, BufRef, WeightPrep};
 use crate::mem::{MemAccount, VramCategory, VramCharge};
 use crate::tensor::GpuBufferId;
 use crate::trace;
@@ -66,6 +66,10 @@ pub struct WgpuBackend {
     /// allocation point; on wasm the handler may fire asynchronously and the
     /// per-submit scopes catch what slips past.
     uncaptured: Arc<Mutex<Option<wgpu::Error>>>,
+    /// Lazily-compiled `ops::weight_prep` pipelines, keyed by op kind. The
+    /// kernels are shape-independent (dims via uniform), so two entries
+    /// serve every weight for the backend's lifetime.
+    prep_pipelines: Mutex<HashMap<&'static str, Arc<WgpuPipeline>>>,
     /// Shared memory accountant. Backend charges `Staging` directly for
     /// internal readback/timestamp buffers; the default `allocate(bytes)`
     /// charges `Workspace`. Residency calls `allocate_in(bytes, Weights)`
@@ -396,6 +400,7 @@ impl WgpuBackend {
             subgroup_min_size,
             subgroup_max_size,
             mem: MemAccount::new(),
+            prep_pipelines: Mutex::new(HashMap::new()),
         })
     }
 
@@ -624,10 +629,16 @@ impl Backend for WgpuBackend {
         src: &[u8],
     ) -> Result<(), Self::Error> {
         let buf = self.get_buffer(dst)?;
-        let t0 = std::time::Instant::now();
+        // Clock reads are gated on subscriber interest: `Instant::now` panics
+        // at runtime on wasm32-unknown-unknown (no OS clock), and the wb
+        // stats only surface via the SUBMIT info event anyway.
+        let t0 = tracing::enabled!(target: trace::SUBMIT, tracing::Level::INFO)
+            .then(std::time::Instant::now);
         self.queue.write_buffer(&buf, dst_offset, src);
-        let ns = t0.elapsed().as_nanos() as u64;
-        self.wb_ns_since_submit.fetch_add(ns, Ordering::Relaxed);
+        if let Some(t0) = t0 {
+            let ns = t0.elapsed().as_nanos() as u64;
+            self.wb_ns_since_submit.fetch_add(ns, Ordering::Relaxed);
+        }
         self.wb_bytes_since_submit
             .fetch_add(src.len() as u64, Ordering::Relaxed);
         self.wb_calls_since_submit.fetch_add(1, Ordering::Relaxed);
@@ -811,12 +822,15 @@ impl Backend for WgpuBackend {
         let wb_calls = self.wb_calls_since_submit.swap(0, Ordering::Relaxed);
         let wb_ns = self.wb_ns_since_submit.swap(0, Ordering::Relaxed);
         let wb_ms = (wb_ns as f64) / 1.0e6;
-        let t_finish = std::time::Instant::now();
+        // Same wasm gate as `write_buffer`: only touch the clock when the
+        // SUBMIT event will actually be emitted.
+        let submit_timing = tracing::enabled!(target: trace::SUBMIT, tracing::Level::INFO);
+        let t_finish = submit_timing.then(std::time::Instant::now);
         let cmdbuf = encoder.enc.finish();
-        let finish_ms = t_finish.elapsed().as_secs_f64() * 1000.0;
-        let t_submit = std::time::Instant::now();
+        let finish_ms = t_finish.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        let t_submit = submit_timing.then(std::time::Instant::now);
         queue.submit([cmdbuf]);
-        let submit_call_ms = t_submit.elapsed().as_secs_f64() * 1000.0;
+        let submit_call_ms = t_submit.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let internal_scope = internal_guard.pop();
         let oom_scope = oom_guard.pop();
         let validation_scope = validation_guard.pop();
@@ -827,9 +841,9 @@ impl Backend for WgpuBackend {
         let guard = self.poll.poll_guard();
         async move {
             let _guard = guard;
-            let t_wait = std::time::Instant::now();
+            let t_wait = submit_timing.then(std::time::Instant::now);
             rx.await.expect("on_submitted_work_done sender dropped");
-            let gpu_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+            let gpu_ms = t_wait.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             let mut errs: Vec<String> = Vec::new();
             if let Some(err) = validation_scope.await {
                 tracing::error!(target: trace::WGPU_ERR, kind = "validation", ordinal = ordinal, error = %err);
@@ -992,6 +1006,84 @@ impl Backend for WgpuBackend {
             let data = staging.slice(..).get_mapped_range().to_vec();
             staging.unmap();
             Ok(data)
+        }
+    }
+
+    fn weight_prep(
+        &self,
+        op: WeightPrep,
+        raw: &[u8],
+        dst: &BufRef,
+    ) -> impl Future<Output = Result<bool, Self::Error>> {
+        let dst = *dst;
+        async move {
+            let (key, dims): (&'static str, [u32; 4]) = match op {
+                WeightPrep::Q8_0FromBf16 { n, k } => {
+                    let pairs = ((n as u64 * k as u64) / 64) as u32;
+                    ("q8_0_from_bf16", [pairs, 0, 0, 0])
+                }
+                WeightPrep::TransposeBf16 { n, k } => ("transpose_bf16_2d", [n, k, 0, 0]),
+            };
+            let pipeline = {
+                let cached = self.prep_pipelines.lock().unwrap().get(key).cloned();
+                match cached {
+                    Some(p) => p,
+                    None => {
+                        let wgsl = match op {
+                            WeightPrep::Q8_0FromBf16 { .. } => {
+                                crate::ops::weight_prep::build_q8_0_from_bf16_wgsl()
+                            }
+                            WeightPrep::TransposeBf16 { .. } => {
+                                crate::ops::weight_prep::build_transpose_bf16_wgsl()
+                            }
+                        };
+                        let p = Arc::new(
+                            self.create_pipeline(&wgsl, key, crate::ops::weight_prep::layout())
+                                .await?,
+                        );
+                        self.prep_pipelines
+                            .lock()
+                            .unwrap()
+                            .insert(key, Arc::clone(&p));
+                        p
+                    }
+                }
+            };
+            let staging = self.allocate_in(raw.len() as u64, VramCategory::Staging)?;
+            let dims_buf = self.allocate_in(16, VramCategory::Staging)?;
+            let run = (|| {
+                self.write_buffer(staging, 0, raw)?;
+                self.write_buffer(dims_buf, 0, bytemuck::bytes_of(&dims))?;
+                let src_ref = BufRef::new(staging, raw.len() as u64);
+                let dims_ref = BufRef::new(dims_buf, 16);
+                let bufs = crate::ops::weight_prep::WeightPrepBufs {
+                    src: &src_ref,
+                    dst: &dst,
+                    dims: &dims_ref,
+                };
+                let mut enc = self.create_command_encoder();
+                match op {
+                    WeightPrep::Q8_0FromBf16 { .. } => {
+                        crate::ops::weight_prep::dispatch_q8_0_from_bf16(
+                            self, &mut enc, &pipeline, &bufs, dims[0],
+                        )?
+                    }
+                    WeightPrep::TransposeBf16 { n, k } => {
+                        crate::ops::weight_prep::dispatch_transpose_bf16(
+                            self, &mut enc, &pipeline, &bufs, n, k,
+                        )?
+                    }
+                }
+                Ok::<_, WgpuError>(enc)
+            })();
+            let res = match run {
+                Ok(enc) => self.submit(enc).await,
+                Err(e) => Err(e),
+            };
+            self.free(staging);
+            self.free(dims_buf);
+            res?;
+            Ok(true)
         }
     }
 }

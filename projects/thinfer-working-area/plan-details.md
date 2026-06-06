@@ -24,8 +24,7 @@ Design decisions beyond `orig-plan.md`. Update when decisions change.
 - Compute dtypes (kernel-time): fp32, fp16 (later fp8).
 - Kernels are parametric over compute dtype. Weight loader handles encoding→compute (dequant on upload or on first use).
 - Per-module precision policy: a sensitive module can compute in fp32 with weights stored in any encoding. fp32-island detection (post-v1) just changes the policy values.
-- bf16 storage is M1 (not M2). Z-Image-Turbo was trained in bf16; an fp16 cast loses magnitude (>65504 -> inf) and produces broken outputs. fp16 is intentionally avoided for Z-Image. bf16 storage was already a v1 commitment for LTX-Video, just pulled forward.
-- bf16 v1: expand to fp32 at upload (2x GPU bytes for bf16 weights). All kernels stay fp32 in M1. Provably correct baseline that diffs against PyTorch with a clean tolerance.
+- Production encoding is GGUF quant: Q4_K_M default, Q8_0 as the pyref-parity canary. bf16 storage is the fallback path (and stays mandatory where quant hurts: Qwen3 mlp_down, embedder, final_layer). fp16 STORAGE is intentionally avoided for Z-Image: bf16-trained, an fp16 cast loses magnitude (>65504 -> inf) and produces broken outputs. Acts: BF16_PACKED with bf16 weights, F16 with quant weights (next bullet).
 - Native f16 storage (`enable f16;` extension) IS used in the Q8 path when the adapter exposes `Features::SHADER_F16`. Storage and pointwise compute are f16/`vec2<f16>`; reductions (matmul accumulators, sdpa softmax, rms/layer norm sums) stay f32 internally. This is the standard f16-IO / f32-accum pattern (llama.cpp, cuBLAS, MPS, cuDNN); f16 mantissa loses ~3-4 bits across the K=10240 FFN dot product and `exp(s_j)` saturates above ~11.1 in softmax. Storage-only narrowing preserves magnitude safety for the bf16-trained Z-Image weights. Bf16-acts production path (BF16_PACKED, used with bf16 weights) is unaffected; F16 acts pair only with Quant weights for now. When SHADER_F16 is unavailable the Quant path falls back to F32 acts.
 
 ## Weight bytes: never in WASM linear memory
@@ -87,7 +86,7 @@ Design decisions beyond `orig-plan.md`. Update when decisions change.
 
 - Pipeline-cache inserts happen at module *prepare* time, never inside `forward`. `ForwardCtx` exposes only the read-only `PipelineLookup` half so the hot path can't accidentally trigger compile.
 - `Workspace` is a size-classed pool: `alloc(backend, bytes)` returns its own physical `GpuBufferId`; `reset()` returns rented buffers to per-class free lists. Pool reuse is across forwards, not within. Sub-slicing one mega-buffer is NOT viable: wgpu rejects a single dispatch binding the same buffer as both storage-read and storage-read-write, even with disjoint offset/size, so every chained kernel needs distinct buffers.
-- Lifetime-aware reuse within a forward (XLA-style buffer assignment) is the v2 move. v1 keeps every activation live to end-of-forward.
+- Workspace pool is arbiter-integrated: idle pool buffers are first in the `MemArbiter` reclaim chain. Lifetime-aware reuse within a forward (XLA-style buffer assignment) remains a possible later move.
 
 ## Concurrency on the hot path
 
@@ -109,9 +108,9 @@ Design decisions beyond `orig-plan.md`. Update when decisions change.
 
 The project thesis is "thin inference": low-quant GGUF compute on memory-constrained devices, especially in-browser WebGPU. Quant kernels are the destination, not an optimization phase. M1's fp32 path exists to be the diff-against-PyTorch baseline that validates M2's quant kernels.
 
-- M1: bf16 storage + fp32 compute end-to-end. Z-Image-Turbo, CLI then browser. Provably correct baseline.
-- M2: GGUF Q-block compute kernels in WGSL. Block-dequant inside the matmul shader (Q8_0 first - simplest layout, ~lossless; Q4_K next - real VRAM win). Non-matmul ops stay fp32 until profiling justifies more. Reuses every layer except the format parser: catalog, manifest, cache, audit, model wiring, residency tiering, fp32 baseline kernels for diffing. This is the entire point of the engine.
-- M3: LTX-Video. Reuses Q-block kernels from M2 (also bf16-trained transformer, similar shapes).
+- M1 (DONE): bf16 storage + fp32 compute end-to-end. Z-Image-Turbo on CLI. Provably correct baseline.
+- M2 (DONE): GGUF Q-block compute kernels in WGSL, block-dequant inside the matmul shader. Q4_K_M is the shipped default, Q8_0 the parity canary. Current state and baselines live in worklog.md.
+- Next: browser (thinfer-web form + Playwright e2e parity), then M3 LTX-Video (reuses Q-block kernels; also bf16-trained transformer, similar shapes).
 
 ## Crate split (extends orig-plan)
 

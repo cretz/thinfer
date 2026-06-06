@@ -36,6 +36,7 @@ pub mod softmax;
 pub mod tanh;
 pub mod transpose12;
 pub mod upsample2d_nearest;
+pub mod weight_prep;
 
 pub use add::AddF32;
 pub(crate) use bcast_add::dispatch_bcast_add;

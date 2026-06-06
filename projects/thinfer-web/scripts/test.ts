@@ -84,10 +84,21 @@ const template = JSON.parse(readFileSync(join(pkgDir, "webdriver.template.json")
 };
 const chromeOpts = (template["goog:chromeOptions"] ?? {}) as Record<string, unknown>;
 chromeOpts.binary = chromiumBin;
+// CI runners have no GPU; point Chrome's WebGPU at SwiftShader (its bundled
+// software implementation) so an adapter exists at all. Local runs keep the
+// real GPU.
+if (process.env.CI) {
+  const args = (chromeOpts.args ?? []) as string[];
+  args.push("--use-webgpu-adapter=swiftshader");
+  chromeOpts.args = args;
+}
 template["goog:chromeOptions"] = chromeOpts;
 writeFileSync(join(pkgDir, "webdriver.json"), `${JSON.stringify(template, null, 2)}\n`);
 
-// 5. cargo test.
+// 5. cargo test. Always --nocapture: wasm-bindgen-test-runner only replays
+// captured console output for tests that REPORT failure; a panic that kills
+// the harness before reporting ("Failed to detect test as having been run")
+// silently swallows the actual error otherwise.
 const cargoArgs = [
   "test",
   "--target",
@@ -95,5 +106,7 @@ const cargoArgs = [
   "-p",
   "thinfer-web",
   ...process.argv.slice(2),
+  "--",
+  "--nocapture",
 ];
 process.exit(run("cargo", cargoArgs, { CHROMEDRIVER: cd.path }));

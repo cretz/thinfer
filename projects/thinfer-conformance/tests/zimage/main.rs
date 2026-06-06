@@ -6,3 +6,4 @@
 
 mod dit_scatter;
 mod e2e_parity;
+mod qwen3_parity;

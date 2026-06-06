@@ -17,11 +17,13 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 const FP32_BYTES: &[u8] = include_bytes!("../../thinfer-conformance/fixtures/fp32.safetensors");
 const BF16W_BYTES: &[u8] = include_bytes!("../../thinfer-conformance/fixtures/bf16w.safetensors");
+const BF16P_BYTES: &[u8] = include_bytes!("../../thinfer-conformance/fixtures/bf16p.safetensors");
 
 fn fixture_bytes(d: Dtype) -> &'static [u8] {
     match d {
         Dtype::Fp32 => FP32_BYTES,
         Dtype::Bf16Writes => BF16W_BYTES,
+        Dtype::Bf16Packed => BF16P_BYTES,
     }
 }
 
@@ -29,9 +31,22 @@ fn fixture_bytes(d: Dtype) -> &'static [u8] {
 async fn ops_match_pytorch_reference() {
     console_error_panic_hook::set_once();
 
-    let backend = WgpuBackend::new()
-        .await
-        .expect("wgpu adapter unavailable in browser");
+    // Race adapter acquisition against a wall-clock timeout. On a GPU-less
+    // environment (e.g. CI runner without a usable WebGPU adapter) Chrome's
+    // `requestAdapter()` can stay pending forever, which otherwise stalls
+    // the job to its 6h timeout instead of failing the test.
+    let backend = {
+        use futures_util::future::{Either, select};
+        let backend_fut = std::pin::pin!(WgpuBackend::new());
+        let timeout = gloo_timers::future::TimeoutFuture::new(15_000);
+        match select(backend_fut, timeout).await {
+            Either::Left((res, _)) => res.expect("wgpu adapter unavailable in browser"),
+            Either::Right(_) => panic!(
+                "no WebGPU adapter within 15s: GPU-less environment? \
+                 (CI uses --use-webgpu-adapter=swiftshader; see scripts/test.ts)"
+            ),
+        }
+    };
 
     let registry = registry();
     let by_op: Vec<(&'static [Dtype], Vec<TestCase>)> = registry

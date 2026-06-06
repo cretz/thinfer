@@ -20,7 +20,6 @@
 //! new ingredients are token embedding lookup and causal mask construction.
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
-use thinfer_core::ops::{AddF32, MulF32, RmsNormF32, RopeF32HalfRot, SdpaF32, SiluF32};
 use thinfer_core::residency::{
     GpuView, ResidencyError, TransposePolicy, WeightHandle, WeightMeta, WeightResidency,
 };
@@ -30,7 +29,10 @@ use thinfer_core::weight::{Decoder, WeightCatalog, WeightId, WeightReader, Weigh
 use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 use tracing::Instrument;
 
-use crate::z_image::block::BlockPipelines;
+use crate::z_image::block::{
+    ActBuf, Block, BlockPipelines, alloc_act, alloc_matmul_out_buf, copy_tap, op_add, op_rmsnorm,
+    op_rope_halfrot, op_sdpa, op_silu_mul,
+};
 use crate::z_image::rope_embedder::RopeEmbedder;
 use crate::z_image::seq;
 
@@ -220,32 +222,59 @@ pub enum LoadError {
     },
 }
 
+/// Register the encoder weights. Only the first `N_LAYERS - 1` layers are
+/// registered: the output is `hidden_states[-2]` so layer `N-1` never runs
+/// (no point paying its residency footprint or last-iteration prefetch).
+///
+/// `transcode`: load-time requantize target for 6 of the 7 matmul weights
+/// per layer (q/k/v/o + gate/up). The Tongyi checkpoint ships them bf16;
+/// `Some(Q8_0)` rides them onto the same quant matmul path the DiT uses
+/// (DP4A `matmul_i8` or the dequant workspace fallback) at ~half the upload
+/// bytes. Norm gains stay dense.
+///
+/// `mlp_down` is NEVER transcoded: Qwen3 massive activations (the
+/// attention-sink token's gate*up row, max-abs ~8k from layer 6 on, with
+/// heavy cancellation in the dot products) amplify per-block weight-quant
+/// noise into ~1.7 absolute output error on that row, corrupting the
+/// conditioning (qwen3_parity layer-6 forensics, 2026-06-05). llama.cpp's
+/// K-quant mixes bump ffn_down precision for the same reason. Callers'
+/// pipeline cfgs must compile `matmul_ffn_down` against Bf16 to match
+/// (`ZImageModel::load` and qwen3_parity mirror this).
 pub fn register_qwen3_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
+    transcode: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<Qwen3Handles, LoadError> {
     let weights = Qwen3Weights::new();
     // `model.embed_tokens.weight` is the 777 MB [vocab, hidden] lookup table.
     // Intentionally NOT registered with residency: a prompt only ever indexes
     // a few hundred rows, so we gather rows directly from disk via
     // `embed_lookup` and never page or upload the full table.
-    let mut layers = Vec::with_capacity(weights.layers.len());
-    for b in &weights.layers {
+    let n_run = config::HIDDEN_STATES_LAYER;
+    let mut layers = Vec::with_capacity(n_run);
+    for b in weights.layers.iter().take(n_run) {
         layers.push(Qwen3BlockHandles {
-            input_layernorm: register_one(residency, &b.input_layernorm, TransposePolicy::None)?,
+            input_layernorm: register_one(
+                residency,
+                &b.input_layernorm,
+                TransposePolicy::None,
+                None,
+            )?,
             post_attention_layernorm: register_one(
                 residency,
                 &b.post_attention_layernorm,
                 TransposePolicy::None,
+                None,
             )?,
-            q_proj: register_one(residency, &b.q_proj, TransposePolicy::Linear2D)?,
-            k_proj: register_one(residency, &b.k_proj, TransposePolicy::Linear2D)?,
-            v_proj: register_one(residency, &b.v_proj, TransposePolicy::Linear2D)?,
-            o_proj: register_one(residency, &b.o_proj, TransposePolicy::Linear2D)?,
-            q_norm: register_one(residency, &b.q_norm, TransposePolicy::None)?,
-            k_norm: register_one(residency, &b.k_norm, TransposePolicy::None)?,
-            mlp_gate: register_one(residency, &b.mlp_gate, TransposePolicy::Linear2D)?,
-            mlp_up: register_one(residency, &b.mlp_up, TransposePolicy::Linear2D)?,
-            mlp_down: register_one(residency, &b.mlp_down, TransposePolicy::Linear2D)?,
+            q_proj: register_one(residency, &b.q_proj, TransposePolicy::Linear2D, transcode)?,
+            k_proj: register_one(residency, &b.k_proj, TransposePolicy::Linear2D, transcode)?,
+            v_proj: register_one(residency, &b.v_proj, TransposePolicy::Linear2D, transcode)?,
+            o_proj: register_one(residency, &b.o_proj, TransposePolicy::Linear2D, transcode)?,
+            q_norm: register_one(residency, &b.q_norm, TransposePolicy::None, None)?,
+            k_norm: register_one(residency, &b.k_norm, TransposePolicy::None, None)?,
+            mlp_gate: register_one(residency, &b.mlp_gate, TransposePolicy::Linear2D, transcode)?,
+            mlp_up: register_one(residency, &b.mlp_up, TransposePolicy::Linear2D, transcode)?,
+            // Never transcoded: see the massive-activation note on this fn.
+            mlp_down: register_one(residency, &b.mlp_down, TransposePolicy::Linear2D, None)?,
         });
     }
     Ok(Qwen3Handles { layers })
@@ -255,6 +284,7 @@ fn register_one<S: WeightSource>(
     residency: &WeightResidency<S>,
     id: &WeightId,
     transpose: TransposePolicy,
+    transcode: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<WeightHandle, LoadError> {
     let entry = residency
         .source()
@@ -273,13 +303,35 @@ fn register_one<S: WeightSource>(
             label: entry.encoding_label.clone(),
         });
     }
+    // Transcode targets keep the file's [N, K] row order (GGUF block layout
+    // is N-major, no transpose); requires bf16 source and whole 32-blocks
+    // along K. Mirrors `loader::register_linear_transcode`.
+    let (transpose, transcode) = match (encoding, transcode) {
+        (StorageEncoding::Bf16, Some(k)) => {
+            assert_eq!(entry.shape.0.len(), 2, "transcode target must be 2-D");
+            assert_eq!(
+                entry.shape.0[1] % 32,
+                0,
+                "transcode requires K % 32 == 0 ({id:?})"
+            );
+            (TransposePolicy::None, Some(k))
+        }
+        (_, Some(_)) => {
+            return Err(LoadError::Undecodable {
+                id: id.clone(),
+                encoding: Some(encoding),
+                label: format!("transcode requires bf16 source ({})", entry.encoding_label),
+            });
+        }
+        (_, None) => (transpose, None),
+    };
     Ok(residency.register(WeightMeta {
         id: id.clone(),
         shape: entry.shape.clone(),
         encoding,
         on_disk_bytes: entry.size,
         transpose,
-        transcode: None,
+        transcode,
     }))
 }
 
@@ -520,6 +572,39 @@ impl Qwen3BlockShape {
     }
 }
 
+/// GPU tap destinations for one Qwen3 layer (parity diagnostics). Each
+/// `Some` BufRef receives an in-scope copy of the corresponding dense
+/// intermediate (act-dtype bytes, caller sizes and reads back post-submit).
+#[derive(Default, Clone)]
+pub struct Qwen3BlockTaps {
+    /// Pre-attn rmsnorm out `[rows, dim]`.
+    pub n1: Option<BufRef>,
+    /// q/k/v projection outputs `[rows, hq*hd]` / `[rows, hkv*hd]` x2.
+    pub q: Option<BufRef>,
+    pub k: Option<BufRef>,
+    pub v: Option<BufRef>,
+    /// Per-head q/k rmsnorm outputs (same shapes as q/k).
+    pub qn: Option<BufRef>,
+    pub kn: Option<BufRef>,
+    /// Post-rope q/k (same shapes).
+    pub qr: Option<BufRef>,
+    pub kr: Option<BufRef>,
+    /// Sdpa out `[rows, hq*hd]`.
+    pub sa: Option<BufRef>,
+    /// o_proj out `[rows, dim]`.
+    pub proj: Option<BufRef>,
+    /// Post-attn residual `[rows, dim]`.
+    pub after_attn: Option<BufRef>,
+    /// Pre-ffn rmsnorm out `[rows, dim]`.
+    pub n2: Option<BufRef>,
+    /// gate/up matmul outs `[rows, hid]` and their silu_mul `[rows, hid]`.
+    pub gate: Option<BufRef>,
+    pub up: Option<BufRef>,
+    pub gu: Option<BufRef>,
+    /// down matmul out `[rows, dim]`.
+    pub down: Option<BufRef>,
+}
+
 /// One Qwen3 decoder layer: pre-norm GQA self-attn (with per-head Q/K
 /// RMSNorm, 1-axis RoPE, causal SDPA) -> residual -> pre-norm SwiGLU FFN ->
 /// residual. No adaLN, no double-norm. Reuses the same kernels as the DiT
@@ -538,7 +623,10 @@ impl Qwen3Block {
     }
 
     /// Append one decoder layer's dispatches to the scope's encoder. Caller
-    /// submits the scope.
+    /// submits the scope. Runs at the pipeline set's act dtype; every matmul
+    /// routes through `Block::dispatch_matmul_site` (DP4A `matmul_i8` on the
+    /// quant path, dequant-workspace or dense fallback otherwise) and sdpa
+    /// picks the subgroup flash kernel when available (`op_sdpa`).
     #[allow(clippy::too_many_arguments)]
     pub fn forward<'wsp>(
         &self,
@@ -550,6 +638,31 @@ impl Qwen3Block {
         y_out: BatchBuf<'wsp>,
         bufs: &'wsp Qwen3BlockBufs,
     ) -> Result<(), WgpuError> {
+        self.forward_taps(
+            scope,
+            pipelines,
+            x_in,
+            freqs_in,
+            mask_in,
+            y_out,
+            bufs,
+            &Qwen3BlockTaps::default(),
+        )
+    }
+
+    /// `forward` with per-op tap copies (see [`Qwen3BlockTaps`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_taps<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &BlockPipelines,
+        x_in: BatchBuf<'wsp>,
+        freqs_in: BatchBuf<'wsp>,
+        mask_in: BatchBuf<'wsp>,
+        y_out: BatchBuf<'wsp>,
+        bufs: &'wsp Qwen3BlockBufs,
+        taps: &Qwen3BlockTaps,
+    ) -> Result<(), WgpuError> {
         let s = self.shape;
         let rows = s.seq as u32;
         let dim = s.dim as u32;
@@ -559,12 +672,8 @@ impl Qwen3Block {
         let hid = s.ffn_hidden as u32;
         let eps = s.norm_eps;
         let scale = s.sdpa_scale();
-
-        let act_bytes = (rows * dim) as u64 * 4;
-        let q_bytes = (rows * hq * hd) as u64 * 4;
-        let kv_bytes = (rows * hkv * hd) as u64 * 4;
-        let hid_bytes = (rows * hid) as u64 * 4;
-        let pairs = hd / 2;
+        let x_in = ActBuf::dense(x_in);
+        let y_out = ActBuf::dense(y_out);
 
         let in_ln = scope.import(&bufs.input_layernorm);
         let q_w = scope.import(&bufs.q_proj);
@@ -579,150 +688,284 @@ impl Qwen3Block {
         let down_w = scope.import(&bufs.mlp_down);
 
         // --- pre-attn norm ---
-        let n1 = scope.alloc(act_bytes)?;
-        let u_n1 = scope_rmsnorm_uniform(scope, rows, dim, eps)?;
-        scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, x_in, in_ln, u_n1, n1, rows)?;
+        let n1 = alloc_act(scope, pipelines, rows, dim)?;
+        op_rmsnorm(scope, pipelines, x_in, in_ln, n1, rows, dim, eps)?;
+        copy_tap(
+            scope,
+            n1.data,
+            taps.n1.as_ref(),
+            pipelines.act_bytes(rows * dim),
+        )?;
 
-        // --- q/k/v projections ---
-        let q = scope.alloc(q_bytes)?;
-        let k = scope.alloc(kv_bytes)?;
-        let v = scope.alloc(kv_bytes)?;
-        let u_q = scope.u32x4_uniform(rows, hq * hd, dim, 0)?;
-        scope.matmul(
-            &pipelines.matmul_qkv,
-            &pipelines.matmuls.qkv,
+        // --- q/k/v projections (separate weights; GQA shapes) ---
+        let q_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hq * hd)?;
+        let dims_q = scope.u32x4_uniform(rows, hq * hd, dim, 0)?;
+        Block::dispatch_matmul_site(
+            scope,
+            pipelines,
             n1,
             q_w,
-            u_q,
-            q,
+            q_scratch,
+            dims_q,
+            pipelines.matmul_i8_qkv.as_ref(),
+            pipelines.dequant_i8_qkv.as_ref(),
+            pipelines.dequant_qkv.as_ref(),
+            &pipelines.matmul_qkv,
+            &pipelines.matmuls.qkv,
             rows,
             hq * hd,
+            dim,
         )?;
-        let u_k = scope.u32x4_uniform(rows, hkv * hd, dim, 0)?;
-        scope.matmul(
-            &pipelines.matmul_qkv,
-            &pipelines.matmuls.qkv,
+        let k_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hkv * hd)?;
+        let dims_k = scope.u32x4_uniform(rows, hkv * hd, dim, 0)?;
+        Block::dispatch_matmul_site(
+            scope,
+            pipelines,
             n1,
             k_w,
-            u_k,
-            k,
-            rows,
-            hkv * hd,
-        )?;
-        let u_v = scope.u32x4_uniform(rows, hkv * hd, dim, 0)?;
-        scope.matmul(
+            k_scratch,
+            dims_k,
+            pipelines.matmul_i8_qkv.as_ref(),
+            pipelines.dequant_i8_qkv.as_ref(),
+            pipelines.dequant_qkv.as_ref(),
             &pipelines.matmul_qkv,
             &pipelines.matmuls.qkv,
-            n1,
-            v_w,
-            u_v,
-            v,
             rows,
             hkv * hd,
+            dim,
+        )?;
+        let v_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hkv * hd)?;
+        let dims_v = scope.u32x4_uniform(rows, hkv * hd, dim, 0)?;
+        Block::dispatch_matmul_site(
+            scope,
+            pipelines,
+            n1,
+            v_w,
+            v_scratch,
+            dims_v,
+            pipelines.matmul_i8_qkv.as_ref(),
+            pipelines.dequant_i8_qkv.as_ref(),
+            pipelines.dequant_qkv.as_ref(),
+            &pipelines.matmul_qkv,
+            &pipelines.matmuls.qkv,
+            rows,
+            hkv * hd,
+            dim,
+        )?;
+        let q = ActBuf::dense(q_scratch);
+        let k = ActBuf::dense(k_scratch);
+        let v = ActBuf::dense(v_scratch);
+        copy_tap(
+            scope,
+            q.data,
+            taps.q.as_ref(),
+            pipelines.act_bytes(rows * hq * hd),
+        )?;
+        copy_tap(
+            scope,
+            k.data,
+            taps.k.as_ref(),
+            pipelines.act_bytes(rows * hkv * hd),
+        )?;
+        copy_tap(
+            scope,
+            v.data,
+            taps.v.as_ref(),
+            pipelines.act_bytes(rows * hkv * hd),
         )?;
 
         // --- per-head Q/K RMSNorm over head_dim ---
-        let qn = scope.alloc(q_bytes)?;
-        let kn = scope.alloc(kv_bytes)?;
-        let u_qn = scope_rmsnorm_uniform(scope, rows * hq, hd, eps)?;
-        scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, q, qn_w, u_qn, qn, rows * hq)?;
-        let u_kn = scope_rmsnorm_uniform(scope, rows * hkv, hd, eps)?;
-        scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, k, kn_w, u_kn, kn, rows * hkv)?;
+        let qn = alloc_act(scope, pipelines, rows * hq, hd)?;
+        op_rmsnorm(scope, pipelines, q, qn_w, qn, rows * hq, hd, eps)?;
+        let kn = alloc_act(scope, pipelines, rows * hkv, hd)?;
+        op_rmsnorm(scope, pipelines, k, kn_w, kn, rows * hkv, hd, eps)?;
+        copy_tap(
+            scope,
+            qn.data,
+            taps.qn.as_ref(),
+            pipelines.act_bytes(rows * hq * hd),
+        )?;
+        copy_tap(
+            scope,
+            kn.data,
+            taps.kn.as_ref(),
+            pipelines.act_bytes(rows * hkv * hd),
+        )?;
 
         // --- rope on Q, K (1-axis token-position freqs broadcast across heads) ---
-        let qr = scope.alloc(q_bytes)?;
-        let kr = scope.alloc(kv_bytes)?;
-        let u_qr = scope.u32x4_uniform(rows, hq, pairs, 0)?;
-        scope.rope::<RopeF32HalfRot>(
-            &pipelines.rope_halfrot,
-            qn,
-            freqs_in,
-            u_qr,
-            qr,
-            rows,
-            hq,
-            pairs,
+        let qr = alloc_act(scope, pipelines, rows, hq * hd)?;
+        op_rope_halfrot(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+        let kr = alloc_act(scope, pipelines, rows, hkv * hd)?;
+        op_rope_halfrot(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+        copy_tap(
+            scope,
+            qr.data,
+            taps.qr.as_ref(),
+            pipelines.act_bytes(rows * hq * hd),
         )?;
-        let u_kr = scope.u32x4_uniform(rows, hkv, pairs, 0)?;
-        scope.rope::<RopeF32HalfRot>(
-            &pipelines.rope_halfrot,
-            kn,
-            freqs_in,
-            u_kr,
-            kr,
-            rows,
-            hkv,
-            pairs,
+        copy_tap(
+            scope,
+            kr.data,
+            taps.kr.as_ref(),
+            pipelines.act_bytes(rows * hkv * hd),
         )?;
 
         // --- causal sdpa ---
-        let sa = scope.alloc(q_bytes)?;
-        let u_sa = scope_sdpa_uniform(scope, 1, hq, hkv, rows, rows, hd, scale, 1)?;
-        scope.sdpa::<SdpaF32>(&pipelines.sdpa, qr, kr, v, mask_in, u_sa, sa, 1, rows, hq)?;
+        let sa = alloc_act(scope, pipelines, rows, hq * hd)?;
+        op_sdpa(
+            scope, pipelines, qr, kr, v, mask_in, sa, 1, rows, rows, hq, hkv, hd, scale, 1,
+        )?;
+        copy_tap(
+            scope,
+            sa.data,
+            taps.sa.as_ref(),
+            pipelines.act_bytes(rows * hq * hd),
+        )?;
 
         // --- o_proj + residual ---
-        let proj = scope.alloc(act_bytes)?;
-        let u_proj = scope.u32x4_uniform(rows, dim, hq * hd, 0)?;
-        scope.matmul(
-            &pipelines.matmul_proj,
-            &pipelines.matmuls.proj,
+        let proj_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
+        let dims_proj = scope.u32x4_uniform(rows, dim, hq * hd, 0)?;
+        Block::dispatch_matmul_site(
+            scope,
+            pipelines,
             sa,
             o_w,
-            u_proj,
-            proj,
+            proj_scratch,
+            dims_proj,
+            pipelines.matmul_i8_proj.as_ref(),
+            pipelines.dequant_i8_proj.as_ref(),
+            pipelines.dequant_proj.as_ref(),
+            &pipelines.matmul_proj,
+            &pipelines.matmuls.proj,
             rows,
             dim,
+            hq * hd,
         )?;
-        let after_attn = scope.alloc(act_bytes)?;
-        scope.dispatch_op::<AddF32>(&pipelines.add, &[x_in, proj], after_attn)?;
+        copy_tap(
+            scope,
+            proj_scratch,
+            taps.proj.as_ref(),
+            pipelines.act_bytes(rows * dim),
+        )?;
+        let after_attn = alloc_act(scope, pipelines, rows, dim)?;
+        op_add(
+            scope,
+            pipelines,
+            x_in,
+            ActBuf::dense(proj_scratch),
+            after_attn,
+        )?;
+        copy_tap(
+            scope,
+            after_attn.data,
+            taps.after_attn.as_ref(),
+            pipelines.act_bytes(rows * dim),
+        )?;
 
         // --- pre-ffn norm ---
-        let n2 = scope.alloc(act_bytes)?;
-        let u_n2 = scope_rmsnorm_uniform(scope, rows, dim, eps)?;
-        scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, after_attn, pa_ln, u_n2, n2, rows)?;
+        let n2 = alloc_act(scope, pipelines, rows, dim)?;
+        op_rmsnorm(scope, pipelines, after_attn, pa_ln, n2, rows, dim, eps)?;
+        copy_tap(
+            scope,
+            n2.data,
+            taps.n2.as_ref(),
+            pipelines.act_bytes(rows * dim),
+        )?;
 
-        // --- SwiGLU FFN: down(silu(gate(x)) * up(x)) ---
-        let g = scope.alloc(hid_bytes)?;
-        let u_mlp_in = scope.alloc(hid_bytes)?;
-        let u_g = scope.u32x4_uniform(rows, hid, dim, 0)?;
-        scope.matmul(
-            &pipelines.matmul_ffn_up,
-            &pipelines.matmuls.ffn_up,
+        // --- SwiGLU FFN: down(silu_mul(gate(x), up(x))) ---
+        let g_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hid)?;
+        let dims_g = scope.u32x4_uniform(rows, hid, dim, 0)?;
+        Block::dispatch_matmul_site(
+            scope,
+            pipelines,
             n2,
             g_w,
-            u_g,
-            g,
-            rows,
-            hid,
-        )?;
-        let u_u = scope.u32x4_uniform(rows, hid, dim, 0)?;
-        scope.matmul(
+            g_scratch,
+            dims_g,
+            pipelines.matmul_i8_ffn_up.as_ref(),
+            pipelines.dequant_i8_ffn_up.as_ref(),
+            pipelines.dequant_ffn_up.as_ref(),
             &pipelines.matmul_ffn_up,
             &pipelines.matmuls.ffn_up,
-            n2,
-            up_w,
-            u_u,
-            u_mlp_in,
             rows,
             hid,
-        )?;
-        let gs = scope.alloc(hid_bytes)?;
-        scope.dispatch_op::<SiluF32>(&pipelines.silu, &[g], gs)?;
-        let gu = scope.alloc(hid_bytes)?;
-        scope.dispatch_op::<MulF32>(&pipelines.mul, &[gs, u_mlp_in], gu)?;
-        let down = scope.alloc(act_bytes)?;
-        let u_down = scope.u32x4_uniform(rows, dim, hid, 0)?;
-        scope.matmul(
-            &pipelines.matmul_ffn_down,
-            &pipelines.matmuls.ffn_down,
-            gu,
-            down_w,
-            u_down,
-            down,
-            rows,
             dim,
         )?;
-        scope.dispatch_op::<AddF32>(&pipelines.add, &[after_attn, down], y_out)?;
+        let up_scratch = alloc_matmul_out_buf(scope, pipelines, rows * hid)?;
+        let dims_up = scope.u32x4_uniform(rows, hid, dim, 0)?;
+        Block::dispatch_matmul_site(
+            scope,
+            pipelines,
+            n2,
+            up_w,
+            up_scratch,
+            dims_up,
+            pipelines.matmul_i8_ffn_up.as_ref(),
+            pipelines.dequant_i8_ffn_up.as_ref(),
+            pipelines.dequant_ffn_up.as_ref(),
+            &pipelines.matmul_ffn_up,
+            &pipelines.matmuls.ffn_up,
+            rows,
+            hid,
+            dim,
+        )?;
+        copy_tap(
+            scope,
+            g_scratch,
+            taps.gate.as_ref(),
+            pipelines.act_bytes(rows * hid),
+        )?;
+        copy_tap(
+            scope,
+            up_scratch,
+            taps.up.as_ref(),
+            pipelines.act_bytes(rows * hid),
+        )?;
+        let gu = alloc_act(scope, pipelines, rows, hid)?;
+        op_silu_mul(
+            scope,
+            pipelines,
+            ActBuf::dense(g_scratch),
+            ActBuf::dense(up_scratch),
+            gu,
+        )?;
+        copy_tap(
+            scope,
+            gu.data,
+            taps.gu.as_ref(),
+            pipelines.act_bytes(rows * hid),
+        )?;
+        let down_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
+        let dims_down = scope.u32x4_uniform(rows, dim, hid, 0)?;
+        Block::dispatch_matmul_site(
+            scope,
+            pipelines,
+            gu,
+            down_w,
+            down_scratch,
+            dims_down,
+            pipelines.matmul_i8_ffn_down.as_ref(),
+            pipelines.dequant_i8_ffn_down.as_ref(),
+            pipelines.dequant_ffn_down.as_ref(),
+            &pipelines.matmul_ffn_down,
+            &pipelines.matmuls.ffn_down,
+            rows,
+            dim,
+            hid,
+        )?;
+        copy_tap(
+            scope,
+            down_scratch,
+            taps.down.as_ref(),
+            pipelines.act_bytes(rows * dim),
+        )?;
+        op_add(
+            scope,
+            pipelines,
+            after_attn,
+            ActBuf::dense(down_scratch),
+            y_out,
+        )?;
 
         Ok(())
     }
@@ -770,57 +1013,143 @@ impl Qwen3Encoder {
         source: &S,
         token_ids: &[u32],
     ) -> Result<Qwen3Output, Qwen3ForwardError<S::Error>> {
-        debug_assert_eq!(handles.layers.len(), config::N_LAYERS);
+        self.forward_taps(
+            backend, pipelines, residency, scratch, handles, source, token_ids, None,
+        )
+        .await
+    }
+
+    /// `forward` with parity diagnostics (see [`Qwen3Taps`]). Tap readbacks
+    /// happen per layer; production callers pass `None` and pay nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_taps<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipelines: &BlockPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        handles: &Qwen3Handles,
+        source: &S,
+        token_ids: &[u32],
+        mut taps: Option<&mut Qwen3Taps>,
+    ) -> Result<Qwen3Output, Qwen3ForwardError<S::Error>> {
+        debug_assert_eq!(handles.layers.len(), config::HIDDEN_STATES_LAYER);
         let seq = token_ids.len();
         assert!(seq > 0, "Qwen3Encoder::forward: empty token list");
+        // Pad to an even row count: the F16 act/mask layouts pack two elems
+        // per u32 word (mask word-offsets require `s_k` even). The pad row
+        // repeats the last token and is causally invisible to every real
+        // row; its own output row is sliced off after readback.
+        let mut ids = token_ids.to_vec();
+        if !ids.len().is_multiple_of(2) {
+            ids.push(*ids.last().expect("non-empty token list"));
+        }
+        let seq_pad = ids.len();
         assert!(
-            seq <= self.rope.axes_lens[0],
-            "prompt length {seq} exceeds Qwen3Encoder rope max_seq {}",
+            seq_pad <= self.rope.axes_lens[0],
+            "prompt length {seq_pad} exceeds Qwen3Encoder rope max_seq {}",
             self.rope.axes_lens[0]
         );
 
         // --- CPU embedding lookup (bf16 -> fp32 per row) ---
-        let embeds = embed_lookup(source, token_ids)
+        let embeds = embed_lookup(source, &ids)
             .instrument(tracing::debug_span!(target: PHASE, "qwen3.embed_lookup", seq))
             .await
             .map_err(Qwen3ForwardError::Embed)?;
 
-        let shape = Qwen3BlockShape::default_from_config(seq);
+        if let Some(t) = taps.as_deref_mut() {
+            t.embeds = embeds.clone();
+        }
+
+        let shape = Qwen3BlockShape::default_from_config(seq_pad);
         let block = Qwen3Block::new(shape);
-        let act_bytes = pipelines.act_bytes((seq * config::HIDDEN) as u32);
+        let act_bytes = pipelines.act_bytes((seq_pad * config::HIDDEN) as u32);
+
+        // Per-op tap buffers for the `tap_block` layer (parity diagnostics).
+        // Allocated only when requested; read back after the layer loop.
+        let rows = seq_pad as u32;
+        let tap_block = taps.as_deref().and_then(|t| t.tap_block);
+        let dim = config::HIDDEN as u32;
+        let hq = config::N_HEADS as u32;
+        let hkv = config::N_KV_HEADS as u32;
+        let hd = config::HEAD_DIM as u32;
+        let hid = config::FFN_HIDDEN as u32;
+        // (elem counts; order mirrors Qwen3BlockTaps fields)
+        let tap_sizes: [u32; 16] = [
+            rows * dim,      // n1
+            rows * hq * hd,  // q
+            rows * hkv * hd, // k
+            rows * hkv * hd, // v
+            rows * hq * hd,  // qn
+            rows * hkv * hd, // kn
+            rows * hq * hd,  // qr
+            rows * hkv * hd, // kr
+            rows * hq * hd,  // sa
+            rows * dim,      // proj
+            rows * dim,      // after_attn
+            rows * dim,      // n2
+            rows * hid,      // gate
+            rows * hid,      // up
+            rows * hid,      // gu
+            rows * dim,      // down
+        ];
+        let mut tap_wsbufs = Vec::with_capacity(if tap_block.is_some() { 16 } else { 0 });
+        let block_gpu = if tap_block.is_some() {
+            for n in tap_sizes {
+                tap_wsbufs.push(scratch.alloc(pipelines.act_bytes(n))?);
+            }
+            let r = |i: usize| Some(tap_wsbufs[i].as_buf_ref());
+            Some(Qwen3BlockTaps {
+                n1: r(0),
+                q: r(1),
+                k: r(2),
+                v: r(3),
+                qn: r(4),
+                kn: r(5),
+                qr: r(6),
+                kr: r(7),
+                sa: r(8),
+                proj: r(9),
+                after_attn: r(10),
+                n2: r(11),
+                gate: r(12),
+                up: r(13),
+                gu: r(14),
+                down: r(15),
+            })
+        } else {
+            None
+        };
 
         let x_buf = scratch.alloc(act_bytes)?;
         let embed_bytes = seq::act_upload_bytes(pipelines.act_dtype, &embeds);
         backend.write_buffer(x_buf.id, 0, &embed_bytes)?;
 
-        // --- rope freqs: positions 0..seq on axis 0 ---
-        let mut pos_ids = vec![0_i32; seq * 3];
-        for i in 0..seq {
+        // --- rope freqs: positions 0..seq_pad on axis 0 ---
+        let mut pos_ids = vec![0_i32; seq_pad * 3];
+        for i in 0..seq_pad {
             pos_ids[i * 3] = i as i32;
         }
-        let freqs_bytes = self.rope.lookup_bytes(&pos_ids);
+        let freqs_bytes = seq::freqs_upload_bytes(pipelines.act_dtype, &self.rope.lookup(&pos_ids));
         let freqs_buf = scratch.alloc(freqs_bytes.len() as u64)?;
         backend.write_buffer(freqs_buf.id, 0, &freqs_bytes)?;
 
-        // --- causal mask [1, seq, seq] ---
-        let mask_bytes = seq::causal_mask_bytes_act(seq, pipelines.act_dtype);
+        // --- causal mask [1, seq_pad, seq_pad] ---
+        let mask_bytes = seq::causal_mask_bytes_act(seq_pad, pipelines.act_dtype);
         let mask_buf = scratch.alloc(mask_bytes.len() as u64)?;
         backend.write_buffer(mask_buf.id, 0, &mask_bytes)?;
 
-        // --- run N_LAYERS-1 (== 35) layers, ping-pong activations ---
+        // --- run the registered N_LAYERS-1 (== 35) layers, ping-pong acts ---
         //
         // The output we want is upstream `hidden_states[-2]` (= post-layer-(N-2)
         // = post-layer-34 for N=36), NOT the last-layer output. Upstream
         // `hidden_states[-1]` is post-`model.norm` of the last layer; we drop
-        // both the final layer's compute AND that norm. So this loop runs only
-        // the first N_LAYERS-1 layers. Weights for the unused layer are still
-        // registered today (TODO: drop layer-(N-1) from `register_qwen3_handles`
-        // to free its residency footprint).
+        // both the final layer's compute AND that norm. `register_qwen3_handles`
+        // registers exactly the layers this loop runs.
         //
         // Prefetch overlap: each iteration runs `submit(enc).await` concurrently
         // with the *next* layer's `acquire(...)`. The first layer's weights are
-        // acquired up front; the last iteration's prefetch acquires the unused
-        // final layer (wasted, see TODO above).
+        // acquired up front.
         let mut cur = x_buf;
         let mut pending: Option<Qwen3BlockViews<'_>> = if handles.layers.is_empty() {
             None
@@ -832,10 +1161,9 @@ impl Qwen3Encoder {
                     .await?,
             )
         };
-        let n_run = handles.layers.len().saturating_sub(1);
         let freqs_ref = freqs_buf.as_buf_ref();
         let mask_ref = mask_buf.as_buf_ref();
-        for (idx, _h) in handles.layers.iter().take(n_run).enumerate() {
+        for (idx, _h) in handles.layers.iter().enumerate() {
             let _layer_guard = trace::scope!(format!("qwen3.layer.{idx}")).entered();
             let views = pending.take().expect("pending acquire missing");
             let bufs = views.bufs();
@@ -847,7 +1175,11 @@ impl Qwen3Encoder {
             let freqs_h = scope.import(&freqs_ref);
             let mask_h = scope.import(&mask_ref);
             let nxt_h = scope.import(&nxt_ref);
-            block.forward(&scope, pipelines, cur_h, freqs_h, mask_h, nxt_h, &bufs)?;
+            match block_gpu.as_ref() {
+                Some(t) if tap_block == Some(idx) => block
+                    .forward_taps(&scope, pipelines, cur_h, freqs_h, mask_h, nxt_h, &bufs, t)?,
+                _ => block.forward(&scope, pipelines, cur_h, freqs_h, mask_h, nxt_h, &bufs)?,
+            }
 
             let next_idx = idx + 1;
             let next_acquire = async {
@@ -869,15 +1201,102 @@ impl Qwen3Encoder {
             submit_res?;
             pending = next_res?;
 
+            if let Some(t) = taps.as_deref_mut()
+                && t.want_layer_outputs
+            {
+                let bytes = backend.read_buffer(nxt.id(), 0, act_bytes).await?;
+                t.layer_outputs.push(seq::act_readback_to_f32(
+                    pipelines.act_dtype,
+                    &bytes,
+                    seq_pad * config::HIDDEN,
+                ));
+            }
+
             drop(views);
             cur = nxt;
         }
 
-        // --- readback final-layer output ---
+        // --- tapped-layer per-op readback (parity diagnostics) ---
+        if tap_block.is_some() {
+            let mut decoded: Vec<Vec<f32>> = Vec::with_capacity(tap_wsbufs.len());
+            for (b, n) in tap_wsbufs.iter().zip(tap_sizes) {
+                let bytes = backend
+                    .read_buffer(b.id(), 0, pipelines.act_bytes(n))
+                    .await?;
+                decoded.push(seq::act_readback_to_f32(
+                    pipelines.act_dtype,
+                    &bytes,
+                    n as usize,
+                ));
+            }
+            let t = taps.take().expect("tap_block implies taps");
+            let mut it = decoded.into_iter();
+            let mut next = || it.next().expect("16 tap fields");
+            t.block_ops = Qwen3BlockOpsHost {
+                n1: next(),
+                q: next(),
+                k: next(),
+                v: next(),
+                qn: next(),
+                kn: next(),
+                qr: next(),
+                kr: next(),
+                sa: next(),
+                proj: next(),
+                after_attn: next(),
+                n2: next(),
+                gate: next(),
+                up: next(),
+                gu: next(),
+                down: next(),
+            };
+        }
+
+        // --- readback final-layer output (drop the even-pad row, if any) ---
         let bytes = backend.read_buffer(cur.id(), 0, act_bytes).await?;
-        let hidden = seq::act_readback_to_f32(pipelines.act_dtype, &bytes, seq * config::HIDDEN);
+        let mut hidden =
+            seq::act_readback_to_f32(pipelines.act_dtype, &bytes, seq_pad * config::HIDDEN);
+        hidden.truncate(seq * config::HIDDEN);
         Ok(Qwen3Output { hidden, seq })
     }
+}
+
+/// Host-side parity tap sinks for [`Qwen3Encoder::forward_taps`]. All
+/// tensors decode to f32 at the PADDED seq (callers compare against a
+/// reference fed the same padded ids).
+#[derive(Default)]
+pub struct Qwen3Taps {
+    /// Capture the full post-layer residual stream per layer
+    /// (`[seq_pad, HIDDEN]` each) into `layer_outputs`.
+    pub want_layer_outputs: bool,
+    pub layer_outputs: Vec<Vec<f32>>,
+    /// Capture per-op intermediates of layer `tap_block` into `block_ops`.
+    pub tap_block: Option<usize>,
+    pub block_ops: Qwen3BlockOpsHost,
+    /// f32 embeds as gathered (pre act-dtype narrowing), `[seq_pad, HIDDEN]`.
+    pub embeds: Vec<f32>,
+}
+
+/// Decoded per-op intermediates for the tapped layer (see
+/// [`Qwen3BlockTaps`] for shapes).
+#[derive(Default)]
+pub struct Qwen3BlockOpsHost {
+    pub n1: Vec<f32>,
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub qn: Vec<f32>,
+    pub kn: Vec<f32>,
+    pub qr: Vec<f32>,
+    pub kr: Vec<f32>,
+    pub sa: Vec<f32>,
+    pub proj: Vec<f32>,
+    pub after_attn: Vec<f32>,
+    pub n2: Vec<f32>,
+    pub gate: Vec<f32>,
+    pub up: Vec<f32>,
+    pub gu: Vec<f32>,
+    pub down: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -905,43 +1324,6 @@ impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for Qwen3ForwardE
     fn from(e: ResidencyError<SE, WgpuError>) -> Self {
         Self::Residency(e)
     }
-}
-
-fn scope_rmsnorm_uniform<'wsp>(
-    scope: &BatchScope<'wsp, WgpuBackend>,
-    n_rows: u32,
-    d: u32,
-    eps: f32,
-) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&n_rows.to_le_bytes());
-    bytes[4..8].copy_from_slice(&d.to_le_bytes());
-    bytes[8..12].copy_from_slice(&eps.to_le_bytes());
-    scope.write_uniform(&bytes)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scope_sdpa_uniform<'wsp>(
-    scope: &BatchScope<'wsp, WgpuBackend>,
-    b: u32,
-    h_q: u32,
-    h_kv: u32,
-    s_q: u32,
-    s_k: u32,
-    d: u32,
-    scale: f32,
-    has_mask: u32,
-) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let mut bytes = [0u8; 32];
-    bytes[0..4].copy_from_slice(&b.to_le_bytes());
-    bytes[4..8].copy_from_slice(&h_q.to_le_bytes());
-    bytes[8..12].copy_from_slice(&h_kv.to_le_bytes());
-    bytes[12..16].copy_from_slice(&s_q.to_le_bytes());
-    bytes[16..20].copy_from_slice(&s_k.to_le_bytes());
-    bytes[20..24].copy_from_slice(&d.to_le_bytes());
-    bytes[24..28].copy_from_slice(&scale.to_le_bytes());
-    bytes[28..32].copy_from_slice(&has_mask.to_le_bytes());
-    scope.write_uniform(&bytes)
 }
 
 #[cfg(test)]

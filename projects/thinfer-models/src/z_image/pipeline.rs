@@ -25,7 +25,7 @@ use thinfer_core::trace;
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 
-use crate::z_image::block::{BlockPipelines, BlockWgslConfigs};
+use crate::z_image::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
 use crate::z_image::dit::{Block0Taps, DitInputs, DitShape, DitTaps, ZImageDit};
 use crate::z_image::loader::{LoadError, register_dit_handles};
 use crate::z_image::scheduler::FlowMatchEulerScheduler;
@@ -57,6 +57,24 @@ pub struct GenerationParams {
     /// Deterministic seed for the initial latent noise.
     pub seed: u64,
 }
+
+/// Stage notifications emitted during `generate` / `denoise_with` for
+/// user-facing progress (CLI lines, web form updates). Distinct from
+/// tracing: tracing is engine telemetry, this is product surface. The
+/// callback is a plain `Fn` ref (no Send/Sync) so it works on
+/// single-threaded wasm.
+#[derive(Clone, Copy, Debug)]
+pub enum ProgressEvent {
+    /// Qwen3 prompt encode is starting.
+    TextEncode,
+    /// Diffusion step `i` of `n` is starting (1-based).
+    Step { i: u32, n: u32 },
+    /// VAE decode is starting.
+    VaeDecode,
+}
+
+/// Optional progress sink. `None` is zero-cost.
+pub type ProgressFn<'a> = Option<&'a dyn Fn(ProgressEvent)>;
 
 /// DIAG sinks for step-0 only: captures the chain of intermediate
 /// tensors between the DiT residual stream out of block N-1 and the
@@ -144,10 +162,10 @@ pub struct ZImageModel<S: WeightSource, T: Tokenizer> {
     /// Q4_K_M files the per-(layer, slot) encoding selects the right
     /// kernel at dispatch time.
     block_pipelines: Vec<BlockPipelines>,
-    /// Block pipelines compiled with `BF16_QUANT_WRITES` (fp32 activation
-    /// storage + RNE writes for parity against bf16-PyTorch). Used only by the
-    /// Qwen3 text encoder, which stays on the untuned matmul/fp32-storage path
-    /// for now; bf16-packing the encoder is queued for a follow-up.
+    /// Qwen3 text-encoder pipeline set: matmul slots compiled against the
+    /// load-time Q8_0 weight transcode (DP4A matmul_i8 / dequant fallback),
+    /// F16 acts when the adapter has SHADER_F16 (F32 fallback). Chosen
+    /// independently of the DiT path's dtype.
     encoder_block_pipelines: BlockPipelines,
     /// Block pipelines for the DiT-side encoder ops (x/t/cap embedders, noise
     /// and context refiners, final_layer). Shares `act_dtype` with
@@ -252,7 +270,12 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         residency: WeightResidency<S>,
         tokenizer: T,
     ) -> Result<Self, ModelLoadError> {
-        let t0 = std::time::Instant::now();
+        // Stage-timing clocks are gated on subscriber interest: `Instant::now`
+        // panics at runtime on wasm32 (no OS clock), and the values only
+        // surface via the info/debug events. An INFO gate covers the debug
+        // event too (a filter admitting DEBUG necessarily admits INFO).
+        let timing = tracing::enabled!(tracing::Level::INFO);
+        let t0 = timing.then(std::time::Instant::now);
         // Weights join the VRAM arbiter's reclaim chain: workspace growth
         // can evict prefetch-warmed (unpinned) residents instead of
         // overshooting the budget. The inverse direction (weights evicting
@@ -266,13 +289,17 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // they ride the quant matmul path (see `refiner_transcode_target`).
         let refiner_transcode = crate::z_image::loader::refiner_transcode_target(&residency);
         let dit_handles = register_dit_handles(&residency, refiner_transcode)?;
-        let encoder_handles = register_qwen3_handles(&residency)?;
+        // Qwen3 encoder matmuls always ship bf16 safetensors; requantize to
+        // Q8_0 at upload unconditionally (lossless-tier, ~half the upload
+        // bytes, rides the quant matmul path). Mirrored in `encoder_cfgs`.
+        let encoder_transcode = thinfer_core::quant::QuantKind::Q8_0;
+        let encoder_handles = register_qwen3_handles(&residency, Some(encoder_transcode))?;
         let vae_handles = register_vae_decoder_handles(&residency)?;
         tracing::debug!(
-            elapsed_ms = t0.elapsed().as_millis() as u64,
+            elapsed_ms = t0.map_or(0, |t| t.elapsed().as_millis() as u64),
             "handles registered"
         );
-        let t_compile = std::time::Instant::now();
+        let t_compile = timing.then(std::time::Instant::now);
         // Detect whether the DiT-side matmul tensors arrived as GGUF
         // quant (e.g. Q8_0) or stayed bf16. Peek the canonical fused QKV
         // tensor (`layers.0.attention.qkv.weight`) in the source catalog. If
@@ -398,6 +425,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 matmul_adaln: matmul_adaln_cfg,
                 ops: ops_template_bf16w,
                 i8_sdpa,
+                dense_acts: DenseActSites::default(),
             };
             block_pipelines.push(BlockPipelines::compile(&backend, &cfgs).await?);
         }
@@ -409,13 +437,38 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ?dit_matmul_weight,
             "DiT block matmul weight dtype (layer 0 qkv probe)"
         );
-        // Qwen3 text encoder pipelines: fp32 acts + bf16 weights, untuned
-        // matmul path. Independent of the DiT path's dtype choice.
-        let encoder_cfgs = BlockWgslConfigs::uniform(WgslConfig {
+        // Qwen3 text encoder pipelines: all 7 per-layer matmul weights are
+        // transcoded to Q8_0 at upload (see `encoder_transcode` above), so
+        // the matmul slots compile against the quant scheme (DP4A matmul_i8
+        // when the adapter has it, dequant-workspace fallback otherwise).
+        // Acts are F16 with SHADER_F16, F32 fallback — same rule as the DiT
+        // quant path, but chosen independently of the DiT's dtype.
+        let encoder_act = if backend.supports_shader_f16() {
+            thinfer_core::ops::ActDtype::F16
+        } else {
+            thinfer_core::ops::ActDtype::F32
+        };
+        let encoder_ops = WgslConfig {
             bf16_quant_writes: crate::z_image::manifest::current_recipe().bf16_quant_writes,
-            act_dtype: thinfer_core::ops::ActDtype::F32,
+            act_dtype: encoder_act,
             weight_dtype: WeightDtype::Bf16,
-        });
+        };
+        let encoder_matmul = WgslConfig {
+            weight_dtype: WeightDtype::Quant(encoder_transcode),
+            ..encoder_ops
+        };
+        let encoder_cfgs = BlockWgslConfigs {
+            matmul_qkv: encoder_matmul,
+            matmul_proj: encoder_matmul,
+            matmul_ffn_up: encoder_matmul,
+            // ffn_down weights are never transcoded (massive-activation
+            // amplification; see `register_qwen3_handles`): bf16 site.
+            matmul_ffn_down: encoder_ops,
+            matmul_adaln: encoder_ops,
+            ops: encoder_ops,
+            i8_sdpa: false,
+            dense_acts: DenseActSites::default(),
+        };
         let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfgs).await?;
         // DiT-side encoder ops (x/t/cap embedders + refiners + final_layer):
         // must share `act_dtype` with the main DiT loop because their outputs
@@ -444,6 +497,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             matmul_adaln: matmul_adaln_cfg,
             ops: dit_encoder_ops,
             i8_sdpa: false,
+            dense_acts: DenseActSites::default(),
         };
         let dit_encoder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_encoder_cfgs).await?;
@@ -458,13 +512,14 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             matmul_adaln: matmul_adaln_cfg,
             ops: dit_encoder_ops,
             i8_sdpa: false,
+            dense_acts: DenseActSites::default(),
         };
         let dit_embedder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_embedder_cfgs).await?;
         let vae_pipelines = VaeDecoderPipelines::compile(&backend).await?;
         tracing::info!(
-            compile_ms = t_compile.elapsed().as_millis() as u64,
-            total_ms = t0.elapsed().as_millis() as u64,
+            compile_ms = t_compile.map_or(0, |t| t.elapsed().as_millis() as u64),
+            total_ms = t0.map_or(0, |t| t.elapsed().as_millis() as u64),
             "ZImageModel loaded"
         );
         let encoder = Qwen3Encoder::new(MAX_PROMPT_TOKENS);
@@ -510,14 +565,17 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
     pub async fn generate(
         &self,
         params: &GenerationParams,
+        progress: ProgressFn<'_>,
     ) -> Result<Vec<u8>, GenerateError<S::Error>> {
-        let t_gen = std::time::Instant::now();
+        // INFO-gated clocks: see `load` for the wasm rationale.
+        let timing = tracing::enabled!(tracing::Level::INFO);
+        let t_gen = timing.then(std::time::Instant::now);
         let mut workspace = Workspace::new(
             Arc::clone(&self.backend),
             Arc::clone(self.residency.arbiter()),
         );
         let (sample, h_lat, w_lat) = self
-            .denoise_with(params, None, &mut workspace, None, None)
+            .denoise_with(params, None, &mut workspace, None, None, progress)
             .await?;
 
         // VAE decode -> RGB CHW fp32 in [-1, 1]. Workspace carries over from
@@ -525,7 +583,10 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // doesn't leak - Workspace has no Drop).
         let rgb = {
             let _s = tracing::info_span!("vae_decode", h_lat = h_lat, w_lat = w_lat).entered();
-            let t = std::time::Instant::now();
+            if let Some(p) = progress {
+                p(ProgressEvent::VaeDecode);
+            }
+            let t = timing.then(std::time::Instant::now);
             let out = self
                 .vae
                 .decode(
@@ -537,7 +598,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     w_lat,
                 )
                 .await?;
-            let vae_ms = t.elapsed().as_millis() as u64;
+            let vae_ms = t.map_or(0, |t| t.elapsed().as_millis() as u64);
             tracing::info!(elapsed_ms = vae_ms, "vae decode done");
             out
         };
@@ -585,7 +646,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             let _s = tracing::debug_span!("png_encode").entered();
             encode_png(&rgb, params.width, params.height).map_err(GenerateError::Png)?
         };
-        let gen_ms = t_gen.elapsed().as_millis() as u64;
+        let gen_ms = t_gen.map_or(0, |t| t.elapsed().as_millis() as u64);
         tracing::info!(elapsed_ms = gen_ms, png_bytes = png.len(), "generate done");
         Ok(png)
     }
@@ -665,10 +726,13 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         workspace: &mut Workspace<WgpuBackend>,
         mut step_dumps: Option<&mut Vec<Vec<f32>>>,
         mut step0_taps: Option<&mut Step0LocalizationTaps>,
+        progress: ProgressFn<'_>,
     ) -> Result<(Vec<f32>, usize, usize), GenerateError<S::Error>> {
         if let Some(sink) = step_dumps.as_deref_mut() {
             sink.clear();
         }
+        // INFO-gated clocks: see `load` for the wasm rationale.
+        let timing = tracing::enabled!(tracing::Level::INFO);
         if !params
             .height
             .is_multiple_of(VAE_SCALE as u32 * PATCH_SIZE as u32)
@@ -717,7 +781,10 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // 2. Qwen3 encode -> cap features.
         let qout = {
             let _s = trace::scope!("text_encode", tokens = token_ids.len()).entered();
-            let t = std::time::Instant::now();
+            if let Some(p) = progress {
+                p(ProgressEvent::TextEncode);
+            }
+            let t = timing.then(std::time::Instant::now);
             let out = self
                 .encoder
                 .forward(
@@ -730,7 +797,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     &token_ids,
                 )
                 .await?;
-            let text_ms = t.elapsed().as_millis() as u64;
+            let text_ms = t.map_or(0, |t| t.elapsed().as_millis() as u64);
             tracing::info!(elapsed_ms = text_ms, seq = out.seq, "text encode done");
             out
         };
@@ -790,7 +857,13 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             trace::scope!("diffusion_steps", steps = params.steps, seq_x = shape.seq_x).entered();
         for i in 0..params.steps as usize {
             let _step = trace::scope!("step", i = i, t = scheduler.t_norm(i)).entered();
-            let t_step = std::time::Instant::now();
+            if let Some(p) = progress {
+                p(ProgressEvent::Step {
+                    i: i as u32 + 1,
+                    n: params.steps,
+                });
+            }
+            let t_step = timing.then(std::time::Instant::now);
             let inputs = DitInputs {
                 image: &sample,
                 size: (C_LATENT, 1, h_lat, w_lat),
@@ -1492,7 +1565,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     sab = smax.abs().max(smin.abs()),
                 );
             }
-            let step_ms = t_step.elapsed().as_millis() as u64;
+            let step_ms = t_step.map_or(0, |t| t.elapsed().as_millis() as u64);
             tracing::info!(
                 elapsed_ms = step_ms,
                 step = i + 1,

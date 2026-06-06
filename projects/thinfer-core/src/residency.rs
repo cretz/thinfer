@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::arbiter::{MemArbiter, MemReclaimer, MemTier};
-use crate::backend::{Backend, BufRef};
+use crate::backend::{Backend, BufRef, WeightPrep};
 use crate::mem::{RamCategory, RamCharge, VramCategory};
 use crate::policy::ResidencyBudget;
 use crate::quant::QuantKind;
@@ -356,18 +356,24 @@ impl<S: WeightSource> WeightResidency<S> {
             });
         }
 
-        // GPU miss. Stream from the mmap'd source directly into the bf16-packed
-        // upload layout; no host-side cache. The temporary `Vec<u8>` lives only
-        // until `write_buffer` returns - tracked as RAM Upload so the budget
-        // sees this transient peak.
+        // GPU miss. Stream from the mmap'd source directly into the upload
+        // payload; no host-side cache. The temporary `Vec<u8>` lives only
+        // until upload returns - tracked as RAM Upload so the budget sees
+        // this transient peak. Weights matching a `weight_prep` kernel read
+        // their raw bytes untouched (the GPU transcodes/transposes during
+        // upload); everything else takes the CPU `read_for_gpu` path.
+        let prep = Self::prep_op(&meta);
         let _upload_charge = RamCharge::new(
             backend.mem_account().clone(),
             RamCategory::Upload,
-            meta.storage_bytes(),
+            meta.storage_bytes().max(meta.on_disk_bytes),
         );
-        let bytes = self.read_for_gpu::<B>(&meta).await?;
+        let payload = match prep {
+            Some(_) => self.read_raw::<B>(&meta).await?,
+            None => self.read_for_gpu::<B>(&meta).await?,
+        };
 
-        let gpu_size = bytes.len() as u64;
+        let gpu_size = meta.storage_bytes();
         // Single weight must fit under the absolute budget. Any further
         // headroom claimed by live workspace/staging is dynamic and is
         // the arbiter's concern; here we only reject weights that are
@@ -419,9 +425,55 @@ impl<S: WeightSource> WeightResidency<S> {
                     .map_err(ResidencyError::Backend)?
             }
         };
-        backend
-            .write_buffer(id, 0, bytes.as_slice())
-            .map_err(ResidencyError::Backend)?;
+        match prep {
+            Some(op) => {
+                // Transient staging for the raw bytes lives inside
+                // `weight_prep`; reserve headroom for it here where the
+                // arbiter is in reach (dims uniform is noise, lumped in).
+                self.arbiter.ensure_headroom(mem, payload.len() as u64 + 16);
+                // Diag-gated clock: `Instant::now` panics on wasm32 and the
+                // timing only surfaces via the diag event below.
+                let t_prep = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO)
+                    .then(std::time::Instant::now);
+                let done = backend
+                    .weight_prep(op, &payload, &BufRef::new(id, gpu_size))
+                    .await
+                    .map_err(ResidencyError::Backend)?;
+                if done {
+                    tracing::info!(
+                        target: "thinfer::diag",
+                        id = %meta.id.0,
+                        mb = (payload.len() as f64) / 1.0e6,
+                        prep_ms = t_prep.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                        op = ?op,
+                        "gpu prep"
+                    );
+                } else {
+                    // Backend without GPU prep (test mocks): produce the
+                    // same bytes on the CPU.
+                    let bytes = match op {
+                        WeightPrep::Q8_0FromBf16 { .. } => {
+                            let mut dst = vec![0u8; gpu_size as usize];
+                            crate::quant::encode_q8_0_from_bf16(&payload, &mut dst);
+                            dst
+                        }
+                        WeightPrep::TransposeBf16 { n, k } => transpose_bf16_cpu(
+                            &payload,
+                            payload.len(),
+                            gpu_size as usize,
+                            n as usize,
+                            k as usize,
+                        ),
+                    };
+                    backend
+                        .write_buffer(id, 0, &bytes)
+                        .map_err(ResidencyError::Backend)?;
+                }
+            }
+            None => backend
+                .write_buffer(id, 0, payload.as_slice())
+                .map_err(ResidencyError::Backend)?,
+        }
 
         let mut g = self.inner.lock().unwrap();
         g.gpu.insert(
@@ -612,12 +664,16 @@ impl<S: WeightSource> WeightResidency<S> {
         }
         // One shot read: source is mmap-backed, so this is a memcpy from the
         // OS page cache. No chunking needed.
+        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO);
+        let t_read = diag.then(std::time::Instant::now);
         reader
             .read_at(0, &mut bytes[..on_disk_len])
             .await
             .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
+        let read_ms = t_read.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        let t_xpose = diag.then(std::time::Instant::now);
 
-        match meta.transpose {
+        let out = match meta.transpose {
             TransposePolicy::None => Ok(bytes),
             TransposePolicy::Linear2D => {
                 if meta.shape.0.len() != 2 {
@@ -629,35 +685,18 @@ impl<S: WeightSource> WeightResidency<S> {
                 }
                 let n = meta.shape.0[0];
                 let k = meta.shape.0[1];
-                // Block-tiled u16-stride transpose. Bf16 elements stored as
-                // u16; transpose preserves the bit pattern. n*k must equal the
-                // element count (padding only matters when odd, and 2-D linear
-                // weights never have an odd product).
-                const BLOCK: usize = 64;
-                let elts = n * k;
-                debug_assert_eq!(elts * 2, on_disk_len);
-                let mut dst = vec![0u8; storage_len];
-                let src_u16: &[u16] = bytemuck::cast_slice(&bytes[..on_disk_len]);
-                let dst_u16: &mut [u16] = bytemuck::cast_slice_mut(&mut dst[..on_disk_len]);
-                let mut br = 0usize;
-                while br < n {
-                    let br_end = (br + BLOCK).min(n);
-                    let mut bc = 0usize;
-                    while bc < k {
-                        let bc_end = (bc + BLOCK).min(k);
-                        for row in br..br_end {
-                            let src_row = &src_u16[row * k + bc..row * k + bc_end];
-                            for (col_off, &v) in src_row.iter().enumerate() {
-                                dst_u16[(bc + col_off) * n + row] = v;
-                            }
-                        }
-                        bc = bc_end;
-                    }
-                    br = br_end;
-                }
-                Ok(dst)
+                Ok(transpose_bf16_cpu(&bytes, on_disk_len, storage_len, n, k))
             }
-        }
+        };
+        tracing::info!(
+            target: "thinfer::diag",
+            id = %meta.id.0,
+            mb = (on_disk_len as f64) / 1.0e6,
+            read_ms = read_ms,
+            transpose_ms = t_xpose.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+            "plain read"
+        );
+        out
     }
 
     /// Load-time requantize: read the bf16 `[N, K]` row-major source and
@@ -691,13 +730,93 @@ impl<S: WeightSource> WeightResidency<S> {
                 got: reader.len(),
             });
         }
+        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO);
+        let t_read = diag.then(std::time::Instant::now);
         reader
             .read_at(0, &mut src)
             .await
             .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
+        let read_ms = t_read.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let mut dst = vec![0u8; meta.storage_bytes() as usize];
+        let t_enc = diag.then(std::time::Instant::now);
         crate::quant::encode_q8_0_from_bf16(&src, &mut dst);
+        tracing::info!(
+            target: "thinfer::diag",
+            id = %meta.id.0,
+            mb = (meta.on_disk_bytes as f64) / 1.0e6,
+            read_ms = read_ms,
+            transcode_ms = t_enc.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+            "transcode"
+        );
         Ok(dst)
+    }
+
+    /// Read `meta`'s raw on-disk bytes untouched (no transcode/transpose).
+    /// Feeds `Backend::weight_prep`, which does the munging on the GPU.
+    async fn read_raw<B: Backend>(
+        &self,
+        meta: &WeightMeta,
+    ) -> Result<Vec<u8>, ResidencyError<S::Error, B::Error>> {
+        let mut raw = vec![0u8; meta.on_disk_bytes as usize];
+        let mut reader = self
+            .source
+            .open(&meta.id)
+            .await
+            .map_err(ResidencyError::Source)?;
+        if reader.len() != meta.on_disk_bytes {
+            return Err(ResidencyError::SizeMismatch {
+                id: meta.id.clone(),
+                expected: meta.on_disk_bytes,
+                got: reader.len(),
+            });
+        }
+        let t_read = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO)
+            .then(std::time::Instant::now);
+        reader
+            .read_at(0, &mut raw)
+            .await
+            .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
+        tracing::info!(
+            target: "thinfer::diag",
+            id = %meta.id.0,
+            mb = (meta.on_disk_bytes as f64) / 1.0e6,
+            read_ms = t_read.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+            "raw read"
+        );
+        Ok(raw)
+    }
+
+    /// GPU-side prep op for this weight, when its layout fits the
+    /// `ops::weight_prep` kernels (rank-2 bf16, whole blocks, dispatch
+    /// limits). `None` falls back to the CPU `read_for_gpu` path, which
+    /// validates and handles every registered shape.
+    fn prep_op(meta: &WeightMeta) -> Option<WeightPrep> {
+        if meta.encoding != StorageEncoding::Bf16 || meta.shape.0.len() != 2 {
+            return None;
+        }
+        let n = u32::try_from(meta.shape.0[0]).ok()?;
+        let k = u32::try_from(meta.shape.0[1]).ok()?;
+        match (meta.transcode, meta.transpose) {
+            (Some(QuantKind::Q8_0), TransposePolicy::None) => {
+                let blocks = (n as u64) * (k as u64) / 32;
+                // Kernel processes block pairs; odd block counts and
+                // dispatch-grid overflow fall back to the CPU transcode.
+                if !k.is_multiple_of(32) || !blocks.is_multiple_of(2) || blocks / 2 > 65535 * 64 {
+                    return None;
+                }
+                Some(WeightPrep::Q8_0FromBf16 { n, k })
+            }
+            (None, TransposePolicy::Linear2D) => {
+                // Odd N breaks output word alignment (one u32 would span two
+                // output rows, racing adjacent threads); real linears are
+                // even-N, odd shapes fall back to the CPU transpose.
+                if !n.is_multiple_of(2) || k > 65535 || n.div_ceil(2).div_ceil(64) > 65535 {
+                    return None;
+                }
+                Some(WeightPrep::TransposeBf16 { n, k })
+            }
+            _ => None,
+        }
     }
 
     /// Load `handle` to GPU without pinning. Used to overlap upload work for
@@ -826,6 +945,42 @@ impl<B: Backend + Send + Sync> MemReclaimer for WeightReclaimer<B> {
         }
         freed
     }
+}
+
+/// Block-tiled u16-stride transpose of bf16 `[n, k]` into `[k, n]`. Bf16
+/// elements stored as u16; transpose preserves the bit pattern. n*k must
+/// equal the element count (padding only matters when odd, and 2-D linear
+/// weights never have an odd product). CPU fallback for
+/// `WeightPrep::TransposeBf16`; the GPU kernel must stay bit-identical.
+fn transpose_bf16_cpu(
+    bytes: &[u8],
+    on_disk_len: usize,
+    storage_len: usize,
+    n: usize,
+    k: usize,
+) -> Vec<u8> {
+    const BLOCK: usize = 64;
+    debug_assert_eq!(n * k * 2, on_disk_len);
+    let mut dst = vec![0u8; storage_len];
+    let src_u16: &[u16] = bytemuck::cast_slice(&bytes[..on_disk_len]);
+    let dst_u16: &mut [u16] = bytemuck::cast_slice_mut(&mut dst[..on_disk_len]);
+    let mut br = 0usize;
+    while br < n {
+        let br_end = (br + BLOCK).min(n);
+        let mut bc = 0usize;
+        while bc < k {
+            let bc_end = (bc + BLOCK).min(k);
+            for row in br..br_end {
+                let src_row = &src_u16[row * k + bc..row * k + bc_end];
+                for (col_off, &v) in src_row.iter().enumerate() {
+                    dst_u16[(bc + col_off) * n + row] = v;
+                }
+            }
+            bc = bc_end;
+        }
+        br = br_end;
+    }
+    dst
 }
 
 /// Which storage tier owns the pin: pool entry keyed by handle, or a ring

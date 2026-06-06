@@ -59,6 +59,18 @@ impl BufRef {
     }
 }
 
+/// GPU-side weight preparation performed by `Backend::weight_prep` at upload
+/// time (residency miss path). Shapes describe the raw bf16 source as
+/// `[n, k]` row-major. See `ops::weight_prep` for the kernels.
+#[derive(Clone, Copy, Debug)]
+pub enum WeightPrep {
+    /// bf16 -> GGUF Q8_0 block stream, same element order (`k % 32 == 0`,
+    /// even total block count).
+    Q8_0FromBf16 { n: u32, k: u32 },
+    /// bf16 `[n, k]` -> `[k, n]` (nn.Linear upload transpose).
+    TransposeBf16 { n: u32, k: u32 },
+}
+
 /// Compute backend abstraction. v1 carries a single bind group (group 0); the
 /// concept generalizes when we hit a kernel that wants more.
 pub trait Backend: 'static {
@@ -130,4 +142,19 @@ pub trait Backend: 'static {
         offset: u64,
         len: u64,
     ) -> impl Future<Output = Result<Vec<u8>, Self::Error>>;
+
+    /// Upload `raw` and run the `op` prep kernel into `dst`, replacing the
+    /// CPU transcode/transpose in the residency miss path. Returns
+    /// `Ok(false)` when the backend has no GPU prep (test mocks); the caller
+    /// then falls back to the CPU path. The transient staging VRAM is the
+    /// backend's to allocate/free; the caller has already ensured arbiter
+    /// headroom for `raw.len()`.
+    fn weight_prep(
+        &self,
+        _op: WeightPrep,
+        _raw: &[u8],
+        _dst: &BufRef,
+    ) -> impl Future<Output = Result<bool, Self::Error>> {
+        async { Ok(false) }
+    }
 }

@@ -19,3 +19,7 @@ console_error_panic_hook = "0.1"
 safetensors = "0.4"
 half = { version = "2", features = ["bytemuck"] }
 thinfer-core = { path = "../thinfer-core", features = ["conformance"] }
+# Test-only adapter-acquisition timeout: a hung `requestAdapter()` (e.g.
+# GPU-less CI runner) must fail loudly, not stall to the job timeout.
+gloo-timers = { version = "0.3", features = ["futures"] }
+futures-util = { version = "0.3", default-features = false }

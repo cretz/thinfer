@@ -648,6 +648,7 @@ async fn run_pipeline_and_compare<S: WeightSource>(
             } else {
                 None
             },
+            None,
         )
         .await
         .expect("denoise_with");
@@ -1234,7 +1235,7 @@ fn fmt_mib(bytes: u64) -> String {
     }
 }
 
-fn summarize(label: &str, v: &[f32]) {
+pub(crate) fn summarize(label: &str, v: &[f32]) {
     let (mut max_abs, mut min, mut max, mut sum, mut nan) =
         (0f32, f32::INFINITY, f32::NEG_INFINITY, 0.0f64, 0usize);
     for &x in v {
@@ -1267,7 +1268,7 @@ fn summarize(label: &str, v: &[f32]) {
     );
 }
 
-fn read_f32(p: &Path) -> Vec<f32> {
+pub(crate) fn read_f32(p: &Path) -> Vec<f32> {
     let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
     bytes
         .chunks_exact(4)
@@ -2190,7 +2191,7 @@ fn row_stats(row: &[f32]) -> (f32, f32) {
 
 /// Ordinary least-squares fit `y ≈ slope * x + bias` returning
 /// `(slope, bias, rmse, n_finite)`. Skips non-finite cells.
-fn linfit(x: &[f32], y: &[f32]) -> (f64, f64, f64, usize) {
+pub(crate) fn linfit(x: &[f32], y: &[f32]) -> (f64, f64, f64, usize) {
     let mut sx = 0.0f64;
     let mut sy = 0.0f64;
     let mut sxx = 0.0f64;

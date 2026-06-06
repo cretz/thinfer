@@ -464,7 +464,7 @@ mod sub_impl {
                 "ws_reuse",
             )?;
             let mut entries: Vec<(&String, &ScopeStats)> = st.scopes.iter().collect();
-            entries.sort_by(|a, b| b.1.busy_ns.cmp(&a.1.busy_ns));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1.busy_ns));
             for (path, s) in &entries {
                 writeln!(
                     w,

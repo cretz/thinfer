@@ -17,7 +17,7 @@ use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::trace::DIAG;
 use thinfer_core::weight::WeightSource;
 use thinfer_models::z_image::manifest::role as zrole;
-use thinfer_models::z_image::pipeline::{GenerationParams, ZImageModel};
+use thinfer_models::z_image::pipeline::{GenerationParams, ProgressEvent, ProgressFn, ZImageModel};
 use thinfer_native::tokenizer::HfTokenizer;
 use thinfer_native::{MmapFileOpener, cache};
 
@@ -33,10 +33,13 @@ pub enum GenerateCmd {
     Image(GenerateImage),
 }
 
-/// Defaults match upstream Z-Image (`Tongyi-MAI/Z-Image:src/config/inference.py`):
-/// 1024x1024, 8 inference steps, guidance_scale=0 (Turbo is a no-CFG model).
-/// Seed defaults to randomized; HF Space uses 42, upstream pipeline takes a
-/// generator and we randomize when `--seed` is omitted.
+/// Defaults follow upstream Z-Image (`Tongyi-MAI/Z-Image:src/config/inference.py`):
+/// 8 inference steps, guidance_scale=0 (Turbo is a no-CFG model). Dims
+/// intentionally diverge: upstream defaults to 1024x1024 assuming datacenter
+/// GPUs; we default to 768x768 as the thin-hardware sweet spot (every parity
+/// and perf baseline is at 768). Seed defaults to randomized; HF Space uses
+/// 42, upstream pipeline takes a generator and we randomize when `--seed` is
+/// omitted.
 ///
 /// TODO: these defaults are Z-Image-specific. Once we add a second model
 /// (LTX-Video per M3), move height/width/steps/guidance defaults into the
@@ -53,10 +56,10 @@ pub struct GenerateImage {
     #[arg(long)]
     pub output: PathBuf,
     /// Image height in pixels. Must be divisible by VAE_SCALE (16).
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 768)]
     pub height: u32,
     /// Image width in pixels. Must be divisible by VAE_SCALE (16).
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 768)]
     pub width: u32,
     /// Inference steps. Upstream default is 8 (Turbo).
     #[arg(long, default_value_t = 8)]
@@ -268,6 +271,26 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
     let backend_for_stats = std::env::var_os("THINFER_TRACE").map(|_| Arc::clone(&backend));
 
     let seed = args.seed.unwrap_or_else(random_seed);
+    // User-facing progress: capitalized one-liners to stderr, each prefixed
+    // with elapsed-from-start so per-stage durations read off directly.
+    // Timer starts here (post-download, pre-GPU-init) so it reflects
+    // generation work, not network.
+    let t_run = std::time::Instant::now();
+    let stamp = move || format!("[{:6.1}s]", t_run.elapsed().as_secs_f64());
+    eprintln!(
+        "{} Generating {}x{} image, {} steps, seed {} ({})",
+        stamp(),
+        args.width,
+        args.height,
+        args.steps,
+        seed,
+        args.model,
+    );
+    let progress = move |ev: ProgressEvent| match ev {
+        ProgressEvent::TextEncode => eprintln!("{} Encoding prompt", stamp()),
+        ProgressEvent::Step { i, n } => eprintln!("{} Denoising step {i}/{n}", stamp()),
+        ProgressEvent::VaeDecode => eprintln!("{} Decoding latents (VAE)", stamp()),
+    };
     let gen_params = GenerationParams {
         prompt: args.prompt,
         height: args.height,
@@ -278,7 +301,7 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
     let png = match dit_gguf_role {
         None => {
             let residency = WeightResidency::new(source, budget);
-            load_and_generate(backend, residency, tokenizer, &gen_params).await?
+            load_and_generate(backend, residency, tokenizer, &gen_params, Some(&progress)).await?
         }
         Some(role) => {
             let path = resolve_role(role)?;
@@ -309,12 +332,21 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
                 source,
             );
             let residency = WeightResidency::new(unioned, budget);
-            load_and_generate(backend, residency, tokenizer, &gen_params).await?
+            load_and_generate(backend, residency, tokenizer, &gen_params, Some(&progress)).await?
         }
     };
     tokio::fs::write(&args.output, &png)
         .await
         .map_err(|e| format!("write {}: {e}", args.output.display()))?;
+    eprintln!(
+        "{} Wrote {} ({}x{}, seed {}) in {:.1}s",
+        stamp(),
+        args.output.display(),
+        args.width,
+        args.height,
+        seed,
+        t_run.elapsed().as_secs_f64(),
+    );
     tracing::info!(target: DIAG, path = %args.output.display(), bytes = png.len(), "wrote output");
     if let Some(b) = backend_for_stats {
         let snap = thinfer_core::backend::Backend::mem_account(&*b).snapshot();
@@ -343,6 +375,7 @@ async fn load_and_generate<S: WeightSource, T: Tokenizer>(
     residency: WeightResidency<S>,
     tokenizer: T,
     params: &GenerationParams,
+    progress: ProgressFn<'_>,
 ) -> Result<Vec<u8>, String> {
     let model = {
         let _s = tracing::info_span!("model_load").entered();
@@ -351,7 +384,7 @@ async fn load_and_generate<S: WeightSource, T: Tokenizer>(
             .map_err(|e| format!("model load: {e:?}"))?
     };
     model
-        .generate(params)
+        .generate(params, progress)
         .await
         .map_err(|e| format!("generate: {e:?}"))
 }

@@ -288,6 +288,24 @@ pub struct BlockWgslConfigs {
     /// feed its paired output to the proj matmul A-side. Requires F16 ops
     /// (SHADER_F16). Never affects the residual carry or elementwise ops.
     pub i8_sdpa: bool,
+    /// Per-site opt-out of the i8 activation path (see [`DenseActSites`]).
+    pub dense_acts: DenseActSites,
+}
+
+/// Per-site DP4A opt-out: a site set here keeps its A-side dense at the
+/// block act dtype and runs the dequant-once matmul even when the device
+/// has DP4A. For sites whose A-side has no preceding norm and can carry
+/// massive-activation outlier rows (Qwen3 attention-sink token at
+/// proj/ffn_down, max-abs ~16k vs ~1 median): per-32 i8 act_quant crushes
+/// the outlier's 31 block neighbors and corrupts that token's entire
+/// output row. The weight encoding is unchanged; only the activation
+/// quantization is bypassed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenseActSites {
+    pub qkv: bool,
+    pub proj: bool,
+    pub ffn_up: bool,
+    pub ffn_down: bool,
 }
 
 impl BlockWgslConfigs {
@@ -302,6 +320,7 @@ impl BlockWgslConfigs {
             matmul_adaln: cfg,
             ops: cfg,
             i8_sdpa: false,
+            dense_acts: DenseActSites::default(),
         }
     }
 
@@ -472,46 +491,56 @@ impl BlockPipelines {
         );
         let dq_i8_layout = thinfer_core::ops::dequant_i8::layout();
         let mm_i8_layout = thinfer_core::ops::matmul_i8::layout();
-        let build_i8 = async |wd: WeightDtype| -> Result<
-            (Option<DequantStep>, Option<WgpuPipeline>),
-            WgpuError,
-        > {
-            if !use_dp4a {
-                return Ok((None, None));
-            }
-            match wd {
-                WeightDtype::Quant(scheme) => {
-                    let dq_wgsl = thinfer_core::ops::dequant_i8::build_wgsl(scheme);
-                    let dq_pipe = backend
-                        .create_pipeline(&dq_wgsl, "main", dq_i8_layout)
-                        .await?;
-                    let mm_wgsl = thinfer_core::ops::matmul_i8::build_wgsl(&i8_cfg);
-                    let mm_pipe = backend
-                        .create_pipeline(&mm_wgsl, "main", mm_i8_layout)
-                        .await?;
-                    Ok((Some(DequantStep { pipeline: dq_pipe, scheme }), Some(mm_pipe)))
+        let build_i8 =
+            async |wd: WeightDtype,
+                   dense_acts: bool|
+                   -> Result<(Option<DequantStep>, Option<WgpuPipeline>), WgpuError> {
+                // dense_acts sites skip the i8 pair entirely: dispatch falls
+                // through to the dequant-once dense matmul built above.
+                if !use_dp4a || dense_acts {
+                    return Ok((None, None));
                 }
-                _ => Ok((None, None)),
-            }
-        };
-        let (dequant_i8_qkv, matmul_i8_qkv) = build_i8(cfgs.matmul_qkv.weight_dtype).await?;
-        let (dequant_i8_proj, matmul_i8_proj) = build_i8(cfgs.matmul_proj.weight_dtype).await?;
+                match wd {
+                    WeightDtype::Quant(scheme) => {
+                        let dq_wgsl = thinfer_core::ops::dequant_i8::build_wgsl(scheme);
+                        let dq_pipe = backend
+                            .create_pipeline(&dq_wgsl, "main", dq_i8_layout)
+                            .await?;
+                        let mm_wgsl = thinfer_core::ops::matmul_i8::build_wgsl(&i8_cfg);
+                        let mm_pipe = backend
+                            .create_pipeline(&mm_wgsl, "main", mm_i8_layout)
+                            .await?;
+                        Ok((
+                            Some(DequantStep {
+                                pipeline: dq_pipe,
+                                scheme,
+                            }),
+                            Some(mm_pipe),
+                        ))
+                    }
+                    _ => Ok((None, None)),
+                }
+            };
+        let (dequant_i8_qkv, matmul_i8_qkv) =
+            build_i8(cfgs.matmul_qkv.weight_dtype, cfgs.dense_acts.qkv).await?;
+        let (dequant_i8_proj, matmul_i8_proj) =
+            build_i8(cfgs.matmul_proj.weight_dtype, cfgs.dense_acts.proj).await?;
         let (dequant_i8_ffn_up, matmul_i8_ffn_up) =
-            build_i8(cfgs.matmul_ffn_up.weight_dtype).await?;
+            build_i8(cfgs.matmul_ffn_up.weight_dtype, cfgs.dense_acts.ffn_up).await?;
         let (dequant_i8_ffn_down, matmul_i8_ffn_down) =
-            build_i8(cfgs.matmul_ffn_down.weight_dtype).await?;
+            build_i8(cfgs.matmul_ffn_down.weight_dtype, cfgs.dense_acts.ffn_down).await?;
         // act_quant serves two consumers: the matmul-site dense->paired
-        // transcode on every DP4A site, and the post-rope q/k/v quantize
+        // transcode on every i8 site, and the post-rope q/k/v quantize
         // when i8 attention is enabled.
-        let any_quant_site = [
-            cfgs.matmul_qkv.weight_dtype,
-            cfgs.matmul_proj.weight_dtype,
-            cfgs.matmul_ffn_up.weight_dtype,
-            cfgs.matmul_ffn_down.weight_dtype,
+        let any_i8_site = [
+            matmul_i8_qkv.is_some(),
+            matmul_i8_proj.is_some(),
+            matmul_i8_ffn_up.is_some(),
+            matmul_i8_ffn_down.is_some(),
         ]
-        .iter()
-        .any(|wd| matches!(wd, WeightDtype::Quant(_)));
-        let act_quant = if (use_dp4a && any_quant_site) || cfgs.i8_sdpa {
+        .into_iter()
+        .any(|s| s);
+        let act_quant = if any_i8_site || cfgs.i8_sdpa {
             let wgsl = thinfer_core::ops::act_quant::build_wgsl();
             Some(
                 backend
@@ -979,7 +1008,7 @@ impl Block {
             let qkv_scratch = alloc_matmul_out_buf(scope, pipelines, rows * n_qkv)?;
             let dims_qkv = scope.u32x4_uniform(rows, n_qkv, dim, 0)?;
             let w_qkv = scope.import_copy(bufs.attn_qkv);
-            self.dispatch_matmul_site(
+            Self::dispatch_matmul_site(
                 scope,
                 pipelines,
                 attn_in,
@@ -1086,7 +1115,7 @@ impl Block {
             let proj_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
             let dims_proj = scope.u32x4_uniform(rows, dim, k_proj, 0)?;
             let wo = scope.import_copy(bufs.attn_to_out);
-            self.dispatch_matmul_site_diag(
+            Self::dispatch_matmul_site_diag(
                 scope,
                 pipelines,
                 sa,
@@ -1176,7 +1205,7 @@ impl Block {
             let dims_ffn3 = scope.u32x4_uniform(rows, hid, dim, 0)?;
             let w1 = scope.import_copy(bufs.ffn_w1);
             let w3 = scope.import_copy(bufs.ffn_w3);
-            self.dispatch_matmul_site(
+            Self::dispatch_matmul_site(
                 scope,
                 pipelines,
                 ffn_in,
@@ -1192,7 +1221,7 @@ impl Block {
                 hid,
                 dim,
             )?;
-            self.dispatch_matmul_site(
+            Self::dispatch_matmul_site(
                 scope,
                 pipelines,
                 ffn_in,
@@ -1217,7 +1246,7 @@ impl Block {
             let h2_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
             let dims_ffn2 = scope.u32x4_uniform(rows, dim, hid, 0)?;
             let w2 = scope.import_copy(bufs.ffn_w2);
-            self.dispatch_matmul_site(
+            Self::dispatch_matmul_site(
                 scope,
                 pipelines,
                 h13,
@@ -1497,7 +1526,7 @@ impl Block {
             // dispatch_matmul_site_diag) and the dequant_i8 outputs (b_i8,
             // b_scale, b_qsum) so the e2e_parity test can CPU-recompute one
             // output element from the actual bytes.
-            self.dispatch_matmul_site_diag(
+            Self::dispatch_matmul_site_diag(
                 scope,
                 pipelines,
                 attn_in,
@@ -1652,7 +1681,7 @@ impl Block {
                 let proj_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
                 let dims_proj = scope.u32x4_uniform(rows, dim, k_proj, 0)?;
                 let wo = scope.import_copy(bufs.attn_to_out);
-                self.dispatch_matmul_site_diag(
+                Self::dispatch_matmul_site_diag(
                     scope,
                     pipelines,
                     sa,
@@ -1763,7 +1792,7 @@ impl Block {
             let dims_ffn3 = scope.u32x4_uniform(rows, hid, dim, 0)?;
             let w1 = scope.import_copy(bufs.ffn_w1);
             let w3 = scope.import_copy(bufs.ffn_w3);
-            self.dispatch_matmul_site(
+            Self::dispatch_matmul_site(
                 scope,
                 pipelines,
                 ffn_in,
@@ -1779,7 +1808,7 @@ impl Block {
                 hid,
                 dim,
             )?;
-            self.dispatch_matmul_site(
+            Self::dispatch_matmul_site(
                 scope,
                 pipelines,
                 ffn_in,
@@ -1832,7 +1861,7 @@ impl Block {
             let h2_scratch = alloc_matmul_out_buf(scope, pipelines, rows * dim)?;
             let dims_ffn2 = scope.u32x4_uniform(rows, dim, hid, 0)?;
             let w2 = scope.import_copy(bufs.ffn_w2);
-            self.dispatch_matmul_site(
+            Self::dispatch_matmul_site(
                 scope,
                 pipelines,
                 h13,
@@ -1895,9 +1924,12 @@ impl Block {
     /// `out_scratch` receives the raw matmul output, always dense at the
     /// block act dtype (the DP4A kernels write f16 == the F16 act dtype they
     /// are gated on). Wrap it with `ActBuf::dense` to feed the next op.
+    ///
+    /// Associated fn (no receiver): shared by the DiT block and the Qwen3
+    /// text-encoder block, which routes its 7 per-layer matmuls through the
+    /// same site logic.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_matmul_site<'wsp>(
-        &self,
+    pub(crate) fn dispatch_matmul_site<'wsp>(
         scope: &BatchScope<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
         a: ActBuf<'wsp>,
@@ -1913,7 +1945,7 @@ impl Block {
         n: u32,
         k: u32,
     ) -> Result<(), WgpuError> {
-        self.dispatch_matmul_site_diag(
+        Self::dispatch_matmul_site_diag(
             scope,
             pipelines,
             a,
@@ -1940,7 +1972,6 @@ impl Block {
 
     #[allow(clippy::too_many_arguments)]
     fn dispatch_matmul_site_diag<'wsp>(
-        &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
         a: ActBuf<'wsp>,
@@ -2279,7 +2310,7 @@ fn pop_act<'wsp>(carry: &[BatchBuf<'wsp>], idx: &mut usize) -> ActBuf<'wsp> {
 }
 
 /// Allocate a dense ActBuf sized for `rows * dim` activation elements.
-fn alloc_act<'wsp>(
+pub(crate) fn alloc_act<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     rows: u32,
@@ -2335,7 +2366,7 @@ fn quant_for_sdpa<'wsp>(
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
-fn op_rmsnorm<'wsp>(
+pub(crate) fn op_rmsnorm<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     src: ActBuf<'wsp>,
@@ -2349,7 +2380,7 @@ fn op_rmsnorm<'wsp>(
     scope.rmsnorm::<RmsNormF32>(&pipelines.rmsnorm, src.data, w, u, dst.data, rows)
 }
 
-fn op_silu_mul<'wsp>(
+pub(crate) fn op_silu_mul<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     a: ActBuf<'wsp>,
@@ -2359,7 +2390,7 @@ fn op_silu_mul<'wsp>(
     scope.dispatch_op::<SiluMulF32>(&pipelines.silu_mul, &[a.data, b.data], dst.data)
 }
 
-fn op_add<'wsp>(
+pub(crate) fn op_add<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     a: ActBuf<'wsp>,
@@ -2468,8 +2499,35 @@ fn op_rope<'wsp>(
     )
 }
 
+/// Half-rotation rope (HF Qwen3 `(k, k+D/2)` pairing) at the block act
+/// dtype. Mirrors `op_rope` but drives the `rope_halfrot` pipeline.
 #[allow(clippy::too_many_arguments)]
-fn op_sdpa<'wsp>(
+pub(crate) fn op_rope_halfrot<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    src: ActBuf<'wsp>,
+    freqs: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+) -> Result<(), WgpuError> {
+    let pairs = head_dim / 2;
+    let u = scope.u32x4_uniform(rows, heads, pairs, 0)?;
+    scope.rope::<RopeF32HalfRot>(
+        &pipelines.rope_halfrot,
+        src.data,
+        freqs,
+        u,
+        dst.data,
+        rows,
+        heads,
+        pairs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_sdpa<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     q: ActBuf<'wsp>,
@@ -2574,7 +2632,7 @@ fn adaln_full_bytes(pipelines: &BlockPipelines, b: u32, dim: u32) -> u64 {
 /// Allocate the scratch buffer that a matmul writes its raw output into
 /// (always the native act dtype; the DP4A kernels write f16 == the F16 act
 /// dtype they are gated on).
-fn alloc_matmul_out_buf<'wsp>(
+pub(crate) fn alloc_matmul_out_buf<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     n_elems: u32,
@@ -2703,7 +2761,7 @@ impl BlockViews<'_> {
     }
 }
 
-fn copy_tap<'wsp>(
+pub(crate) fn copy_tap<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     src: BatchBuf<'wsp>,
     dst: Option<&BufRef>,
