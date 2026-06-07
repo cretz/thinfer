@@ -58,6 +58,12 @@ pub struct WgpuBackend {
     /// a specific size (the broadcast hint is correct for any size).
     subgroup_min_size: u32,
     subgroup_max_size: u32,
+    /// True when this is wgpu's browser WebGPU backend (Tint compiles our
+    /// WGSL) rather than a native backend (naga). Tint REQUIRES an `enable
+    /// subgroups;` directive on shaders that use subgroup builtins; naga
+    /// implements the builtins but REJECTS that directive (gfx-rs/wgpu#5555).
+    /// Drives `subgroup_enable_directive`.
+    is_web: bool,
     /// Sink for uncaptured errors. The wgpu uncaptured handler stores the
     /// FIRST error received here (later ones are eprintln'd but not stored,
     /// so the root cause isn't shadowed by its own cascade). Drained at sync
@@ -76,6 +82,20 @@ pub struct WgpuBackend {
     /// explicitly. Buffer-id -> (bytes, category) is recorded so `free` can
     /// release to the right counter without the caller re-specifying.
     mem: Arc<MemAccount>,
+}
+
+impl Drop for WgpuBackend {
+    fn drop(&mut self) {
+        // Explicitly destroy the device: on wgpu's web backend, dropping a
+        // `wgpu::Device` is a no-op (the underlying `GPUDevice` and every
+        // buffer created from it stay alive until JS GC collects the
+        // wrappers, which can be arbitrarily late since GC feels no VRAM
+        // pressure). `GPUDevice.destroy()` releases all device resources
+        // immediately per the WebGPU spec. The backend is shared as
+        // `Arc<WgpuBackend>` by engine and models, so this fires only once
+        // every holder is gone.
+        self.device.destroy();
+    }
 }
 
 /// Entry in `WgpuBackend.buffers`. The `cat` is recorded at allocate so
@@ -121,7 +141,7 @@ pub enum WgpuError {
         message: String,
     },
     PipelineCreate {
-        entry: String,
+        label: String,
         source: wgpu::Error,
     },
 }
@@ -207,7 +227,7 @@ async fn emit_dispatch_gpu(pt: PendingTimestamps) {
         }
         let gpu_ms = ((end - begin) as f64) * (pt.period_ns as f64) / 1_000_000.0;
         let _g = r.span.enter();
-        tracing::info!(
+        tracing::trace!(
             target: trace::DISPATCH_GPU,
             pipeline = %r.pipeline,
             gpu_ms = gpu_ms,
@@ -346,6 +366,7 @@ impl WgpuBackend {
         let info = adapter.get_info();
         let subgroup_min_size = info.subgroup_min_size;
         let subgroup_max_size = info.subgroup_max_size;
+        let is_web = info.backend == wgpu::Backend::BrowserWebGpu;
         tracing::info!(
             target: trace::ADAPTER,
             name = %info.name,
@@ -399,6 +420,7 @@ impl WgpuBackend {
             subgroups: adapter_has_subgroups,
             subgroup_min_size,
             subgroup_max_size,
+            is_web,
             mem: MemAccount::new(),
             prep_pipelines: Mutex::new(HashMap::new()),
         })
@@ -436,6 +458,20 @@ impl WgpuBackend {
     /// range).
     pub fn subgroup_size_range(&self) -> (u32, u32) {
         (self.subgroup_min_size, self.subgroup_max_size)
+    }
+
+    /// WGSL `enable` directive to prepend to shaders that use subgroup
+    /// builtins. On the browser (Tint) backend this is `enable subgroups;\n`
+    /// (Tint requires it); on native (naga) it is `""` — naga implements the
+    /// builtins but rejects the directive (gfx-rs/wgpu#5555). Empty unless
+    /// subgroups are actually enabled, so callers can prepend unconditionally
+    /// at their subgroup-shader build sites.
+    pub fn subgroup_enable_directive(&self) -> &'static str {
+        if self.is_web && self.subgroups {
+            "enable subgroups;\n"
+        } else {
+            ""
+        }
     }
 
     fn get_buffer(&self, id: GpuBufferId) -> Result<Arc<wgpu::Buffer>, WgpuError> {
@@ -488,7 +524,7 @@ impl WgpuBackend {
                 bytes,
             },
         );
-        tracing::info!(
+        tracing::trace!(
             target: trace::BUF,
             op = "alloc",
             id = id.0,
@@ -528,7 +564,7 @@ impl WgpuBackend {
         encoder.copy_buffer_to_buffer(&src_buf, offset, &staging, 0, len);
         let scope = scope_guard.pop();
         let guard = self.poll.poll_guard();
-        tracing::info!(
+        tracing::trace!(
             target: trace::RBE,
             op = "record",
             ordinal = ord,
@@ -574,7 +610,7 @@ impl WgpuBackend {
             tracing::debug!(target: crate::trace::PHASE, "rbe.mapped");
             let data = staging.slice(..).get_mapped_range().to_vec();
             staging.unmap();
-            tracing::info!(
+            tracing::trace!(
                 target: trace::RBE,
                 op = "complete",
                 ordinal = ord,
@@ -613,7 +649,7 @@ impl Backend for WgpuBackend {
             }
             None => (0, None),
         };
-        tracing::info!(
+        tracing::trace!(
             target: trace::BUF,
             op = "free",
             id = id.0,
@@ -629,11 +665,11 @@ impl Backend for WgpuBackend {
         src: &[u8],
     ) -> Result<(), Self::Error> {
         let buf = self.get_buffer(dst)?;
-        // Clock reads are gated on subscriber interest: `Instant::now` panics
-        // at runtime on wasm32-unknown-unknown (no OS clock), and the wb
-        // stats only surface via the SUBMIT info event anyway.
-        let t0 = tracing::enabled!(target: trace::SUBMIT, tracing::Level::INFO)
-            .then(std::time::Instant::now);
+        // Clock reads are gated on subscriber interest: the wb stats only
+        // surface via the SUBMIT trace event, and on wasm each enabled read
+        // is a JS roundtrip (`trace::Instant` = `performance.now()` there).
+        let t0 = tracing::enabled!(target: trace::SUBMIT, tracing::Level::TRACE)
+            .then(trace::Instant::now);
         self.queue.write_buffer(&buf, dst_offset, src);
         if let Some(t0) = t0 {
             let ns = t0.elapsed().as_nanos() as u64;
@@ -693,7 +729,7 @@ impl Backend for WgpuBackend {
             layout: &pipeline.bind_group_layout,
             entries: &entries,
         });
-        tracing::info!(
+        tracing::trace!(
             target: trace::DISPATCH,
             pipeline = %pipeline.name,
             wg_x = workgroups[0],
@@ -824,11 +860,11 @@ impl Backend for WgpuBackend {
         let wb_ms = (wb_ns as f64) / 1.0e6;
         // Same wasm gate as `write_buffer`: only touch the clock when the
         // SUBMIT event will actually be emitted.
-        let submit_timing = tracing::enabled!(target: trace::SUBMIT, tracing::Level::INFO);
-        let t_finish = submit_timing.then(std::time::Instant::now);
+        let submit_timing = tracing::enabled!(target: trace::SUBMIT, tracing::Level::TRACE);
+        let t_finish = submit_timing.then(trace::Instant::now);
         let cmdbuf = encoder.enc.finish();
         let finish_ms = t_finish.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
-        let t_submit = submit_timing.then(std::time::Instant::now);
+        let t_submit = submit_timing.then(trace::Instant::now);
         queue.submit([cmdbuf]);
         let submit_call_ms = t_submit.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let internal_scope = internal_guard.pop();
@@ -841,7 +877,7 @@ impl Backend for WgpuBackend {
         let guard = self.poll.poll_guard();
         async move {
             let _guard = guard;
-            let t_wait = submit_timing.then(std::time::Instant::now);
+            let t_wait = submit_timing.then(trace::Instant::now);
             rx.await.expect("on_submitted_work_done sender dropped");
             let gpu_ms = t_wait.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             let mut errs: Vec<String> = Vec::new();
@@ -861,7 +897,7 @@ impl Backend for WgpuBackend {
                 tracing::error!(target: trace::WGPU_ERR, kind = "post_submit_uncaptured", ordinal = ordinal, error = %post);
                 errs.push(format!("post-submit uncaptured: {post}"));
             }
-            tracing::info!(
+            tracing::trace!(
                 target: trace::SUBMIT,
                 ordinal = ordinal,
                 finish_ms = finish_ms,
@@ -887,16 +923,18 @@ impl Backend for WgpuBackend {
 
     fn create_pipeline(
         &self,
+        label: &str,
         wgsl: &str,
         entry: &str,
         layout: &[BindingLayout],
     ) -> impl Future<Output = Result<Self::Pipeline, Self::Error>> {
         let device = self.device.clone();
+        let label = label.to_owned();
         let wgsl = wgsl.to_owned();
         let entry = entry.to_owned();
         let layout: Vec<BindingLayout> = layout.to_vec();
         async move {
-            tracing::debug!(target: crate::trace::COMPILE, %entry, "wgsl compile");
+            tracing::trace!(target: crate::trace::COMPILE, %label, %entry, "wgsl compile");
             // Push a validation scope around shader-module creation so WGSL
             // parse/validation failures surface in the returned PipelineCreate
             // error instead of disappearing into the uncaptured-error handler
@@ -906,11 +944,11 @@ impl Backend for WgpuBackend {
             // makes shader bugs debuggable from the program's error output.
             let module_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(&entry),
+                label: Some(&label),
                 source: wgpu::ShaderSource::Wgsl(wgsl.into()),
             });
             if let Some(err) = module_scope.pop().await {
-                return Err(WgpuError::PipelineCreate { entry, source: err });
+                return Err(WgpuError::PipelineCreate { label, source: err });
             }
             let entries: Vec<wgpu::BindGroupLayoutEntry> = layout
                 .iter()
@@ -939,7 +977,7 @@ impl Backend for WgpuBackend {
             });
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[&bgl],
+                bind_group_layouts: &[Some(&bgl)],
                 immediate_size: 0,
             });
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -952,12 +990,12 @@ impl Backend for WgpuBackend {
                 cache: None,
             });
             if let Some(err) = scope.pop().await {
-                return Err(WgpuError::PipelineCreate { entry, source: err });
+                return Err(WgpuError::PipelineCreate { label, source: err });
             }
             Ok(WgpuPipeline {
                 pipeline,
                 bind_group_layout: bgl,
-                name: entry,
+                name: label,
             })
         }
     }
@@ -1009,12 +1047,17 @@ impl Backend for WgpuBackend {
         }
     }
 
+    fn supports_weight_prep(&self, _op: WeightPrep) -> bool {
+        true
+    }
+
     fn weight_prep(
         &self,
         op: WeightPrep,
-        raw: &[u8],
+        staging: &BufRef,
         dst: &BufRef,
-    ) -> impl Future<Output = Result<bool, Self::Error>> {
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        let staging = *staging;
         let dst = *dst;
         async move {
             let (key, dims): (&'static str, [u32; 4]) = match op {
@@ -1038,8 +1081,13 @@ impl Backend for WgpuBackend {
                             }
                         };
                         let p = Arc::new(
-                            self.create_pipeline(&wgsl, key, crate::ops::weight_prep::layout())
-                                .await?,
+                            self.create_pipeline(
+                                key,
+                                &wgsl,
+                                key,
+                                crate::ops::weight_prep::layout(),
+                            )
+                            .await?,
                         );
                         self.prep_pipelines
                             .lock()
@@ -1049,15 +1097,12 @@ impl Backend for WgpuBackend {
                     }
                 }
             };
-            let staging = self.allocate_in(raw.len() as u64, VramCategory::Staging)?;
             let dims_buf = self.allocate_in(16, VramCategory::Staging)?;
             let run = (|| {
-                self.write_buffer(staging, 0, raw)?;
                 self.write_buffer(dims_buf, 0, bytemuck::bytes_of(&dims))?;
-                let src_ref = BufRef::new(staging, raw.len() as u64);
                 let dims_ref = BufRef::new(dims_buf, 16);
                 let bufs = crate::ops::weight_prep::WeightPrepBufs {
-                    src: &src_ref,
+                    src: &staging,
                     dst: &dst,
                     dims: &dims_ref,
                 };
@@ -1080,10 +1125,9 @@ impl Backend for WgpuBackend {
                 Ok(enc) => self.submit(enc).await,
                 Err(e) => Err(e),
             };
-            self.free(staging);
+            // `staging` is caller-owned; only the dims uniform is ours.
             self.free(dims_buf);
-            res?;
-            Ok(true)
+            res
         }
     }
 }

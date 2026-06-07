@@ -171,12 +171,24 @@ pub async fn embed_lookup<S: WeightSource>(
     let encoding = entry
         .encoding
         .ok_or(EmbedLookupError::Undecodable(StorageEncoding::F32))?;
-    let bytes_per_elt: u64 = match encoding {
-        StorageEncoding::Bf16 => 2,
-        StorageEncoding::F32 => 4,
+    // Quant rows (GGUF TE, Q8_0 token_embd) dequantize via the CPU block
+    // path: HIDDEN is whole blocks for every supported scheme, so a row is
+    // a self-contained run of blocks at a computable byte offset.
+    let quant = match encoding {
+        StorageEncoding::Bf16 | StorageEncoding::F32 => None,
+        StorageEncoding::Quant(k) => {
+            if !config::HIDDEN.is_multiple_of(k.block_size() as usize) {
+                return Err(EmbedLookupError::Undecodable(encoding));
+            }
+            Some(k)
+        }
         enc => return Err(EmbedLookupError::Undecodable(enc)),
     };
-    let row_src_bytes = (config::HIDDEN as u64) * bytes_per_elt;
+    let row_src_bytes: u64 = match (encoding, quant) {
+        (_, Some(k)) => k.bytes_for_elements(config::HIDDEN as u64),
+        (StorageEncoding::Bf16, _) => (config::HIDDEN as u64) * 2,
+        _ => (config::HIDDEN as u64) * 4,
+    };
 
     let mut reader = source
         .open(&id)
@@ -195,6 +207,11 @@ pub async fn embed_lookup<S: WeightSource>(
             .await
             .map_err(|e| EmbedLookupError::Reader(format!("{e:?}")))?;
         let dst_byte_off = i * row_dst_bytes;
+        if let Some(k) = quant {
+            let dst = &mut out[i * config::HIDDEN..(i + 1) * config::HIDDEN];
+            thinfer_core::quant::dequantize_row(k, &row_src, dst);
+            continue;
+        }
         // Safety: cast &mut [f32] -> &mut [u8] for byte-level decode write.
         let out_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut out[..]);
         let mut decoder = Decoder::new(encoding).map_err(EmbedLookupError::Decode)?;
@@ -238,8 +255,11 @@ pub enum LoadError {
 /// noise into ~1.7 absolute output error on that row, corrupting the
 /// conditioning (qwen3_parity layer-6 forensics, 2026-06-05). llama.cpp's
 /// K-quant mixes bump ffn_down precision for the same reason. Callers'
-/// pipeline cfgs must compile `matmul_ffn_down` against Bf16 to match
-/// (`ZImageModel::load` and qwen3_parity mirror this).
+/// pipeline cfgs must compile `matmul_ffn_down` against the registered
+/// encoding (`ZImageModel::load` and qwen3_parity probe the catalog).
+/// On the GGUF TE checkpoint every site INCLUDING `mlp_down` ships
+/// quantized in-file (the config the ComfyUI-GGUF ecosystem runs) and
+/// registers natively; the e2e parity gates judge that quality.
 pub fn register_qwen3_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
     transcode: Option<thinfer_core::quant::QuantKind>,
@@ -296,16 +316,11 @@ fn register_one<S: WeightSource>(
         encoding: None,
         label: entry.encoding_label.clone(),
     })?;
-    if thinfer_core::weight::Decoder::new(encoding).is_err() {
-        return Err(LoadError::Undecodable {
-            id: id.clone(),
-            encoding: Some(encoding),
-            label: entry.encoding_label.clone(),
-        });
-    }
     // Transcode targets keep the file's [N, K] row order (GGUF block layout
     // is N-major, no transpose); requires bf16 source and whole 32-blocks
-    // along K. Mirrors `loader::register_linear_transcode`.
+    // along K. In-file GGUF quant (TE GGUF checkpoint) is already
+    // block-major [N, K]: registered as-is, any transcode request is moot.
+    // Mirrors `loader::register_linear_transcode`.
     let (transpose, transcode) = match (encoding, transcode) {
         (StorageEncoding::Bf16, Some(k)) => {
             assert_eq!(entry.shape.0.len(), 2, "transcode target must be 2-D");
@@ -316,14 +331,15 @@ fn register_one<S: WeightSource>(
             );
             (TransposePolicy::None, Some(k))
         }
-        (_, Some(_)) => {
+        (StorageEncoding::Quant(_), _) => (TransposePolicy::None, None),
+        (StorageEncoding::Bf16 | StorageEncoding::F32, None) => (transpose, None),
+        _ => {
             return Err(LoadError::Undecodable {
                 id: id.clone(),
                 encoding: Some(encoding),
-                label: format!("transcode requires bf16 source ({})", entry.encoding_label),
+                label: entry.encoding_label.clone(),
             });
         }
-        (_, None) => (transpose, None),
     };
     Ok(residency.register(WeightMeta {
         id: id.clone(),

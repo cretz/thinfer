@@ -11,9 +11,9 @@
 //!     `unsloth/Z-Image-Turbo-GGUF` (Q8_0). Tolerances bumped to absorb
 //!     Q8_0 quantization error vs the bf16 PyTorch reference.
 //!
-//! The only path difference is the source: the GGUF variant wraps the
-//! same safetensors source in `UnionSource::new(RenamedSource(GgufSource),
-//! sts)`. Tokenizer, TE, VAE, py reference, budget assertions, per-stage
+//! The only path difference is the source: the GGUF variant passes a GGUF
+//! opener to `ZImageSource::open`, which unions the DiT matmuls over the
+//! safetensors side. Tokenizer, TE, VAE, py reference, budget assertions, per-stage
 //! VAE diag, PNG dump, and divergence-checking logic are all shared via
 //! `run_pipeline_and_compare`.
 //!
@@ -34,11 +34,6 @@ use std::sync::Arc;
 
 use thinfer_core::Backend;
 use thinfer_core::backend::{PowerPreference, WgpuBackend, WgpuConfig};
-use thinfer_core::format::gguf::GgufSource;
-use thinfer_core::format::safetensors::ShardedSafetensorsSource;
-use thinfer_core::format::union::{
-    QuantOnlySource, RenamedSource, SplitToFusedQkvSource, UnionSource,
-};
 use thinfer_core::ops::WeightDtype;
 use thinfer_core::policy::ResidencyBudget;
 use thinfer_core::quant::QuantKind;
@@ -46,11 +41,11 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::trace::{self, DIAG};
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
-use thinfer_models::z_image::dit_qkv_triples;
 use thinfer_models::z_image::manifest::{self, RecipeOverrideGuard, ZImageRecipe, role};
 use thinfer_models::z_image::pipeline::{
     Block0LocalTaps, GenerationParams, Step0LocalizationTaps, ZImageModel, encode_png,
 };
+use thinfer_models::z_image::source::{GgufOpeners, ZImageSource};
 use thinfer_models::z_image::vae::VaeStageSample;
 use thinfer_native::MmapFileOpener;
 use thinfer_native::cache;
@@ -155,6 +150,12 @@ impl Variant {
             Variant::GgufQ8_0 | Variant::GgufQ8_0I8Sdpa => Some(role::DIT_GGUF_Q8_0),
             Variant::GgufQ4_K_M => Some(role::DIT_GGUF_Q4_K_M),
         }
+    }
+
+    /// Text-encoder GGUF role, paired with `gguf_role` (every quant
+    /// variant ships the Q8_0 TE; see `manifest::VARIANTS`).
+    fn te_gguf_role(self) -> Option<&'static str> {
+        self.gguf_role().map(|_| role::TE_GGUF_Q8_0)
     }
 
     /// Dtype the DiT main matmul kernels must compile against for this
@@ -304,6 +305,9 @@ async fn run(variant: Variant) {
     if let Some(r) = variant.gguf_role() {
         needed.push(r);
     }
+    if let Some(r) = variant.te_gguf_role() {
+        needed.push(r);
+    }
     let mut resolved: Vec<(&str, PathBuf)> = Vec::with_capacity(needed.len());
     for r in needed {
         let fr = manifest::MANIFEST.get(r).expect("role in manifest");
@@ -436,15 +440,50 @@ async fn run(variant: Variant) {
                 .unwrap_or_else(|e| panic!("open {}: {e}", path.display())),
         );
     }
-    let base_source = ShardedSafetensorsSource::open(openers)
+    let gguf_openers = match (variant.gguf_role(), variant.te_gguf_role()) {
+        (Some(dit_r), Some(te_r)) => {
+            let dit_path = path_of(dit_r);
+            let te_path = path_of(te_r);
+            eprintln!(
+                "e2e-parity[{}]: union GGUFs over safetensors: {} + {}",
+                variant.slug(),
+                dit_path.display(),
+                te_path.display()
+            );
+            Some(GgufOpeners {
+                dit: MmapFileOpener::new(dit_path)
+                    .await
+                    .unwrap_or_else(|e| panic!("open gguf {}: {e}", dit_path.display())),
+                te: MmapFileOpener::new(te_path)
+                    .await
+                    .unwrap_or_else(|e| panic!("open gguf {}: {e}", te_path.display())),
+            })
+        }
+        _ => None,
+    };
+    // Schema adapters + optional GGUF union live in `ZImageSource::open`,
+    // shared with the CLI and web.
+    let source = ZImageSource::open(openers, gguf_openers)
         .await
-        .expect("parse sharded safetensors");
-    // Engine consumes canonical fused QKV; split safetensors checkpoints
-    // (dimitribarbot) flow through this adapter, fused-fused checkpoints
-    // see it as a passthrough.
-    let base_source = SplitToFusedQkvSource::new(base_source, dit_qkv_triples());
-    let base_source =
-        RenamedSource::with_passthrough(base_source, thinfer_models::z_image::dit_to_out_renames());
+        .expect("parse weight files");
+    // The base source still carries the bf16 TE shards, so a misnamed
+    // `qwen3_gguf_renames` map would silently fall back to safetensors and
+    // pass a run identical to the bf16 TE. Assert the union actually
+    // serves the TE from the GGUF (same trap-guard as
+    // `expected_dit_matmul_weight` for the DiT side).
+    if variant.te_gguf_role().is_some() {
+        use thinfer_core::tensor::StorageEncoding;
+        use thinfer_core::weight::{WeightId, WeightSource as _};
+        let enc = source
+            .catalog()
+            .get(&WeightId("model.layers.0.self_attn.q_proj.weight".into()))
+            .and_then(|e| e.encoding);
+        assert_eq!(
+            enc,
+            Some(StorageEncoding::Quant(QuantKind::Q8_0)),
+            "TE q_proj must come from the Q8_0 GGUF, not the safetensors fallback"
+        );
+    }
 
     // Aggressive 2 GiB / 2 GiB budgets - intentionally well under model
     // size to exercise the eviction + rolling-residency paths. Anything
@@ -509,58 +548,8 @@ async fn run(variant: Variant) {
         budget,
     };
 
-    // Dispatch by variant. Source type changes between arms so this is
-    // where the union happens; everything below
-    // `run_pipeline_and_compare` is source-agnostic.
-    match variant.gguf_role() {
-        None => {
-            let residency = WeightResidency::new(base_source, budget);
-            run_pipeline_and_compare(backend, residency, tokenizer, ctx).await;
-        }
-        Some(gguf_role) => {
-            let gguf_path = path_of(gguf_role);
-            eprintln!(
-                "e2e-parity[{}]: union GGUF over safetensors: {}",
-                variant.slug(),
-                gguf_path.display()
-            );
-            let gguf_opener = MmapFileOpener::new(gguf_path)
-                .await
-                .unwrap_or_else(|e| panic!("open gguf {}: {e}", gguf_path.display()));
-            let gguf = GgufSource::open(gguf_opener)
-                .await
-                .unwrap_or_else(|e| panic!("parse gguf {}: {e:?}", gguf_path.display()));
-            // GGUF (unsloth Z-Image-Turbo) already ships canonical upstream
-            // names including fused `attention.qkv.weight`; no rename. The
-            // safetensors fallback feeds AdaLN/biases/norms under matching
-            // names (and supplies the fused QKV via `SplitToFusedQkvSource`
-            // for any quant-eligible tensor the GGUF doesn't carry).
-            //
-            // `QuantOnlySource` hides GGUF's F32 norms/AdaLN from the union
-            // so the bf16 safetensors entries (same canonical names) aren't
-            // shadowed by F32 ones the engine residency can't decode.
-
-            // unsloth Z-Image-Turbo-GGUF quantizes more tensors than the
-            // engine treats as quantized (e.g. main-layer AdaLN, refiners,
-            // possibly biases). Engine quantizes only the five main-DiT
-            // matmul weights per `layers.<i>.` block. Allowlist those.
-            let unioned = UnionSource::new(
-                QuantOnlySource::with_allowed_substrings(
-                    gguf,
-                    &[
-                        ".attention.qkv.weight",
-                        ".attention.out.weight",
-                        ".feed_forward.w1.weight",
-                        ".feed_forward.w2.weight",
-                        ".feed_forward.w3.weight",
-                    ],
-                ),
-                base_source,
-            );
-            let residency = WeightResidency::new(unioned, budget);
-            run_pipeline_and_compare(backend, residency, tokenizer, ctx).await;
-        }
-    }
+    let residency = WeightResidency::new(source, budget);
+    run_pipeline_and_compare(backend, residency, tokenizer, ctx).await;
 }
 
 /// Source-agnostic context passed to `run_pipeline_and_compare`. Owns

@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use thinfer_core::arbiter::{MemArbiter, RECLAIM_EVICTABLE_WEIGHTS};
 use thinfer_core::backend::{Backend, WgpuBackend, WgpuError};
+use thinfer_core::mem::VramCategory;
 use thinfer_core::ops::{WeightDtype, WgslConfig};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
 use thinfer_core::tensor::StorageEncoding;
@@ -270,12 +271,12 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         residency: WeightResidency<S>,
         tokenizer: T,
     ) -> Result<Self, ModelLoadError> {
-        // Stage-timing clocks are gated on subscriber interest: `Instant::now`
-        // panics at runtime on wasm32 (no OS clock), and the values only
-        // surface via the info/debug events. An INFO gate covers the debug
-        // event too (a filter admitting DEBUG necessarily admits INFO).
+        // Stage-timing clocks are gated on subscriber interest: the values
+        // only surface via the info/debug events, and on wasm each enabled
+        // read is a JS roundtrip (`trace::Instant`). An INFO gate covers the
+        // debug event too (a filter admitting DEBUG necessarily admits INFO).
         let timing = tracing::enabled!(tracing::Level::INFO);
-        let t0 = timing.then(std::time::Instant::now);
+        let t0 = timing.then(trace::Instant::now);
         // Weights join the VRAM arbiter's reclaim chain: workspace growth
         // can evict prefetch-warmed (unpinned) residents instead of
         // overshooting the budget. The inverse direction (weights evicting
@@ -289,9 +290,11 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // they ride the quant matmul path (see `refiner_transcode_target`).
         let refiner_transcode = crate::z_image::loader::refiner_transcode_target(&residency);
         let dit_handles = register_dit_handles(&residency, refiner_transcode)?;
-        // Qwen3 encoder matmuls always ship bf16 safetensors; requantize to
-        // Q8_0 at upload unconditionally (lossless-tier, ~half the upload
-        // bytes, rides the quant matmul path). Mirrored in `encoder_cfgs`.
+        // Qwen3 encoder matmuls: GGUF TE checkpoints ship them quantized
+        // in-file (registered natively); bf16 safetensors sources are
+        // requantized to Q8_0 at upload (lossless-tier, ~half the upload
+        // bytes, rides the quant matmul path). `encoder_cfgs` below probes
+        // the catalog so the compiled slots match either way.
         let encoder_transcode = thinfer_core::quant::QuantKind::Q8_0;
         let encoder_handles = register_qwen3_handles(&residency, Some(encoder_transcode))?;
         let vae_handles = register_vae_decoder_handles(&residency)?;
@@ -299,7 +302,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             elapsed_ms = t0.map_or(0, |t| t.elapsed().as_millis() as u64),
             "handles registered"
         );
-        let t_compile = timing.then(std::time::Instant::now);
+        let t_compile = timing.then(trace::Instant::now);
         // Detect whether the DiT-side matmul tensors arrived as GGUF
         // quant (e.g. Q8_0) or stayed bf16. Peek the canonical fused QKV
         // tensor (`layers.0.attention.qkv.weight`) in the source catalog. If
@@ -437,10 +440,14 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ?dit_matmul_weight,
             "DiT block matmul weight dtype (layer 0 qkv probe)"
         );
-        // Qwen3 text encoder pipelines: all 7 per-layer matmul weights are
-        // transcoded to Q8_0 at upload (see `encoder_transcode` above), so
-        // the matmul slots compile against the quant scheme (DP4A matmul_i8
-        // when the adapter has it, dequant-workspace fallback otherwise).
+        // Qwen3 text encoder pipelines: matmul slots compile against the
+        // quant scheme (DP4A matmul_i8 when the adapter has it,
+        // dequant-workspace fallback otherwise). Per-site catalog probe:
+        // GGUF TE checkpoints answer Quant(k) (every site, ffn_down
+        // included); bf16 safetensors answer Bf16 and the slot compiles
+        // against the upload-time transcode target instead — except
+        // ffn_down, which is never transcoded (massive-activation
+        // amplification; see `register_qwen3_handles`) and stays bf16.
         // Acts are F16 with SHADER_F16, F32 fallback — same rule as the DiT
         // quant path, but chosen independently of the DiT's dtype.
         let encoder_act = if backend.supports_shader_f16() {
@@ -453,17 +460,20 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             act_dtype: encoder_act,
             weight_dtype: WeightDtype::Bf16,
         };
-        let encoder_matmul = WgslConfig {
-            weight_dtype: WeightDtype::Quant(encoder_transcode),
+        let qwen3_l0 = crate::z_image::text_encoder::Qwen3Weights::new();
+        let encoder_slot = |id, on_bf16| WgslConfig {
+            weight_dtype: match probe_slot(id) {
+                WeightDtype::Quant(k) => WeightDtype::Quant(k),
+                _ => on_bf16,
+            },
             ..encoder_ops
         };
+        let transcoded = WeightDtype::Quant(encoder_transcode);
         let encoder_cfgs = BlockWgslConfigs {
-            matmul_qkv: encoder_matmul,
-            matmul_proj: encoder_matmul,
-            matmul_ffn_up: encoder_matmul,
-            // ffn_down weights are never transcoded (massive-activation
-            // amplification; see `register_qwen3_handles`): bf16 site.
-            matmul_ffn_down: encoder_ops,
+            matmul_qkv: encoder_slot(&qwen3_l0.layers[0].q_proj, transcoded),
+            matmul_proj: encoder_slot(&qwen3_l0.layers[0].o_proj, transcoded),
+            matmul_ffn_up: encoder_slot(&qwen3_l0.layers[0].mlp_gate, transcoded),
+            matmul_ffn_down: encoder_slot(&qwen3_l0.layers[0].mlp_down, WeightDtype::Bf16),
             matmul_adaln: encoder_ops,
             ops: encoder_ops,
             i8_sdpa: false,
@@ -569,7 +579,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
     ) -> Result<Vec<u8>, GenerateError<S::Error>> {
         // INFO-gated clocks: see `load` for the wasm rationale.
         let timing = tracing::enabled!(tracing::Level::INFO);
-        let t_gen = timing.then(std::time::Instant::now);
+        let t_gen = timing.then(trace::Instant::now);
         let mut workspace = Workspace::new(
             Arc::clone(&self.backend),
             Arc::clone(self.residency.arbiter()),
@@ -586,7 +596,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             if let Some(p) = progress {
                 p(ProgressEvent::VaeDecode);
             }
-            let t = timing.then(std::time::Instant::now);
+            let t = timing.then(trace::Instant::now);
             let out = self
                 .vae
                 .decode(
@@ -602,6 +612,12 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             tracing::info!(elapsed_ms = vae_ms, "vae decode done");
             out
         };
+        // Phase boundary: generation is done; nothing stays resident between
+        // generates. Evicts the VAE weights (and any other unpinned residents)
+        // so an idle model holds no VRAM; the workspace pool frees via RAII
+        // when `workspace` drops at return. The next generate re-acquires from
+        // the source on demand, same as a first run.
+        self.residency.evict_all_and_free(&*self.backend);
 
         // Diag dump: gated on DIAG-target INFO enablement so the stat passes
         // (full sweep over `rgb`) don't fire when tracing is off. Zero-cost in
@@ -784,7 +800,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             if let Some(p) = progress {
                 p(ProgressEvent::TextEncode);
             }
-            let t = timing.then(std::time::Instant::now);
+            let t = timing.then(trace::Instant::now);
             let out = self
                 .encoder
                 .forward(
@@ -843,6 +859,31 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // 4. Assemble DiT for this image shape + scheduler.
         let shape = DitShape::for_image(C_LATENT, h_lat, w_lat, qout.seq, PATCH_SIZE, F_PATCH_SIZE);
         let dit = ZImageDit::assemble(self.dit_handles.clone(), shape);
+        // Fill VRAM to budget: pin a deterministic prefix of the DiT weights
+        // for the denoise phase so steps 2..N skip their re-upload (the ring
+        // streams only the remainder). Pin-on-first-touch - step 1 uploads as
+        // usual, pinned entries just aren't evicted afterwards. The headroom
+        // reserve keeps the rings, the packer's workspace, and one prep
+        // staging buffer out of the pinned span; `evict_all_and_free` at the
+        // end of denoise drops the plan so VAE reclaims the VRAM.
+        {
+            let vram = self.residency.budget().vram_bytes;
+            let reserve = self
+                .residency
+                .ring_reserved_bytes()
+                .saturating_add(dit.workspace_reserve_estimate(&self.block_pipelines))
+                .saturating_add(self.residency.staging_reserve_bytes());
+            let pin_budget = vram.saturating_sub(reserve);
+            let (pin_bytes, pin_count) =
+                self.residency.set_pin_plan(&dit.pin_priority(), pin_budget);
+            tracing::info!(
+                pinned_mib = pin_bytes / (1024 * 1024),
+                pinned_count = pin_count,
+                pin_budget_mib = pin_budget / (1024 * 1024),
+                reserve_mib = reserve / (1024 * 1024),
+                "dit pin plan"
+            );
+        }
         let scheduler = FlowMatchEulerScheduler::new(params.steps as usize, shape.seq_x);
         tracing::info!(
             target: trace::DIAG,
@@ -863,7 +904,8 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     n: params.steps,
                 });
             }
-            let t_step = timing.then(std::time::Instant::now);
+            let t_step = timing.then(trace::Instant::now);
+            let step_src0 = self.backend.mem_account().source_bytes_total();
             let inputs = DitInputs {
                 image: &sample,
                 size: (C_LATENT, 1, h_lat, w_lat),
@@ -1566,11 +1608,40 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 );
             }
             let step_ms = t_step.map_or(0, |t| t.elapsed().as_millis() as u64);
+            // Per-step weight streaming volume + effective read throughput.
+            // When streaming overlaps GPU compute fully, step time tracks
+            // compute; when it doesn't, this throughput sags and step time
+            // tracks IO instead (the GPU-idle signal we're chasing).
+            let mem = self.backend.mem_account();
+            let streamed = mem.source_bytes_total().saturating_sub(step_src0);
+            let mbps = if step_ms > 0 {
+                (streamed as f64) / 1.0e6 / (step_ms as f64 / 1000.0)
+            } else {
+                0.0
+            };
             tracing::info!(
                 elapsed_ms = step_ms,
                 step = i + 1,
                 steps = params.steps,
+                streamed_mib = streamed / (1024 * 1024),
+                read_mbps = mbps as u64,
+                weights_mib = mem.vram_current(VramCategory::Weights) / (1024 * 1024),
+                vram_peak_mib = mem.vram_total_peak() / (1024 * 1024),
                 "step done"
+            );
+        }
+        // Denoise-phase snapshot: budget vs realized peak + total streamed,
+        // so a run shows at a glance whether weights were re-streamed (total
+        // streamed past model size = paging under a tight budget).
+        {
+            let mem = self.backend.mem_account();
+            tracing::info!(
+                budget_mib = self.residency.budget().vram_bytes / (1024 * 1024),
+                vram_peak_mib = mem.vram_total_peak() / (1024 * 1024),
+                weights_peak_mib = mem.vram_peak(VramCategory::Weights) / (1024 * 1024),
+                workspace_peak_mib = mem.vram_peak(VramCategory::Workspace) / (1024 * 1024),
+                staging_peak_mib = mem.vram_peak(VramCategory::Staging) / (1024 * 1024),
+                "denoise done"
             );
         }
 

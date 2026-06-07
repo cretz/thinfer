@@ -254,8 +254,66 @@ fn register_adaln<S: WeightSource>(
     rings: Option<&BlockRingSet>,
 ) -> Result<AdaLnHandles, LoadError> {
     Ok(AdaLnHandles {
-        weight: register_linear_opt_ring(residency, &w.weight, rings.map(|r| r.adaln_weight))?,
+        weight: register_linear_dense_opt_ring(
+            residency,
+            &w.weight,
+            rings.map(|r| r.adaln_weight),
+        )?,
         bias: register_passthrough_opt_ring(residency, &w.bias, rings.map(|r| r.adaln_bias))?,
+    })
+}
+
+/// Dense-consumed linear: the matmul site reads bf16 `[K, N]` regardless of
+/// file encoding. Quant files (GGUF checkpoints quantize the AdaLN
+/// modulation weights) dequant to dense bf16 at upload (`encoding Quant +
+/// TransposePolicy::Linear2D`, see `WeightMeta::gpu_encoding`); bf16/F32
+/// files ride the plain `Linear2D` path. Never registers a quant GPU
+/// layout: the adaln matmul pipeline compiles `WeightDtype::Bf16`
+/// unconditionally (M=1 modulation matmul, see `BlockMatmuls::for_cfgs`).
+fn register_linear_dense_opt_ring<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    id: &WeightId,
+    ring: Option<RingId>,
+) -> Result<WeightHandle, LoadError> {
+    let entry = residency
+        .source()
+        .catalog()
+        .get(id)
+        .ok_or_else(|| LoadError::UnknownWeight(id.clone()))?;
+    let encoding = entry.encoding.ok_or_else(|| LoadError::Undecodable {
+        id: id.clone(),
+        encoding: None,
+        label: entry.encoding_label.clone(),
+    })?;
+    match encoding {
+        StorageEncoding::Bf16 | StorageEncoding::F32 => {}
+        StorageEncoding::Quant(k) => {
+            assert_eq!(entry.shape.0.len(), 2, "dense-linear quant must be 2-D");
+            assert_eq!(
+                entry.shape.0[1] % k.block_size() as usize,
+                0,
+                "dense-linear dequant requires K % block_size == 0 ({id:?})"
+            );
+        }
+        _ => {
+            return Err(LoadError::Undecodable {
+                id: id.clone(),
+                encoding: Some(encoding),
+                label: entry.encoding_label.clone(),
+            });
+        }
+    }
+    let meta = WeightMeta {
+        id: id.clone(),
+        shape: entry.shape.clone(),
+        encoding,
+        on_disk_bytes: entry.size,
+        transpose: TransposePolicy::Linear2D,
+        transcode: None,
+    };
+    Ok(match ring {
+        Some(r) => residency.register_in_ring(meta, r)?,
+        None => residency.register(meta),
     })
 }
 

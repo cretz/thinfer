@@ -484,30 +484,78 @@ fn main(
 "#
 );
 
-// F16 subgroup sdpa. Same flash layout as WGSL_F16_PACKED but each Q row is
-// owned by a CL=8-lane cluster instead of one thread: D is split across the
-// cluster (vec4<f16> slices, max 4 per lane at D=128), the per-key dot is
-// cluster-reduced with three subgroupShuffleXor hops, and every lane then
-// replicates the online-softmax scalars (m, l, p_j, alpha) locally - no
-// shared-memory round trip, no barrier in the inner loop. This removes the
-// per-thread `array<f32, 128>` q/o state of the one-thread-one-row kernel,
-// which spills to local memory at D=128 and made sdpa memory-latency-bound
-// (~0.22 TFLOPS effective at 768x768; llama.cpp's Vulkan flash_attn.comp
+// F16 subgroup sdpa, CL-parameterized. Same flash layout as WGSL_F16_PACKED but
+// each Q row is owned by a CL-lane cluster instead of one thread: D is split
+// across the cluster (vec4<f16> slices, MAX_DV4/CL per lane at D=128), the
+// per-key dot is cluster-reduced with log2(CL) subgroupShuffleXor hops, and
+// every lane then replicates the online-softmax scalars (m, l, p_j, alpha)
+// locally - no shared-memory round trip, no barrier in the inner loop. This
+// removes the per-thread `array<f32, 128>` q/o state of the one-thread-one-row
+// kernel, which spills to local memory at D=128 and made sdpa memory-latency-
+// bound (~0.22 TFLOPS effective at 768x768; llama.cpp's Vulkan flash_attn.comp
 // uses the same D_split + subgroupShuffleXor decomposition).
+//
+// CL is chosen at the build site = min(8, reported subgroup_min_size): native
+// (NVIDIA min=32) uses CL=8; web/mobile, where the browser reports the spec
+// floor of 4 (and wgpu-web hardcodes it - it can't read the real value), uses
+// CL=4. The cluster reduce is correct as long as CL divides the ACTUAL runtime
+// subgroup size, which holds for any power-of-2 size >= CL; picking CL <=
+// reported_min guarantees it whatever size the driver picks. Math is identical
+// across CL, so native CL=8 stays bit-for-bit unchanged.
 //
 // Tail keys (s_k not a multiple of BC) are folded branchlessly: their score
 // is forced to -FLT_MAX so p_j = 0 and the shuffle stays in uniform control
-// flow. Cluster lanes never straddle a subgroup (lid%8 == sg_lane%8 for any
-// subgroup size that is a multiple of 8); the build site gates on
-// subgroup_min_size >= 8.
+// flow.
 //
-// Constraints: D % 32 == 0 (each lane handles D/8 elements as D/32 vec4s),
-// D <= 128. Grid [ceil(S_q/16), H_q, B].
-// Shared: BC * MAX_DV4 * 8 bytes * 2 = 16 KiB (2+ workgroups/SM).
-// NOTE: no `enable subgroups;` - naga implements the subgroup builtins but
-// rejects the enable directive itself (gfx-rs/wgpu#5555); matmul_i8 relies
-// on the same behavior.
-const WGSL_F16_SG: &str = r#"enable f16;
+// Constraints: d_v4 % CL == 0 (i.e. D % (4*CL) == 0), D <= 128. Build sites pass
+// D % 32 == 0, which satisfies both CL=4 and CL=8. Grid [ceil(S_q/BR), H_q, B]
+// with BR = WG/CL. Shared: BC * MAX_DV4 * 8 bytes * 2 = 16 KiB.
+// NOTE: no `enable subgroups;` here - naga (native) implements the subgroup
+// builtins but rejects the enable directive itself (gfx-rs/wgpu#5555); matmul_i8
+// relies on the same behavior. On the web (Tint) backend the directive IS
+// required, so the model layer prepends `backend.subgroup_enable_directive()`
+// to this source at the build site.
+pub fn build_f16_sg_wgsl(cl: u32) -> String {
+    assert!(cl == 4 || cl == 8, "sdpa_sg: CL must be 4 or 8, got {cl}");
+    let br = 128 / cl; // WG=128 lanes / CL lanes-per-row
+    let max_nl = 32 / cl; // MAX_DV4=32 vec4 (D=128) split across CL lanes
+    let decls = |kw: &str| -> String {
+        (0..max_nl)
+            .map(|i| format!("    var {kw}{i} = vec4<f32>();\n"))
+            .collect()
+    };
+    let q_decls = decls("q");
+    let o_decls = decls("o");
+    let mut q_loads = String::from("    q0 = vec4<f32>(q[q_off + l_off]);\n");
+    let mut dot = String::from("            var part = dot(q0, vec4<f32>(k_tile[tb]));\n");
+    let mut o_upd = String::from("            o0 = o0 * alpha + p_j * vec4<f32>(v_tile[tb]);\n");
+    let mut out_w = String::from("        out[q_off + l_off] = vec4<f16>(o0 * inv_l);\n");
+    for i in 1..max_nl {
+        q_loads.push_str(&format!(
+            "    if (n_l > {i}u) {{ q{i} = vec4<f32>(q[q_off + l_off + {i}u]); }}\n"
+        ));
+        dot.push_str(&format!(
+            "            if (n_l > {i}u) {{ part = part + dot(q{i}, vec4<f32>(k_tile[tb + {i}u])); }}\n"
+        ));
+        o_upd.push_str(&format!(
+            "            if (n_l > {i}u) {{ o{i} = o{i} * alpha + p_j * vec4<f32>(v_tile[tb + {i}u]); }}\n"
+        ));
+        out_w.push_str(&format!(
+            "        if (n_l > {i}u) {{ out[q_off + l_off + {i}u] = vec4<f16>(o{i} * inv_l); }}\n"
+        ));
+    }
+    // Cluster reduce: xor hops 1, 2, .., CL/2 so every lane ends with the full dot.
+    let mut hops = String::new();
+    let mut off = 1u32;
+    while off < cl {
+        hops.push_str(&format!(
+            "            part = part + subgroupShuffleXor(part, {off}u);\n"
+        ));
+        off <<= 1;
+    }
+
+    let mut s = String::from(
+        r#"enable f16;
 
 struct U {
     b: u32, h_q: u32, h_kv: u32, s_q: u32,
@@ -521,13 +569,13 @@ struct U {
 @group(0) @binding(4) var<storage, read_write> out: array<vec4<f16>>;
 @group(0) @binding(5) var<uniform> u: U;
 
-const BR: u32 = 16u;      // Q rows per workgroup
-const BC: u32 = 32u;      // keys per shared tile
-const WG: u32 = 128u;
-const CL: u32 = 8u;       // lanes per Q row (D split)
-const MAX_DV4: u32 = 32u; // vec4s per row at D=128
-const NEG_MAX: f32 = -3.402823e38;
-
+"#,
+    );
+    s.push_str(&format!(
+        "const BR: u32 = {br}u;      // Q rows per workgroup (WG/CL)\nconst BC: u32 = 32u;      // keys per shared tile\nconst WG: u32 = 128u;\nconst CL: u32 = {cl}u;       // lanes per Q row (D split)\nconst MAX_DV4: u32 = 32u; // vec4s per row at D=128\nconst NEG_MAX: f32 = -3.402823e38;\n"
+    ));
+    s.push_str(
+        r#"
 var<workgroup> k_tile: array<vec4<f16>, 1024>; // BC * MAX_DV4
 var<workgroup> v_tile: array<vec4<f16>, 1024>;
 
@@ -547,27 +595,21 @@ fn main(
 
     let hkv     = (hq * u.h_kv) / u.h_q;
     let d_v4    = u.d >> 2u;
-    let n_l     = d_v4 / CL; // vec4s per lane: 1..4
+    let n_l     = d_v4 / CL; // vec4s per lane
     let q_off   = (((bb * u.s_q + sq_c) * u.h_q + hq) * u.d) >> 2u;
     let kv_b0   = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 2u;
     let kv_step = (u.h_kv * u.d) >> 2u;
     let mask_w_base = ((bb * u.s_q + sq_c) * u.s_k) >> 1u;
     let l_off   = lane * n_l;
 
-    var q0 = vec4<f32>();
-    var q1 = vec4<f32>();
-    var q2 = vec4<f32>();
-    var q3 = vec4<f32>();
-    q0 = vec4<f32>(q[q_off + l_off]);
-    if (n_l > 1u) { q1 = vec4<f32>(q[q_off + l_off + 1u]); }
-    if (n_l > 2u) { q2 = vec4<f32>(q[q_off + l_off + 2u]); }
-    if (n_l > 3u) { q3 = vec4<f32>(q[q_off + l_off + 3u]); }
-
-    var o0 = vec4<f32>();
-    var o1 = vec4<f32>();
-    var o2 = vec4<f32>();
-    var o3 = vec4<f32>();
-    var m: f32 = NEG_MAX;
+"#,
+    );
+    s.push_str(&q_decls);
+    s.push_str(&q_loads);
+    s.push('\n');
+    s.push_str(&o_decls);
+    s.push_str(
+        r#"    var m: f32 = NEG_MAX;
     var l: f32 = 0.0;
 
     let n_tiles = (u.s_k + BC - 1u) / BC;
@@ -596,15 +638,12 @@ fn main(
             let key_global = kc_base + kc;
             let tb = kc * d_v4 + l_off;
 
-            var part = dot(q0, vec4<f32>(k_tile[tb]));
-            if (n_l > 1u) { part = part + dot(q1, vec4<f32>(k_tile[tb + 1u])); }
-            if (n_l > 2u) { part = part + dot(q2, vec4<f32>(k_tile[tb + 2u])); }
-            if (n_l > 3u) { part = part + dot(q3, vec4<f32>(k_tile[tb + 3u])); }
-            // Cluster reduce: after 3 xor hops every lane holds the full dot.
-            part = part + subgroupShuffleXor(part, 1u);
-            part = part + subgroupShuffleXor(part, 2u);
-            part = part + subgroupShuffleXor(part, 4u);
-
+"#,
+    );
+    s.push_str(&dot);
+    s.push_str(&hops);
+    s.push_str(
+        r#"
             var bias: f32 = 0.0;
             if (u.has_mask != 0u) {
                 let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (key_global >> 1u)]);
@@ -615,11 +654,11 @@ fn main(
             let m_new = max(m, s_j);
             let alpha = exp(m - m_new);
             let p_j   = exp(s_j - m_new);
-            o0 = o0 * alpha + p_j * vec4<f32>(v_tile[tb]);
-            if (n_l > 1u) { o1 = o1 * alpha + p_j * vec4<f32>(v_tile[tb + 1u]); }
-            if (n_l > 2u) { o2 = o2 * alpha + p_j * vec4<f32>(v_tile[tb + 2u]); }
-            if (n_l > 3u) { o3 = o3 * alpha + p_j * vec4<f32>(v_tile[tb + 3u]); }
-            l = l * alpha + p_j;
+"#,
+    );
+    s.push_str(&o_upd);
+    s.push_str(
+        r#"            l = l * alpha + p_j;
             m = m_new;
         }
         workgroupBarrier();
@@ -627,13 +666,12 @@ fn main(
 
     if (valid) {
         let inv_l = 1.0 / l;
-        out[q_off + l_off] = vec4<f16>(o0 * inv_l);
-        if (n_l > 1u) { out[q_off + l_off + 1u] = vec4<f16>(o1 * inv_l); }
-        if (n_l > 2u) { out[q_off + l_off + 2u] = vec4<f16>(o2 * inv_l); }
-        if (n_l > 3u) { out[q_off + l_off + 3u] = vec4<f16>(o3 * inv_l); }
-    }
+"#,
+    );
+    s.push_str(&out_w);
+    s.push_str("    }\n}\n");
+    s
 }
-"#;
 
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
@@ -687,37 +725,45 @@ impl SdpaOp for SdpaF32 {
     }
 }
 
-/// Subgroup small-D variant of [`SdpaF32`]: F16 acts only, D % 32 == 0,
-/// D <= 128. Build sites gate on `supports_subgroups()` and
-/// `subgroup_size_range().0 >= 8`; dispatch sites fall back to [`SdpaF32`]
-/// when the D constraint doesn't hold.
-pub struct SdpaF16Sg;
+/// Bindings for the subgroup small-D sdpa (same 6-slot layout as [`SdpaF32`]).
+/// F16 acts only, D % 32 == 0, D <= 128; built via [`build_f16_sg_wgsl`] and
+/// dispatched via [`dispatch_sdpa_f16_sg`]. Dispatch sites fall back to
+/// [`SdpaF32`] when the D constraint doesn't hold.
+pub fn sg_layout() -> &'static [BindingLayout] {
+    LAYOUT
+}
 
-impl SdpaOp for SdpaF16Sg {
-    const KERNEL_ID: &'static str = "sdpa_sg.f16";
-    type Dtype = F32;
-    const Q: &'static str = "sdpa/q";
-    const K: &'static str = "sdpa/k";
-    const V: &'static str = "sdpa/v";
-    const MASK: &'static str = "sdpa/mask";
-    const DIMS: &'static str = "sdpa/dims";
-    const OUTPUT: &'static str = "sdpa/out";
+/// Workgroup grid for the CL-parameterized subgroup sdpa: BR = WG/CL Q rows
+/// per workgroup, so the grid is [ceil(S_q/BR), H_q, B]. `cl` must match the
+/// value passed to [`build_f16_sg_wgsl`] for the bound pipeline.
+pub fn f16_sg_workgroups(cl: u32, b: u32, s_q: u32, h_q: u32) -> [u32; 3] {
+    [s_q.div_ceil(128 / cl), h_q, b]
+}
 
-    fn wgsl(cfg: &WgslConfig) -> &'static str {
-        assert_eq!(
-            cfg.act_dtype,
-            ActDtype::F16,
-            "sdpa_sg: F16 acts only (build site gates on the F16 pipeline set)"
-        );
-        WGSL_F16_SG
-    }
-    fn layout() -> &'static [BindingLayout] {
-        LAYOUT
-    }
-    fn workgroups(b: u32, s_q: u32, h_q: u32) -> [u32; 3] {
-        // BR=16 Q rows per workgroup (8-lane cluster per row, WG=128).
-        [s_q.div_ceil(16), h_q, b]
-    }
+pub(crate) fn dispatch_sdpa_f16_sg<B: Backend>(
+    backend: &B,
+    encoder: &mut B::CommandEncoder,
+    pipeline: &B::Pipeline,
+    bufs: &SdpaBufs<'_>,
+    cl: u32,
+    b: u32,
+    s_q: u32,
+    h_q: u32,
+) -> Result<(), B::Error> {
+    let bindings = [
+        bufs.q.binding(0),
+        bufs.k.binding(1),
+        bufs.v.binding(2),
+        bufs.mask.binding(3),
+        bufs.out.binding(4),
+        bufs.uniform.binding(5),
+    ];
+    backend.dispatch(
+        encoder,
+        pipeline,
+        &bindings,
+        f16_sg_workgroups(cl, b, s_q, h_q),
+    )
 }
 
 // ---------------------------------------------------------------------------

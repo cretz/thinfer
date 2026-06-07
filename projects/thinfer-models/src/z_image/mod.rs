@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod rope_embedder;
 pub mod scheduler;
 pub mod seq;
+pub mod source;
 pub mod t_embedder;
 pub mod text_encoder;
 pub mod tokenizer;
@@ -264,6 +265,95 @@ pub fn dit_to_out_renames() -> std::collections::HashMap<WeightId, WeightId> {
             out.insert(
                 WeightId(format!("{p}.attention.to_out.0.weight")),
                 WeightId(format!("{p}.attention.out.weight")),
+            );
+        }
+    }
+    out
+}
+
+/// GGUF -> canonical id renames for `unsloth/Z-Image-Turbo-GGUF`. The GGUF
+/// ships canonical names for almost everything; the exceptions are the
+/// flattened single-patch-variant modules (`x_embedder.*` /
+/// `final_layer.*` vs canonical `all_x_embedder.<patch>.*` /
+/// `all_final_layer.<patch>.*`) and the swapped q/k norm spelling
+/// (`attention.q_norm` vs canonical `attention.norm_q`). Pass to
+/// `RenamedSource::with_passthrough` over the GGUF source.
+pub fn dit_gguf_renames() -> std::collections::HashMap<WeightId, WeightId> {
+    let patch = config::PATCH_KEY;
+    let mut out = std::collections::HashMap::with_capacity(
+        6 + 2 * (config::N_LAYERS + 2 * config::N_REFINER_LAYERS),
+    );
+    for suffix in ["weight", "bias"] {
+        out.insert(
+            WeightId(format!("x_embedder.{suffix}")),
+            WeightId(format!("all_x_embedder.{patch}.{suffix}")),
+        );
+        out.insert(
+            WeightId(format!("final_layer.linear.{suffix}")),
+            WeightId(format!("all_final_layer.{patch}.linear.{suffix}")),
+        );
+        out.insert(
+            WeightId(format!("final_layer.adaLN_modulation.1.{suffix}")),
+            WeightId(format!(
+                "all_final_layer.{patch}.adaLN_modulation.1.{suffix}"
+            )),
+        );
+    }
+    for kind in [
+        BlockKind::Main,
+        BlockKind::NoiseRefiner,
+        BlockKind::ContextRefiner,
+    ] {
+        let n = match kind {
+            BlockKind::Main => config::N_LAYERS,
+            BlockKind::NoiseRefiner | BlockKind::ContextRefiner => config::N_REFINER_LAYERS,
+        };
+        for i in 0..n {
+            let p = format!("{}.{}", kind.prefix(), i);
+            out.insert(
+                WeightId(format!("{p}.attention.q_norm.weight")),
+                WeightId(format!("{p}.attention.norm_q.weight")),
+            );
+            out.insert(
+                WeightId(format!("{p}.attention.k_norm.weight")),
+                WeightId(format!("{p}.attention.norm_k.weight")),
+            );
+        }
+    }
+    out
+}
+
+/// GGUF -> canonical id renames for the Qwen3 text encoder GGUF
+/// (`worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF`). llama.cpp tensor
+/// naming (`blk.{i}.attn_q.weight`, `token_embd.weight`) maps to the HF
+/// Qwen3 ids the encoder registers (`model.layers.{i}.self_attn.q_proj.
+/// weight`, `model.embed_tokens.weight`). `output_norm` is left unmapped:
+/// the encoder stops at `hidden_states[-2]` and never reads it.
+pub fn qwen3_gguf_renames() -> std::collections::HashMap<WeightId, WeightId> {
+    use crate::z_image::text_encoder::config::N_LAYERS;
+    const SITES: [(&str, &str); 11] = [
+        ("attn_norm", "input_layernorm"),
+        ("ffn_norm", "post_attention_layernorm"),
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_output", "self_attn.o_proj"),
+        ("attn_q_norm", "self_attn.q_norm"),
+        ("attn_k_norm", "self_attn.k_norm"),
+        ("ffn_gate", "mlp.gate_proj"),
+        ("ffn_up", "mlp.up_proj"),
+        ("ffn_down", "mlp.down_proj"),
+    ];
+    let mut out = std::collections::HashMap::with_capacity(1 + SITES.len() * N_LAYERS);
+    out.insert(
+        WeightId("token_embd.weight".into()),
+        WeightId("model.embed_tokens.weight".into()),
+    );
+    for i in 0..N_LAYERS {
+        for (gguf, hf) in SITES {
+            out.insert(
+                WeightId(format!("blk.{i}.{gguf}.weight")),
+                WeightId(format!("model.layers.{i}.{hf}.weight")),
             );
         }
     }

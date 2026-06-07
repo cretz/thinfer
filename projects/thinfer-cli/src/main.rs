@@ -26,34 +26,43 @@ enum Top {
 }
 
 fn main() -> ExitCode {
+    use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     // Subscriber emits to stderr. Default filter is `warn` so a normal run is
-    // quiet; set `RUST_LOG=info` for pipeline lifecycle, `debug` for per-step
-    // / per-dispatch, `trace` for every weight upload + eviction. Targets are
-    // namespaced under `thinfer::*` (see `thinfer-core::trace`).
+    // quiet; set `RUST_LOG=info` for stage milestones + load rollups, `debug`
+    // for residency traffic + evictions, `trace` for the per-dispatch /
+    // per-buffer / per-compile firehose. Targets are namespaced under
+    // `thinfer::*` (see `thinfer-core::trace`).
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     // CLOSE events emit `time.busy` / `time.idle` per span on exit, giving
-    // us per-phase wall-clock without manual Instant captures.
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
+    // us per-phase wall-clock without manual Instant captures. The fmt layer
+    // is constructed inline per branch: its subscriber type parameter is
+    // monomorphized differently in the two stacks.
+    macro_rules! fmt_layer {
+        () => {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        };
+    }
     // `THINFER_TRACE=1` opts into the rollup layer; otherwise the SCOPE-target
     // callsites stay never-interested (single atomic load per scope!).
     let rollup_handle = match thinfer_core::trace::rollup_layer_from_env() {
         Some((layer, handle)) => {
+            // EnvFilter rides the fmt layer only: the rollup must keep seeing
+            // its (trace-level) input targets regardless of RUST_LOG.
             tracing_subscriber::registry()
-                .with(env_filter)
-                .with(fmt_layer)
-                .with(layer)
+                .with(layer.with_filter(thinfer_core::trace::rollup_filter()))
+                .with(fmt_layer!().with_filter(env_filter))
                 .init();
             Some(handle)
         }
         None => {
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(fmt_layer)
+                .with(fmt_layer!())
                 .init();
             None
         }

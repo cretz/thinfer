@@ -94,9 +94,10 @@ pub trait Backend: 'static {
     /// throwaway `MemAccount` in a field.
     fn mem_account(&self) -> &Arc<MemAccount>;
 
-    /// Host bytes → GPU buffer. Test inputs and host-resident weights land here.
-    /// JS-heap weights on web go through a backend-specific path that bypasses
-    /// `&[u8]` (per plan-details: no weight bytes in WASM linear memory).
+    /// Host bytes → GPU buffer. Test inputs and weight uploads land here; on
+    /// web, weight bytes arrive in bounded chunks (residency streams through
+    /// a fixed scratch; tensor-sized wasm allocations are banned). `dst_offset`
+    /// and `src.len()` must be 4-byte aligned (wgpu `COPY_BUFFER_ALIGNMENT`).
     fn write_buffer(
         &self,
         dst: GpuBufferId,
@@ -129,8 +130,12 @@ pub trait Backend: 'static {
         encoder: Self::CommandEncoder,
     ) -> impl Future<Output = Result<(), Self::Error>>;
 
+    /// `label` names the pipeline for telemetry (compile/dispatch events,
+    /// rollup tables) and backend debug labels; `entry` stays the WGSL entry
+    /// point (almost always "main").
     fn create_pipeline(
         &self,
+        label: &str,
         wgsl: &str,
         entry: &str,
         layout: &[BindingLayout],
@@ -143,18 +148,23 @@ pub trait Backend: 'static {
         len: u64,
     ) -> impl Future<Output = Result<Vec<u8>, Self::Error>>;
 
-    /// Upload `raw` and run the `op` prep kernel into `dst`, replacing the
-    /// CPU transcode/transpose in the residency miss path. Returns
-    /// `Ok(false)` when the backend has no GPU prep (test mocks); the caller
-    /// then falls back to the CPU path. The transient staging VRAM is the
-    /// backend's to allocate/free; the caller has already ensured arbiter
-    /// headroom for `raw.len()`.
+    /// Whether `weight_prep` implements `op` on the GPU. Residency checks
+    /// this before reading any bytes: a supported op streams the raw source
+    /// straight into a staging buffer (bounded host scratch), an unsupported
+    /// one (test mocks) takes the CPU transform path.
+    fn supports_weight_prep(&self, _op: WeightPrep) -> bool {
+        false
+    }
+
+    /// Run the `op` prep kernel over `staging` (raw on-disk bytes, uploaded
+    /// by the caller, who owns its alloc/free) into `dst`. Only called when
+    /// `supports_weight_prep(op)`.
     fn weight_prep(
         &self,
         _op: WeightPrep,
-        _raw: &[u8],
+        _staging: &BufRef,
         _dst: &BufRef,
-    ) -> impl Future<Output = Result<bool, Self::Error>> {
-        async { Ok(false) }
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        async { unreachable!("weight_prep called without supports_weight_prep") }
     }
 }

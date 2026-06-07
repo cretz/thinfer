@@ -20,7 +20,7 @@ use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
     BcastFmaOp, LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op,
     QkvSplitF32, QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp,
-    ScatterPadRowsF32, ScatterPadRowsOp, SdpaF16Sg, SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32,
+    ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32,
     WeightDtype, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
@@ -239,11 +239,13 @@ pub struct BlockPipelines {
     pub rope: WgpuPipeline,
     pub rope_halfrot: WgpuPipeline,
     pub sdpa: WgpuPipeline,
-    /// Subgroup small-D sdpa (`SdpaF16Sg`). `Some` iff F16 acts AND the
-    /// backend exposes subgroups with min size >= 8. Dispatch prefers it
-    /// when `head_dim % 32 == 0 && head_dim <= 128`, else falls back to
-    /// `sdpa`.
+    /// Subgroup small-D sdpa. `Some` iff F16 acts AND the backend exposes
+    /// subgroups (min size >= 4). Dispatch prefers it when `head_dim % 32 == 0
+    /// && head_dim <= 128`, else falls back to `sdpa`.
     pub sdpa_sg: Option<WgpuPipeline>,
+    /// Lane-cluster width (CL) baked into the `sdpa_sg` kernel: 8 when the
+    /// adapter's subgroup min size >= 8, else 4. Sets BR = WG/CL at dispatch.
+    pub sdpa_sg_cl: u32,
     pub qkv_split: WgpuPipeline,
     pub silu: WgpuPipeline,
     pub silu_mul: WgpuPipeline,
@@ -430,20 +432,24 @@ impl BlockPipelines {
         let adaln_wgsl = matmuls.adaln.wgsl(&cfgs.matmul_adaln);
         // Build dequant pipelines for sites whose source weight is Quant.
         let dq_layout = thinfer_core::ops::dequant::layout();
-        let build_dq = async |wd: WeightDtype| -> Result<Option<DequantStep>, WgpuError> {
-            match wd {
-                WeightDtype::Quant(scheme) => {
-                    let wgsl = thinfer_core::ops::dequant::build_wgsl(scheme, dequant_target);
-                    let pipeline = backend.create_pipeline(&wgsl, "main", dq_layout).await?;
-                    Ok(Some(DequantStep { pipeline, scheme }))
+        let build_dq =
+            async |label: &str, wd: WeightDtype| -> Result<Option<DequantStep>, WgpuError> {
+                match wd {
+                    WeightDtype::Quant(scheme) => {
+                        let wgsl = thinfer_core::ops::dequant::build_wgsl(scheme, dequant_target);
+                        let pipeline = backend
+                            .create_pipeline(label, &wgsl, "main", dq_layout)
+                            .await?;
+                        Ok(Some(DequantStep { pipeline, scheme }))
+                    }
+                    _ => Ok(None),
                 }
-                _ => Ok(None),
-            }
-        };
-        let dequant_qkv = build_dq(cfgs.matmul_qkv.weight_dtype).await?;
-        let dequant_proj = build_dq(cfgs.matmul_proj.weight_dtype).await?;
-        let dequant_ffn_up = build_dq(cfgs.matmul_ffn_up.weight_dtype).await?;
-        let dequant_ffn_down = build_dq(cfgs.matmul_ffn_down.weight_dtype).await?;
+            };
+        let dequant_qkv = build_dq("dequant_qkv", cfgs.matmul_qkv.weight_dtype).await?;
+        let dequant_proj = build_dq("dequant_proj", cfgs.matmul_proj.weight_dtype).await?;
+        let dequant_ffn_up = build_dq("dequant_ffn_up", cfgs.matmul_ffn_up.weight_dtype).await?;
+        let dequant_ffn_down =
+            build_dq("dequant_ffn_down", cfgs.matmul_ffn_down.weight_dtype).await?;
         // DP4A int8 path. Gated on the WGSL packed_4x8_integer_dot_product
         // language feature (queried on the wgpu Instance). When present we
         // build a per-site (dequant_i8, matmul_i8) pair for each Quant
@@ -457,29 +463,34 @@ impl BlockPipelines {
         let use_dp4a = backend.supports_packed_int_dot()
             && backend.supports_shader_f16()
             && cfg.act_dtype == ActDtype::F16;
-        // Subgroup-aware tile_a / tile_a_scale reads on the DP4A inner loop.
-        // Pure WGSL-level optimization gated by `Features::SUBGROUP`; the
-        // kernel emits a runtime branch on `subgroup_size` so any device
-        // exposing the feature (Intel/NVIDIA/AMD on native; mobile/desktop
-        // when wgpu's web backend wires it through) gets the broadcast or
-        // shuffle path. Numerically identical to the non-subgroup branch.
-        let i8_cfg = thinfer_core::ops::matmul_i8::MatMulI8Config {
-            use_subgroup: backend.supports_subgroups(),
-            ..thinfer_core::ops::matmul_i8::MatMulI8Config::DEFAULT
-        };
         let (sg_min, sg_max) = backend.subgroup_size_range();
-        // Subgroup small-D sdpa: cluster lanes must not straddle a subgroup,
-        // which holds for any subgroup size that is a multiple of CL=8.
+        // Matmul subgroups: the ORT-style register-resident kernel branches
+        // at runtime on `sg_size >= 16` (shuffle path) with a broadcast
+        // shared-read fallback, so the flag only requires the feature; any
+        // reported size range is safe.
+        // Matmul subgroups stay OFF: the shuffle path measured ~30% SLOWER
+        // than the broadcast shared-read path on NVIDIA sg=32 (a vec4
+        // subgroupShuffle lowers to 4 SHFL, ~one per dp4a; broadcast reads
+        // are served to all 16 lanes in one transaction). ORT gates its
+        // shuffle path to Intel sg=16; revisit per-vendor if a browser
+        // measurement on Intel ever justifies it. sdpa subgroups (configured
+        // below) are unaffected and stay on.
+        let i8_cfg = thinfer_core::ops::matmul_i8::MatMulI8Config::DEFAULT;
+        // Subgroup small-D sdpa: a CL-lane cluster owns each Q row, so CL must
+        // divide the ACTUAL runtime subgroup size. Pick CL = min(8, sg_min),
+        // which divides any power-of-2 size >= the reported floor: native
+        // (sg_min=32) -> CL=8 (unchanged); web/mobile, where the browser reports
+        // the spec floor of 4, -> CL=4. (sg_min >= 4 guards pathological adapters
+        // that expose subgroups but report a sub-spec floor.)
+        let sdpa_sg_cl = if sg_min >= 8 { 8u32 } else { 4u32 };
         let use_sdpa_sg =
-            cfg.act_dtype == ActDtype::F16 && backend.supports_subgroups() && sg_min >= 8;
+            cfg.act_dtype == ActDtype::F16 && backend.supports_subgroups() && sg_min >= 4;
         tracing::info!(
             target: thinfer_core::trace::ADAPTER,
             use_dp4a = use_dp4a,
             sdpa_use_subgroup = use_sdpa_sg,
-            matmul_i8_bm = i8_cfg.bm,
-            matmul_i8_bn = i8_cfg.bn,
-            matmul_i8_tm = i8_cfg.tm,
-            matmul_i8_tn = i8_cfg.tn,
+            sdpa_sg_cl = sdpa_sg_cl,
+            matmul_i8_tile = i8_cfg.tile,
             matmul_i8_use_subgroup = i8_cfg.use_subgroup,
             shader_f16 = backend.supports_shader_f16(),
             packed_int_dot = backend.supports_packed_int_dot(),
@@ -492,7 +503,8 @@ impl BlockPipelines {
         let dq_i8_layout = thinfer_core::ops::dequant_i8::layout();
         let mm_i8_layout = thinfer_core::ops::matmul_i8::layout();
         let build_i8 =
-            async |wd: WeightDtype,
+            async |site: &str,
+                   wd: WeightDtype,
                    dense_acts: bool|
                    -> Result<(Option<DequantStep>, Option<WgpuPipeline>), WgpuError> {
                 // dense_acts sites skip the i8 pair entirely: dispatch falls
@@ -504,11 +516,27 @@ impl BlockPipelines {
                     WeightDtype::Quant(scheme) => {
                         let dq_wgsl = thinfer_core::ops::dequant_i8::build_wgsl(scheme);
                         let dq_pipe = backend
-                            .create_pipeline(&dq_wgsl, "main", dq_i8_layout)
+                            .create_pipeline(
+                                &format!("dequant_i8_{site}"),
+                                &dq_wgsl,
+                                "main",
+                                dq_i8_layout,
+                            )
                             .await?;
-                        let mm_wgsl = thinfer_core::ops::matmul_i8::build_wgsl(&i8_cfg);
+                        // Subgroup-using shader: prepend `enable subgroups;` on
+                        // the web (Tint) backend; native (naga) returns "".
+                        let mm_wgsl = format!(
+                            "{}{}",
+                            backend.subgroup_enable_directive(),
+                            thinfer_core::ops::matmul_i8::build_wgsl(&i8_cfg),
+                        );
                         let mm_pipe = backend
-                            .create_pipeline(&mm_wgsl, "main", mm_i8_layout)
+                            .create_pipeline(
+                                &format!("matmul_i8_{site}"),
+                                &mm_wgsl,
+                                "main",
+                                mm_i8_layout,
+                            )
                             .await?;
                         Ok((
                             Some(DequantStep {
@@ -522,13 +550,21 @@ impl BlockPipelines {
                 }
             };
         let (dequant_i8_qkv, matmul_i8_qkv) =
-            build_i8(cfgs.matmul_qkv.weight_dtype, cfgs.dense_acts.qkv).await?;
+            build_i8("qkv", cfgs.matmul_qkv.weight_dtype, cfgs.dense_acts.qkv).await?;
         let (dequant_i8_proj, matmul_i8_proj) =
-            build_i8(cfgs.matmul_proj.weight_dtype, cfgs.dense_acts.proj).await?;
-        let (dequant_i8_ffn_up, matmul_i8_ffn_up) =
-            build_i8(cfgs.matmul_ffn_up.weight_dtype, cfgs.dense_acts.ffn_up).await?;
-        let (dequant_i8_ffn_down, matmul_i8_ffn_down) =
-            build_i8(cfgs.matmul_ffn_down.weight_dtype, cfgs.dense_acts.ffn_down).await?;
+            build_i8("proj", cfgs.matmul_proj.weight_dtype, cfgs.dense_acts.proj).await?;
+        let (dequant_i8_ffn_up, matmul_i8_ffn_up) = build_i8(
+            "ffn_up",
+            cfgs.matmul_ffn_up.weight_dtype,
+            cfgs.dense_acts.ffn_up,
+        )
+        .await?;
+        let (dequant_i8_ffn_down, matmul_i8_ffn_down) = build_i8(
+            "ffn_down",
+            cfgs.matmul_ffn_down.weight_dtype,
+            cfgs.dense_acts.ffn_down,
+        )
+        .await?;
         // act_quant serves two consumers: the matmul-site dense->paired
         // transcode on every i8 site, and the post-rope q/k/v quantize
         // when i8 attention is enabled.
@@ -544,7 +580,12 @@ impl BlockPipelines {
             let wgsl = thinfer_core::ops::act_quant::build_wgsl();
             Some(
                 backend
-                    .create_pipeline(&wgsl, "main", thinfer_core::ops::act_quant::layout())
+                    .create_pipeline(
+                        "act_quant",
+                        &wgsl,
+                        "main",
+                        thinfer_core::ops::act_quant::layout(),
+                    )
                     .await?,
             )
         } else {
@@ -554,7 +595,12 @@ impl BlockPipelines {
             let wgsl = thinfer_core::ops::sdpa_i8::build_wgsl();
             Some(
                 backend
-                    .create_pipeline(&wgsl, "main", thinfer_core::ops::sdpa_i8::layout())
+                    .create_pipeline(
+                        "sdpa_i8",
+                        &wgsl,
+                        "main",
+                        thinfer_core::ops::sdpa_i8::layout(),
+                    )
                     .await?,
             )
         } else {
@@ -570,7 +616,12 @@ impl BlockPipelines {
             let wgsl = thinfer_core::ops::matmul_i8_bf16::build_wgsl(&i8_bf16_cfg);
             Some(
                 backend
-                    .create_pipeline(&wgsl, "main", thinfer_core::ops::matmul_i8_bf16::layout())
+                    .create_pipeline(
+                        "matmul_i8_bf16",
+                        &wgsl,
+                        "main",
+                        thinfer_core::ops::matmul_i8_bf16::layout(),
+                    )
                     .await?,
             )
         } else {
@@ -584,7 +635,12 @@ impl BlockPipelines {
             let wgsl = thinfer_core::ops::bf16_block_sum::build_wgsl();
             Some(
                 backend
-                    .create_pipeline(&wgsl, "main", thinfer_core::ops::bf16_block_sum::layout())
+                    .create_pipeline(
+                        "bf16_block_sum",
+                        &wgsl,
+                        "main",
+                        thinfer_core::ops::bf16_block_sum::layout(),
+                    )
                     .await?,
             )
         } else {
@@ -592,19 +648,19 @@ impl BlockPipelines {
         };
         Ok(Self {
             matmul_qkv: backend
-                .create_pipeline(&qkv_wgsl, "main", mm_layout)
+                .create_pipeline("matmul_qkv", &qkv_wgsl, "main", mm_layout)
                 .await?,
             matmul_proj: backend
-                .create_pipeline(&proj_wgsl, "main", mm_layout)
+                .create_pipeline("matmul_proj", &proj_wgsl, "main", mm_layout)
                 .await?,
             matmul_ffn_up: backend
-                .create_pipeline(&ffn_up_wgsl, "main", mm_layout)
+                .create_pipeline("matmul_ffn_up", &ffn_up_wgsl, "main", mm_layout)
                 .await?,
             matmul_ffn_down: backend
-                .create_pipeline(&ffn_down_wgsl, "main", mm_layout)
+                .create_pipeline("matmul_ffn_down", &ffn_down_wgsl, "main", mm_layout)
                 .await?,
             matmul_adaln: backend
-                .create_pipeline(&adaln_wgsl, "main", mm_layout)
+                .create_pipeline("matmul_adaln", &adaln_wgsl, "main", mm_layout)
                 .await?,
             dequant_qkv,
             dequant_proj,
@@ -626,6 +682,7 @@ impl BlockPipelines {
             matmuls,
             rmsnorm: backend
                 .create_pipeline(
+                    "rmsnorm",
                     <RmsNormF32 as RmsNormOp>::wgsl(cfg_compat),
                     "main",
                     <RmsNormF32 as RmsNormOp>::layout(),
@@ -633,6 +690,7 @@ impl BlockPipelines {
                 .await?,
             layernorm: backend
                 .create_pipeline(
+                    "layernorm",
                     <LayerNormF32 as LayerNormOp>::wgsl(cfg_compat),
                     "main",
                     <LayerNormF32 as LayerNormOp>::layout(),
@@ -640,6 +698,7 @@ impl BlockPipelines {
                 .await?,
             rope: backend
                 .create_pipeline(
+                    "rope",
                     <RopeF32 as RopeOp>::wgsl(cfg_compat),
                     "main",
                     <RopeF32 as RopeOp>::layout(),
@@ -647,6 +706,7 @@ impl BlockPipelines {
                 .await?,
             rope_halfrot: backend
                 .create_pipeline(
+                    "rope_halfrot",
                     <RopeF32HalfRot as RopeOp>::wgsl(cfg_compat),
                     "main",
                     <RopeF32HalfRot as RopeOp>::layout(),
@@ -654,48 +714,66 @@ impl BlockPipelines {
                 .await?,
             sdpa: backend
                 .create_pipeline(
+                    "sdpa",
                     <SdpaF32 as SdpaOp>::wgsl(cfg_compat),
                     "main",
                     <SdpaF32 as SdpaOp>::layout(),
                 )
                 .await?,
             sdpa_sg: if use_sdpa_sg {
+                // Subgroup-using shader: prepend `enable subgroups;` on the web
+                // (Tint) backend; native (naga) returns "". CL is baked into the
+                // kernel here and must match `sdpa_sg_cl` at dispatch.
+                let sdpa_sg_wgsl = format!(
+                    "{}{}",
+                    backend.subgroup_enable_directive(),
+                    thinfer_core::ops::sdpa::build_f16_sg_wgsl(sdpa_sg_cl),
+                );
                 Some(
                     backend
                         .create_pipeline(
-                            <SdpaF16Sg as SdpaOp>::wgsl(cfg_compat),
+                            "sdpa_sg",
+                            &sdpa_sg_wgsl,
                             "main",
-                            <SdpaF16Sg as SdpaOp>::layout(),
+                            thinfer_core::ops::sdpa::sg_layout(),
                         )
                         .await?,
                 )
             } else {
                 None
             },
+            sdpa_sg_cl,
             qkv_split: backend
                 .create_pipeline(
+                    "qkv_split",
                     <QkvSplitF32 as QkvSplitOp>::wgsl(cfg_compat),
                     "main",
                     <QkvSplitF32 as QkvSplitOp>::layout(),
                 )
                 .await?,
             silu: backend
-                .create_pipeline(SiluF32::wgsl(cfg_compat), "main", SiluF32::layout())
+                .create_pipeline("silu", SiluF32::wgsl(cfg_compat), "main", SiluF32::layout())
                 .await?,
             silu_mul: backend
-                .create_pipeline(SiluMulF32::wgsl(cfg_compat), "main", SiluMulF32::layout())
+                .create_pipeline(
+                    "silu_mul",
+                    SiluMulF32::wgsl(cfg_compat),
+                    "main",
+                    SiluMulF32::layout(),
+                )
                 .await?,
             add: backend
-                .create_pipeline(AddF32::wgsl(cfg_compat), "main", AddF32::layout())
+                .create_pipeline("add", AddF32::wgsl(cfg_compat), "main", AddF32::layout())
                 .await?,
             mul: backend
-                .create_pipeline(MulF32::wgsl(cfg_compat), "main", MulF32::layout())
+                .create_pipeline("mul", MulF32::wgsl(cfg_compat), "main", MulF32::layout())
                 .await?,
             tanh: backend
-                .create_pipeline(TanhF32::wgsl(cfg_compat), "main", TanhF32::layout())
+                .create_pipeline("tanh", TanhF32::wgsl(cfg_compat), "main", TanhF32::layout())
                 .await?,
             bcast_affine: backend
                 .create_pipeline(
+                    "bcast_affine",
                     <BcastAffineF32 as BcastAffineOp>::wgsl(cfg_compat),
                     "main",
                     <BcastAffineF32 as BcastAffineOp>::layout(),
@@ -703,6 +781,7 @@ impl BlockPipelines {
                 .await?,
             bcast_fma: backend
                 .create_pipeline(
+                    "bcast_fma",
                     <BcastFmaF32 as BcastFmaOp>::wgsl(cfg_compat),
                     "main",
                     <BcastFmaF32 as BcastFmaOp>::layout(),
@@ -710,6 +789,7 @@ impl BlockPipelines {
                 .await?,
             bcast_add: backend
                 .create_pipeline(
+                    "bcast_add",
                     <BcastAddF32 as BcastAddOp>::wgsl(cfg_compat),
                     "main",
                     <BcastAddF32 as BcastAddOp>::layout(),
@@ -717,6 +797,7 @@ impl BlockPipelines {
                 .await?,
             scatter_pad_rows: backend
                 .create_pipeline(
+                    "scatter_pad_rows",
                     <ScatterPadRowsF32 as ScatterPadRowsOp>::wgsl(cfg_compat),
                     "main",
                     <ScatterPadRowsF32 as ScatterPadRowsOp>::layout(),
@@ -2562,8 +2643,18 @@ pub(crate) fn op_sdpa<'wsp>(
         .as_ref()
         .filter(|_| head_dim.is_multiple_of(32) && head_dim <= 128)
     {
-        scope.sdpa::<SdpaF16Sg>(
-            sdpa_sg, q.data, k.data, v.data, mask, u, dst.data, b, s_q, h_q,
+        scope.sdpa_sg(
+            sdpa_sg,
+            q.data,
+            k.data,
+            v.data,
+            mask,
+            u,
+            dst.data,
+            pipelines.sdpa_sg_cl,
+            b,
+            s_q,
+            h_q,
         )
     } else {
         scope.sdpa::<SdpaF32>(

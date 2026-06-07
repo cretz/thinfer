@@ -69,3 +69,67 @@ impl WeightReader for MmapFile {
         Ok(())
     }
 }
+
+/// Sequential read-bandwidth bench over the real weight-read paths. Gated on
+/// `THINFER_READ_BENCH_PATH` (skips when unset) so it never runs in CI.
+/// Reports mmap-path cold/warm and buffered `File::read` warm, separating
+/// "disk is slow" from "the mmap fault/copy path is slow" from "page cache
+/// does not retain between passes".
+#[cfg(test)]
+mod read_bench {
+    use super::*;
+    use std::time::Instant;
+    use thinfer_core::weight::{FileOpener, WeightReader};
+
+    const CHUNK: usize = 32 << 20;
+
+    fn report(label: &str, bytes: u64, secs: f64) {
+        eprintln!(
+            "read_bench: {label}: {:.0} MB/s ({:.2} GiB in {:.2}s)",
+            bytes as f64 / 1e6 / secs,
+            bytes as f64 / (1u64 << 30) as f64,
+            secs
+        );
+    }
+
+    #[test]
+    fn read_bench() {
+        let Some(path) = std::env::var_os("THINFER_READ_BENCH_PATH") else {
+            eprintln!("read_bench: THINFER_READ_BENCH_PATH unset; skipping");
+            return;
+        };
+        let mut buf = vec![0u8; CHUNK];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opener = MmapFileOpener::new(&path).await.unwrap();
+            let mut reader = opener.open().await.unwrap();
+            let len = reader.len();
+            for pass in ["mmap pass 1 (cold-ish)", "mmap pass 2 (warm)"] {
+                let t = Instant::now();
+                let mut off = 0u64;
+                while off < len {
+                    let n = CHUNK.min((len - off) as usize);
+                    reader.read_at(off, &mut buf[..n]).await.unwrap();
+                    std::hint::black_box(&buf);
+                    off += n as u64;
+                }
+                report(pass, len, t.elapsed().as_secs_f64());
+            }
+        });
+        // Buffered ReadFile path (no mmap) on now-warm pages, for comparison.
+        use std::io::Read as _;
+        let mut f = std::fs::File::open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let t = Instant::now();
+        let mut off = 0u64;
+        while off < len {
+            let n = CHUNK.min((len - off) as usize);
+            f.read_exact(&mut buf[..n]).unwrap();
+            std::hint::black_box(&buf);
+            off += n as u64;
+        }
+        report("File::read (warm)", len, t.elapsed().as_secs_f64());
+    }
+}

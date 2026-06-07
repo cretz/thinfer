@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Tightest CSP this page can run under. Notes:
+         - script-src 'wasm-unsafe-eval': required to compile WebAssembly; it
+           does NOT enable JS eval. There is no narrower wasm grant today.
+         - script-src sha256-...: the inline import map below (import maps
+           count as inline scripts; external ones aren't supported). The hash
+           covers its exact bytes: editing the map means recomputing it
+           (devtools prints the new hash in the violation report).
+         - connect-src: 'self' for the .wasm fetch, plus the Hugging Face hub
+           and the CDN hosts its download redirects land on.
+         - worker-src 'self': the library's OPFS IO worker (fast weight
+           reads). Without it the library falls back to slow main-thread IO.
+         - img-src blob: for the generated PNG. No styles inline. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'sha256-7yzLMmCwMw5DMVeLaovbMtFy9kKGufZS54LFy6zSO34='; style-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co; worker-src 'self'; img-src blob:; base-uri 'none'; form-action 'none'"
+    />
+    <title>thinfer: generate image</title>
+    <!-- A bundler app would `npm install thinfer` and import it directly;
+         this page is bundler-free, so the import map stands in for node
+         resolution of the bare "thinfer" specifier. The package's own
+         modules use relative specifiers only (no map entries needed), which
+         is also what lets gen-worker.js import it: import maps do not apply
+         inside workers. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "thinfer": "/dist/index.js"
+        }
+      }
+    </script>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <h1>thinfer: generate image</h1>
+    <section id="model-section">
+      <label for="model">Model</label>
+      <select id="model">
+        <option value="zimage-turbo-q4" selected>zimage-turbo-q4</option>
+        <option value="zimage-turbo-q8">zimage-turbo-q8</option>
+        <option value="zimage-turbo-bf16">zimage-turbo-bf16</option>
+      </select>
+      <button id="download" type="button" disabled>Download model</button>
+      <button id="clear-cache" type="button">Clear cached files</button>
+      <span id="model-status">Checking cache&hellip;</span>
+    </section>
+    <form id="form">
+      <fieldset id="gen-fields" disabled>
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="3" required>
+a corgi wearing a tiny wizard hat, studio photo</textarea
+        >
+        <label for="width">Width</label>
+        <input id="width" type="number" value="768" min="16" step="16" />
+        <label for="height">Height</label>
+        <input id="height" type="number" value="768" min="16" step="16" />
+        <label for="steps">Steps</label>
+        <input id="steps" type="number" value="8" min="1" />
+        <label for="seed">Seed</label>
+        <input id="seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />
+        <label for="budget">VRAM/RAM budget</label>
+        <select id="budget">
+          <option value="2">2 GiB</option>
+          <option value="4" selected>4 GiB</option>
+          <option value="6">6 GiB</option>
+        </select>
+        <button id="generate" type="submit">Generate</button>
+      </fieldset>
+    </form>
+    <p id="status">Idle.</p>
+    <img id="output" alt="" />
+    <label id="trace-label"
+      >Engine telemetry (into the log)
+      <select id="trace">
+        <option value="off" selected>off</option>
+        <option value="info">info</option>
+        <option value="debug">debug</option>
+      </select></label
+    >
+    <!-- Library logs land here as well as the console: on mobile (no
+         devtools) this is the only way to see them. -->
+    <textarea id="log" rows="10" readonly></textarea>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

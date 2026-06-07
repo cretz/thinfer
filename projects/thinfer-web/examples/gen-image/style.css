@@ -1,0 +1,52 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 48rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+#model-section {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+#gen-fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  border: none;
+  padding: 0;
+}
+
+#gen-fields label small {
+  font-weight: normal;
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+#gen-fields > button {
+  grid-column: 2;
+  justify-self: start;
+  padding: 0.4rem 1.2rem;
+}
+
+#status {
+  margin: 1rem 0;
+  font-variant-numeric: tabular-nums;
+  white-space: pre-wrap;
+}
+
+#output {
+  max-width: 100%;
+}
+
+#log {
+  width: 100%;
+  margin-top: 1rem;
+  font-family: monospace;
+  font-size: 0.8rem;
+  white-space: pre;
+}

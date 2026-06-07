@@ -8,11 +8,29 @@
   "engines": {
     "node": ">=24"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "imports": {
+    "#wasm": "./pkg/thinfer_web.js"
+  },
+  "files": [
+    "dist",
+    "pkg"
+  ],
+  "sideEffects": false,
   "scripts": {
+    "build": "pnpm build:wasm && pnpm build:ts",
+    "build:wasm": "cargo build --release --target wasm32-unknown-unknown -p thinfer-web && wasm-bindgen --target web --out-dir pkg ../target/wasm32-unknown-unknown/release/thinfer_web.wasm",
+    "build:ts": "tsc -p tsconfig.build.json && node scripts/resolve-wasm-import.ts",
     "typecheck": "tsc --noEmit",
-    "lint": "oxlint src/ scripts/",
-    "fmt": "oxfmt --write src/ scripts/",
-    "fmt:check": "oxfmt --check src/ scripts/",
+    "lint": "oxlint src/ scripts/ examples/",
+    "fmt": "oxfmt --write src/ scripts/ examples/",
+    "fmt:check": "oxfmt --check src/ scripts/ examples/",
+    "example:gen-image": "node examples/gen-image/serve.ts",
     "playwright:install": "playwright install chromium",
     "test:web": "pnpm playwright:install && node scripts/test.ts"
   },

@@ -209,6 +209,12 @@ pub fn parse_header(buf: &[u8]) -> Result<GgufHeader, ParseError> {
 /// uses `file_size` to bound it; other tensors derive size from the next
 /// tensor's offset. Pass `None` for `file_size` if the caller doesn't have
 /// it; the final tensor's `size` falls back to `on_disk_bytes`.
+///
+/// Shape convention: GGUF stores dims innermost-first (`ne[0]` = fastest
+/// axis), the reverse of the PyTorch/safetensors outer-first order the rest
+/// of the engine uses (`nn.Linear` weight `[N, K]`). The byte stream is the
+/// same row-major data either way, so the catalog REVERSES dims to
+/// outer-first: one shape convention engine-wide.
 pub fn catalog_from(h: &GgufHeader, file_size: Option<u64>) -> WeightCatalog {
     // Tensors in GGUF are listed in arbitrary order in the header, but
     // their tensor_data offsets are monotonically increasing per the
@@ -227,6 +233,8 @@ pub fn catalog_from(h: &GgufHeader, file_size: Option<u64>) -> WeightCatalog {
             file_size.unwrap_or(abs_offset + t.on_disk_bytes.unwrap_or(0))
         };
         let size = next_abs.saturating_sub(abs_offset);
+        // Innermost-first GGUF dims -> outer-first engine convention.
+        let shape = Shape(t.shape.0.iter().rev().copied().collect());
         entries.insert(
             WeightId(t.name.clone()),
             WeightEntry {
@@ -234,7 +242,7 @@ pub fn catalog_from(h: &GgufHeader, file_size: Option<u64>) -> WeightCatalog {
                 size,
                 encoding: t.encoding,
                 encoding_label: ggml_type_label(t.ggml_type).to_string(),
-                shape: t.shape.clone(),
+                shape,
             },
         );
     }
@@ -568,12 +576,14 @@ mod tests {
         b.extend_from_slice(&8u32.to_le_bytes()); // ggml_type = Q8_0
         b.extend_from_slice(&0u64.to_le_bytes()); // offset_in_tensor_data
 
-        // Tensor 1: name="bb", dims=[64], ggml_type=8 (Q8_0), offset=34
+        // Tensor 1: name="bb", GGUF dims=[32, 2] (innermost-first; engine
+        // sees [2, 32]), ggml_type=8 (Q8_0), offset=34
         let name = "bb";
         b.extend_from_slice(&(name.len() as u64).to_le_bytes());
         b.extend_from_slice(name.as_bytes());
-        b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&64u64.to_le_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&32u64.to_le_bytes());
+        b.extend_from_slice(&2u64.to_le_bytes());
         b.extend_from_slice(&8u32.to_le_bytes());
         b.extend_from_slice(&34u64.to_le_bytes());
 
@@ -601,7 +611,8 @@ mod tests {
         assert_eq!(a.encoding, Some(StorageEncoding::Quant(QuantKind::Q8_0)));
         assert_eq!(a.on_disk_bytes, Some(34));
         let bb = h.tensors.iter().find(|t| t.name == "bb").unwrap();
-        assert_eq!(bb.shape.0, vec![64]);
+        // Header keeps raw GGUF (innermost-first) order; the catalog reverses.
+        assert_eq!(bb.shape.0, vec![32, 2]);
         assert_eq!(bb.on_disk_bytes, Some(68));
     }
 
@@ -651,5 +662,8 @@ mod tests {
         assert_eq!(a.size, 34);
         let bb = cat.get(&WeightId("bb".to_string())).unwrap();
         assert_eq!(bb.size, 68);
+        // Catalog shape is outer-first (engine convention), reversed from
+        // the GGUF header's innermost-first dims.
+        assert_eq!(bb.shape.0, vec![2, 32]);
     }
 }

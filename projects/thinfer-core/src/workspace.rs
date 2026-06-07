@@ -31,7 +31,7 @@ impl<B: Backend> OwnedBuffer<B> {
 
 impl<B: Backend> Drop for OwnedBuffer<B> {
     fn drop(&mut self) {
-        tracing::info!(
+        tracing::trace!(
             target: trace::WS,
             op = "drop",
             id = self.id.0,
@@ -75,7 +75,7 @@ fn spill_pool_locked<B: Backend>(inner: &mut WorkspaceInner<B>, at_least: u64) -
     }
     inner.pool_bytes = inner.pool_bytes.saturating_sub(freed);
     if freed > 0 {
-        tracing::info!(
+        tracing::debug!(
             target: trace::WS,
             op = "spill",
             at_least = at_least,
@@ -216,7 +216,7 @@ impl<B: Backend> Workspace<B> {
                 )
             }
         };
-        tracing::info!(
+        tracing::trace!(
             target: trace::WS,
             op = "alloc",
             id = owned.id.0,
@@ -267,7 +267,7 @@ impl<B: Backend> Workspace<B> {
         // the iterator step, then each OwnedBuffer::Drop calls backend.free.
         let total: usize = inner.free.drain().map(|(_, v)| v.len()).sum();
         inner.pool_bytes = 0;
-        tracing::info!(
+        tracing::debug!(
             target: trace::WS,
             op = "drain_pool",
             freed = total as u64,
@@ -326,7 +326,7 @@ impl<B: Backend> core::ops::Deref for WsBuf<B> {
 impl<B: Backend> Drop for WsBuf<B> {
     fn drop(&mut self) {
         let owned = self.owned.take().expect("WsBuf double-drop");
-        tracing::info!(
+        tracing::trace!(
             target: trace::WS,
             op = "release",
             id = owned.id.0,
@@ -1009,6 +1009,49 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             s_q,
             h_q,
             d,
+        )
+    }
+
+    /// CL-parameterized subgroup sdpa. `cl` must match the value the bound
+    /// `pipeline` was built with (it sets BR = WG/CL for the workgroup grid).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_sg(
+        &self,
+        pipeline: &B::Pipeline,
+        q: BatchBuf<'wsp>,
+        k: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        mask: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        cl: u32,
+        b: u32,
+        s_q: u32,
+        h_q: u32,
+    ) -> Result<(), B::Error> {
+        let q = self.resolve(q);
+        let k = self.resolve(k);
+        let v = self.resolve(v);
+        let mask = self.resolve(mask);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::SdpaBufs {
+            q: &q,
+            k: &k,
+            v: &v,
+            mask: &mask,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_sdpa_f16_sg(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            cl,
+            b,
+            s_q,
+            h_q,
         )
     }
 
@@ -1777,6 +1820,7 @@ mod tests {
         }
         async fn create_pipeline(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &[crate::backend::BindingLayout],

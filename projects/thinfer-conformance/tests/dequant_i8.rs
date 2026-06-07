@@ -75,7 +75,7 @@ async fn run_one(
     let backend = WgpuBackend::new().await.expect("wgpu adapter");
     let wgsl = build_wgsl(scheme);
     let pipeline = backend
-        .create_pipeline(&wgsl, "main", layout())
+        .create_pipeline("dequant_i8", &wgsl, "main", layout())
         .await
         .expect("dequant_i8 pipeline");
 

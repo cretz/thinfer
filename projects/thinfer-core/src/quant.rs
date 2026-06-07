@@ -933,6 +933,20 @@ pub fn dequantize_row_q6_k(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// `dequantize_row_*` dispatched by kind. `src` must be a whole number of
+/// blocks and `dst.len()` the matching element count (asserted per-kind).
+/// Used by the residency dequant-at-upload path for quant file tensors the
+/// engine consumes dense (e.g. GGUF-quantized AdaLN weights).
+pub fn dequantize_row(kind: QuantKind, src: &[u8], dst: &mut [f32]) {
+    match kind {
+        QuantKind::Q8_0 => dequantize_row_q8_0(src, dst),
+        QuantKind::Q4_0 => dequantize_row_q4_0(src, dst),
+        QuantKind::Q4_K => dequantize_row_q4_k(src, dst),
+        QuantKind::Q5_K => dequantize_row_q5_k(src, dst),
+        QuantKind::Q6_K => dequantize_row_q6_k(src, dst),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

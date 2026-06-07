@@ -12,6 +12,12 @@
 //!   gated on the `trace-subscriber` feature) buckets dispatch/submit/buf
 //!   events per active `SCOPE` span path and dumps a sorted table on demand.
 
+/// The clock for every tracing-gated timing read in the engine. `std::time`
+/// on native, `performance.now()` on wasm (where `std::time::Instant::now`
+/// aborts). Always behind a subscriber-interest gate so disabled tracing
+/// reads no clock at all; on wasm an enabled read is one JS roundtrip.
+pub use web_time::Instant;
+
 // --- Existing targets retained (used by `debug!` calls already in the tree) ---
 
 pub const WEIGHT_UPLOAD: &str = "thinfer::weight.upload";
@@ -118,22 +124,36 @@ pub use crate::trace_scope as scope;
 
 #[cfg(feature = "trace-subscriber")]
 mod sub_impl {
+    use super::Instant;
     use std::collections::HashMap;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
-
     use tracing::Subscriber;
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id};
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::Registry;
+    use tracing_subscriber::filter::FilterFn;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
     use tracing_subscriber::registry::{LookupSpan, SpanRef};
     use tracing_subscriber::util::SubscriberInitExt;
 
     use super::{BUF, DISPATCH, DISPATCH_GPU, SCOPE, SUBMIT, WS};
+
+    /// Per-layer filter admitting exactly the rollup's inputs (SCOPE spans
+    /// plus dispatch/submit/buf/ws events) at every level. The rollup must
+    /// see them regardless of `RUST_LOG`: the live fmt stream filters those
+    /// targets out at its default level (they sit at `trace`), but the
+    /// aggregate tables are built from them. Always compose `RollupLayer`
+    /// with this via `with_filter`, and put the `EnvFilter` on the fmt layer
+    /// (a bare `EnvFilter` layer filters the whole stack, rollup included).
+    pub fn rollup_filter() -> FilterFn {
+        FilterFn::new(|meta| {
+            let t = meta.target();
+            t == SCOPE || t == DISPATCH || t == DISPATCH_GPU || t == SUBMIT || t == BUF || t == WS
+        })
+    }
 
     #[derive(Default)]
     struct ScopeStats {
@@ -512,9 +532,10 @@ mod sub_impl {
     /// installed (call `handle.dump(&mut io::stderr())` at end-of-run), `None`
     /// when env var is unset.
     ///
-    /// Reads `RUST_LOG` for the live filter (defaults to `info`). The fmt
-    /// layer is only added when `THINFER_TRACE=verbose` (or `v` / `2`) to keep
-    /// silent runs quiet.
+    /// Reads `RUST_LOG` for the live filter (defaults to `info`); it scopes
+    /// the fmt stream only, while the rollup always sees its own targets via
+    /// [`rollup_filter`]. Span-close rendering is only added when
+    /// `THINFER_TRACE=verbose` (or `v` / `2`) to keep silent runs quiet.
     ///
     /// Returns `Some(handle)` for the first caller in a process; subsequent
     /// callers (e.g. a second `#[test]` in the same binary) get `None` because
@@ -545,9 +566,8 @@ mod sub_impl {
                 .boxed()
         };
         let installed = Registry::default()
-            .with(env_filter)
-            .with(rollup)
-            .with(fmt_layer)
+            .with(rollup.with_filter(rollup_filter()))
+            .with(fmt_layer.with_filter(env_filter))
             .try_init()
             .is_ok();
         if installed { Some(handle) } else { None }
@@ -555,7 +575,9 @@ mod sub_impl {
 
     /// Like `init_from_env` but yields the layer for the caller to compose
     /// with their own subscriber (CLI already installs `fmt::Subscriber`).
-    /// Returns `None` when `THINFER_TRACE` is unset.
+    /// Compose it as `layer.with_filter(rollup_filter())` and keep the
+    /// `EnvFilter` on the fmt layer, not as a stack-wide layer. Returns
+    /// `None` when `THINFER_TRACE` is unset.
     pub fn rollup_layer_from_env() -> Option<(RollupLayer, RollupHandle)> {
         std::env::var("THINFER_TRACE").ok()?;
         let layer = RollupLayer::new();
@@ -565,4 +587,6 @@ mod sub_impl {
 }
 
 #[cfg(feature = "trace-subscriber")]
-pub use sub_impl::{RollupHandle, RollupLayer, init_from_env, rollup_layer_from_env};
+pub use sub_impl::{
+    RollupHandle, RollupLayer, init_from_env, rollup_filter, rollup_layer_from_env,
+};

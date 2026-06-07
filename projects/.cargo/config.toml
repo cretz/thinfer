@@ -1,2 +1,5 @@
 [target.wasm32-unknown-unknown]
 runner = "wasm-bindgen-test-runner"
+# simd128 is universal wherever WebGPU exists; speeds up the CPU-bound wasm
+# bits (tokenizer, PNG encode, header parsing).
+rustflags = ["-C", "target-feature=+simd128"]

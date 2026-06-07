@@ -121,7 +121,10 @@ impl MemArbiter {
         for (_, r) in chain.iter() {
             let freed = r.reclaim(want);
             if freed > 0 {
-                tracing::info!(
+                // Eviction traffic: debug per the level semantics (info is
+                // stage milestones + rollups only); overshoot below stays
+                // info because it means the budget was actually busted.
+                tracing::debug!(
                     target: trace::ARBITER,
                     op = "reclaim",
                     source = r.label(),

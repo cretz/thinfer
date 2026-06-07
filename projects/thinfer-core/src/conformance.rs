@@ -257,7 +257,7 @@ impl<'a> OpTestContext<'a> {
     {
         let pipeline = self
             .backend
-            .create_pipeline(wgsl, "main", layout())
+            .create_pipeline(self.case.name, wgsl, "main", layout())
             .await
             .expect("pipeline");
         let inputs: Vec<BufRef> = self
