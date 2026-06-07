@@ -1,0 +1,202 @@
+//! Channel-broadcast affine scale: `out[i] = x[i] * (s[i % C] + bias)`.
+//!
+//! Used in Z-Image modulation=True blocks: `norm(x) * (1 + scale)` (bias=1)
+//! and gate/scale multiplies (bias=0). The broadcast unit is a single
+//! per-channel vector `[C]` repeated across all rows of `x [N, C]`.
+//!
+//! v1 single-batch only (B=1). With B>1, scale/gate are `[B, 1, C]` per
+//! upstream and require batch-aware indexing (`(i / (S*C)) * C + i%C`);
+//! extend the uniform when batched generation lands.
+
+use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
+#[cfg(feature = "conformance")]
+use crate::conformance::{
+    DTYPES_ACT_BF16, Dtype, OpSpec, OpTest, OpTestContext, TestCase, linspace, t,
+};
+use crate::ops::{ActDtype, WgslConfig};
+use crate::tensor::{ComputeDtype, F32};
+use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
+
+pub trait BcastAffineOp {
+    const KERNEL_ID: &'static str;
+    type Dtype: ComputeDtype;
+    const X: &'static str;
+    const S: &'static str;
+    const OUTPUT: &'static str;
+
+    fn wgsl(cfg: &WgslConfig) -> &'static str;
+    fn layout() -> &'static [BindingLayout];
+
+    fn workgroups(n_elems: u32) -> [u32; 3] {
+        super::linear_workgroups(n_elems, 64)
+    }
+}
+
+pub struct BcastAffineBufs<'a> {
+    pub x: &'a BufRef,
+    pub s: &'a BufRef,
+    pub uniform: &'a BufRef,
+    pub out: &'a BufRef,
+}
+
+pub(crate) fn dispatch_bcast_affine<O: BcastAffineOp, B: Backend>(
+    backend: &B,
+    encoder: &mut B::CommandEncoder,
+    pipeline: &B::Pipeline,
+    bufs: &BcastAffineBufs<'_>,
+    n_elems: u32,
+) -> Result<(), B::Error> {
+    let bindings = [
+        bufs.x.binding(0),
+        bufs.s.binding(1),
+        bufs.out.binding(2),
+        bufs.uniform.binding(3),
+    ];
+    backend.dispatch(encoder, pipeline, &bindings, O::workgroups(n_elems))
+}
+
+wgsl_with_bf16_variant!(
+    WGSL_F32,
+    WGSL_F32_BF16 = r#"
+struct U { c: u32, bias: f32, _pad0: u32, _pad1: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> s: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let i = gid.y * (ng.x * 64u) + gid.x;
+    if (i >= arrayLength(&out)) { return; }
+    out[i] = act_store(x[i] * (s[i % u.c] + u.bias));
+}
+"#
+);
+
+// Packed-bf16 path. Each thread writes one word (2 elements). Requires C even
+// so that the two elements always fall in the same row + consecutive channels
+// (DiT modulation channels are always even-sized).
+const WGSL_BF16_PACKED: &str = concat!(
+    act_bf16_prelude!(),
+    r#"
+struct U { c: u32, bias: f32, _pad0: u32, _pad1: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read> s: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let w = gid.y * (ng.x * 64u) + gid.x;
+    if (w >= arrayLength(&out)) { return; }
+    let xv = unpack_bf16x2(x[w]);
+    let c0 = (w * 2u) % u.c;
+    let sv = unpack_bf16x2(s[c0 >> 1u]);
+    out[w] = pack_bf16x2(xv.x * (sv.x + u.bias), xv.y * (sv.y + u.bias));
+}
+"#
+);
+
+// Native f16 path. `s` is a per-call gate/scale vector (acts, not weights);
+// when act_dtype is F16 the modulation chunks are f16-packed alongside x/out.
+// `bias` is an f32 uniform — narrow to f16 once per thread, then native
+// vec2<f16> compute.
+const WGSL_F16_PACKED: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { c: u32, bias: f32, _pad0: u32, _pad1: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> s: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let w = gid.y * (ng.x * 64u) + gid.x;
+    if (w >= arrayLength(&out)) { return; }
+    let xv: vec2<f16> = x[w];
+    let c0 = (w * 2u) % u.c;
+    let sv: vec2<f16> = s[c0 >> 1u];
+    let bias_h: f16 = f16(u.bias);
+    let bias_v: vec2<f16> = vec2<f16>(bias_h, bias_h);
+    out[w] = xv * (sv + bias_v);
+}
+"#
+);
+
+const LAYOUT: &[BindingLayout] = &[
+    BindingLayout {
+        slot: 0,
+        kind: BindingKind::StorageRead,
+    },
+    BindingLayout {
+        slot: 1,
+        kind: BindingKind::StorageRead,
+    },
+    BindingLayout {
+        slot: 2,
+        kind: BindingKind::StorageReadWrite,
+    },
+    BindingLayout {
+        slot: 3,
+        kind: BindingKind::Uniform,
+    },
+];
+
+pub struct BcastAffineF32;
+
+impl BcastAffineOp for BcastAffineF32 {
+    const KERNEL_ID: &'static str = "bcast_affine.f32";
+    type Dtype = F32;
+    const X: &'static str = "bcast_affine/x";
+    const S: &'static str = "bcast_affine/s";
+    const OUTPUT: &'static str = "bcast_affine/out";
+    fn wgsl(cfg: &WgslConfig) -> &'static str {
+        match (cfg.act_dtype, cfg.bf16_quant_writes) {
+            (ActDtype::F32, false) => WGSL_F32,
+            (ActDtype::F32, true) => WGSL_F32_BF16,
+            (ActDtype::Bf16, _) => WGSL_BF16_PACKED,
+            (ActDtype::F16, _) => WGSL_F16_PACKED,
+            (ActDtype::I8, _) => unreachable!("ActDtype::I8 is never a block-level act dtype"),
+        }
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+}
+
+#[cfg(feature = "conformance")]
+impl OpTest for BcastAffineF32 {
+    fn dtypes(&self) -> &'static [Dtype] {
+        DTYPES_ACT_BF16
+    }
+    fn test_cases(&self) -> Vec<TestCase> {
+        vec![
+            TestCase {
+                name: "bcast_affine_scale",
+                op: OpSpec::BcastAffine { bias: 0.0 },
+                inputs: vec![
+                    t("x", [4, 16], linspace(-1.0, 1.0, false)),
+                    t("s", [16], linspace(-0.5, 0.5, false)),
+                ],
+            },
+            TestCase {
+                name: "bcast_affine_one_plus_scale",
+                op: OpSpec::BcastAffine { bias: 1.0 },
+                inputs: vec![
+                    t("x", [4, 16], linspace(-1.0, 1.0, false)),
+                    t("s", [16], linspace(-0.5, 0.5, false)),
+                ],
+            },
+        ]
+    }
+    fn run_test<'a>(
+        &self,
+        ctx: &'a OpTestContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
+        Box::pin(ctx.run_bcast_affine::<BcastAffineF32>())
+    }
+}

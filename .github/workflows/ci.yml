@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects
+
+      - uses: astral-sh/setup-uv@v3
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: projects/thinfer-web/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: projects/thinfer-web/pnpm-lock.yaml
+
+      - name: install matching wasm-bindgen-cli
+        working-directory: projects
+        shell: bash
+        run: |
+          version=$(cargo metadata --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          echo "wasm-bindgen version: $version"
+          cargo install --locked --version "$version" wasm-bindgen-cli
+
+      - name: pnpm install
+        working-directory: projects/thinfer-web
+        run: pnpm install --frozen-lockfile
+
+      - name: cargo fmt --check
+        working-directory: projects
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (native)
+        working-directory: projects
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo clippy (wasm32)
+        working-directory: projects
+        run: cargo clippy -p thinfer-web --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      - name: pnpm fmt:check / lint / typecheck
+        working-directory: projects/thinfer-web
+        run: |
+          pnpm fmt:check
+          pnpm lint
+          pnpm typecheck
+
+      - name: cargo test (native)
+        working-directory: projects
+        run: cargo test --workspace
+
+      - name: verify committed fixtures are up to date
+        shell: bash
+        run: git diff --exit-code projects/thinfer-conformance/fixtures/
+
+      # TODO: re-enable. Hangs on GH-hosted runners: output stops right after
+      # the Playwright chromium download, before cargo prints anything, on all
+      # three OSes. Unresolved; suspects are the GPU-less-runner WebGPU path
+      # and chromedriver bring-up (pnpm v10 blocks the chromedriver package's
+      # postinstall binary download by default). The suite runs fine locally
+      # (`pnpm test:web` in projects/thinfer-web) and must be run there before
+      # merging web-facing changes.
+      # - name: pnpm test:web
+      #   working-directory: projects/thinfer-web
+      #   run: pnpm test:web

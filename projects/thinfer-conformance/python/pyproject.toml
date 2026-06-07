@@ -1,0 +1,23 @@
+[project]
+name = "thinfer-pytorch-ref"
+version = "0.0.0"
+description = "Generates fixed-seed reference outputs for thinfer accuracy diffing."
+requires-python = ">=3.11"
+dependencies = [
+    "diffusers",
+    "numpy",
+    "packaging",
+    "safetensors",
+    "torch",
+    "transformers",
+    "zimage-native",
+]
+
+[tool.uv]
+package = false
+
+# Upstream Z-Image as block reference for thinfer-models fixtures. Pinned
+# commit; bump explicitly when the upstream block API changes. uv installs
+# into the project venv; not a path dep.
+[tool.uv.sources]
+zimage-native = { git = "https://github.com/Tongyi-MAI/Z-Image.git", rev = "26f23eda626ffadda020b04ff79488e1d72004cd" }

@@ -1,0 +1,26 @@
+[package]
+name = "thinfer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+wgpu = { version = "28", features = ["fragile-send-sync-non-atomic-wasm"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+safetensors = { version = "0.4", optional = true }
+
+[features]
+conformance = ["dep:safetensors"]
+# Brings in `tracing-subscriber` so the `trace::subscriber` module can install
+# a Registry + RollupLayer. Native-only (CLI / conformance tests). Wasm builds
+# omit this and ship without the subscriber; raw `tracing::*` event emission
+# stays cheap and works on both targets regardless.
+trace-subscriber = ["dep:tracing-subscriber"]

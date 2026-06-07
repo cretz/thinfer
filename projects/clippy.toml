@@ -1,0 +1,5 @@
+# Forward/dispatch functions in this codebase structurally take 6-8 plumbing
+# args (backend, pipelines, residency, workspace, handles, bufs, shape) before
+# any meaningful parameters. The default of 7 flags the established shape, not
+# real design problems; raise to keep the lint useful for genuine outliers.
+too-many-arguments-threshold = 12
