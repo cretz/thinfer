@@ -196,7 +196,7 @@ async fn try_run(
 
     let wgsl = build_wgsl(&cfg);
     let pipeline = backend
-        .create_pipeline(&wgsl, "main", layout())
+        .create_pipeline("matmul_i8_bf16", &wgsl, "main", layout())
         .await
         .expect("matmul_i8_bf16 pipeline");
 

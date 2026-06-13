@@ -373,6 +373,7 @@ pub fn assert_paired_close(
 /// binding & dispatch via the closure.
 pub async fn run_and_read_paired<B, F>(
     backend: &B,
+    label: &str,
     wgsl: &str,
     layout: &'static [thinfer_core::backend::BindingLayout],
     out_data: &BufRef,
@@ -384,7 +385,7 @@ where
     F: FnOnce(&B, &mut B::CommandEncoder, &B::Pipeline),
 {
     let pipeline = backend
-        .create_pipeline(wgsl, "main", layout)
+        .create_pipeline(label, wgsl, "main", layout)
         .await
         .expect("pipeline");
     let mut enc = backend.create_command_encoder();

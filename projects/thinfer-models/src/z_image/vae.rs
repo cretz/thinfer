@@ -709,12 +709,18 @@ pub struct ConvPipeline {
 impl ConvPipeline {
     async fn compile(
         backend: &WgpuBackend,
+        label: &str,
         cfg: &WgslConfig,
         tile: Conv2dConfig,
     ) -> Result<Self, WgpuError> {
         let op = Conv2dF32::new(tile);
         let pipeline = backend
-            .create_pipeline(&op.wgsl(cfg), "main", <Conv2dF32 as Conv2dOp>::layout())
+            .create_pipeline(
+                label,
+                &op.wgsl(cfg),
+                "main",
+                <Conv2dF32 as Conv2dOp>::layout(),
+            )
             .await?;
         Ok(Self { pipeline, op })
     }
@@ -795,38 +801,54 @@ impl VaeDecoderPipelines {
         Ok(Self {
             act_dtype,
             act_size: act_dtype.bytes_per_elem(),
-            conv2d: ConvPipeline::compile(backend, cfg, Conv2dConfig::DEFAULT).await?,
-            conv2d_wide: ConvPipeline::compile(backend, cfg, CONV_TILE_WIDE).await?,
-            conv2d_small_n: ConvPipeline::compile(backend, cfg, CONV_TILE_SMALL_N).await?,
+            conv2d: ConvPipeline::compile(backend, "vae_conv2d", cfg, Conv2dConfig::DEFAULT)
+                .await?,
+            conv2d_wide: ConvPipeline::compile(backend, "vae_conv2d_wide", cfg, CONV_TILE_WIDE)
+                .await?,
+            conv2d_small_n: ConvPipeline::compile(
+                backend,
+                "vae_conv2d_small_n",
+                cfg,
+                CONV_TILE_SMALL_N,
+            )
+            .await?,
             group_norm: backend
                 .create_pipeline(
+                    "vae_group_norm",
                     <GroupNormF32 as GroupNormOp>::wgsl(cfg),
                     "main",
                     <GroupNormF32 as GroupNormOp>::layout(),
                 )
                 .await?,
             silu: backend
-                .create_pipeline(SiluF32::wgsl(cfg), "main", SiluF32::layout())
+                .create_pipeline("vae_silu", SiluF32::wgsl(cfg), "main", SiluF32::layout())
                 .await?,
             upsample: backend
                 .create_pipeline(
+                    "vae_upsample",
                     <Upsample2dNearestF32 as Upsample2dNearestOp>::wgsl(cfg),
                     "main",
                     <Upsample2dNearestF32 as Upsample2dNearestOp>::layout(),
                 )
                 .await?,
             add: backend
-                .create_pipeline(AddF32::wgsl(cfg), "main", AddF32::layout())
+                .create_pipeline("vae_add", AddF32::wgsl(cfg), "main", AddF32::layout())
                 .await?,
             matmul: {
                 let op = MatMulF32::new(VAE_MATMUL_CFG);
                 backend
-                    .create_pipeline(&op.wgsl(cfg), "main", <MatMulF32 as MatmulOp>::layout())
+                    .create_pipeline(
+                        "vae_matmul",
+                        &op.wgsl(cfg),
+                        "main",
+                        <MatMulF32 as MatmulOp>::layout(),
+                    )
                     .await?
             },
             matmul_op: MatMulF32::new(VAE_MATMUL_CFG),
             bcast_add: backend
                 .create_pipeline(
+                    "vae_bcast_add",
                     <BcastAddF32 as BcastAddOp>::wgsl(cfg),
                     "main",
                     <BcastAddF32 as BcastAddOp>::layout(),
@@ -834,6 +856,7 @@ impl VaeDecoderPipelines {
                 .await?,
             sdpa_large_d: backend
                 .create_pipeline(
+                    "vae_sdpa_large_d",
                     <SdpaF32LargeD as SdpaOp>::wgsl(cfg),
                     "main",
                     <SdpaF32LargeD as SdpaOp>::layout(),
@@ -841,6 +864,7 @@ impl VaeDecoderPipelines {
                 .await?,
             transpose12: backend
                 .create_pipeline(
+                    "vae_transpose12",
                     <Transpose12F32 as Transpose12Op>::wgsl(cfg),
                     "main",
                     <Transpose12F32 as Transpose12Op>::layout(),

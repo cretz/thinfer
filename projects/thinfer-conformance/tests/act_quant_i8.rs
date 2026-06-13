@@ -142,7 +142,7 @@ async fn run_one(m: u32, k: u32, seed: u64) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<
 
     let wgsl = build_wgsl();
     let pipeline = backend
-        .create_pipeline(&wgsl, "main", layout())
+        .create_pipeline("act_quant", &wgsl, "main", layout())
         .await
         .expect("act_quant pipeline");
 

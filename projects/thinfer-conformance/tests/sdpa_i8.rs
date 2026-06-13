@@ -168,6 +168,7 @@ async fn try_run(
 
     let (g_d, g_s) = run_and_read_paired(
         &backend,
+        "sdpa_i8",
         &build_wgsl(),
         layout(),
         &out_data_view,

@@ -5,19 +5,15 @@ use std::sync::Arc;
 
 use clap::{Args, Subcommand, ValueEnum};
 use thinfer_core::backend::{PowerPreference, WgpuBackend, WgpuConfig};
-use thinfer_core::format::gguf::GgufSource;
-use thinfer_core::format::safetensors::ShardedSafetensorsSource;
-use thinfer_core::format::union::{
-    QuantOnlySource, RenamedSource, SplitToFusedQkvSource, UnionSource,
-};
 use thinfer_core::manifest::{FileRef, ModelManifest};
 use thinfer_core::policy::{ResidencyBudget, parse_bytes};
 use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::trace::DIAG;
 use thinfer_core::weight::WeightSource;
-use thinfer_models::z_image::manifest::role as zrole;
+use thinfer_models::z_image::manifest::{VariantFiles, role as zrole};
 use thinfer_models::z_image::pipeline::{GenerationParams, ProgressEvent, ProgressFn, ZImageModel};
+use thinfer_models::z_image::source::{GgufOpeners, ZImageSource};
 use thinfer_native::tokenizer::HfTokenizer;
 use thinfer_native::{MmapFileOpener, cache};
 
@@ -105,13 +101,11 @@ impl ModelId {
         }
     }
 
-    /// Role of the GGUF file to union over the safetensors source, if any.
-    fn dit_gguf_role(self) -> Option<&'static str> {
-        match self {
-            ModelId::ZImageTurboQ8 => Some(zrole::DIT_GGUF_Q8_0),
-            ModelId::ZImageTurboQ4 => Some(zrole::DIT_GGUF_Q4_K_M),
-            ModelId::ZImageTurboBf16 => None,
-        }
+    /// File set from the shared variant registry (single source of truth
+    /// with web; keyed by the same id strings clap displays).
+    fn variant(self) -> &'static VariantFiles {
+        thinfer_models::z_image::manifest::variant(&self.to_string())
+            .expect("CLI ModelId missing from VARIANTS registry")
     }
 }
 
@@ -152,29 +146,9 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
     };
 
     let manifest = args.model.manifest();
-    let dit_gguf_role = args.model.dit_gguf_role();
-    // Weight shards (safetensors, merged into one ShardedSafetensorsSource)
-    // and tokenizer JSON live in the manifest. As future loaders land they
-    // join the relevant list here; nothing else in CLI needs to change.
-    let weight_roles: &[&str] = &[
-        zrole::DIT_SHARD_1,
-        zrole::DIT_SHARD_2,
-        zrole::TEXT_ENCODER_SHARD_1,
-        zrole::TEXT_ENCODER_SHARD_2,
-        zrole::TEXT_ENCODER_SHARD_3,
-        zrole::VAE,
-    ];
-    let aux_roles: &[&str] = &[zrole::TOKENIZER_JSON];
-    let all_files: Vec<FileRef> = weight_roles
-        .iter()
-        .chain(aux_roles.iter())
-        .chain(dit_gguf_role.iter())
-        .map(|r| {
-            *manifest
-                .get(r)
-                .expect("required role missing from model manifest")
-        })
-        .collect();
+    let variant = args.model.variant();
+    let dit_gguf_role = variant.dit_gguf_role;
+    let all_files: Vec<FileRef> = variant.files().map(|(_, f)| *f).collect();
     let (_resolved, missing) = cache::resolve_all(all_files.iter());
 
     if !missing.is_empty()
@@ -197,8 +171,8 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
             .ok_or_else(|| format!("{}/{} not in cache after download", r.repo, r.path))
     };
 
-    let mut weight_openers: Vec<MmapFileOpener> = Vec::with_capacity(weight_roles.len());
-    for role in weight_roles {
+    let mut weight_openers: Vec<MmapFileOpener> = Vec::with_capacity(variant.weight_roles.len());
+    for role in variant.weight_roles {
         let path = resolve_role(role)?;
         weight_openers.push(
             MmapFileOpener::new(&path)
@@ -206,18 +180,25 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
                 .map_err(|e| format!("open {}: {e}", path.display()))?,
         );
     }
-    let source = ShardedSafetensorsSource::open(weight_openers)
+    let mut open_gguf = Vec::with_capacity(2);
+    for role in [dit_gguf_role, variant.te_gguf_role].into_iter().flatten() {
+        let path = resolve_role(role)?;
+        open_gguf.push(
+            MmapFileOpener::new(&path)
+                .await
+                .map_err(|e| format!("open gguf {}: {e}", path.display()))?,
+        );
+    }
+    let gguf_openers = match (open_gguf.pop(), open_gguf.pop()) {
+        (Some(te), Some(dit)) => Some(GgufOpeners { dit, te }),
+        (None, None) => None,
+        _ => return Err("variant must set both gguf roles or neither".into()),
+    };
+    // Schema adapters + optional GGUF union live in `ZImageSource::open`,
+    // shared with web and the e2e tests.
+    let source = ZImageSource::open(weight_openers, gguf_openers)
         .await
-        .map_err(|e| format!("parse sharded safetensors: {e:?}"))?;
-    // Z-Image canonical schema is fused `attention.qkv.weight`. Checkpoints
-    // that ship split `to_q`/`to_k`/`to_v` (dimitribarbot) flow through this
-    // adapter; checkpoints with a fused entry already see the adapter as a
-    // passthrough.
-    let source = SplitToFusedQkvSource::new(source, thinfer_models::z_image::dit_qkv_triples());
-    // dimitribarbot publishes `attention.to_out.0.weight`; engine asks for
-    // canonical `attention.out.weight` (matches unsloth GGUF schema).
-    let source =
-        RenamedSource::with_passthrough(source, thinfer_models::z_image::dit_to_out_renames());
+        .map_err(|e| format!("parse weight files: {e:?}"))?;
 
     let tokenizer_path = resolve_role(zrole::TOKENIZER_JSON)?;
     let tokenizer = HfTokenizer::from_path(&tokenizer_path)
@@ -298,43 +279,9 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
         steps: args.steps,
         seed,
     };
-    let png = match dit_gguf_role {
-        None => {
-            let residency = WeightResidency::new(source, budget);
-            load_and_generate(backend, residency, tokenizer, &gen_params, Some(&progress)).await?
-        }
-        Some(role) => {
-            let path = resolve_role(role)?;
-            let opener = MmapFileOpener::new(&path)
-                .await
-                .map_err(|e| format!("open gguf {}: {e}", path.display()))?;
-            let gguf = GgufSource::open(opener)
-                .await
-                .map_err(|e| format!("parse gguf {}: {e:?}", path.display()))?;
-            // GGUF (unsloth Z-Image-Turbo) ships upstream canonical names
-            // including fused `attention.qkv.weight`; no rename needed.
-            // safetensors fallback supplies AdaLN/biases/norms under the
-            // same canonical names. unsloth's file Q8-quantizes the
-            // main-layer AdaLN modulation weights too, but the engine
-            // keeps AdaLN as bf16 (see pipeline.rs::dit_adaln_cfg), so
-            // we hide AdaLN ids from the GGUF side to fall through.
-            let unioned = UnionSource::new(
-                QuantOnlySource::with_allowed_substrings(
-                    gguf,
-                    &[
-                        ".attention.qkv.weight",
-                        ".attention.out.weight",
-                        ".feed_forward.w1.weight",
-                        ".feed_forward.w2.weight",
-                        ".feed_forward.w3.weight",
-                    ],
-                ),
-                source,
-            );
-            let residency = WeightResidency::new(unioned, budget);
-            load_and_generate(backend, residency, tokenizer, &gen_params, Some(&progress)).await?
-        }
-    };
+    let residency = WeightResidency::new(source, budget);
+    let png =
+        load_and_generate(backend, residency, tokenizer, &gen_params, Some(&progress)).await?;
     tokio::fs::write(&args.output, &png)
         .await
         .map_err(|e| format!("write {}: {e}", args.output.display()))?;

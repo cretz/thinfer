@@ -62,8 +62,8 @@ pub(crate) use rope::dispatch_rope;
 pub use rope::{RopeBufs, RopeF32, RopeF32HalfRot, RopeOp};
 pub(crate) use scatter_pad_rows::dispatch_scatter_pad_rows;
 pub use scatter_pad_rows::{ScatterPadRowsBufs, ScatterPadRowsF32, ScatterPadRowsOp};
-pub(crate) use sdpa::dispatch_sdpa;
-pub use sdpa::{SdpaBufs, SdpaF16Sg, SdpaF32, SdpaF32LargeD, SdpaOp};
+pub use sdpa::{SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, build_f16_sg_wgsl, f16_sg_workgroups};
+pub(crate) use sdpa::{dispatch_sdpa, dispatch_sdpa_f16_sg};
 pub use silu::SiluF32;
 pub use silu_mul::SiluMulF32;
 #[cfg(feature = "conformance")]

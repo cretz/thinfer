@@ -114,7 +114,7 @@ async fn run_one_with_cfg(
     let op = MatMulF32::new(mm_cfg);
     let wgsl = op.wgsl(&cfg);
     let pipeline = backend
-        .create_pipeline(&wgsl, "main", MatMulF32::layout())
+        .create_pipeline("q8_0_matmul", &wgsl, "main", MatMulF32::layout())
         .await
         .expect("pipeline");
 
@@ -384,7 +384,7 @@ async fn run_one_bf16_acts(m: u32, n: u32, k: u32, seed: u64) -> (Vec<f32>, Vec<
     });
     let wgsl = op.wgsl(&cfg);
     let pipeline = backend
-        .create_pipeline(&wgsl, "main", MatMulF32::layout())
+        .create_pipeline("q8_0_matmul", &wgsl, "main", MatMulF32::layout())
         .await
         .expect("pipeline");
 

@@ -9,10 +9,7 @@
 //! Workspace activations persist across submits within one DiT forward as
 //! caller-owned `WsBuf`s; each scope `import`s them as needed.
 
-use std::collections::VecDeque;
-
 use std::future::Future;
-use std::pin::Pin;
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
 use thinfer_core::mem::VramCategory;
@@ -358,6 +355,109 @@ impl ZImageDit {
         }
     }
 
+    /// Deterministic pin-priority list for the denoise phase (consumed by
+    /// `WeightResidency::set_pin_plan`). The DiT access pattern is a uniform
+    /// cyclic scan - every weight is read exactly once per step - so per byte
+    /// pinned the saved per-step upload is identical no matter which bytes
+    /// are picked; the order only shapes the residual streaming demand.
+    ///
+    /// Front: per-step constants and the pool-path embedder/refiner weights
+    /// (small; refiner linears also pay a per-acquire Q8 transcode, so
+    /// residency saves prep dispatches, not just bytes). Then the main
+    /// layers role-major / block-minor, largest roles first: every block
+    /// keeps the same role subset resident and streams the rest, keeping
+    /// per-block stream demand flat across the step. Pinning blocks
+    /// contiguously instead would alternate upload-free stretches with
+    /// full-rate bursts the ring would have to hide.
+    pub fn pin_priority(&self) -> Vec<thinfer_core::residency::WeightHandle> {
+        let mut out = Vec::new();
+        let lb = |out: &mut Vec<_>, h: &LinearBiasHandles| {
+            out.push(h.weight);
+            out.push(h.bias);
+        };
+        out.push(self.x_pad_token);
+        out.push(self.cap_pad_token);
+        out.extend([
+            self.t_embedder_handles.fc1_weight,
+            self.t_embedder_handles.fc1_bias,
+            self.t_embedder_handles.fc2_weight,
+            self.t_embedder_handles.fc2_bias,
+        ]);
+        lb(&mut out, &self.x_embedder_handles);
+        out.push(self.cap_embedder_handles.norm_weight);
+        lb(&mut out, &self.cap_embedder_handles.linear);
+        lb(&mut out, &self.final_layer_handles.linear);
+        lb(&mut out, &self.final_layer_handles.adaln);
+        for h in self
+            .noise_refiner_handles
+            .iter()
+            .chain(&self.context_refiner_handles)
+        {
+            out.extend([h.ffn_w1, h.ffn_w2, h.ffn_w3, h.attn_qkv, h.attn_to_out]);
+            if let Some(a) = &h.adaln {
+                out.extend([a.weight, a.bias]);
+            }
+            out.extend([
+                h.attention_norm1,
+                h.attention_norm2,
+                h.ffn_norm1,
+                h.ffn_norm2,
+                h.attn_norm_q,
+                h.attn_norm_k,
+            ]);
+        }
+        // Main layers: one role across all blocks, then the next role.
+        type RoleFn = fn(&BlockHandles) -> Option<thinfer_core::residency::WeightHandle>;
+        let roles: [RoleFn; 6] = [
+            |h| Some(h.ffn_w1),
+            |h| Some(h.ffn_w2),
+            |h| Some(h.ffn_w3),
+            |h| Some(h.attn_qkv),
+            |h| Some(h.attn_to_out),
+            |h| h.adaln.as_ref().map(|a| a.weight),
+        ];
+        for role in roles {
+            out.extend(self.layers_handles.iter().filter_map(role));
+        }
+        let small_roles: [RoleFn; 7] = [
+            |h| h.adaln.as_ref().map(|a| a.bias),
+            |h| Some(h.attention_norm1),
+            |h| Some(h.attention_norm2),
+            |h| Some(h.ffn_norm1),
+            |h| Some(h.ffn_norm2),
+            |h| Some(h.attn_norm_q),
+            |h| Some(h.attn_norm_k),
+        ];
+        for role in small_roles {
+            out.extend(self.layers_handles.iter().filter_map(role));
+        }
+        out
+    }
+
+    /// Conservative VRAM reserve for the denoise-phase workspace, used to
+    /// size the pin plan's budget headroom. Covers the heaviest main block
+    /// packed into a single scope (sum of its four phase peaks, the packer's
+    /// zero-overhead fast path) plus the cross-submit persistents (residual
+    /// streams, unified assembly, freqs/mask/t_emb), approximated as a
+    /// handful of `rows * dim` activation buffers. Overestimating only
+    /// shrinks the pin set; underestimating starves the packer into
+    /// scope-thrash, so err high.
+    pub fn workspace_reserve_estimate(&self, main_pipelines: &[BlockPipelines]) -> u64 {
+        let mut block_peak = 0u64;
+        for (blk, pl) in self.layers.iter().zip(main_pipelines) {
+            block_peak = block_peak.max(blk.phase_peaks(pl).iter().sum());
+        }
+        let persist = self
+            .layers
+            .first()
+            .zip(main_pipelines.first())
+            .map_or(0, |(blk, pl)| {
+                let cfg = &blk.cfg;
+                8 * pl.act_bytes((cfg.rows() * cfg.dim) as u32)
+            });
+        block_peak + persist
+    }
+
     pub async fn forward<'a, S: WeightSource>(
         &self,
         backend: &WgpuBackend,
@@ -538,20 +638,16 @@ impl ZImageDit {
         )
         .await?;
 
-        // Depth-K ring of in-flight submits shared by the refiner loops, the
-        // cap glue, and the main layer loop. Deferred submits keep the queue
-        // fed across section boundaries (no CPU fence wait per section); each
-        // hold-bag keeps the submit's consumed buffers and weight pins alive
-        // until the GPU finishes. Static depth=2: higher depths help GPU
-        // saturation when per-block GPU >> CPU-encode, but each extra slot
-        // pins another block's weights + live workspace (in-flight guards
-        // aren't spillable). At 768x768 / 2 GiB, depth=3 wedges (verified:
-        // BudgetTooSmall at block.3 with the elastic gate accepting depth=3
-        // transiently before mid-phase workspace expansion eats the residency
-        // headroom). Keep static depth=2; the idx+2 prefetch in each loop is
-        // the overlap mechanism.
-        const SUBMIT_DEPTH: usize = 2;
-        let mut pending_submits: SubmitRing<'_> = VecDeque::new();
+        // Overlap model: each block submits its GPU work, then awaits the
+        // completion fence *concurrently* with streaming the next blocks'
+        // weights (join of submit + acquire + idx+2 prefetch). On web there is
+        // no poll thread (backend/poll.rs is a wasm no-op), so awaiting the
+        // fence is the only thing that pumps the browser's GPU completion - it
+        // must run alongside the reads or the GPU idles. Per-block wall is then
+        // max(compute, read), not compute + read. CPU command-encode is ~0.5ms
+        // a block (measured), so there is nothing to gain from keeping a second
+        // submit in flight; awaiting per block also caps simultaneous weight
+        // pins at one block, the safest shape for the 2 GiB ceiling.
 
         // --- 6. noise_refiner ---
         // Block expression scopes the rollup span guard `_nr_scope` so it
@@ -572,10 +668,6 @@ impl ZImageDit {
             };
             for (idx, blk) in self.noise_refiner.iter().enumerate() {
                 let _blk_scope = trace::scope!(format_args!("block.{idx}")).entered();
-                while pending_submits.len() >= SUBMIT_DEPTH {
-                    let (fut, _holds) = pending_submits.pop_front().unwrap();
-                    fut.await?;
-                }
                 let nxt = ResStream::alloc(scratch, pipelines, seq_x, dim)?;
                 let views = pending
                     .take()
@@ -620,20 +712,29 @@ impl ZImageDit {
                         None => Ok(()),
                     }
                 };
-                // queue.submit happens synchronously inside submit_deferred;
-                // the GPU runs this block while the joins below upload the
-                // next blocks' weights.
+                // submit_deferred() runs the synchronous queue.submit and
+                // returns the GPU completion fence. On web there is NO poll
+                // thread (backend/poll.rs is a wasm no-op): the browser only
+                // advances submitted GPU work and fires on_submitted_work_done
+                // while the engine thread awaits the fence and yields. So the
+                // fence MUST be awaited concurrently with the next blocks'
+                // weight streaming - join it with next_acquire + prefetch. If
+                // it were instead drained at the top of a later iteration (the
+                // old ring), compute would serialize behind the reads (the
+                // browser GPU-idle regression). Joined, per-block wall is
+                // max(compute, read) not compute + read. Native (poll thread)
+                // is unaffected. With the fence awaited here, this block's
+                // input (prior x_cur) and weight pins drop at end of iteration
+                // - no ring hold-bag.
                 let submit_fut = scope.submit_deferred().instrument(
                     tracing::debug_span!(target: PHASE, "dit.submit", phase = "noise_refiner", idx),
                 );
-                let (n_res, p_res) = futures::join!(next_acquire, prefetch_after);
+                let (s_res, n_res, p_res) =
+                    futures::join!(submit_fut, next_acquire, prefetch_after);
+                s_res?;
                 p_res?;
                 pending = n_res?;
-                let prev_x = std::mem::replace(&mut x_cur, nxt);
-                pending_submits.push_back((
-                    Box::pin(submit_fut),
-                    vec![Box::new(prev_x) as Box<dyn RingHold + '_>, Box::new(views)],
-                ));
+                x_cur = nxt;
                 diag_probe_resstream(
                     backend,
                     pipelines,
@@ -661,10 +762,6 @@ impl ZImageDit {
         backend.write_buffer(cap_in.id, 0, &cap_in_bytes)?;
         let cap_act = ResStream::alloc(scratch, pipelines, seq_cap, dim)?;
         let (cap_intermediate_normed, cap_intermediate_pre_bias) = {
-            while pending_submits.len() >= SUBMIT_DEPTH {
-                let (fut, _holds) = pending_submits.pop_front().unwrap();
-                fut.await?;
-            }
             let views = self
                 .cap_embedder_handles
                 .acquire(residency, backend)
@@ -682,10 +779,9 @@ impl ZImageDit {
                 &bufs,
             )?;
             let (outs, fut) = scope.submit_many_deferred(&[inter.normed, inter.pre_bias]);
-            pending_submits.push_back((
-                Box::pin(fut),
-                vec![Box::new(views) as Box<dyn RingHold + '_>],
-            ));
+            // One-shot section off the hot path: await the fence inline (on web
+            // an un-awaited fence never gets pumped). `views` drops after.
+            fut.await?;
             let mut it = outs.into_iter();
             let normed = it.next().unwrap();
             let pre_bias = it.next().unwrap();
@@ -720,12 +816,8 @@ impl ZImageDit {
             .await?;
         }
         {
-            while pending_submits.len() >= SUBMIT_DEPTH {
-                let (fut, _holds) = pending_submits.pop_front().unwrap();
-                fut.await?;
-            }
             let pad = residency.acquire(self.cap_pad_token, backend).await?;
-            let fut = scatter_pad_rows_deferred(
+            scatter_pad_rows_deferred(
                 backend,
                 embedder_pipelines,
                 scratch,
@@ -734,9 +826,8 @@ impl ZImageDit {
                 seq_cap,
                 dim,
                 &cm.pad_mask,
-            )?;
-            pending_submits
-                .push_back((Box::pin(fut), vec![Box::new(pad) as Box<dyn RingHold + '_>]));
+            )?
+            .await?;
         }
         diag_probe_resstream(
             backend,
@@ -789,10 +880,6 @@ impl ZImageDit {
             };
             for (idx, blk) in self.context_refiner.iter().enumerate() {
                 let _blk_scope = trace::scope!(format_args!("block.{idx}")).entered();
-                while pending_submits.len() >= SUBMIT_DEPTH {
-                    let (fut, _holds) = pending_submits.pop_front().unwrap();
-                    fut.await?;
-                }
                 if idx == 1
                     && let Some(sink) = taps.ctx_refiner_0_out.as_deref_mut()
                 {
@@ -867,25 +954,24 @@ impl ZImageDit {
                         None => Ok(()),
                     }
                 };
+                // Await this block's fence concurrently with streaming the next
+                // blocks' weights (see the overlap-model note at the top of
+                // dit_forward). Fence-await pumps the GPU on web; joined with
+                // the reads it collapses per-block wall to max(compute, read).
                 let submit_fut = scope.submit_deferred().instrument(
                     tracing::debug_span!(target: PHASE, "dit.submit", phase = "context_refiner", idx),
                 );
-                let (n_res, p_res) = futures::join!(next_acquire, prefetch_after);
+                let (s_res, n_res, p_res) =
+                    futures::join!(submit_fut, next_acquire, prefetch_after);
+                s_res?;
                 p_res?;
                 pending = n_res?;
                 if let (Some(tap_bufs), Some(sink)) = (cb0_bufs, taps.ctx_block0.as_deref_mut()) {
-                    // Tap readback maps after the deferred submit in queue
-                    // order, so it observes this block's writes.
+                    // Fence already awaited above, so the readback observes this
+                    // block's writes.
                     tap_bufs.read_back(backend, pipelines, sink).await?;
                 }
-                let prev_cap = std::mem::replace(&mut cap_cur, nxt);
-                pending_submits.push_back((
-                    Box::pin(submit_fut),
-                    vec![
-                        Box::new(prev_cap) as Box<dyn RingHold + '_>,
-                        Box::new(views),
-                    ],
-                ));
+                cap_cur = nxt;
                 diag_probe_resstream(
                     backend,
                     pipelines,
@@ -919,10 +1005,6 @@ impl ZImageDit {
         let freq_row = pipelines.act_bytes(head_dim as u32);
         let unified_freqs = scratch.alloc(seq_u as u64 * freq_row)?;
         {
-            while pending_submits.len() >= SUBMIT_DEPTH {
-                let (fut, _holds) = pending_submits.pop_front().unwrap();
-                fut.await?;
-            }
             let x_cur_ref = x_cur.data.as_buf_ref();
             let cap_cur_ref = cap_cur.data.as_buf_ref();
             let x_freqs_ref = x_freqs.as_buf_ref();
@@ -952,8 +1034,7 @@ impl ZImageDit {
                 (seq_x as u64) * freq_row,
                 (seq_cap as u64) * freq_row,
             )?;
-            let fut = scope.submit_deferred();
-            pending_submits.push_back((Box::pin(fut), Vec::new()));
+            scope.submit_deferred().await?;
         }
         diag_probe_resstream(
             backend,
@@ -988,15 +1069,32 @@ impl ZImageDit {
             )
         };
         let last_main_idx = self.layers.len().saturating_sub(1);
+        // Per-step critical-path breakdown (browser GPU-idle diagnosis).
+        // encode = CPU recording this block's commands + the sync queue.submit
+        //          (~0.5ms/block measured; if this grows, CPU-encode is the wall).
+        // stream = the overlap window: awaiting this block's GPU fence joined
+        //          with streaming the next blocks' weights. With overlap working
+        //          this is ~max(compute, read) per block and ~= the step wall.
+        //          Before the overlap fix, compute and read serialized and the
+        //          step was ~compute + read (the GPU sat idle through the read).
+        // Cheap (a handful of clock reads per block); always on.
+        let mut acc_encode = std::time::Duration::ZERO;
+        let mut acc_stream = std::time::Duration::ZERO;
+        let mut max_stream = std::time::Duration::ZERO;
+        // Join split (debug-only diag): within each block's
+        // join!(submit_fut, next_acquire, prefetch) measure WHEN each leg
+        // resolves relative to the join start. fence = GPU drain (compute +
+        // queued upload copies on the single queue); acquire/prefetch = CPU
+        // read + write_buffer enqueue. If fence ~= stream and acquire << stream
+        // the wall is GPU-queue-bound (re-upload serializes with compute), not
+        // read-bound, and deeper load-ahead cannot help. Gated on debug diag so
+        // non-debug runs take the unwrapped join with zero added work.
+        let diag_split = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG);
+        let mut acc_fence = std::time::Duration::ZERO;
+        let mut acc_acq = std::time::Duration::ZERO;
+        let mut acc_pf = std::time::Duration::ZERO;
         for (idx, blk) in self.layers.iter().enumerate() {
             let _blk_scope = trace::scope!(format_args!("block.{idx}")).entered();
-            // Cap simultaneous pinned BlockViews before adding more.
-            // Drain to len < SUBMIT_DEPTH so that after this iteration's
-            // push_back the ring sits at exactly SUBMIT_DEPTH.
-            while pending_submits.len() >= SUBMIT_DEPTH {
-                let (fut, _holds) = pending_submits.pop_front().unwrap();
-                fut.await?;
-            }
             // DIAG per-block trajectory: when DIAG INFO is enabled, probe
             // residual stream at EVERY block boundary so we get a slope-vs-
             // block-index curve. Without DIAG, fall back to the prior sparse
@@ -1020,14 +1118,11 @@ impl ZImageDit {
             }
             // DIAG full-residual readback into per-block sink. Fires at
             // every block boundary (idx > 0), captures block (idx-1).
-            // Forces queue drain so the read sees committed writes from
-            // the previous iter's pipelined submit.
+            // The previous block's submit was already awaited in its own
+            // iteration, so u_cur holds committed writes here.
             if idx > 0
                 && let Some(sink) = taps.per_main_block_residual.as_deref_mut()
             {
-                while let Some((fut, _holds)) = pending_submits.pop_front() {
-                    fut.await?;
-                }
                 let prev = idx - 1;
                 if sink.len() <= prev {
                     sink.resize(prev + 1, Vec::new());
@@ -1166,6 +1261,7 @@ impl ZImageDit {
                 .saturating_sub(pinned_weights)
                 .saturating_sub(rented_workspace);
             let mut packer = ScopePacker::new(scratch, packer_budget);
+            let t_encode = trace::Instant::now();
             blk.forward_taps_packed(
                 &mut packer,
                 &main_pipelines[idx],
@@ -1177,6 +1273,7 @@ impl ZImageDit {
                 &bufs,
                 &b0_block_taps,
             )?;
+            acc_encode += t_encode.elapsed();
             // Acquire the next block's weights concurrently with this
             // block's GPU work. Also prefetch idx+2 (unpinned) so the LRU
             // is pre-warmed and the next iter's acquire is a hit. Prefetch
@@ -1205,12 +1302,8 @@ impl ZImageDit {
                 }
             };
             if needs_sync {
-                // Drain any in-flight submits first so the read_back we're
-                // about to do observes a quiet queue; then sync-submit and
-                // read taps before moving on.
-                while let Some((fut, _holds)) = pending_submits.pop_front() {
-                    fut.await?;
-                }
+                // Taps path: submit and await the fence, then read taps. No
+                // prior in-flight submit to drain - each block awaits its own.
                 let submit_fut = packer.finish_void().instrument(
                     tracing::debug_span!(target: PHASE, "dit.submit", phase = "layers", idx),
                 );
@@ -1239,32 +1332,77 @@ impl ZImageDit {
                 // so weight pins are free to release.
                 drop(views);
             } else {
-                // Pipelined path: scope.submit_deferred() runs
-                // backend.submit's synchronous prelude (queue.submit
-                // happens here), returning a completion future. Move the
-                // future plus the buffers it transitively depends on
-                // (prior u_cur, the block's BlockViews) into the ring.
-                // The ring is bounded by the drain-at-top above, so no
-                // trailing pop here.
-                // packer.finish_void synchronously calls queue.submit; the
-                // returned future just awaits the fence. So GPU is already
-                // running this block when we join next_acquire + prefetch
-                // for upcoming blocks (uploads overlap with compute).
-                let submit_fut = packer.finish_void();
-                let (n_res, p_res) = futures::join!(next_acquire, prefetch_after);
+                // packer.finish_void() runs backend.submit's synchronous
+                // prelude (queue.submit happens here) and returns the GPU
+                // completion fence. Await that fence JOINED with streaming the
+                // next blocks' weights: on web there is no poll thread
+                // (backend/poll.rs is a wasm no-op), so the fence-await is what
+                // pumps the browser's GPU completion and it must run alongside
+                // the reads or the GPU idles through them. Joined, per-block
+                // wall is max(compute, read) not compute + read. The fence is
+                // resolved before the next iteration, so `views` (weight pins)
+                // and the prior `u_cur` drop at end of iteration with no ring.
+                let t_submit = trace::Instant::now();
+                let submit_fut = packer.finish_void().instrument(
+                    tracing::debug_span!(target: PHASE, "dit.submit", phase = "layers", idx),
+                );
+                acc_encode += t_submit.elapsed();
+                let t_stream = trace::Instant::now();
+                let (s_res, n_res, p_res) = if diag_split {
+                    // Wrap each leg to stamp its resolution time relative to the
+                    // join start, so we can tell fence (GPU drain) from
+                    // acquire/prefetch (CPU read + upload enqueue) even though
+                    // they run concurrently. Debug-only.
+                    let fence_leg = async {
+                        let r = submit_fut.await;
+                        acc_fence += t_stream.elapsed();
+                        r
+                    };
+                    let acq_leg = async {
+                        let r = next_acquire.await;
+                        acc_acq += t_stream.elapsed();
+                        r
+                    };
+                    let pf_leg = async {
+                        let r = prefetch_after.await;
+                        acc_pf += t_stream.elapsed();
+                        r
+                    };
+                    futures::join!(fence_leg, acq_leg, pf_leg)
+                } else {
+                    futures::join!(submit_fut, next_acquire, prefetch_after)
+                };
+                let d_stream = t_stream.elapsed();
+                acc_stream += d_stream;
+                max_stream = max_stream.max(d_stream);
+                s_res?;
                 p_res?;
                 pending = n_res?;
-                let prev_u = std::mem::replace(&mut u_cur, nxt);
-                pending_submits.push_back((
-                    Box::pin(submit_fut),
-                    vec![Box::new(prev_u) as Box<dyn RingHold + '_>, Box::new(views)],
-                ));
+                u_cur = nxt;
             }
         }
-        // Drain remaining in-flight submits before any downstream read or
-        // the final_layer encoder consumes `u_cur`.
-        while let Some((fut, _holds)) = pending_submits.pop_front() {
-            fut.await?;
+        let ms = |d: std::time::Duration| d.as_millis() as u64;
+        tracing::info!(
+            blocks = self.layers.len(),
+            encode_ms = ms(acc_encode),
+            stream_ms = ms(acc_stream),
+            max_stream_ms = ms(max_stream),
+            "dit.layers timing"
+        );
+        if diag_split {
+            // fence_ms = summed wall until each block's GPU fence resolved
+            // (compute + queued upload copies draining on the single queue);
+            // acq_ms / pf_ms = summed wall until the N+1 acquire / N+2 prefetch
+            // (CPU read + write_buffer enqueue) resolved. fence ~= stream with
+            // acq/pf much smaller => GPU-queue-bound, not read-bound.
+            tracing::debug!(
+                target: "thinfer::diag",
+                fence_ms = ms(acc_fence),
+                acq_ms = ms(acc_acq),
+                pf_ms = ms(acc_pf),
+                stream_ms = ms(acc_stream),
+                "dit.layers join split"
+            );
         }
         diag_probe_resstream_split(
             backend,
@@ -1496,20 +1634,6 @@ fn round_f32_to_bf16(x: f32) -> u16 {
 /// vector at `pad_token` (bf16-packed `[dim]` from residency). Dispatches the
 /// `scatter_pad_rows` kernel which decodes bf16 -> fp32 inline. `pub` for the
 /// conformance smoke test.
-/// Type-erased member of a pending-submit hold-bag. Blanket impl: anything
-/// can be held; dropping the bag releases buffers and weight pins.
-trait RingHold {}
-impl<T> RingHold for T {}
-
-/// Depth-bounded ring of in-flight submits spanning dit_forward sections.
-/// Each entry pairs a submit completion future with the hold-bag that keeps
-/// the submit's input buffers and weight views alive until the fence
-/// resolves.
-type SubmitRing<'a> = VecDeque<(
-    Pin<Box<dyn Future<Output = Result<(), WgpuError>> + 'a>>,
-    Vec<Box<dyn RingHold + 'a>>,
-)>;
-
 pub async fn scatter_pad_rows(
     backend: &WgpuBackend,
     pipelines: &BlockPipelines,

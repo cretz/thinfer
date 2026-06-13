@@ -187,7 +187,7 @@ async fn try_run(
 
     let wgsl = build_wgsl(&cfg);
     let pipeline = backend
-        .create_pipeline(&wgsl, "main", layout())
+        .create_pipeline("matmul_i8", &wgsl, "main", layout())
         .await
         .expect("matmul_i8 pipeline");
 
@@ -313,13 +313,12 @@ fn check(got: &[f32], exp: &[f32]) {
     );
 }
 
+/// m/n smaller than the tile exercise the OOB-guard (zero-fill) load and
+/// guarded-write paths; m/n above it exercise multi-workgroup grids.
 #[test]
 fn matmul_i8_small() {
     let cfg = MatMulI8Config {
-        bm: 8,
-        bn: 8,
-        tm: 2,
-        tn: 2,
+        tile: 16,
         use_subgroup: false,
     };
     let pair = pollster::block_on(try_run(8, 8, 32, cfg, 0xC0DE_F00D));
@@ -330,10 +329,7 @@ fn matmul_i8_small() {
 #[test]
 fn matmul_i8_multi_block_k() {
     let cfg = MatMulI8Config {
-        bm: 8,
-        bn: 8,
-        tm: 2,
-        tn: 2,
+        tile: 16,
         use_subgroup: false,
     };
     let pair = pollster::block_on(try_run(8, 8, 64, cfg, 0xDEAD_BEEF));
@@ -344,10 +340,7 @@ fn matmul_i8_multi_block_k() {
 #[test]
 fn matmul_i8_small_subgroup() {
     let cfg = MatMulI8Config {
-        bm: 8,
-        bn: 8,
-        tm: 2,
-        tn: 2,
+        tile: 16,
         use_subgroup: true,
     };
     let pair = pollster::block_on(try_run(8, 8, 32, cfg, 0xC0DE_F00D));
@@ -358,13 +351,18 @@ fn matmul_i8_small_subgroup() {
 #[test]
 fn matmul_i8_multi_block_k_subgroup() {
     let cfg = MatMulI8Config {
-        bm: 8,
-        bn: 8,
-        tm: 2,
-        tn: 2,
+        tile: 16,
         use_subgroup: true,
     };
     let pair = pollster::block_on(try_run(8, 8, 64, cfg, 0xDEAD_BEEF));
+    let Some((got, exp)) = pair else { return };
+    check(&got, &exp);
+}
+
+#[test]
+fn matmul_i8_default_tile() {
+    let cfg = MatMulI8Config::DEFAULT;
+    let pair = pollster::block_on(try_run(80, 100, 128, cfg, 0xFEED_FACE));
     let Some((got, exp)) = pair else { return };
     check(&got, &exp);
 }
@@ -375,7 +373,7 @@ fn matmul_i8_default_tile_subgroup() {
         use_subgroup: true,
         ..MatMulI8Config::DEFAULT
     };
-    let pair = pollster::block_on(try_run(64, 64, 128, cfg, 0xFEED_FACE));
+    let pair = pollster::block_on(try_run(80, 100, 128, cfg, 0xFEED_FACE));
     let Some((got, exp)) = pair else { return };
     check(&got, &exp);
 }

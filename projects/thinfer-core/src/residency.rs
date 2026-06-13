@@ -15,7 +15,7 @@
 //! [`MemReclaimer`] built by [`WeightResidency::reclaimer`] frees unpinned
 //! LRU residents and idle ring slots under pressure from any client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::arbiter::{MemArbiter, MemReclaimer, MemTier};
@@ -48,6 +48,33 @@ pub struct RingId(pub u32);
 /// pinned slot to release.
 pub const WEIGHT_RING_SLOTS: usize = 4;
 
+/// Bounded host scratch for source -> GPU streaming. Weight bytes transit
+/// this much host memory at most, regardless of tensor size (web hard rule:
+/// no tensor-sized wasm allocations). 4-byte multiple (write_buffer
+/// alignment).
+//
+// Chunk size is NOT the bottleneck: a 4x (64 MiB) classifier run was wall-time
+// identical to 16 MiB, so the upload cost is throughput-bound, not per-call /
+// staging-overhead bound. Kept at 16 MiB (bounds in-flight JS heap to
+// READ_QUEUE_DEPTH * 16 MiB).
+const UPLOAD_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How many chunk reads the streaming path keeps in flight against the
+/// source reader at once. The async reader (web OPFS worker) processes them
+/// back-to-back, so the read pipe stays full while the engine thread is busy
+/// encoding GPU work — without this lead the worker idles between chunks
+/// waiting for the next request and read throughput sags below GPU compute
+/// rate (GPU then stalls). No-op on mmap readers (`will_read` is a no-op).
+/// In-flight bytes live in the reader's own buffers (JS heap on web), not
+/// the wasm scratch below, which still holds one chunk.
+const READ_PREFETCH_CHUNKS: u64 = 4;
+
+/// Cap on retired upload scratch buffers kept for reuse. Streaming acquires
+/// borrow a chunk-sized host buffer and return it here instead of
+/// re-allocating (and re-zeroing) per weight; two can be live at once
+/// (`join!` of next-acquire + prefetch), so a small cap covers steady state.
+const SCRATCH_POOL_CAP: usize = 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransposePolicy {
     /// 1-D weights, biases, norm gains, pad tokens. No layout change.
@@ -77,13 +104,32 @@ impl WeightMeta {
         self.shape.0.iter().map(|&d| d as u64).product()
     }
 
-    /// Encoding of the bytes that land on GPU: the transcode target when
-    /// set, the file encoding otherwise.
+    /// Encoding of the bytes that land on GPU. Derived from the file
+    /// encoding plus the upload transforms:
+    /// - `transcode` set: the quant block stream (bf16 file requantized).
+    /// - Quant file + `Linear2D`: dense bf16 `[K, N]`. Dequant-at-upload for
+    ///   tensors the engine consumes dense even though the GGUF quantized
+    ///   them (AdaLN modulation weights).
+    /// - F32 file: bf16. GGUF norms/biases ship F32 upcast from the bf16
+    ///   checkpoint; the RNE narrowing is lossless (verified at upload) and
+    ///   keeps every kernel on the engine-wide bf16 weight storage.
+    /// - else: the file encoding as-is.
     pub fn gpu_encoding(&self) -> StorageEncoding {
-        match self.transcode {
-            Some(k) => StorageEncoding::Quant(k),
-            None => self.encoding,
+        match (self.transcode, self.encoding, self.transpose) {
+            (Some(k), _, _) => StorageEncoding::Quant(k),
+            (None, StorageEncoding::Quant(_), TransposePolicy::Linear2D) => StorageEncoding::Bf16,
+            (None, StorageEncoding::F32, _) => StorageEncoding::Bf16,
+            (None, e, _) => e,
         }
+    }
+
+    /// True when the on-disk bytes upload unchanged: no transcode, no
+    /// transpose, no encoding change. Such weights stream straight into
+    /// their GPU buffer through the bounded scratch.
+    fn is_passthrough(&self) -> bool {
+        self.transcode.is_none()
+            && matches!(self.transpose, TransposePolicy::None)
+            && self.gpu_encoding() == self.encoding
     }
 
     /// Bytes the weight occupies on GPU, derived from `gpu_encoding`. Bf16
@@ -119,6 +165,14 @@ pub enum ResidencyError<SE: core::fmt::Debug, BE: core::fmt::Debug> {
     /// `WeightSource::Error`; stringified to avoid a third generic on every
     /// `ResidencyError`.
     Reader(String),
+    /// An F32 source value didn't survive the bf16 narrowing round-trip.
+    /// GGUF F32 tensors the engine stores as bf16 must be upcast bf16
+    /// values (true for bf16-trained checkpoints); a genuine f32-precision
+    /// tensor needs an F32 GPU path, not silent truncation.
+    F32NarrowingLoss {
+        id: WeightId,
+        index: u64,
+    },
     /// One weight's footprint exceeds its tier budget; no eviction policy can
     /// satisfy. Caller's `ResidencyBudget` is too tight for this model.
     BudgetTooSmall {
@@ -150,6 +204,11 @@ struct GpuEntry {
     id: GpuBufferId,
     bytes: u64,
     pin_count: u32,
+    /// Filled (or prefetch-refreshed) but not yet consumed by a real
+    /// `acquire`. Reclaim skips fresh entries: their next access is a
+    /// certainty, so evicting them trades a guaranteed re-read for
+    /// headroom that LRU victims can provide instead.
+    fresh: bool,
 }
 
 /// One slot in a `WeightRing`. `id` is `None` until the slot is first
@@ -160,6 +219,11 @@ struct RingSlot {
     id: Option<GpuBufferId>,
     occupant: Option<WeightHandle>,
     pin_count: u32,
+    /// Filled (or prefetch-refreshed) but not yet consumed by a real
+    /// acquire. Reclaim drains stale slots before fresh ones (see
+    /// `GpuEntry::fresh`): a prefetched block weight will be read again
+    /// this step, so it's the worst eviction choice.
+    fresh: bool,
 }
 
 struct WeightRing {
@@ -184,6 +248,12 @@ struct Inner {
     /// a slot via `write_buffer` and pins it for the view's lifetime.
     rings: HashMap<RingId, WeightRing>,
     handle_to_ring: HashMap<WeightHandle, RingId>,
+    /// Phase pin plan (see [`WeightResidency::set_pin_plan`]). Pinned handles
+    /// bypass any ring binding (pool path) and stay resident across acquires:
+    /// the same-size recycle scan and the reclaimer skip them (the reclaimer
+    /// only as a last resort, so the budget stays a hard ceiling). Nothing
+    /// uploads at plan time; residency builds on first touch.
+    pinned: HashSet<WeightHandle>,
 }
 
 impl Inner {
@@ -204,6 +274,9 @@ pub struct WeightResidency<S: WeightSource> {
     /// `vram_bytes` ceiling enters the system; handed out via
     /// [`Self::arbiter`].
     arbiter: Arc<MemArbiter>,
+    /// Reuse pool for chunk-sized upload scratch (see `SCRATCH_POOL_CAP`).
+    /// Avoids a per-weight alloc + full zero of `UPLOAD_CHUNK_BYTES`.
+    scratch_pool: Mutex<Vec<Vec<u8>>>,
 }
 
 impl<S: WeightSource> WeightResidency<S> {
@@ -216,6 +289,7 @@ impl<S: WeightSource> WeightResidency<S> {
             source,
             arbiter: MemArbiter::new(MemTier::Vram, budget.vram_bytes),
             budget,
+            scratch_pool: Mutex::new(Vec::new()),
             inner: Arc::new(Mutex::new(Inner {
                 metas: Vec::new(),
                 gpu: HashMap::new(),
@@ -223,6 +297,7 @@ impl<S: WeightSource> WeightResidency<S> {
                 gpu_lru: Vec::new(),
                 rings: HashMap::new(),
                 handle_to_ring: HashMap::new(),
+                pinned: HashSet::new(),
             })),
         }
     }
@@ -283,6 +358,7 @@ impl<S: WeightSource> WeightResidency<S> {
                             id: None,
                             occupant: None,
                             pin_count: 0,
+                            fresh: false,
                         }),
                         next_idx: 0,
                         allocated_bytes: 0,
@@ -308,6 +384,71 @@ impl<S: WeightSource> WeightResidency<S> {
         Ok(h)
     }
 
+    /// Install a phase pin plan: walk `priority` front-to-back, marking
+    /// handles pinned while their cumulative GPU bytes fit `pin_budget_bytes`
+    /// (an entry that doesn't fit is skipped; later smaller ones may still
+    /// fit). Pin-on-first-touch: nothing uploads here. A pinned handle
+    /// bypasses its ring binding (pool path), and once resident it survives
+    /// the same-size recycle scan and the reclaim chain (except as a last
+    /// resort), so repeated acquires across steps hit without re-reading the
+    /// source. Replaces any previous plan; formerly pinned residents become
+    /// ordinary LRU entries. Returns `(pinned_bytes, pinned_count)`.
+    ///
+    /// Caller computes `pin_budget_bytes` from its budget headroom, typically
+    /// `vram_bytes - ring_reserved_bytes() - workspace estimate - staging
+    /// reserve`. Over-pinning cannot bust the ceiling (the reclaimer's last
+    /// resort frees pinned entries) but starves workspace into reclaim
+    /// thrash, so the estimate should be conservative.
+    pub fn set_pin_plan(&self, priority: &[WeightHandle], pin_budget_bytes: u64) -> (u64, usize) {
+        let mut g = self.inner.lock().unwrap();
+        g.pinned.clear();
+        let mut bytes = 0u64;
+        for &h in priority {
+            let Some(meta) = g.metas.get(h.0 as usize) else {
+                continue;
+            };
+            let sz = meta.storage_bytes();
+            if bytes.saturating_add(sz) > pin_budget_bytes {
+                continue;
+            }
+            if g.pinned.insert(h) {
+                bytes += sz;
+            }
+        }
+        (bytes, g.pinned.len())
+    }
+
+    /// Drop the pin plan (phase boundary). Resident entries stay warm but
+    /// become ordinary LRU/reclaim candidates, so the next phase's
+    /// allocations evict them on demand.
+    pub fn clear_pin_plan(&self) {
+        self.inner.lock().unwrap().pinned.clear();
+    }
+
+    /// Upper bound on the VRAM the rings claim once streaming reaches steady
+    /// state: every ring fully populated (`WEIGHT_RING_SLOTS * bytes_per_slot`
+    /// each). Pin-plan callers subtract this from the budget headroom.
+    pub fn ring_reserved_bytes(&self) -> u64 {
+        let g = self.inner.lock().unwrap();
+        g.rings
+            .values()
+            .map(|r| WEIGHT_RING_SLOTS as u64 * r.bytes_per_slot)
+            .sum()
+    }
+
+    /// Largest transient upload-staging footprint a single acquire can take:
+    /// the max `on_disk_bytes` across registered weights (GPU-prep acquires
+    /// stage the raw bytes in VRAM while the prep kernel runs). Pin-plan
+    /// callers subtract this from the budget headroom.
+    pub fn staging_reserve_bytes(&self) -> u64 {
+        let g = self.inner.lock().unwrap();
+        g.metas
+            .iter()
+            .map(|m| m.on_disk_bytes.next_multiple_of(4))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Page the weight up to GPU. Returns a `GpuView` that pins the buffer for
     /// its lifetime. Drop the view to release the pin; subsequent eviction may
     /// reclaim the buffer.
@@ -317,10 +458,16 @@ impl<S: WeightSource> WeightResidency<S> {
         backend: &B,
     ) -> Result<GpuView<'a>, ResidencyError<S::Error, B::Error>> {
         // Ring-bound handles take a separate code path: no pool, no LRU,
-        // fixed-size rotating slots overwritten via `write_buffer`.
+        // fixed-size rotating slots overwritten via `write_buffer`. Pinned
+        // handles bypass their ring binding: the whole point of the pin is
+        // residency across acquires, which a rotating slot can't provide.
         let ring_id = {
             let g = self.inner.lock().unwrap();
-            g.handle_to_ring.get(&handle).copied()
+            if g.pinned.contains(&handle) {
+                None
+            } else {
+                g.handle_to_ring.get(&handle).copied()
+            }
         };
         if let Some(rid) = ring_id {
             return self.acquire_from_ring(handle, rid, backend).await;
@@ -335,6 +482,11 @@ impl<S: WeightSource> WeightResidency<S> {
                 .ok_or(ResidencyError::UnknownHandle(handle))?;
             let hit = g.gpu.get_mut(&handle).map(|e| {
                 e.pin_count += 1;
+                // First access after a fill consumes the freshness: a
+                // prefetch fills cold (fresh), the block's real acquire is
+                // this hit, and from here the entry is an ordinary LRU
+                // candidate again.
+                e.fresh = false;
                 BufRef::new(e.id, e.bytes)
             });
             if hit.is_some() {
@@ -356,22 +508,14 @@ impl<S: WeightSource> WeightResidency<S> {
             });
         }
 
-        // GPU miss. Stream from the mmap'd source directly into the upload
-        // payload; no host-side cache. The temporary `Vec<u8>` lives only
-        // until upload returns - tracked as RAM Upload so the budget sees
-        // this transient peak. Weights matching a `weight_prep` kernel read
-        // their raw bytes untouched (the GPU transcodes/transposes during
-        // upload); everything else takes the CPU `read_for_gpu` path.
-        let prep = Self::prep_op(&meta);
-        let _upload_charge = RamCharge::new(
-            backend.mem_account().clone(),
-            RamCategory::Upload,
-            meta.storage_bytes().max(meta.on_disk_bytes),
-        );
-        let payload = match prep {
-            Some(_) => self.read_raw::<B>(&meta).await?,
-            None => self.read_for_gpu::<B>(&meta).await?,
-        };
+        // GPU miss. Stream from the source through a bounded scratch into
+        // GPU buffers: no host-side cache, no tensor-sized host allocations
+        // (hard rule on web, transient-RAM win on native). Weights matching
+        // a `weight_prep` kernel stream raw into GPU staging (the kernel
+        // transcodes/transposes during upload); plain weights stream straight
+        // into their buffer. Only backends without GPU prep (test mocks)
+        // take the whole-tensor CPU path.
+        let prep = Self::prep_op(&meta).filter(|&op| backend.supports_weight_prep(op));
 
         let gpu_size = meta.storage_bytes();
         // Single weight must fit under the absolute budget. Any further
@@ -398,16 +542,29 @@ impl<S: WeightSource> WeightResidency<S> {
             None
         } else {
             let mut g = self.inner.lock().unwrap();
-            let victim = g.gpu_lru.iter().position(|h| {
-                g.gpu
-                    .get(h)
-                    .is_some_and(|e| e.pin_count == 0 && e.bytes == gpu_size)
-            });
+            // Prefer a stale same-size victim; only recycle a fresh
+            // (prefetched-unconsumed) buffer when no stale one exists.
+            // Pinned residents are never recycle victims.
+            let victim = g
+                .gpu_lru
+                .iter()
+                .position(|h| {
+                    g.gpu.get(h).is_some_and(|e| {
+                        e.pin_count == 0 && e.bytes == gpu_size && !e.fresh && !g.pinned.contains(h)
+                    })
+                })
+                .or_else(|| {
+                    g.gpu_lru.iter().position(|h| {
+                        g.gpu.get(h).is_some_and(|e| {
+                            e.pin_count == 0 && e.bytes == gpu_size && !g.pinned.contains(h)
+                        })
+                    })
+                });
             victim.map(|pos| {
                 let h = g.gpu_lru.remove(pos);
                 let e = g.gpu.remove(&h).expect("victim came from lru scan");
                 g.gpu_bytes -= e.bytes;
-                tracing::info!(
+                tracing::debug!(
                     target: crate::trace::WEIGHT_EVICT,
                     op = "recycle",
                     handle = h.0,
@@ -427,52 +584,63 @@ impl<S: WeightSource> WeightResidency<S> {
         };
         match prep {
             Some(op) => {
-                // Transient staging for the raw bytes lives inside
-                // `weight_prep`; reserve headroom for it here where the
-                // arbiter is in reach (dims uniform is noise, lumped in).
-                self.arbiter.ensure_headroom(mem, payload.len() as u64 + 16);
-                // Diag-gated clock: `Instant::now` panics on wasm32 and the
-                // timing only surfaces via the diag event below.
-                let t_prep = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO)
-                    .then(std::time::Instant::now);
-                let done = backend
-                    .weight_prep(op, &payload, &BufRef::new(id, gpu_size))
-                    .await
+                // Raw bytes stream into transient GPU staging; the prep
+                // kernel transcodes/transposes into the weight buffer.
+                // Headroom covers staging (dims uniform is noise, lumped in).
+                let staging_len = meta.on_disk_bytes.next_multiple_of(4);
+                self.arbiter.ensure_headroom(mem, staging_len + 16);
+                let staging = backend
+                    .allocate_in(staging_len, VramCategory::Staging)
                     .map_err(ResidencyError::Backend)?;
-                if done {
-                    tracing::info!(
-                        target: "thinfer::diag",
-                        id = %meta.id.0,
-                        mb = (payload.len() as f64) / 1.0e6,
-                        prep_ms = t_prep.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
-                        op = ?op,
-                        "gpu prep"
-                    );
-                } else {
-                    // Backend without GPU prep (test mocks): produce the
-                    // same bytes on the CPU.
-                    let bytes = match op {
-                        WeightPrep::Q8_0FromBf16 { .. } => {
-                            let mut dst = vec![0u8; gpu_size as usize];
-                            crate::quant::encode_q8_0_from_bf16(&payload, &mut dst);
-                            dst
-                        }
-                        WeightPrep::TransposeBf16 { n, k } => transpose_bf16_cpu(
-                            &payload,
-                            payload.len(),
-                            gpu_size as usize,
-                            n as usize,
-                            k as usize,
-                        ),
-                    };
-                    backend
-                        .write_buffer(id, 0, &bytes)
-                        .map_err(ResidencyError::Backend)?;
-                }
+                // Diag-gated clock: the timing only surfaces via the diag
+                // event below, and on wasm each enabled read is a JS roundtrip.
+                let t_prep = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG)
+                    .then(crate::trace::Instant::now);
+                let res = match self
+                    .stream_source_to_gpu(backend, &meta, staging, staging_len)
+                    .await
+                {
+                    Ok(()) => backend
+                        .weight_prep(
+                            op,
+                            &BufRef::new(staging, staging_len),
+                            &BufRef::new(id, gpu_size),
+                        )
+                        .await
+                        .map_err(ResidencyError::Backend),
+                    Err(e) => Err(e),
+                };
+                backend.free(staging);
+                res?;
+                tracing::debug!(
+                    target: "thinfer::diag",
+                    id = %meta.id.0,
+                    mb = (meta.on_disk_bytes as f64) / 1.0e6,
+                    prep_ms = t_prep.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                    op = ?op,
+                    "gpu prep"
+                );
             }
-            None => backend
-                .write_buffer(id, 0, payload.as_slice())
-                .map_err(ResidencyError::Backend)?,
+            None if meta.is_passthrough() => {
+                // Pure passthrough: stream straight into the weight buffer
+                // (storage padding past the on-disk bytes is zero-filled).
+                self.stream_source_to_gpu(backend, &meta, id, gpu_size)
+                    .await?;
+            }
+            None => {
+                // CPU transform fallback (backend lacks GPU prep, or the
+                // layout misses the kernel constraints): whole-tensor read.
+                let _upload_charge = RamCharge::new(
+                    backend.mem_account().clone(),
+                    RamCategory::Upload,
+                    gpu_size.max(meta.on_disk_bytes),
+                );
+                let payload = self.read_for_gpu::<B>(&meta).await?;
+                backend.mem_account().add_source_bytes(meta.on_disk_bytes);
+                backend
+                    .write_buffer(id, 0, payload.as_slice())
+                    .map_err(ResidencyError::Backend)?;
+            }
         }
 
         let mut g = self.inner.lock().unwrap();
@@ -482,6 +650,7 @@ impl<S: WeightSource> WeightResidency<S> {
                 id,
                 bytes: gpu_size,
                 pin_count: 1,
+                fresh: true,
             },
         );
         g.gpu_bytes += gpu_size;
@@ -519,6 +688,9 @@ impl<S: WeightSource> WeightResidency<S> {
             let bytes_per_slot = r.bytes_per_slot;
             if let Some(idx) = r.slots.iter().position(|s| s.occupant == Some(handle)) {
                 r.slots[idx].pin_count += 1;
+                // Consume freshness: the prefetch filled this slot, this
+                // hit is the block's real read (see `GpuEntry::fresh`).
+                r.slots[idx].fresh = false;
                 let id = r.slots[idx].id.expect("populated occupant has id");
                 tracing::trace!(
                     target: crate::trace::RESIDENCY_MOVE,
@@ -543,57 +715,86 @@ impl<S: WeightSource> WeightResidency<S> {
             let idx = chosen.ok_or(ResidencyError::RingAllSlotsPinned { ring })?;
             let needs_alloc = r.slots[idx].id.is_none();
             r.next_idx = (idx + 1) % n;
+            // Claim = pin. The fill below awaits off-mutex (web OPFS reads
+            // suspend to the event loop), so an interleaved acquire under
+            // budget pressure would otherwise see pin_count == 0 and free
+            // this slot's buffer mid-fill (UnknownBuffer on the write), and
+            // an acquire of the old occupant would ring-hit a slot being
+            // overwritten. Unpinned again if the fill fails.
+            r.slots[idx].pin_count = 1;
+            r.slots[idx].occupant = None;
             (meta, bytes_per_slot, handle_bytes, idx, needs_alloc)
         };
 
-        // If we need to allocate, ensure the new slot's footprint fits
-        // under the VRAM budget (counting workspace and other rings as
-        // already-reserved).
-        if needs_alloc {
-            if bytes_per_slot > self.budget.vram_bytes {
-                return Err(ResidencyError::BudgetTooSmall {
-                    needed: bytes_per_slot,
-                    have: self.budget.vram_bytes,
-                    tier: "vram",
-                });
+        // Allocate (if needed) and fill the claimed slot off-mutex. Fallible
+        // section lives in one block so every failure unpins the claim
+        // (a leaked pin would dead-end the ring as RingAllSlotsPinned).
+        let fill = async {
+            // If we need to allocate, ensure the new slot's footprint fits
+            // under the VRAM budget (counting workspace and other rings as
+            // already-reserved).
+            let id = if needs_alloc {
+                if bytes_per_slot > self.budget.vram_bytes {
+                    return Err(ResidencyError::BudgetTooSmall {
+                        needed: bytes_per_slot,
+                        have: self.budget.vram_bytes,
+                        tier: "vram",
+                    });
+                }
+                self.arbiter
+                    .ensure_headroom(backend.mem_account(), bytes_per_slot);
+                let id = backend
+                    .allocate_in(bytes_per_slot, VramCategory::Weights)
+                    .map_err(ResidencyError::Backend)?;
+                let mut g = self.inner.lock().unwrap();
+                let r = g.rings.get_mut(&ring).expect("ring registered");
+                r.slots[slot_idx].id = Some(id);
+                r.allocated_bytes += bytes_per_slot;
+                id
+            } else {
+                let g = self.inner.lock().unwrap();
+                g.rings[&ring].slots[slot_idx]
+                    .id
+                    .expect("populated slot has id")
+            };
+            if meta.is_passthrough() {
+                // Passthrough: stream through the bounded scratch.
+                self.stream_source_to_gpu(backend, &meta, id, handle_bytes)
+                    .await?;
+            } else {
+                // CPU transform fallback: whole-tensor read.
+                let _upload_charge = RamCharge::new(
+                    backend.mem_account().clone(),
+                    RamCategory::Upload,
+                    handle_bytes,
+                );
+                let bytes = self.read_for_gpu::<B>(&meta).await?;
+                backend.mem_account().add_source_bytes(meta.on_disk_bytes);
+                debug_assert_eq!(bytes.len() as u64, handle_bytes);
+                backend
+                    .write_buffer(id, 0, bytes.as_slice())
+                    .map_err(ResidencyError::Backend)?;
             }
-            self.arbiter
-                .ensure_headroom(backend.mem_account(), bytes_per_slot);
-        }
-
-        // Read bytes off-mutex (mmap path may touch async).
-        let _upload_charge = RamCharge::new(
-            backend.mem_account().clone(),
-            RamCategory::Upload,
-            handle_bytes,
-        );
-        let bytes = self.read_for_gpu::<B>(&meta).await?;
-        debug_assert_eq!(bytes.len() as u64, handle_bytes);
-
-        // Allocate (if needed), claim the slot, and write the contents.
-        let id = if needs_alloc {
-            let id = backend
-                .allocate_in(bytes_per_slot, VramCategory::Weights)
-                .map_err(ResidencyError::Backend)?;
-            let mut g = self.inner.lock().unwrap();
-            let r = g.rings.get_mut(&ring).expect("ring registered");
-            r.slots[slot_idx].id = Some(id);
-            r.allocated_bytes += bytes_per_slot;
-            id
-        } else {
-            let g = self.inner.lock().unwrap();
-            g.rings[&ring].slots[slot_idx]
-                .id
-                .expect("populated slot has id")
+            Ok(id)
         };
-        backend
-            .write_buffer(id, 0, bytes.as_slice())
-            .map_err(ResidencyError::Backend)?;
+        let id = match fill.await {
+            Ok(id) => id,
+            Err(e) => {
+                let mut g = self.inner.lock().unwrap();
+                let r = g.rings.get_mut(&ring).expect("ring registered");
+                // Claim-time pin is ours alone (occupant is None, so no hit
+                // can stack a second pin); drop it so the slot stays usable.
+                r.slots[slot_idx].pin_count = 0;
+                return Err(e);
+            }
+        };
 
         let mut g = self.inner.lock().unwrap();
         let r = g.rings.get_mut(&ring).expect("ring registered");
         r.slots[slot_idx].occupant = Some(handle);
-        r.slots[slot_idx].pin_count = 1;
+        // Just filled, not yet consumed (a prefetch leaves this set until
+        // the block's acquire hits and clears it).
+        r.slots[slot_idx].fresh = true;
         tracing::trace!(
             target: crate::trace::RESIDENCY_MOVE,
             handle = handle.0,
@@ -613,41 +814,37 @@ impl<S: WeightSource> WeightResidency<S> {
         })
     }
 
-    /// Stream `meta` from source into the GPU storage layout.
-    /// Bf16 source: passthrough (bytes are already bf16). `Linear2D` applies a
-    /// block-tiled u16-stride transpose. Quant (GGUF Q-block) source: byte
-    /// passthrough; GGUF stores `[N, K]` block-major already, so Linear2D is
-    /// rejected. F32 source: not implemented on the GPU path (would need a
-    /// per-binding kernel flavor; add when a model requires it). Output length
-    /// matches `meta.storage_bytes()`.
+    /// CPU-transform fallback: whole-tensor read into the GPU storage layout
+    /// (backends without GPU `weight_prep`, i.e. test mocks; passthrough
+    /// layouts stream via `stream_source_to_gpu` instead and never land
+    /// here). Transforms: bf16 `Linear2D` block-tiled u16-stride transpose;
+    /// `transcode` delegates to `read_transcoded`; F32 narrows to bf16
+    /// (lossless round-trip enforced; GGUF F32 tensors are upcast bf16);
+    /// Quant + `Linear2D` dequants to dense bf16 `[K, N]` (GGUF-quantized
+    /// AdaLN). Output length matches `meta.storage_bytes()`.
     async fn read_for_gpu<B: Backend>(
         &self,
         meta: &WeightMeta,
     ) -> Result<Vec<u8>, ResidencyError<S::Error, B::Error>> {
-        if !matches!(
-            meta.encoding,
-            StorageEncoding::Bf16 | StorageEncoding::Quant(_)
-        ) {
-            return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
-                meta.encoding,
-            )));
-        }
-        if matches!(meta.encoding, StorageEncoding::Quant(_))
-            && !matches!(meta.transpose, TransposePolicy::None)
-        {
-            return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
-                meta.encoding,
-            )));
-        }
         if let Some(kind) = meta.transcode {
             return self.read_transcoded::<B>(meta, kind).await;
         }
         let storage_len = meta.storage_bytes() as usize;
         let on_disk_len = meta.on_disk_bytes as usize;
-        // For bf16 with odd element count, storage_bytes pads to u32. The disk
-        // bytes are tight (no padding); we leave the tail as zero. Quant
-        // tensors satisfy `storage_bytes == on_disk_bytes` by construction.
-        let mut bytes = vec![0u8; storage_len];
+        // Same-encoding flows read straight into a storage-sized buffer (for
+        // bf16 with odd element count, storage_bytes pads to u32; the tail
+        // stays zero). Encoding-changing flows (F32 narrow, quant dequant)
+        // read the tight on-disk bytes and build the storage buffer in the
+        // transform below.
+        let same_encoding = meta.gpu_encoding() == meta.encoding;
+        let mut bytes = vec![
+            0u8;
+            if same_encoding {
+                storage_len
+            } else {
+                on_disk_len
+            }
+        ];
 
         let mut reader = self
             .source
@@ -664,36 +861,54 @@ impl<S: WeightSource> WeightResidency<S> {
         }
         // One shot read: source is mmap-backed, so this is a memcpy from the
         // OS page cache. No chunking needed.
-        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO);
-        let t_read = diag.then(std::time::Instant::now);
+        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG);
+        let t_read = diag.then(crate::trace::Instant::now);
         reader
             .read_at(0, &mut bytes[..on_disk_len])
             .await
             .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
         let read_ms = t_read.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
-        let t_xpose = diag.then(std::time::Instant::now);
+        let t_xpose = diag.then(crate::trace::Instant::now);
 
-        let out = match meta.transpose {
-            TransposePolicy::None => Ok(bytes),
-            TransposePolicy::Linear2D => {
-                if meta.shape.0.len() != 2 {
-                    return Err(ResidencyError::BadRank {
-                        id: meta.id.clone(),
-                        rank: meta.shape.0.len(),
-                        wanted: "2D",
-                    });
-                }
-                let n = meta.shape.0[0];
-                let k = meta.shape.0[1];
+        let out = match (meta.encoding, meta.transpose) {
+            (StorageEncoding::Bf16 | StorageEncoding::Quant(_), TransposePolicy::None) => Ok(bytes),
+            (StorageEncoding::Bf16, TransposePolicy::Linear2D) => {
+                let (n, k) = rank2(meta)?;
                 Ok(transpose_bf16_cpu(&bytes, on_disk_len, storage_len, n, k))
             }
+            (StorageEncoding::F32, transpose) => {
+                let tight_len = on_disk_len / 2; // bf16 halves the f32 bytes
+                let narrowed = narrow_f32_to_bf16(
+                    &bytes,
+                    match transpose {
+                        TransposePolicy::None => storage_len,
+                        TransposePolicy::Linear2D => tight_len,
+                    },
+                )
+                .map_err(|index| ResidencyError::F32NarrowingLoss {
+                    id: meta.id.clone(),
+                    index,
+                })?;
+                match transpose {
+                    TransposePolicy::None => Ok(narrowed),
+                    TransposePolicy::Linear2D => {
+                        let (n, k) = rank2(meta)?;
+                        Ok(transpose_bf16_cpu(&narrowed, tight_len, storage_len, n, k))
+                    }
+                }
+            }
+            (StorageEncoding::Quant(kind), TransposePolicy::Linear2D) => {
+                let (n, k) = rank2(meta)?;
+                Ok(dequant_transpose_bf16(kind, &bytes, storage_len, n, k))
+            }
+            (e, _) => Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(e))),
         };
-        tracing::info!(
+        tracing::debug!(
             target: "thinfer::diag",
             id = %meta.id.0,
             mb = (on_disk_len as f64) / 1.0e6,
             read_ms = read_ms,
-            transpose_ms = t_xpose.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+            transform_ms = t_xpose.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
             "plain read"
         );
         out
@@ -730,17 +945,17 @@ impl<S: WeightSource> WeightResidency<S> {
                 got: reader.len(),
             });
         }
-        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO);
-        let t_read = diag.then(std::time::Instant::now);
+        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG);
+        let t_read = diag.then(crate::trace::Instant::now);
         reader
             .read_at(0, &mut src)
             .await
             .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
         let read_ms = t_read.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let mut dst = vec![0u8; meta.storage_bytes() as usize];
-        let t_enc = diag.then(std::time::Instant::now);
+        let t_enc = diag.then(crate::trace::Instant::now);
         crate::quant::encode_q8_0_from_bf16(&src, &mut dst);
-        tracing::info!(
+        tracing::debug!(
             target: "thinfer::diag",
             id = %meta.id.0,
             mb = (meta.on_disk_bytes as f64) / 1.0e6,
@@ -751,39 +966,123 @@ impl<S: WeightSource> WeightResidency<S> {
         Ok(dst)
     }
 
-    /// Read `meta`'s raw on-disk bytes untouched (no transcode/transpose).
-    /// Feeds `Backend::weight_prep`, which does the munging on the GPU.
-    async fn read_raw<B: Backend>(
+    /// Stream `meta`'s raw on-disk bytes into `dst[0..padded_len)` through a
+    /// bounded scratch: host memory never exceeds one chunk regardless of
+    /// tensor size (the web hard rule). Bytes past `on_disk_bytes` (storage
+    /// padding; `padded_len` is 4-byte aligned for `write_buffer`) are
+    /// zero-filled. No transform: callers pair this with GPU `weight_prep`
+    /// or use it for passthrough layouts.
+    async fn stream_source_to_gpu<B: Backend>(
         &self,
+        backend: &B,
         meta: &WeightMeta,
-    ) -> Result<Vec<u8>, ResidencyError<S::Error, B::Error>> {
-        let mut raw = vec![0u8; meta.on_disk_bytes as usize];
+        dst: GpuBufferId,
+        padded_len: u64,
+    ) -> Result<(), ResidencyError<S::Error, B::Error>> {
+        if !matches!(
+            meta.encoding,
+            StorageEncoding::Bf16 | StorageEncoding::Quant(_)
+        ) {
+            return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
+                meta.encoding,
+            )));
+        }
+        let total = meta.on_disk_bytes;
+        debug_assert!(padded_len >= total && padded_len.is_multiple_of(4));
         let mut reader = self
             .source
             .open(&meta.id)
             .await
             .map_err(ResidencyError::Source)?;
-        if reader.len() != meta.on_disk_bytes {
+        if reader.len() != total {
             return Err(ResidencyError::SizeMismatch {
                 id: meta.id.clone(),
-                expected: meta.on_disk_bytes,
+                expected: total,
                 got: reader.len(),
             });
         }
-        let t_read = tracing::enabled!(target: "thinfer::diag", tracing::Level::INFO)
-            .then(std::time::Instant::now);
-        reader
-            .read_at(0, &mut raw)
-            .await
-            .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
-        tracing::info!(
+        let scratch_len = padded_len.min(UPLOAD_CHUNK_BYTES) as usize;
+        let _upload_charge = RamCharge::new(
+            backend.mem_account().clone(),
+            RamCategory::Upload,
+            scratch_len as u64,
+        );
+        let mut scratch = {
+            let mut pool = self.scratch_pool.lock().unwrap();
+            pool.pop().unwrap_or_default()
+        };
+        // Reused buffers are at least chunk-sized; grow a smaller/empty one.
+        // Contents are stale but every chunk fully overwrites `[..n_write]`
+        // below, so no up-front zeroing is needed.
+        if scratch.len() < scratch_len {
+            scratch.resize(scratch_len, 0);
+        }
+        // Prime the read pipeline: issue the first `READ_PREFETCH_CHUNKS`
+        // chunk reads up front so the async reader's IO worker stays
+        // saturated and never idles between chunks waiting for the engine
+        // thread to ask for the next one.
+        let mut primed = 0u64;
+        for _ in 0..READ_PREFETCH_CHUNKS {
+            if primed >= total {
+                break;
+            }
+            let len = (total - primed).min(UPLOAD_CHUNK_BYTES);
+            reader.will_read(primed, len);
+            primed += UPLOAD_CHUNK_BYTES;
+        }
+        // Split read (read_at: worker RPC + transfer + copy_to scratch) from
+        // upload (write_buffer enqueue, which blocks under queue backpressure)
+        // so we can attribute the per-step cost to the OPFS/IO side vs the GPU
+        // side. Debug-gated; zero clock reads otherwise.
+        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG);
+        let mut read_acc = std::time::Duration::ZERO;
+        let mut write_acc = std::time::Duration::ZERO;
+        let mut off = 0u64;
+        while off < padded_len {
+            let n_write = (padded_len - off).min(UPLOAD_CHUNK_BYTES) as usize;
+            let n_read = (total.saturating_sub(off)).min(n_write as u64) as usize;
+            let t_r = diag.then(crate::trace::Instant::now);
+            reader
+                .read_at(off, &mut scratch[..n_read])
+                .await
+                .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
+            if let Some(t) = t_r {
+                read_acc += t.elapsed();
+            }
+            backend.mem_account().add_source_bytes(n_read as u64);
+            // Keep the pipeline full: hint the chunk `READ_PREFETCH_CHUNKS`
+            // ahead of the one just consumed (the nearer chunks are already
+            // queued from priming / prior refills).
+            let ahead_off = off + READ_PREFETCH_CHUNKS * UPLOAD_CHUNK_BYTES;
+            let ahead_read = total.saturating_sub(ahead_off).min(UPLOAD_CHUNK_BYTES);
+            if ahead_read > 0 {
+                reader.will_read(ahead_off, ahead_read);
+            }
+            scratch[n_read..n_write].fill(0);
+            let t_w = diag.then(crate::trace::Instant::now);
+            backend
+                .write_buffer(dst, off, &scratch[..n_write])
+                .map_err(ResidencyError::Backend)?;
+            if let Some(t) = t_w {
+                write_acc += t.elapsed();
+            }
+            off += n_write as u64;
+        }
+        {
+            let mut pool = self.scratch_pool.lock().unwrap();
+            if pool.len() < SCRATCH_POOL_CAP {
+                pool.push(scratch);
+            }
+        }
+        tracing::debug!(
             target: "thinfer::diag",
             id = %meta.id.0,
-            mb = (meta.on_disk_bytes as f64) / 1.0e6,
-            read_ms = t_read.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
-            "raw read"
+            mb = (total as f64) / 1.0e6,
+            read_ms = read_acc.as_secs_f64() * 1000.0,
+            write_ms = write_acc.as_secs_f64() * 1000.0,
+            "stream read"
         );
-        Ok(raw)
+        Ok(())
     }
 
     /// GPU-side prep op for this weight, when its layout fits the
@@ -847,6 +1146,9 @@ impl<S: WeightSource> WeightResidency<S> {
     /// are skipped; they stay resident.
     pub fn evict_all_and_free<B: Backend>(&self, backend: &B) {
         let mut g = self.inner.lock().unwrap();
+        // A phase boundary ends any pin plan: pinned residents free with the
+        // rest (the caller installs a fresh plan for the next phase if any).
+        g.pinned.clear();
         let victims: Vec<WeightHandle> = g
             .gpu
             .iter()
@@ -874,6 +1176,7 @@ impl<S: WeightSource> WeightResidency<S> {
                         r.allocated_bytes -= r.bytes_per_slot;
                     }
                     slot.occupant = None;
+                    slot.fresh = false;
                 }
             }
             r.next_idx = 0;
@@ -906,39 +1209,54 @@ impl<B: Backend + Send + Sync> MemReclaimer for WeightReclaimer<B> {
         };
         let mut g = inner.lock().unwrap();
         let mut freed = 0u64;
-        let mut idx = 0;
-        while freed < at_least && idx < g.gpu_lru.len() {
-            let h = g.gpu_lru[idx];
-            if g.gpu.get(&h).is_some_and(|e| e.pin_count == 0) {
-                g.gpu_lru.remove(idx);
-                let e = g.gpu.remove(&h).expect("lru entries are resident");
-                g.gpu_bytes -= e.bytes;
-                self.backend.free(e.id);
-                freed += e.bytes;
-                tracing::info!(
-                    target: crate::trace::WEIGHT_EVICT,
-                    op = "evict",
-                    handle = h.0,
-                    bytes = e.bytes,
-                );
-            } else {
-                idx += 1;
-            }
-        }
-        if freed >= at_least {
-            return freed;
-        }
-        for r in g.rings.values_mut() {
-            for slot in r.slots.iter_mut() {
-                if slot.pin_count == 0
-                    && let Some(id) = slot.id.take()
+        // Three passes: stale residents first, then fresh (prefetched-but-
+        // unconsumed) ones, then pin-plan residents only if still short. A
+        // fresh weight is a guaranteed imminent re-read, so it's a bad
+        // eviction; a pinned weight is the phase's whole residency win, so
+        // it's the worst - but both stay evictable so a working set that
+        // genuinely exceeds budget can't deadlock the chain (the budget is
+        // a hard ceiling, not a mode switch).
+        for (allow_fresh, allow_pinned) in [(false, false), (true, false), (true, true)] {
+            let mut idx = 0;
+            while freed < at_least && idx < g.gpu_lru.len() {
+                let h = g.gpu_lru[idx];
+                if (allow_pinned || !g.pinned.contains(&h))
+                    && g.gpu
+                        .get(&h)
+                        .is_some_and(|e| e.pin_count == 0 && (allow_fresh || !e.fresh))
                 {
-                    self.backend.free(id);
-                    r.allocated_bytes -= r.bytes_per_slot;
-                    slot.occupant = None;
-                    freed += r.bytes_per_slot;
-                    if freed >= at_least {
-                        return freed;
+                    g.gpu_lru.remove(idx);
+                    let e = g.gpu.remove(&h).expect("lru entries are resident");
+                    g.gpu_bytes -= e.bytes;
+                    self.backend.free(e.id);
+                    freed += e.bytes;
+                    tracing::debug!(
+                        target: crate::trace::WEIGHT_EVICT,
+                        op = "evict",
+                        handle = h.0,
+                        bytes = e.bytes,
+                    );
+                } else {
+                    idx += 1;
+                }
+            }
+            if freed >= at_least {
+                return freed;
+            }
+            for r in g.rings.values_mut() {
+                for slot in r.slots.iter_mut() {
+                    if slot.pin_count == 0
+                        && (allow_fresh || !slot.fresh)
+                        && let Some(id) = slot.id.take()
+                    {
+                        self.backend.free(id);
+                        r.allocated_bytes -= r.bytes_per_slot;
+                        slot.occupant = None;
+                        slot.fresh = false;
+                        freed += r.bytes_per_slot;
+                        if freed >= at_least {
+                            return freed;
+                        }
                     }
                 }
             }
@@ -952,6 +1270,65 @@ impl<B: Backend + Send + Sync> MemReclaimer for WeightReclaimer<B> {
 /// equal the element count (padding only matters when odd, and 2-D linear
 /// weights never have an odd product). CPU fallback for
 /// `WeightPrep::TransposeBf16`; the GPU kernel must stay bit-identical.
+/// `meta.shape` as `(n, k)`, or `BadRank` for non-2-D tensors.
+fn rank2<SE: core::fmt::Debug, BE: core::fmt::Debug>(
+    meta: &WeightMeta,
+) -> Result<(usize, usize), ResidencyError<SE, BE>> {
+    if meta.shape.0.len() != 2 {
+        return Err(ResidencyError::BadRank {
+            id: meta.id.clone(),
+            rank: meta.shape.0.len(),
+            wanted: "2D",
+        });
+    }
+    Ok((meta.shape.0[0], meta.shape.0[1]))
+}
+
+/// Narrow an f32 byte stream to packed bf16 in an `out_len`-byte buffer
+/// (`out_len >= 2 * elements`; tail stays zero). Every value must round-trip
+/// f32 -> bf16 -> f32 exactly; the index of the first that doesn't is
+/// returned so the caller can fail loud (see
+/// `ResidencyError::F32NarrowingLoss`).
+fn narrow_f32_to_bf16(src: &[u8], out_len: usize) -> Result<Vec<u8>, u64> {
+    let values: &[f32] = bytemuck::cast_slice(src);
+    debug_assert!(out_len >= values.len() * 2);
+    let mut out = vec![0u8; out_len];
+    let dst: &mut [u16] = bytemuck::cast_slice_mut(&mut out[..values.len() * 2]);
+    for (i, (&v, d)) in values.iter().zip(dst.iter_mut()).enumerate() {
+        let b = half::bf16::from_f32(v);
+        if b.to_f32().to_bits() != v.to_bits() {
+            return Err(i as u64);
+        }
+        *d = b.to_bits();
+    }
+    Ok(out)
+}
+
+/// Dequantize a GGUF quant block stream (`[N, K]` row-major, `K` a whole
+/// number of blocks) into dense packed-bf16 `[K, N]` (the `Linear2D` matmul
+/// B layout). Row at a time: dequant one K-row to f32, RNE to bf16, scatter
+/// into column `n` of the output.
+fn dequant_transpose_bf16(
+    kind: QuantKind,
+    src: &[u8],
+    storage_len: usize,
+    n: usize,
+    k: usize,
+) -> Vec<u8> {
+    let bytes_per_row = kind.bytes_for_elements(k as u64) as usize;
+    debug_assert_eq!(bytes_per_row * n, src.len());
+    let mut row = vec![0f32; k];
+    let mut out = vec![0u8; storage_len];
+    let dst: &mut [u16] = bytemuck::cast_slice_mut(&mut out[..n * k * 2]);
+    for nn in 0..n {
+        crate::quant::dequantize_row(kind, &src[nn * bytes_per_row..][..bytes_per_row], &mut row);
+        for (kk, &v) in row.iter().enumerate() {
+            dst[kk * n + nn] = half::bf16::from_f32(v).to_bits();
+        }
+    }
+    out
+}
+
 fn transpose_bf16_cpu(
     bytes: &[u8],
     on_disk_len: usize,

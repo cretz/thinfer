@@ -2,81 +2,14 @@
 //! resolved by the priority chosen at construction (the "primary"). The
 //! merged catalog reflects that priority.
 //!
-//! Use case: stitch a quantized GGUF source for matmul tensors on top of a
-//! safetensors source for norms/biases. The GGUF source is primary so its
-//! Q8_0 entries shadow the bf16 entries with the same `WeightId`.
+//! Use case: stitch a GGUF source serving a full quantized submodel (DiT)
+//! on top of a safetensors source serving the rest (text encoder, VAE).
+//! The GGUF source is primary so its entries shadow any same-`WeightId`
+//! safetensors entries.
 
-use crate::tensor::{Shape, StorageEncoding};
+use crate::tensor::Shape;
 use crate::weight::{WeightCatalog, WeightEntry, WeightId, WeightReader, WeightSource};
 use std::collections::HashMap;
-
-/// Hides any catalog entry whose encoding isn't `StorageEncoding::Quant`,
-/// plus any entry whose id contains one of `excluded_substrings`. Use
-/// over a GGUF source so a `UnionSource(gguf, safetensors)` falls through
-/// to safetensors for non-quant tensors (norms, biases) AND for tensors
-/// the engine intentionally keeps unquantized even when the GGUF file
-/// quantized them (e.g. AdaLN modulation weights, which the Z-Image
-/// engine reads as bf16).
-pub struct QuantOnlySource<S: WeightSource> {
-    inner: S,
-    catalog: WeightCatalog,
-}
-
-impl<S: WeightSource> QuantOnlySource<S> {
-    /// Hide only non-Quant entries. Convenience for callers that don't
-    /// need name-based exclusion.
-    pub fn new(inner: S) -> Self {
-        Self::with_excluded_substrings(inner, &[])
-    }
-
-    /// Hide non-Quant entries plus any id whose string contains one of
-    /// `excluded_substrings`. The name filter applies even to Quant
-    /// entries — that's the whole point (Q8 GGUFs from unsloth quantize
-    /// AdaLN tensors that the engine still wants as bf16).
-    pub fn with_excluded_substrings(inner: S, excluded_substrings: &[&str]) -> Self {
-        let mut catalog = WeightCatalog::new();
-        for (id, entry) in &inner.catalog().entries {
-            if !matches!(entry.encoding, Some(StorageEncoding::Quant(_))) {
-                continue;
-            }
-            if excluded_substrings.iter().any(|s| id.0.contains(s)) {
-                continue;
-            }
-            catalog.entries.insert(id.clone(), entry.clone());
-        }
-        Self { inner, catalog }
-    }
-
-    /// Hide non-Quant entries, then keep only those whose id contains one
-    /// of `allowed_substrings`. The engine-side equivalent of "only these
-    /// specific weight roles are expected to come from the Quant source —
-    /// everything else falls through". Use this when the upstream GGUF
-    /// quantizes more tensors than the engine treats as quantized.
-    pub fn with_allowed_substrings(inner: S, allowed_substrings: &[&str]) -> Self {
-        let mut catalog = WeightCatalog::new();
-        for (id, entry) in &inner.catalog().entries {
-            if !matches!(entry.encoding, Some(StorageEncoding::Quant(_))) {
-                continue;
-            }
-            if !allowed_substrings.iter().any(|s| id.0.contains(s)) {
-                continue;
-            }
-            catalog.entries.insert(id.clone(), entry.clone());
-        }
-        Self { inner, catalog }
-    }
-}
-
-impl<S: WeightSource> WeightSource for QuantOnlySource<S> {
-    type Reader = S::Reader;
-    type Error = S::Error;
-    fn catalog(&self) -> &WeightCatalog {
-        &self.catalog
-    }
-    async fn open(&self, id: &WeightId) -> Result<Self::Reader, Self::Error> {
-        self.inner.open(id).await
-    }
-}
 
 /// Re-keys another source's catalog. Entries appear under their renamed
 /// id; `open(renamed)` resolves back to the underlying id. Tensors not in
@@ -203,6 +136,12 @@ impl<A: WeightReader, B: WeightReader> WeightReader for UnionReader<A, B> {
         match self {
             Self::Primary(a) => a.read_at(offset, dst).await.map_err(UnionError::Primary),
             Self::Fallback(b) => b.read_at(offset, dst).await.map_err(UnionError::Fallback),
+        }
+    }
+    fn will_read(&mut self, offset: u64, len: u64) {
+        match self {
+            Self::Primary(a) => a.will_read(offset, len),
+            Self::Fallback(b) => b.will_read(offset, len),
         }
     }
 }
@@ -423,6 +362,15 @@ impl<S: WeightSource> WeightReader for SplitToFusedQkvReader<S> {
         match self {
             Self::Pass(r) => r.read_at(offset, dst).await,
             Self::Fused(f) => f.read_at(offset, dst).await,
+        }
+    }
+
+    // Fused readers span three sub-readers; a hint there would need the
+    // same range-split as `read_at` for marginal benefit (split-QKV
+    // checkpoints are the off-path schema). Pass-through forwards.
+    fn will_read(&mut self, offset: u64, len: u64) {
+        if let Self::Pass(r) = self {
+            r.will_read(offset, len);
         }
     }
 }

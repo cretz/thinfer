@@ -83,7 +83,7 @@ async fn run_one_with_cfg(
     let op = MatMulF32::new(mm_cfg);
     let wgsl = op.wgsl(&cfg);
     let pipeline = backend
-        .create_pipeline(&wgsl, "main", MatMulF32::layout())
+        .create_pipeline("q4_0_matmul", &wgsl, "main", MatMulF32::layout())
         .await
         .expect("pipeline");
 

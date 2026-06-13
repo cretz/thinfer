@@ -110,6 +110,12 @@ pub struct MemAccount {
     /// (looser) sum of per-category peaks.
     vram_total: Counter,
     ram_total: Counter,
+    /// Monotonic count of bytes read from the weight source (OPFS/disk),
+    /// ever. Not a live gauge: the caller diffs it across a phase to get
+    /// that phase's streamed volume. The headline web-perf number, since
+    /// re-reads (paging under a tight budget) show up here as growth past
+    /// the model size.
+    source_bytes: AtomicU64,
 }
 
 impl MemAccount {
@@ -171,6 +177,18 @@ impl MemAccount {
     }
     pub fn ram_total_peak(&self) -> u64 {
         self.ram_total.peak()
+    }
+
+    /// Record `bytes` read from the weight source. Monotonic; residency
+    /// calls this from every source read path.
+    pub fn add_source_bytes(&self, bytes: u64) {
+        self.source_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    /// Total bytes ever read from the weight source. Diff across a phase
+    /// to get that phase's streamed volume (re-reads inflate it past the
+    /// model size: the web paging signal).
+    pub fn source_bytes_total(&self) -> u64 {
+        self.source_bytes.load(Ordering::Relaxed)
     }
 
     /// Point-in-time read-out for reporting / test assertions.

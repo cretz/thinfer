@@ -27,6 +27,11 @@ const REPO_UPSTREAM: &str = "Tongyi-MAI/Z-Image-Turbo";
 /// stay safetensors and union over the top via
 /// `thinfer_core::format::union::UnionSource`.
 const REPO_GGUF: &str = "unsloth/Z-Image-Turbo-GGUF";
+/// Community GGUF conversion of the Z-Image text encoder (Qwen3-4B),
+/// declared `base_model: Tongyi-MAI/Z-Image-Turbo` so the underlying
+/// weights match the safetensors TE exactly (parity rule: same
+/// checkpoint). The standard pick for ComfyUI-GGUF Z-Image workflows.
+const REPO_TE_GGUF: &str = "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF";
 
 pub mod role {
     /// DiT (transformer). bf16 storage, sharded across 2 safetensors files
@@ -56,6 +61,89 @@ pub mod role {
     pub const DIT_GGUF_Q4_0: &str = "dit/gguf-q4_0";
     /// DiT-only GGUF, Q4_K_M. Same union pattern as Q8_0.
     pub const DIT_GGUF_Q4_K_M: &str = "dit/gguf-q4_k_m";
+    /// Qwen3-4B text encoder GGUF, Q8_0 (all 7 matmul sites + token_embd
+    /// Q8_0, norms F32). Replaces the 8GB bf16 TE safetensors shards on
+    /// quant variants: 4.28GB download AND ~half the per-encode cold read.
+    /// Q8_0 for both q8 and q4 variants: the smaller files in the repo are
+    /// IQ4_XS / Q3_K_M imatrix quants we don't decode.
+    pub const TE_GGUF_Q8_0: &str = "text_encoder/gguf-q8_0";
+}
+
+/// One loadable model variant: the file set `ZImageModel::load` needs.
+/// Single source of truth shared by CLI and web; `id` strings are the
+/// user-facing model ids on both.
+pub struct VariantFiles {
+    pub id: &'static str,
+    /// Safetensors weight shards, in `ShardedSafetensorsSource` order.
+    pub weight_roles: &'static [&'static str],
+    /// Non-weight files (tokenizer json).
+    pub aux_roles: &'static [&'static str],
+    /// GGUF to union over the safetensors source, if the variant quantizes
+    /// the DiT.
+    pub dit_gguf_role: Option<&'static str>,
+    /// Text-encoder GGUF, unioned the same way. `Some` exactly when
+    /// `dit_gguf_role` is (quant variants take both from GGUF).
+    pub te_gguf_role: Option<&'static str>,
+}
+
+const WEIGHT_ROLES: &[&str] = &[
+    role::DIT_SHARD_1,
+    role::DIT_SHARD_2,
+    role::TEXT_ENCODER_SHARD_1,
+    role::TEXT_ENCODER_SHARD_2,
+    role::TEXT_ENCODER_SHARD_3,
+    role::VAE,
+];
+/// Quant variants take the COMPLETE DiT and text encoder from GGUFs
+/// (matmuls + AdaLN as-tagged, F32 norms — residency decodes each at
+/// upload), so the 11.5GB of bf16 DiT shards and 8GB of bf16 TE shards
+/// drop out of the download entirely. Matches ComfyUI-GGUF consumption.
+const QUANT_WEIGHT_ROLES: &[&str] = &[role::VAE];
+const AUX_ROLES: &[&str] = &[role::TOKENIZER_JSON];
+
+pub static VARIANTS: &[VariantFiles] = &[
+    VariantFiles {
+        id: "zimage-turbo-q8",
+        weight_roles: QUANT_WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_gguf_role: Some(role::DIT_GGUF_Q8_0),
+        te_gguf_role: Some(role::TE_GGUF_Q8_0),
+    },
+    VariantFiles {
+        id: "zimage-turbo-q4",
+        weight_roles: QUANT_WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_gguf_role: Some(role::DIT_GGUF_Q4_K_M),
+        te_gguf_role: Some(role::TE_GGUF_Q8_0),
+    },
+    VariantFiles {
+        id: "zimage-turbo-bf16",
+        weight_roles: WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_gguf_role: None,
+        te_gguf_role: None,
+    },
+];
+
+pub fn variant(id: &str) -> Option<&'static VariantFiles> {
+    VARIANTS.iter().find(|v| v.id == id)
+}
+
+impl VariantFiles {
+    /// Every role the variant needs, with its `FileRef` from `MANIFEST`.
+    pub fn files(&self) -> impl Iterator<Item = (&'static str, &'static FileRef)> + '_ {
+        self.weight_roles
+            .iter()
+            .chain(self.aux_roles.iter())
+            .chain(self.dit_gguf_role.iter())
+            .chain(self.te_gguf_role.iter())
+            .map(|r| {
+                (
+                    *r,
+                    MANIFEST.get(r).expect("variant role missing from MANIFEST"),
+                )
+            })
+    }
 }
 
 /// Compute recipe for Z-Image-Turbo. Z-Image was trained in bf16 and the
@@ -209,6 +297,10 @@ pub static MANIFEST: ModelManifest = ModelManifest {
             role::DIT_GGUF_Q4_K_M,
             FileRef::new(REPO_GGUF, "z-image-turbo-Q4_K_M.gguf"),
         ),
+        (
+            role::TE_GGUF_Q8_0,
+            FileRef::new(REPO_TE_GGUF, "Qwen_3_4b-Q8_0.gguf"),
+        ),
     ],
 };
 
@@ -239,6 +331,22 @@ mod tests {
             assert_eq!(f.repo, REPO_UPSTREAM);
             assert!(f.path.ends_with(".safetensors"));
         }
+    }
+
+    #[test]
+    fn variants_resolve() {
+        for v in VARIANTS {
+            assert_eq!(variant(v.id).map(|x| x.id), Some(v.id));
+            // `files()` panics on a role missing from MANIFEST; drain it.
+            assert_eq!(
+                v.files().count(),
+                v.weight_roles.len()
+                    + v.aux_roles.len()
+                    + usize::from(v.dit_gguf_role.is_some())
+                    + usize::from(v.te_gguf_role.is_some()),
+            );
+        }
+        assert!(variant("no-such-model").is_none());
     }
 
     #[test]

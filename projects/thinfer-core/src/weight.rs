@@ -65,6 +65,15 @@ pub trait WeightReader {
         offset: u64,
         dst: &mut [u8],
     ) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Prefetch hint: the next `read_at` will be exactly `(offset, len)`.
+    /// Chunked consumers (`stream_source_to_gpu`) call this before doing
+    /// CPU/GPU work on the current chunk so a reader with async IO (web
+    /// OPFS) can overlap the next read with that work. Default no-op;
+    /// readers that don't benefit (mmap memcpy) ignore it. Wrong hints are
+    /// a perf bug, never a correctness one: `read_at` must validate any
+    /// prefetched bytes against its actual arguments.
+    fn will_read(&mut self, _offset: u64, _len: u64) {}
 }
 
 pub trait WeightSource {
@@ -110,6 +119,9 @@ impl<R: WeightReader> WeightReader for OffsetView<R> {
     async fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
         debug_assert!(offset + dst.len() as u64 <= self.len);
         self.inner.read_at(self.base + offset, dst).await
+    }
+    fn will_read(&mut self, offset: u64, len: u64) {
+        self.inner.will_read(self.base + offset, len);
     }
 }
 

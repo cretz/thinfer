@@ -35,13 +35,28 @@ fn synth_bf16(elems: usize, seed: u64, amp: f32) -> Vec<u8> {
 
 async fn gpu_prep(op: WeightPrep, raw: &[u8], dst_len: u64) -> Vec<u8> {
     let backend = WgpuBackend::new().await.expect("wgpu adapter");
+    assert!(
+        backend.supports_weight_prep(op),
+        "WgpuBackend must implement weight_prep"
+    );
+    // Staging is the caller's job now (residency streams into it; here one
+    // aligned write covers it).
+    let staging_len = (raw.len() as u64).next_multiple_of(4);
+    let staging = backend.allocate(staging_len).expect("alloc staging");
+    let mut padded = raw.to_vec();
+    padded.resize(staging_len as usize, 0);
+    backend.write_buffer(staging, 0, &padded).expect("stage");
     let dst = backend.allocate(dst_len).expect("alloc dst");
-    let done = backend
-        .weight_prep(op, raw, &BufRef::new(dst, dst_len))
+    backend
+        .weight_prep(
+            op,
+            &BufRef::new(staging, staging_len),
+            &BufRef::new(dst, dst_len),
+        )
         .await
         .expect("weight_prep");
-    assert!(done, "WgpuBackend must implement weight_prep");
     let got = backend.read_buffer(dst, 0, dst_len).await.expect("read");
+    backend.free(staging);
     backend.free(dst);
     got
 }
