@@ -34,3 +34,6 @@ conformance = []
 # Opt-in Z-Image end-to-end tests that touch the local HF cache. Skip
 # cleanly if the relevant files aren't cached; never trigger a download.
 zimage-e2e = []
+# Opt-in SkyReels-V2 (Wan) video end-to-end parity test. Same discipline as
+# zimage-e2e: touches the local HF cache, skips cleanly when uncached.
+wan-e2e = []

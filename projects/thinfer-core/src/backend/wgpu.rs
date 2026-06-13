@@ -1066,6 +1066,9 @@ impl Backend for WgpuBackend {
                     ("q8_0_from_bf16", [pairs, 0, 0, 0])
                 }
                 WeightPrep::TransposeBf16 { n, k } => ("transpose_bf16_2d", [n, k, 0, 0]),
+                WeightPrep::NarrowTransposeF32 { n, k, n0, band_n } => {
+                    ("narrow_transpose_f32", [n, k, n0, band_n])
+                }
             };
             let pipeline = {
                 let cached = self.prep_pipelines.lock().unwrap().get(key).cloned();
@@ -1078,6 +1081,9 @@ impl Backend for WgpuBackend {
                             }
                             WeightPrep::TransposeBf16 { .. } => {
                                 crate::ops::weight_prep::build_transpose_bf16_wgsl()
+                            }
+                            WeightPrep::NarrowTransposeF32 { .. } => {
+                                crate::ops::weight_prep::build_narrow_transpose_f32_wgsl()
                             }
                         };
                         let p = Arc::new(
@@ -1116,6 +1122,11 @@ impl Backend for WgpuBackend {
                     WeightPrep::TransposeBf16 { n, k } => {
                         crate::ops::weight_prep::dispatch_transpose_bf16(
                             self, &mut enc, &pipeline, &bufs, n, k,
+                        )?
+                    }
+                    WeightPrep::NarrowTransposeF32 { n, k, n0, band_n } => {
+                        crate::ops::weight_prep::dispatch_narrow_transpose_f32(
+                            self, &mut enc, &pipeline, &bufs, n, k, n0, band_n,
                         )?
                     }
                 }

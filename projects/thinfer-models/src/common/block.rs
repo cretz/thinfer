@@ -1,6 +1,9 @@
-//! Z-Image transformer block forward, both `modulation` flavors.
+//! Shared DiT transformer block: the `BlockPipelines` kernel set, the
+//! activation/op primitives, and a `Block::forward` for the Z-Image-style
+//! block (both `modulation` flavors). Reused across models (Z-Image drives
+//! `forward`; Wan composes the same pipelines/ops/`dispatch_matmul_site`).
 //!
-//! Sequence per upstream `ZImageTransformerBlock.forward`
+//! Forward sequence per upstream `ZImageTransformerBlock.forward`
 //! (`src/zimage/transformer.py`):
 //!
 //! ```text
@@ -1504,7 +1507,7 @@ impl Block {
     /// otherwise consecutive phases share a scope (zero overhead at small
     /// dims). See [`Self::phase_peaks`].
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_taps_packed<'wsp>(
+    pub async fn forward_taps_packed<'wsp>(
         &self,
         packer: &mut ScopePacker<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
@@ -1662,7 +1665,7 @@ impl Block {
         };
 
         // ---- Advance to phase 1 (sdpa + proj + residual1) ----
-        let p1_carry = packer.advance(&p1_in, peaks[1])?;
+        let p1_carry = packer.advance(&p1_in, peaks[1]).await?;
         let mut idx = 0usize;
         let q = pop_act(&p1_carry, &mut idx);
         let k = pop_act(&p1_carry, &mut idx);
@@ -1832,7 +1835,7 @@ impl Block {
         };
 
         // ---- Advance to phase 2 (ffn1) ----
-        let p2_carry = packer.advance(&p2_in, peaks[2])?;
+        let p2_carry = packer.advance(&p2_in, peaks[2]).await?;
         let mut idx = 0usize;
         let x1 = pop_act(&p2_carry, &mut idx);
         let scale_mlp = if modulated { Some(p2_carry[idx]) } else { None };
@@ -1929,7 +1932,7 @@ impl Block {
         };
 
         // ---- Advance to phase 3 (ffn2 + residual2) ----
-        let p3_carry = packer.advance(&p3_in, peaks[3])?;
+        let p3_carry = packer.advance(&p3_in, peaks[3]).await?;
         let mut idx = 0usize;
         let h13 = pop_act(&p3_carry, &mut idx);
         let x1 = pop_act(&p3_carry, &mut idx);

@@ -146,3 +146,40 @@ The project thesis is "thin inference": low-quant GGUF compute on memory-constra
 - Pipeline disk cache — trait-shaped now, implementation deferred.
 - IR / graph optimizer — deferred per orig-plan.
 - Persistent prefetch hints / runtime-learned residency schedules — deferred.
+
+## Reused engine (shipped w/ Z-Image, substrate for video)
+
+Code is source of truth for internals; below = rules that bite + pointers.
+
+- MemArbiter (arbiter.rs) is the sole VRAM-budget owner; hard ceiling (e2e
+  TRUE_PEAK asserts). Budgets are ceilings, not modes (no --low-vram). Buffer
+  pool, not free+alloc.
+- Matmul DP4A/ORT path + sdpa flash `SdpaF16Sg` reused as-is for Wan
+  full-attention. Subgroups off on NVIDIA (loss); web subgroups need the
+  vendored facade `projects/vendor/wgpu-29.0.3` (markers #5555).
+- Quant: Q4_K_M default, Q8_0 pyref canary, bf16 fallback; CLI defaults q4.
+- VAE: ONE heavy submit at a time (consecutive heavy submits hang the GPU).
+- No env in thinfer-core (binary edge reads env). No eprintln in lib (tracing).
+- PowerPreference high everywhere. GGUF B viewed [N,K]; matmul B [K,N].
+
+## Web (wasm)
+
+- npm `thinfer` (TS/wasm) + OPFS cache (opfs.ts/opfs-worker.ts). No DOM in lib,
+  no lazy downloads, `pnpm build` has no wasm-opt. `pnpm test:web` known-broken
+  (run locally before merge).
+- OPFS quota: Chrome ~60% disk (multi-GB ok); Firefox 2GB / Safari 1GB =
+  Chrome/Edge-only at model scale. Call `navigator.storage.persist()`. Read
+  speed is not a lever (compute-bound).
+- Web caps 128MiB binding / 16KiB workgroup storage; matmul builds 16KiB-fit.
+
+## Ops (commands / validation / flow)
+
+- Validation order: op conformance -> q8 256 pyref e2e -> q4 768 skip-pyref
+  perf e2e. Serial, NEVER parallel GPU runs.
+- e2e env always: `THINFER_TRACE=verbose THINFER_E2E_PNG_DIR=...
+  THINFER_POWER_PREF=high`; perf adds `RUST_LOG="info,thinfer::diag=warn"
+  THINFER_E2E_SKIP_PYREF=1`. Verify non-zero passed count. Read the TRACE
+  rollup tail before any perf target. (Z-Image test names: zimage-plan.md.)
+- web: `cd thinfer-web && pnpm build`; user runs the server, reports numbers.
+- Branch flow: `git commit --amend --no-edit && git push --force-with-lease`,
+  terse. fmt + clippy (all warnings) after edits.

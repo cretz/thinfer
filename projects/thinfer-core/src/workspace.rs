@@ -1338,6 +1338,100 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv3d<O: crate::ops::Conv3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        op: &O,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        cout: u32,
+        m_spatial: u32,
+        batch: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let bias = self.resolve(bias);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::Conv3dBufs {
+            x: &x,
+            w: &w,
+            bias: &bias,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_conv3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            op,
+            &bufs,
+            cout,
+            m_spatial,
+            batch,
+        )
+    }
+
+    pub fn rmsnorm3d<O: crate::ops::RmsNorm3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_pos: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::RmsNorm3dBufs {
+            x: &x,
+            w: &w,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_rmsnorm3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_pos,
+        )
+    }
+
+    pub fn concat_time<O: crate::ops::ConcatTimeOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ConcatTimeBufs {
+            a: &a,
+            b: &b,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_concat_time::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
     pub fn transpose12<O: crate::ops::Transpose12Op>(
         &self,
         pipeline: &B::Pipeline,
@@ -1388,6 +1482,38 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &bufs,
             n_elems,
+        )
+    }
+
+    /// Expand a compact relative-position bias `table [num_buckets, H]` +
+    /// `bucket_map [S,S]` (u32) into a dense per-head SDPA mask `[H,S,S]`.
+    /// `n` is the output element count (f32 acts) or word count (`H*S*S/2`,
+    /// packed acts).
+    pub fn relpos_bias<O: crate::ops::RelposBiasOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        table: BatchBuf<'wsp>,
+        bucket_map: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let table = self.resolve(table);
+        let bucket_map = self.resolve(bucket_map);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::RelposBiasBufs {
+            table: &table,
+            bucket_map: &bucket_map,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_relpos_bias::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n,
         )
     }
 
@@ -1552,7 +1678,7 @@ impl<'wsp> BatchScope<'wsp, crate::backend::WgpuBackend> {
 /// let q = scope1.alloc(...)?;
 /// // ...dispatches into scope1...
 /// // Cut between phases (or keep going in same scope if budget allows).
-/// let [q_in_p2] = packer.advance([q], peak_p2)?;
+/// let [q_in_p2] = packer.advance([q], peak_p2).await?;
 /// let scope2 = packer.scope();
 /// // ...dispatches into scope2, q_in_p2 is a valid BatchBuf here...
 /// packer.finish().await?;
@@ -1575,6 +1701,15 @@ where
     B::Error: 'wsp,
     B: 'wsp,
 {
+    /// Max submits left in flight (queued but not yet awaited) before a `cut`
+    /// blocks to drain the oldest. Bounds peak VRAM to ~this many phases of
+    /// workspace: each cut scope's guards stay live until its completion future
+    /// is awaited, so without this bound a long-lived packer (e.g. the whole
+    /// VAE frame decode) pins every phase's scratch at once and OOMs at native
+    /// res. 2 keeps one submit overlapping GPU exec with the next phase's encode
+    /// while still recycling buffers back to the pool every cut.
+    const MAX_INFLIGHT: usize = 2;
+
     /// New packer with a single open scope and no live workspace charged.
     pub fn new(workspace: &'wsp Workspace<B>, budget_bytes: u64) -> Self {
         Self {
@@ -1627,7 +1762,7 @@ where
     /// The prior cut's carry (now stale w.r.t. fresh scopes) folds into the
     /// just-submitted scope's completion future so it releases to pool when
     /// GPU finishes consuming it.
-    pub fn cut(
+    pub async fn cut(
         &mut self,
         carry_in: &[BatchBuf<'wsp>],
         peak_bytes: u64,
@@ -1678,6 +1813,14 @@ where
         };
         self.pending.push(Box::pin(completion));
         self.carry_holds = new_carry;
+        // Backpressure: drain the oldest in-flight submits until at most
+        // MAX_INFLIGHT remain. Awaiting a completion future drops its scope's
+        // guards (and folded prior carry) back to the pool, so the next scope's
+        // allocs reuse those buffers instead of growing VRAM. `carry_holds` is
+        // already moved above, so the live carry survives the await.
+        while self.pending.len() > Self::MAX_INFLIGHT {
+            self.pending.remove(0).await?;
+        }
         self.current = Some(self.workspace.batch());
         self.current_live = peak_bytes;
         let new_scope = self.current.as_ref().unwrap();
@@ -1693,13 +1836,13 @@ where
     /// Decide-and-cut helper. If `would_overflow(peak_bytes)` then `cut(...)`
     /// else pass `carry_in` through (still valid in the current scope) and
     /// `charge(peak_bytes)`. Returns the BatchBufs to use in the next phase.
-    pub fn advance(
+    pub async fn advance(
         &mut self,
         carry_in: &[BatchBuf<'wsp>],
         peak_bytes: u64,
     ) -> Result<Vec<BatchBuf<'wsp>>, B::Error> {
         if self.would_overflow(peak_bytes) {
-            self.cut(carry_in, peak_bytes)
+            self.cut(carry_in, peak_bytes).await
         } else {
             self.charge(peak_bytes);
             Ok(carry_in.to_vec())

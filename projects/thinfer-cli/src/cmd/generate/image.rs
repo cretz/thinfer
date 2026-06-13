@@ -1,12 +1,12 @@
-use std::io::{self, BufRead, IsTerminal, Write};
+//! `thinfer generate image` (Z-Image-Turbo t2i).
+
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Args, Subcommand, ValueEnum};
-use thinfer_core::backend::{PowerPreference, WgpuBackend, WgpuConfig};
+use clap::{Args, ValueEnum};
+use thinfer_core::backend::WgpuBackend;
 use thinfer_core::manifest::{FileRef, ModelManifest};
-use thinfer_core::policy::{ResidencyBudget, parse_bytes};
+use thinfer_core::policy::ResidencyBudget;
 use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::trace::DIAG;
@@ -17,16 +17,29 @@ use thinfer_models::z_image::source::{GgufOpeners, ZImageSource};
 use thinfer_native::tokenizer::HfTokenizer;
 use thinfer_native::{MmapFileOpener, cache};
 
-/// 2 GiB default for both RAM and VRAM. Chosen so a low-spec laptop can run
-/// at all; larger budgets help, but the residency manager pages weights so a
-/// small budget just means more disk traffic, not failure. Override with
-/// `--ram-budget` / `--vram-budget`.
-const DEFAULT_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+use super::{
+    PercentLogger, backend_for_stats, confirm_download, init_backend, parse_budget, random_seed,
+    report_mem, resolve_output_format, validate_dim,
+};
 
-#[derive(Subcommand)]
-pub enum GenerateCmd {
-    /// Generate an image from a prompt.
-    Image(GenerateImage),
+/// Output container/codec. PNG-only today (the only encoder we ship; every
+/// parity baseline is PNG). Adding a second format is a one-arm change here
+/// plus the matching encoder call in `run_image`.
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ImageFormat {
+    Png,
+}
+
+impl ImageFormat {
+    /// Lower-cased file extension -> format. `None` is "unknown extension", a
+    /// hard error in `resolve_output_format` (never a silent default).
+    fn from_ext(ext: &str) -> Option<Self> {
+        match ext {
+            "png" => Some(Self::Png),
+            _ => None,
+        }
+    }
+    const KNOWN: &'static str = "png";
 }
 
 /// Defaults follow upstream Z-Image (`Tongyi-MAI/Z-Image:src/config/inference.py`):
@@ -37,10 +50,10 @@ pub enum GenerateCmd {
 /// 42, upstream pipeline takes a generator and we randomize when `--seed` is
 /// omitted.
 ///
-/// TODO: these defaults are Z-Image-specific. Once we add a second model
-/// (LTX-Video per M3), move height/width/steps/guidance defaults into the
-/// model registry (`ModelId::defaults() -> ImageGenDefaults`) and have clap
-/// pull from there instead of hardcoded constants on the args struct.
+/// TODO: these defaults are Z-Image-specific. Once we add a second image model,
+/// move height/width/steps/guidance defaults into the model registry
+/// (`ModelId::defaults() -> ImageGenDefaults`) and have clap pull from there
+/// instead of hardcoded constants on the args struct.
 #[derive(Args)]
 pub struct GenerateImage {
     /// Model identifier. Defaults to `zimage-turbo-q4` (Q4_K_M DiT: ~half
@@ -51,6 +64,10 @@ pub struct GenerateImage {
     pub prompt: String,
     #[arg(long)]
     pub output: PathBuf,
+    /// Output format. Defaults to inferring from the `--output` extension;
+    /// errors if the extension is missing or unrecognized.
+    #[arg(long, value_enum)]
+    pub output_format: Option<ImageFormat>,
     /// Image height in pixels. Must be divisible by VAE_SCALE (16).
     #[arg(long, default_value_t = 768)]
     pub height: u32,
@@ -119,24 +136,19 @@ impl std::fmt::Display for ModelId {
     }
 }
 
-pub async fn run(cmd: GenerateCmd) -> ExitCode {
-    match cmd {
-        GenerateCmd::Image(args) => match run_image(args).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(1)
-            }
-        },
-    }
-}
-
-async fn run_image(args: GenerateImage) -> Result<(), String> {
+pub async fn run_image(args: GenerateImage) -> Result<(), String> {
     validate_dim("height", args.height)?;
     validate_dim("width", args.width)?;
     if args.steps == 0 {
         return Err("--steps must be > 0".into());
     }
+    // Resolve up front so a bad extension fails before any download / GPU work.
+    let ImageFormat::Png = resolve_output_format(
+        args.output_format,
+        &args.output,
+        ImageFormat::from_ext,
+        ImageFormat::KNOWN,
+    )?;
 
     let ram_bytes = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
     let vram_bytes = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
@@ -218,38 +230,8 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
         "generate start",
     );
 
-    let backend = {
-        let _s = tracing::info_span!("wgpu_init").entered();
-        // Default `HighPerformance` (not `None`) because Vulkan drivers treat
-        // an unset preference as a background-priority hint: on Intel Arc
-        // iGPU this clamps clocks / shrinks the subgroup_size range, slowing
-        // DiT by ~2.5x. Users who explicitly want thin-hardware-friendly
-        // scheduling can set `THINFER_POWER_PREF=low`.
-        let cfg = WgpuConfig {
-            power_preference: match std::env::var("THINFER_POWER_PREF")
-                .ok()
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-            {
-                Some("high" | "highperformance" | "discrete") => PowerPreference::HighPerformance,
-                Some("low" | "lowpower" | "integrated") => PowerPreference::LowPower,
-                Some("none") => PowerPreference::None,
-                _ => PowerPreference::HighPerformance,
-            },
-            timestamps: std::env::var("THINFER_TRACE").is_ok(),
-        };
-        Arc::new(
-            WgpuBackend::new_with_config(cfg)
-                .await
-                .map_err(|e| format!("wgpu init: {e:?}"))?,
-        )
-    };
-    // Clone for end-of-run stats reporting; ZImageModel::load takes
-    // ownership of one Arc, we keep the other to read mem snapshots when
-    // THINFER_TRACE is set (same gate that enables the rollup table in
-    // main.rs, so a single env var turns on the full report).
-    let backend_for_stats = std::env::var_os("THINFER_TRACE").map(|_| Arc::clone(&backend));
+    let backend = init_backend().await?;
+    let stats = backend_for_stats(&backend);
 
     let seed = args.seed.unwrap_or_else(random_seed);
     // User-facing progress: capitalized one-liners to stderr, each prefixed
@@ -295,24 +277,8 @@ async fn run_image(args: GenerateImage) -> Result<(), String> {
         t_run.elapsed().as_secs_f64(),
     );
     tracing::info!(target: DIAG, path = %args.output.display(), bytes = png.len(), "wrote output");
-    if let Some(b) = backend_for_stats {
-        let snap = thinfer_core::backend::Backend::mem_account(&*b).snapshot();
-        eprintln!(
-            "[mem] vram TRUE_PEAK={} / budget {} | per-cat peaks: weights={} workspace={} staging={}",
-            fmt_mib(snap.vram_total_peak),
-            fmt_mib(vram_bytes),
-            fmt_mib(snap.vram_weights.1),
-            fmt_mib(snap.vram_workspace.1),
-            fmt_mib(snap.vram_staging.1),
-        );
-        eprintln!(
-            "[mem] ram  TRUE_PEAK={} / budget {} | per-cat peaks: upload={} readback={} other={}",
-            fmt_mib(snap.ram_total_peak),
-            fmt_mib(ram_bytes),
-            fmt_mib(snap.ram_upload.1),
-            fmt_mib(snap.ram_readback.1),
-            fmt_mib(snap.ram_other.1),
-        );
+    if let Some(b) = stats {
+        report_mem(&b, ram_bytes, vram_bytes);
     }
     Ok(())
 }
@@ -334,122 +300,4 @@ async fn load_and_generate<S: WeightSource, T: Tokenizer>(
         .generate(params, progress)
         .await
         .map_err(|e| format!("generate: {e:?}"))
-}
-
-fn fmt_mib(bytes: u64) -> String {
-    if bytes >= 1 << 30 {
-        format!("{:.2}GiB", bytes as f64 / (1u64 << 30) as f64)
-    } else {
-        format!("{:.1}MiB", bytes as f64 / (1u64 << 20) as f64)
-    }
-}
-
-/// Non-cryptographic seed for `--seed`-omitted runs. Mixes nanos and pid so
-/// rapid successive invocations don't collide.
-fn random_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
-
-fn parse_budget(flag: &str, raw: Option<&str>) -> Result<u64, String> {
-    match raw {
-        Some(s) => parse_bytes(s).map_err(|e| format!("{flag}={s:?}: {e}")),
-        None => Ok(DEFAULT_BUDGET_BYTES),
-    }
-}
-
-fn validate_dim(name: &str, v: u32) -> Result<(), String> {
-    // Upstream `pipeline.py` requires divisibility by vae_scale = vae_factor*2
-    // (16 for the default VAE). No min/max bound upstream; the HF Space caps
-    // at 512..=2048 for UX only.
-    const VAE_SCALE: u32 = 16;
-    if v == 0 {
-        return Err(format!("--{name} must be > 0"));
-    }
-    if !v.is_multiple_of(VAE_SCALE) {
-        return Err(format!(
-            "--{name} must be a multiple of {VAE_SCALE} (got {v})"
-        ));
-    }
-    Ok(())
-}
-
-/// Emits a stderr line at each 10% boundary. hf-hub fans chunks across tasks
-/// and the adapter clones the `Arc` per chunk, so `update` calls are racy -
-/// state lives in atomics.
-struct PercentLogger {
-    name: String,
-    size: std::sync::atomic::AtomicU64,
-    downloaded: std::sync::atomic::AtomicU64,
-    last_decile: std::sync::atomic::AtomicU8,
-}
-
-impl PercentLogger {
-    fn new(name: String) -> Self {
-        Self {
-            name,
-            size: std::sync::atomic::AtomicU64::new(0),
-            downloaded: std::sync::atomic::AtomicU64::new(0),
-            last_decile: std::sync::atomic::AtomicU8::new(0),
-        }
-    }
-}
-
-impl cache::DownloadProgress for PercentLogger {
-    fn init(&self, size: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.size.store(size, Relaxed);
-        self.downloaded.store(0, Relaxed);
-        self.last_decile.store(0, Relaxed);
-        tracing::info!(
-            target: DIAG,
-            name = %self.name,
-            gib = size as f64 / (1024.0 * 1024.0 * 1024.0),
-            "downloading",
-        );
-    }
-    fn update(&self, delta: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let size = self.size.load(Relaxed);
-        if size == 0 {
-            return;
-        }
-        let new = self.downloaded.fetch_add(delta, Relaxed) + delta;
-        let pct = ((new.min(size) * 10) / size) as u8;
-        let prev = self.last_decile.fetch_max(pct, Relaxed);
-        if pct > prev {
-            // Cover gaps when a single chunk crosses several deciles, and when
-            // hf-hub's resume update jumps from 0 to N0% in one call.
-            for p in (prev + 1)..=pct {
-                tracing::info!(target: DIAG, name = %self.name, pct = p * 10, "download progress");
-            }
-        }
-    }
-    fn finish(&self) {
-        tracing::info!(target: DIAG, name = %self.name, "download done");
-    }
-}
-
-fn confirm_download(missing: &[FileRef], download_as_needed: bool) -> io::Result<bool> {
-    eprintln!("{} file(s) not in HF cache:", missing.len());
-    for f in missing {
-        eprintln!("  {}/{}", f.repo, f.path);
-    }
-    if download_as_needed {
-        return Ok(true);
-    }
-    let stdin = io::stdin();
-    if !stdin.is_terminal() {
-        eprintln!("non-interactive: use --download-as-needed to proceed");
-        return Ok(false);
-    }
-    eprint!("download now? [y/N] ");
-    io::stderr().flush()?;
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
 }

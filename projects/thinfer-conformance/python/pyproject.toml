@@ -5,6 +5,7 @@ description = "Generates fixed-seed reference outputs for thinfer accuracy diffi
 requires-python = ">=3.11"
 dependencies = [
     "diffusers",
+    "ftfy",
     "numpy",
     "packaging",
     "safetensors",

@@ -17,8 +17,8 @@ use thinfer_core::residency::{ResidencyError, WeightResidency};
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{BatchBuf, BatchScope};
 
-use crate::z_image::block::BlockPipelines;
-use crate::z_image::embedders::{LinearBiasBufs, LinearBiasHandles, LinearBiasViews};
+use crate::common::block::BlockPipelines;
+use crate::common::embedders::{LinearBiasBufs, LinearBiasHandles, LinearBiasViews};
 
 #[derive(Clone, Copy, Debug)]
 pub struct FinalLayerConfig {

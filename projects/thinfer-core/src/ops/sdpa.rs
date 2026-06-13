@@ -25,6 +25,9 @@ use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
 /// - V   `[B, S_k, H_kv, D]`
 /// - Mask `[B, S_q, S_k]`         additive bias per (query, key) pair. Causal,
 ///   sliding-window, prefix-LM, and pad-only are all degenerate cases.
+///   Per-head mode (`has_mask == 2`) reads `[B, H_q, S_q, S_k]` instead - one
+///   bias plane per query head, e.g. T5/umT5 relative-position bias (built by
+///   `relpos_bias`).
 /// - Out `[B, S_q, H_q,  D]`
 ///
 /// `SdpaF32` requires `D <= 128`; `SdpaF32LargeD` requires `D` divisible by
@@ -33,10 +36,12 @@ use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
 /// Layout: 0=Q, 1=K, 2=V, 3=Mask, 4=Out, 5=Uniform
 /// `{B, H_q, H_kv, S_q, S_k, D, scale: f32, has_mask: u32}`.
 ///
-/// `has_mask` gates the mask read. When 0 the kernel uses 0.0 as the additive
-/// bias and the `mask` binding need only be a 1-element zero scratch. This
-/// avoids allocating the `[B, S_q, S_k]` zero-filled tensor for full-attention
-/// callers (e.g. VAE mid-block: at S=16384 that mask is 1 GiB).
+/// `has_mask` is a mode, not a bool: 0 = no mask (kernel uses 0.0 bias; the
+/// `mask` binding need only be a 1-element scratch - avoids the `[B, S_q, S_k]`
+/// zero tensor for full-attention callers like VAE mid-block, 1 GiB at
+/// S=16384); 1 = shared `[B, S_q, S_k]` mask; 2 = per-head `[B, H_q, S_q, S_k]`
+/// mask. Modes 1 and 2 differ only in the row index (`+ hq` for per-head); the
+/// read itself is gated by `has_mask != 0u` in every variant.
 pub trait SdpaOp {
     const KERNEL_ID: &'static str;
     type Dtype: ComputeDtype;
@@ -137,7 +142,9 @@ fn main(
     let q_off    = ((bb * u.s_q + sq) * u.h_q + hq) * u.d;
     let kv_b0    = (bb * u.s_k * u.h_kv + hkv) * u.d;
     let kv_step  = u.h_kv * u.d;
-    let mask_base = (bb * u.s_q + sq) * u.s_k;
+    // has_mask==2: per-head mask [B, Hq, Sq, Sk]; else shared [B, Sq, Sk].
+    let mask_row = select(bb * u.s_q + sq, (bb * u.h_q + hq) * u.s_q + sq, u.has_mask == 2u);
+    let mask_base = mask_row * u.s_k;
 
     var q_local: array<f32, 128>;
     for (var d = 0u; d < u.d; d = d + 1u) { q_local[d] = 0.0; }
@@ -262,7 +269,9 @@ fn main(
     let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
     let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
     let kv_step_w  = (u.h_kv * u.d) >> 1u;
-    let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
+    // has_mask==2: per-head mask [B, Hq, Sq, Sk]; else shared [B, Sq, Sk].
+    let mask_row = select(bb * u.s_q + sq, (bb * u.h_q + hq) * u.s_q + sq, u.has_mask == 2u);
+    let mask_w_base = (mask_row * u.s_k) >> 1u;
 
     var q_local: array<f32, 128>;
     for (var d = 0u; d < u.d; d = d + 1u) { q_local[d] = 0.0; }
@@ -397,7 +406,9 @@ fn main(
     let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
     let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
     let kv_step_w  = (u.h_kv * u.d) >> 1u;
-    let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
+    // has_mask==2: per-head mask [B, Hq, Sq, Sk]; else shared [B, Sq, Sk].
+    let mask_row = select(bb * u.s_q + sq, (bb * u.h_q + hq) * u.s_q + sq, u.has_mask == 2u);
+    let mask_w_base = (mask_row * u.s_k) >> 1u;
 
     var q_local: array<f32, 128>;
     for (var d = 0u; d < u.d; d = d + 1u) { q_local[d] = 0.0; }
@@ -599,7 +610,9 @@ fn main(
     let q_off   = (((bb * u.s_q + sq_c) * u.h_q + hq) * u.d) >> 2u;
     let kv_b0   = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 2u;
     let kv_step = (u.h_kv * u.d) >> 2u;
-    let mask_w_base = ((bb * u.s_q + sq_c) * u.s_k) >> 1u;
+    // has_mask==2: per-head mask [B, Hq, Sq, Sk]; else shared [B, Sq, Sk].
+    let mask_row = select(bb * u.s_q + sq_c, (bb * u.h_q + hq) * u.s_q + sq_c, u.has_mask == 2u);
+    let mask_w_base = (mask_row * u.s_k) >> 1u;
     let l_off   = lane * n_l;
 
 "#,
@@ -822,7 +835,9 @@ fn main(
     let q_off    = ((bb * u.s_q + sq) * u.h_q + hq) * u.d;
     let kv_b0    = (bb * u.s_k * u.h_kv + hkv) * u.d;
     let kv_step  = u.h_kv * u.d;
-    let mask_base = (bb * u.s_q + sq) * u.s_k;
+    // has_mask==2: per-head mask [B, Hq, Sq, Sk]; else shared [B, Sq, Sk].
+    let mask_row = select(bb * u.s_q + sq, (bb * u.h_q + hq) * u.s_q + sq, u.has_mask == 2u);
+    let mask_base = mask_row * u.s_k;
 
     // d_per is D/WG; caller guarantees divisibility.
     let d_per = u.d / WG;
@@ -944,7 +959,9 @@ fn main(
     let q_w_off    = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
     let kv_b0_w    = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 1u;
     let kv_step_w  = (u.h_kv * u.d) >> 1u;
-    let mask_w_base = ((bb * u.s_q + sq) * u.s_k) >> 1u;
+    // has_mask==2: per-head mask [B, Hq, Sq, Sk]; else shared [B, Sq, Sk].
+    let mask_row = select(bb * u.s_q + sq, (bb * u.h_q + hq) * u.s_q + sq, u.has_mask == 2u);
+    let mask_w_base = (mask_row * u.s_k) >> 1u;
 
     // d_per (in elements) must be even since D is even and WG divides D.
     // d_per_w (in words) = d_per / 2.

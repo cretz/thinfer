@@ -632,7 +632,7 @@ impl VaeDecoderHandles {
 // Registration: build handles from weight names (no GPU upload yet).
 // ============================================================================
 
-use crate::z_image::loader::{LoadError, register_linear, register_passthrough};
+use crate::common::loader::{LoadError, register_linear, register_passthrough};
 
 fn reg_conv<S: WeightSource>(
     residency: &WeightResidency<S>,

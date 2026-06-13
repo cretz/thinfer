@@ -75,6 +75,13 @@ const READ_PREFETCH_CHUNKS: u64 = 4;
 /// (`join!` of next-acquire + prefetch), so a small cap covers steady state.
 const SCRATCH_POOL_CAP: usize = 4;
 
+/// Target VRAM staging footprint for the banded f32 narrow+transpose prep
+/// (`NarrowTransposeF32`). The source is staged one row-band at a time so the
+/// transient f32 buffer (2x the bf16 weight) never spikes the whole tensor
+/// into VRAM and busts the budget; a band this size is comfortably covered by
+/// evicting unpinned residents. Rounded down to whole (even) rows per weight.
+const PREP_BAND_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransposePolicy {
     /// 1-D weights, biases, norm gains, pad tokens. No layout change.
@@ -165,14 +172,6 @@ pub enum ResidencyError<SE: core::fmt::Debug, BE: core::fmt::Debug> {
     /// `WeightSource::Error`; stringified to avoid a third generic on every
     /// `ResidencyError`.
     Reader(String),
-    /// An F32 source value didn't survive the bf16 narrowing round-trip.
-    /// GGUF F32 tensors the engine stores as bf16 must be upcast bf16
-    /// values (true for bf16-trained checkpoints); a genuine f32-precision
-    /// tensor needs an F32 GPU path, not silent truncation.
-    F32NarrowingLoss {
-        id: WeightId,
-        index: u64,
-    },
     /// One weight's footprint exceeds its tier budget; no eviction policy can
     /// satisfy. Caller's `ResidencyBudget` is too tight for this model.
     BudgetTooSmall {
@@ -277,6 +276,14 @@ pub struct WeightResidency<S: WeightSource> {
     /// Reuse pool for chunk-sized upload scratch (see `SCRATCH_POOL_CAP`).
     /// Avoids a per-weight alloc + full zero of `UPLOAD_CHUNK_BYTES`.
     scratch_pool: Mutex<Vec<Vec<u8>>>,
+    /// Persistent VRAM staging band for `NarrowTransposeF32` prep, lazily
+    /// allocated on first use (when VRAM is still empty) and reused for every
+    /// band. Allocating it once - rather than per-acquire - keeps it from being
+    /// a net-new allocation against an already-full budget: charged up front,
+    /// the warm weight set self-limits to `budget - PREP_BAND_BYTES` via the
+    /// arbiter, so the transient narrow never pushes the true peak over budget.
+    /// Freed at phase boundaries by [`Self::evict_all_and_free`].
+    prep_staging: Mutex<Option<GpuBufferId>>,
 }
 
 impl<S: WeightSource> WeightResidency<S> {
@@ -290,6 +297,7 @@ impl<S: WeightSource> WeightResidency<S> {
             arbiter: MemArbiter::new(MemTier::Vram, budget.vram_bytes),
             budget,
             scratch_pool: Mutex::new(Vec::new()),
+            prep_staging: Mutex::new(None),
             inner: Arc::new(Mutex::new(Inner {
                 metas: Vec::new(),
                 gpu: HashMap::new(),
@@ -584,34 +592,11 @@ impl<S: WeightSource> WeightResidency<S> {
         };
         match prep {
             Some(op) => {
-                // Raw bytes stream into transient GPU staging; the prep
-                // kernel transcodes/transposes into the weight buffer.
-                // Headroom covers staging (dims uniform is noise, lumped in).
-                let staging_len = meta.on_disk_bytes.next_multiple_of(4);
-                self.arbiter.ensure_headroom(mem, staging_len + 16);
-                let staging = backend
-                    .allocate_in(staging_len, VramCategory::Staging)
-                    .map_err(ResidencyError::Backend)?;
                 // Diag-gated clock: the timing only surfaces via the diag
                 // event below, and on wasm each enabled read is a JS roundtrip.
                 let t_prep = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG)
                     .then(crate::trace::Instant::now);
-                let res = match self
-                    .stream_source_to_gpu(backend, &meta, staging, staging_len)
-                    .await
-                {
-                    Ok(()) => backend
-                        .weight_prep(
-                            op,
-                            &BufRef::new(staging, staging_len),
-                            &BufRef::new(id, gpu_size),
-                        )
-                        .await
-                        .map_err(ResidencyError::Backend),
-                    Err(e) => Err(e),
-                };
-                backend.free(staging);
-                res?;
+                self.prep_to_gpu(backend, &meta, op, id, gpu_size).await?;
                 tracing::debug!(
                     target: "thinfer::diag",
                     id = %meta.id.0,
@@ -624,7 +609,7 @@ impl<S: WeightSource> WeightResidency<S> {
             None if meta.is_passthrough() => {
                 // Pure passthrough: stream straight into the weight buffer
                 // (storage padding past the on-disk bytes is zero-filled).
-                self.stream_source_to_gpu(backend, &meta, id, gpu_size)
+                self.stream_source_to_gpu(backend, &meta, id, 0, meta.on_disk_bytes, gpu_size)
                     .await?;
             }
             None => {
@@ -759,7 +744,7 @@ impl<S: WeightSource> WeightResidency<S> {
             };
             if meta.is_passthrough() {
                 // Passthrough: stream through the bounded scratch.
-                self.stream_source_to_gpu(backend, &meta, id, handle_bytes)
+                self.stream_source_to_gpu(backend, &meta, id, 0, meta.on_disk_bytes, handle_bytes)
                     .await?;
             } else {
                 // CPU transform fallback: whole-tensor read.
@@ -884,11 +869,7 @@ impl<S: WeightSource> WeightResidency<S> {
                         TransposePolicy::None => storage_len,
                         TransposePolicy::Linear2D => tight_len,
                     },
-                )
-                .map_err(|index| ResidencyError::F32NarrowingLoss {
-                    id: meta.id.clone(),
-                    index,
-                })?;
+                );
                 match transpose {
                     TransposePolicy::None => Ok(narrowed),
                     TransposePolicy::Linear2D => {
@@ -972,32 +953,136 @@ impl<S: WeightSource> WeightResidency<S> {
     /// padding; `padded_len` is 4-byte aligned for `write_buffer`) are
     /// zero-filled. No transform: callers pair this with GPU `weight_prep`
     /// or use it for passthrough layouts.
+    /// The persistent `NarrowTransposeF32` staging band, allocated on first
+    /// use. Sized `PREP_BAND_BYTES`; the band loop caps each band to fit (real
+    /// linears have `K <= ~16K`, so one band is well under this). Charged to
+    /// VRAM once so it reserves its own headroom against the budget.
+    fn prep_staging_buf<B: Backend>(
+        &self,
+        backend: &B,
+    ) -> Result<GpuBufferId, ResidencyError<S::Error, B::Error>> {
+        let mut slot = self.prep_staging.lock().unwrap();
+        if let Some(id) = *slot {
+            return Ok(id);
+        }
+        self.arbiter
+            .ensure_headroom(backend.mem_account(), PREP_BAND_BYTES + 16);
+        let id = backend
+            .allocate_in(PREP_BAND_BYTES, VramCategory::Staging)
+            .map_err(ResidencyError::Backend)?;
+        *slot = Some(id);
+        Ok(id)
+    }
+
+    /// Stage the source into a transient VRAM buffer and run `op`'s prep
+    /// kernel into `dst`. `NarrowTransposeF32` stages one row band at a time so
+    /// the f32 staging stays bounded (`PREP_BAND_BYTES`) instead of spiking the
+    /// whole 2x-bf16 tensor into VRAM and busting the budget. The bf16-source
+    /// ops (`Q8_0FromBf16` / `TransposeBf16`) stage the whole tensor: their
+    /// staging is <= the weight buffer, so no banding is needed.
+    async fn prep_to_gpu<B: Backend>(
+        &self,
+        backend: &B,
+        meta: &WeightMeta,
+        op: WeightPrep,
+        dst: GpuBufferId,
+        gpu_size: u64,
+    ) -> Result<(), ResidencyError<S::Error, B::Error>> {
+        let mem = backend.mem_account();
+        if let WeightPrep::NarrowTransposeF32 { n, k, .. } = op {
+            // Whole even row-bands, capped to the persistent staging band and
+            // to the weight itself (small weights take a single band). N even
+            // (prep gate) keeps every band start/length even, so the
+            // two-rows-per-output-word writes never straddle a band boundary.
+            let row_bytes = k as u64 * 4;
+            let cap_rows = (PREP_BAND_BYTES / row_bytes.max(1)) as u32 & !1;
+            let band_rows = cap_rows.max(2).min(n);
+            let staging = self.prep_staging_buf(backend)?;
+            let mut n0 = 0u32;
+            while n0 < n {
+                let band_n = band_rows.min(n - n0);
+                let band_bytes = band_n as u64 * row_bytes;
+                self.stream_source_to_gpu(
+                    backend,
+                    meta,
+                    staging,
+                    n0 as u64 * row_bytes,
+                    band_bytes,
+                    band_bytes,
+                )
+                .await?;
+                backend
+                    .weight_prep(
+                        WeightPrep::NarrowTransposeF32 { n, k, n0, band_n },
+                        &BufRef::new(staging, band_bytes),
+                        &BufRef::new(dst, gpu_size),
+                    )
+                    .await
+                    .map_err(ResidencyError::Backend)?;
+                n0 += band_n;
+            }
+            return Ok(());
+        }
+        let staging_len = meta.on_disk_bytes.next_multiple_of(4);
+        self.arbiter.ensure_headroom(mem, staging_len + 16);
+        let staging = backend
+            .allocate_in(staging_len, VramCategory::Staging)
+            .map_err(ResidencyError::Backend)?;
+        let res = match self
+            .stream_source_to_gpu(backend, meta, staging, 0, meta.on_disk_bytes, staging_len)
+            .await
+        {
+            Ok(()) => backend
+                .weight_prep(
+                    op,
+                    &BufRef::new(staging, staging_len),
+                    &BufRef::new(dst, gpu_size),
+                )
+                .await
+                .map_err(ResidencyError::Backend),
+            Err(e) => Err(e),
+        };
+        backend.free(staging);
+        res
+    }
+
     async fn stream_source_to_gpu<B: Backend>(
         &self,
         backend: &B,
         meta: &WeightMeta,
         dst: GpuBufferId,
+        src_offset: u64,
+        total: u64,
         padded_len: u64,
     ) -> Result<(), ResidencyError<S::Error, B::Error>> {
+        // Streams `total` source bytes starting at `src_offset` into
+        // `dst[0..padded_len)` (bytes past `total` zero-filled). `src_offset`
+        // is non-zero only for the banded f32 prep path, which feeds one row
+        // band at a time so the staging buffer stays bounded; the whole-tensor
+        // callers pass `src_offset = 0`, `total = on_disk_bytes`.
+        //
+        // F32 is allowed here only as raw staging bytes for a GPU prep kernel
+        // (NarrowTransposeF32); F32 is never `is_passthrough`, so the only
+        // caller streaming f32 is the prep staging path above. Bf16/Quant
+        // stream straight into their final buffer.
         if !matches!(
             meta.encoding,
-            StorageEncoding::Bf16 | StorageEncoding::Quant(_)
+            StorageEncoding::Bf16 | StorageEncoding::Quant(_) | StorageEncoding::F32
         ) {
             return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
                 meta.encoding,
             )));
         }
-        let total = meta.on_disk_bytes;
         debug_assert!(padded_len >= total && padded_len.is_multiple_of(4));
         let mut reader = self
             .source
             .open(&meta.id)
             .await
             .map_err(ResidencyError::Source)?;
-        if reader.len() != total {
+        if reader.len() != meta.on_disk_bytes || src_offset + total > meta.on_disk_bytes {
             return Err(ResidencyError::SizeMismatch {
                 id: meta.id.clone(),
-                expected: total,
+                expected: meta.on_disk_bytes,
                 got: reader.len(),
             });
         }
@@ -1027,7 +1112,7 @@ impl<S: WeightSource> WeightResidency<S> {
                 break;
             }
             let len = (total - primed).min(UPLOAD_CHUNK_BYTES);
-            reader.will_read(primed, len);
+            reader.will_read(src_offset + primed, len);
             primed += UPLOAD_CHUNK_BYTES;
         }
         // Split read (read_at: worker RPC + transfer + copy_to scratch) from
@@ -1043,7 +1128,7 @@ impl<S: WeightSource> WeightResidency<S> {
             let n_read = (total.saturating_sub(off)).min(n_write as u64) as usize;
             let t_r = diag.then(crate::trace::Instant::now);
             reader
-                .read_at(off, &mut scratch[..n_read])
+                .read_at(src_offset + off, &mut scratch[..n_read])
                 .await
                 .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
             if let Some(t) = t_r {
@@ -1056,7 +1141,7 @@ impl<S: WeightSource> WeightResidency<S> {
             let ahead_off = off + READ_PREFETCH_CHUNKS * UPLOAD_CHUNK_BYTES;
             let ahead_read = total.saturating_sub(ahead_off).min(UPLOAD_CHUNK_BYTES);
             if ahead_read > 0 {
-                reader.will_read(ahead_off, ahead_read);
+                reader.will_read(src_offset + ahead_off, ahead_read);
             }
             scratch[n_read..n_write].fill(0);
             let t_w = diag.then(crate::trace::Instant::now);
@@ -1090,13 +1175,17 @@ impl<S: WeightSource> WeightResidency<S> {
     /// limits). `None` falls back to the CPU `read_for_gpu` path, which
     /// validates and handles every registered shape.
     fn prep_op(meta: &WeightMeta) -> Option<WeightPrep> {
-        if meta.encoding != StorageEncoding::Bf16 || meta.shape.0.len() != 2 {
+        if meta.shape.0.len() != 2 {
             return None;
         }
         let n = u32::try_from(meta.shape.0[0]).ok()?;
         let k = u32::try_from(meta.shape.0[1]).ok()?;
-        match (meta.transcode, meta.transpose) {
-            (Some(QuantKind::Q8_0), TransposePolicy::None) => {
+        // Odd N breaks output word alignment for the transpose kernels (one
+        // u32 would span two output rows, racing adjacent threads); real
+        // linears are even-N, odd shapes fall back to the CPU path.
+        let transpose_ok = n.is_multiple_of(2) && k <= 65535 && n.div_ceil(2).div_ceil(64) <= 65535;
+        match (meta.encoding, meta.transcode, meta.transpose) {
+            (StorageEncoding::Bf16, Some(QuantKind::Q8_0), TransposePolicy::None) => {
                 let blocks = (n as u64) * (k as u64) / 32;
                 // Kernel processes block pairs; odd block counts and
                 // dispatch-grid overflow fall back to the CPU transcode.
@@ -1105,14 +1194,23 @@ impl<S: WeightSource> WeightResidency<S> {
                 }
                 Some(WeightPrep::Q8_0FromBf16 { n, k })
             }
-            (None, TransposePolicy::Linear2D) => {
-                // Odd N breaks output word alignment (one u32 would span two
-                // output rows, racing adjacent threads); real linears are
-                // even-N, odd shapes fall back to the CPU transpose.
-                if !n.is_multiple_of(2) || k > 65535 || n.div_ceil(2).div_ceil(64) > 65535 {
-                    return None;
-                }
+            (StorageEncoding::Bf16, None, TransposePolicy::Linear2D) if transpose_ok => {
                 Some(WeightPrep::TransposeBf16 { n, k })
+            }
+            // f32 (safetensors) linear: fuse the RNE narrow with the upload
+            // transpose on the GPU so the source streams raw and the CPU stays
+            // off the critical path (the whole-tensor `read_for_gpu` narrow is
+            // the cold-load bottleneck). f32 + None (small norm/table tensors)
+            // stays on the CPU path: negligible and not worth a kernel.
+            (StorageEncoding::F32, None, TransposePolicy::Linear2D) if transpose_ok => {
+                // Band window filled per-band by `prep_to_gpu`; this is the
+                // whole-tensor descriptor used to pick the kernel.
+                Some(WeightPrep::NarrowTransposeF32 {
+                    n,
+                    k,
+                    n0: 0,
+                    band_n: n,
+                })
             }
             _ => None,
         }
@@ -1145,6 +1243,12 @@ impl<S: WeightSource> WeightResidency<S> {
     /// `max(phase)`, not the sum across phases. Pinned entries (mid-forward)
     /// are skipped; they stay resident.
     pub fn evict_all_and_free<B: Backend>(&self, backend: &B) {
+        // Release the persistent prep staging band too: the next phase
+        // re-allocates it lazily (while VRAM is empty again), so its reserved
+        // headroom does not carry across a phase boundary.
+        if let Some(id) = self.prep_staging.lock().unwrap().take() {
+            backend.free(id);
+        }
         let mut g = self.inner.lock().unwrap();
         // A phase boundary ends any pin plan: pinned residents free with the
         // rest (the caller installs a fresh plan for the next phase if any).
@@ -1285,23 +1389,18 @@ fn rank2<SE: core::fmt::Debug, BE: core::fmt::Debug>(
 }
 
 /// Narrow an f32 byte stream to packed bf16 in an `out_len`-byte buffer
-/// (`out_len >= 2 * elements`; tail stays zero). Every value must round-trip
-/// f32 -> bf16 -> f32 exactly; the index of the first that doesn't is
-/// returned so the caller can fail loud (see
-/// `ResidencyError::F32NarrowingLoss`).
-fn narrow_f32_to_bf16(src: &[u8], out_len: usize) -> Result<Vec<u8>, u64> {
+/// (`out_len >= 2 * elements`; tail stays zero). Plain RNE narrowing, matching
+/// every other f32 -> bf16 path in core (`quant.rs`, `dequant_transpose_bf16`,
+/// `weight.rs`).
+fn narrow_f32_to_bf16(src: &[u8], out_len: usize) -> Vec<u8> {
     let values: &[f32] = bytemuck::cast_slice(src);
     debug_assert!(out_len >= values.len() * 2);
     let mut out = vec![0u8; out_len];
     let dst: &mut [u16] = bytemuck::cast_slice_mut(&mut out[..values.len() * 2]);
-    for (i, (&v, d)) in values.iter().zip(dst.iter_mut()).enumerate() {
-        let b = half::bf16::from_f32(v);
-        if b.to_f32().to_bits() != v.to_bits() {
-            return Err(i as u64);
-        }
-        *d = b.to_bits();
+    for (&v, d) in values.iter().zip(dst.iter_mut()) {
+        *d = half::bf16::from_f32(v).to_bits();
     }
-    Ok(out)
+    out
 }
 
 /// Dequantize a GGUF quant block stream (`[N, K]` row-major, `K` a whole

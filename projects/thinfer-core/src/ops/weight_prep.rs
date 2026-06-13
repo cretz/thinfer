@@ -14,6 +14,10 @@
 //!   llama.cpp accepts between its CPU/CUDA/Metal quantizers.
 //! - `transpose_bf16_2d`: raw bf16 `[N, K]` row-major into `[K, N]`
 //!   (nn.Linear upload transpose), bit-exact vs the CPU `Linear2D` path.
+//! - `narrow_transpose_f32`: raw f32 `[N, K]` row-major into bf16 `[K, N]`,
+//!   fusing the RNE narrow with the Linear2D transpose. Bit-exact vs the CPU
+//!   `narrow_f32_to_bf16` + `transpose_bf16_cpu` pair (the f32/safetensors
+//!   weight path, ~1.4s/umT5-layer single-threaded while the GPU idles).
 //!
 //! Both kernels are shape-independent (dims via uniform), so one pipeline
 //! per op serves every weight.
@@ -189,6 +193,56 @@ fn transpose_bf16_2d(
     .to_string()
 }
 
+/// f32 -> bf16 bits with round-to-nearest-even, bit-exact vs
+/// `half::bf16::from_f32` (truncate the low 16 bits, round on the discarded
+/// MSB with ties-to-even; NaN keeps its high mantissa plus the quiet bit).
+/// `3 * 0x8000 - 1 == 0x17FFF == 0x7FFF | 0x10000`: the sticky bits OR the
+/// result LSB, excluding the round bit, so an exact half rounds to even.
+const F32_TO_BF16_RNE: &str = r#"
+fn bf16_bits_rne(b: u32) -> u32 {
+    if ((b & 0x7FFFFFFFu) > 0x7F800000u) { return (b >> 16u) | 0x40u; }
+    if ((b & 0x8000u) != 0u && (b & 0x17FFFu) != 0u) { return ((b >> 16u) + 1u) & 0xFFFFu; }
+    return b >> 16u;
+}
+"#;
+
+/// Build the f32 `[N, K]` -> bf16 `[K, N]` fused narrow+transpose WGSL. One
+/// thread per output word (two consecutive output-row elements = two source
+/// rows at one column); caller dispatches `(ceil(band_n/2 / 64), K, 1)`.
+///
+/// Banded: `src` holds only rows `[n0, n0 + band_n)` of the `[N, K]` tensor
+/// (band-local indexing), while output uses the global `[K, N]` layout (stride
+/// `n`, column offset `n0`), so the f32 staging stays bounded to one band. `n`
+/// and `n0`, `band_n` must be even (odd would put one output u32 across two
+/// output rows, racing adjacent threads; the residency prep gate routes odd-N
+/// weights to the CPU path). Source is the raw f32 stream as `array<u32>` (one
+/// word per element); each element narrows through `bf16_bits_rne`.
+pub fn build_narrow_transpose_f32_wgsl() -> String {
+    format!(
+        r#"struct Dims {{ n: u32, k: u32, n0: u32, band_n: u32 }};
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> dims: Dims;
+{F32_TO_BF16_RNE}
+@compute @workgroup_size(64, 1, 1)
+fn narrow_transpose_f32(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let kk = wid.y;
+    let r = (wid.x * 64u + lid.x) * 2u; // band-local row
+    if (r >= dims.band_n) {{ return; }}
+    let i0 = r * dims.k + kk; // band-local source element
+    let lo = bf16_bits_rne(src[i0]);
+    let hi = bf16_bits_rne(src[i0 + dims.k]);
+    let nn = dims.n0 + r; // global output column
+    dst[(kk * dims.n + nn) >> 1u] = lo | (hi << 16u);
+}}
+"#
+    )
+}
+
 pub struct WeightPrepBufs<'a> {
     pub src: &'a BufRef,
     pub dst: &'a BufRef,
@@ -232,6 +286,36 @@ pub fn dispatch_transpose_bf16<B: Backend>(
     assert!(
         wgx <= 65535 && k <= 65535,
         "transpose_bf16_2d: [{n}, {k}] exceeds dispatch"
+    );
+    let bindings = [
+        bufs.src.binding(0),
+        bufs.dst.binding(1),
+        bufs.dims.binding(2),
+    ];
+    backend.dispatch(encoder, pipeline, &bindings, [wgx, k, 1])
+}
+
+/// Dispatch one f32 -> bf16 narrow+transpose band: source rows
+/// `[n0, n0 + band_n)` of the global `[n, k]` tensor into the `[k, n]` output.
+/// One thread per output word over the band, `(ceil(band_n/2 / 64), k, 1)`.
+pub fn dispatch_narrow_transpose_f32<B: Backend>(
+    backend: &B,
+    encoder: &mut B::CommandEncoder,
+    pipeline: &B::Pipeline,
+    bufs: &WeightPrepBufs<'_>,
+    n: u32,
+    k: u32,
+    n0: u32,
+    band_n: u32,
+) -> Result<(), B::Error> {
+    assert!(
+        n.is_multiple_of(2) && n0.is_multiple_of(2) && band_n.is_multiple_of(2),
+        "narrow_transpose_f32: N={n} n0={n0} band_n={band_n} must be even"
+    );
+    let wgx = (band_n / 2).div_ceil(64);
+    assert!(
+        wgx <= 65535 && k <= 65535,
+        "narrow_transpose_f32: band [{band_n}, {k}] exceeds dispatch"
     );
     let bindings = [
         bufs.src.binding(0),

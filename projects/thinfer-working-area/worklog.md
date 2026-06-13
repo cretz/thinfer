@@ -1,190 +1,185 @@
 # Worklog
 
-## State: Z-Image t2i complete (native + web)
+Start here. Forward-looking only (git history is the changelog). Engine-wide
+design + kernel/runtime state: `plan-details.md`. Active model port:
+`wan-plan.md`. Z-Image (shipped, archived): `zimage-plan.md`.
 
-Full text-to-image (Qwen3 encoder -> DiT -> VAE) on wgpu, native + browser
-(wasm). q4 default, all parity green. Native q8 256 pyref bit-clean (rgb slope
-1.003478 / 2.22% with pinning). Quant variants take the COMPLETE DiT+TE from
-GGUFs (q4 9.5GB / q8 14.7GB / bf16 20.5GB). Sources: Tongyi-MAI/Z-Image,
-diffusers ZImage pipeline, DiT GGUF unsloth/Z-Image-Turbo-GGUF (Turbo =
-distilled few-step), TE GGUF worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF,
-VAE safetensors upstream.
+## State
 
-## NEXT
+- Z-Image-Turbo t2i complete, native + web, q4 default, parity green, perf mined
+  out. Details: `zimage-plan.md`.
+- Engine (residency/arbiter, matmul + sdpa kernels, GGUF quant, wgpu native +
+  wasm, OPFS) is the reusable substrate for video. Details: `plan-details.md`.
+- Wan: SkyReels-V2-DF-1.3B port on branch `video` off `main`. Full pipeline runs
+  e2e (umT5 -> DiT -> synchronous-DF UniPC -> 3D causal VAE) within the 2GiB
+  budget and is numerically healthy: the **8-step parity gate is green** end to
+  end (all `step_post` slopes 0.99-1.00, `vae_rgb` slope 0.994). umT5/text and
+  ALL scheduler paths (order-1, order-2 predictor AND corrector) are parity-clean.
+- VAE decode at native res (960x544) now fits the budget: watchdog-safe submits
+  + **budget-derived spatial tiling** (`wan/vae.rs`, see gotchas). peak_live 5312
+  -> 2047 MiB, no TDR, no OOM, no seams. The native peak is now the **DiT
+  DENOISE** (~2.0 GiB), not the VAE.
+- `thinfer generate video` CLI (t2v) shipped: `thinfer-cli/src/cmd/generate/`
+  (`mod` + `image` + `video`). MP4 via openh264 + `mp4`; `--output-format
+  png-frames` (--output = dir) for codec-free frame inspection.
+- **FIRST REAL FRAME PROVEN** (2026-06-18): CLI t2v with CFG produces a sharp,
+  coherent red balloon over a green field (960x544, 5 frames, 25 steps, seed
+  random, guidance 6.0). CFG was the missing adherence piece. See CFG below.
 
-DiT per-step time WAS the target; the compute levers are now mined out. The
-whole pipeline is COMPUTE-BOUND on every platform (warm step = GPU fence =
-matmul/sdpa; uploads + weight-prep hide behind compute on the single queue).
-Proven by a pin-vs-no-pin A/B (2026-06-13, a temporary set_pin_disabled knob,
-since reverted): forcing every weight to re-stream each step left fence_ms flat
-while upload bytes jumped. Desktop q4 768 4G: 1570 -> 3397 MiB/step (2.2x),
-fence 3399 -> 3404. So IO is NOT a lever: OPFS read-path work, the JS-heap pin
-tier, and bigger budgets are DEAD ENDS. Mobile is just a slow iGPU (VAE 5.4x
-desktop) and rides every desktop sdpa/matmul win directly; the only mobile
-curve-benders are product-shaped (lower res, compute ~ seq^2; fewer steps,
-Turbo is distilled).
+## Project: video generation (Wan family)
 
-SDPA IS MINED OUT (2026-06-13). The ORT `prefer_subgroupshuffle` rewrite was
-the last untried compute lever; it was a wash (see rejected). All three sdpa
-attempts (FA2 softmax, f16 accum, ORT shuffle) now wash/regress. Per-step
-gpu_disp baseline (q4 768 native, post-ORT-matmul): sdpa 1363ms, ffn1 1070,
-qkv 726, ffn2 657, proj 225, refiner ffn 119. The image generator is
-feature-complete and perf-mined; remaining work is wrap-up and the secondary
-below, not another kernel attack.
+Port the Wan backbone once, unlock a family. First target SkyReels-V2-DF-1.3B-
+540P (low resource + infinite length), then 5B (LongLive-2.0 / Wan2.2-TI2V-5B)
+and audio (NAVA). Full plan + sources + rationale in `wan-plan.md`.
 
-NEXT ACTION: put a bow on the image generator (cleanup, docs, any final
-polish). No more sdpa/matmul kernel attempts - both mined out.
+## DONE: CFG wired, first real frame proven
 
-Secondary (still open): web text encode 3436ms (was 2434) on one post-rebuild
-run; likely one-off Tint/Dawn recompile (native flat). Confirm on a warm-cache
-run. This is the only DiT-adjacent perf item left, and it's a measurement
-confirm, not a rewrite.
+SkyReels-V2-DF is NOT guidance-distilled. Confirmed from diffusers source
+(`pipeline_skyreels_v2_diffusion_forcing.py`): `guidance_scale` defaults to 6.0
+(T2V; 5.0 for I2V), `do_classifier_free_guidance = guidance_scale > 1.0`, default
+negative prompt `""`, combine `uncond + gs*(cond - uncond)` (line 909). The pyref
+pins `guidance_scale=1.0` purely for parity convenience (one forward = clean
+byte-compare), which is why every prior tap was washed out + balloon-less.
 
-## Invariants
+Wired (2026-06-18): `GenerationParams.{negative_prompt, guidance_scale}`; default
+guidance lives on the model (`manifest::RECIPE.default_guidance_scale = 6.0`), CLI
+`--guidance-scale`/`--negative-prompt` override. `denoise_with` encodes both
+prompts while umT5 is resident, then runs a second (uncond) DiT forward per step
+when `guidance_scale > 1.0`. The e2e pins `guidance_scale = 1.0` at both
+`GenerationParams` sites, so `do_cfg=false`, single forward, parity stays
+bit-clean.
 
-- VRAM budget single owner `MemArbiter` (arbiter.rs), shared into every
-  `Workspace`. Reclaim order: idle pool -> evictable weights -> unpinned ring
-  slots. Lock order arbiter -> client. Hard ceiling; e2e TRUE_PEAK asserts it.
-- Fill-to-budget pin plan: `set_pin_plan` pins a `pin_priority` prefix up to
-  `budget - ring_reserved - workspace_reserve - staging_reserve`, installed in
-  `denoise_with` after assemble ("dit pin plan" line). Pin-on-first-touch:
-  pinned handles use the pool path, skip recycle + reclaim (freed only as a
-  3rd-pass last resort). `evict_all_and_free` drops the plan at denoise end so
-  VAE reclaims. `pin_priority` role-major/block-minor, largest roles +
-  refiners/embedders first. `set_pin_disabled` forces it off (A/B knob).
-- ActDtype::I8 is matmul/sdpa-internal ONLY (`BlockWgslConfigs::validate`);
-  residual/norms/glue dense at act dtype. Qwen3 `mlp_down` stays bf16.
-- `dispatch_matmul_site`: dense (act_quant inside, DP4A) or paired A-side;
-  `dense_acts` opts a site out at compile time.
-- Weight transcode `WeightMeta::transcode=Some(Q8_0)` requantizes bf16 at
-  upload (Qwen3 6/7 sites; `mlp_down` NEVER). Value-equiv NOT bit-exact vs CPU.
-  GPU weight prep (transcode + Linear2D transpose) on-GPU at upload.
-- No eprintln in lib; stage timing tracing::info; diag dumps target=DIAG
-  tap-gated. No env in thinfer-core (binary edge reads env, passes config).
+Result by eye (scratch run, 5 frames / 25 steps / 540P): frames 2-4 are a sharp,
+coherent red balloon. Frame 0 is washed-out -- that is latent-frame-0, the causal
+VAE anchor (f_lat=2 -> only 2 latent frames; output0 = latent0, outputs1-4 =
+latent1 upsampled). Weak-first-frame is a known Wan causal-DF t2v trait, not a
+pipeline bug; it dilutes to 1-of-97 at real length. Minor follow-up, not a gate.
 
-## Locked design decisions
+## NEXT (lead): DiT denoise perf -- the real frame costs too much
 
-- DP4A matmul auto-on for Packed4x8 + SHADER_F16 + F16 acts + Quant weight.
-  ORT register-resident subtiles (tile=64, 256 threads, lane owns 1 A row + 16
-  cols, hardware-broadcast B shared reads, fused scale fold; shared layout
-  [kv][row]). q8 256 pyref BIT-IDENTICAL. subgroups OFF: shuffle path kept in
-  kernel but ~30% loss on NVIDIA sg=32 (vec4 shuffle = 4 SHFL/dp4a vs free
-  broadcast); only an Intel sg=16 per-vendor candidate.
-- sdpa flash small-D `SdpaF16Sg`: BR=WG/CL, BC=32, WG=128, CL=min(8,sg_min)
-  (native 8, web/mobile 4). The ~2.3x/step lever; needs web subgroups (vendor).
-- No dynamically-indexed local arrays in hot loops; unroll via codegen.
-- Four pipeline-set split (main / encoder / dit_encoder / dit_embedder).
-- GGUF parser range-fetch-first; B viewed [N,K] N-major; matmul `a@b` B [K,N].
-- PowerPreference::HighPerformance default (CLI/e2e/web).
-- VAE per-resnet sub-submits, single submit per tile. DiT submit ring REMOVED:
-  each block awaits its own fence joined with next-block load.
-  WEIGHT_RING_SLOTS=4; matmul WGSL <= 32KiB workgroup storage.
-- Quants Q4_K_M + Q8_0 (+ bf16 fallback): others no perf win (compute-bound on
-  dequant+MAD, not format), Q6_K only a download-size trade; matches ComfyUI.
+The frame is proven but SLOW: 457s for 5 frames / 25 steps at 540P (~16.7s/step;
+CFG doubled it to TWO DiT forwards/step). The 97-frame default (f_lat=25, ~12.5x
+tokens, quadratic self-attn) is impractical on this path. This is now the wall
+between "proven" and "usable".
 
-## Tested + rejected (do not retry)
+NON-NEGOTIABLE: quality stays at full normal-run settings. Do NOT "fix" perf by
+cutting steps/frames/guidance -- that degrades the output, it does not optimize
+the engine. The fix is making the SAME high-quality run fast.
 
-- sdpa f16-math dot+accumulate: -1.2%/step only AND f16 o-accum compounds over
-  keys (blocky grain at 768; pyref-256 can't catch it). NOT ALU-rate-bound.
-- sdpa FA2-style tile softmax restructure: +20% native, web flat. Per-key
-  softmax bookkeeping is NOT the bottleneck. (Op test kept: tests/sdpa_sg.rs.)
-- sdpa ORT `prefer_subgroupshuffle` shape (2026-06-13, reverted): 1 lane = 1
-  query row, K/V staged then distributed across the subgroup via subgroupShuffle
-  (replacing the CL-cluster D-split + shuffleXor reduce), fp32 accum (NOT ORT's
-  f16 - kept fp32 to dodge the f16-grain class above; 768 PNG confirmed clean),
-  chunk-wise softmax, head-vec unrolled, chunk width from runtime subgroup_size
-  builtin (drops build-time CL). Correct (conformance green; q8-256 slope 1.0044
-  vs 1.0035). Perf WASH: q4 768 attn_sdpa 73.7->75.8 ms/block, but EVERY
-  unchanged op also drifted (qkv +12%, ffn2 +7%, ffn1 +1%) = global clock/
-  thermal drift, not a real sdpa change; sdpa moved less than unchanged qkv.
-  CAVEAT: A/B confounded - baseline ab-pin.log was a different session/logging,
-  not a same-session old-vs-new. A truly clean verdict would re-run both kernels
-  back-to-back; given two prior sdpa washes too, called mined out rather than
-  chase it. (Source on the dead branch / git history; ORT template at
-  third-party/onnxruntime/.../bert/flash_attention.wgsl.template.)
-- matmul bk_step=2 (llama.cpp mmq): +8-12% (shmem vs occupancy).
-- matmul 4-bit B end-to-end: +8% (inner shift+mask eats the traffic save).
-  Confirms matmul is ALU/occupancy-bound, not B-traffic-bound. (4-bit halves
-  transient B VRAM; revisit only if pinning ever needs VRAM, not for speed.)
-- matmul subgroup loads (both select() and shuffle forms): ~30% NVIDIA loss.
-- BW/dispatch fusions on ALU-bound kernels (dual-matmul+silu_mul, QKV+RoPE,
-  flash-attn+proj): all regressed.
-- IO: native never disk-bound (page cache serves at memcpy speed; e2e
-  read_mbps is ring-consumption-paced + overlap-inflated). `read_at` into
-  mapped staging (WC collapse 0.8-1.7 vs 9.5 GB/s). Host-RAM weight cache
-  (page cache is free). Host threads / disk caches / JS-heap pin tier on web.
-  Kernel read-ahead hints. Raising VRAM budget as a "fix".
-- Misc: i8 residual/elementwise; BC=64 sdpa; bm=128 tiles; LUT dequant;
-  dedicated submit per upload; SUBMIT_DEPTH ring; static workspace reserve;
-  weight prepack; derived on-disk transcode caches (ask first, case-by-case).
+METHOD (how to attack it):
+1. Drive from the e2e (`video_e2e_parity`, SKIP_PYREF + native dims) + the
+   `THINFER_TRACE` rollup. Read the per-scope gpu_ms / submit_ms / n_alloc /
+   ws_alloc table FIRST; let it point at the hot scope before touching code.
+2. If the trace can't localize a cost (e.g. weight-feed vs attention vs
+   modulation-broadcast inside a block), ADD telemetry -- but only under the
+   trace/diag gate so prod + `generate` pay zero (same discipline as the
+   per-step readback sink). Then re-measure.
+3. Fix the structural cause, re-run the e2e, confirm the trace moved AND parity
+   stayed green. Repeat.
 
-## Web specifics
+The big lift is wanted and approved: do it right, no shortcuts. Levers below; the
+trace hot op at f_lat=2 is `narrow_transpose_f32` (weight-feed), so start by
+proving weight-feed-bound vs compute-bound with telemetry, not by guessing.
 
-npm lib `thinfer` (TS over wasm) + example `examples/gen-image/` + Playwright
-parity. `bindings.rs`/`weight_file.rs` over JS `WeightFile`; `ZImageSource`
-single-sources the recipe for CLI/web/e2e. OPFS IO `opfs.ts`/`opfs-worker.ts`:
-`OpfsWeightCache {dirName?, io?: auto|worker|inline}`. CSP needs
-`worker-src 'self'`.
+## DiT denoise is the perf + memory wall (gates real-length + thin HW)
 
-- No DOM types in lib/API. No lazy downloads (caller downloads, else
-  `loadModel` throws). `pnpm build` does NOT run wasm-opt (binaryen absent).
-- `setTraceLevel` (default off): info = milestones + rollups; debug = per-weight
-  residency + join split; trace = per-dispatch + DIAG readbacks.
-- Teardown RAII -> `WgpuBackend::drop` -> `device.destroy()`.
-- OPFS `put`: sync-handle coalesced 16 MiB writes, visibility via `<file>#ok`
-  marker. Read locks held only during an op (released in `finally` after
-  loadModel + each generate). Two tabs at once collide ("locked by another
-  context"); accepted. Desktop write ~3 GiB/s, mobile ~1 GiB/s.
-- KNOWN FAILURE `pnpm test:web` ("Failed to detect test as having been run"
-  since bindings); CI disabled (hangs on GH runners). Run locally before merge.
-- Web caps maxBindingSize/workgroup-storage 128MiB / 16KiB (downlevel); matmul
-  builds 16KiB-fit. >128MiB single binds (DiT FFN 150MiB) parked (chunking).
-- Vendored wgpu facade `projects/vendor/wgpu-29.0.3/` (web subgroups): web-sys
-  omits the `subgroups` GpuFeatureName + hardcodes subgroup size to spec floor
-  4, both blocking subgroup shaders. Fix = vendor ONLY the `wgpu` facade,
-  `[patch.crates-io]`, two `// THINFER-PATCH(web-subgroups #5555)` edits. Our
-  `backend.subgroup_enable_directive()` prepends `enable subgroups;` to sdpa
-  WGSL on web (Tint needs it, naga rejects). Re-check #5555/#8202 each wgpu
-  bump; delete if upstream ships web subgroups. Needed for the sdpa sg lever.
+Now that the VAE is tiled, the DENOISE is the single ~2.0 GiB peak AND the time
+sink. Both block real runs and thin (<2GiB) hardware.
 
-## Conventions
+- Perf: synchronous DF runs FULL O(T^2) self-attention over ALL tokens
+  (f_lat*h_lat*w_lat). Measured (960x544, f_lat=2, 25 steps, CFG 6.0, RTX 5070
+  laptop): umT5 ~16s, denoise ~16.7s/step, VAE ~22s, total 457s. At the 97-frame
+  default (f_lat=25, ~12.5x tokens, quadratic) per-step explodes -> impractical.
+  LEVER: async/causal-block DF -> O(T*block).
+- CFG doubles per-step cost (cond + uncond = TWO DiT forwards). LEVER: batch the
+  two forwards into one `[2*ppf]` rows pass (shared weights, one residency feed,
+  better GPU occupancy) instead of two sequential forwards. Or, since CFG is
+  expensive, expose a distilled/low-CFG fast mode. Biggest single win on this
+  path right now.
+- Memory: DF modulation materializes 6+1 per-token `[n_tok, inner]` broadcast
+  buffers (~1.9 GB at 540P). FIX: a row-broadcast op so blocks read the compact
+  `[f, inner]` form. This is the main thing standing between native decode and a
+  <2GiB budget (VAE already tiles to fit).
+- Secondary: umT5's flat ~13.5s serial tax (24 layers @ ~0.55s); probe whether
+  the q4 GGUF DiT path is weight-feed-bound (f32 safetensors path was; fixed via
+  GPU-side `WeightPrep::NarrowTransposeF32`).
 
-- Rope: DiT interleaved `rope`; Qwen3 half-rot `rope_halfrot`.
-- nn.Linear uploaded transposed; GGUF native. TE stops at Qwen3
-  `hidden_states[-2]`; pads odd prompts to even seq.
-- VAE: `(z/scaling)+shift`; SCALING=0.3611, SHIFT=0.1159; tile=64 ovl=8.
-- WIP branch flow: `git commit --amend --no-edit && git push
-  --force-with-lease`, terse messages. `THINFER_TRACE=1` rollup; `=verbose`
-  adds span-close. fmt + clippy (all warnings) after edits.
-- Validation order: op conformance (`--features conformance`) -> q8 256 pyref
-  e2e -> q4 768 skip-pyref perf e2e. Serial, NEVER parallel GPU runs.
+## Characterized (not blocking): bf16 DiT-velocity floor
 
-## Commands (scratch/ is outside the repo, gitignored)
+The only numerical residual. fp32-pyref probe verdict: it is a PRECISION FLOOR,
+not a block bug -- velocity slope ~1.0 (no systematic under-build) but noisy
+(rmse ~0.2 at 2-step), and it diverges similarly vs bf16 AND fp32 references.
+Worst at aggressive 2-step (`step1_post` slope 0.927); benign by 8-step (0.997,
+the green gate). Scheduler/`conv` is bit-exact (rmse 0.0). No action needed
+unless a real frame looks wrong in a way that traces here.
 
-- **web**: `cd thinfer-web && pnpm build` (wasm + tsc, NO wasm-opt), user runs
-  the server; report browser numbers back. Debug trace, few steps.
-- **e2e parity** (PNG dir env always): `THINFER_TRACE=verbose
-  THINFER_E2E_PNG_DIR=scratch/png_staging THINFER_POWER_PREF=high cargo test
-  --release -p thinfer-conformance --features zimage-e2e
-  e2e_parity_for_gguf_q8_0 -- --skip i8_sdpa --nocapture --test-threads=1`
-  (variants `..._q4_k_m`, `..._i8_sdpa`; `--exact` does NOT work; verify the
-  `starting` line + non-zero passed count).
-- **768 perf (no pyref)**: add `THINFER_E2E_SKIP_PYREF=1
-  THINFER_E2E_DIMS=768x768`.
-- **perf runs**: add `RUST_LOG="info,thinfer::diag=warn"` (debug serializes
-  every block via DIAG probes; use `=debug` only when you need join-split).
-  `THINFER_E2E_BUDGET_GB=N` overrides the 2G default.
-- **qwen3 parity** (encoder localization): `... qwen3_parity -- --nocapture
-  --test-threads=1`.
+## Smaller follow-ups
 
-## Diag / telemetry (opt-in)
+- Bump the committed canary default from 2-step to >=4 (`THINFER_E2E_STEPS`
+  default) so order-2 predictor AND corrector stay gated and the default sits
+  above the 2-step floor. Confirm 4-step green before committing the change.
+- Tighten the broken-vs-noisy caps (`CAP_STEP`/`PRE_VAE`/`VAE_RGB` in
+  `video_e2e_parity.rs`) to real numbers now that 8-step parity is clean.
+- Large-dim pyref + e2e (parity has only run at 64px; coherence lives at native).
+  CPU pyref is slow -- may need a GPU/torch-cuda path or a mid-size compromise.
+- VAE-ENCODE stage tap (t2v only decodes; encoder unvalidated). `WanModel`
+  exposes decode but not encode-stage-diag -- add a thin accessor. Encoder
+  `mid_attention` asserts B==T==1; may need general b*t batching if a tap drives
+  T>1.
 
-- `step done` / `denoise done` / `dit.layers timing` (info): streamed,
-  read_mbps, encode/stream ms. debug adds `join split` (fence/acq/pf; fence ~=
-  stream + tiny acq/pf = GPU-queue-bound) + per-weight `stream read`
-  (overlap-inflated, NOT additive). pf_ms is a finish marker, not a cost.
-- `THINFER_E2E_STEP0_DIAG=1`: DiT step-0 taps (~300MiB, busts budget).
-- qwen3_parity self-localizes per-layer -> pyref per-op dumps -> engine taps.
-- Conformance fixtures cached; `THINFER_CONFORMANCE_REGEN=1` forces.
-- NOTE: laptop thermals throttle all clocks uniformly when vents blocked;
-  ~2x uniform slowdown is airflow, not code.
+## Running the e2e
+
+`tests/wan/video_e2e_parity.rs` (`video_e2e_parity_safetensors`, feature
+`wan-e2e`). Byte-loads pinned `[16,2,8,8]` noise both sides, drives the pyref via
+`uv run`, per-stage compares, asserts dims + 2GiB VRAM/RAM, stages PNGs.
+
+`THINFER_TRACE=1 THINFER_POWER_PREF=high THINFER_E2E_PNG_DIR=<dir> cargo test -p
+thinfer-conformance --features wan-e2e --release video_e2e_parity -- --nocapture
+--test-threads=1`
+
+- Env knobs: `THINFER_E2E_{STEPS,WIDTH,HEIGHT,FRAMES}` (committed default
+  2-step/64px; deep accuracy = more steps, perf = larger dims +
+  `THINFER_E2E_SKIP_PYREF=1` since the CPU pyref can't scale).
+  `THINFER_E2E_PYREF_DTYPE=fp32` for the bf16-floor probe. `SKIP_PYREF=1` keeps
+  budget asserts + PNG staging, skips the reference + checks. Authoritative gate
+  is STEPS=8; native memory check is SKIP_PYREF=1 WIDTH=960 HEIGHT=544 FRAMES=5.
+- Bisection telemetry (gated behind the diag sink; prod/`generate` pass None ->
+  zero readbacks): per-step `WanStepDiag` from `denoise_with`; pyref dumps
+  `py_dit_out_step{i}` + `py_block{b}_out_step{s}`; test prints velocity linfit +
+  scheduler-isolation + per-block slope tables.
+- Step-0-only deep harness: `WanModel::diag_step0` + `THINFER_WAN_DIAG=1`. Bringup.
+
+## Module status
+
+Module-complete + fmt/clippy/check clean, exercised via the e2e gate:
+- VAE (`wan/vae.rs`): decoder (incl. native-res tiling) + encoder drivers +
+  per-stage taps. Pyref `autoencoder_kl_wan.py` (is_residual=False). Encoder
+  unvalidated (follow-up above).
+- Scheduler (`wan/scheduler.rs`): pinned flow config, synchronous DF only, orders
+  1-2 (family pins 2). last_sample = post-corrector sample; all order paths
+  proven correct + 8-step e2e green.
+- `source.rs`/`manifest.rs`/`loader.rs`/`pipeline.rs`: WanSource (Plain
+  safetensors parity path | Quantized umT5-GGUF+DiT-GGUF+VAE-safetensors), GGUF
+  rename maps verified from real Q4_K_M dumps. Open for the GGUF path: confirm
+  Q4_K_M quantizes patch/proj_out/embedders like the blocks (norms/biases stay
+  F32), and `bf16_quant_writes` correctness.
+
+## Carry-forward gotchas
+
+- VAE tiling calibration: if a device still OOMs/overshoots the VAE decode, the
+  knobs are `BYTES_PER_LAT_AREA_F16` + `SAFETY_NUM,_DEN` in `vae_tile_dims`
+  (`wan/vae.rs`). Live set is ~linear in tile AREA * act bytes; the safe fraction
+  of budget is the lever. The encoder has the SAME working-set wall at native res
+  -- the decode tiling pattern (`plan_tiles`/`feather_1d`/`decode_tile`) is there
+  to copy when the encoder needs it.
+- Wan RoPE3D is interleaved-pair, NOT half-rot (opposite of Qwen3). RoPE freqs
+  MUST be packed to the act dtype (`freqs_upload_bytes`): f32 freqs into an f16
+  kernel decode to inf -> NaN softmax (see `wan/dit.rs`).
+- Wan DiT driver takes `text` as host f32 `[text_seq, text_dim]` (umT5 readback +
+  reupload), zero-padded to TEXT_SEQ=512, no cross-attn mask (pyref matches).
+  Clean e2e seam; revisit if it costs at native.
+- Shared-helper layering: Wan DiT modules reach into `z_image::{block, embedders,
+  rope_embedder, seq}`. Decision pending: extract a `thinfer-models` common
+  module vs leave the reuse. Do before the family grows past Wan; not blocking.
+- Video staging: per-frame PNG sequence per side (py_/ours_) + tiled contact
+  sheet. MP4/WebM in the CLI only (openh264); the e2e stages raw PNGs.

@@ -29,12 +29,12 @@ use thinfer_core::weight::{Decoder, WeightCatalog, WeightId, WeightReader, Weigh
 use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 use tracing::Instrument;
 
-use crate::z_image::block::{
+use crate::common::block::{
     ActBuf, Block, BlockPipelines, alloc_act, alloc_matmul_out_buf, copy_tap, op_add, op_rmsnorm,
     op_rope_halfrot, op_sdpa, op_silu_mul,
 };
-use crate::z_image::rope_embedder::RopeEmbedder;
-use crate::z_image::seq;
+use crate::common::rope_embedder::RopeEmbedder;
+use crate::common::seq;
 
 /// Audited against `Tongyi-MAI/Z-Image-Turbo/text_encoder/config.json`
 /// (snapshot `f332072aa78be7aecdf3ee76d5c247082da564a6`, 2026-05-12).

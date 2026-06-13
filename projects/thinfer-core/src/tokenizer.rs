@@ -31,7 +31,11 @@ impl std::error::Error for TokenizerError {}
 /// Backend-agnostic tokenizer. Implementations are not required to be
 /// thread-safe; callers serialize as needed.
 pub trait Tokenizer {
-    /// Tokenize `text` exactly: no special-token insertion, no chat-template
-    /// wrapping. Callers handle templating upstream.
-    fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError>;
+    /// Tokenize `text`, with no chat-template wrapping (callers handle
+    /// templating upstream). `add_special_tokens` selects whether the
+    /// tokenizer's configured specials (e.g. a trailing T5/umT5 `</s>` EOS) are
+    /// inserted: chat-template models pass `false` (their specials are already
+    /// literal text in the wrapped prompt), while umT5/T5 pass `true` to append
+    /// the EOS the reference encoders expect.
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, TokenizerError>;
 }

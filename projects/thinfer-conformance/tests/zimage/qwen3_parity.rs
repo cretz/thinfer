@@ -23,7 +23,7 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::trace;
 use thinfer_core::workspace::Workspace;
-use thinfer_models::z_image::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
+use thinfer_models::common::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
 use thinfer_models::z_image::manifest::{self, role};
 use thinfer_models::z_image::text_encoder::{
     self, Qwen3BlockOpsHost, Qwen3Encoder, Qwen3Taps, register_qwen3_handles,
@@ -93,7 +93,7 @@ async fn qwen3_parity() {
         .await
         .expect("tokenizer load");
     let mut ids = tokenizer
-        .encode(&format_qwen3_prompt(PROMPT))
+        .encode(&format_qwen3_prompt(PROMPT), false)
         .expect("tokenize");
     if !ids.len().is_multiple_of(2) {
         ids.push(*ids.last().unwrap());

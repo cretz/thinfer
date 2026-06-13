@@ -5,27 +5,21 @@
 //! - `CapEmbedder` is `RMSNorm(cap_feat_dim) -> Linear(cap_feat_dim, dim, bias=True)`.
 //!   Input `[N_cap_tokens, cap_feat_dim]`, output `[N_cap_tokens, dim]`.
 //!
-//! Both Linears use `matmul + bcast_add` (additive bias broadcast over rows).
-//!
-//! All scratch (matmul output, uniforms) is allocated through `BatchScope` so
-//! pool-reuse-during-pending-dispatch is unconstructible. Caller passes the
-//! output buffer in as an import.
+//! The bias-Linear machinery (`LinearBias*`, the matmul/bcast dispatch helpers)
+//! is model-agnostic and lives in `crate::common::embedders`; this module is
+//! the Z-Image-specific composition of it.
 
-use thinfer_core::backend::{BufRef, WgpuBackend, WgpuError};
+use thinfer_core::backend::{WgpuBackend, WgpuError};
 use thinfer_core::ops::{BcastAddF32, RmsNormF32};
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{BatchBuf, BatchScope};
 
-use crate::z_image::block::BlockPipelines;
-
-#[derive(Clone, Copy, Debug)]
-pub struct LinearBiasBufs {
-    /// `[in_dim, out_dim]` (transposed from PyTorch `[out_dim, in_dim]`).
-    pub weight: BufRef,
-    /// `[out_dim]`.
-    pub bias: BufRef,
-}
+use crate::common::block::BlockPipelines;
+use crate::common::embedders::{
+    LinearBiasBufs, LinearBiasHandles, LinearBiasViews, bcast_add_uniform, linear_bias,
+    linear_no_bias, rmsnorm_uniform,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct XEmbedderConfig {
@@ -76,7 +70,7 @@ pub struct CapEmbedderConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct CapEmbedderBufs {
     /// RMSNorm gain `[cap_feat_dim]`.
-    pub norm_weight: BufRef,
+    pub norm_weight: thinfer_core::backend::BufRef,
     pub linear: LinearBiasBufs,
 }
 
@@ -140,81 +134,15 @@ impl CapEmbedder {
     }
 }
 
-fn linear_no_bias<'wsp>(
-    scope: &BatchScope<'wsp, WgpuBackend>,
-    pipelines: &BlockPipelines,
-    x: BatchBuf<'wsp>,
-    w: &LinearBiasBufs,
-    n_rows: u32,
-    in_dim: u32,
-    out_dim: u32,
-) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let pre = scope.alloc(pipelines.act_bytes(n_rows * out_dim))?;
-    let dims = scope.u32x4_uniform(n_rows, out_dim, in_dim, 0)?;
-    let weight = scope.import_copy(w.weight);
-    scope.matmul(
-        &pipelines.matmul_qkv,
-        &pipelines.matmuls.qkv,
-        x,
-        weight,
-        dims,
-        pre,
-        n_rows,
-        out_dim,
-    )?;
-    Ok(pre)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn linear_bias<'wsp>(
-    scope: &BatchScope<'wsp, WgpuBackend>,
-    pipelines: &BlockPipelines,
-    x: BatchBuf<'wsp>,
-    w: &LinearBiasBufs,
-    n_rows: u32,
-    in_dim: u32,
-    out_dim: u32,
-    out: BatchBuf<'wsp>,
-) -> Result<(), WgpuError> {
-    let pre = linear_no_bias(scope, pipelines, x, w, n_rows, in_dim, out_dim)?;
-    let ba_u = bcast_add_uniform(scope, out_dim)?;
-    let bias = scope.import_copy(w.bias);
-    scope.bcast_add::<BcastAddF32>(&pipelines.bcast_add, pre, bias, ba_u, out, n_rows * out_dim)
-}
-
-#[derive(Clone, Debug)]
-pub struct LinearBiasHandles {
-    pub weight: WeightHandle,
-    pub bias: WeightHandle,
-}
-
 #[derive(Clone, Debug)]
 pub struct CapEmbedderHandles {
     pub norm_weight: WeightHandle,
     pub linear: LinearBiasHandles,
 }
 
-pub struct LinearBiasViews<'a> {
-    pub weight: GpuView<'a>,
-    pub bias: GpuView<'a>,
-}
-
 pub struct CapEmbedderViews<'a> {
     pub norm_weight: GpuView<'a>,
     pub linear: LinearBiasViews<'a>,
-}
-
-impl LinearBiasHandles {
-    pub async fn acquire<'a, S: WeightSource>(
-        &self,
-        residency: &'a WeightResidency<S>,
-        backend: &WgpuBackend,
-    ) -> Result<LinearBiasViews<'a>, ResidencyError<S::Error, WgpuError>> {
-        Ok(LinearBiasViews {
-            weight: residency.acquire(self.weight, backend).await?,
-            bias: residency.acquire(self.bias, backend).await?,
-        })
-    }
 }
 
 impl CapEmbedderHandles {
@@ -230,15 +158,6 @@ impl CapEmbedderHandles {
     }
 }
 
-impl LinearBiasViews<'_> {
-    pub fn bufs(&self) -> LinearBiasBufs {
-        LinearBiasBufs {
-            weight: self.weight.buf(),
-            bias: self.bias.buf(),
-        }
-    }
-}
-
 impl CapEmbedderViews<'_> {
     pub fn bufs(&self) -> CapEmbedderBufs {
         CapEmbedderBufs {
@@ -246,26 +165,4 @@ impl CapEmbedderViews<'_> {
             linear: self.linear.bufs(),
         }
     }
-}
-
-fn rmsnorm_uniform<'wsp>(
-    scope: &BatchScope<'wsp, WgpuBackend>,
-    n_rows: u32,
-    d: u32,
-    eps: f32,
-) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&n_rows.to_le_bytes());
-    bytes[4..8].copy_from_slice(&d.to_le_bytes());
-    bytes[8..12].copy_from_slice(&eps.to_le_bytes());
-    scope.write_uniform(&bytes)
-}
-
-fn bcast_add_uniform<'wsp>(
-    scope: &BatchScope<'wsp, WgpuBackend>,
-    c: u32,
-) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&c.to_le_bytes());
-    scope.write_uniform(&bytes)
 }

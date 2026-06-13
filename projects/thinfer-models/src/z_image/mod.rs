@@ -11,14 +11,12 @@ use thinfer_core::format::union::QkvTriple;
 use thinfer_core::weight::WeightId;
 
 pub mod audit;
-pub mod block;
 pub mod dit;
 pub mod embedders;
 pub mod final_layer;
 pub mod loader;
 pub mod manifest;
 pub mod pipeline;
-pub mod rope_embedder;
 pub mod scheduler;
 pub mod seq;
 pub mod source;

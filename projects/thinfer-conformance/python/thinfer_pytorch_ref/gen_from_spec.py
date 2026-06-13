@@ -63,6 +63,9 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
         return F.silu(inputs["x"])
     if op == "silu_mul":
         return F.silu(inputs["a"]) * inputs["b"]
+    if op == "gelu_mul":
+        # gelu_new (tanh approximation) gate, matching HF NewGELUActivation.
+        return F.gelu(inputs["a"], approximate="tanh") * inputs["b"]
     if op == "tanh":
         return torch.tanh(inputs["x"])
     if op == "bcast_affine":
@@ -111,6 +114,26 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
             stride=(int(case["stride_h"]), int(case["stride_w"])),
             padding=(int(case["pad_h"]), int(case["pad_w"])),
         )
+    if op == "conv3d":
+        # Causal time conv: pad only the front of the time axis (low-time
+        # side) by pad_t; H/W stay symmetric. F.pad order for NCTHW is
+        # (w_l, w_r, h_l, h_r, t_l, t_r).
+        x = F.pad(inputs["x"], (0, 0, 0, 0, int(case["pad_t"]), 0))
+        return F.conv3d(
+            x,
+            inputs["w"],
+            bias=inputs["bias"],
+            stride=(int(case["stride_t"]), int(case["stride_h"]), int(case["stride_w"])),
+            padding=(0, int(case["pad_h"]), int(case["pad_w"])),
+        )
+    if op == "rmsnorm3d":
+        # WanRMS_norm: L2-normalize across the channel axis (dim 1 of NCTHW),
+        # scale by sqrt(C), apply per-channel gain. bias=False in the Wan VAE.
+        x = inputs["x"]
+        gamma = inputs["w"]
+        c = x.shape[1]
+        normed = F.normalize(x, dim=1)
+        return normed * (c**0.5) * gamma.reshape(1, c, 1, 1, 1)
     if op == "transpose12":
         x = inputs["x"]
         return x.transpose(1, 2).contiguous()

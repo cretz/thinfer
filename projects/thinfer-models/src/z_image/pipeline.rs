@@ -26,9 +26,10 @@ use thinfer_core::trace;
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 
-use crate::z_image::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
+use crate::common::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
+use crate::common::loader::LoadError;
 use crate::z_image::dit::{Block0Taps, DitInputs, DitShape, DitTaps, ZImageDit};
-use crate::z_image::loader::{LoadError, register_dit_handles};
+use crate::z_image::loader::register_dit_handles;
 use crate::z_image::scheduler::FlowMatchEulerScheduler;
 use crate::z_image::text_encoder::{
     EmbedLookupError, Qwen3Encoder, Qwen3ForwardError, Qwen3Handles, register_qwen3_handles,
@@ -780,9 +781,11 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         let token_ids = {
             let _s = trace::scope!("tokenize").entered();
             let wrapped = format_qwen3_prompt(&params.prompt);
+            // Chat-template specials are already literal text in `wrapped`; do
+            // not let the tokenizer insert its own (would add a stray BOS/EOS).
             let ids = self
                 .tokenizer
-                .encode(&wrapped)
+                .encode(&wrapped, false)
                 .map_err(GenerateError::Tokenizer)?;
             tracing::debug!(n_tokens = ids.len(), "tokenize done");
             if ids.len() > MAX_PROMPT_TOKENS {
@@ -1369,7 +1372,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     if inner == 0 || !inner.is_multiple_of(32) {
                         return;
                     }
-                    crate::z_image::seq::diag_quant_roundtrip_loss(label, v, seq_u as usize, inner);
+                    crate::common::seq::diag_quant_roundtrip_loss(label, v, seq_u as usize, inner);
                 };
                 if let Some(v) = &b0.attn_qkv_f16_pre_quant {
                     print("block0.attn_qkv_f16_pre_quant", v);

@@ -18,3 +18,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+# Video output (CLI-only): H.264 encode (Cisco BSD, compiled from source) +
+# MP4 mux. Kept out of thinfer-native/-models so web stays free of a wasm
+# software encoder (it uses the browser's WebCodecs encoder instead).
+openh264 = "0.6"
+mp4 = "0.14"

@@ -15,7 +15,7 @@ use thinfer_core::arbiter::MemArbiter;
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
 use thinfer_core::ops::WgslConfig;
 use thinfer_core::workspace::Workspace;
-use thinfer_models::z_image::block::{ActBufRef, BlockPipelines, BlockWgslConfigs};
+use thinfer_models::common::block::{ActBufRef, BlockPipelines, BlockWgslConfigs};
 use thinfer_models::z_image::dit::scatter_pad_rows;
 
 const N_ROWS: usize = 5;

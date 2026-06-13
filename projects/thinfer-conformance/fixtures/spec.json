@@ -125,6 +125,40 @@
       ]
     },
     {
+      "name": "gelu_mul_basic",
+      "op": "gelu_mul",
+      "inputs": [
+        {
+          "name": "a",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -4.0,
+            "hi": 4.0
+          }
+        },
+        {
+          "name": "b",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.5,
+            "hi": 1.75,
+            "flip": true
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
       "name": "tanh_basic",
       "op": "tanh",
       "inputs": [
@@ -973,6 +1007,373 @@
             "kind": "linspace",
             "lo": -0.25,
             "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv3d_3x3x3_pad",
+      "op": "conv3d",
+      "kt": 3,
+      "kh": 3,
+      "kw": 3,
+      "pad_t": 2,
+      "pad_h": 1,
+      "pad_w": 1,
+      "stride_t": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4,
+            3,
+            5,
+            5
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            3,
+            4,
+            3,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.3,
+            "hi": 0.3
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv3d_3x1x1_time",
+      "op": "conv3d",
+      "kt": 3,
+      "kh": 1,
+      "kw": 1,
+      "pad_t": 2,
+      "pad_h": 0,
+      "pad_w": 0,
+      "stride_t": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            6,
+            4,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            12,
+            6,
+            3,
+            1,
+            1
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.2,
+            "hi": 0.2
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            12
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.1,
+            "hi": 0.1
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv3d_1x1x1",
+      "op": "conv3d",
+      "kt": 1,
+      "kh": 1,
+      "kw": 1,
+      "pad_t": 0,
+      "pad_h": 0,
+      "pad_w": 0,
+      "stride_t": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            8,
+            2,
+            4,
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            5,
+            8,
+            1,
+            1,
+            1
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5,
+            "flip": true
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            5
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv3d_3x1x1_stride_t2",
+      "op": "conv3d",
+      "kt": 3,
+      "kh": 1,
+      "kw": 1,
+      "pad_t": 0,
+      "pad_h": 0,
+      "pad_w": 0,
+      "stride_t": 2,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4,
+            5,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            4,
+            4,
+            3,
+            1,
+            1
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.2,
+            "hi": 0.2
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.1,
+            "hi": 0.1
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "conv3d_3x3x3_multitile",
+      "op": "conv3d",
+      "kt": 3,
+      "kh": 3,
+      "kw": 3,
+      "pad_t": 2,
+      "pad_h": 1,
+      "pad_w": 1,
+      "stride_t": 1,
+      "stride_h": 1,
+      "stride_w": 1,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            16,
+            3,
+            7,
+            5
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            70,
+            16,
+            3,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.05,
+            "hi": 0.05
+          }
+        },
+        {
+          "name": "bias",
+          "shape": [
+            70
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "rmsnorm3d_basic",
+      "op": "rmsnorm3d",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            8,
+            2,
+            3,
+            3
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -2.0,
+            "hi": 2.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.5,
+            "hi": 1.5
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
+      "name": "rmsnorm3d_t1",
+      "op": "rmsnorm3d",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            16,
+            1,
+            4,
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "w",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.8,
+            "hi": 1.2,
+            "flip": true
           }
         }
       ],

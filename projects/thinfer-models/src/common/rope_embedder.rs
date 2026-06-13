@@ -16,8 +16,6 @@
 //! Upstream does the computation in f64 then casts to f32, which we mirror to
 //! keep numerics aligned for differential tests.
 
-use crate::z_image::config;
-
 #[derive(Clone, Debug)]
 pub struct RopeEmbedder {
     pub theta: f32,
@@ -29,14 +27,6 @@ pub struct RopeEmbedder {
 }
 
 impl RopeEmbedder {
-    pub fn z_image() -> Self {
-        Self::new(
-            config::ROPE_THETA,
-            config::ROPE_AXES_DIMS,
-            config::ROPE_AXES_LENS,
-        )
-    }
-
     pub fn new(theta: f32, axes_dims: [usize; 3], axes_lens: [usize; 3]) -> Self {
         let theta_f64 = theta as f64;
         let tables = std::array::from_fn(|i| {

@@ -183,3 +183,141 @@ fn transpose_bf16_odd_k() {
     let raw = synth_bf16((n * k) as usize, 0xF00D, 2.0);
     check_transpose(n, k, &raw);
 }
+
+/// Compare `narrow_transpose_f32` (fused f32->bf16 RNE + `[N,K]`->`[K,N]`
+/// transpose) against the production CPU narrow (`half::bf16::from_f32`)
+/// placed transposed. Bit-exact: the WGSL RNE is pure integer bit movement.
+fn check_narrow_transpose(n: u32, k: u32, vals: &[f32]) {
+    let (nu, ku) = (n as usize, k as usize);
+    assert_eq!(vals.len(), nu * ku);
+    let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // Expected bf16 `[K, N]`: output word i holds elements (kk, nn) low and
+    // (kk, nn+1) high, each narrowed by `half` (what the CPU upload uses).
+    let mut exp = vec![0u8; nu * ku * 2];
+    for (i, chunk) in exp.chunks_exact_mut(2).enumerate() {
+        let kk = i / nu;
+        let nn = i % nu;
+        let v = bf16::from_f32(vals[nn * ku + kk]).to_bits();
+        chunk.copy_from_slice(&v.to_le_bytes());
+    }
+    // Single whole-tensor band (n0 = 0, band_n = n): the residency prep loop
+    // exercises multi-band striping separately via `narrow_transpose_f32_banded`.
+    let got = pollster::block_on(gpu_prep(
+        WeightPrep::NarrowTransposeF32 {
+            n,
+            k,
+            n0: 0,
+            band_n: n,
+        },
+        &raw,
+        exp.len() as u64,
+    ));
+    let diff = got.iter().zip(&exp).filter(|(g, e)| g != e).count();
+    assert_eq!(diff, 0, "[{n}, {k}]: {diff}/{} bytes differ", exp.len());
+}
+
+#[test]
+fn narrow_transpose_f32_random() {
+    // Full-precision f32 LCG values (NOT pre-rounded), so every element
+    // exercises the RNE rounding path, not just a copy.
+    let (n, k) = (70u32, 33u32);
+    let mut s = 0x1234_5678_9abc_def0u64;
+    let vals: Vec<f32> = (0..n * k)
+        .map(|_| {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            // Wide exponent spread (mantissa from high bits, exponent from
+            // low) to hit normals across magnitudes.
+            let mant = ((s >> 40) as u32) & 0x007F_FFFF;
+            let exp = (((s >> 8) as u32) % 60 + 100) << 23; // exp in [100,160)
+            let sign = ((s >> 4) as u32 & 1) << 31;
+            f32::from_bits(sign | exp | mant)
+        })
+        .collect();
+    check_narrow_transpose(n, k, &vals);
+}
+
+#[test]
+fn narrow_transpose_f32_banded() {
+    // Stripe a tensor through several offset bands (as the residency prep loop
+    // does) into one [K, N] buffer; the result must equal the whole-tensor
+    // narrow+transpose. Exercises n0 offsets, a non-divisor band size (last
+    // band is smaller), and the global-stride output. K odd (=5) too.
+    let (n, k, band_rows) = (16u32, 5u32, 6u32);
+    let (nu, ku) = (n as usize, k as usize);
+    let mut s = 0xDEAD_BEEF_0000_0001u64;
+    let vals: Vec<f32> = (0..n * k)
+        .map(|_| {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let mant = ((s >> 40) as u32) & 0x007F_FFFF;
+            let exp = (((s >> 8) as u32) % 50 + 110) << 23;
+            f32::from_bits(exp | mant)
+        })
+        .collect();
+    let mut exp = vec![0u8; nu * ku * 2];
+    for (i, chunk) in exp.chunks_exact_mut(2).enumerate() {
+        let (kk, nn) = (i / nu, i % nu);
+        chunk.copy_from_slice(&bf16::from_f32(vals[nn * ku + kk]).to_bits().to_le_bytes());
+    }
+    let got = pollster::block_on(async {
+        let backend = WgpuBackend::new().await.expect("wgpu adapter");
+        let row_bytes = (k as u64) * 4;
+        let staging = backend
+            .allocate(band_rows as u64 * row_bytes)
+            .expect("stage");
+        let dst_len = (nu * ku * 2) as u64;
+        let dst = backend.allocate(dst_len).expect("dst");
+        let mut n0 = 0u32;
+        while n0 < n {
+            let band_n = band_rows.min(n - n0);
+            let band_bytes = band_n as u64 * row_bytes;
+            let mut buf = Vec::with_capacity(band_bytes as usize);
+            for r in 0..band_n {
+                let row = (n0 + r) as usize;
+                for &v in &vals[row * ku..row * ku + ku] {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            backend.write_buffer(staging, 0, &buf).expect("write band");
+            backend
+                .weight_prep(
+                    WeightPrep::NarrowTransposeF32 { n, k, n0, band_n },
+                    &BufRef::new(staging, band_bytes),
+                    &BufRef::new(dst, dst_len),
+                )
+                .await
+                .expect("weight_prep band");
+            n0 += band_n;
+        }
+        let out = backend.read_buffer(dst, 0, dst_len).await.expect("read");
+        backend.free(staging);
+        backend.free(dst);
+        out
+    });
+    let diff = got.iter().zip(&exp).filter(|(g, e)| g != e).count();
+    assert_eq!(
+        diff,
+        0,
+        "banded [{n}, {k}]: {diff}/{} bytes differ",
+        exp.len()
+    );
+}
+
+#[test]
+fn narrow_transpose_f32_rounding_edges() {
+    // Hand-built f32 bit patterns that pin the RNE corners: exact ties
+    // (low 16 == 0x8000) with even vs odd result LSB, sticky-set round-up,
+    // round-down, plus NaN / +-inf / max-finite. N even, K=1 keeps the map
+    // a straight narrow so a mismatch is rounding, not layout.
+    let f = f32::from_bits;
+    let vals: Vec<f32> = vec![
+        f(0x3F80_8000), // tie, result LSB 0 (0x3F80) -> stays even (round down)
+        f(0x3F81_8000), // tie, result LSB 1 (0x3F81) -> round up to 0x3F82
+        f(0x3F80_8001), // round bit + sticky -> round up
+        f(0x3F80_7FFF), // below half -> round down
+        f(0x7F80_0000), // +inf -> 0x7F80
+        f(0xFF80_0000), // -inf -> 0xFF80
+        f(0x7FC0_0000), // NaN -> high mantissa | quiet bit
+        f(0x7F7F_FFFF), // max finite, round bit set -> rounds up to 0x7F80
+    ];
+    check_narrow_transpose(vals.len() as u32, 1, &vals);
+}
