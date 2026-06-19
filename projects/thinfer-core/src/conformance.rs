@@ -11,13 +11,14 @@
 use crate::backend::{Backend, BindingLayout, BufRef, WgpuBackend, WgpuError};
 use crate::ops::{
     AddF32, BcastAddBufs, BcastAddF32, BcastAddOp, BcastAffineBufs, BcastAffineF32, BcastAffineOp,
-    BcastFmaBufs, BcastFmaF32, BcastFmaOp, Conv2dBufs, Conv2dF32, Conv2dOp, Conv3dBufs, Conv3dF32,
-    Conv3dOp, GeluMulF32, LayerNormBufs, LayerNormF32, LayerNormOp, MatMulF32, MatmulBufs,
-    MatmulOp, MulF32, Op, RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp, RmsNormBufs, RmsNormF32,
-    RmsNormOp, RopeBufs, RopeF32, RopeF32HalfRot, RopeOp, SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp,
-    SiluF32, SiluMulF32, SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32, Transpose12Bufs,
-    Transpose12F32, Transpose12Op, WgslConfig, dispatch_bcast_add, dispatch_bcast_affine,
-    dispatch_bcast_fma, dispatch_conv2d, dispatch_conv3d, dispatch_layernorm, dispatch_matmul,
+    BcastFmaBufs, BcastFmaF32, BcastFmaOp, BcastModulateBufs, BcastModulateF32, BcastModulateOp,
+    BcastMulF32, Conv2dBufs, Conv2dF32, Conv2dOp, Conv3dBufs, Conv3dF32, Conv3dOp, GeluMulF32,
+    LayerNormBufs, LayerNormF32, LayerNormOp, MatMulF32, MatmulBufs, MatmulOp, MulF32, Op,
+    RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp, RmsNormBufs, RmsNormF32, RmsNormOp, RopeBufs,
+    RopeF32, RopeF32HalfRot, RopeOp, SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32,
+    SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32, Transpose12Bufs, Transpose12F32, Transpose12Op,
+    WgslConfig, dispatch_bcast_add, dispatch_bcast_affine, dispatch_bcast_fma,
+    dispatch_bcast_modulate, dispatch_conv2d, dispatch_conv3d, dispatch_layernorm, dispatch_matmul,
     dispatch_op, dispatch_rmsnorm, dispatch_rmsnorm3d, dispatch_rope, dispatch_sdpa,
     dispatch_softmax, dispatch_transpose12,
 };
@@ -114,8 +115,14 @@ pub enum OpSpec {
     },
     #[serde(rename = "bcast_fma")]
     BcastFma,
+    #[serde(rename = "bcast_modulate")]
+    BcastModulate {
+        bias: f32,
+    },
     #[serde(rename = "bcast_add")]
     BcastAdd,
+    #[serde(rename = "bcast_mul")]
+    BcastMul,
     Conv2d {
         kh: u32,
         kw: u32,
@@ -617,6 +624,39 @@ impl<'a> OpTestContext<'a> {
         .await
     }
 
+    pub async fn run_bcast_modulate<O: BcastModulateOp>(&self) -> Vec<u8> {
+        let bias = match self.case.op {
+            OpSpec::BcastModulate { bias } => bias,
+            _ => panic!("run_bcast_modulate called with non-bcast_modulate OpSpec"),
+        };
+        let (c, n_elems, out_len) = bcast_shapes(self);
+        let mut u = [0u8; 16];
+        u[0..4].copy_from_slice(&c.to_le_bytes());
+        u[4..8].copy_from_slice(&bias.to_le_bytes());
+        self.run_op(
+            O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |b, e, p, ins, uf, out| {
+                dispatch_bcast_modulate::<O, _>(
+                    b,
+                    e,
+                    p,
+                    &BcastModulateBufs {
+                        x: &ins[0],
+                        s: &ins[1],
+                        t: &ins[2],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n_elems,
+                )
+            },
+        )
+        .await
+    }
+
     pub async fn run_conv2d<O: Conv2dOp>(&self, op: O) -> Vec<u8> {
         let (kh, kw, pad_h, pad_w, stride_h, stride_w) = match self.case.op {
             OpSpec::Conv2d {
@@ -869,7 +909,9 @@ pub fn registry() -> Vec<Box<dyn OpTest>> {
         Box::new(Transpose12F32),
         Box::new(BcastAffineF32),
         Box::new(BcastFmaF32),
+        Box::new(BcastModulateF32),
         Box::new(BcastAddF32),
+        Box::new(BcastMulF32),
         Box::new(Conv2dF32::default_op()),
         Box::new(Conv3dF32::default_op()),
         Box::new(RmsNorm3dF32),

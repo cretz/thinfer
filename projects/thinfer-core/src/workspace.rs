@@ -1229,6 +1229,38 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn bcast_modulate<O: crate::ops::BcastModulateOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        s: BatchBuf<'wsp>,
+        t: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_elems: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let s = self.resolve(s);
+        let t = self.resolve(t);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::BcastModulateBufs {
+            x: &x,
+            s: &s,
+            t: &t,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_bcast_modulate::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_elems,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn rope<O: crate::ops::RopeOp>(
         &self,
         pipeline: &B::Pipeline,
@@ -1566,6 +1598,31 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             out: &out,
         };
         crate::ops::dispatch_upsample2d_nearest::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out_elems,
+        )
+    }
+
+    pub fn dupup3d<O: crate::ops::DupUp3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out_elems: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::DupUp3dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_dupup3d::<O, _>(
             self.backend,
             &mut self.encoder_mut(),
             pipeline,

@@ -1,39 +1,33 @@
-//! Wan / SkyReels-V2 DiT stack driver (`SkyReelsV2Transformer3DModel.forward`,
-//! `transformer_skyreels_v2.py`). Single-stream video DiT, `B = 1`:
+//! Wan2.2 DiT stack driver (`WanTransformer3DModel.forward`,
+//! `transformer_wan.py`). Single-stream video DiT, `B = 1`:
 //!
 //! ```text
 //! x      = patch_linear(patchify(image)) + bias        // [n_tok, inner]
-//! temb, timestep_proj, text = condition_embedder(timesteps, fps, text_states)
+//! temb, timestep_proj, text = condition_embedder(timestep, text_states)
 //! freqs  = rope3d(grid)                                 // [n_tok, head_dim]
-//! for blk in blocks:                                    // 30 SkyReelsV2 blocks
-//!     mod6 = blk.scale_shift_table[6] + timestep_proj   // per-token (DF)
+//! for blk in blocks:                                    // 30 Wan blocks
+//!     mod6 = blk.scale_shift_table[6] + timestep_proj   // [6, inner] vectors
 //!     x    = blk(x, text, freqs, mod6)
-//! shift, scale = model.scale_shift_table[2] + temb      // per-token (DF)
+//! shift, scale = model.scale_shift_table[2] + temb      // [inner] vectors
 //! x      = norm_out(x) * (1 + scale) + shift
 //! tokens = proj_out(x)                                  // [n_tok, out_ch*p_t*p_h*p_w]
 //! image  = unpatchify(tokens)                           // [out_ch, F, H, W]
 //! ```
 //!
-//! Diffusion Forcing means the timestep is per latent frame: `temb`,
-//! `timestep_proj`, and the final `shift`/`scale` are per-frame signals
-//! broadcast over each frame's spatial tokens (`pph * ppw`) to per-token
-//! `[n_tok, inner]` tensors, which is what [`WanDitBlock`] consumes. The driver
-//! materializes the broadcast once (the six modulation bases + the final temb)
-//! and reuses it across all 30 blocks.
+//! The timestep is a single scalar uniform over the clip, so `temb`,
+//! `timestep_proj`, and the final `shift`/`scale` are channel vectors `[inner]`
+//! (`[6, inner]` for the per-block six), broadcast over the `n_tok` rows inside
+//! the block via `bcast_affine`/`bcast_fma`. No per-token materialization (the
+//! SkyReels-V2-DF path broadcast the six bases to `[n_tok, inner]` up front, a
+//! `6 * n_tok * inner` resident hog; that is gone).
 //!
 //! Residency: each block pages its weights via [`WeightResidency`]; the loop
 //! awaits each block's GPU fence concurrently with streaming the next block's
 //! weights (the same overlap model as `z_image/dit.rs`). Activations persist
 //! across submits as caller-owned `WsBuf`s.
-//!
-//! Per-frame-broadcast modulation costs `6 * n_tok * inner` resident floats,
-//! inherent to DF (diffusers materializes the same 4D temb). At 540P that is
-//! large; a row-broadcast op that lets blocks read the compact `[f, inner]`
-//! form directly is the native-memory optimization, deferred (parity shapes are
-//! tiny). See `wan-plan.md`.
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
-use thinfer_core::ops::{ActDtype, BcastAddF32, LayerNormF32, MulF32};
+use thinfer_core::ops::{ActDtype, BcastAddF32, BcastModulateF32, LayerNormF32};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace, WsBuf};
@@ -41,15 +35,15 @@ use tracing::Instrument;
 
 use thinfer_core::trace::{self, PHASE};
 
-use crate::common::block::{ActBuf, BlockPipelines, alloc_act, alloc_matmul_out_buf, op_add};
+use crate::common::block::{ActBuf, BlockPipelines, alloc_act, alloc_matmul_out_buf};
 use crate::common::embedders::{LinearBiasBufs, LinearBiasHandles};
 use crate::common::seq::{act_upload_bytes, freqs_upload_bytes};
 use crate::wan::condition_embedder::{
     ConditionEmbedder, ConditionEmbedderHandles, ConditionEmbedderOut,
 };
 use crate::wan::dit_block::{
-    WanDitBlock, WanDitBlockHandles, WanDitBlockShape, WanDitBlockTaps, WanDitPipelines, WanMod,
-    config,
+    WanDitBlock, WanDitBlockBufs, WanDitBlockHandles, WanDitBlockShape, WanDitBlockTaps,
+    WanDitConfig, WanDitPipelines, WanMod, config,
 };
 use crate::wan::patchify::{self, PatchGrid};
 use crate::wan::rope3d::WanRope3d;
@@ -83,8 +77,6 @@ pub struct WanDitShape {
     pub text_seq: usize,
     /// Patch tokens `ppf * pph * ppw`.
     pub n_tok: usize,
-    /// Spatial tokens per frame `pph * ppw` (the DF broadcast factor).
-    pub spatial: usize,
 }
 
 impl WanDitShape {
@@ -92,7 +84,6 @@ impl WanDitShape {
         let grid = PatchGrid::new(c, f, h, w);
         Self {
             n_tok: grid.n_tok(),
-            spatial: grid.pph * grid.ppw,
             grid,
             text_seq,
         }
@@ -105,10 +96,9 @@ pub struct WanDitInputs<'a> {
     pub image: &'a [f32],
     /// umT5 text states `[text_seq, text_dim]` row-major f32.
     pub text: &'a [f32],
-    /// Per-frame noise levels (`len == ppf`, Diffusion Forcing).
-    pub timesteps: &'a [f32],
-    /// `fps_embedding` bucket (DF, `inject_sample_info`).
-    pub fps: usize,
+    /// Scalar diffusion timestep, uniform over the whole clip (the distilled
+    /// T2V line is plain flow-matching, not per-frame Diffusion Forcing).
+    pub timestep: f32,
 }
 
 /// One DiT forward output, ready for VAE decode.
@@ -118,7 +108,7 @@ pub struct WanDitOutput {
 }
 
 /// Optional per-stage readbacks (ad-hoc bringup diff vs pyref). The committed
-/// gate is the single end-state `video_e2e_parity`; these localize divergence.
+/// gate is the single end-state `video_e2e`; these localize divergence.
 #[derive(Default)]
 pub struct WanDitTaps<'a> {
     pub patch_x: Option<&'a mut Vec<f32>>,
@@ -180,6 +170,7 @@ impl ResStream {
 
 pub struct WanDit {
     pub shape: WanDitShape,
+    pub cfg: WanDitConfig,
     pub handles: LoadedWanDitHandles,
     block: WanDitBlock,
     condition_embedder: ConditionEmbedder,
@@ -187,13 +178,14 @@ pub struct WanDit {
 }
 
 impl WanDit {
-    pub fn assemble(handles: LoadedWanDitHandles, shape: WanDitShape) -> Self {
-        let block = WanDitBlock::new(WanDitBlockShape::new(shape.n_tok, shape.text_seq));
+    pub fn assemble(handles: LoadedWanDitHandles, shape: WanDitShape, cfg: WanDitConfig) -> Self {
+        let block = WanDitBlock::new(WanDitBlockShape::new(&cfg, shape.n_tok, shape.text_seq));
         Self {
             shape,
+            cfg,
             handles,
             block,
-            condition_embedder: ConditionEmbedder::skyreels_df(),
+            condition_embedder: ConditionEmbedder::from_cfg(&cfg),
             rope: WanRope3d::new(),
         }
     }
@@ -229,16 +221,10 @@ impl WanDit {
     ) -> Result<WanDitOutput, WanDitError<S::Error>> {
         let bp = &pipelines.block;
         let s = self.shape;
-        let inner = config::INNER as u32;
+        let inner = self.cfg.inner() as u32;
         let rows = s.n_tok as u32;
         let ppf = s.grid.ppf;
-        let spatial = s.spatial as u32;
         let text_seq = s.text_seq as u32;
-        assert_eq!(
-            inputs.timesteps.len(),
-            ppf,
-            "Diffusion Forcing needs one timestep per latent frame"
-        );
 
         // --- 1. patchify image + front-door linear -> x [n_tok, inner] ---
         let patch_in = s.grid.patch_in() as u32;
@@ -275,8 +261,9 @@ impl WanDit {
         let text_bytes = act_upload_bytes(bp.act_dtype, inputs.text);
         let text_in = scratch.alloc(text_bytes.len() as u64)?;
         backend.write_buffer(text_in.id, 0, &text_bytes)?;
-        let temb = scratch.alloc(bp.act_bytes(ppf as u32 * inner))?;
-        let tproj = scratch.alloc(bp.act_bytes(ppf as u32 * 6 * inner))?;
+        // temb [1, inner], timestep_proj [1, 6*inner] (scalar-t channel vectors).
+        let temb = scratch.alloc(bp.act_bytes(inner))?;
+        let tproj = scratch.alloc(bp.act_bytes(6 * inner))?;
         let text = ResStream::alloc(scratch, bp, text_seq, inner)?;
         {
             let views = self.handles.condition.acquire(residency, backend).await?;
@@ -290,8 +277,7 @@ impl WanDit {
                 &scope,
                 bp,
                 &pipelines.gelu,
-                inputs.timesteps,
-                inputs.fps,
+                inputs.timestep,
                 scope.import_copy(text_in.as_buf_ref()),
                 text_seq,
                 &out,
@@ -302,7 +288,7 @@ impl WanDit {
         read_tap(
             backend,
             &temb.as_buf_ref(),
-            (ppf as u32 * inner) as usize,
+            inner as usize,
             bp.act_dtype,
             &mut taps.temb,
         )
@@ -310,7 +296,7 @@ impl WanDit {
         read_tap(
             backend,
             &tproj.as_buf_ref(),
-            (ppf as u32 * 6 * inner) as usize,
+            (6 * inner) as usize,
             bp.act_dtype,
             &mut taps.timestep_proj,
         )
@@ -333,36 +319,29 @@ impl WanDit {
         let freqs = scratch.alloc(freqs_bytes.len() as u64)?;
         backend.write_buffer(freqs.id, 0, &freqs_bytes)?;
 
-        // --- 4. broadcast the 6 modulation bases + temb to per-token [rows, *] ---
-        // Each base is `timestep_proj[:, k]` (or temb) repeated over spatial.
-        let mod_base: Vec<WsBuf<WgpuBackend>> = (0..6)
-            .map(|_| scratch.alloc(bp.act_bytes(rows * inner)))
-            .collect::<Result<_, _>>()?;
-        let temb_tok = scratch.alloc(bp.act_bytes(rows * inner))?;
-        {
-            let scope = scratch.batch();
-            let elem = bp.act_dtype.bytes_per_elem();
-            let row_b = inner as u64 * elem;
-            let tproj_h = scope.import_copy(tproj.as_buf_ref());
-            let temb_h = scope.import_copy(temb.as_buf_ref());
-            for (k, base) in mod_base.iter().enumerate() {
-                let dst = scope.import_copy(base.as_buf_ref());
-                for t in 0..rows as u64 {
-                    let frame = t / spatial as u64;
-                    let src_off = (frame * 6 + k as u64) * row_b;
-                    scope.copy_buffer_to_buffer(tproj_h, src_off, dst, t * row_b, row_b)?;
-                }
-            }
-            let temb_dst = scope.import_copy(temb_tok.as_buf_ref());
-            for t in 0..rows as u64 {
-                let frame = t / spatial as u64;
-                scope.copy_buffer_to_buffer(temb_h, frame * row_b, temb_dst, t * row_b, row_b)?;
-            }
-            scope.submit_void().await?;
-        }
-
-        // --- 5. main transformer blocks (residency-paged) ---
+        // --- 4. main transformer blocks (residency-paged) ---
+        // The six modulation vectors `scale_shift_table[k] + timestep_proj[k]`
+        // are built per block inside its scope (`build_mod`); each is `[inner]`
+        // and broadcasts over the rows in the block. No up-front per-token
+        // materialization.
         let mut x_cur = x;
+        // Activation-tiling tier: above ~one tile's worth of tokens, run each
+        // block as pass A (row-tiled q/k/v) -> global self-SDPA -> pass B
+        // (row-tiled cross-attn + FFN), so the heavy `[tile, ffn_dim]` FFN
+        // transients recycle through the pool instead of all living at once.
+        // Below the threshold (the e2e gate's tiny grids), n_tiles == 1 keeps
+        // the original single-scope path bit-identical. Diag taps force the
+        // untiled path (intra-block taps are single-scope only).
+        let n_tiles = if taps.block0.is_some() {
+            1
+        } else {
+            rows.div_ceil(dit_tile_rows()).max(1)
+        };
+        let tile = if n_tiles > 1 {
+            Some(TileBufs::alloc(scratch, bp, rows, text_seq, inner)?)
+        } else {
+            None
+        };
         let _lr = trace::scope!("wan.dit.blocks", n = self.handles.blocks.len()).entered();
         let mut pending = if self.handles.blocks.is_empty() {
             None
@@ -400,23 +379,6 @@ impl WanDit {
                 WanDitBlockTaps::default()
             };
             {
-                let scope = scratch.batch();
-                // Build the six per-token modulation signals: base_k + table[k].
-                let table = scope.import_copy(views.scale_shift_table());
-                let m = self.build_mod(&scope, bp, &mod_base, table, rows, inner)?;
-                let nxt_h = scope.import_copy(nxt.as_act_ref());
-                self.block.forward(
-                    &scope,
-                    pipelines,
-                    scope.import_copy(x_cur.as_act_ref()),
-                    scope.import_copy(text.as_act_ref()),
-                    scope.import_copy(freqs.as_buf_ref()),
-                    &m,
-                    nxt_h,
-                    &views.bufs(),
-                    &block_taps,
-                )?;
-
                 let next_idx = idx + 1;
                 let next_acquire = async {
                     match self.handles.blocks.get(next_idx) {
@@ -440,14 +402,59 @@ impl WanDit {
                         None => Ok(()),
                     }
                 };
-                let submit_fut = scope
-                    .submit_deferred()
-                    .instrument(tracing::debug_span!(target: PHASE, "wan.submit", idx));
-                let (s_res, n_res, p_res) =
-                    futures::join!(submit_fut, next_acquire, prefetch_after);
-                s_res?;
-                p_res?;
-                pending = n_res?;
+                if let Some(tb) = tile.as_ref() {
+                    // Tiled path owns its own (serial) submits; overlap weight
+                    // streaming for the next block(s) with the whole movement.
+                    let block_bufs = views.bufs();
+                    let sst = views.scale_shift_table();
+                    let compute = self
+                        .forward_block_tiled(
+                            pipelines,
+                            scratch,
+                            &block_bufs,
+                            sst,
+                            tproj.as_buf_ref(),
+                            freqs.as_buf_ref(),
+                            text.as_act_ref(),
+                            x_cur.as_act_ref(),
+                            nxt.as_act_ref(),
+                            tb,
+                            n_tiles,
+                        )
+                        .instrument(tracing::debug_span!(target: PHASE, "wan.tiled", idx));
+                    let (c_res, n_res, p_res) =
+                        futures::join!(compute, next_acquire, prefetch_after);
+                    c_res?;
+                    p_res?;
+                    pending = n_res?;
+                } else {
+                    let scope = scratch.batch();
+                    // Build the six modulation vectors: scale_shift_table[k] +
+                    // timestep_proj[k], each `[inner]` (broadcast over the rows).
+                    let tproj_h = scope.import_copy(tproj.as_buf_ref());
+                    let m =
+                        self.build_mod(&scope, bp, views.scale_shift_table(), tproj_h, inner)?;
+                    let nxt_h = scope.import_copy(nxt.as_act_ref());
+                    self.block.forward(
+                        &scope,
+                        pipelines,
+                        scope.import_copy(x_cur.as_act_ref()),
+                        scope.import_copy(text.as_act_ref()),
+                        scope.import_copy(freqs.as_buf_ref()),
+                        &m,
+                        nxt_h,
+                        &views.bufs(),
+                        &block_taps,
+                    )?;
+                    let submit_fut = scope
+                        .submit_deferred()
+                        .instrument(tracing::debug_span!(target: PHASE, "wan.submit", idx));
+                    let (s_res, n_res, p_res) =
+                        futures::join!(submit_fut, next_acquire, prefetch_after);
+                    s_res?;
+                    p_res?;
+                    pending = n_res?;
+                }
             }
             x_cur = nxt;
         }
@@ -470,7 +477,7 @@ impl WanDit {
         }
 
         // --- 6. final norm + modulation + proj_out ---
-        let proj_w = config::OUT_CHANNELS * config::PATCH_T * config::PATCH_H * config::PATCH_W;
+        let proj_w = self.cfg.out_channels * config::PATCH_T * config::PATCH_H * config::PATCH_W;
         let proj_out = ResStream::alloc(scratch, bp, rows, proj_w as u32)?;
         // Persist the post-modulation activation when a tap wants it (readback
         // after submit; scope-local buffers do not survive the submit).
@@ -484,11 +491,11 @@ impl WanDit {
                 .await?;
             let pv = self.handles.proj_out.acquire(residency, backend).await?;
             let scope = scratch.batch();
-            // shift = table[0] + temb_tok ; scale = table[1] + temb_tok.
-            let table = scope.import_copy(sst.buf());
-            let temb_h = ActBuf::dense(scope.import_copy(temb_tok.as_buf_ref()));
-            let shift = self.add_table_row(&scope, bp, temb_h, table, 0, rows, inner)?;
-            let scale = self.add_table_row(&scope, bp, temb_h, table, 1, rows, inner)?;
+            // shift = table[0] + temb ; scale = table[1] + temb (all [inner]).
+            // Same bf16-decoding `mod_signal` path as the per-block modulation.
+            let temb_h = scope.import_copy(temb.as_buf_ref());
+            let shift = self.mod_signal(&scope, bp, sst.buf(), 0, temb_h, inner)?;
+            let scale = self.mod_signal(&scope, bp, sst.buf(), 1, temb_h, inner)?;
             // norm_out (FP32 LayerNorm, no affine).
             let x_h = ActBuf::dense(scope.import_copy(x_cur.as_act_ref()));
             let normed = alloc_act(&scope, bp, rows, inner)?;
@@ -543,67 +550,223 @@ impl WanDit {
             &mut tokens_out,
         )
         .await?;
-        let image = patchify::unpatchify(&tokens_out, &s.grid, config::OUT_CHANNELS);
+        let image = patchify::unpatchify(&tokens_out, &s.grid, self.cfg.out_channels);
         Ok(WanDitOutput { image })
     }
 
-    /// Build the six per-token modulation signals `base_k + scale_shift_table[k]`
-    /// (`table` is the block's `[6, inner]` weight, imported into `scope`).
+    /// Run one transformer block in the activation-tiled regime: pass A
+    /// (row-tiled q/k/v projection + RoPE) -> global self-SDPA barrier ->
+    /// pass B (row-tiled o-proj + cross-attn + FFN). Each movement submits on
+    /// its own so the pool recycles tile transients between submits; the only
+    /// resolution-growing residents are `qx`/`kx`/`v`/`sa` (the cost of an
+    /// exact global attention). Numerically identical to [`WanDitBlock::forward`].
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_block_tiled(
+        &self,
+        pipelines: &WanDitPipelines,
+        scratch: &Workspace<WgpuBackend>,
+        bufs: &WanDitBlockBufs,
+        sst: BufRef,
+        tproj: BufRef,
+        freqs: BufRef,
+        text: BufRef,
+        x_in: BufRef,
+        y_out: BufRef,
+        tb: &TileBufs,
+        n_tiles: u32,
+    ) -> Result<(), WgpuError> {
+        let bp = &pipelines.block;
+        let inner = self.cfg.inner() as u32;
+        let rows = self.shape.n_tok as u32;
+        let text_seq = self.shape.text_seq as u32;
+        let hd = config::HEAD_DIM as u32;
+
+        // Modulation vectors for this block, persisted across the tile scopes.
+        self.fill_mod(bp, scratch, sst, tproj, inner, &tb.m).await?;
+
+        // Cross-attention K/V projected once (shared by every query tile).
+        {
+            let scope = scratch.batch();
+            let text_h = scope.import_copy(text);
+            let ck = scope.import_copy(tb.ck.as_buf_ref());
+            let cv = scope.import_copy(tb.cv.as_buf_ref());
+            self.block.cross_kv(
+                &scope,
+                pipelines,
+                text_h,
+                &bufs.cross_attn,
+                ck,
+                cv,
+                text_seq,
+            )?;
+            scope.submit_void().await?;
+        }
+
+        // Pass A: per-tile q/k/v projection + RoPE into the full qx/kx/v.
+        for t in 0..n_tiles {
+            let (r0, tr) = tile_range(rows, n_tiles, t);
+            let scope = scratch.batch();
+            let m = mk_mod(&scope, &tb.m);
+            let x_slice = scope.import_copy(act_slice(x_in, r0, tr, inner, bp));
+            let f_slice = scope.import_copy(act_slice(freqs, r0, tr, hd, bp));
+            let qx = scope.import_copy(act_slice(tb.qx.as_buf_ref(), r0, tr, inner, bp));
+            let kx = scope.import_copy(act_slice(tb.kx.as_buf_ref(), r0, tr, inner, bp));
+            let v = scope.import_copy(act_slice(tb.v.as_buf_ref(), r0, tr, inner, bp));
+            self.block.self_qkv_tile(
+                &scope,
+                pipelines,
+                x_slice,
+                f_slice,
+                &m,
+                qx,
+                kx,
+                v,
+                tr,
+                &bufs.self_attn,
+            )?;
+            scope.submit_void().await?;
+        }
+
+        // Barrier: global self-attention over the whole sequence.
+        {
+            let scope = scratch.batch();
+            let qx = scope.import_copy(tb.qx.as_buf_ref());
+            let kx = scope.import_copy(tb.kx.as_buf_ref());
+            let v = scope.import_copy(tb.v.as_buf_ref());
+            let sa = scope.import_copy(tb.sa.as_buf_ref());
+            self.block
+                .self_sdpa(&scope, pipelines, qx, kx, v, sa, rows)?;
+            scope.submit_void().await?;
+        }
+
+        // Pass B: per-tile o-proj + gated residual + cross-attn + FFN -> y_out.
+        for t in 0..n_tiles {
+            let (r0, tr) = tile_range(rows, n_tiles, t);
+            let scope = scratch.batch();
+            let m = mk_mod(&scope, &tb.m);
+            let x_slice = scope.import_copy(act_slice(x_in, r0, tr, inner, bp));
+            let sa_slice = scope.import_copy(act_slice(tb.sa.as_buf_ref(), r0, tr, inner, bp));
+            let y_slice = scope.import_copy(act_slice(y_out, r0, tr, inner, bp));
+            let ck = scope.import_copy(tb.ck.as_buf_ref());
+            let cv = scope.import_copy(tb.cv.as_buf_ref());
+            self.block.post_attn_tile(
+                &scope, pipelines, x_slice, sa_slice, &m, ck, cv, y_slice, tr, text_seq, bufs,
+            )?;
+            scope.submit_void().await?;
+        }
+        Ok(())
+    }
+
+    /// Build the six modulation vectors for one block into the persistent
+    /// `[inner]` buffers `m` (so the tile scopes can broadcast them). Same
+    /// `scale_shift_table[k] + timestep_proj[k]` sum as [`Self::build_mod`].
+    async fn fill_mod(
+        &self,
+        bp: &BlockPipelines,
+        scratch: &Workspace<WgpuBackend>,
+        sst: BufRef,
+        tproj: BufRef,
+        inner: u32,
+        m: &[WsBuf<WgpuBackend>; 6],
+    ) -> Result<(), WgpuError> {
+        let scope = scratch.batch();
+        let tproj_h = scope.import_copy(tproj);
+        let built = self.build_mod(&scope, bp, sst, tproj_h, inner)?;
+        let srcs = [
+            built.shift_msa,
+            built.scale_msa,
+            built.gate_msa,
+            built.c_shift_mlp,
+            built.c_scale_mlp,
+            built.c_gate_mlp,
+        ];
+        let row_b = bp.act_bytes(inner);
+        for (i, src) in srcs.into_iter().enumerate() {
+            let dst = scope.import_copy(m[i].as_buf_ref());
+            scope.copy_buffer_to_buffer(src, 0, dst, 0, row_b)?;
+        }
+        scope.submit_void().await
+    }
+
+    /// Build the six modulation vectors `scale_shift_table[k] +
+    /// timestep_proj[k]`, each `[inner]`. `table` is the block's `[6, inner]`
+    /// bf16 weight (a raw `BufRef`, NOT pre-imported as an act buffer); `tproj`
+    /// the imported `[6, inner]` act-dtype projected timestep. The add is done
+    /// via [`Self::mod_signal`] (`bcast_add`, which decodes the bf16 table
+    /// operand) - a byte copy of the table into an act buffer would reinterpret
+    /// its bf16 bits as f16 and corrupt the modulation.
     fn build_mod<'wsp>(
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
         bp: &BlockPipelines,
-        mod_base: &[WsBuf<WgpuBackend>],
-        table: BatchBuf<'wsp>,
-        rows: u32,
+        table: BufRef,
+        tproj: BatchBuf<'wsp>,
         inner: u32,
     ) -> Result<WanMod<'wsp>, WgpuError> {
-        let mut out = Vec::with_capacity(6);
-        for (k, base) in mod_base.iter().enumerate() {
-            let base_h = ActBuf::dense(scope.import_copy(base.as_buf_ref()));
-            out.push(self.add_table_row(scope, bp, base_h, table, k, rows, inner)?);
-        }
+        let sig = |k: u32| -> Result<BatchBuf<'wsp>, WgpuError> {
+            let p = self.mod_row(scope, bp, tproj, k, inner)?;
+            self.mod_signal(scope, bp, table, k, p, inner)
+        };
         Ok(WanMod {
-            shift_msa: out[0],
-            scale_msa: out[1],
-            gate_msa: out[2],
-            c_shift_mlp: out[3],
-            c_scale_mlp: out[4],
-            c_gate_mlp: out[5],
+            shift_msa: sig(0)?,
+            scale_msa: sig(1)?,
+            gate_msa: sig(2)?,
+            c_shift_mlp: sig(3)?,
+            c_scale_mlp: sig(4)?,
+            c_gate_mlp: sig(5)?,
         })
     }
 
-    /// `out = x + table[k]` where `table` is `[n, inner]` and row `k` broadcasts
-    /// over the `rows` of `x` (channel-broadcast bias add on row `k`).
-    #[allow(clippy::too_many_arguments)]
-    fn add_table_row<'wsp>(
+    /// Copy the `[inner]` channel vector at row `k` of an ACT-dtype `[*, inner]`
+    /// buffer into a fresh scope buffer (used for the `timestep_proj` / `temb`
+    /// rows, which are activations - never for the bf16 `scale_shift_table`).
+    fn mod_row<'wsp>(
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
         bp: &BlockPipelines,
-        x: ActBuf<'wsp>,
-        table: BatchBuf<'wsp>,
-        k: usize,
-        rows: u32,
+        src: BatchBuf<'wsp>,
+        k: u32,
         inner: u32,
     ) -> Result<BatchBuf<'wsp>, WgpuError> {
-        // Copy row k of the table into an [inner] scratch, then bias-add.
-        let row = alloc_act(scope, bp, 1, inner)?;
+        let dst = alloc_act(scope, bp, 1, inner)?;
         let row_b = bp.act_bytes(inner);
-        scope.copy_buffer_to_buffer(table, k as u64 * row_b, row.data, 0, row_b)?;
-        let dst = alloc_act(scope, bp, rows, inner)?;
-        let u = scope.u32x4_uniform(inner, 0, 0, 0)?;
-        scope.bcast_add::<BcastAddF32>(
-            &bp.bcast_add,
-            x.data,
-            row.data,
-            u,
-            dst.data,
-            rows * inner,
-        )?;
+        scope.copy_buffer_to_buffer(src, k as u64 * row_b, dst.data, 0, row_b)?;
         Ok(dst.data)
     }
 
-    /// `out = x * (1 + scale) + shift` (full-elementwise, per-token modulation).
+    /// `out = x + table[k]`, where `x` is an `[inner]` ACT vector and `table` is
+    /// the bf16 `scale_shift_table` weight (`[*, inner]`). Row `k` is sliced
+    /// directly out of the weight buffer and added via `bcast_add`, whose
+    /// `(act=F16, weight=Bf16)` kernel decodes the bf16 table operand. This is
+    /// the bias-add path the q/k/v/ffn biases already use; routing the table
+    /// through a plain act `op_add` instead would read its bf16 bytes as f16.
+    fn mod_signal<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        bp: &BlockPipelines,
+        table: BufRef,
+        k: u32,
+        x: BatchBuf<'wsp>,
+        inner: u32,
+    ) -> Result<BatchBuf<'wsp>, WgpuError> {
+        // scale_shift_table is always bf16 (registered passthrough, never
+        // transcoded), so a row is `inner` bf16 elements = `inner * 2` bytes.
+        let row_b = inner as u64 * 2;
+        let row = BufRef::view(table.id, table.offset + k as u64 * row_b, row_b);
+        let s = scope.import_copy(row);
+        let dst = alloc_act(scope, bp, 1, inner)?;
+        let u = scope.u32x4_uniform(inner, 0, 0, 0)?;
+        scope.bcast_add::<BcastAddF32>(&bp.bcast_add, x, s, u, dst.data, inner)?;
+        Ok(dst.data)
+    }
+
+    /// `out = x * (1 + scale) + shift` with `scale`/`shift` `[inner]` channel
+    /// vectors broadcast over the `rows` tokens. `scale`/`shift` are runtime ACTS
+    /// (`scale_shift_table + timestep_proj`), so this uses the fused
+    /// `bcast_modulate` (reads both in the act dtype; bias=1 folds the `1 +`).
+    /// NOT `bcast_affine` + `bcast_add`: `bcast_add` reads its broadcast vector as
+    /// a weight and would reinterpret the f16 `shift` act as bf16, dropping it
+    /// (the same BUG #3 the per-block `op_modulate` was migrated to fix).
     #[allow(clippy::too_many_arguments)]
     fn modulate<'wsp>(
         &self,
@@ -616,14 +779,16 @@ impl WanDit {
         rows: u32,
         inner: u32,
     ) -> Result<(), WgpuError> {
-        // Distinct scratch per stage: elementwise ops bind input read-only and
-        // output read-write, so input and output must not alias the same buffer.
-        let xs = alloc_act(scope, bp, rows, inner)?;
-        scope.dispatch_op::<MulF32>(&bp.mul, &[x.data, scale], xs.data)?; // x * scale
-        let xss = alloc_act(scope, bp, rows, inner)?;
-        op_add(scope, bp, xs, ActBuf::dense(shift), xss)?; // x * scale + shift
-        op_add(scope, bp, x, xss, dst)?; // x + (x * scale + shift) = x * (1 + scale) + shift
-        Ok(())
+        let u = scope.u32x4_uniform(inner, 1.0_f32.to_bits(), 0, 0)?;
+        scope.bcast_modulate::<BcastModulateF32>(
+            &bp.bcast_modulate,
+            x.data,
+            scale,
+            shift,
+            u,
+            dst.data,
+            rows * inner,
+        )
     }
 
     /// `out = x @ wᵀ + b` through the qkv matmul site (dense front-door).
@@ -655,6 +820,111 @@ impl WanDit {
         let u = scope.u32x4_uniform(out_dim, 0, 0, 0)?;
         let bias = scope.import_copy(w.bias);
         scope.bcast_add::<BcastAddF32>(&bp.bcast_add, pre, bias, u, out, rows * out_dim)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Activation tiling
+// ---------------------------------------------------------------------------
+
+/// Row-tile granularity for the DiT activation-tiling tier. A block's pass-B
+/// transient envelope is `~(17 * inner + 3 * ffn_dim) * tile_rows * act_bytes`
+/// (the FFN `[tile, ffn_dim]` buffers dominate); at 1024 rows / f16 / the 5B
+/// geometry that is ~190 MiB, comfortably inside the `DIT_WORKSPACE_RESERVE`
+/// envelope while keeping the submit count low. Sequences at or under one tile
+/// (the e2e gate) run untiled.
+const DIT_TILE_ROWS: u32 = 1024;
+
+/// Effective tile-row threshold, overridable via `THINFER_DIT_TILE_ROWS` (read
+/// once). Diagnostics use it to force tiling ON at a small grid (validate the
+/// tiled path against the parity gate's ground truth) or OFF at a large grid
+/// (A/B the tier vs an untiled reference). Falls back to [`DIT_TILE_ROWS`].
+fn dit_tile_rows() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("THINFER_DIT_TILE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DIT_TILE_ROWS)
+    })
+}
+
+/// Cross-submit buffers for one block's tiled execution, reused across all
+/// blocks (every block has the same geometry). `qx`/`kx`/`v`/`sa` are full
+/// `[rows, inner]`; `ck`/`cv` the `[text_seq, inner]` cross-attn K/V; `m` the
+/// six `[inner]` modulation vectors.
+struct TileBufs {
+    qx: WsBuf<WgpuBackend>,
+    kx: WsBuf<WgpuBackend>,
+    v: WsBuf<WgpuBackend>,
+    sa: WsBuf<WgpuBackend>,
+    ck: WsBuf<WgpuBackend>,
+    cv: WsBuf<WgpuBackend>,
+    m: [WsBuf<WgpuBackend>; 6],
+}
+
+impl TileBufs {
+    fn alloc(
+        scratch: &Workspace<WgpuBackend>,
+        bp: &BlockPipelines,
+        rows: u32,
+        text_seq: u32,
+        inner: u32,
+    ) -> Result<Self, WgpuError> {
+        let act = |n: u32| scratch.alloc(bp.act_bytes(n));
+        Ok(Self {
+            qx: act(rows * inner)?,
+            kx: act(rows * inner)?,
+            v: act(rows * inner)?,
+            sa: act(rows * inner)?,
+            ck: act(text_seq * inner)?,
+            cv: act(text_seq * inner)?,
+            m: [
+                act(inner)?,
+                act(inner)?,
+                act(inner)?,
+                act(inner)?,
+                act(inner)?,
+                act(inner)?,
+            ],
+        })
+    }
+}
+
+/// Row range `[r0, r0 + tr)` for tile `t` of `n_tiles`, distributing the
+/// remainder across the first tiles so every tile is within one row of even.
+fn tile_range(rows: u32, n_tiles: u32, t: u32) -> (u32, u32) {
+    let base = rows / n_tiles;
+    let rem = rows % n_tiles;
+    let r0 = t * base + t.min(rem);
+    let tr = base + if t < rem { 1 } else { 0 };
+    (r0, tr)
+}
+
+/// View rows `[row0, row0 + rows)` of a row-major `[*, dim]` activation buffer.
+fn act_slice(base: BufRef, row0: u32, rows: u32, dim: u32, bp: &BlockPipelines) -> BufRef {
+    BufRef::view(
+        base.id,
+        base.offset + row0 as u64 * bp.act_bytes(dim),
+        bp.act_bytes(rows * dim),
+    )
+}
+
+/// Re-import the six persistent modulation vectors into `scope` as a [`WanMod`]
+/// (the per-tile broadcast operands). Index order matches [`WanDit::fill_mod`].
+fn mk_mod<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    m: &[WsBuf<WgpuBackend>; 6],
+) -> WanMod<'wsp> {
+    WanMod {
+        shift_msa: scope.import_copy(m[0].as_buf_ref()),
+        scale_msa: scope.import_copy(m[1].as_buf_ref()),
+        gate_msa: scope.import_copy(m[2].as_buf_ref()),
+        c_shift_mlp: scope.import_copy(m[3].as_buf_ref()),
+        c_scale_mlp: scope.import_copy(m[4].as_buf_ref()),
+        c_gate_mlp: scope.import_copy(m[5].as_buf_ref()),
     }
 }
 
@@ -725,6 +995,5 @@ mod tests {
         let sh = WanDitShape::new(16, 5, 16, 16, 512);
         assert_eq!((sh.grid.ppf, sh.grid.pph, sh.grid.ppw), (5, 8, 8));
         assert_eq!(sh.n_tok, 5 * 8 * 8);
-        assert_eq!(sh.spatial, 64);
     }
 }

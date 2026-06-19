@@ -72,8 +72,12 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
         return inputs["x"] * (inputs["s"] + float(case["bias"]))
     if op == "bcast_fma":
         return inputs["x"] + inputs["s"] * inputs["y"]
+    if op == "bcast_modulate":
+        return inputs["x"] * (inputs["s"] + float(case["bias"])) + inputs["t"]
     if op == "bcast_add":
         return inputs["x"] + inputs["s"]
+    if op == "bcast_mul":
+        return inputs["x"] * inputs["s"]
     if op == "matmul":
         return inputs["a"] @ inputs["b"]
     if op == "rmsnorm":

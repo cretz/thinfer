@@ -1,4 +1,4 @@
-//! `thinfer generate video` (SkyReels-V2-DF t2v) plus the CLI-only MP4
+//! `thinfer generate video` (FastWan2.2-TI2V-5B t2v) plus the CLI-only MP4
 //! encode/mux. The engine yields CTHW f32 frames; this module turns them into a
 //! single `.mp4` (H.264 via openh264, muxed with the `mp4` crate). Encode lives
 //! here, not in `thinfer-native`/`thinfer-models`, so the codec dep stays in the
@@ -14,7 +14,7 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::trace::DIAG;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::wan::pipeline::{GenerationParams, ProgressEvent, WanModel, WanVideo};
-use thinfer_models::wan::source::{GgufOpeners as WanGgufOpeners, WanSource};
+use thinfer_models::wan::source::WanSource;
 use thinfer_models::z_image::pipeline::encode_png;
 use thinfer_native::tokenizer::HfTokenizer;
 use thinfer_native::{MmapFileOpener, cache};
@@ -46,29 +46,20 @@ impl VideoFormat {
     const KNOWN: &'static str = "mp4";
 }
 
-/// Defaults = the SkyReels-V2-DF 540P real run: 960x544, 97 frames (= 4*24+1,
-/// ~4.0s @ 24fps), 30 steps. Dims must be /16; frames must be 4k+1 (the causal
-/// VAE temporal grid). For a fast first run, pass `--frames 5 --steps 6` (still
-/// full 540P self-attention, so its wall-clock is the perf signal).
+/// Defaults: 960x544, 97 frames (= 4*24+1, ~4.0s @ 24fps). FastWan is
+/// DMD-distilled (fixed 3-step schedule, baked in) and CFG-free, so there is no
+/// `--steps`/`--guidance-scale`/`--negative-prompt`. Dims must be /32 (TI2V VAE
+/// 16x spatial * patch 2); frames must be 4k+1 (the causal-VAE temporal grid).
+/// For a fast first run, pass `--frames 5` (still full self-attention, so its
+/// wall-clock is the perf signal).
 #[derive(Args)]
 pub struct GenerateVideo {
-    /// Model identifier. Defaults to `skyreels-v2-df-1.3b` (safetensors, the
-    /// only e2e-validated path). The `-q8`/`-q4` GGUF variants are experimental
-    /// (no e2e parity gate yet).
-    #[arg(long, default_value_t = VideoModelId::SkyreelsV2Df13b, value_enum)]
+    /// Model identifier. Defaults to `fastwan-ti2v-5b` (safetensors, the
+    /// e2e-validated path). GGUF variants are deferred.
+    #[arg(long, default_value_t = VideoModelId::FastwanTi2v5b, value_enum)]
     pub model: VideoModelId,
     #[arg(long)]
     pub prompt: String,
-    /// Classifier-free-guidance negative prompt. Defaults to empty (the
-    /// diffusers default); cross-attended by the unconditional forward when CFG
-    /// is on. Ignored when `--guidance-scale <= 1`.
-    #[arg(long, default_value_t = String::new())]
-    pub negative_prompt: String,
-    /// CFG scale. Omit to use the model's recommended default (SkyReels-V2-DF:
-    /// 6.0). `<= 1` disables CFG (one DiT forward per step; faster, weaker prompt
-    /// adherence).
-    #[arg(long)]
-    pub guidance_scale: Option<f32>,
     /// Output video file. A single file (e.g. `out.mp4`); no frame dir.
     #[arg(long)]
     pub output: PathBuf,
@@ -76,20 +67,17 @@ pub struct GenerateVideo {
     /// errors if the extension is missing or unrecognized.
     #[arg(long, value_enum)]
     pub output_format: Option<VideoFormat>,
-    /// Frame width in pixels. Must be divisible by 16.
+    /// Frame width in pixels. Must be divisible by 32.
     #[arg(long, default_value_t = 960)]
     pub width: u32,
-    /// Frame height in pixels. Must be divisible by 16.
+    /// Frame height in pixels. Must be divisible by 32.
     #[arg(long, default_value_t = 544)]
     pub height: u32,
     /// Output frame count. Must be `4 * k + 1` (causal-VAE temporal grid).
     #[arg(long, default_value_t = 97)]
     pub frames: u32,
-    /// Inference steps.
-    #[arg(long, default_value_t = 30)]
-    pub steps: u32,
-    /// Playback frames-per-second written into the MP4. Also mapped to the
-    /// Diffusion-Forcing fps conditioning bucket (16 -> 0, else 1).
+    /// Playback frames-per-second written into the MP4. Output-only metadata;
+    /// the DMD model takes no fps conditioning.
     #[arg(long, default_value_t = 24)]
     pub fps: u32,
     /// Seed. Omit for a randomized seed.
@@ -112,17 +100,10 @@ pub struct GenerateVideo {
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum VideoModelId {
-    /// SkyReels-V2-DF-1.3B-540P, fp32/bf16 safetensors. The bit-clean parity
-    /// path (what the e2e pyref consumes).
-    #[value(name = "skyreels-v2-df-1.3b")]
-    SkyreelsV2Df13b,
-    /// Same model, DiT + umT5 from Q8_0 GGUF (canary tier). Experimental: no
-    /// e2e parity gate yet.
-    #[value(name = "skyreels-v2-df-1.3b-q8")]
-    SkyreelsV2Df13bQ8,
-    /// Same model, DiT from Q4_K_M GGUF (umT5 stays Q8_0). Experimental.
-    #[value(name = "skyreels-v2-df-1.3b-q4")]
-    SkyreelsV2Df13bQ4,
+    /// FastWan2.2-TI2V-5B-FullAttn, DMD-distilled (3-step, CFG-free), fp32/bf16
+    /// safetensors. The e2e-validated path. GGUF variants are deferred.
+    #[value(name = "fastwan-ti2v-5b")]
+    FastwanTi2v5b,
 }
 
 impl VideoModelId {
@@ -138,9 +119,7 @@ impl VideoModelId {
 impl std::fmt::Display for VideoModelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VideoModelId::SkyreelsV2Df13b => f.write_str("skyreels-v2-df-1.3b"),
-            VideoModelId::SkyreelsV2Df13bQ8 => f.write_str("skyreels-v2-df-1.3b-q8"),
-            VideoModelId::SkyreelsV2Df13bQ4 => f.write_str("skyreels-v2-df-1.3b-q4"),
+            VideoModelId::FastwanTi2v5b => f.write_str("fastwan-ti2v-5b"),
         }
     }
 }
@@ -148,9 +127,6 @@ impl std::fmt::Display for VideoModelId {
 pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     validate_dim("height", args.height)?;
     validate_dim("width", args.width)?;
-    if args.steps == 0 {
-        return Err("--steps must be > 0".into());
-    }
     // Causal VAE temporal grid: frame count must be 4k+1.
     if args.frames == 0 || args.frames % 4 != 1 {
         return Err(format!(
@@ -213,26 +189,9 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
                 .map_err(|e| format!("open {}: {e}", path.display()))?,
         );
     }
-    // GGUF variants pull DiT + umT5 from GGUF (both roles set together); the
-    // safetensors variant has neither.
-    let mut open_gguf = Vec::with_capacity(2);
-    for role in [variant.dit_gguf_role, variant.umt5_gguf_role]
-        .into_iter()
-        .flatten()
-    {
-        let path = resolve_role(role)?;
-        open_gguf.push(
-            MmapFileOpener::new(&path)
-                .await
-                .map_err(|e| format!("open gguf {}: {e}", path.display()))?,
-        );
-    }
-    let gguf_openers = match (open_gguf.pop(), open_gguf.pop()) {
-        (Some(umt5), Some(dit)) => Some(WanGgufOpeners { dit, umt5 }),
-        (None, None) => None,
-        _ => return Err("variant must set both gguf roles or neither".into()),
-    };
-    let source = WanSource::open(weight_openers, gguf_openers)
+    // GGUF is deferred: bringup is safetensors-only (the union path in
+    // `wan::source` is retained for when a published FastWan GGUF is wired).
+    let source = WanSource::open(weight_openers, None)
         .await
         .map_err(|e| format!("parse weight files: {e:?}"))?;
 
@@ -241,24 +200,14 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         .await
         .map_err(|e| format!("tokenizer {}: {e:?}", tokenizer_path.display()))?;
 
-    // Real fps -> DF conditioning bucket (`inject_sample_info`): 16 -> 0, else 1.
-    let fps_bucket = if args.fps == 16 { 0 } else { 1 };
-
-    let guidance_scale = args
-        .guidance_scale
-        .unwrap_or(wanmf::RECIPE.default_guidance_scale);
     tracing::info!(
         target: DIAG,
         model = %args.model,
         prompt = %args.prompt,
-        negative_prompt = %args.negative_prompt,
-        guidance_scale,
         width = args.width,
         height = args.height,
         frames = args.frames,
-        steps = args.steps,
         fps = args.fps,
-        fps_bucket,
         seed = ?args.seed,
         ram_budget = ram_bytes,
         vram_budget = vram_bytes,
@@ -272,12 +221,11 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     let t_run = std::time::Instant::now();
     let stamp = move || format!("[{:6.1}s]", t_run.elapsed().as_secs_f64());
     eprintln!(
-        "{} Generating {}x{} video, {} frames, {} steps, {} fps, seed {} ({})",
+        "{} Generating {}x{} video, {} frames, {} fps, seed {} ({})",
         stamp(),
         args.width,
         args.height,
         args.frames,
-        args.steps,
         args.fps,
         seed,
         args.model,
@@ -289,14 +237,10 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     };
     let gen_params = GenerationParams {
         prompt: args.prompt,
-        negative_prompt: args.negative_prompt,
-        guidance_scale,
         height: args.height,
         width: args.width,
         num_frames: args.frames,
-        steps: args.steps,
         seed,
-        fps: fps_bucket,
     };
     let residency = WeightResidency::new(source, budget);
     let video = {
@@ -351,7 +295,20 @@ fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> {
 
     let (w, h, n) = (video.width, video.height, video.num_frames);
     // openh264 wants even dimensions for 4:2:0; our dims are /16 so this holds.
-    let mut enc = Encoder::with_api_config(OpenH264API::from_source(), EncoderConfig::new())
+    // The default config (120 kbps target, frame-skip enabled) is built for
+    // low-bandwidth real-time camera streams: at video resolution it produces
+    // heavy block artifacts, and frame-skip can DROP frames -- but our muxer
+    // emits exactly one sample per encode() call, so a dropped frame becomes a
+    // broken empty sample. Configure for offline archival quality: a
+    // resolution/fps-scaled bitrate, no frame skipping, and the real frame rate
+    // so rate control budgets per second correctly.
+    const BITS_PER_PIXEL: f64 = 0.2; // visually near-lossless for H.264 at these dims
+    let bitrate = ((w as f64) * (h as f64) * (fps as f64) * BITS_PER_PIXEL).max(1_000_000.0) as u32;
+    let cfg = EncoderConfig::new()
+        .set_bitrate_bps(bitrate)
+        .enable_skip_frame(false)
+        .max_frame_rate(fps as f32);
+    let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)
         .map_err(|e| format!("openh264 init: {e}"))?;
 
     let mut samples: Vec<(bool, Vec<u8>)> = Vec::with_capacity(n);

@@ -1,21 +1,22 @@
-//! SkyReels-V2-DF-1.3B (Wan) pipeline orchestrator. Single entry point for CLI,
-//! web, and the e2e: `WanModel::load(...)` builds the bundle once, `generate`
-//! runs the whole stack (tokenize -> umT5 encode -> synchronous Diffusion-
-//! Forcing denoise loop with the Wan DiT -> 3D causal VAE decode -> video
-//! frames). Mirrors `z_image::pipeline::ZImageModel`.
+//! FastWan2.2-TI2V-5B pipeline orchestrator. Single entry point for CLI, web,
+//! and the e2e: `WanModel::load(...)` builds the bundle once, `generate` runs
+//! the whole stack (tokenize -> umT5 encode -> DMD few-step denoise loop with
+//! the Wan DiT -> TI2V VAE decode -> video frames). Mirrors
+//! `z_image::pipeline::ZImageModel`.
 //!
 //! Owns the compiled `Umt5Pipelines` + `WanDitPipelines`, the residency-backed
 //! handle bundles, the `WanVaeDecoder`, the residency, backend, and tokenizer.
 //! No model internals leak past `generate`'s `WanVideo` return.
 //!
-//! Synchronous Diffusion Forcing only (the parity mode): every latent frame
-//! shares `timesteps[i]` at step `i`, so the loop is a standard flow-match
-//! denoise over the whole `[16, f_lat, h, w]` latent with per-frame timesteps
-//! broadcast equal. Async/causal staggering + overlap_history stitching are
-//! deferred to long-video (see `wan-plan.md`).
+//! DMD distillation: a fixed handful of timesteps (3 for FastWan), CFG-free, one
+//! DiT forward per step over the whole `[48, f_lat, h, w]` latent with a single
+//! scalar timestep, renoised between steps. LongLive (4-step, autoregressive)
+//! reuses this backbone with its own `DmdConfig` and an AR path (see
+//! `wan-plan.md`).
 
 use std::sync::Arc;
 
+use thinfer_core::arbiter::RECLAIM_EVICTABLE_WEIGHTS;
 use thinfer_core::backend::{WgpuBackend, WgpuError};
 use thinfer_core::ops::{ActDtype, WeightDtype, WgslConfig};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
@@ -29,50 +30,52 @@ use crate::common::block::{BlockWgslConfigs, DenseActSites};
 use crate::wan::dit::{
     LoadedWanDitHandles, WanDit, WanDitError, WanDitInputs, WanDitShape, WanDitTaps, read_into_f32,
 };
-use crate::wan::dit_block::{WanDitBlockTaps, WanDitPipelines, config as dit_config};
+use crate::wan::dit_block::{WanDitBlockTaps, WanDitConfig, WanDitPipelines, config as dit_config};
 use crate::wan::loader::register_wan_dit_handles;
 use crate::wan::manifest::RECIPE;
-use crate::wan::scheduler::{SchedulerStepDiag, UniPCScheduler};
+use crate::wan::scheduler::{DmdConfig, DmdSampler};
 use crate::wan::umt5::{
     Umt5BlockOpsHost, Umt5Encoder, Umt5ForwardError, Umt5Handles, Umt5Pipelines, Umt5Taps,
     register_umt5_handles,
 };
 use crate::wan::vae::{
-    VaeDecoderWeights, WanVaeDecodeError, WanVaeDecoder, WanVaePipelines, register_decoder,
+    VaeDecoderWeights, WanVaeConfig, WanVaeDecodeError, WanVaeDecoder, WanVaePipelines,
+    register_decoder,
 };
 
 /// umT5 rope-free context cap. The Wan DiT cross-attends to a fixed
 /// `max_sequence_length`; SkyReels-V2 ships 512.
 const TEXT_SEQ: usize = dit_config::TEXT_SEQ;
 const MAX_PROMPT_TOKENS: usize = TEXT_SEQ;
-const Z_DIM: usize = dit_config::IN_CHANNELS;
-const VAE_SCALE: usize = 8;
+/// Wan2.2-TI2V high-compression VAE: 16x spatial, 4x temporal (the new module,
+/// `wan/vae.rs`). The latent grid the DiT sees derives from these.
+const VAE_SCALE: usize = 16;
 const TEMPORAL_SCALE: usize = 4;
 
-/// Inputs to one `generate` call.
+/// The DiT step loop prefetches two blocks ahead (next-acquire + prefetch via
+/// the `join!` in `WanDit::forward`), so up to this many whole-tensor upload
+/// stagings overlap in VRAM at once.
+const PREFETCH_STAGING_DEPTH: u64 = 2;
+/// VRAM headroom held for the DiT forward's activation workspace, on top of the
+/// prefetch staging envelope (see `set_transient_reserve`). Calibrated at the
+/// e2e gate dims (32x32x5, workspace ~46 MiB); larger resolutions grow the
+/// workspace and rely on the budget-tier / activation-tiling path, not this
+/// fixed pad.
+const DIT_WORKSPACE_RESERVE: u64 = 64 * 1024 * 1024;
+
+/// Inputs to one `generate` call. The DMD distillation bakes the step schedule
+/// and is CFG-free, so there is no `steps`, `guidance_scale`, or
+/// `negative_prompt` knob (the abandoned SkyReels-V2-DF path had all three).
 pub struct GenerationParams {
     pub prompt: String,
-    /// Classifier-free-guidance negative prompt. Encoded as a second umT5 pass
-    /// and cross-attended by the unconditional DiT forward. Ignored when
-    /// `guidance_scale <= 1.0` (no CFG). Upstream diffusers default is `""`.
-    pub negative_prompt: String,
-    /// CFG scale. `<= 1.0` disables CFG (one DiT forward per step, the bit-clean
-    /// parity path). SkyReels-V2-DF is NOT guidance-distilled: the diffusers
-    /// default is 6.0 (T2V) / 5.0 (I2V); CFG combines per step as
-    /// `uncond + guidance_scale * (cond - uncond)`.
-    pub guidance_scale: f32,
-    /// Frame height in pixels. Divisible by `VAE_SCALE * PATCH_H` (16).
+    /// Frame height in pixels. Divisible by `VAE_SCALE * PATCH_H` (32).
     pub height: u32,
-    /// Frame width in pixels. Divisible by `VAE_SCALE * PATCH_W` (16).
+    /// Frame width in pixels. Divisible by `VAE_SCALE * PATCH_W` (32).
     pub width: u32,
     /// Output frame count. Must be `4 * k + 1` (the causal-VAE temporal grid).
     pub num_frames: u32,
-    /// Inference steps.
-    pub steps: u32,
-    /// Deterministic seed for the initial latent noise.
+    /// Deterministic seed for the initial latent noise (and per-step renoise).
     pub seed: u64,
-    /// Diffusion-Forcing `fps` bucket (`inject_sample_info`).
-    pub fps: usize,
 }
 
 /// Decoded video: CTHW f32 in `[-1, 1]` plus dims, ready for the caller's
@@ -91,12 +94,14 @@ pub struct WanVideo {
 /// e2e split a per-step divergence into DiT-velocity vs scheduler vs a specific
 /// DiT block, at EVERY step (not just step 0 like `diag_step0`).
 pub struct WanStepDiag {
-    /// The scheduler timestep fed to the DiT this step.
+    /// The model timestep fed to the DiT this step.
     pub timestep: f32,
-    /// Raw DiT output (flow velocity) handed to the scheduler == the exact
+    /// Flow sigma `t / num_train_timesteps` used to convert velocity -> x0.
+    pub sigma: f32,
+    /// Raw DiT output (flow velocity) handed to the sampler == the exact
     /// tensor pyref dumps as `py_dit_out_step{i}`.
     pub velocity: Vec<f32>,
-    /// Latent after `scheduler.step` (the old per-step dump; == `py_step{i}_post`).
+    /// Latent after `sampler.step` (the old per-step dump; == `py_step{i}_post`).
     pub post: Vec<f32>,
     /// Residual stream after each DiT block (`len == num_layers`). Localizes a
     /// velocity divergence to a block (vs `py_block{b}_out_step{i}`).
@@ -105,8 +110,6 @@ pub struct WanStepDiag {
     pub timestep_proj: Vec<f32>,
     pub final_norm: Vec<f32>,
     pub proj_out: Vec<f32>,
-    /// Scheduler internals for this step (sigma/order/m_conv/corrected).
-    pub sched: SchedulerStepDiag,
 }
 
 /// Stage notifications for user-facing progress. Distinct from tracing.
@@ -128,6 +131,9 @@ pub struct WanModel<S: WeightSource, T: Tokenizer> {
     umt5_handles: Umt5Handles,
     dit: WanDitPipelines,
     dit_handles: LoadedWanDitHandles,
+    /// Per-variant DiT geometry (FastWan 5B today). Drives latent channels, the
+    /// block dims, and the loader layer count.
+    cfg: WanDitConfig,
     vae: WanVaeDecoder,
     /// Weight dtype the DiT matmul kernels were compiled against (`Bf16` for the
     /// safetensors path, `Quant(k)` when the GGUF surfaced the matmuls). Lets
@@ -212,15 +218,46 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         residency: WeightResidency<S>,
         tokenizer: T,
     ) -> Result<Self, ModelLoadError> {
+        Self::load_with_act(backend, residency, tokenizer, None).await
+    }
+
+    /// Diagnostic variant of [`load`] that forces the block activation dtype
+    /// instead of probing device f16 support. Lets the e2e run an fp32-acts
+    /// forward to separate amplified-bf16 rounding from algorithmic (dtype-
+    /// independent) error. Prod callers use [`load`] (probe-driven).
+    pub async fn load_with_act(
+        backend: Arc<WgpuBackend>,
+        residency: WeightResidency<S>,
+        tokenizer: T,
+        act_override: Option<ActDtype>,
+    ) -> Result<Self, ModelLoadError> {
         let timing = tracing::enabled!(tracing::Level::INFO);
         let t0 = timing.then(trace::Instant::now);
+
+        let cfg = WanDitConfig::fastwan_ti2v_5b();
 
         // --- handle registration (no upload) ---
         // umT5 GGUF ships matmuls quantized in-file; bf16/f32 safetensors stay
         // dense (no transcode for v1 -- keep the parity path bit-clean).
+        let vae_cfg = WanVaeConfig::fastwan_ti2v_5b();
         let umt5_handles = register_umt5_handles(&residency, None)?;
-        let dit_handles = register_wan_dit_handles(&residency, None)?;
-        let vae_handles = register_decoder(&residency, &VaeDecoderWeights::new())?;
+        let dit_handles = register_wan_dit_handles(&residency, &cfg, None)?;
+        // VAE decoder weights all fit resident; diff the registered footprint
+        // across registration so the decode can reserve exactly it (not a budget
+        // fraction) when sizing its non-evictable tile workspace.
+        let before_vae_bytes = residency.total_registered_bytes();
+        let vae_handles = register_decoder(&residency, &VaeDecoderWeights::new(&vae_cfg))?;
+        let vae_weight_footprint = residency.total_registered_bytes() - before_vae_bytes;
+
+        // Weights join the VRAM arbiter's reclaim chain so workspace/staging
+        // growth evicts unpinned (LRU / prefetch-warmed) residents instead of
+        // overshooting the budget. Without this the streamed weight set is
+        // bounded only by same-size recycling and pins at the budget ceiling,
+        // leaving no room for the in-flight transient envelope.
+        residency.arbiter().register(
+            RECLAIM_EVICTABLE_WEIGHTS,
+            residency.reclaimer(Arc::clone(&backend)),
+        );
 
         // --- dtype selection ---
         // Probe a representative matmul tensor per submodel: `Quant(k)` when the
@@ -230,15 +267,25 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // quantizes those big linears uniformly (norms/biases stay F32).
         let dit_w = probe_weight(&residency, "blocks.0.attn1.to_q.weight");
         let umt5_w = probe_weight(&residency, "encoder.block.0.layer.0.SelfAttention.q.weight");
-        let act = if backend.supports_shader_f16() {
+        let act = act_override.unwrap_or(if backend.supports_shader_f16() {
             ActDtype::F16
         } else {
             ActDtype::F32
-        };
-        tracing::info!(?dit_w, ?umt5_w, ?act, "Wan dtype selection");
+        });
+        // umT5 must NOT use f16 acts: T5-family residual streams are large and
+        // ours grow monotonically through the 24 blocks, exceeding f16's 65504
+        // ceiling around block ~20 (overflow -> inf -> NaN in final_layer_norm).
+        // The magnitude is prompt-content-dependent, so the f16 path only blows
+        // up on some prompts (the even-token gate prompt stayed in range; longer
+        // prompts did not). The pyref text encoder runs bf16, so bf16 acts both
+        // hold the range (f32 exponent) and match the reference dtype. Honor an
+        // explicit override (the fp32 diagnostic), else force bf16 for umT5.
+        let umt5_act = act_override.unwrap_or(ActDtype::Bf16);
+        tracing::info!(?dit_w, ?umt5_w, ?act, ?umt5_act, "Wan dtype selection");
 
         let dit = WanDitPipelines::compile(&backend, &block_cfgs(dit_w, act)).await?;
-        let umt5_pipelines = Umt5Pipelines::compile(&backend, &block_cfgs(umt5_w, act)).await?;
+        let umt5_pipelines =
+            Umt5Pipelines::compile(&backend, &block_cfgs(umt5_w, umt5_act)).await?;
         let vae_pipelines = WanVaePipelines::compile(&backend).await?;
 
         tracing::info!(
@@ -254,9 +301,12 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             umt5_handles,
             dit,
             dit_handles,
+            cfg,
             vae: WanVaeDecoder {
                 pipelines: vae_pipelines,
                 handles: vae_handles,
+                cfg: vae_cfg,
+                weight_footprint: vae_weight_footprint,
             },
             dit_matmul_weight: dit_w,
         })
@@ -346,16 +396,16 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             .await?)
     }
 
-    /// Tokenize -> umT5 encode -> synchronous DF denoise loop. Returns the final
+    /// Tokenize -> umT5 encode -> DMD few-step denoise loop. Returns the final
     /// pre-VAE latent (CTHW f32, `16 * f_lat * h_lat * w_lat`) plus the latent
     /// dims. Caller owns `workspace` so the GPU pool survives the DiT->VAE seam.
     ///
     /// `initial_noise`: used verbatim as the starting latent when `Some` (e2e
     /// pinned-noise byte-load), else derived from `seed`. `step_diag`: when
     /// `Some`, a [`WanStepDiag`] per step is pushed (cleared on entry) with the
-    /// velocity, post-step latent, per-block residual, and scheduler internals;
-    /// the final entry's `post` equals the returned latent. `None` is the prod
-    /// path (no GPU readbacks, plain `forward`/`step`).
+    /// velocity, sigma, post-step latent, and per-block residual; the final
+    /// entry's `post` equals the returned latent. `None` is the prod path (no
+    /// GPU readbacks, plain `forward`/`step`).
     #[allow(clippy::too_many_arguments)]
     pub async fn denoise_with(
         &self,
@@ -389,22 +439,17 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let w_lat = (params.width as usize) / VAE_SCALE;
         let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
 
-        // CFG is on when the scale exceeds 1.0 (mirrors diffusers
-        // `do_classifier_free_guidance = guidance_scale > 1.0`). When off, the
-        // step loop runs exactly one DiT forward -- the bit-clean parity path
-        // the e2e drives (it pins `guidance_scale = 1.0`).
-        let do_cfg = params.guidance_scale > 1.0;
-
         let _denoise = trace::scope!("denoise").entered();
 
-        // --- 1. tokenize (prompt + CFG negative prompt) ---
-        let encode_ids = |prompt: &str| -> Result<Vec<u32>, GenerateError<S::Error>> {
+        // --- 1. tokenize ---
+        let token_ids = {
+            let _s = trace::scope!("tokenize").entered();
             // umT5 needs the trailing `</s>` EOS the diffusers reference appends
             // (add_special_tokens=True). Omitting it shifts every token's
             // bidirectional attention and compounds across layers.
             let ids = self
                 .tokenizer
-                .encode(prompt, true)
+                .encode(&params.prompt, true)
                 .map_err(GenerateError::Tokenizer)?;
             if ids.len() > MAX_PROMPT_TOKENS {
                 return Err(GenerateError::PromptTooLong {
@@ -412,42 +457,27 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     max: MAX_PROMPT_TOKENS,
                 });
             }
-            Ok(ids)
-        };
-        let token_ids = {
-            let _s = trace::scope!("tokenize").entered();
-            encode_ids(&params.prompt)?
-        };
-        let neg_token_ids = if do_cfg {
-            let _s = trace::scope!("tokenize_neg").entered();
-            Some(encode_ids(&params.negative_prompt)?)
-        } else {
-            None
+            ids
         };
 
         // --- 2. umT5 encode -> text states, padded to the DiT context ---
-        // Both prompts are encoded while umT5 is resident (one phase), then the
-        // weights are evicted; the padded host tensors live through the loop.
+        // Encoded while umT5 is resident (one phase), then the weights are
+        // evicted; the padded host tensor lives through the loop. CFG-free, so a
+        // single conditional pass (no negative prompt).
         if let Some(p) = progress {
             p(ProgressEvent::TextEncode);
         }
-        // Shared reborrow so the encode closure captures a `Copy` `&Workspace`
-        // (callable twice); the `&mut workspace` reverts after the encodes for
-        // `drain_pool` below.
-        let ws: &Workspace<WgpuBackend> = &*workspace;
-        // `ids` is taken by value so the returned future owns it (a closure
-        // can't tie a borrowed arg's lifetime into its async return type).
-        let umt5_encode = |ids: Vec<u32>| async move {
+        let text = {
             let qout = self
                 .umt5
                 .forward(
                     &self.backend,
                     &self.umt5_pipelines,
                     &self.residency,
-                    ws,
+                    &*workspace,
                     &self.umt5_handles,
                     self.residency.source(),
-                    &ids,
+                    &token_ids,
                 )
                 .await?;
             // Diffusers pads `prompt_embeds` to `max_sequence_length` (512) and
@@ -455,25 +485,15 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             // with zeros / truncate to TEXT_SEQ rows. The e2e must feed pyref the
             // same padded context. (Cross-attn masking is deferred -- verify at
             // e2e.)
-            Ok::<Vec<f32>, GenerateError<S::Error>>(pad_text(
-                &qout.hidden,
-                qout.seq,
-                dit_config::TEXT_DIM,
-                TEXT_SEQ,
-            ))
-        };
-        let text = umt5_encode(token_ids).await?;
-        let neg_text = match neg_token_ids {
-            Some(ids) => Some(umt5_encode(ids).await?),
-            None => None,
+            pad_text(&qout.hidden, qout.seq, dit_config::TEXT_DIM, TEXT_SEQ)
         };
 
         // Phase boundary: umT5 weights are dead for the rest of the call.
         self.residency.evict_all_and_free(&*self.backend);
         workspace.drain_pool();
 
-        // --- 3. initial noise [16, f_lat, h_lat, w_lat] ---
-        let n_lat = Z_DIM * f_lat * h_lat * w_lat;
+        // --- 3. initial noise [z_dim, f_lat, h_lat, w_lat] ---
+        let n_lat = self.cfg.in_channels * f_lat * h_lat * w_lat;
         let mut sample: Vec<f32> = match initial_noise {
             Some(buf) => {
                 assert_eq!(
@@ -487,126 +507,107 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             None => gaussian_noise(n_lat, params.seed),
         };
 
-        // --- 4. DiT + scheduler ---
-        let shape = WanDitShape::new(Z_DIM, f_lat, h_lat, w_lat, TEXT_SEQ);
-        let dit = WanDit::assemble(self.dit_handles.clone(), shape);
-        let mut scheduler = UniPCScheduler::new(params.steps as usize);
-        let ppf = shape.grid.ppf;
+        // --- 4. DiT + DMD sampler (fixed few-step schedule, CFG-free) ---
+        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
+        let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
+        let n_steps = sampler.num_steps();
 
-        // --- 5. step loop (synchronous DF: every frame shares timesteps[i]) ---
-        for i in 0..params.steps as usize {
+        // Cap the streamed DiT weight set below budget by the in-flight transient
+        // envelope (overlapping prefetch stagings + the forward workspace), so the
+        // VRAM true peak holds under the (hard) budget ceiling even at the thin
+        // 2 GB default. Budget-independent; set once for the whole step loop.
+        self.residency.set_transient_reserve(
+            PREFETCH_STAGING_DEPTH * self.residency.vram_staging_reserve_bytes()
+                + DIT_WORKSPACE_RESERVE,
+        );
+
+        // --- 5. step loop: one DiT forward per fixed timestep, renoise between ---
+        for i in 0..n_steps {
             let _step = trace::scope!("step", i = i).entered();
             if let Some(p) = progress {
                 p(ProgressEvent::Step {
                     i: i as u32 + 1,
-                    n: params.steps,
+                    n: n_steps as u32,
                 });
             }
-            let t = scheduler.timesteps()[i];
-            let timesteps = vec![t; ppf];
+            let t = sampler.timestep(i);
             let inputs = WanDitInputs {
                 image: &sample,
                 text: &text,
-                timesteps: &timesteps,
-                fps: params.fps,
+                timestep: t,
             };
-            // Diag path captures per-block + final-stage taps via forward_with_taps
-            // and the scheduler internals; prod takes the plain forward/step.
-            let (out, per_block, temb, timestep_proj, final_norm, proj_out) = if step_diag.is_some()
-            {
-                let mut per_block = Vec::new();
-                let (mut temb, mut timestep_proj, mut final_norm, mut proj_out) =
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                let taps = WanDitTaps {
-                    per_block: Some(&mut per_block),
-                    temb: Some(&mut temb),
-                    timestep_proj: Some(&mut timestep_proj),
-                    final_norm: Some(&mut final_norm),
-                    proj_out: Some(&mut proj_out),
-                    ..Default::default()
-                };
-                let out = dit
-                    .forward_with_taps(
-                        &self.backend,
-                        &self.dit,
-                        &self.residency,
-                        &*workspace,
-                        &inputs,
-                        taps,
-                    )
-                    .await?;
-                (out, per_block, temb, timestep_proj, final_norm, proj_out)
-            } else {
-                let out = dit
-                    .forward(
-                        &self.backend,
-                        &self.dit,
-                        &self.residency,
-                        &*workspace,
-                        &inputs,
-                    )
-                    .await?;
-                (
-                    out,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
-            };
-            // CFG: a second (unconditional) DiT forward over the negative prompt,
-            // combined as `uncond + guidance_scale * (cond - uncond)` (diffusers
-            // parity, line 909 of the DF pipeline). `neg_text` is `Some` exactly
-            // when `do_cfg`, so when off the single cond forward is used verbatim
-            // and the e2e (guidance_scale = 1.0) stays bit-identical.
-            let velocity = match &neg_text {
-                Some(neg) => {
-                    let _cfg = trace::scope!("cfg_uncond").entered();
-                    let neg_inputs = WanDitInputs {
-                        image: &sample,
-                        text: neg,
-                        timesteps: &timesteps,
-                        fps: params.fps,
+            // Diag path captures per-block + final-stage taps via forward_with_taps;
+            // prod takes the plain forward.
+            let (velocity, per_block, temb, timestep_proj, final_norm, proj_out) =
+                if step_diag.is_some() {
+                    let mut per_block = Vec::new();
+                    let (mut temb, mut timestep_proj, mut final_norm, mut proj_out) =
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                    let taps = WanDitTaps {
+                        per_block: Some(&mut per_block),
+                        temb: Some(&mut temb),
+                        timestep_proj: Some(&mut timestep_proj),
+                        final_norm: Some(&mut final_norm),
+                        proj_out: Some(&mut proj_out),
+                        ..Default::default()
                     };
-                    let uncond = dit
+                    let out = dit
+                        .forward_with_taps(
+                            &self.backend,
+                            &self.dit,
+                            &self.residency,
+                            &*workspace,
+                            &inputs,
+                            taps,
+                        )
+                        .await?;
+                    (
+                        out.image,
+                        per_block,
+                        temb,
+                        timestep_proj,
+                        final_norm,
+                        proj_out,
+                    )
+                } else {
+                    let out = dit
                         .forward(
                             &self.backend,
                             &self.dit,
                             &self.residency,
                             &*workspace,
-                            &neg_inputs,
+                            &inputs,
                         )
                         .await?;
-                    let gs = params.guidance_scale;
-                    out.image
-                        .iter()
-                        .zip(uncond.image.iter())
-                        .map(|(c, u)| u + gs * (c - u))
-                        .collect::<Vec<f32>>()
-                }
-                None => out.image,
+                    (
+                        out.image,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                };
+            // DMD: convert the predicted flow velocity to x0 and renoise to the
+            // next fixed timestep (the final step returns x0 unchanged). The
+            // renoise Gaussian is independent per step, seeded deterministically.
+            let noise = match sampler.noise_len(i, n_lat) {
+                0 => Vec::new(),
+                len => gaussian_noise(len, renoise_seed(params.seed, i)),
             };
-            // Wan flow-prediction: the DiT predicts the flow velocity; the UniPC
-            // scheduler converts to x0 and steps (no output negation, unlike
-            // Z-Image's `-noise_pred`).
-            let mut sched_diag = SchedulerStepDiag::default();
-            sample = if step_diag.is_some() {
-                scheduler.step_with_diag(&velocity, &sample, &mut sched_diag)
-            } else {
-                scheduler.step(&velocity, &sample)
-            };
+            sample = sampler.step(i, &velocity, &sample, &noise);
             if let Some(sink) = step_diag.as_deref_mut() {
                 sink.push(WanStepDiag {
                     timestep: t,
-                    velocity, // moved; the post-CFG velocity fed to the scheduler
+                    sigma: sampler.sigma(i),
+                    velocity, // moved; the flow velocity fed to the sampler
                     post: sample.clone(),
                     per_block,
                     temb,
                     timestep_proj,
                     final_norm,
                     proj_out,
-                    sched: sched_diag,
                 });
             }
         }
@@ -624,6 +625,23 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         &self,
         params: &GenerationParams,
         initial_noise: &[f32],
+        workspace: &mut Workspace<WgpuBackend>,
+    ) -> Result<WanStep0Diag, GenerateError<S::Error>> {
+        self.diag_step_at(params, initial_noise, 0, workspace).await
+    }
+
+    /// Bringup diagnostic: like [`Self::diag_step0`] but at an arbitrary DMD
+    /// `step_index` on an externally supplied `latent` (the reference's input to
+    /// that step, drift-stripped). The per-stage taps + their pyref dumps are
+    /// step-agnostic, so pointing this at the FIRST divergent step localizes a
+    /// timestep-specific divergence (e.g. a t=757 modulation underscale) to a
+    /// stage. `step_index == 0` + `initial_noise` reproduces `diag_step0`. Not a
+    /// committed path.
+    pub async fn diag_step_at(
+        &self,
+        params: &GenerationParams,
+        latent: &[f32],
+        step_index: usize,
         workspace: &mut Workspace<WgpuBackend>,
     ) -> Result<WanStep0Diag, GenerateError<S::Error>> {
         let h_lat = (params.height as usize) / VAE_SCALE;
@@ -666,21 +684,18 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         self.residency.evict_all_and_free(&*self.backend);
         workspace.drain_pool();
 
-        let n_lat = Z_DIM * f_lat * h_lat * w_lat;
-        assert_eq!(initial_noise.len(), n_lat, "diag_step0 noise len");
-        let sample = initial_noise.to_vec();
+        let n_lat = self.cfg.in_channels * f_lat * h_lat * w_lat;
+        assert_eq!(latent.len(), n_lat, "diag_step_at latent len");
+        let sample = latent.to_vec();
 
-        let shape = WanDitShape::new(Z_DIM, f_lat, h_lat, w_lat, TEXT_SEQ);
-        let dit = WanDit::assemble(self.dit_handles.clone(), shape);
-        let mut scheduler = UniPCScheduler::new(params.steps as usize);
-        let ppf = shape.grid.ppf;
-        let t = scheduler.timesteps()[0];
-        let timesteps = vec![t; ppf];
+        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
+        let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
+        let t = sampler.timestep(step_index);
         let inputs = WanDitInputs {
             image: &sample,
             text: &text,
-            timesteps: &timesteps,
-            fps: params.fps,
+            timestep: t,
         };
 
         // Block-0 per-op sinks: the driver only fills these GPU buffers; the
@@ -688,9 +703,13 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // Sized rows*inner except ffn_gelu (rows*ffn_dim).
         let bp = &self.dit.block;
         let rows = shape.n_tok as u32;
-        let inner = dit_config::INNER as u32;
-        let ffn = dit_config::FFN_DIM as u32;
+        let inner = self.cfg.inner() as u32;
+        let ffn = self.cfg.ffn_dim as u32;
         let inner_buf = || workspace.alloc(bp.act_bytes(rows * inner));
+        let vec_buf = || workspace.alloc(bp.act_bytes(inner));
+        let b_norm1_premod = inner_buf()?;
+        let b_mod_scale = vec_buf()?;
+        let b_mod_shift = vec_buf()?;
         let b_norm1 = inner_buf()?;
         let b_self_q = inner_buf()?;
         let b_self_k = inner_buf()?;
@@ -704,6 +723,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let b_ffn_gelu = workspace.alloc(bp.act_bytes(rows * ffn))?;
         let b_ffn_down = inner_buf()?;
         let block0 = WanDitBlockTaps {
+            norm1_premod: Some(b_norm1_premod.as_buf_ref()),
+            mod_scale: Some(b_mod_scale.as_buf_ref()),
+            mod_shift: Some(b_mod_shift.as_buf_ref()),
             norm1: Some(b_norm1.as_buf_ref()),
             self_q: Some(b_self_q.as_buf_ref()),
             self_k: Some(b_self_k.as_buf_ref()),
@@ -741,12 +763,21 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 taps,
             )
             .await?;
-        let stepped = scheduler.step(&out.image, &sample);
+        // Renoise this step (the sampler returns plain x0 on the final step, and
+        // `noise_len` is 0 there, so this is correct for any step_index).
+        let noise = gaussian_noise(
+            sampler.noise_len(step_index, n_lat),
+            renoise_seed(params.seed, step_index),
+        );
+        let stepped = sampler.step(step_index, &out.image, &sample, &noise);
 
         // Read block-0 sinks back (in execution order) before draining the pool.
         let act = bp.act_dtype;
         let mut block0_stages: Vec<(String, Vec<f32>)> = Vec::new();
         for (name, buf, n) in [
+            ("norm1_premod", &b_norm1_premod, rows * inner),
+            ("mod_scale", &b_mod_scale, inner),
+            ("mod_shift", &b_mod_shift, inner),
             ("norm1", &b_norm1, rows * inner),
             ("self_q", &b_self_q, rows * inner),
             ("self_k", &b_self_k, rows * inner),
@@ -785,6 +816,66 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             dit_out: out.image,
             stepped,
         })
+    }
+
+    /// Bringup diagnostic: run ONE DiT forward at DMD `step_index`'s timestep on
+    /// an externally supplied `latent`, returning the raw velocity. Lets the e2e
+    /// feed the reference's per-step input back through our forward (identical
+    /// input, no accumulated drift), isolating per-step forward error from the
+    /// drift that compounds across the schedule. Not a committed path.
+    pub async fn forward_velocity_at(
+        &self,
+        params: &GenerationParams,
+        latent: &[f32],
+        step_index: usize,
+        workspace: &mut Workspace<WgpuBackend>,
+    ) -> Result<Vec<f32>, GenerateError<S::Error>> {
+        let h_lat = (params.height as usize) / VAE_SCALE;
+        let w_lat = (params.width as usize) / VAE_SCALE;
+        let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
+        let n_lat = self.cfg.in_channels * f_lat * h_lat * w_lat;
+        assert_eq!(latent.len(), n_lat, "forward_velocity_at latent len");
+
+        let token_ids = self
+            .tokenizer
+            .encode(&params.prompt, true)
+            .map_err(GenerateError::Tokenizer)?;
+        let qout = self
+            .umt5
+            .forward(
+                &self.backend,
+                &self.umt5_pipelines,
+                &self.residency,
+                &*workspace,
+                &self.umt5_handles,
+                self.residency.source(),
+                &token_ids,
+            )
+            .await?;
+        let text = pad_text(&qout.hidden, qout.seq, dit_config::TEXT_DIM, TEXT_SEQ);
+        self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
+
+        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
+        let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
+        let inputs = WanDitInputs {
+            image: latent,
+            text: &text,
+            timestep: sampler.timestep(step_index),
+        };
+        let out = dit
+            .forward(
+                &self.backend,
+                &self.dit,
+                &self.residency,
+                &*workspace,
+                &inputs,
+            )
+            .await?;
+        self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
+        Ok(out.image)
     }
 }
 
@@ -867,9 +958,20 @@ fn pad_text(hidden: &[f32], seq: usize, dim: usize, rows: usize) -> Vec<f32> {
     out
 }
 
+/// Per-step renoise seed: an independent stream for step `i` derived from the
+/// generation seed. DMD becomes byte-parity-friendly because this is
+/// deterministic: the e2e dumps the exact per-step renoise tensor (via this same
+/// fn + [`gaussian_noise`]) and the pyref byte-loads it, so both sides consume
+/// identical renoise rather than each drawing from its own RNG.
+pub fn renoise_seed(seed: u64, i: usize) -> u64 {
+    seed.wrapping_add((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
 /// Deterministic standard-normal samples via SplitMix64 -> Box-Muller (avoids a
-/// `rand` dep). Same generator as `z_image::pipeline::gaussian_noise`.
-fn gaussian_noise(n: usize, seed: u64) -> Vec<f32> {
+/// `rand` dep). Same generator as `z_image::pipeline::gaussian_noise`. `pub` so
+/// the e2e parity test can reproduce the exact per-step renoise tensors the
+/// denoise loop consumes and dump them for the pyref to byte-load.
+pub fn gaussian_noise(n: usize, seed: u64) -> Vec<f32> {
     let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut next_u64 = || {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);

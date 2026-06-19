@@ -26,11 +26,12 @@
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
 use thinfer_core::cache::KernelKey;
+use thinfer_core::mem::VramCategory;
 use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, ConcatTimeF32, ConcatTimeOp, Conv2dConfig,
-    Conv2dF32, Conv2dOp, Conv3dConfig, Conv3dF32, Conv3dOp, MatMulConfig, MatMulF32, MatmulOp, Op,
-    RmsNorm3dF32, RmsNorm3dOp, SdpaF32LargeD, SdpaOp, SiluF32, Transpose12F32, Transpose12Op,
-    Upsample2dNearestF32, Upsample2dNearestOp, WgslConfig,
+    Conv2dF32, Conv2dOp, Conv3dConfig, Conv3dF32, Conv3dOp, DupUp3dF32, DupUp3dOp, MatMulConfig,
+    MatMulF32, MatmulOp, Op, RmsNorm3dF32, RmsNorm3dOp, SdpaF32LargeD, SdpaOp, SiluF32,
+    Transpose12F32, Transpose12Op, Upsample2dNearestF32, Upsample2dNearestOp, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace::PHASE;
@@ -44,99 +45,189 @@ use crate::common::loader::{LoadError, register_passthrough};
 // Config: derived dims for the Wan2.1 VAE encoder + decoder.
 // ============================================================================
 
-pub mod config {
-    pub const BASE_DIM: usize = 96;
-    pub const Z_DIM: usize = 16;
-    pub const IN_CHANNELS: usize = 3;
-    pub const OUT_CHANNELS: usize = 3;
-    pub const DIM_MULT: [usize; 4] = [1, 2, 4, 4];
-    pub const NUM_RES_BLOCKS: usize = 2;
-    /// Decoder up_blocks / encoder mid use `num_res_blocks + 1` resnets.
-    pub const RESNETS_PER_UP_BLOCK: usize = NUM_RES_BLOCKS + 1;
-    /// `temperal_downsample` (encoder, low->high res order).
-    pub const TEMPORAL_DOWNSAMPLE: [bool; 3] = [false, true, true];
-    /// `temperal_upsample` = reversed `temperal_downsample` (decoder order).
-    pub const TEMPORAL_UPSAMPLE: [bool; 3] = [true, true, false];
+/// Per-variant geometry for the `AutoencoderKLWan` video VAE. A runtime struct
+/// (mirrors [`crate::wan::dit_block::WanDitConfig`]) so a new VAE variant is a
+/// ctor, not a fork: the `is_residual` / `patch_size` flags gate the Wan2.2
+/// structural branches (residual up/down + pixel-shuffle) while the shared
+/// causal-conv decode engine stays single-sourced. All per-stage dims are
+/// methods over `dim_mult` + base dims, so the same code serves Wan2.1 (8x,
+/// z16, non-residual) and FastWan2.2-TI2V (16x, z48, residual) variants.
+#[derive(Clone, Debug)]
+pub struct WanVaeConfig {
+    /// Encoder base channel count.
+    pub base_dim: usize,
+    /// Decoder base channel count (Wan2.2 splits this from `base_dim`).
+    pub decoder_base_dim: usize,
+    pub z_dim: usize,
+    /// Encoder `conv_in` input channels (= raw pixel channels * patch_size^2
+    /// when `patch_size` packs; decoder `conv_out` emits `out_channels`).
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub dim_mult: Vec<usize>,
+    pub num_res_blocks: usize,
+    /// `temperal_downsample` (encoder order, low->high res).
+    pub temporal_downsample: Vec<bool>,
+    /// Wan2.2 residual up/down blocks (`AvgDown3D`/`DupUp3D` shortcuts) when set.
+    pub is_residual: bool,
+    /// Pixel-(un)shuffle factor at the in/out boundary (Wan2.2 = 2; Wan2.1 = 1).
+    pub patch_size: usize,
+    /// Total spatial / temporal compression (decoder upsamples
+    /// `spatial_compression / patch_size`; the trailing patch unshuffle covers
+    /// the rest).
+    pub spatial_compression: usize,
+    pub temporal_compression: usize,
     /// RMS norm eps floor (matches `F.normalize` default in `WanRMS_norm`).
-    pub const NORM_EPS: f32 = 1e-12;
-    pub const ATTN_HEADS: usize = 1;
-    /// 8x spatial / 4x temporal.
-    pub const SPATIAL_COMPRESSION: usize = 8;
-    pub const TEMPORAL_COMPRESSION: usize = 4;
+    pub norm_eps: f32,
+    /// Baked latent normalization (`z_dim`-vector each); decode pre-scales the
+    /// latent by `z * std + mean` per channel before `post_quant_conv`.
+    pub latents_mean: Vec<f32>,
+    pub latents_std: Vec<f32>,
+}
 
-    /// Baked latent normalization (16-vector each); decode pre-scales the latent
-    /// by `z * std + mean` per channel before `post_quant_conv`.
-    pub const LATENTS_MEAN: [f32; Z_DIM] = [
-        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715,
-        0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
-    ];
-    pub const LATENTS_STD: [f32; Z_DIM] = [
-        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652,
-        1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
-    ];
+impl WanVaeConfig {
+    /// FastWan2.2-TI2V-5B VAE (`vae/config.json`): 16x spatial / 4x temporal,
+    /// z48, residual up/down, patch_size 2. Decoder dims (decoder_base_dim 256 *
+    /// `[dim_mult[-1]] + dim_mult[::-1]`) = `[1024, 1024, 1024, 512, 256]`.
+    pub fn fastwan_ti2v_5b() -> Self {
+        Self {
+            base_dim: 160,
+            decoder_base_dim: 256,
+            z_dim: 48,
+            in_channels: 12,
+            out_channels: 12,
+            dim_mult: vec![1, 2, 4, 4],
+            num_res_blocks: 2,
+            temporal_downsample: vec![false, true, true],
+            is_residual: true,
+            patch_size: 2,
+            spatial_compression: 16,
+            temporal_compression: 4,
+            norm_eps: 1e-12,
+            latents_mean: vec![
+                -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382,
+                0.0542, 0.2813, 0.0891, 0.157, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698,
+                0.5109, 0.2665, -0.2108, -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567,
+                -0.0729, 0.0899, -0.2799, -0.123, -0.0313, -0.1649, 0.0117, 0.0723, -0.2839,
+                -0.2083, -0.052, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681,
+                -0.0667,
+            ],
+            latents_std: vec![
+                0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.499, 0.4818, 0.5013, 0.8158, 1.0344,
+                0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804,
+                0.5833, 1.4146, 0.8986, 0.5659, 0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999,
+                0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
+                0.3971, 1.06, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
+            ],
+        }
+    }
 
-    /// Decoder per-stage channel dims: `[dim_mult[-1]] + dim_mult[::-1]`, times
-    /// `base_dim`. Length `N_UP_BLOCKS + 1` = 5: `[384, 384, 384, 192, 96]`.
-    pub const N_UP_BLOCKS: usize = DIM_MULT.len();
-    pub const fn dec_dim(i: usize) -> usize {
-        // [dim_mult[3], dim_mult[3], dim_mult[2], dim_mult[1], dim_mult[0]]
+    /// `temperal_upsample` = reversed `temperal_downsample` (decoder order).
+    fn temporal_upsample(&self, i: usize) -> bool {
+        self.temporal_downsample[self.temporal_downsample.len() - 1 - i]
+    }
+
+    /// Decoder spatial upsample factor (8x for both Wan2.1 and 2.2; the rest of
+    /// `spatial_compression` is the trailing patch unshuffle).
+    pub fn decoder_spatial_scale(&self) -> usize {
+        self.spatial_compression / self.patch_size
+    }
+    /// Pixel channels after the final unpatchify (`out_channels / patch_size^2`).
+    pub fn pixel_channels(&self) -> usize {
+        self.out_channels / (self.patch_size * self.patch_size)
+    }
+
+    // --- decoder per-stage dims ---
+    pub fn n_up_blocks(&self) -> usize {
+        self.dim_mult.len()
+    }
+    /// Up_blocks / encoder mid use `num_res_blocks + 1` resnets.
+    pub fn resnets_per_up_block(&self) -> usize {
+        self.num_res_blocks + 1
+    }
+    /// Decoder per-stage channel dims: `decoder_base_dim * ([dim_mult[-1]] +
+    /// dim_mult[::-1])`. Length `n_up_blocks + 1`.
+    pub fn dec_dim(&self, i: usize) -> usize {
+        let n = self.dim_mult.len();
         let mult = if i == 0 {
-            DIM_MULT[DIM_MULT.len() - 1]
+            self.dim_mult[n - 1]
         } else {
-            DIM_MULT[DIM_MULT.len() - i]
+            self.dim_mult[n - i]
         };
-        BASE_DIM * mult
+        self.decoder_base_dim * mult
     }
-    /// Channels feeding the mid block / conv_in output (= `dec_dim(0)` = 384).
-    pub const MID_CHANNELS: usize = dec_dim(0);
-
+    /// Channels feeding the mid block / conv_in output (= `dec_dim(0)`).
+    pub fn mid_channels(&self) -> usize {
+        self.dec_dim(0)
+    }
     /// Up_block `i` output channels (`dims[i+1]`).
-    pub const fn up_out_channels(i: usize) -> usize {
-        dec_dim(i + 1)
+    pub fn up_out_channels(&self, i: usize) -> usize {
+        self.dec_dim(i + 1)
     }
-    /// Up_block `i` input channels. For `i > 0` the previous block's upsampler
-    /// halved the channel count (its spatial conv maps `out -> out/2`), so the
-    /// stored block input is `dims[i] / 2`. `i == 0` consumes the mid output.
-    pub const fn up_in_channels(i: usize) -> usize {
-        if i == 0 { dec_dim(0) } else { dec_dim(i) / 2 }
+    /// Up_block `i` input channels. Wan2.1 halves for `i > 0` (the previous
+    /// upsampler's spatial conv maps `out -> out/2`); the Wan2.2 residual path
+    /// keeps full channels.
+    pub fn up_in_channels(&self, i: usize) -> usize {
+        if self.is_residual || i == 0 {
+            self.dec_dim(i)
+        } else {
+            self.dec_dim(i) / 2
+        }
     }
     /// Up_block `i` has an upsampler on all but the last block.
-    pub const fn up_has_upsampler(i: usize) -> bool {
-        i + 1 < N_UP_BLOCKS
+    pub fn up_has_upsampler(&self, i: usize) -> bool {
+        i + 1 < self.n_up_blocks()
     }
     /// Whether up_block `i`'s upsampler upsamples in time (`upsample3d`).
-    pub const fn up_temporal(i: usize) -> bool {
-        up_has_upsampler(i) && TEMPORAL_UPSAMPLE[i]
+    pub fn up_temporal(&self, i: usize) -> bool {
+        self.up_has_upsampler(i) && self.temporal_upsample(i)
     }
-    /// Upsampler spatial conv output channels (`out_dim / 2`).
-    pub const fn up_resample_out(i: usize) -> usize {
-        up_out_channels(i) / 2
+    /// Upsampler spatial conv output channels. Wan2.1 halves (`out/2`); the
+    /// Wan2.2 residual upsampler keeps `out_dim` (`upsample_out_dim=out_dim`).
+    pub fn up_resample_out(&self, i: usize) -> usize {
+        if self.is_residual {
+            self.up_out_channels(i)
+        } else {
+            self.up_out_channels(i) / 2
+        }
+    }
+    /// `DupUp3D` channel `repeat_interleave` count for residual up_block `i`
+    /// (`out * factor_t * factor_s^2 / in`, factor_s fixed at 2 for up_flag).
+    pub fn up_dup_repeats(&self, i: usize) -> usize {
+        let ft = if self.up_temporal(i) { 2 } else { 1 };
+        let factor = ft * 2 * 2;
+        self.up_out_channels(i) * factor / self.up_in_channels(i)
     }
 
-    /// Encoder per-stage channel dims: `[1] + dim_mult` times `base_dim`.
-    /// Length `N_DOWN_STAGES + 1` = 5: `[96, 96, 192, 384, 384]`.
-    pub const N_DOWN_STAGES: usize = DIM_MULT.len();
-    pub const fn enc_dim(i: usize) -> usize {
-        let mult = if i == 0 { 1 } else { DIM_MULT[i - 1] };
-        BASE_DIM * mult
+    // --- encoder per-stage dims ---
+    pub fn n_down_stages(&self) -> usize {
+        self.dim_mult.len()
     }
-    pub const fn down_in_channels(i: usize) -> usize {
-        enc_dim(i)
+    /// Encoder per-stage channel dims: `base_dim * ([1] + dim_mult)`.
+    pub fn enc_dim(&self, i: usize) -> usize {
+        let mult = if i == 0 { 1 } else { self.dim_mult[i - 1] };
+        self.base_dim * mult
     }
-    pub const fn down_out_channels(i: usize) -> usize {
-        enc_dim(i + 1)
+    pub fn down_in_channels(&self, i: usize) -> usize {
+        self.enc_dim(i)
     }
-    pub const fn down_has_downsampler(i: usize) -> bool {
-        i + 1 < N_DOWN_STAGES
+    pub fn down_out_channels(&self, i: usize) -> usize {
+        self.enc_dim(i + 1)
+    }
+    pub fn down_has_downsampler(&self, i: usize) -> bool {
+        i + 1 < self.n_down_stages()
     }
     /// Whether down stage `i`'s downsampler downsamples in time (`downsample3d`).
-    pub const fn down_temporal(i: usize) -> bool {
-        down_has_downsampler(i) && TEMPORAL_DOWNSAMPLE[i]
+    pub fn down_temporal(&self, i: usize) -> bool {
+        self.down_has_downsampler(i) && self.temporal_downsample[i]
     }
-    /// Encoder mid / norm_out channels (= last enc_dim = 384).
-    pub const ENC_MID_CHANNELS: usize = enc_dim(N_DOWN_STAGES);
+    /// Encoder mid / norm_out channels (= last enc_dim).
+    pub fn enc_mid_channels(&self) -> usize {
+        self.enc_dim(self.n_down_stages())
+    }
     /// Encoder latent output channels before quant_conv (`z_dim * 2`).
-    pub const Z_DIM_X2: usize = Z_DIM * 2;
+    pub fn z_dim_x2(&self) -> usize {
+        self.z_dim * 2
+    }
 }
 
 // ============================================================================
@@ -239,7 +330,7 @@ pub struct VaeEncoderWeights {
 }
 
 impl VaeDecoderWeights {
-    pub fn new() -> Self {
+    pub fn new(cfg: &WanVaeConfig) -> Self {
         let conv = conv_ids;
         let rms = rms_ids;
 
@@ -251,23 +342,30 @@ impl VaeDecoderWeights {
             attention: attn_ids("decoder.mid_block.attentions.0"),
         };
 
-        let mut up_blocks = Vec::with_capacity(config::N_UP_BLOCKS);
-        for i in 0..config::N_UP_BLOCKS {
-            let cin = config::up_in_channels(i);
-            let cout = config::up_out_channels(i);
-            let mut resnets = Vec::with_capacity(config::RESNETS_PER_UP_BLOCK);
-            for j in 0..config::RESNETS_PER_UP_BLOCK {
+        let mut up_blocks = Vec::with_capacity(cfg.n_up_blocks());
+        for i in 0..cfg.n_up_blocks() {
+            let cin = cfg.up_in_channels(i);
+            let cout = cfg.up_out_channels(i);
+            let mut resnets = Vec::with_capacity(cfg.resnets_per_up_block());
+            for j in 0..cfg.resnets_per_up_block() {
                 let rin = if j == 0 { cin } else { cout };
                 resnets.push(resnet_ids(
                     &format!("decoder.up_blocks.{i}.resnets.{j}"),
                     rin != cout,
                 ));
             }
-            let upsampler = config::up_has_upsampler(i).then(|| {
-                let p = format!("decoder.up_blocks.{i}.upsamplers.0");
+            // The residual up_block's `upsamplers` live directly under the block
+            // (Wan2.1 nests them in `upsamplers.0`); the avg_shortcut (DupUp3D)
+            // is parameter-free, so it needs no weight ids.
+            let upsampler = cfg.up_has_upsampler(i).then(|| {
+                let p = if cfg.is_residual {
+                    format!("decoder.up_blocks.{i}.upsampler")
+                } else {
+                    format!("decoder.up_blocks.{i}.upsamplers.0")
+                };
                 UpsampleWeights {
                     spatial_conv: conv(&format!("{p}.resample.1")),
-                    time_conv: config::up_temporal(i).then(|| conv(&format!("{p}.time_conv"))),
+                    time_conv: cfg.up_temporal(i).then(|| conv(&format!("{p}.time_conv"))),
                 }
             });
             up_blocks.push(UpBlockWeights { resnets, upsampler });
@@ -284,38 +382,38 @@ impl VaeDecoderWeights {
     }
 }
 
-impl Default for VaeDecoderWeights {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl VaeEncoderWeights {
-    pub fn new() -> Self {
+    /// NB: the encoder is not on the generation (decode) path; the Wan2.2
+    /// residual down-block flat-index layout (avg_shortcut) is unported, so this
+    /// currently builds the Wan2.1 non-residual naming. Kept compiling for the
+    /// encode() entry point; revisit when encode parity is needed.
+    pub fn new(cfg: &WanVaeConfig) -> Self {
         let conv = conv_ids;
         let rms = rms_ids;
 
         // Encoder `down_blocks` is a flat ModuleList: each stage contributes
         // `num_res_blocks` resnets then (for all but the last) a downsampler, so
         // stage `i` starts at flat index `i * (num_res_blocks + 1)`.
-        let mut down_stages = Vec::with_capacity(config::N_DOWN_STAGES);
-        for i in 0..config::N_DOWN_STAGES {
-            let cin = config::down_in_channels(i);
-            let cout = config::down_out_channels(i);
-            let base = i * (config::NUM_RES_BLOCKS + 1);
-            let mut resnets = Vec::with_capacity(config::NUM_RES_BLOCKS);
-            for j in 0..config::NUM_RES_BLOCKS {
+        let mut down_stages = Vec::with_capacity(cfg.n_down_stages());
+        for i in 0..cfg.n_down_stages() {
+            let cin = cfg.down_in_channels(i);
+            let cout = cfg.down_out_channels(i);
+            let base = i * (cfg.num_res_blocks + 1);
+            let mut resnets = Vec::with_capacity(cfg.num_res_blocks);
+            for j in 0..cfg.num_res_blocks {
                 let rin = if j == 0 { cin } else { cout };
                 resnets.push(resnet_ids(
                     &format!("encoder.down_blocks.{}", base + j),
                     rin != cout,
                 ));
             }
-            let downsampler = config::down_has_downsampler(i).then(|| {
-                let p = format!("encoder.down_blocks.{}", base + config::NUM_RES_BLOCKS);
+            let downsampler = cfg.down_has_downsampler(i).then(|| {
+                let p = format!("encoder.down_blocks.{}", base + cfg.num_res_blocks);
                 DownsampleWeights {
                     spatial_conv: conv(&format!("{p}.resample.1")),
-                    time_conv: config::down_temporal(i).then(|| conv(&format!("{p}.time_conv"))),
+                    time_conv: cfg
+                        .down_temporal(i)
+                        .then(|| conv(&format!("{p}.time_conv"))),
                 }
             });
             down_stages.push(DownStageWeights {
@@ -340,12 +438,6 @@ impl VaeEncoderWeights {
             conv_out: conv("encoder.conv_out"),
             quant_conv: conv("quant_conv"),
         }
-    }
-}
-
-impl Default for VaeEncoderWeights {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1064,6 +1156,31 @@ const CONV3D_TILE_SMALL_N: Conv3dConfig = Conv3dConfig {
     tn: 2,
 };
 
+/// Decoder conv tiles. The VAE decode is conv-GPU bound (~95% of wall is
+/// conv3d+conv2d) and the implicit-GEMM kernels are memory-bandwidth bound, so
+/// global traffic per output (`bk*(1/bm + 1/bn)`) is the lever: `bm=128` halves
+/// the weight-side reads vs the 64x64 default. The register block (`tm*tn=48`,
+/// 256 threads) is the occupancy sweet spot found by sweep -- 64 accumulators
+/// (128x128) regressed on register pressure, 32 (128x64) left throughput on the
+/// table. Bit-identical to the default tile: f32 accumulation in ascending-k
+/// order is independent of the tile shape. Measured -27% conv3d / -28% conv2d
+/// ms/disp at 576x576 (RTX 5070 Laptop). Distinct from the global
+/// `Conv*Config::DEFAULT` (shared by other models) on purpose.
+const WAN_VAE_CONV3D_TILE: Conv3dConfig = Conv3dConfig {
+    bm: 128,
+    bn: 96,
+    bk: 16,
+    tm: 8,
+    tn: 6,
+};
+const WAN_VAE_CONV2D_TILE: Conv2dConfig = Conv2dConfig {
+    bm: 128,
+    bn: 96,
+    bk: 16,
+    tm: 8,
+    tn: 6,
+};
+
 /// Every WGSL pipeline the Wan VAE forward dispatches. Shared encoder + decoder.
 pub struct WanVaePipelines {
     /// Activation storage dtype: F16 when the device has `SHADER_F16`, else F32.
@@ -1083,6 +1200,8 @@ pub struct WanVaePipelines {
     pub bcast_add: thinfer_core::backend::WgpuPipeline,
     pub sdpa_large_d: thinfer_core::backend::WgpuPipeline,
     pub transpose12: thinfer_core::backend::WgpuPipeline,
+    /// Wan2.2 residual up-block avg_shortcut (`DupUp3D`); unused by Wan2.1.
+    pub dupup3d: thinfer_core::backend::WgpuPipeline,
 }
 
 impl WanVaePipelines {
@@ -1101,7 +1220,7 @@ impl WanVaePipelines {
         Ok(Self {
             act_dtype,
             act_size: act_dtype.bytes_per_elem(),
-            conv3d: Conv3dPipeline::compile(backend, "wan_vae_conv3d", cfg, Conv3dConfig::DEFAULT)
+            conv3d: Conv3dPipeline::compile(backend, "wan_vae_conv3d", cfg, WAN_VAE_CONV3D_TILE)
                 .await?,
             conv3d_small_n: Conv3dPipeline::compile(
                 backend,
@@ -1110,7 +1229,7 @@ impl WanVaePipelines {
                 CONV3D_TILE_SMALL_N,
             )
             .await?,
-            conv2d: Conv2dPipeline::compile(backend, "wan_vae_conv2d", cfg, Conv2dConfig::DEFAULT)
+            conv2d: Conv2dPipeline::compile(backend, "wan_vae_conv2d", cfg, WAN_VAE_CONV2D_TILE)
                 .await?,
             concat_time: backend
                 .create_pipeline(
@@ -1183,10 +1302,18 @@ impl WanVaePipelines {
                     <Transpose12F32 as Transpose12Op>::layout(),
                 )
                 .await?,
+            dupup3d: backend
+                .create_pipeline(
+                    "wan_vae_dupup3d",
+                    <DupUp3dF32 as DupUp3dOp>::wgsl(cfg),
+                    "main",
+                    <DupUp3dF32 as DupUp3dOp>::layout(),
+                )
+                .await?,
         })
     }
 
-    pub fn kernel_keys() -> [KernelKey; 11] {
+    pub fn kernel_keys() -> [KernelKey; 12] {
         let kk = |id: &'static str| KernelKey {
             kernel_id: id,
             hint: String::new(),
@@ -1203,6 +1330,7 @@ impl WanVaePipelines {
             kk(<BcastAddF32 as BcastAddOp>::KERNEL_ID),
             kk(<SdpaF32LargeD as SdpaOp>::KERNEL_ID),
             kk(<Transpose12F32 as Transpose12Op>::KERNEL_ID),
+            kk(<DupUp3dF32 as DupUp3dOp>::KERNEL_ID),
         ]
     }
 }
@@ -1271,32 +1399,40 @@ const VAE_SUBMIT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 // pixels (output is 8x).
 
 /// Largest square latent tile (and its overlap) whose decode working set fits
-/// the VRAM budget. The live set is ~linear in tile AREA and in act-dtype bytes.
-/// Calibrated from a 27x27-latent f16 tile that ran at ~2.3 GiB workspace live
-/// -> ~3.2 MiB per latent-px^2 at f16. (A 64x64 tile only tells us it exceeded
-/// the card, an unusable lower bound -- don't calibrate off a crash.) Solve for
-/// the largest tile using a fraction of the budget; the remainder (~1/4) covers
-/// resident weights + I/O staging + fragmentation. An unbounded budget falls
-/// back to a 2 GiB reference so we still tile sanely.
-fn vae_tile_dims(budget_bytes: u64, act_size: u64) -> (u32, u32) {
-    /// Live workspace bytes per latent-px^2 at f16 (measured, rounded up).
-    const BYTES_PER_LAT_AREA_F16: u64 = 3_200_000;
-    /// Fraction of budget (3/4) spent on the tile working set.
-    const SAFETY_NUM: u64 = 3;
-    const SAFETY_DEN: u64 = 4;
+/// `workspace_budget` (the VRAM budget already net of the resident VAE weights
+/// and staging; see the decode call site). The live set has two parts, both
+/// scaling with the per-group output frame count `max_tout`: each
+/// `decode_frame` temporally upsamples one latent frame to `tout` video frames
+/// (`temporal_compression` for every group after the first), and the high-res
+/// up_blocks then run at that T.
+///
+///   ws(area, tout) = FIXED(tout) + area * PER_AREA(tout)
+///
+/// `area`-scaling shrinks with the tile; `FIXED` (the temporal buffers carried
+/// across the up_blocks) does NOT -- it is a floor tiling cannot pass, so
+/// there is a min budget below which even `TILE_MIN` will not fit. Calibrated
+/// from four measured f16 points (tile 11 & 22 at tout 1 & 4): tout=1 has ~no
+/// fixed term and ~2.4 MiB/area; tout=4 adds ~553 MiB fixed and ~6.0 MiB/area.
+/// The old area-only model (one constant) undercounted small tiles and the
+/// tout=4 groups, overrunning a thin budget at 540P+. Recalibrate these if the
+/// decoder graph changes.
+fn vae_tile_dims(workspace_budget: u64, act_size: u64, max_tout: u32) -> (u32, u32) {
+    /// Fixed (tile-independent) workspace bytes at f16 per output frame beyond
+    /// the first: the temporal buffers the up_blocks carry across frames.
+    const FIXED_PER_EXTRA_T_F16: u64 = 193_000_000;
+    /// Workspace bytes per latent-px^2 at f16, T-independent stages.
+    const AREA_BASE_F16: u64 = 1_260_000;
+    /// Additional workspace bytes per latent-px^2 at f16, per output frame.
+    const AREA_PER_T_F16: u64 = 1_270_000;
     /// Upper cap so a huge budget doesn't pick a TDR-prone megatile.
     const TILE_MAX: u32 = 96;
     /// Floor: an 8-latent (64px) tile fits any usable device.
     const TILE_MIN: u32 = 8;
 
-    let budget = if budget_bytes == u64::MAX {
-        2 * 1024 * 1024 * 1024
-    } else {
-        budget_bytes
-    };
-    let per_area = (BYTES_PER_LAT_AREA_F16 * act_size / 2).max(1);
-    let max_area = (budget / SAFETY_DEN * SAFETY_NUM) / per_area;
-    let tile = ((max_area as f64).sqrt() as u32).clamp(TILE_MIN, TILE_MAX);
+    let fixed = FIXED_PER_EXTRA_T_F16 * u64::from(max_tout.saturating_sub(1)) * act_size / 2;
+    let per_area = ((AREA_BASE_F16 + AREA_PER_T_F16 * u64::from(max_tout)) * act_size / 2).max(1);
+    let area = workspace_budget.saturating_sub(fixed) / per_area;
+    let tile = ((area as f64).sqrt() as u32).clamp(TILE_MIN, TILE_MAX);
     // Overlap ~1/4 of the tile (>=4 latent / 32px) for a smooth feather seam.
     let overlap = (tile / 4).max(4);
     (tile, overlap)
@@ -1323,14 +1459,15 @@ fn plan_tiles(n: u32, tile: u32, overlap: u32) -> Vec<(u32, u32)> {
     tiles
 }
 
-/// Per-output-pixel feather weights along one tiled axis (length `ext * 8`).
-/// Linearly ramps 0->1 over the `overlap`-wide band on any edge that abuts a
-/// neighbor (`has_prev`/`has_next`) and holds 1 elsewhere; true image borders
-/// get no ramp. Two adjacent tiles' complementary ramps sum to ~1 over their
-/// shared overlap (partition of unity); the small floor keeps `wsum` positive.
-fn feather_1d(ext: u32, overlap: u32, has_prev: bool, has_next: bool) -> Vec<f32> {
-    let len = (ext * 8) as usize;
-    let ramp = ((overlap * 8) as usize).min(len) as f32;
+/// Per-output-pixel feather weights along one tiled axis (length `ext * scale`,
+/// where `scale` is the latent->output spatial factor). Linearly ramps 0->1 over
+/// the `overlap`-wide band on any edge that abuts a neighbor
+/// (`has_prev`/`has_next`) and holds 1 elsewhere; true image borders get no
+/// ramp. Two adjacent tiles' complementary ramps sum to ~1 over their shared
+/// overlap (partition of unity); the small floor keeps `wsum` positive.
+fn feather_1d(ext: u32, overlap: u32, scale: u32, has_prev: bool, has_next: bool) -> Vec<f32> {
+    let len = (ext * scale) as usize;
+    let ramp = ((overlap * scale) as usize).min(len) as f32;
     (0..len)
         .map(|i| {
             let mut w = 1.0f32;
@@ -1511,6 +1648,29 @@ fn transpose12_uniform<'wsp>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn dupup3d_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    in_c: u32,
+    out_c: u32,
+    ft: u32,
+    fs: u32,
+    t_in: u32,
+    h_in: u32,
+    w_in: u32,
+    repeats: u32,
+    t_drop: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let fields: [u32; 12] = [
+        in_c, out_c, ft, fs, t_in, h_in, w_in, repeats, t_drop, 0, 0, 0,
+    ];
+    let mut bytes = [0u8; 48];
+    for (i, v) in fields.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    scope.write_uniform(&bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sdpa_uniform<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     b: u32,
@@ -1659,6 +1819,37 @@ fn add_run<'wsp>(
     let out = scope.alloc(shape.bytes(pl.act_size))?;
     scope.dispatch_op::<AddF32>(&pl.add, &[a, b], out)?;
     Ok(out)
+}
+
+/// `DupUp3D` (Wan2.2 residual up-shortcut): duplicate-upsample `in_shape`
+/// (`[1, in_c, t, h, w]`) by `ft` in time / `fs` per spatial axis with the
+/// channel regroup, dropping the leading `t_drop` output frames (first_chunk
+/// trim). Output `[1, out_c, t*ft - t_drop, h*fs, w*fs]`.
+#[allow(clippy::too_many_arguments)]
+fn dupup3d_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    in_shape: Shape5,
+    out_c: u32,
+    ft: u32,
+    fs: u32,
+    repeats: u32,
+    t_drop: u32,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let out_shape = Shape5 {
+        b: in_shape.b,
+        c: out_c,
+        t: in_shape.t * ft - t_drop,
+        h: in_shape.h * fs,
+        w: in_shape.w * fs,
+    };
+    let out = scope.alloc(out_shape.bytes(pl.act_size))?;
+    let u = dupup3d_uniform(
+        scope, in_shape.c, out_c, ft, fs, in_shape.t, in_shape.h, in_shape.w, repeats, t_drop,
+    )?;
+    scope.dupup3d::<DupUp3dF32>(&pl.dupup3d, x, u, out, out_shape.elems())?;
+    Ok((out, out_shape))
 }
 
 /// `transpose12` over a flat `[d0, d1, d2, d3]` view: `out[d0,d2,d1,d3] =
@@ -1996,7 +2187,30 @@ async fn up_block_forward<'wsp>(
     temporal: bool,
     w: &'wsp UpBlockBufs,
     asz: u64,
+    is_residual: bool,
+    // Upsampler spatial-conv output channels (`out_c` residual, `out_c/2` 2.1).
+    resample_out: u32,
+    // `DupUp3D` channel `repeat_interleave` count (residual shortcut only).
+    dup_repeats: u32,
+    // True on the first decoded frame group (drives the `DupUp3D` temporal trim).
+    first_chunk: bool,
 ) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    // Wan2.2 residual avg_shortcut (`DupUp3D`) input is the up_block input
+    // (pre-resnet); persist it across the resnet/upsampler submits and add it
+    // back after the upsampler. Parameter-free, so only the activation is saved.
+    let do_shortcut = is_residual && w.upsampler.is_some();
+    let saved = if do_shortcut {
+        let in_shape = shape;
+        let ws = workspace.alloc(in_shape.bytes(asz))?;
+        let dst = packer.scope().import_copy(ws.as_buf_ref());
+        packer
+            .scope()
+            .copy_buffer_to_buffer(x, 0, dst, 0, in_shape.bytes(asz))?;
+        Some((ws, in_shape))
+    } else {
+        None
+    };
+
     for resnet in &w.resnets {
         // Resnets preserve t/h/w; only the channel count moves to out_c.
         let peak = peak_bytes(out_c, shape.t, shape.h, shape.w, asz);
@@ -2019,9 +2233,11 @@ async fn up_block_forward<'wsp>(
         return Ok((x, shape));
     };
 
-    // Upsampler phase: spatial 2x always, time 2x when temporal; out_c/2 chans.
+    // Upsampler phase: spatial 2x always, time 2x when temporal. The spatial
+    // conv emits `resample_out` channels (`out_c` for the Wan2.2 residual path,
+    // `out_c/2` for Wan2.1).
     let up_t = if temporal { shape.t * 2 } else { shape.t };
-    let up_peak = peak_bytes(out_c / 2, up_t, shape.h * 2, shape.w * 2, asz);
+    let up_peak = peak_bytes(resample_out, up_t, shape.h * 2, shape.w * 2, asz);
     x = packer.advance(&[x], up_peak).await?.pop().unwrap();
     let scope = packer.scope();
 
@@ -2206,8 +2422,26 @@ async fn up_block_forward<'wsp>(
         }
     }
 
-    // Spatial resample (every frame), out_c -> out_c/2, H/W doubled.
-    spatial_resample(scope, pl, x, shape, &up.spatial_conv, out_c / 2)
+    // Spatial resample (every frame): out_c -> resample_out, H/W doubled.
+    let (mut x_out, shape_out) =
+        spatial_resample(scope, pl, x, shape, &up.spatial_conv, resample_out)?;
+
+    // Wan2.2 residual: add the DupUp3D-upsampled block input. `factor_s` is 2
+    // (the spatial upsample), `factor_t` 2 when this block upsamples in time.
+    if let Some((ws, in_shape)) = saved {
+        let ft = if temporal { 2 } else { 1 };
+        let t_drop = if first_chunk && ft > 1 { ft - 1 } else { 0 };
+        let src = scope.import_copy(ws.as_buf_ref());
+        let (shortcut, sc_shape) =
+            dupup3d_run(scope, pl, src, in_shape, out_c, ft, 2, dup_repeats, t_drop)?;
+        debug_assert_eq!(
+            (sc_shape.c, sc_shape.t, sc_shape.h, sc_shape.w),
+            (shape_out.c, shape_out.t, shape_out.h, shape_out.w),
+            "DupUp3D shortcut shape must match the upsampler output",
+        );
+        x_out = add_run(scope, pl, x_out, shortcut, shape_out)?;
+    }
+    Ok((x_out, shape_out))
 }
 
 // ---------------------------------------------------------------------------
@@ -2308,6 +2542,7 @@ async fn decode_frame(
     backend: &WgpuBackend,
     workspace: &Workspace<WgpuBackend>,
     pl: &WanVaePipelines,
+    cfg: &WanVaeConfig,
     bufs: &VaeDecoderBufs,
     fc: &mut FeatCache,
     frame_in: &BufRef,
@@ -2344,9 +2579,10 @@ async fn decode_frame(
         // the unpacked path. Carried activations (`advance`) survive cuts via
         // the packer's hold-bag; `retire`/persisted taps are workspace-owned.
         let mut packer = ScopePacker::new(workspace, VAE_SUBMIT_BUDGET_BYTES);
+        let z_dim = cfg.z_dim as u32;
         let in_shape = Shape5 {
             b: 1,
-            c: config::Z_DIM as u32,
+            c: z_dim,
             t: 1,
             h: h_in,
             w: w_in,
@@ -2355,7 +2591,7 @@ async fn decode_frame(
 
         // post_quant_conv (1x1x1, pointwise in time so per-frame == whole).
         let z = packer
-            .advance(&[z], peak_bytes(config::Z_DIM as u32, 1, h_in, w_in, asz))
+            .advance(&[z], peak_bytes(z_dim, 1, h_in, w_in, asz))
             .await?
             .pop()
             .unwrap();
@@ -2365,14 +2601,14 @@ async fn decode_frame(
             z,
             in_shape,
             &bufs.post_quant_conv,
-            config::Z_DIM as u32,
+            z_dim,
         )?;
         if want_post {
             p_post = Some(persist_stage(workspace, packer.scope(), x, sh, asz)?);
         }
 
         // conv_in (causal 3x3x3).
-        let mid_c = config::MID_CHANNELS as u32;
+        let mid_c = cfg.mid_channels() as u32;
         let x = packer
             .advance(&[x], peak_bytes(mid_c, sh.t, sh.h, sh.w, asz))
             .await?
@@ -2443,8 +2679,8 @@ async fn decode_frame(
 
         // up_blocks 0..N (each resnet/upsampler is its own packer phase).
         for (i, ub) in bufs.up_blocks.iter().enumerate() {
-            let out_c = config::up_out_channels(i) as u32;
-            let temporal = config::up_temporal(i);
+            let out_c = cfg.up_out_channels(i) as u32;
+            let temporal = cfg.up_temporal(i);
             let (y, s) = up_block_forward(
                 workspace,
                 &mut packer,
@@ -2457,6 +2693,10 @@ async fn decode_frame(
                 temporal,
                 ub,
                 asz,
+                cfg.is_residual,
+                cfg.up_resample_out(i) as u32,
+                cfg.up_dup_repeats(i) as u32,
+                frame_idx == 0,
             )
             .await?;
             x = y;
@@ -2466,7 +2706,10 @@ async fn decode_frame(
             }
         }
 
-        // norm_out -> silu -> conv_out (causal 3x3x3, cout=3).
+        // norm_out -> silu -> conv_out (causal 3x3x3). For Wan2.2 the decoder
+        // emits `out_channels` (12 = 3*patch^2) packed channels at the decoder
+        // spatial scale; the trailing patch unshuffle (host-side) recovers the
+        // 3-channel video at full resolution.
         x = packer
             .advance(&[x], peak_bytes(sh.c, sh.t, sh.h, sh.w, asz))
             .await?
@@ -2483,7 +2726,7 @@ async fn decode_frame(
             a,
             sh,
             &bufs.conv_out,
-            config::OUT_CHANNELS as u32,
+            cfg.out_channels as u32,
             3,
             3,
         )?;
@@ -2540,6 +2783,7 @@ async fn decode_tile<S: WeightSource>(
     backend: &WgpuBackend,
     workspace: &mut Workspace<WgpuBackend>,
     pl: &WanVaePipelines,
+    cfg: &WanVaeConfig,
     bufs: &VaeDecoderBufs,
     latents: &[f32],
     f: usize,
@@ -2555,12 +2799,16 @@ async fn decode_tile<S: WeightSource>(
 ) -> Result<(), WanVaeDecodeError<S::Error>> {
     let (r0, c0, hext, wext) = tile;
     let (r0, c0, hext, wext) = (r0 as usize, c0 as usize, hext as usize, wext as usize);
-    let z_dim = config::Z_DIM;
+    let z_dim = cfg.z_dim;
     let asz = pl.act_size;
-    let (h_out, w_out) = (h_in * 8, w_in * 8);
+    let spat = cfg.spatial_compression; // final output scale per latent px (16)
+    let dec_scale = cfg.decoder_spatial_scale(); // decoder conv output scale (8)
+    let patch = cfg.patch_size; // trailing pixel-unshuffle factor (2)
+    let packed_c = cfg.out_channels; // decoder conv_out channels (12 = 3*patch^2)
+    let (h_out, w_out) = (h_in * spat, w_in * spat);
     let hw_out = h_out * w_out;
-    let (toh, tow) = (hext * 8, wext * 8); // tile output H/W
-    let tile_hw = toh * tow;
+    let (dh, dw) = (hext * dec_scale, wext * dec_scale); // decoder output H/W per frame
+    let dec_hw = dh * dw;
     let tile_elems = z_dim * hext * wext;
 
     let mut fc = FeatCache::new();
@@ -2570,8 +2818,8 @@ async fn decode_tile<S: WeightSource>(
         // the F axis), uploading as act bytes.
         let mut scaled = vec![0.0_f32; tile_elems];
         for c in 0..z_dim {
-            let std = config::LATENTS_STD[c];
-            let mean = config::LATENTS_MEAN[c];
+            let std = cfg.latents_std[c];
+            let mean = cfg.latents_mean[c];
             for hh in 0..hext {
                 for ww in 0..wext {
                     let src = (c * f + i) * h_in * w_in + (r0 + hh) * w_in + (c0 + ww);
@@ -2583,8 +2831,8 @@ async fn decode_tile<S: WeightSource>(
         let in_buf = workspace.alloc(in_bytes.len() as u64)?;
         backend.write_buffer(in_buf.id(), 0, &in_bytes)?;
 
-        let tout = if i == 0 { 1 } else { 4 };
-        let out_bytes = (3 * tout * tile_hw) as u64 * asz;
+        let tout = if i == 0 { 1 } else { cfg.temporal_compression };
+        let out_bytes = (packed_c * tout * dec_hw) as u64 * asz;
         let out_buf = workspace.alloc(out_bytes)?;
         let out_ref = out_buf.as_buf_ref();
 
@@ -2592,6 +2840,7 @@ async fn decode_tile<S: WeightSource>(
             backend,
             &*workspace,
             pl,
+            cfg,
             bufs,
             &mut fc,
             &in_buf.as_buf_ref(),
@@ -2603,6 +2852,18 @@ async fn decode_tile<S: WeightSource>(
         )
         .await?;
         debug_assert_eq!(shape.t as usize, tout);
+        debug_assert_eq!(shape.c as usize, packed_c);
+        debug_assert_eq!((shape.h as usize, shape.w as usize), (dh, dw));
+
+        if std::env::var_os("THINFER_VAE_MEM").is_some() {
+            let acct = backend.mem_account();
+            eprintln!(
+                "[vae_mem] tile=({r0},{c0},{hext},{wext}) group={i} tout={tout} ws_cur={}MiB ws_peak={}MiB vram_peak={}MiB",
+                acct.vram_current(VramCategory::Workspace) / (1024 * 1024),
+                acct.vram_peak(VramCategory::Workspace) / (1024 * 1024),
+                acct.vram_total_peak() / (1024 * 1024),
+            );
+        }
 
         let host = backend
             .read_buffer(out_ref.id, out_ref.offset, out_bytes)
@@ -2610,17 +2871,27 @@ async fn decode_tile<S: WeightSource>(
             .await?;
         let vals = act_bytes_to_f32_vec(asz, &host);
 
-        // Feather-blend this group's [3, tout, toh, tow] block into the video at
-        // the running time offset, accumulating per-pixel weight once (ch 0).
-        for ch in 0..3 {
+        // Unpatchify + feather-blend this group's `[packed_c, tout, dh, dw]`
+        // block into the 16x video. The pixel unshuffle maps packed channel `cp`
+        // -> video channel `cp / patch^2` at spatial sub-offset `(d3, d2)` where
+        // `d3 = cp % patch` (height), `d2 = (cp / patch) % patch` (width). For a
+        // given video channel the `patch^2` packed channels tile every output
+        // pixel exactly once, so `wsum` accumulates on the `ch == 0` packed set.
+        for cp in 0..packed_c {
+            let ch = cp / (patch * patch);
+            let d3 = cp % patch;
+            let d2 = (cp / patch) % patch;
             for tt in 0..tout {
                 let t = t_off + tt;
-                for (hh, &wh) in weights_h.iter().enumerate().take(toh) {
-                    let oh = r0 * 8 + hh;
-                    for (ww, &wwt) in weights_w.iter().enumerate().take(tow) {
-                        let ow = c0 * 8 + ww;
-                        let wgt = wh * wwt;
-                        let src = (ch * tout + tt) * tile_hw + hh * tow + ww;
+                for h8 in 0..dh {
+                    let hh = h8 * patch + d3; // local 16x H within tile
+                    let wh = weights_h[hh];
+                    let oh = r0 * spat + hh;
+                    for w8 in 0..dw {
+                        let ww = w8 * patch + d2; // local 16x W within tile
+                        let wgt = wh * weights_w[ww];
+                        let ow = c0 * spat + ww;
+                        let src = (cp * tout + tt) * dec_hw + h8 * dw + w8;
                         let pix = t * hw_out + oh * w_out + ow;
                         video[ch * t_total * hw_out + pix] += vals[src] * wgt;
                         if ch == 0 {
@@ -2645,6 +2916,11 @@ async fn decode_tile<S: WeightSource>(
 pub struct WanVaeDecoder {
     pub pipelines: WanVaePipelines,
     pub handles: VaeDecoderHandles,
+    pub cfg: WanVaeConfig,
+    /// Total GPU bytes of the decoder weights (all fit resident). Reserved out
+    /// of the VRAM budget when sizing the tile workspace, so weights stay
+    /// resident (no per-tile re-streaming) and the true peak holds the budget.
+    pub weight_footprint: u64,
 }
 
 #[derive(Debug)]
@@ -2700,7 +2976,10 @@ impl WanVaeDecoder {
         w_in: usize,
         mut taps: Option<&mut WanVaeDecodeTaps<'_>>,
     ) -> Result<Vec<f32>, WanVaeDecodeError<S::Error>> {
-        let z_dim = config::Z_DIM;
+        let cfg = &self.cfg;
+        let z_dim = cfg.z_dim;
+        let spat = cfg.spatial_compression;
+        let pix_c = cfg.pixel_channels();
         let frame_elems = z_dim * h_in * w_in;
         assert_eq!(
             latents.len(),
@@ -2709,7 +2988,7 @@ impl WanVaeDecoder {
             frame_elems * f,
             latents.len()
         );
-        let (h_out, w_out) = (h_in * 8, w_in * 8);
+        let (h_out, w_out) = (h_in * spat, w_in * spat);
 
         let views = self
             .handles
@@ -2719,34 +2998,95 @@ impl WanVaeDecoder {
         let bufs = views.bufs();
 
         // Output video: CTHW with the time axis concatenated across frame
-        // groups (group 0 -> 1 frame, each later group -> 4 frames).
-        let t_total = if f == 0 { 0 } else { 4 * f - 3 };
+        // groups (group 0 -> 1 frame, each later group -> `temporal_compression`).
+        let t_total = if f == 0 {
+            0
+        } else {
+            cfg.temporal_compression * f - (cfg.temporal_compression - 1)
+        };
         let hw_out = h_out * w_out;
         // `video` accumulates feather-weighted tile outputs; `wsum` the matching
         // per-pixel weights (channel-independent). Normalized + clamped below.
-        let mut video = vec![0.0_f32; 3 * t_total * hw_out];
+        let mut video = vec![0.0_f32; pix_c * t_total * hw_out];
         let mut wsum = vec![0.0_f32; t_total * hw_out];
 
         // Latent tile size derived from the live VRAM budget (not a fixed
         // const): bigger tiles on a roomy device, smaller on thin hardware, so
         // peak VRAM tracks the budget instead of a hardcoded ceiling.
         let budget = residency.arbiter().budget_bytes();
-        let (tile, overlap) = vae_tile_dims(budget, self.pipelines.act_size);
+        // Worst-case per-group output frames: groups after the first temporally
+        // upsample one latent frame to `temporal_compression` video frames, the
+        // peak the tile must hold. A single-frame (image) decode never hits it.
+        let max_tout = if f <= 1 {
+            1
+        } else {
+            cfg.temporal_compression as u32
+        };
+        // Reserve the real fixed footprint out of the budget before sizing the
+        // (non-evictable) tile workspace: the resident VAE weights (all fit) +
+        // readback/upload staging + fragmentation. Budget-independent -- not a
+        // budget fraction. An unbounded budget tiles against a 2 GiB reference.
+        const VAE_STAGING_RESERVE: u64 = 256 * 1024 * 1024;
+        let eff_budget = if budget == u64::MAX {
+            2 * 1024 * 1024 * 1024
+        } else {
+            budget
+        };
+        let reserve = self.weight_footprint + VAE_STAGING_RESERVE;
+        let workspace_budget = eff_budget.saturating_sub(reserve);
+        let (tile, overlap) = vae_tile_dims(workspace_budget, self.pipelines.act_size, max_tout);
+        // Hold everything-but-weights free so the arbiter caps weight residency
+        // at the footprint (all VAE weights stay resident, no per-tile
+        // re-streaming) while the tile workspace + staging cannot push the true
+        // peak past the budget. The DiT step loop uses the same mechanism.
+        if budget != u64::MAX {
+            residency.set_transient_reserve(eff_budget.saturating_sub(self.weight_footprint));
+        }
 
         // Overlapping latent tiles per axis; a single full tile at parity res.
         let tiles_h = plan_tiles(h_in as u32, tile, overlap);
         let tiles_w = plan_tiles(w_in as u32, tile, overlap);
+        if std::env::var_os("THINFER_VAE_MEM").is_some() {
+            eprintln!(
+                "[vae_mem] budget={}MiB weights={}MiB reserve={}MiB ws_budget={}MiB act_size={} tile={} overlap={} grid={}x{} (h_in={} w_in={} f={})",
+                budget / (1024 * 1024),
+                self.weight_footprint / (1024 * 1024),
+                reserve / (1024 * 1024),
+                workspace_budget / (1024 * 1024),
+                self.pipelines.act_size,
+                tile,
+                overlap,
+                tiles_h.len(),
+                tiles_w.len(),
+                h_in,
+                w_in,
+                f,
+            );
+        }
         let single = tiles_h.len() == 1 && tiles_w.len() == 1;
         for &(r0, hext) in &tiles_h {
-            let weights_h = feather_1d(hext, overlap, r0 > 0, (r0 + hext) < h_in as u32);
+            let weights_h = feather_1d(
+                hext,
+                overlap,
+                spat as u32,
+                r0 > 0,
+                (r0 + hext) < h_in as u32,
+            );
             for &(c0, wext) in &tiles_w {
-                let weights_w = feather_1d(wext, overlap, c0 > 0, (c0 + wext) < w_in as u32);
+                let weights_w = feather_1d(
+                    wext,
+                    overlap,
+                    spat as u32,
+                    c0 > 0,
+                    (c0 + wext) < w_in as u32,
+                );
                 // Taps (parity bisection) only apply to the single full tile.
                 let tile_taps = if single { taps.as_deref_mut() } else { None };
                 decode_tile::<S>(
                     backend,
                     workspace,
                     &self.pipelines,
+                    cfg,
                     &bufs,
                     latents,
                     f,
@@ -2771,7 +3111,7 @@ impl WanVaeDecoder {
 
         // Normalize the feather blend (wsum is unit everywhere for a single
         // tile -> exact passthrough) and clamp to [-1, 1].
-        for ch in 0..3 {
+        for ch in 0..pix_c {
             let base = ch * t_total * hw_out;
             for pix in 0..(t_total * hw_out) {
                 video[base + pix] = (video[base + pix] / wsum[pix]).clamp(-1.0, 1.0);
@@ -3002,6 +3342,7 @@ async fn encode_chunk(
     backend: &WgpuBackend,
     workspace: &Workspace<WgpuBackend>,
     pl: &WanVaePipelines,
+    cfg: &WanVaeConfig,
     bufs: &VaeEncoderBufs,
     fc: &mut FeatCache,
     chunk_in: &BufRef,
@@ -3034,7 +3375,7 @@ async fn encode_chunk(
         let x0 = scope.import(chunk_in);
         let in_shape = Shape5 {
             b: 1,
-            c: config::IN_CHANNELS as u32,
+            c: cfg.in_channels as u32,
             t: tin,
             h: h_in,
             w: w_in,
@@ -3050,7 +3391,7 @@ async fn encode_chunk(
             x0,
             in_shape,
             &bufs.conv_in,
-            config::enc_dim(0) as u32,
+            cfg.enc_dim(0) as u32,
             3,
             3,
         )?;
@@ -3060,8 +3401,8 @@ async fn encode_chunk(
 
         // down stages 0..N.
         for (i, ds) in bufs.down_stages.iter().enumerate() {
-            let out_c = config::down_out_channels(i) as u32;
-            let temporal = config::down_temporal(i);
+            let out_c = cfg.down_out_channels(i) as u32;
+            let temporal = cfg.down_temporal(i);
             let (y, s) = down_stage_forward(
                 workspace,
                 &scope,
@@ -3090,7 +3431,7 @@ async fn encode_chunk(
             &mut retire,
             x,
             sh,
-            config::ENC_MID_CHANNELS as u32,
+            cfg.enc_mid_channels() as u32,
             &bufs.mid_block.resnets[0],
         )?;
         let (m1, s1) = mid_attention_forward(&scope, pl, m0, s0, &bufs.mid_block.attention)?;
@@ -3102,7 +3443,7 @@ async fn encode_chunk(
             &mut retire,
             m1,
             s1,
-            config::ENC_MID_CHANNELS as u32,
+            cfg.enc_mid_channels() as u32,
             &bufs.mid_block.resnets[1],
         )?;
         x = m2;
@@ -3123,7 +3464,7 @@ async fn encode_chunk(
             a,
             sh,
             &bufs.conv_out,
-            config::Z_DIM_X2 as u32,
+            cfg.z_dim_x2() as u32,
             3,
             3,
         )?;
@@ -3138,7 +3479,7 @@ async fn encode_chunk(
             c_out,
             c_sh,
             &bufs.quant_conv,
-            config::Z_DIM_X2 as u32,
+            cfg.z_dim_x2() as u32,
         )?;
         out_shape = q_sh;
 
@@ -3181,6 +3522,7 @@ async fn encode_chunk(
 pub struct WanVaeEncoder {
     pub pipelines: WanVaePipelines,
     pub handles: VaeEncoderHandles,
+    pub cfg: WanVaeConfig,
 }
 
 #[derive(Debug)]
@@ -3247,10 +3589,11 @@ impl WanVaeEncoder {
             f >= 1 && (f - 1).is_multiple_of(4),
             "encode: F must be 4k+1, got {f}"
         );
+        let cfg = &self.cfg;
         let asz = self.pipelines.act_size;
         let (h_out, w_out) = (h_in / 8, w_in / 8);
         let hw_out = h_out * w_out;
-        let zc = config::Z_DIM_X2;
+        let zc = cfg.z_dim_x2();
 
         let views = self
             .handles
@@ -3291,6 +3634,7 @@ impl WanVaeEncoder {
                 backend,
                 &*workspace,
                 &self.pipelines,
+                cfg,
                 &bufs,
                 &mut fc,
                 &in_buf.as_buf_ref(),

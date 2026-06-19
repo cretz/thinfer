@@ -1,4 +1,10 @@
-# Wan-family video plan (active)
+# Wan-family video plan (BEING REPURPOSED -- see worklog.md "Direction" pivot)
+
+> 2026-06-19: SkyReels-V2-DF ABANDONED. New targets:
+> FastWan2.2-TI2V-5B-FullAttn (next) then LongLive-2.0-5B, both Wan2.2-TI2V-5B
+> base. SkyReels-DF-specific sections below (synchronous-DF scheduler, CFG
+> wiring, DF thesis) are OBSOLETE; the Wan-backbone / RoPE3D / umT5 / VAE-tiling /
+> GGUF lore is reusable. Prune to the 2.2 line during the port.
 
 ## Thesis
 

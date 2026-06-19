@@ -2,7 +2,7 @@
 //! `transformer_skyreels_v2.py`). Full-attention video DiT block:
 //!
 //! ```text
-//! shift_msa,scale_msa,gate_msa,c_shift,c_scale,c_gate = mod   // per-token (DF)
+//! shift_msa,scale_msa,gate_msa,c_shift,c_scale,c_gate = mod   // [inner] vectors
 //! // 1. self-attention (RoPE3D, interleaved-pair)
 //! n  = norm1(x) * (1 + scale_msa) + shift_msa                 // FP32 LayerNorm, no affine
 //! a  = self_attn(n)                                           // q/k/v biased, qk RMSNorm-across-heads
@@ -26,18 +26,19 @@
 //! - A cross-attention stage to the umT5 text states (no RoPE, no mask).
 //! - Non-gated gelu-tanh FFN (`proj_out(gelu_new(proj_in(x)))`), reusing the new
 //!   [`GeluF32`] op (single-input sibling of umT5's `GeluMulF32`).
-//! - Diffusion-Forcing modulation is PER-TOKEN: scale/shift/gate are full
-//!   `[rows, inner]` tensors (one timestep per latent frame, broadcast over the
-//!   frame's spatial tokens by the driver), so modulation is full-elementwise
-//!   `Mul`/`Add`, not the channel-broadcast `bcast_affine`/`bcast_fma`.
+//! - Modulation is CHANNEL-BROADCAST: the distilled T2V line feeds one scalar
+//!   timestep, so scale/shift/gate are `[inner]` vectors uniform over all
+//!   tokens. norm modulation is `bcast_affine`(bias=1) + `bcast_add`; the gated
+//!   residual is a single `bcast_fma` (matches the Z-Image modulation form).
 //!
-//! The `scale_shift_table` add (`table[6,inner] + temb`) that produces the six
-//! modulation signals lives in the driver; this block consumes the six ready
-//! `[rows, inner]` tensors via [`WanMod`].
+//! The `scale_shift_table` add (`table[6,inner] + timestep_proj`) that produces
+//! the six modulation signals lives in the driver; this block consumes the six
+//! ready `[inner]` vectors via [`WanMod`].
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::ops::{
-    BcastAddF32, BcastAffineF32, GeluF32, LayerNormF32, MatMulF32, MulF32, RopeF32,
+    BcastAddF32, BcastFmaF32, BcastModulateF32, BcastMulF32, GeluF32, LayerNormF32, MatMulF32,
+    RopeF32,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::weight::WeightSource;
@@ -48,16 +49,16 @@ use crate::common::block::{
     op_sdpa,
 };
 
-/// Audited against the SkyReels-V2-DF-1.3B-540P-Diffusers `transformer/
-/// config.json` (see `wan-plan.md` "Pinned config").
+/// Wan-family-invariant DiT constants (the same across SkyReels-1.3B, FastWan
+/// 5B, Wan2.2-14B): only `num_heads`, `ffn_dim`, `num_layers`, and the latent
+/// channel count differ between variants -- those live in [`WanDitConfig`]. The
+/// `qk_norm rms_norm_across_heads`, `cross_attn_norm`, gelu-tanh FFN, and patch
+/// structure are shared.
 pub mod config {
-    pub const NUM_HEADS: usize = 12;
+    /// Per-head dim. 128 across the whole Wan family (variants scale `num_heads`,
+    /// not `head_dim`), so the rope axis split below is a fixed function of it.
     pub const HEAD_DIM: usize = 128;
-    /// `num_heads * head_dim`. Equals the model dim for the 1.3B DiT.
-    pub const INNER: usize = NUM_HEADS * HEAD_DIM; // 1536
-    pub const DIM: usize = INNER;
-    pub const FFN_DIM: usize = 8960;
-    pub const NUM_LAYERS: usize = 30;
+    /// umT5-XXL hidden width (the text encoder, shared by every Wan variant).
     pub const TEXT_DIM: usize = 4096;
     pub const FREQ_DIM: usize = 256;
     pub const EPS: f32 = 1e-6;
@@ -70,13 +71,10 @@ pub mod config {
     pub const PATCH_T: usize = 1;
     pub const PATCH_H: usize = 2;
     pub const PATCH_W: usize = 2;
-    /// Latent channels in / out (Wan2.1 VAE `z_dim`).
-    pub const IN_CHANNELS: usize = 16;
-    pub const OUT_CHANNELS: usize = 16;
 
     /// RoPE3D theta and the per-axis (t, h, w) sub-dimensions of `HEAD_DIM`.
     /// `h = w = 2 * (head_dim / 6)`, `t = head_dim - h - w` (diffusers
-    /// `SkyReelsV2RotaryPosEmbed`). At head_dim 128: t=44, h=w=42.
+    /// `WanRotaryPosEmbed`). At head_dim 128: t=44, h=w=42.
     pub const ROPE_THETA: f32 = 10_000.0;
     pub const ROPE_H_DIM: usize = 2 * (HEAD_DIM / 6); // 42
     pub const ROPE_W_DIM: usize = 2 * (HEAD_DIM / 6); // 42
@@ -84,6 +82,41 @@ pub mod config {
     /// Max per-axis grid length the freq tables are precomputed to
     /// (`rope_max_seq_len`).
     pub const ROPE_MAX_SEQ_LEN: usize = 1024;
+}
+
+/// Per-variant Wan DiT geometry. Threaded through the driver / block / loader /
+/// condition embedder so a new variant (e.g. Wan2.2-14B) is a new constructor,
+/// not a code fork. Family-invariant numbers stay in [`config`].
+#[derive(Clone, Copy, Debug)]
+pub struct WanDitConfig {
+    pub num_heads: usize,
+    pub ffn_dim: usize,
+    pub num_layers: usize,
+    /// Latent channels in / out (== the VAE `z_dim`): 48 for the Wan2.2-TI2V
+    /// high-compression VAE, 16 for the Wan2.1 VAE.
+    pub in_channels: usize,
+    pub out_channels: usize,
+}
+
+impl WanDitConfig {
+    /// FastWan2.2-TI2V-5B-FullAttn (== LongLive-2.0-5B base). Audited against the
+    /// `transformer/config.json` (`WanTransformer3DModel`): num_attention_heads
+    /// 24, attention_head_dim 128 -> inner 3072; num_layers 30; ffn_dim 14336;
+    /// in/out_channels 48.
+    pub fn fastwan_ti2v_5b() -> Self {
+        Self {
+            num_heads: 24,
+            ffn_dim: 14336,
+            num_layers: 30,
+            in_channels: 48,
+            out_channels: 48,
+        }
+    }
+
+    /// Model dim `num_heads * HEAD_DIM`.
+    pub fn inner(&self) -> usize {
+        self.num_heads * config::HEAD_DIM
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,13 +168,13 @@ pub struct WanDitBlockShape {
 }
 
 impl WanDitBlockShape {
-    pub fn new(seq: usize, text_seq: usize) -> Self {
+    pub fn new(cfg: &WanDitConfig, seq: usize, text_seq: usize) -> Self {
         Self {
-            dim: config::DIM,
-            n_heads: config::NUM_HEADS,
+            dim: cfg.inner(),
+            n_heads: cfg.num_heads,
             head_dim: config::HEAD_DIM,
-            inner: config::INNER,
-            ffn_dim: config::FFN_DIM,
+            inner: cfg.inner(),
+            ffn_dim: cfg.ffn_dim,
             seq,
             text_seq,
             norm_eps: config::EPS,
@@ -365,8 +398,11 @@ impl<'a> WanDitBlockViews<'a> {
     }
 }
 
-/// The six per-token Diffusion-Forcing modulation signals, each `[rows, inner]`
-/// (`scale_shift_table + temb`, already summed by the driver).
+/// The six modulation signals, each a channel vector `[inner]`
+/// (`scale_shift_table[k] + timestep_proj[k]`, already summed by the driver).
+/// The distilled T2V line feeds one scalar timestep, so modulation is uniform
+/// over all tokens: each signal broadcasts over the `seq` rows (no per-token
+/// materialization, the SkyReels-V2-DF `[rows, inner]` hog is gone).
 #[derive(Clone)]
 pub struct WanMod<'wsp> {
     pub shift_msa: BatchBuf<'wsp>,
@@ -380,6 +416,12 @@ pub struct WanMod<'wsp> {
 /// GPU tap destinations for one Wan DiT block (parity diagnostics).
 #[derive(Default, Clone)]
 pub struct WanDitBlockTaps {
+    /// Pre-modulation self-attn LayerNorm output (`norm1(x)`, before
+    /// `*(1+scale)+shift`). Separates a LayerNorm bug from a modulation bug.
+    pub norm1_premod: Option<BufRef>,
+    /// The self-attn modulation channel vectors `[inner]` (scale_msa, shift_msa).
+    pub mod_scale: Option<BufRef>,
+    pub mod_shift: Option<BufRef>,
     pub norm1: Option<BufRef>,
     pub self_q: Option<BufRef>,
     pub self_k: Option<BufRef>,
@@ -398,17 +440,6 @@ pub struct WanDitBlockTaps {
 // Local op helpers (the ones common::block keeps private). All compose the
 // reusable BlockPipelines kernels; nothing Wan-specific except GeluF32.
 // ---------------------------------------------------------------------------
-
-/// Full-elementwise `out = a * b`.
-fn op_mul<'wsp>(
-    scope: &BatchScope<'wsp, WgpuBackend>,
-    bp: &BlockPipelines,
-    a: ActBuf<'wsp>,
-    b: ActBuf<'wsp>,
-    dst: ActBuf<'wsp>,
-) -> Result<(), WgpuError> {
-    scope.dispatch_op::<MulF32>(&bp.mul, &[a.data, b.data], dst.data)
-}
 
 /// `out = layernorm(x)` (mean-subtract, no affine). FP32 LayerNorm, eps folded.
 fn op_layernorm<'wsp>(
@@ -439,47 +470,51 @@ fn op_bias_add<'wsp>(
     scope.bcast_add::<BcastAddF32>(&bp.bcast_add, x.data, bias, u, dst.data, rows * dim)
 }
 
-/// Per-token modulation `out = x * (1 + scale) + shift` (full-elementwise; DF
-/// modulation varies per row). Composes mul + add + add through two scratch
-/// buffers from `scope`.
+/// Channel-broadcast modulation `out = x * (1 + scale) + shift`, where `scale`
+/// and `shift` are `[dim]` vectors broadcast over the `rows` tokens (uniform
+/// scalar-t). Both are runtime ACTIVATIONS (`scale_shift_table + timestep_proj`),
+/// so the fused `bcast_modulate` op reads them in the act dtype (bias=1 folds the
+/// `1 +`). NOT `bcast_add`, which reads its broadcast vector as a weight and
+/// would reinterpret the f16 shift act as bf16, dropping it.
 #[allow(clippy::too_many_arguments)]
 fn op_modulate<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     bp: &BlockPipelines,
     x: ActBuf<'wsp>,
-    scale: ActBuf<'wsp>,
-    shift: ActBuf<'wsp>,
+    scale: BatchBuf<'wsp>,
+    shift: BatchBuf<'wsp>,
     dst: ActBuf<'wsp>,
     rows: u32,
     dim: u32,
 ) -> Result<(), WgpuError> {
-    // Distinct scratch per stage: elementwise ops bind input read-only and
-    // output read-write, so input and output must not alias the same buffer.
-    let xs = alloc_act(scope, bp, rows, dim)?;
-    op_mul(scope, bp, x, scale, xs)?; // x * scale
-    let xss = alloc_act(scope, bp, rows, dim)?;
-    op_add(scope, bp, xs, shift, xss)?; // x * scale + shift
-    op_add(scope, bp, x, xss, dst)?; // x + (x * scale + shift) = x * (1 + scale) + shift
-    Ok(())
+    let u = scope.u32x4_uniform(dim, 1.0_f32.to_bits(), 0, 0)?;
+    scope.bcast_modulate::<BcastModulateF32>(
+        &bp.bcast_modulate,
+        x.data,
+        scale,
+        shift,
+        u,
+        dst.data,
+        rows * dim,
+    )
 }
 
-/// Gated residual `out = x + gate * y` (full-elementwise). Writes into a scratch
-/// then adds; `out` may alias `x`.
+/// Channel-broadcast gated residual `out = x + gate * y`, `gate` a `[dim]`
+/// vector broadcast over rows. Single `bcast_fma` dispatch; `out` must not alias
+/// `x` or `y`.
 #[allow(clippy::too_many_arguments)]
 fn op_gate_residual<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     bp: &BlockPipelines,
     x: ActBuf<'wsp>,
-    gate: ActBuf<'wsp>,
+    gate: BatchBuf<'wsp>,
     y: ActBuf<'wsp>,
     dst: ActBuf<'wsp>,
     rows: u32,
     dim: u32,
 ) -> Result<(), WgpuError> {
-    let gy = alloc_act(scope, bp, rows, dim)?;
-    op_mul(scope, bp, gate, y, gy)?;
-    op_add(scope, bp, x, gy, dst)?;
-    Ok(())
+    let u = scope.u32x4_uniform(dim, 0, 0, 0)?;
+    scope.bcast_fma::<BcastFmaF32>(&bp.bcast_fma, x.data, gate, y.data, u, dst.data, rows * dim)
 }
 
 /// One matmul site: `out = input @ wᵀ` through `dispatch_matmul_site` (handles
@@ -559,17 +594,26 @@ impl WanDitBlock {
         // ============== 1. self-attention ==============
         let n1 = alloc_act(scope, bp, rows, dim)?;
         op_layernorm(scope, bp, x_in, n1, rows, dim, eps)?;
-        let n1m = alloc_act(scope, bp, rows, dim)?;
-        op_modulate(
+        copy_tap(
             scope,
-            bp,
-            n1,
-            ActBuf::dense(m.scale_msa),
-            ActBuf::dense(m.shift_msa),
-            n1m,
-            rows,
-            dim,
+            n1.data,
+            taps.norm1_premod.as_ref(),
+            bp.act_bytes(rows * dim),
         )?;
+        copy_tap(
+            scope,
+            m.scale_msa,
+            taps.mod_scale.as_ref(),
+            bp.act_bytes(dim),
+        )?;
+        copy_tap(
+            scope,
+            m.shift_msa,
+            taps.mod_shift.as_ref(),
+            bp.act_bytes(dim),
+        )?;
+        let n1m = alloc_act(scope, bp, rows, dim)?;
+        op_modulate(scope, bp, n1, m.scale_msa, m.shift_msa, n1m, rows, dim)?;
         copy_tap(
             scope,
             n1m.data,
@@ -594,16 +638,7 @@ impl WanDitBlock {
         )?;
 
         let x1 = alloc_act(scope, bp, rows, dim)?;
-        op_gate_residual(
-            scope,
-            bp,
-            x_in,
-            ActBuf::dense(m.gate_msa),
-            sa,
-            x1,
-            rows,
-            dim,
-        )?;
+        op_gate_residual(scope, bp, x_in, m.gate_msa, sa, x1, rows, dim)?;
         copy_tap(
             scope,
             x1.data,
@@ -617,15 +652,11 @@ impl WanDitBlock {
         op_layernorm(scope, bp, x1, n2, rows, dim, eps)?;
         let n2w = alloc_act(scope, bp, rows, dim)?;
         let w2 = scope.import_copy(bufs.norm2_w);
-        let u_aff = scope.u32x4_uniform(dim, 0, 0, 0)?;
-        scope.bcast_affine::<BcastAffineF32>(
-            &bp.bcast_affine,
-            n2.data,
-            w2,
-            u_aff,
-            n2w.data,
-            rows * dim,
-        )?;
+        // norm2 weight is a stored bf16 weight, not an act: use `bcast_mul`
+        // (decodes by weight_dtype) NOT `bcast_affine` (reads its scale as an
+        // f16 act, which reinterprets the bf16 weight bits -> wrong scale).
+        let u_mul = scope.u32x4_uniform(dim, 0, 0, 0)?;
+        scope.bcast_add::<BcastMulF32>(&bp.bcast_mul, n2.data, w2, u_mul, n2w.data, rows * dim)?;
         let b2 = scope.import_copy(bufs.norm2_b);
         let n2wb = alloc_act(scope, bp, rows, dim)?;
         op_bias_add(scope, bp, n2w, b2, n2wb, rows, dim)?;
@@ -665,16 +696,7 @@ impl WanDitBlock {
         let n3 = alloc_act(scope, bp, rows, dim)?;
         op_layernorm(scope, bp, x2, n3, rows, dim, eps)?;
         let n3m = alloc_act(scope, bp, rows, dim)?;
-        op_modulate(
-            scope,
-            bp,
-            n3,
-            ActBuf::dense(m.c_scale_mlp),
-            ActBuf::dense(m.c_shift_mlp),
-            n3m,
-            rows,
-            dim,
-        )?;
+        op_modulate(scope, bp, n3, m.c_scale_mlp, m.c_shift_mlp, n3m, rows, dim)?;
         copy_tap(
             scope,
             n3m.data,
@@ -740,17 +762,314 @@ impl WanDitBlock {
             bp.act_bytes(rows * dim),
         )?;
 
+        op_gate_residual(scope, bp, x2, m.c_gate_mlp, downb, y_out, rows, dim)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Activation-tiled block (large-token path). The block's only all-to-all
+    // op is the self-attention SDPA; everything else is per-token-row. So the
+    // driver runs the block in three movements, each in its own scope(s) so
+    // the workspace pool recycles tile transients between submits:
+    //
+    //   pass A (row-tiled): norm1 -> modulate -> q/k/v proj+bias -> qk-norm
+    //                       -> rope, writing the full `qx`/`kx`/`v` buffers.
+    //   barrier:            cross-attn K/V projected once + GLOBAL self-SDPA.
+    //   pass B (row-tiled): self o-proj -> gate residual -> cross-attn ->
+    //                       FFN, writing the residual stream out.
+    //
+    // The math is identical to `forward`; only the buffer lifetime changes
+    // (the heavy `[tile, ffn_dim]` FFN transients no longer all live at once).
+    // -----------------------------------------------------------------------
+
+    /// Pass A for one row-tile: produce the rotated `qx`/`kx` and `v` slices
+    /// for `tr` query rows. `x_in`/`freqs`/`qx`/`kx`/`v` are the tile slices
+    /// (`tr` rows) of the full-sequence buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn self_qkv_tile<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        x_in: BatchBuf<'wsp>,
+        freqs: BatchBuf<'wsp>,
+        m: &WanMod<'wsp>,
+        qx: BatchBuf<'wsp>,
+        kx: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        tr: u32,
+        w: &WanAttnBufs,
+    ) -> Result<(), WgpuError> {
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let dim = s.dim as u32;
+        let inner = s.inner as u32;
+        let eps = s.norm_eps;
+        let x_in = ActBuf::dense(x_in);
+
+        // norm1 (no affine) -> modulate by (scale_msa, shift_msa).
+        let n1 = alloc_act(scope, bp, tr, dim)?;
+        op_layernorm(scope, bp, x_in, n1, tr, dim, eps)?;
+        let n1m = alloc_act(scope, bp, tr, dim)?;
+        op_modulate(scope, bp, n1, m.scale_msa, m.shift_msa, n1m, tr, dim)?;
+
+        // q/k/v projections + bias, qk-norm (RMSNorm across the full inner dim).
+        let q = self.biased_proj(scope, bp, n1m, w.q_w, w.q_b, tr, inner)?;
+        let k = self.biased_proj(scope, bp, n1m, w.k_w, w.k_b, tr, inner)?;
+        let vv = self.biased_proj(scope, bp, n1m, w.v_w, w.v_b, tr, inner)?;
+        let qn = alloc_act(scope, bp, tr, inner)?;
+        let nq = scope.import_copy(w.norm_q);
+        op_rmsnorm(scope, bp, q, nq, qn, tr, inner, eps)?;
+        let kn = alloc_act(scope, bp, tr, inner)?;
+        let nk = scope.import_copy(w.norm_k);
+        op_rmsnorm(scope, bp, k, nk, kn, tr, inner, eps)?;
+
+        // RoPE3D into the persistent qx/kx slices; v carried unrotated.
+        self.rope(scope, bp, qn, freqs, ActBuf::dense(qx), tr)?;
+        self.rope(scope, bp, kn, freqs, ActBuf::dense(kx), tr)?;
+        scope.copy_buffer_to_buffer(vv.data, 0, v, 0, bp.act_bytes(tr * inner))?;
+        Ok(())
+    }
+
+    /// Project the umT5 text states to the cross-attention K/V once (shared by
+    /// every query tile in pass B). `ck` is `norm_k(to_k(text)+b_k)`; `cv` is
+    /// `to_v(text)+b_v`. No RoPE (cross-attn is unrotated).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cross_kv<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        text: BatchBuf<'wsp>,
+        w: &WanAttnBufs,
+        ck: BatchBuf<'wsp>,
+        cv: BatchBuf<'wsp>,
+        trows: u32,
+    ) -> Result<(), WgpuError> {
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let inner = s.inner as u32;
+        let eps = s.norm_eps;
+        let text = ActBuf::dense(text);
+        let k = self.biased_proj(scope, bp, text, w.k_w, w.k_b, trows, inner)?;
+        let vv = self.biased_proj(scope, bp, text, w.v_w, w.v_b, trows, inner)?;
+        let nk = scope.import_copy(w.norm_k);
+        op_rmsnorm(scope, bp, k, nk, ActBuf::dense(ck), trows, inner, eps)?;
+        scope.copy_buffer_to_buffer(vv.data, 0, cv, 0, bp.act_bytes(trows * inner))?;
+        Ok(())
+    }
+
+    /// Pass B for one row-tile: consume the self-attention output `sa` slice
+    /// (`tr` rows) and produce the block's residual-stream output slice.
+    /// `ck`/`cv` are the full precomputed cross-attn K/V (`trows` text rows).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn post_attn_tile<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        x_in: BatchBuf<'wsp>,
+        sa: BatchBuf<'wsp>,
+        m: &WanMod<'wsp>,
+        ck: BatchBuf<'wsp>,
+        cv: BatchBuf<'wsp>,
+        y_out: BatchBuf<'wsp>,
+        tr: u32,
+        trows: u32,
+        bufs: &WanDitBlockBufs,
+    ) -> Result<(), WgpuError> {
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let dim = s.dim as u32;
+        let inner = s.inner as u32;
+        let dff = s.ffn_dim as u32;
+        let eps = s.norm_eps;
+        let nh = s.n_heads as u32;
+        let hd = s.head_dim as u32;
+        let scale = s.sdpa_scale();
+        let x_in = ActBuf::dense(x_in);
+
+        // self-attn output projection + bias, then gated residual.
+        let sa_proj =
+            self.attn_out_proj(scope, bp, ActBuf::dense(sa), &bufs.self_attn, tr, inner)?;
+        let x1 = alloc_act(scope, bp, tr, dim)?;
+        op_gate_residual(scope, bp, x_in, m.gate_msa, sa_proj, x1, tr, dim)?;
+
+        // cross-attention: norm2 (affine) -> q proj -> SDPA against ck/cv.
+        let n2 = alloc_act(scope, bp, tr, dim)?;
+        op_layernorm(scope, bp, x1, n2, tr, dim, eps)?;
+        let n2w = alloc_act(scope, bp, tr, dim)?;
+        let w2 = scope.import_copy(bufs.norm2_w);
+        let u_mul = scope.u32x4_uniform(dim, 0, 0, 0)?;
+        scope.bcast_add::<BcastMulF32>(&bp.bcast_mul, n2.data, w2, u_mul, n2w.data, tr * dim)?;
+        let b2 = scope.import_copy(bufs.norm2_b);
+        let n2wb = alloc_act(scope, bp, tr, dim)?;
+        op_bias_add(scope, bp, n2w, b2, n2wb, tr, dim)?;
+
+        let cq_b = self.biased_proj(
+            scope,
+            bp,
+            n2wb,
+            bufs.cross_attn.q_w,
+            bufs.cross_attn.q_b,
+            tr,
+            inner,
+        )?;
+        let cq = alloc_act(scope, bp, tr, inner)?;
+        let ncq = scope.import_copy(bufs.cross_attn.norm_q);
+        op_rmsnorm(scope, bp, cq_b, ncq, cq, tr, inner, eps)?;
+        let ca = alloc_act(scope, bp, tr, inner)?;
+        let no_mask = scope.alloc(16)?;
+        op_sdpa(
+            scope,
+            bp,
+            cq,
+            ActBuf::dense(ck),
+            ActBuf::dense(cv),
+            no_mask,
+            ca,
+            1,
+            tr,
+            trows,
+            nh,
+            nh,
+            hd,
+            scale,
+            0,
+        )?;
+        let ca_proj = self.attn_out_proj(scope, bp, ca, &bufs.cross_attn, tr, inner)?;
+        // cross-attn residual: no gate.
+        let x2 = alloc_act(scope, bp, tr, dim)?;
+        op_add(scope, bp, x1, ca_proj, x2)?;
+
+        // feed-forward (gelu-tanh, non-gated), gated residual into y_out.
+        let n3 = alloc_act(scope, bp, tr, dim)?;
+        op_layernorm(scope, bp, x2, n3, tr, dim, eps)?;
+        let n3m = alloc_act(scope, bp, tr, dim)?;
+        op_modulate(scope, bp, n3, m.c_scale_mlp, m.c_shift_mlp, n3m, tr, dim)?;
+        let up = alloc_matmul_out_buf(scope, bp, tr * dff)?;
+        let wi = scope.import_copy(bufs.ffn_up_w);
+        lin(
+            scope,
+            bp,
+            n3m,
+            wi,
+            up,
+            tr,
+            dff,
+            inner,
+            bp.matmul_i8_ffn_up.as_ref(),
+            bp.dequant_i8_ffn_up.as_ref(),
+            bp.dequant_ffn_up.as_ref(),
+            &bp.matmul_ffn_up,
+            &bp.matmuls.ffn_up,
+        )?;
+        let bi = scope.import_copy(bufs.ffn_up_b);
+        let upb = alloc_act(scope, bp, tr, dff)?;
+        op_bias_add(scope, bp, ActBuf::dense(up), bi, upb, tr, dff)?;
+        let gelu = alloc_act(scope, bp, tr, dff)?;
+        scope.dispatch_op::<GeluF32>(&pipelines.gelu, &[upb.data], gelu.data)?;
+        let down = alloc_matmul_out_buf(scope, bp, tr * dim)?;
+        let wo = scope.import_copy(bufs.ffn_down_w);
+        lin(
+            scope,
+            bp,
+            gelu,
+            wo,
+            down,
+            tr,
+            dim,
+            dff,
+            bp.matmul_i8_ffn_down.as_ref(),
+            bp.dequant_i8_ffn_down.as_ref(),
+            bp.dequant_ffn_down.as_ref(),
+            &bp.matmul_ffn_down,
+            &bp.matmuls.ffn_down,
+        )?;
+        let bo = scope.import_copy(bufs.ffn_down_b);
+        let downb = alloc_act(scope, bp, tr, dim)?;
+        op_bias_add(scope, bp, ActBuf::dense(down), bo, downb, tr, dim)?;
         op_gate_residual(
             scope,
             bp,
             x2,
-            ActBuf::dense(m.c_gate_mlp),
+            m.c_gate_mlp,
             downb,
-            y_out,
-            rows,
+            ActBuf::dense(y_out),
+            tr,
             dim,
         )?;
         Ok(())
+    }
+
+    /// Global self-attention barrier for the tiled path: `sa = softmax(qx kxᵀ)
+    /// v` over the full token sequence (the one all-to-all op in the block).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn self_sdpa<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        qx: BatchBuf<'wsp>,
+        kx: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        sa: BatchBuf<'wsp>,
+        rows: u32,
+    ) -> Result<(), WgpuError> {
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let nh = s.n_heads as u32;
+        let hd = s.head_dim as u32;
+        let scale = s.sdpa_scale();
+        let no_mask = scope.alloc(16)?;
+        op_sdpa(
+            scope,
+            bp,
+            ActBuf::dense(qx),
+            ActBuf::dense(kx),
+            ActBuf::dense(v),
+            no_mask,
+            ActBuf::dense(sa),
+            1,
+            rows,
+            rows,
+            nh,
+            nh,
+            hd,
+            scale,
+            0,
+        )
+    }
+
+    /// `out = bias + proj(x)` through the attention output matmul site. Shared
+    /// by the self/cross output projections in the tiled path (the dense tail
+    /// of [`Self::attention`], factored so pass B can reuse it).
+    fn attn_out_proj<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        bp: &BlockPipelines,
+        sa: ActBuf<'wsp>,
+        w: &WanAttnBufs,
+        rows: u32,
+        inner: u32,
+    ) -> Result<ActBuf<'wsp>, WgpuError> {
+        let proj = alloc_matmul_out_buf(scope, bp, rows * inner)?;
+        let ow = scope.import_copy(w.o_w);
+        lin(
+            scope,
+            bp,
+            sa,
+            ow,
+            proj,
+            rows,
+            inner,
+            inner,
+            bp.matmul_i8_proj.as_ref(),
+            bp.dequant_i8_proj.as_ref(),
+            bp.dequant_proj.as_ref(),
+            &bp.matmul_proj,
+            &bp.matmuls.proj,
+        )?;
+        let ob = scope.import_copy(w.o_b);
+        let projb = alloc_act(scope, bp, rows, inner)?;
+        op_bias_add(scope, bp, ActBuf::dense(proj), ob, projb, rows, inner)?;
+        Ok(projb)
     }
 
     /// Shared self/cross attention. `q_src` provides the queries `[q_rows,
@@ -822,27 +1141,7 @@ impl WanDitBlock {
         copy_tap(scope, sa.data, tap_sa, bp.act_bytes(q_rows * inner))?;
 
         // output projection + bias
-        let proj = alloc_matmul_out_buf(scope, bp, q_rows * inner)?;
-        let ow = scope.import_copy(w.o_w);
-        lin(
-            scope,
-            bp,
-            sa,
-            ow,
-            proj,
-            q_rows,
-            inner,
-            inner,
-            bp.matmul_i8_proj.as_ref(),
-            bp.dequant_i8_proj.as_ref(),
-            bp.dequant_proj.as_ref(),
-            &bp.matmul_proj,
-            &bp.matmuls.proj,
-        )?;
-        let ob = scope.import_copy(w.o_b);
-        let projb = alloc_act(scope, bp, q_rows, inner)?;
-        op_bias_add(scope, bp, ActBuf::dense(proj), ob, projb, q_rows, inner)?;
-        Ok(projb)
+        self.attn_out_proj(scope, bp, sa, w, q_rows, inner)
     }
 
     /// `out = x @ wᵀ + bias` through the qkv matmul site.
@@ -905,14 +1204,15 @@ mod tests {
 
     #[test]
     fn inner_matches_heads() {
-        assert_eq!(config::INNER, config::NUM_HEADS * config::HEAD_DIM);
-        assert_eq!(config::DIM, config::INNER);
+        let cfg = WanDitConfig::fastwan_ti2v_5b();
+        assert_eq!(cfg.inner(), cfg.num_heads * config::HEAD_DIM);
+        assert_eq!(cfg.inner(), 3072);
     }
 
     #[test]
     fn shape_builds() {
-        let sh = WanDitBlockShape::new(1024, config::TEXT_SEQ);
-        assert_eq!(sh.inner, 1536);
+        let sh = WanDitBlockShape::new(&WanDitConfig::fastwan_ti2v_5b(), 1024, config::TEXT_SEQ);
+        assert_eq!(sh.inner, 3072);
         assert!((sh.sdpa_scale() - 1.0 / (128f32).sqrt()).abs() < 1e-9);
     }
 }

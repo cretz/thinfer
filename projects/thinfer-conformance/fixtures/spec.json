@@ -710,8 +710,89 @@
       ]
     },
     {
+      "name": "bcast_modulate",
+      "op": "bcast_modulate",
+      "bias": 1.0,
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "s",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        },
+        {
+          "name": "t",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.25,
+            "hi": 0.25,
+            "flip": true
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
       "name": "bcast_add",
       "op": "bcast_add",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "s",
+          "shape": [
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 0.5
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "bcast_mul",
+      "op": "bcast_mul",
       "inputs": [
         {
           "name": "x",

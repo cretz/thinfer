@@ -1,6 +1,6 @@
-//! Residency-aware Wan / SkyReels-V2 DiT loader. Resolves the diffusers
-//! `SkyReelsV2Transformer3DModel` state-dict names (see
-//! `transformer_skyreels_v2.py`), looks each tensor up in the source's
+//! Residency-aware Wan2.2 DiT loader. Resolves the diffusers
+//! `WanTransformer3DModel` state-dict names (see `transformer_wan.py`), looks
+//! each tensor up in the source's
 //! `WeightCatalog`, builds a `WeightMeta` (decode + transpose policy) and
 //! registers it with `WeightResidency`. Returns `LoadedWanDitHandles`.
 //!
@@ -23,7 +23,7 @@ use thinfer_core::weight::{WeightId, WeightSource};
 use crate::common::embedders::LinearBiasHandles;
 use crate::wan::condition_embedder::ConditionEmbedderHandles;
 use crate::wan::dit::LoadedWanDitHandles;
-use crate::wan::dit_block::{WanAttnHandles, WanDitBlockHandles, config as dit_config};
+use crate::wan::dit_block::{WanAttnHandles, WanDitBlockHandles, WanDitConfig};
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -36,7 +36,7 @@ pub enum LoadError {
 }
 
 // ---------------------------------------------------------------------------
-// Weight names (diffusers SkyReelsV2Transformer3DModel state-dict keys)
+// Weight names (diffusers WanTransformer3DModel state-dict keys)
 // ---------------------------------------------------------------------------
 
 /// Module-level (non-block) weight names.
@@ -74,18 +74,15 @@ struct LinearNames {
 }
 
 /// Condition embedder names. `time_embedder`/`time_proj`/`text_embedder` live
-/// under `condition_embedder.*`; `fps_embedding`/`fps_projection` are ROOT-level
-/// attributes (`inject_sample_info`), not under the embedder (see
-/// `transformer_skyreels_v2.py`).
+/// under `condition_embedder.*` (diffusers `WanTimeTextImageEmbedding`). The
+/// T2V base has no `image_embedder` and no `fps_*` (that was SkyReels-V2-DF's
+/// `inject_sample_info`).
 struct ConditionEmbedderNames {
     time_linear_1: LinearNames,
     time_linear_2: LinearNames,
     time_proj: LinearNames,
     text_linear_1: LinearNames,
     text_linear_2: LinearNames,
-    fps_embedding: WeightId,
-    fps_proj_in: LinearNames,
-    fps_proj_out: LinearNames,
 }
 
 impl ConditionEmbedderNames {
@@ -115,12 +112,6 @@ impl ConditionEmbedderNames {
                 "condition_embedder.text_embedder.linear_2.weight",
                 "condition_embedder.text_embedder.linear_2.bias",
             ),
-            fps_embedding: WeightId("fps_embedding.weight".to_string()),
-            fps_proj_in: lin(
-                "fps_projection.net.0.proj.weight",
-                "fps_projection.net.0.proj.bias",
-            ),
-            fps_proj_out: lin("fps_projection.net.2.weight", "fps_projection.net.2.bias"),
         }
     }
 }
@@ -195,10 +186,11 @@ impl WanDitBlockWeights {
 /// `z_image::loader::register_dit_handles`.
 pub fn register_wan_dit_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
+    cfg: &WanDitConfig,
     transcode: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<LoadedWanDitHandles, LoadError> {
     let mw = WanDitModelWeights::new();
-    let blocks = (0..dit_config::NUM_LAYERS)
+    let blocks = (0..cfg.num_layers)
         .map(|i| register_block(residency, &WanDitBlockWeights::new(i), transcode))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LoadedWanDitHandles {
@@ -258,11 +250,6 @@ fn register_condition_embedder<S: WeightSource>(
         time_proj: lb(&w.time_proj)?,
         text_linear_1: lb(&w.text_linear_1)?,
         text_linear_2: lb(&w.text_linear_2)?,
-        // `fps_embedding.weight` is the raw `[2, inner]` embedding table read as
-        // matmul B `[K=2, N=inner]` -> no transpose.
-        fps_embedding: Some(register_passthrough(residency, &w.fps_embedding)?),
-        fps_proj_in: Some(lb(&w.fps_proj_in)?),
-        fps_proj_out: Some(lb(&w.fps_proj_out)?),
     })
 }
 

@@ -17,7 +17,7 @@ use thinfer_core::format::safetensors::{self, ShardedSafetensorsSource};
 use thinfer_core::format::union::{RenamedSource, UnionError, UnionReader, UnionSource};
 use thinfer_core::weight::{FileOpener, WeightCatalog, WeightId, WeightSource};
 
-use crate::wan::dit_block::config as dit_config;
+use crate::wan::dit_block::WanDitConfig;
 use crate::wan::umt5::config as umt5_config;
 
 /// Safetensors side: sharded diffusers files, names already canonical.
@@ -75,7 +75,10 @@ impl<O: FileOpener> WanSource<O> {
                 Self::Quantized(Box::new(UnionSource::new(
                     RenamedSource::with_passthrough(umt5, umt5_gguf_renames()),
                     UnionSource::new(
-                        RenamedSource::with_passthrough(dit, dit_gguf_renames()),
+                        RenamedSource::with_passthrough(
+                            dit,
+                            dit_gguf_renames(WanDitConfig::fastwan_ti2v_5b().num_layers),
+                        ),
                         sharded,
                     ),
                 )))
@@ -114,17 +117,20 @@ impl<O: FileOpener> WeightSource for WanSource<O> {
 // ---------------------------------------------------------------------------
 //
 // Maps are `original (GGUF) -> renamed (canonical)`, the direction
-// `RenamedSource::with_passthrough` consumes. Filled from a tensor-name dump of
-// the wsbagnsv1 DiT GGUF and the city96 umT5 GGUF (Q4_K_M). NOTE: these are
-// placeholders pending the dump; finalize before the GGUF e2e variant runs.
+// `RenamedSource::with_passthrough` consumes. GGUF is DEFERRED for FastWan (the
+// active path is `Plain` safetensors); these maps are unexercised until a
+// FastWan2.2-TI2V-5B GGUF exists. The structure below is Wan-family-general
+// (original-Wan single-file names -> diffusers canonical), so it is reusable
+// as the starting point; re-verify the exact tensor names against the real
+// FastWan GGUF dump before enabling the quant e2e variant.
 
-/// `wsbagnsv1/SkyReels-V2-DF-1.3B-540P-GGUF` tensor names -> diffusers
-/// canonical (the ids `wan/loader.rs` registers). The GGUF carries the
-/// original-Wan single-file names (`self_attn`/`cross_attn`/`norm3`/`ffn.0`/
-/// `head.head`/`modulation`/`time_embedding.0`...); `patch_embedding.*` and
-/// `fps_embedding.weight` are already canonical and ride the passthrough.
-/// Verified against the Q4_K_M dump (830 tensors = 27 * 30 + 20).
-pub fn dit_gguf_renames() -> HashMap<WeightId, WeightId> {
+/// Original-Wan single-file DiT tensor names -> diffusers canonical (the ids
+/// `wan/loader.rs` registers): `self_attn`/`cross_attn`/`norm3`/`ffn.0`/
+/// `head.head`/`modulation`/`time_embedding.0`... -> diffusers. `patch_embedding.*`
+/// is already canonical and rides the passthrough. `num_layers` is the variant's
+/// block count (FastWan2.2-TI2V-5B: 30). FastWan has no fps conditioning, so no
+/// `fps_embedding` entry (unlike the SkyReels-DF GGUF this was first shaped from).
+pub fn dit_gguf_renames(num_layers: usize) -> HashMap<WeightId, WeightId> {
     // `pair` expands a weight+bias linear into `(orig, canon)` entries; nested
     // `fn` so it doesn't capture `e` (avoids a long-lived mutable borrow).
     fn pair(e: &mut Vec<(String, String)>, o: &str, c: &str) {
@@ -156,15 +162,13 @@ pub fn dit_gguf_renames() -> HashMap<WeightId, WeightId> {
         "text_embedding.2",
         "condition_embedder.text_embedder.linear_2",
     );
-    pair(&mut e, "fps_projection.0", "fps_projection.net.0.proj");
-    pair(&mut e, "fps_projection.2", "fps_projection.net.2");
     pair(&mut e, "head.head", "proj_out");
     // `head.modulation` is the model-level scale_shift_table (weight-only).
     e.push(("head.modulation".into(), "scale_shift_table".into()));
 
     // Per-block: original-Wan -> diffusers (attn1=self, attn2=cross, norm3 ->
     // norm2, ffn.0/2 -> ffn.net.0.proj/net.2, modulation -> scale_shift_table).
-    for i in 0..dit_config::NUM_LAYERS {
+    for i in 0..num_layers {
         let b = format!("blocks.{i}");
         for (gg, df) in [("self_attn", "attn1"), ("cross_attn", "attn2")] {
             for (gq, dq) in [

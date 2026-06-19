@@ -13,6 +13,7 @@
 - Code quality needs to be high and succinct and legible.
 - Session-start re-familiarization: read the four working-area files and skim the immediately-relevant code, then start writing. Do not survey the whole crate graph or re-read ops you've already seen in prior sessions. If the worklog says "next: build X in file Y", open Y and start. Hard budget for getting up to speed: ~50k tokens. If you're past that without having edited anything, you're over-investigating - start writing.
 - Surface the plan before non-trivial edits. State what you're about to do in 2-3 lines and ask if it lands well, especially when adding new ops, files, or crate-level wiring. Don't silently architect.
+- Use existing out-of-repo scratch/ dir for logs and PNG dirs and such.
 
 ## File guide
 

@@ -735,11 +735,14 @@ impl Umt5Encoder {
         let seq = token_ids.len();
         assert!(seq > 0, "Umt5Encoder::forward: empty token list");
         // Even-pad for the packed act/mask layouts (2 elems/word; mask rows
-        // need s_k even). The pad row repeats the last token; its output row
-        // is sliced off after readback. Bidirectional attention means the pad
-        // row is visible to real rows, so its relpos column must be benign:
-        // it is (a duplicate key), and we slice the pad query row out. This
-        // matches how the pyref must be fed (same even-padded ids).
+        // need s_k even). The pad row repeats the last token; its output row is
+        // sliced off after readback. Bidirectional attention makes the pad row
+        // visible to real rows, so it is NOT benign: an unmasked duplicate key
+        // double-counts the last token (EOS) in every real row's softmax. The
+        // pyref runs umT5 over 512 max_length-padded ids WITH an attention mask
+        // (padding contributes nothing), then slices to real tokens, so to
+        // match we MASK the pad key column(s) out of attention below (sentinel
+        // bucket -> -inf bias). We slice the pad QUERY row out after readback.
         let mut ids = token_ids.to_vec();
         if !ids.len().is_multiple_of(2) {
             ids.push(*ids.last().expect("non-empty token list"));
@@ -775,23 +778,35 @@ impl Umt5Encoder {
         backend.write_buffer(x_buf.id, 0, &embed_bytes)?;
 
         // --- bucket map (shared across layers), uploaded once as u32 ---
-        let bucket_map =
+        // Real keys use their relpos bucket; the even-pad key column(s) point at
+        // the sentinel bucket NUM_BUCKETS (appended to each layer's table below
+        // with a -inf bias) so real query rows never see the duplicate pad key.
+        let mut bucket_map =
             relpos_bucket_map(seq_pad, true, config::NUM_BUCKETS, config::MAX_DISTANCE);
+        for i in 0..seq_pad {
+            for j in seq..seq_pad {
+                bucket_map[i * seq_pad + j] = config::NUM_BUCKETS;
+            }
+        }
         let bm_bytes: Vec<u8> = bucket_map.iter().flat_map(|x| x.to_le_bytes()).collect();
         let bm_buf = scratch.alloc(bm_bytes.len() as u64)?;
         backend.write_buffer(bm_buf.id, 0, &bm_bytes)?;
 
         // --- preload per-layer relpos tables (tiny: [32, 64] each) ---
+        // Append a sentinel bucket row (index NUM_BUCKETS) of -inf so masked
+        // pad-key columns (set above) get ~0 softmax weight. -1e4 is safely
+        // representable in f16/bf16 acts and underflows `exp(dot - 1e4)` to 0.
+        const PAD_MASK_BIAS: f32 = -1e4;
         let mut tables: Vec<Vec<f32>> = Vec::with_capacity(config::N_LAYERS);
         for i in 0..config::N_LAYERS {
             let id = WeightId(format!(
                 "encoder.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight"
             ));
-            tables.push(
-                load_tensor_f32(source, &id)
-                    .await
-                    .map_err(Umt5ForwardError::Tensor)?,
-            );
+            let mut table = load_tensor_f32(source, &id)
+                .await
+                .map_err(Umt5ForwardError::Tensor)?;
+            table.extend(std::iter::repeat_n(PAD_MASK_BIAS, config::N_HEADS));
+            tables.push(table);
         }
 
         // One reusable per-op tap buffer set, filled by EVERY block and read

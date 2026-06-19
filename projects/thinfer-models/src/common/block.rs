@@ -21,10 +21,10 @@ use thinfer_core::backend::{BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::cache::KernelKey;
 use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
-    BcastFmaOp, LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op,
-    QkvSplitF32, QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp,
-    ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32,
-    WeightDtype, WgslConfig,
+    BcastFmaOp, BcastModulateF32, BcastModulateOp, BcastMulF32, LayerNormF32, LayerNormOp,
+    MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, QkvSplitF32, QkvSplitOp, RmsNormF32, RmsNormOp,
+    RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaOp, SiluF32,
+    SiluMulF32, TanhF32, WeightDtype, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace;
@@ -257,7 +257,9 @@ pub struct BlockPipelines {
     pub tanh: WgpuPipeline,
     pub bcast_affine: WgpuPipeline,
     pub bcast_fma: WgpuPipeline,
+    pub bcast_modulate: WgpuPipeline,
     pub bcast_add: WgpuPipeline,
+    pub bcast_mul: WgpuPipeline,
     pub scatter_pad_rows: WgpuPipeline,
     /// Opt-in i8 attention (the only i8 activation storage outside matmul
     /// internals). `Some` iff `BlockWgslConfigs::i8_sdpa`. When enabled the
@@ -790,12 +792,28 @@ impl BlockPipelines {
                     <BcastFmaF32 as BcastFmaOp>::layout(),
                 )
                 .await?,
+            bcast_modulate: backend
+                .create_pipeline(
+                    "bcast_modulate",
+                    <BcastModulateF32 as BcastModulateOp>::wgsl(cfg_compat),
+                    "main",
+                    <BcastModulateF32 as BcastModulateOp>::layout(),
+                )
+                .await?,
             bcast_add: backend
                 .create_pipeline(
                     "bcast_add",
                     <BcastAddF32 as BcastAddOp>::wgsl(cfg_compat),
                     "main",
                     <BcastAddF32 as BcastAddOp>::layout(),
+                )
+                .await?,
+            bcast_mul: backend
+                .create_pipeline(
+                    "bcast_mul",
+                    <BcastMulF32 as BcastAddOp>::wgsl(cfg_compat),
+                    "main",
+                    <BcastMulF32 as BcastAddOp>::layout(),
                 )
                 .await?,
             scatter_pad_rows: backend
@@ -954,7 +972,7 @@ impl Block {
         Self { cfg }
     }
 
-    pub fn kernel_keys() -> [KernelKey; 13] {
+    pub fn kernel_keys() -> [KernelKey; 15] {
         [
             kk(<MatMulF32 as MatmulOp>::KERNEL_ID),
             kk(<RmsNormF32 as RmsNormOp>::KERNEL_ID),
@@ -968,7 +986,9 @@ impl Block {
             kk(<TanhF32 as Op>::KERNEL_ID),
             kk(<BcastAffineF32 as BcastAffineOp>::KERNEL_ID),
             kk(<BcastFmaF32 as BcastFmaOp>::KERNEL_ID),
+            kk(<BcastModulateF32 as BcastModulateOp>::KERNEL_ID),
             kk(<BcastAddF32 as BcastAddOp>::KERNEL_ID),
+            kk(<BcastMulF32 as BcastAddOp>::KERNEL_ID),
         ]
     }
 

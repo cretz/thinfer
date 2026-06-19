@@ -16,6 +16,7 @@
 //! LRU residents and idle ring slots under pressure from any client.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::arbiter::{MemArbiter, MemReclaimer, MemTier};
@@ -284,6 +285,13 @@ pub struct WeightResidency<S: WeightSource> {
     /// arbiter, so the transient narrow never pushes the true peak over budget.
     /// Freed at phase boundaries by [`Self::evict_all_and_free`].
     prep_staging: Mutex<Option<GpuBufferId>>,
+    /// Sticky VRAM reserve the weight-acquire path holds free on every weight
+    /// admission, so the streamed weight working set caps at `budget - reserve`
+    /// and the in-flight transient envelope (concurrent upload staging + the
+    /// forward's workspace) never pushes the true peak past the budget. Budget-
+    /// independent (transients don't grow with budget). Zero (default) disables
+    /// it. Set per phase via [`Self::set_transient_reserve`].
+    transient_reserve: AtomicU64,
 }
 
 impl<S: WeightSource> WeightResidency<S> {
@@ -298,6 +306,7 @@ impl<S: WeightSource> WeightResidency<S> {
             budget,
             scratch_pool: Mutex::new(Vec::new()),
             prep_staging: Mutex::new(None),
+            transient_reserve: AtomicU64::new(0),
             inner: Arc::new(Mutex::new(Inner {
                 metas: Vec::new(),
                 gpu: HashMap::new(),
@@ -444,6 +453,16 @@ impl<S: WeightSource> WeightResidency<S> {
             .sum()
     }
 
+    /// Sum of the GPU-resident bytes of every weight registered so far. A phase
+    /// that pages a known weight set fully resident (e.g. the VAE decode, whose
+    /// weights all fit) diffs this across its `register_*` call to learn that
+    /// set's footprint, then reserves exactly it when sizing the non-evictable
+    /// workspace -- budget-independent, unlike a budget fraction.
+    pub fn total_registered_bytes(&self) -> u64 {
+        let g = self.inner.lock().unwrap();
+        g.metas.iter().map(|m| m.storage_bytes()).sum()
+    }
+
     /// Largest transient upload-staging footprint a single acquire can take:
     /// the max `on_disk_bytes` across registered weights (GPU-prep acquires
     /// stage the raw bytes in VRAM while the prep kernel runs). Pin-plan
@@ -455,6 +474,45 @@ impl<S: WeightSource> WeightResidency<S> {
             .map(|m| m.on_disk_bytes.next_multiple_of(4))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Transient VRAM staging a single acquire of `meta` allocates *on top of*
+    /// its weight buffer while uploading. The whole-tensor prep path
+    /// (`prep_to_gpu`) stages `on_disk_bytes` in VRAM; the banded
+    /// `NarrowTransposeF32` path uses the persistent, self-reserved band; the
+    /// passthrough / CPU-fallback paths stage in host RAM, not VRAM. The acquire
+    /// path reserves at least this much up front so a single weight and its own
+    /// staging never together cross the budget even with no transient envelope
+    /// configured. The `+ 16` matches the slack `prep_to_gpu` adds to its own
+    /// headroom call so that call stays a no-op.
+    fn vram_staging_bytes(meta: &WeightMeta, prep: Option<WeightPrep>) -> u64 {
+        match prep {
+            Some(WeightPrep::Q8_0FromBf16 { .. } | WeightPrep::TransposeBf16 { .. }) => {
+                meta.on_disk_bytes.next_multiple_of(4) + 16
+            }
+            Some(WeightPrep::NarrowTransposeF32 { .. }) | None => 0,
+        }
+    }
+
+    /// Largest single VRAM upload-staging buffer across registered weights that
+    /// actually stage in VRAM (the whole-tensor `Q8_0FromBf16` / `TransposeBf16`
+    /// prep path; passthrough and banded-f32 weights stage in host RAM or the
+    /// persistent band, not as a net-new VRAM buffer). Callers scale this by the
+    /// prefetch concurrency (the driver can have several uploads in flight) to
+    /// size [`Self::set_transient_reserve`].
+    pub fn vram_staging_reserve_bytes(&self) -> u64 {
+        let g = self.inner.lock().unwrap();
+        g.metas
+            .iter()
+            .map(|m| Self::vram_staging_bytes(m, Self::prep_op(m)))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Set the sticky VRAM reserve held free on every weight admission (see
+    /// [`Self::transient_reserve`]). Set once per phase; zero disables it.
+    pub fn set_transient_reserve(&self, bytes: u64) {
+        self.transient_reserve.store(bytes, Ordering::Relaxed);
     }
 
     /// Page the weight up to GPU. Returns a `GpuView` that pins the buffer for
@@ -581,10 +639,26 @@ impl<S: WeightSource> WeightResidency<S> {
                 e.id
             })
         };
+        // Hold the in-flight transient envelope (concurrent upload staging + the
+        // forward's workspace) free alongside this weight so the streamed weight
+        // set caps below budget and the transients never push the true peak past
+        // it (a hard ceiling at any value, not a soft target). Floored by this
+        // weight's own staging so a single load is safe even with no envelope
+        // configured; reclaiming for staging only after the weight is allocated
+        // would let the peak overshoot by one staging buffer.
+        let reserve = self
+            .transient_reserve
+            .load(Ordering::Relaxed)
+            .max(Self::vram_staging_bytes(&meta, prep));
         let id = match recycled {
-            Some(id) => id,
+            Some(id) => {
+                // Weight buffer reused (still charged to the account); make room
+                // for the transient envelope that lands on top of it.
+                self.arbiter.ensure_headroom(mem, reserve);
+                id
+            }
             None => {
-                self.arbiter.ensure_headroom(mem, gpu_size);
+                self.arbiter.ensure_headroom(mem, gpu_size + reserve);
                 backend
                     .allocate_in(gpu_size, VramCategory::Weights)
                     .map_err(ResidencyError::Backend)?
