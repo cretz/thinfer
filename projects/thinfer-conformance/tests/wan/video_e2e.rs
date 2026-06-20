@@ -423,7 +423,7 @@ async fn video_e2e_safetensors() {
         };
         let mut ws = Workspace::new(Arc::clone(&backend), Arc::clone(model.arbiter()));
         let d = model
-            .diag_step_at(&params, &diag_latent, diag_step, &mut ws)
+            .diag_step_at(&params, &diag_latent, diag_step, 0, &mut ws)
             .await
             .expect("diag_step_at");
         eprintln!(

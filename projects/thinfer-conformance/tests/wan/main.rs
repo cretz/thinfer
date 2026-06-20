@@ -4,4 +4,7 @@
 //! Opt-in via the `wan-e2e` feature; run manually, never under default
 //! `cargo test`.
 
+mod longlive_e2e;
+mod longlive_load;
+mod longlive_parity;
 mod video_e2e;

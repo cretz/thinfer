@@ -1,4 +1,4 @@
-﻿# Worklog
+# Worklog
 
 Forward-looking only (git history is the changelog). Engine-wide design +
 kernel/runtime state: `plan-details.md`. Per-model porting: `wan-plan.md`
@@ -7,166 +7,295 @@ reusable, SkyReels-DF sections obsolete). Z-Image (shipped): `zimage-plan.md`.
 
 ## Status
 
-- **Parity GREEN** at 256x256x5 / 6GB (`parity OK vs pyref`). DiT forward is
-  bit-clean at high-t (step0/1 slope ~1.000, rel_rmse ~0.003); the final low-t
-  step + VAE carry the f16 act precision floor amplified by the stiff low-sigma
-  velocity field (slope 0.99->0.96, rel_rmse <= 0.053), proven precision NOT a
-  bug. Prod runs f16 acts; fp32 is test-only. Gate metric = slope + rel_rmse
-  bands (`CmpTol` in `video_e2e.rs`), not cell-count-over-tol. The parity
-  default is 256x256x5/6GB; a tiny grid is a perf/health smoke only (a 2-token
-  grid lets one outlier channel dominate the whole-tensor slope -> false red).
-- **576x576x5 fits a 2GB budget** (TRUE_PEAK 1.98GiB; thin-hardware goal met)
-  and produces coherent NaN-free frames at real resolution.
-- **Generation is correct on arbitrary prompts.** The old "washed mirror blob"
-  was umT5 f16 overflow, fixed by running umT5 in bf16 acts (see below). A full
-  576x576x97 CLI clip is coherent NaN-free (5.00GiB peak @ 5GB budget).
+- **FastWan2.2-TI2V-5B-FullAttn SHIPPED.** Parity GREEN at 256x256x5/6GB; coherent
+  NaN-free 576x576x97 clips; fits a 2GB budget. bf16 full precision (no quant in
+  path). DiT bf16 acts, umT5 bf16 acts. This is the baseline; DO NOT DISTURB it.
+- **Active work = LongLive-2.0-5B** (next section). Same base, adds AR/causal
+  streaming for long + multi-shot video. AR ENGINE PATH LANDED + e2e health-GREEN
+  on the real weights. PYREF PARITY RESOLVED (2026-06-21): engine proven faithful
+  (per-forward DiT in band, AR path bit-identical to GREEN FastWan); the AR-depth
+  compounding vs the bf16-locked pyref is TOLERATED via a two-tier band (tight
+  per-forward `vel_c0s0`, gross floor on compounded tensors). Video CLI-confirmed
+  good (512x512x349, 11 chunks, faces stable). Remaining = AR perf + multi-shot e2e.
 
-## Tiny VAE (LightTAE) -- SHIPPED, now the CLI default
+## NEXT (active): LongLive-2.0-5B (AR/causal long video)
 
-ONE NAME EVERYWHERE: "tiny" (the ecosystem/TAE name). `VaeChoice::Tiny`, `--vae
-tiny`, `role::TINY_VAE`; "turbo" is gone from the VAE surface (Z-Image-Turbo the
-model name is unrelated). `wan/vae_tiny.rs` LightTAE (`lighttaew2_2`) is the
-`--vae` default; `--vae full` is the opt-in parity path. Arch + bias/dtype map:
-`scratch/notes/lighttae_spec.md`. 576x576x97: end-to-end ~179s (DiT-bound, ~93%
-denoise); decode ~4.4s.
+Direction LOCKED with user (2026-06-20). Same Wan2.2-TI2V-5B base as FastWan; AR/
+causal streaming = long + multi-shot video. The "port the backbone once" payoff.
 
-DECODE TILING -- LANDED. Temporal-chunk over latent frames, sized from the VRAM
-budget (`plan_chunk`, `TINY_PEAK_K` calibrated; `THINFER_VAE_TINY_CHUNK` /
-`THINFER_VAE_TINY_MEM` for calibration). `memcat` is the ONLY temporal coupling
-(causal depth 1), so each chunk carries every MemBlock's trailing input frame
-into the next via a ping-pong device buffer; output frames concatenate exactly
-(no halo, no seam). `memcat` op extended with a `prev`-frame binding + `has_prev`
-flag (`has_prev=0` = the old zero-pad, conformance fixture bit-identical). A clip
-that fits runs as one chunk, bit-identical to untiled. VERIFIED: full 576x576x97
-holds a 2GB budget (TRUE_PEAK 2.00GiB, cf=7/4 chunks, NaN-free) -- was 4.98GiB
-untiled, the case that used to force `--vae full` on thin budgets.
+CURRENT STATE: full AR path LANDED + e2e health-GREEN on the real weights; FastWan
+byte-untouched. The pieces (read the code, not a re-spec):
+- Ingestion: `.pt` WeightSource (`thinfer-core/.../format/pytorch.rs`); `LongLiveSource`
+  + `open_longlive_source` + `longlive_dit_renames` (`wan/source.rs`, .pt renamed to
+  canonical, unioned over base umT5+VAE safetensors); `longlive-2.0-5b` manifest variant
+  (`dit_pt_role`); `WanDitConfig::longlive_2_0_5b()` (== fastwan geometry).
+- Sampler: `wan/unipc.rs` `FlowUniPc` (4-step bh2 predict_x0, order [1,2,2,1], pivoted
+  2x2 at the sigma=1 edge). Per chunk: 4 steps then a timestep-0 clean recache forward
+  (output discarded; only updates the KV cache).
+- KV cache: `wan/kv_cache.rs` `KvWindowCache` (`begin_chunk` rolls/evicts once + returns
+  the `ChunkPlan{prefix segs, tail, chunk_start_frame, temporal_offset}`; `commit_chunk`
+  writes the clean pass; pin/zero/advance_shot for multi-shot). Host-resident
+  (`RamKvStore`/`KvStore` offload seam). `longlive_runtime` sizes `frame_seq_len=pph*ppw`.
+- GPU AR forward: `WanDitBlock::self_attn_ar` (windowed self-attn: rope q+chunk-k at the
+  absolute frame, window = [host prefix ++ chunk], `op_sdpa` mode 0, exports roped-k/v
+  for commit); `WanDit::forward_ar` (per-chunk forward, per-layer prefix upload, serial
+  residency); `WanModel::denoise_ar`/`generate_ar` (the chunk loop; no separate model
+  type -- `WanModel` loads from `LongLiveSource` directly). cross-attn+FFN tail factored
+  to `WanDitBlock::cross_ffn` (shared with `forward`, byte-identical).
+- CLI: `--model longlive-2.0-5b`. `--frames` must give f_lat % 8 == 0 (29->1 chunk,
+  61->2, 125->4). e2e: `longlive_e2e` (conformance, wan-e2e), GREEN at 128x128x61/6GB.
+  Run: `THINFER_LONGLIVE_PT=<pt> THINFER_POWER_PREF=high THINFER_LL_BUDGET_GB=6 cargo
+  test -p thinfer-conformance --features wan-e2e --release longlive_e2e -- --nocapture
+  --test-threads=1`.
 
-DURABLE TEST -- LANDED. `video_e2e` `THINFER_E2E_TINY=1` loads the tiny decoder
-alongside Full (gate untouched) and, post-gate, decodes the same latent single-
-vs multi-chunk: asserts bit-identical (proves the carry is exact, no pyref
-needed) + NaN-free + clamp range. The whole-run TRUE_PEAK assert now also covers
-the tiny decode. Exercises the multi-chunk carry even at the 256 grid.
+REMAINING:
+1. PYREF BYTE-COMPARE PARITY -- RESOLVED 2026-06-21 (GREEN with two-tier bands; user
+   approved tolerating the AR-depth precision compounding). The engine is proven faithful;
+   the failure was AR-depth f16-vs-bf16 compounding vs a bf16-LOCKED reference, NOT a code
+   bug. Full diagnosis kept below as the record (do NOT re-open the op-hunt). Harness +
+   diagnostic scaffolding retained (gated/opt-in) for the perf + multi-shot work.
 
-Follow-ups (open):
-- Conv tile is `Conv2dConfig::DEFAULT` (untuned; decode is no longer the
-  bottleneck so low priority).
-- TINY_PEAK_K is anchored to one measured point (576x576x97). Recalibrate if the
-  decoder graph changes or a new res/budget reveals the model is off (the
-  `set_transient_reserve` backstop prevents overshoot meanwhile).
-- A true same-latent A/B (Full vs Tiny, identical prompt+seed) was NOT run;
-  quality judged on the tiny clip alone. Worth one if a regression is suspected.
-- No decode-vs-TAEHV-pyref parity (the e2e tiny case is health + tiling-exactness
-  only); add one when wiring the TAEHV pyref.
+   What's built (all UNCOMMITTED, working tree):
+   - Pyref `gen_longlive_video_e2e_ref.py` (thinfer-conformance/python/.../wan/). CPU/bf16
+     (venv is torch-CPU; fp32 would blow host RAM on the 10GB DiT). Drives the AUTHORITATIVE
+     upstream `CausalWanModel` on the real `.pt` (meta-init + assign-load; ckpt["generator"],
+     strip "model." -> 825 params exact). Reimplements ONLY the single-prompt T2V AR chunk
+     loop (UniPC via upstream FlowUniPCMultistepScheduler, windowed KV cache, clean recache);
+     cache/window/RoPE all live in upstream code = truth. umT5+VAE from the shared FastWan
+     diffusers base (engine reuses same base for LongLive). Shims (clone is read-only): inject
+     `x_clip_loss` into transformers (dropped upstream); replace `flash_attention` with an SDPA
+     equivalent (CUDA-only assert otherwise) -- self-attn already uses the SDPA-fallback
+     `attention()`; LLV2_TRITON_{ROPE,ADALN}=0 + HF_HUB_OFFLINE. Loads umT5/VAE from
+     THINFER_FASTWAN_DIR (Rust sets it = base snapshot dir). Added deps: einops, scipy (uv).
+   - Rust test `longlive_parity.rs` (tests/wan/, registered in main.rs). Pins CTHW noise
+     (same SplitMix64 as video_e2e), runs pyref via `uv`, byte-compares with slope+rel_rmse
+     bands. Pyref noise reshape/permute: CTHW [C,F,h,w] -> [B,C,F,h,w] -> permute [B,F,C,h,w]
+     (upstream pipeline is frame-major).
+   - Engine diag hooks in `denoise_ar` (pipeline.rs) + `forward_ar` (dit.rs), all opt-in:
+     `chunk_diag` (per-chunk post), `vel_diag` (per-step raw velocity), `block_res_diag`
+     (per-block residual, chunk0/step0 only). generate_ar passes None. THESE TAPS ARE
+     DIAGNOSTIC SCAFFOLDING -- strip (or gate cleanly) before commit.
+   - Test env hooks in `longlive_parity.rs` (all uncommitted scaffolding): THINFER_LL_SELFCHECK
+     (forward_ar vs forward_velocity_at), THINFER_LL_ACT=fp32|f16|bf16 (force DiT block act
+     dtype; default = device f16), THINFER_LL_DUMP_BLOCKRES=<dir> (dump 30 chunk0/step0
+     block_res .bin), THINFER_LL_DUMP_SUBOPS=<dir> (call `diag_step_at` on chunk0 -> dump
+     front-end taps + 15 block-0 sub-ops + 30 per-block + dit_out).
+   - Python A/B tooling in scratch/longlive/ (run via `uv run` from
+     thinfer-conformance/python so the venv resolves): `ab_diffusers_upstream.py`
+     (diffusers vs upstream, the fact (A) prover -- has `make_pinned_noise` port + the
+     longlive->diffusers rename port), `isolate_block.py` (per-block isolation),
+     `subop_compare.py` (block-0 sub-op A/B vs upstream -- generalize its block index next),
+     `intermediate_mags.py`, `bias_structure.py`, `precision_probe.py` (early dead-end).
+   - Run engine parity: `THINFER_LONGLIVE_PT=<pt> THINFER_POWER_PREF=high THINFER_LL_BUDGET_GB=6
+     THINFER_LL_WIDTH=256 THINFER_LL_HEIGHT=256 cargo test -p thinfer-conformance --features
+     wan-e2e --release longlive_parity -- --nocapture --test-threads=1`. USE 256x256, NOT the
+     128 default (128 is pathological per fact (E); 256 = FastWan's GREEN res). Pyref AR loop
+     at 256 ~5min CPU; total run ~280s. Logs scratch/logs/ll_*.log; scratch probe
+     scratch/longlive/.
 
-## VRAM: VAE decode tiling (the hog at higher res, not DiT attention)
+   DIAGNOSIS (RE-CORRECTED 2026-06-21, telemetry-driven against the AUTHORITATIVE pyref
+   dumps; the prior "find the one op that under-produces outliers at block 17-18" diagnosis
+   was ALSO WRONG -- there is NO single buggy op, do not revive the op-hunt). The earlier
+   scratch A/B scripts (`chain_compare.py` first pass, `ts_probe.py`) gave UNRELIABLE upstream
+   numbers because a hand-built `model(...)` call is fragile (windowed self-attn reads
+   `_CURRENT_GRID_META`; mis-set -> garbage, e.g. slope 0.03). The RELIABLE method: compare
+   against the pyref's OWN persisted dumps in `target/tmp/wan_longlive_parity/` (py_c0_s0_vel,
+   py_c0s0_block{i}); a bf16 replica that mirrors the pyref `run_model` EXACTLY (latents
+   permute, context=pe, seq_len=28160, sched.timesteps[0]) is bit-exact to the persisted
+   pyref (`fp32_ref.py` sanity slope 1.00000) -- use that, not naive model calls.
 
-The decode live set is `FIXED(tout) + area*PER_AREA(tout)` per spatial tile;
-each `decode_frame` temporally upsamples one latent frame to `tout` video frames
-(`temporal_compression`=4 for groups after the first), so a video group carries
-a ~553MiB temporal FIXED floor + ~6MiB/latent-area that tiling shrinks. Tile is
-sized from `budget - reserve` where `reserve = real VAE weight footprint
-(queried via residency.total_registered_bytes diff) + staging`, NOT a budget
-fraction; `set_transient_reserve` (same mechanism DiT uses) is the hard-ceiling
-backstop so the arbiter caps weights and never overshoots (degrades to weight
-paging if the estimate is off). Model constants in `vae_tile_dims` are
-calibrated from 4 measured points; recalibrate if the decoder graph changes.
+   Established facts (authoritative):
+   - AR PATH IS NOT THE BUG. THINFER_LL_SELFCHECK at 256: forward_ar chunk0 vel == FastWan
+     full-attn forward, BIT-EXACT (rmse 0). diagVSar per-block all 1.00000. So denoise_ar /
+     windowed self_attn_ar / KV cache are clean; the gap is in the shared DiT forward.
+   - PER-OP / PER-BLOCK-GIVEN-SAME-INPUT IS FAITHFUL. `subop_compare.py` (generalized to any
+     THINFER_LL_TAP_BLOCK; engine perblock{N-1} -> upstream block N): every sub-op at blocks
+     0,8,16,17,18,20,24,28 matches dev <0.004, rel <1.5e-3. No op under-produces.
+   - THE ENGINE CHAIN DIVERGES FROM THE PYREF CHAIN GRADUALLY, ONSET ~block 15 where outlier
+     channels SPIKE. Engine perblock{i} vs authoritative py_c0s0_block{i}: slope ~1.0 for
+     blocks 0-14, then 0.987(b15) 0.980(b17) 0.971(b18) 0.96-0.97(b20-24) 0.95(b25-28). The
+     residual outlier max SPIKES blocks 20-24 (438/648/712/548/324) then COLLAPSES at b25 (76)
+     -- catastrophic cancellation of large outlier channels AMPLIFIES the 16-bit rounding
+     gap (b25 76 vs 68.6 = 9.7% under). The engine slightly UNDER-produces the spiked outliers.
+   - IT IS A TWO-16-BIT-PATHS PRECISION DIVERGENCE, NOT A LOGIC BUG. vel_c0s0 vs pyref scales
+     MONOTONICALLY with engine act precision then PLATEAUS: f16 0.97564, bf16 0.98271, fp32
+     0.98444 (THINFER_LL_ACT sweep, diag-only). A logic bug would not improve with precision;
+     this does, then floors at ~0.984 because the REFERENCE is bf16. The pyref is bf16-LOCKED:
+     CPU venv bf16 weights AND `wan_5b/modules/attention.py::attention()` HARDCODES bf16 SDPA
+     compute (dtype=torch.bfloat16, line 272) regardless of input dtype -- so self-attn in the
+     reference is bf16 by design; a true fp32 reference would require rewriting upstream attn.
+   - bf16 ENGINE ACTS DO NOT FIX THE FULL RUN. Full parity at THINFER_LL_ACT=bf16: vel_c0s0
+     0.983 (now in band) but vel_c0s1 0.956 (FAILS), compounding to chunk1_post 0.732,
+     vae_rgb 0.755. Per-step dev grows SUPER-linearly within chunk0 (0.017->0.044->0.091->
+     0.110) = flow-sampling amplification of the per-forward 16-bit gap, not a sampler bug.
+   - SAMPLER SCHEDULE IS FAITHFUL. Engine FlowUniPc timesteps [1000,937,833,625] vs upstream
+     [999,937,833,624]; steps 1,2 exact, only a 1-unit rounding at the sigma=1 edge (engine
+     sigma[0]=1.0 vs upstream 0.99980) and step3. 0.1% effect, not the cause.
+   => ROOT: the engine (any 16-bit precision) vs the bf16-locked CPU pyref diverge ~1.6-2.4%
+   per forward in the large-outlier residual channels (blocks 15-25, magnitudes 200-700 with a
+   cancellation spike), and this COMPOUNDS across 30 blocks x 8 forwards (4 UniPC steps x 2
+   chunks) to fail the bands. The engine is arithmetically faithful per-op and bit-clean on the
+   AR path; the per-forward gap (vel_c0s0 dev 0.024) is ITSELF within the slope band -- only the
+   AR-depth compounding breaks it. FastWan (3 forwards) tolerates the same engine; LongLive
+   (8 forwards) does not. This is NOT a fixable single-op/code bug.
 
-- Thin-budget cost: at 2GB/576 the tile floors at 8 (64 tiles) -> VAE decode
-  ~87s vs ~55s untiled. One-time per clip; only at thin budgets. At 6GB the gate
-  (256) is single-tile / bit-identical; 576 tiles only ~2x2.
-- 2GB is near the floor for 576 with weights resident (weights 1058 + temporal
-  FIXED ~553 + staging). Below ~2GB the backstop pages VAE weights (fits, slower).
-- DiT weights are freed before VAE (`denoise_with` -> `evict_all_and_free`); the
-  ~1GB resident during decode is the VAE's own weights.
-- `THINFER_VAE_MEM` env gates a per-tile workspace probe (off by default).
+   DECISION (made with user 2026-06-21): option (a) -- TOLERATE. Engine stays f16 (perf;
+   proven faithful). `longlive_parity.rs` now uses a TWO-TIER band: `vel_c0s0` (single
+   forward) holds the TIGHT `TOL_LATENT` (the real per-forward DiT regression catcher);
+   the AR-compounded tensors (vel_c0s1+, chunk{c}_post, pre_vae_latent, vae_rgb) use a loose
+   GROSS-regression floor `TOL_AR`/`TOL_AR_VAE` (catches sign/scale/structural breaks, not
+   byte-parity). Test GREEN at 256. Video CLI-confirmed good. fp32 reference (option b) was
+   REJECTED by the user (never want fp32); revisit only if a regression makes the gross floor
+   trip. bf16 acts (option c) shown insufficient on its own + costs perf -- not taken.
 
-## Carry-forward: umT5 MUST run bf16 acts (the "odd-token blob" fix)
+   Diagnostic scaffolding added this session (UNCOMMITTED, strip/gate before commit):
+   `WanDitTaps.tap_block` + `diag_step_at(tap_block)` (pipeline.rs/dit.rs) generalize the
+   block-0 sub-op taps to any block; `THINFER_LL_TAP_BLOCKS` (comma list) + `THINFER_LL_DIAG_ONLY`
+   in longlive_parity.rs sweep N blocks in one model load and skip denoise_ar. scratch/longlive/
+   `chain_compare.py` (engine perblock vs pyref per-block, authoritative), `fp32_ref.py` (the
+   bit-exact pyref replica + precision sweep), `ts_probe.py` (timestep probe; note its naive
+   model call is unreliable -- kept only as a caution). `cargo fmt`+`clippy` clean.
+2. AR PERF. MEASURED 576x576x125 (4 chunks, tiny VAE, 5G, TRACE): 390s wall (DiT
+   denoise 376s, tiny VAE 6.4s). COMPUTE-BOUND at 576: GPU sum ~319s vs DiT wall 376s
+   => ~57s (~15%) idle (serial-residency weight streaming + submit + host gather/
+   readback). Per-op totals over the 20 forwards: ffn_down 80.8s / ffn_up 80.8s /
+   qkv 67.5s / sdpa_sg 48.5s / proj 32.8s (matmul ceiling, same as FastWan). workspace
+   peaked 4.98GiB at the 5G budget (untiled AR self-attn). Wall is HIGHER than FastWan
+   for similar length (FastWan 576x576x97 = 179s) because LongLive runs 20 forwards
+   (4 chunks x [4 steps + 1 clean recache]) vs FastWan's 3 -- each re-pays per-block
+   weight streaming + cross-attn over the full 512 text rows; the O(N)-streaming win is
+   LENGTH/VRAM-bound generation, not shorter wall at a fixed length.
+   WINS, in value order (all quality-neutral, exact):
+   (a) PREFETCH OVERLAP in `forward_ar` (the ~15% idle): mirror `forward`'s
+       `join!(submit, next_acquire, prefetch_after)` so the next block's weights stream
+       during this block's compute. Highest value, cleanest.
+   (b) Upload the window prefix ONCE per chunk, not per forward: it is identical across
+       a chunk's 5 forwards (host transfer, not in gpu_ms, but cuts HtoD traffic).
+   (c) Activation-tile the AR self-attn (workspace ~= budget at 576): cuts the workspace
+       peak, buys prefetch/res headroom; mirror `forward_block_tiled`.
+   (d) Cross-attn text K/V cache across a chunk's 5 forwards (same prompt -> identical);
+       upstream bypasses it for cudagraphs, but we have no cudagraph, so it is a free win.
+   (e) Skip the head (proj_out + unpatchify) on the clean recache pass (velocity
+       discarded); small (proj_out is 192 cols).
+3. MULTI-SHOT / SCENE-CUT path is built in `kv_cache.rs` (pin/zero/advance_shot,
+   global+pinned sink, multi_shot_rope_offset) but UNEXERCISED e2e -- single-prompt T2V
+   only so far (no scene cuts -> no pinning, rope_offset 0). Wire shot boundaries
+   (`scene_cut_prefix` prompts) + a multi-shot e2e when multi-shot output is wanted.
 
-The "washed mirror blob" was NOT an odd-token masking bug (masking is correct;
-DiT-tiling / SDPA-scale / RoPE all exonerated). umT5's residual stream grows
-monotonically past f16's 65504 ceiling by block ~20 (peak ~67k at 576) -> inf ->
-NaN in `final_layer_norm` (inf*rsqrt(inf) = the `{NaN, 0.0}` hidden, which then
-collapses `text_proj` to token-uniform -> mirror-symmetric latent). Magnitude is
-PROMPT-CONTENT dependent, so f16 blew up only on some prompts; the even/odd-token
-correlation was coincidence (the even gate prompt stayed in range).
+KEY GOTCHA for the AR loop: within a chunk, `current_start` is CONSTANT across all 4
+UniPC steps + the clean pass; each forward recomputes the chunk's K/V at the same tail
+slot. Only the timestep-0 clean pass's K/V are committed (survive into future chunks).
+Convert frames<->tokens with `frame_seq_len = pph*ppw` (= 880 at release res, runtime
+elsewhere) everywhere.
 
-Fix: `pipeline.rs::load_with_act` compiles umT5 with bf16 acts (`umt5_act`),
-matching the pyref bf16 text encoder. bf16 has f32's exponent range so it holds
-~67k; DiT stays f16 (the umT5->DiT seam is host-f32 readback+reupload, so the two
-act dtypes are independent). GREEN: corgi parity OK vs pyref (umt5_hidden slope
-1.001 / rel_rmse 1.4e-3, was nan=27168/36864); full 576x576x97 clip coherent.
+CONTEXT (verified against the clone, do not relitigate):
+- ROPE: release runs `use_relative_rope=False`, `t_scale=1.0`, `rope_method="linear"`,
+  `original_seq_len=None`. ABSOLUTE-position temporal RoPE: q and chunk-k rotate at
+  `chunk_start_frame = current_start/frame_seq_len`; cached prefix k stored already-roped
+  at its own absolute position (no re-rotation at attention time). `temporal_offset =
+  shot_index * 8` is INTEGER, folds into the frame id. `rope3d.rs` `lookup_temporal`.
+- For single-prompt T2V the per-frame modulation `e[B,F,6,C]` collapses to FastWan's
+  scalar-t `[6,inner]` broadcast (all chunk frames share one timestep), so forward_ar
+  reuses the FastWan condition embedder + modulation unchanged; ONLY self-attn differs.
+- inference.yaml: chunk 8 / window 32 / sink 8 / multi_shot_sink true (global_sink 8) /
+  rope_offset 8 / 4 steps / shift 5.0; shape [1,128,48,44,80] -> frame_seq 880.
 
-Localize via `video_e2e.rs` WAN_DIAG branch (first-NONFINITE walk over umT5
-embeds/layers/ops). GOTCHA: check non-finite, NOT just NaN -- `inf.is_nan()` is
-false, so the overflow hid from a nan-only pass until the layer max_abs was
-printed.
+GROUND TRUTH IS THE CLONE for the parity work -- re-verify mechanics, don't trust
+notes. Upstream `third-party/LongLive` (NVlabs/LongLive, depth-1, sibling of
+`thinfer/`): `pipeline/causal_diffusion_inference.py` (the AR loop = the real spec),
+`wan_5b/modules/causal_model.py` (self-attn + cache updates), `wan_5b/utils/
+fm_solvers_unipc.py` (the sampler), `configs/inference.yaml`. IGNORE the nvfp4 branch.
+Weights: HF `Efficient-Large-Model/LongLive-2.0-5B` = `model_bf16.pt` (10GB, 825 bf16
+tensors, the COMPLETE merged DiT -- LoRA pre-folded, no separate lora_ckpt, no
+safetensors mirror); base Wan2.2-TI2V-5B (umT5+VAE) reused from FastWan.
 
-## VAE decode perf: conv-GPU bound (NOT submit-bound); conv tiles tuned
+DECISIONS LOCKED (do not relitigate):
+- bf16 full precision, NO quant (NVFP4 upstream variant SKIPPED). Must not regress vs
+  FastWan (same 5B/10GB tier -- user's explicit ask).
+- RUNTIME `.pt` ingestion, no build step / no committed artifact / no on-disk dup
+  (footprint first-class). Reading the real `.pt` keeps parity "same weights" honest.
+- DO NOT DISTURB FastWan (GREEN). New attention behavior lives in the AR path only;
+  FastWan's full-attention `forward` stays byte-unchanged.
+- Track here (no longlive-plan.md).
 
-CORRECTION (2026-06-20): the prior "VAE is SUBMIT/SYNC bound" read was WRONG.
-Timestamp totals (true GPU exec, not overlapping wall) at 576x576x49 / 5GB show
-the VAE wall is ~95% pure conv GPU time, near-zero idle to recover. The earlier
-"sawtooth / half idle" eyeball was misleading (the bandwidth-bound conv reads as
-low SM occupancy, not idle). Deepening `ScopePacker::MAX_INFLIGHT` would buy
-<=5%; do NOT chase it. Authoritative metric: `gpu_disp_ms` (timestamp) for the
-`vae_decode` scope vs scope `busy_ms`, NOT nvidia-smi utilization.
+## SHIPPED: Tiny VAE (LightTAE) -- CLI default
 
-Baseline 576x576x49 / 5GB (`scratch/logs/vae_perf_baseline.log`): VAE wall 161s
-= conv3d 134s (72ms/disp) + conv2d 18.5s (119ms/disp) + <4s everything else.
+ONE NAME: "tiny" (`VaeChoice::Tiny`, `--vae tiny`, `role::TINY_VAE`). `wan/
+vae_tiny.rs` LightTAE (`lighttaew2_2`) is the `--vae` default; `--vae full` is the
+parity path. Spec: `scratch/notes/lighttae_spec.md`. Decode tiling LANDED:
+temporal-chunk over latent frames sized from VRAM budget; `memcat` carries each
+chunk's trailing frame into the next via ping-pong buffer (causal depth 1, no
+halo/seam); a clip that fits = one chunk, bit-identical to untiled. Holds 2GB at
+576x576x97 (was 4.98GiB untiled). Durable test: `THINFER_E2E_TINY=1` decodes
+single- vs multi-chunk, asserts bit-identical + NaN-free + clamp + TRUE_PEAK.
+Open follow-ups (low priority): conv tile untuned; `TINY_PEAK_K` anchored to one
+point (recalibrate if graph changes); no true Full-vs-Tiny same-latent A/B; no
+decode-vs-TAEHV-pyref parity (add when wiring TAEHV pyref).
 
-LANDED: VAE conv tiles tuned (`wan/vae.rs` `WAN_VAE_CONV3D_TILE` /
-`WAN_VAE_CONV2D_TILE` = 128x96x16, tm8 tn6). The implicit-GEMM convs are
-memory-bandwidth bound, so global traffic per output `bk*(1/bm+1/bn)` is the
-lever: `bm=128` halves weight-side reads vs the 64x64 `Conv*Config::DEFAULT`.
-Sweep found 48 accumulators / 256 threads is the occupancy knee (64 acc =
-128x128 REGRESSED on register pressure; >256 threads fails the invocation cap).
-Bit-EXACT (f32 accum, ascending-k order is tile-shape-independent) -> 256 parity
-gate stays GREEN (vae_rgb slope 0.942 / rel_rmse 0.062, the known precision
-floor). Measured at 576x576x49: conv3d 134->95s (-29%), conv2d 18.5->12.7s
-(-32%), VAE wall 161->117s (-28%). Extrapolates to ~310->~224s at x97.
-Sweep harness: `scratch/sweep_conv.sh` (scratch-only).
+## SHIPPED: VAE decode VRAM tiling
 
-NEXT levers if more VAE perf is needed (all still conv-GPU bound, ~95s conv3d):
-- Tile-overlap recompute: thin-budget tiling decodes overlapping latent tiles
-  with a ~25% halo -> redundant conv on halo pixels. Budget-aware larger tiles
-  (fewer/smaller halos) cut conv work directly; trade vs seam quality.
-- Packed/vectorized x gathers in the conv kernel (f16x2 / vec4) to lift the
-  bandwidth ceiling. Deeper kernel work; keep f32 accum order for bit-exactness.
-- `conv3d_small_n` (cout=3/12 convs) still on its own tiny tile; minor.
-- DO NOT tweak conv3d kernel MATH. The im2col loop-invariant-div hoist was TRIED
-  and REVERTED 2026-06-19: REGRESSED conv3d GPU 262->301s (occupancy loss). Tile
-  tuning (above) is the throughput lever, not index-math.
+Decode live set = `FIXED(tout) + area*PER_AREA(tout)` per spatial tile; tile sized
+from `budget - reserve` (reserve = real VAE weight footprint + staging, queried
+not fractional); `set_transient_reserve` backstop caps weights, degrades to paging
+if estimate is off. Constants in `vae_tile_dims` from 4 measured points
+(recalibrate if decoder graph changes). DiT weights freed before VAE
+(`evict_all_and_free`). At 2GB/576 tile floors at 8 (~87s vs ~55s untiled);
+6GB/256 is single-tile/bit-identical. `THINFER_VAE_MEM` gates a per-tile probe.
 
-## DiT activation-tiling tier (engages at scale; PROVEN CORRECT)
+## SHIPPED: VAE decode perf -- conv-GPU bound (NOT submit-bound)
 
-`wan/dit_block.rs` + `wan/dit.rs`: per-block pass A (row-tiled
-norm1/qkv/qk-norm/rope) -> global self-SDPA barrier -> pass B (row-tiled
-o-proj/residual/cross-attn/FFN), each movement its own submit so FFN transients
-recycle; only qx/kx/v/sa stay resident across the barrier. `DIT_TILE_ROWS=1024`;
-engages only above one tile (~1024 tok = real video res/frames).
-- VRAM: VERIFIED at 8100 tok -- engages, bounds VRAM (pegged 5G, no OOM), SDPA
-  streams (`sdpa_sg` flash, no materialized `[n_tok,n_tok]`).
-- CORRECTNESS: bit-exact. `THINFER_DIT_TILE_ROWS=64` forcing 2 tiles at the 256
-  parity grid stays GREEN vs pyref; forcing 9 tiles at 576x576x13 is bit-IDENTICAL
-  to 2 tiles (FWD_REF rel_rmse 0.0). Tile count does not change output. The
-  blocker is umT5, not this tier.
+CORRECTION (2026-06-20): prior "submit/sync bound" read was WRONG. Timestamp
+totals at 576x576x49/5GB: VAE wall ~95% pure conv GPU time, ~zero recoverable
+idle. Authoritative metric: `gpu_disp_ms` (timestamp) for `vae_decode` vs `busy_ms`,
+NOT nvidia-smi util. LANDED: conv tiles tuned (`wan/vae.rs`
+`WAN_VAE_CONV3D_TILE`/`CONV2D_TILE` = 128x96x16, tm8 tn6) -- implicit-GEMM convs
+are bandwidth-bound, `bm=128` halves weight-side reads; 48 acc / 256 threads is
+the occupancy knee. Bit-EXACT (f32 accum, ascending-k). 576x576x49: conv3d
+134->95s, conv2d 18.5->12.7s, wall 161->117s (-28%). Sweep: `scratch/sweep_conv.sh`.
+NEXT levers if needed (all still conv-GPU bound): budget-aware larger tiles (fewer
+halos), packed/vec4 x-gathers (keep f32 accum order). DO NOT retry conv3d index-
+math: im2col loop-invariant-div hoist TRIED + REVERTED 2026-06-19 (262->301s).
 
-## After FastWan: LongLive-2.0-5B (AR/causal long video)
+## SHIPPED: DiT perf -- at the WGSL matmul ceiling (DEAD ENDS, do not retry)
 
-Same Wan2.2-TI2V-5B base, 4-step DMD, autoregressive/causal. ~90% shared engine;
-adds the AR/causal attention regime. GGUF DEFERRED (pin a revision, SCRATCH GGUF
-for bringup; `dit_gguf_renames` is Wan-family-general, re-verify vs a real
-FastWan GGUF dump; umT5 map is model-agnostic).
+DiT denoise (576x576x97, 3 DMD steps, ~55s/step) is 100% matmul+sdpa GPU time.
+Quant does NOT help (no paging to hide; quant path runs the SAME bf16 matmul after
+dequant). FFN 49% / attn (qkv+proj+sdpa) 51%. matmul ~2.5-3.4 TFLOP/s = ~20-25%
+of the f16 issue ceiling; latency/occupancy bound (NOT bandwidth), so bigger tiles
+backfire on the 28-SM mobile 5070. REGRESSED + reverted (tree clean): tile_b
+per-kk2 register hoist (36.4->40.4 ffn_down); bk 16->64 (36.4->43.7). Only large
+levers left are backend-level, NOT kernel tweaks: tensor-core matmul (5-10x; WGSL/
+naga expose no WMMA, likely blocked) or i8 DP4A FFN (2-4x; needs i8 acts =
+outlier-quality risk, gate hard on parity). Measure via e2e (NOT microbench):
+`THINFER_E2E_SKIP_PYREF=1 THINFER_E2E_FRAMES=13`, read `gpu_ms by pipeline`
+ms/disp. Baseline (f13): ffn_down 36.4 / ffn_up 26.5 / qkv 5.98 / proj 6.82 /
+sdpa_sg 3.40.
 
-## Carry-forward gotchas (Wan-general)
+## SHIPPED: DiT activation-tiling tier (PROVEN CORRECT)
 
-- RoPE3D is interleaved-pair, NOT half-rot (opposite of Qwen3). Freqs MUST pack
-  to the act dtype (`freqs_upload_bytes`): f32 freqs into an f16 kernel -> inf ->
-  NaN softmax (`wan/dit.rs`).
+`wan/dit_block.rs` + `wan/dit.rs`: per-block pass A (row-tiled norm1/qkv/qk-norm/
+rope) -> global self-SDPA barrier -> pass B (row-tiled o-proj/residual/cross-attn/
+FFN), each its own submit so FFN transients recycle. `DIT_TILE_ROWS=1024`; engages
+only above one tile (~real video res/frames). Bit-exact: forcing 2 tiles at 256
+stays GREEN vs pyref; 9 tiles at 576x576x13 is bit-IDENTICAL to 2 tiles. Bounds
+VRAM at 8100 tok (pegged 5G, no OOM, `sdpa_sg` flash, no materialized [n,n]).
+
+## Carry-forward gotchas (Wan-general; reused by LongLive)
+
+- umT5 MUST run bf16 acts. Its residual stream grows past f16's 65504 by block ~20
+  (peak ~67k at 576) -> inf -> NaN in `final_layer_norm` -> token-uniform hidden ->
+  mirror-symmetric "washed blob". Magnitude is PROMPT-content dependent (so f16
+  blew up only on some prompts). Fix: `pipeline.rs::load_with_act` compiles umT5
+  bf16 (matches pyref bf16 text encoder); DiT stays f16 (the umT5->DiT seam is
+  host-f32 readback+reupload, dtypes independent). Localize via `video_e2e.rs`
+  WAN_DIAG first-NONFINITE walk -- check non-finite NOT just NaN (`inf.is_nan()`
+  is false).
+- RoPE3D is interleaved-pair, NOT half-rot (opposite of Qwen3). Freqs MUST pack to
+  the act dtype (`freqs_upload_bytes`): f32 freqs into an f16 kernel -> inf -> NaN.
 - bf16->f16 reinterpret class: broadcast vectors that are STORED WEIGHTS
   (scale_shift_table, norm2 affine) read via a `weight_dtype`-keyed op
-  (`bcast_add`/`bcast_mul`), not an act-scale op (`bcast_affine`/
-  `bcast_modulate`). New broadcast site: check weight vs act and match the op.
+  (`bcast_add`/`bcast_mul`), not an act-scale op (`bcast_affine`/`bcast_modulate`).
+  New broadcast site: check weight vs act, match the op.
 - DiT driver takes `text` as host f32 `[text_seq, text_dim]` (umT5 readback +
   reupload), zero-padded, no cross-attn mask. Clean seam; revisit if it costs.
 - umT5 even-pads odd token counts by duplicating EOS; that pad key MUST be masked
@@ -174,32 +303,26 @@ FastWan GGUF dump; umT5 map is model-agnostic).
 - VAE decode-tiling pattern (`plan_tiles`/`feather_1d`/`decode_tile`) is what the
   DiT tier mirrors in spirit.
 - Shared helpers: Wan DiT reaches into `z_image::{block, embedders,
-  rope_embedder, seq}`. Extract a `thinfer-models` common module before the
-  family grows; not blocking.
-- Video staging: per-frame PNG sequence + tiled contact sheet; MP4/WebM in the
-  CLI only (openh264).
+  rope_embedder, seq}`. Extract a `thinfer-models` common module before the family
+  grows (LongLive is the trigger to consider it); not blocking.
+- Video staging: per-frame PNG sequence + tiled contact sheet; MP4/WebM in the CLI
+  only (openh264; encoder config hardened 2026-06-19).
 
 ## Running the e2e / measuring
 
-Test is `video_e2e`. Parity (the gate; needs the HF bundle + `uv`):
+Test is `video_e2e`. Parity gate (needs HF bundle + `uv`):
 `THINFER_TRACE=1 THINFER_POWER_PREF=high THINFER_E2E_BUDGET_GB=6
 THINFER_E2E_WIDTH=256 THINFER_E2E_HEIGHT=256 THINFER_E2E_PNG_DIR=<dir> cargo test
 -p thinfer-conformance --features wan-e2e --release video_e2e -- --nocapture
 --test-threads=1`. Perf/trace only: add `THINFER_E2E_SKIP_PYREF=1`. NEVER run the
 fp32 pyref (`REF_DTYPE=fp32`) above tiny dims (~30GB weights, OOMs host). Card is
-an RTX 5070 Laptop (8GB); an 8GB budget OOMs the device -- keep budgets <8GB.
-Per-op `gpu_ms` in the trace rollup ("gpu_ms by pipeline") localizes perf.
+RTX 5070 Laptop (8GB); keep budgets <8GB (8GB OOMs the device). Per-op `gpu_ms` in
+the trace rollup ("gpu_ms by pipeline") localizes perf.
 
-CLI full run (for the large-token blocker): `THINFER_TRACE=1
-THINFER_POWER_PREF=high ./target/release/thinfer.exe generate video --prompt ...
---width 576 --height 576 --vram-budget 5G --ram-budget 5G --download-as-needed
---output out.mp4` (default 97 frames = ~4s; CFG-free DMD, no steps/guidance/cfg
-flag exists; frames default is good, don't set it). The trace rollup + `[mem]`
-dump only at process EXIT. To LOOK at pixels (the codec is fine, inspect the
-generation): ffmpeg is installed under WinGet; extract frames with `ffmpeg -i
-out.mp4 -vf "select=eq(n\,N)" -vframes 1 frame.png` then read the PNG. Or use
-`--output-format png-frames` for the codec-free decode. NB: the mp4 encoder
-config was hardened 2026-06-19 (sane bitrate, `enable_skip_frame(false)`,
-`max_frame_rate=fps`) replacing openh264's 120kbps+skip default; correct but
-incidental (not the bad-video cause). Scratch artifacts live in
-`<repo-root>/scratch/logs/` (sibling of `thinfer/`, not under working-area).
+CLI full run: `THINFER_TRACE=1 THINFER_POWER_PREF=high ./target/release/thinfer.exe
+generate video --prompt ... --width 576 --height 576 --vram-budget 5G --ram-budget
+5G --download-as-needed --output out.mp4` (default 97 frames; CFG-free DMD, no
+steps/guidance flags). Rollup + `[mem]` dump at process EXIT. To inspect pixels:
+ffmpeg (WinGet) `ffmpeg -i out.mp4 -vf "select=eq(n\,N)" -vframes 1 frame.png`, or
+`--output-format png-frames`. Scratch artifacts live in `<repo-root>/scratch/logs/`
+(sibling of `thinfer/`, not under working-area).

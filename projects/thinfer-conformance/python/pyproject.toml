@@ -5,10 +5,12 @@ description = "Generates fixed-seed reference outputs for thinfer accuracy diffi
 requires-python = ">=3.11"
 dependencies = [
     "diffusers",
+    "einops>=0.8.2",
     "ftfy",
     "numpy",
     "packaging",
     "safetensors",
+    "scipy>=1.17.1",
     "torch",
     "transformers",
     "zimage-native",

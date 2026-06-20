@@ -21,10 +21,17 @@ const REPO_DIFFUSERS: &str = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers";
 /// LightTAE tiny decoder lives in lightx2v's standalone autoencoder repo (NOT
 /// the FastVideo bundle); downloaded only when `VaeChoice::Tiny` is selected.
 const REPO_LIGHTX2V_AE: &str = "lightx2v/Autoencoders";
+/// LongLive-2.0-5B causal/AR DiT: a single 10GB `torch.save` `.pt` (the complete
+/// merged generator). umT5 + VAE + tokenizer reuse the FastVideo base bundle, so
+/// only this one file is LongLive-specific.
+const REPO_LONGLIVE: &str = "Efficient-Large-Model/LongLive-2.0-5B";
 
 pub mod role {
     /// DMD-distilled Wan2.2-TI2V-5B DiT (`WanTransformer3DModel`), single file.
     pub const DIT: &str = "dit/model";
+    /// LongLive-2.0-5B causal DiT, single `torch.save` `.pt` (runtime-read via
+    /// `PytorchSource`; not safetensors).
+    pub const LONGLIVE_DIT: &str = "dit/longlive_pt";
     pub const DIT_CONFIG: &str = "dit/config";
     /// umT5-XXL text encoder, 3 fp32 shards + index.
     pub const TEXT_ENCODER_SHARD_1: &str = "text_encoder/shard1";
@@ -51,6 +58,11 @@ pub struct VariantFiles {
     pub weight_roles: &'static [&'static str],
     /// Non-weight files (tokenizer).
     pub aux_roles: &'static [&'static str],
+    /// `Some` when the DiT is a standalone `.pt` (LongLive) rather than the
+    /// leading safetensors shard: then `weight_roles` carries only the umT5 +
+    /// VAE safetensors and this role is the `.pt` consumed by
+    /// `open_longlive_source`. `None` for the all-safetensors FastWan bundle.
+    pub dit_pt_role: Option<&'static str>,
 }
 
 const WEIGHT_ROLES: &[&str] = &[
@@ -62,11 +74,29 @@ const WEIGHT_ROLES: &[&str] = &[
 ];
 const AUX_ROLES: &[&str] = &[role::TOKENIZER_JSON];
 
-pub static VARIANTS: &[VariantFiles] = &[VariantFiles {
-    id: "fastwan-ti2v-5b",
-    weight_roles: WEIGHT_ROLES,
-    aux_roles: AUX_ROLES,
-}];
+/// LongLive shares the FastVideo umT5 + VAE (the Wan2.2 base components); only
+/// the DiT differs (the causal `.pt`), carried in `dit_pt_role`.
+const LONGLIVE_WEIGHT_ROLES: &[&str] = &[
+    role::TEXT_ENCODER_SHARD_1,
+    role::TEXT_ENCODER_SHARD_2,
+    role::TEXT_ENCODER_SHARD_3,
+    role::VAE,
+];
+
+pub static VARIANTS: &[VariantFiles] = &[
+    VariantFiles {
+        id: "fastwan-ti2v-5b",
+        weight_roles: WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_pt_role: None,
+    },
+    VariantFiles {
+        id: "longlive-2.0-5b",
+        weight_roles: LONGLIVE_WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_pt_role: Some(role::LONGLIVE_DIT),
+    },
+];
 
 pub fn variant(id: &str) -> Option<&'static VariantFiles> {
     VARIANTS.iter().find(|v| v.id == id)
@@ -74,8 +104,11 @@ pub fn variant(id: &str) -> Option<&'static VariantFiles> {
 
 impl VariantFiles {
     pub fn files(&self) -> impl Iterator<Item = (&'static str, &'static FileRef)> + '_ {
-        self.weight_roles
+        // The standalone DiT `.pt` (when present) is part of the download set too,
+        // so resolution/caching pulls it alongside the safetensors + aux files.
+        self.dit_pt_role
             .iter()
+            .chain(self.weight_roles.iter())
             .chain(self.aux_roles.iter())
             .map(|r| {
                 (
@@ -110,6 +143,10 @@ pub static MANIFEST: ModelManifest = ModelManifest {
         (
             role::DIT_CONFIG,
             FileRef::new(REPO_DIFFUSERS, "transformer/config.json"),
+        ),
+        (
+            role::LONGLIVE_DIT,
+            FileRef::new(REPO_LONGLIVE, "model_bf16.pt"),
         ),
         (
             role::TEXT_ENCODER_INDEX,
@@ -175,7 +212,12 @@ mod tests {
     fn variants_resolve() {
         for v in VARIANTS {
             assert_eq!(variant(v.id).map(|x| x.id), Some(v.id));
-            assert_eq!(v.files().count(), v.weight_roles.len() + v.aux_roles.len());
+            let dit_pt = usize::from(v.dit_pt_role.is_some());
+            // `files()` also panics if any declared role is missing from MANIFEST.
+            assert_eq!(
+                v.files().count(),
+                dit_pt + v.weight_roles.len() + v.aux_roles.len()
+            );
         }
         assert!(variant("no-such-model").is_none());
     }
@@ -185,5 +227,21 @@ mod tests {
         let v = variant("fastwan-ti2v-5b").expect("safetensors variant");
         // 1 DiT + 3 TE + 1 VAE.
         assert_eq!(v.weight_roles.len(), 5);
+        assert!(v.dit_pt_role.is_none());
+    }
+
+    #[test]
+    fn longlive_variant_separates_pt_dit_from_base() {
+        let v = variant("longlive-2.0-5b").expect("longlive variant");
+        // DiT is the standalone `.pt`; safetensors side is umT5 (3) + VAE (1).
+        assert_eq!(v.dit_pt_role, Some(role::LONGLIVE_DIT));
+        assert_eq!(v.weight_roles.len(), 4);
+        assert!(!v.weight_roles.contains(&role::DIT));
+        // The `.pt` is in the download set and points at the LongLive repo.
+        let pt = v
+            .files()
+            .find(|(r, _)| *r == role::LONGLIVE_DIT)
+            .expect("pt in file set");
+        assert!(pt.1.path.ends_with("model_bf16.pt"));
     }
 }

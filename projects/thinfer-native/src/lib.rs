@@ -133,3 +133,49 @@ mod read_bench {
         report("File::read (warm)", len, t.elapsed().as_secs_f64());
     }
 }
+
+/// Smoke-test the `.pt` reader against a real `torch.save` checkpoint (e.g.
+/// LongLive `model_bf16.pt`). Gated on `THINFER_PT_PATH` (skips when unset).
+/// Parses the ZIP64 directory + pickle index, then prints every tensor name,
+/// shape and dtype - both proof the parser handles a 10GB real file and the
+/// source of truth for the DiT rename map.
+#[cfg(test)]
+mod pt_smoke {
+    use super::*;
+    use thinfer_core::format::pytorch::PytorchSource;
+    use thinfer_core::weight::WeightSource;
+
+    #[test]
+    fn dump_pt_catalog() {
+        let Some(path) = std::env::var_os("THINFER_PT_PATH") else {
+            eprintln!("pt_smoke: THINFER_PT_PATH unset; skipping");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opener = MmapFileOpener::new(&path).await.unwrap();
+            let src = PytorchSource::open(opener).await.expect("parse .pt");
+            let mut names: Vec<_> = src
+                .catalog()
+                .entries
+                .iter()
+                .map(|(id, e)| {
+                    (
+                        id.0.clone(),
+                        format!("{:?}", e.shape.0),
+                        e.encoding_label.clone(),
+                        e.size,
+                    )
+                })
+                .collect();
+            names.sort();
+            let total: u64 = names.iter().map(|(_, _, _, sz)| *sz).sum();
+            eprintln!("pt_smoke: {} tensors, {} bytes total", names.len(), total);
+            for (n, shape, dt, sz) in &names {
+                eprintln!("pt_smoke: {n}\t{dt}\t{shape}\t{sz}");
+            }
+        });
+    }
+}

@@ -7,6 +7,7 @@
 pub mod condition_embedder;
 pub mod dit;
 pub mod dit_block;
+pub mod kv_cache;
 pub mod loader;
 pub mod manifest;
 pub mod patchify;
@@ -15,5 +16,6 @@ pub mod rope3d;
 pub mod scheduler;
 pub mod source;
 pub mod umt5;
+pub mod unipc;
 pub mod vae;
 pub mod vae_tiny;

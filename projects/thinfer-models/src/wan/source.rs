@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use thinfer_core::format::gguf::{self, GgufSource};
+use thinfer_core::format::pytorch::{self, PytorchSource};
 use thinfer_core::format::safetensors::{self, ShardedSafetensorsSource};
 use thinfer_core::format::union::{RenamedSource, UnionError, UnionReader, UnionSource};
 use thinfer_core::weight::{FileOpener, WeightCatalog, WeightId, WeightSource};
@@ -110,6 +111,69 @@ impl<O: FileOpener> WeightSource for WanSource<O> {
             Self::Quantized(s) => s.open(id).await,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LongLive-2.0-5B source (DiT from a `.pt`, umT5 + VAE from the base bundle)
+// ---------------------------------------------------------------------------
+//
+// The HF `LongLive-2.0-5B` repo carries only `model_bf16.pt`: the complete merged
+// causal DiT (LoRA pre-folded), 825 bf16 tensors named in original-Wan style under
+// a `generator.model.` prefix. We rename those to the canonical diffusers ids the
+// DiT loader asks for, then union the renamed `.pt` over the base safetensors that
+// still supplies umT5 + VAE (the Wan2.2 components, shared with FastWan). Lookup
+// order is `.pt` first so canonical DiT ids resolve to the causal weights while
+// text-encoder/VAE ids fall through. `WanSource` (FastWan) is intentionally left
+// untouched: LongLive is its own source type.
+
+/// DiT side: the `.pt` re-presented under canonical diffusers names.
+type LongLiveDitSide<O> = RenamedSource<PytorchSource<O>>;
+/// The one weight source a LongLive model loads from.
+pub type LongLiveSource<O> = UnionSource<LongLiveDitSide<O>, SafetensorsSide<O>>;
+
+#[derive(Debug)]
+pub enum LongLiveOpenError<E: core::fmt::Debug> {
+    Pt(pytorch::PtError),
+    Safetensors(safetensors::SourceError<E>),
+}
+
+/// Build a [`LongLiveSource`]: `dit_opener` is the `model_bf16.pt`;
+/// `base_openers` are the base safetensors shards that supply umT5 + VAE (in
+/// `VariantFiles::weight_roles` order, same as FastWan's `Plain` arm).
+pub async fn open_longlive_source<O: FileOpener>(
+    dit_opener: O,
+    base_openers: Vec<O>,
+    num_layers: usize,
+) -> Result<LongLiveSource<O>, LongLiveOpenError<O::Error>> {
+    let dit = PytorchSource::open(dit_opener)
+        .await
+        .map_err(LongLiveOpenError::Pt)?;
+    let base = ShardedSafetensorsSource::open(base_openers)
+        .await
+        .map_err(LongLiveOpenError::Safetensors)?;
+    Ok(UnionSource::new(
+        RenamedSource::with_passthrough(dit, longlive_dit_renames(num_layers)),
+        base,
+    ))
+}
+
+/// LongLive `.pt` (original-Wan names, `generator.model.` prefixed) -> diffusers
+/// canonical. Reuses [`dit_gguf_renames`] (the original-Wan -> diffusers map) with
+/// the prefix prepended, then adds `patch_embedding.{weight,bias}` (canonical in a
+/// GGUF so it rode passthrough there, but prefixed in the `.pt`).
+pub fn longlive_dit_renames(num_layers: usize) -> HashMap<WeightId, WeightId> {
+    const PRE: &str = "generator.model.";
+    let mut m: HashMap<WeightId, WeightId> = dit_gguf_renames(num_layers)
+        .into_iter()
+        .map(|(WeightId(orig), canon)| (WeightId(format!("{PRE}{orig}")), canon))
+        .collect();
+    for s in ["weight", "bias"] {
+        m.insert(
+            WeightId(format!("{PRE}patch_embedding.{s}")),
+            WeightId(format!("patch_embedding.{s}")),
+        );
+    }
+    m
 }
 
 // ---------------------------------------------------------------------------
@@ -248,4 +312,70 @@ pub fn umt5_gguf_renames() -> HashMap<WeightId, WeightId> {
     e.into_iter()
         .map(|(o, c)| (WeightId(o), WeightId(c)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The LongLive rename map must be a bijection onto the full LongLive DiT
+    /// checkpoint: 825 tensors (823 from the original-Wan map + 2 patch entries),
+    /// every key `generator.model.`-prefixed, every canonical value distinct.
+    /// 825 is also the verified tensor count of the real `model_bf16.pt`, so a
+    /// passing structural test here means every `.pt` tensor is consumed and
+    /// every canonical id the loader requests is supplied.
+    #[test]
+    fn longlive_renames_are_a_total_bijection() {
+        let m = longlive_dit_renames(WanDitConfig::fastwan_ti2v_5b().num_layers);
+        assert_eq!(m.len(), 825, "expected 825 LongLive DiT tensors");
+        for k in m.keys() {
+            assert!(k.0.starts_with("generator.model."), "unprefixed key {k:?}");
+        }
+        let values: HashSet<&String> = m.values().map(|v| &v.0).collect();
+        assert_eq!(values.len(), m.len(), "canonical values must be distinct");
+
+        // Spot-check the structural transforms (native -> diffusers canonical).
+        let want = |k: &str, v: &str| {
+            assert_eq!(
+                m.get(&WeightId(k.to_string())).map(|c| c.0.as_str()),
+                Some(v),
+                "mapping for {k}"
+            );
+        };
+        want(
+            "generator.model.blocks.0.self_attn.q.weight",
+            "blocks.0.attn1.to_q.weight",
+        );
+        want(
+            "generator.model.blocks.7.cross_attn.o.bias",
+            "blocks.7.attn2.to_out.0.bias",
+        );
+        want(
+            "generator.model.blocks.0.ffn.0.weight",
+            "blocks.0.ffn.net.0.proj.weight",
+        );
+        want(
+            "generator.model.blocks.0.ffn.2.weight",
+            "blocks.0.ffn.net.2.weight",
+        );
+        want(
+            "generator.model.blocks.0.norm3.weight",
+            "blocks.0.norm2.weight",
+        );
+        want(
+            "generator.model.blocks.0.modulation",
+            "blocks.0.scale_shift_table",
+        );
+        want("generator.model.head.modulation", "scale_shift_table");
+        want("generator.model.head.head.weight", "proj_out.weight");
+        want(
+            "generator.model.time_projection.1.weight",
+            "condition_embedder.time_proj.weight",
+        );
+        want(
+            "generator.model.patch_embedding.weight",
+            "patch_embedding.weight",
+        );
+    }
 }

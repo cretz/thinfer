@@ -5,5 +5,6 @@
 //! one implementation per format.
 
 pub mod gguf;
+pub mod pytorch;
 pub mod safetensors;
 pub mod union;

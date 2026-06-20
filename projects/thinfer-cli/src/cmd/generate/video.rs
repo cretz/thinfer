@@ -16,7 +16,7 @@ use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::wan::pipeline::{
     GenerationParams, ProgressEvent, VaeChoice, WanModel, WanVideo,
 };
-use thinfer_models::wan::source::WanSource;
+use thinfer_models::wan::source::{WanSource, open_longlive_source};
 use thinfer_models::z_image::pipeline::encode_png;
 use thinfer_native::tokenizer::HfTokenizer;
 use thinfer_native::{MmapFileOpener, cache};
@@ -128,6 +128,13 @@ pub enum VideoModelId {
     /// safetensors. The e2e-validated path. GGUF variants are deferred.
     #[value(name = "fastwan-ti2v-5b")]
     FastwanTi2v5b,
+    /// LongLive-2.0-5B: the causal/AR (autoregressive) long-video finetune of the
+    /// FastWan base (same 5B geometry). 4-step FlowUniPC per chunk over a windowed
+    /// KV cache. DiT is a standalone `.pt`; umT5 + VAE reuse the FastWan base. The
+    /// frame count must give a latent frame count divisible by 8 (the chunk size):
+    /// e.g. `--frames 29` (8 latent frames) or `--frames 61` (16).
+    #[value(name = "longlive-2.0-5b")]
+    Longlive205b,
 }
 
 impl VideoModelId {
@@ -138,13 +145,53 @@ impl VideoModelId {
     fn variant(self) -> &'static wanmf::VariantFiles {
         wanmf::variant(&self.to_string()).expect("CLI VideoModelId missing from VARIANTS registry")
     }
+
+    /// AR (LongLive) path: the `.pt` DiT + windowed-KV-cache chunk loop.
+    fn is_ar(self) -> bool {
+        matches!(self, VideoModelId::Longlive205b)
+    }
 }
 
 impl std::fmt::Display for VideoModelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VideoModelId::FastwanTi2v5b => f.write_str("fastwan-ti2v-5b"),
+            VideoModelId::Longlive205b => f.write_str("longlive-2.0-5b"),
         }
+    }
+}
+
+/// Load the model from `source` and run the appropriate denoise (FastWan DMD vs
+/// LongLive AR). Generic over the weight source so both the safetensors
+/// (`WanSource`) and the `.pt`-backed (`LongLiveSource`) paths share the load +
+/// generate + error-mapping tail.
+async fn build_and_generate<S: thinfer_core::weight::WeightSource>(
+    backend: std::sync::Arc<thinfer_core::backend::WgpuBackend>,
+    source: S,
+    budget: ResidencyBudget,
+    tokenizer: HfTokenizer,
+    vae: VaeChoice,
+    gen_params: &GenerationParams,
+    progress: &dyn Fn(ProgressEvent),
+    ar: bool,
+) -> Result<WanVideo, String> {
+    let residency = WeightResidency::new(source, budget);
+    let model = {
+        let _s = tracing::info_span!("model_load").entered();
+        WanModel::load(backend, residency, tokenizer, vae)
+            .await
+            .map_err(|e| format!("model load: {e:?}"))?
+    };
+    if ar {
+        model
+            .generate_ar(gen_params, vae, Some(progress))
+            .await
+            .map_err(|e| format!("generate: {e:?}"))
+    } else {
+        model
+            .generate(gen_params, vae, Some(progress))
+            .await
+            .map_err(|e| format!("generate: {e:?}"))
     }
 }
 
@@ -235,12 +282,6 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
                 .map_err(|e| format!("open {}: {e}", path.display()))?,
         );
     }
-    // GGUF is deferred: bringup is safetensors-only (the union path in
-    // `wan::source` is retained for when a published FastWan GGUF is wired).
-    let source = WanSource::open(weight_openers, None)
-        .await
-        .map_err(|e| format!("parse weight files: {e:?}"))?;
-
     let tokenizer_path = resolve_role(wanmf::role::TOKENIZER_JSON)?;
     let tokenizer = HfTokenizer::from_path(&tokenizer_path)
         .await
@@ -279,6 +320,15 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     let progress = move |ev: ProgressEvent| match ev {
         ProgressEvent::TextEncode => eprintln!("{} Encoding prompt", stamp()),
         ProgressEvent::Step { i, n } => eprintln!("{} Denoising step {i}/{n}", stamp()),
+        ProgressEvent::ChunkStep {
+            chunk,
+            num_chunks,
+            step,
+            num_steps,
+        } => eprintln!(
+            "{} Denoising chunk {chunk}/{num_chunks} step {step}/{num_steps}",
+            stamp()
+        ),
         ProgressEvent::VaeDecode => eprintln!("{} Decoding latents (VAE)", stamp()),
     };
     let gen_params = GenerationParams {
@@ -288,18 +338,46 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         num_frames: args.frames,
         seed,
     };
-    let residency = WeightResidency::new(source, budget);
-    let video = {
-        let model = {
-            let _s = tracing::info_span!("model_load").entered();
-            WanModel::load(backend, residency, tokenizer, vae)
-                .await
-                .map_err(|e| format!("model load: {e:?}"))?
-        };
-        model
-            .generate(&gen_params, vae, Some(&progress))
+    // FastWan loads the all-safetensors `WanSource`; LongLive unions the renamed
+    // `.pt` DiT over the base safetensors (umT5 + VAE) via `LongLiveSource`. Both
+    // share the generic load + generate tail.
+    let video = if args.model.is_ar() {
+        let pt_path = resolve_role(wanmf::role::LONGLIVE_DIT)?;
+        let dit_opener = MmapFileOpener::new(&pt_path)
             .await
-            .map_err(|e| format!("generate: {e:?}"))?
+            .map_err(|e| format!("open {}: {e}", pt_path.display()))?;
+        let num_layers = thinfer_models::wan::dit_block::WanDitConfig::longlive_2_0_5b().num_layers;
+        let source = open_longlive_source(dit_opener, weight_openers, num_layers)
+            .await
+            .map_err(|e| format!("parse LongLive weights: {e:?}"))?;
+        build_and_generate(
+            backend,
+            source,
+            budget,
+            tokenizer,
+            vae,
+            &gen_params,
+            &progress,
+            true,
+        )
+        .await?
+    } else {
+        // GGUF is deferred: bringup is safetensors-only (the union path in
+        // `wan::source` is retained for when a published FastWan GGUF is wired).
+        let source = WanSource::open(weight_openers, None)
+            .await
+            .map_err(|e| format!("parse weight files: {e:?}"))?;
+        build_and_generate(
+            backend,
+            source,
+            budget,
+            tokenizer,
+            vae,
+            &gen_params,
+            &progress,
+            false,
+        )
+        .await?
     };
 
     match format {

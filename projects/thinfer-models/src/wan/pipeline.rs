@@ -31,6 +31,7 @@ use crate::wan::dit::{
     LoadedWanDitHandles, WanDit, WanDitError, WanDitInputs, WanDitShape, WanDitTaps, read_into_f32,
 };
 use crate::wan::dit_block::{WanDitBlockTaps, WanDitConfig, WanDitPipelines, config as dit_config};
+use crate::wan::kv_cache::{KvCacheConfig, KvWindowCache, RamKvStore};
 use crate::wan::loader::register_wan_dit_handles;
 use crate::wan::manifest::RECIPE;
 use crate::wan::scheduler::{DmdConfig, DmdSampler};
@@ -38,6 +39,7 @@ use crate::wan::umt5::{
     Umt5BlockOpsHost, Umt5Encoder, Umt5ForwardError, Umt5Handles, Umt5Pipelines, Umt5Taps,
     register_umt5_handles,
 };
+use crate::wan::unipc::{FlowUniPc, UniPcConfig};
 use crate::wan::vae::{
     VaeDecoderWeights, WanVaeConfig, WanVaeDecodeError, WanVaeDecoder, WanVaePipelines,
     register_decoder,
@@ -120,7 +122,19 @@ pub struct WanStepDiag {
 #[derive(Clone, Copy, Debug)]
 pub enum ProgressEvent {
     TextEncode,
-    Step { i: u32, n: u32 },
+    Step {
+        i: u32,
+        n: u32,
+    },
+    /// AR (LongLive) per-chunk denoise step: `chunk`/`num_chunks` and the 1-based
+    /// `step`/`num_steps` within that chunk (the FlowUniPC schedule). The clean
+    /// recache forward is not reported (it is not a scheduler step).
+    ChunkStep {
+        chunk: u32,
+        num_chunks: u32,
+        step: u32,
+        num_steps: u32,
+    },
     VaeDecode,
 }
 
@@ -498,6 +512,273 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             .await
     }
 
+    /// LongLive-2.0-5B AR generate: the autoregressive/causal long-video path.
+    /// Same backbone + umT5 + VAE as [`Self::generate`]; the denoise is the AR
+    /// chunk loop ([`Self::denoise_ar`]) instead of the FastWan DMD loop. Load the
+    /// model from a `LongLiveSource` (the `.pt` DiT renamed to canonical) for the
+    /// causal weights; the geometry is identical to FastWan so nothing else here
+    /// changes.
+    pub async fn generate_ar(
+        &self,
+        params: &GenerationParams,
+        vae: VaeChoice,
+        progress: ProgressFn<'_>,
+    ) -> Result<WanVideo, GenerateError<S::Error>> {
+        let mut workspace = Workspace::new(
+            Arc::clone(&self.backend),
+            Arc::clone(self.residency.arbiter()),
+        );
+        let (latent, f_lat, h_lat, w_lat) = self
+            .denoise_ar(params, None, &mut workspace, None, None, None, progress)
+            .await?;
+
+        if let Some(p) = progress {
+            p(ProgressEvent::VaeDecode);
+        }
+        let frames = self
+            .decode_video(vae, &mut workspace, &latent, f_lat, h_lat, w_lat, None)
+            .await?;
+        self.residency.evict_all_and_free(&*self.backend);
+
+        let num_frames = if f_lat == 0 {
+            0
+        } else {
+            TEMPORAL_SCALE * f_lat - 3
+        };
+        Ok(WanVideo {
+            frames,
+            num_frames,
+            height: h_lat * VAE_SCALE,
+            width: w_lat * VAE_SCALE,
+        })
+    }
+
+    /// AR (LongLive) denoise: tokenize -> umT5 encode -> per-chunk FlowUniPC
+    /// denoise over a windowed KV cache -> assembled pre-VAE latent (CTHW f32).
+    /// Each chunk runs 4 UniPC steps over `[committed window ++ this chunk]`, then
+    /// a clean-context timestep-0 pass commits the chunk's K/V into the cache for
+    /// future chunks (the streaming core). `f_lat` must be a multiple of the chunk
+    /// size (`num_frame_per_block`, 8). `initial_noise`: full `[C, f_lat, h, w]`
+    /// noise used verbatim when `Some` (parity byte-load), else seed-derived.
+    pub async fn denoise_ar(
+        &self,
+        params: &GenerationParams,
+        initial_noise: Option<&[f32]>,
+        workspace: &mut Workspace<WgpuBackend>,
+        mut chunk_diag: Option<&mut Vec<Vec<f32>>>,
+        mut vel_diag: Option<&mut Vec<Vec<f32>>>,
+        mut block_res_diag: Option<&mut Vec<Vec<f32>>>,
+        progress: ProgressFn<'_>,
+    ) -> Result<(Vec<f32>, usize, usize, usize), GenerateError<S::Error>> {
+        if let Some(sink) = chunk_diag.as_deref_mut() {
+            sink.clear();
+        }
+        if let Some(sink) = vel_diag.as_deref_mut() {
+            sink.clear();
+        }
+        if let Some(sink) = block_res_diag.as_deref_mut() {
+            sink.clear();
+        }
+        let div = (VAE_SCALE * dit_config::PATCH_H) as u32;
+        if params.height == 0
+            || params.width == 0
+            || !params.height.is_multiple_of(div)
+            || !params.width.is_multiple_of(div)
+        {
+            return Err(GenerateError::InvalidDims {
+                height: params.height,
+                width: params.width,
+            });
+        }
+        if params.num_frames == 0 || params.num_frames % TEMPORAL_SCALE as u32 != 1 {
+            return Err(GenerateError::InvalidFrames {
+                num_frames: params.num_frames,
+            });
+        }
+        let h_lat = (params.height as usize) / VAE_SCALE;
+        let w_lat = (params.width as usize) / VAE_SCALE;
+        let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
+
+        let _denoise = trace::scope!("denoise_ar").entered();
+
+        // --- 1. tokenize + 2. umT5 encode -> padded text states ---
+        let token_ids = self
+            .tokenizer
+            .encode(&params.prompt, true)
+            .map_err(GenerateError::Tokenizer)?;
+        if token_ids.len() > MAX_PROMPT_TOKENS {
+            return Err(GenerateError::PromptTooLong {
+                tokens: token_ids.len(),
+                max: MAX_PROMPT_TOKENS,
+            });
+        }
+        if let Some(p) = progress {
+            p(ProgressEvent::TextEncode);
+        }
+        let text = {
+            let qout = self
+                .umt5
+                .forward(
+                    &self.backend,
+                    &self.umt5_pipelines,
+                    &self.residency,
+                    &*workspace,
+                    &self.umt5_handles,
+                    self.residency.source(),
+                    &token_ids,
+                )
+                .await?;
+            pad_text(&qout.hidden, qout.seq, dit_config::TEXT_DIM, TEXT_SEQ)
+        };
+        self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
+
+        // --- 3. windowed KV cache (host-resident) + AR geometry ---
+        let act_bytes = self.dit.block.act_dtype.bytes_per_elem() as usize;
+        let frame_seq_len = (h_lat / dit_config::PATCH_H) * (w_lat / dit_config::PATCH_W);
+        let kv_cfg = KvCacheConfig::longlive_runtime(
+            self.cfg.num_layers,
+            frame_seq_len,
+            self.cfg.inner(),
+            act_bytes,
+        );
+        let chunk_frames = kv_cfg.chunk_frames();
+        if !f_lat.is_multiple_of(chunk_frames) {
+            // The release T2V path requires the latent frame count to tile the
+            // chunk size exactly (no independent-first-frame here).
+            return Err(GenerateError::InvalidFrames {
+                num_frames: params.num_frames,
+            });
+        }
+        let num_chunks = f_lat / chunk_frames;
+        let mut cache = KvWindowCache::new(kv_cfg);
+        let mut store = RamKvStore::new(kv_cfg.num_layers, kv_cfg.bytes_per_layer());
+
+        // --- 4. initial noise [C, f_lat, h, w] ---
+        let n_lat = self.cfg.in_channels * f_lat * h_lat * w_lat;
+        let full_noise: Vec<f32> = match initial_noise {
+            Some(buf) => {
+                assert_eq!(
+                    buf.len(),
+                    n_lat,
+                    "initial_noise len {} != {n_lat}",
+                    buf.len()
+                );
+                buf.to_vec()
+            }
+            None => gaussian_noise(n_lat, params.seed),
+        };
+
+        // --- 5. AR chunk loop ---
+        let chunk_shape =
+            WanDitShape::new(self.cfg.in_channels, chunk_frames, h_lat, w_lat, TEXT_SEQ);
+        let dit = WanDit::assemble(self.dit_handles.clone(), chunk_shape, self.cfg);
+        let mut unipc = FlowUniPc::new(&UniPcConfig::longlive());
+        let n_steps = unipc.num_steps();
+
+        self.residency.set_transient_reserve(
+            self.residency.vram_staging_reserve_bytes() + DIT_WORKSPACE_RESERVE,
+        );
+
+        let c = self.cfg.in_channels;
+        let hw = h_lat * w_lat;
+        let chunk_len = c * chunk_frames * hw;
+        let num_layers = self.cfg.num_layers;
+        let mut output = vec![0.0_f32; n_lat];
+
+        for chunk in 0..num_chunks {
+            let _cs = trace::scope!("ar_chunk", chunk = chunk).entered();
+            let f0 = chunk * chunk_frames;
+            let current_start = chunk * chunk_frames * frame_seq_len;
+            let plan = cache.begin_chunk(&mut store, current_start, chunk_frames);
+
+            let mut latents = slice_chunk(&full_noise, c, f_lat, f0, chunk_frames, hw);
+
+            unipc.reset();
+            for step in 0..n_steps {
+                if let Some(p) = progress {
+                    p(ProgressEvent::ChunkStep {
+                        chunk: chunk as u32 + 1,
+                        num_chunks: num_chunks as u32,
+                        step: step as u32 + 1,
+                        num_steps: n_steps as u32,
+                    });
+                }
+                let inputs = WanDitInputs {
+                    image: &latents,
+                    text: &text,
+                    timestep: unipc.timestep(step),
+                };
+                // Per-block residual taps only on the very first forward (chunk 0,
+                // step 0): isolates where the AR forward first diverges from the
+                // pyref without flooding readbacks across every step.
+                let bd = if chunk == 0 && step == 0 {
+                    block_res_diag.as_deref_mut()
+                } else {
+                    None
+                };
+                let out = dit
+                    .forward_ar(
+                        &self.backend,
+                        &self.dit,
+                        &self.residency,
+                        &*workspace,
+                        &inputs,
+                        &store,
+                        &plan,
+                        None,
+                        bd,
+                    )
+                    .await?;
+                // Raw DiT velocity (CTHW [c, chunk_frames, hw]) before the
+                // scheduler step; matches the pyref `py_c{c}_s{s}_vel` dump and
+                // isolates the DiT forward from the UniPC sampler.
+                if let Some(sink) = vel_diag.as_deref_mut() {
+                    sink.push(out.image.clone());
+                }
+                latents = unipc.step(&out.image, &latents);
+            }
+
+            // Record the denoised chunk, then run the clean-context recache pass
+            // (timestep 0) whose K/V are committed into the cache tail.
+            scatter_chunk(&mut output, &latents, c, f_lat, f0, chunk_frames, hw);
+            // Per-chunk post latent (CTHW [c, chunk_frames, hw]) for parity
+            // localization; matches the pyref `py_chunk{c}_post` dump.
+            if let Some(sink) = chunk_diag.as_deref_mut() {
+                sink.push(latents.clone());
+            }
+
+            let mut k_commit: Vec<Vec<u8>> = vec![Vec::new(); num_layers];
+            let mut v_commit: Vec<Vec<u8>> = vec![Vec::new(); num_layers];
+            let clean_inputs = WanDitInputs {
+                image: &latents,
+                text: &text,
+                timestep: 0.0,
+            };
+            dit.forward_ar(
+                &self.backend,
+                &self.dit,
+                &self.residency,
+                &*workspace,
+                &clean_inputs,
+                &store,
+                &plan,
+                Some((&mut k_commit, &mut v_commit)),
+                None,
+            )
+            .await?;
+            let k_refs: Vec<&[u8]> = k_commit.iter().map(|v| v.as_slice()).collect();
+            let v_refs: Vec<&[u8]> = v_commit.iter().map(|v| v.as_slice()).collect();
+            cache.commit_chunk(&mut store, &plan, &k_refs, &v_refs);
+
+            debug_assert_eq!(chunk_len, latents.len());
+        }
+
+        self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
+        Ok((output, f_lat, h_lat, w_lat))
+    }
+
     /// Tokenize -> umT5 encode -> DMD few-step denoise loop. Returns the final
     /// pre-VAE latent (CTHW f32, `16 * f_lat * h_lat * w_lat`) plus the latent
     /// dims. Caller owns `workspace` so the GPU pool survives the DiT->VAE seam.
@@ -729,7 +1010,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         initial_noise: &[f32],
         workspace: &mut Workspace<WgpuBackend>,
     ) -> Result<WanStep0Diag, GenerateError<S::Error>> {
-        self.diag_step_at(params, initial_noise, 0, workspace).await
+        self.diag_step_at(params, initial_noise, 0, 0, workspace)
+            .await
     }
 
     /// Bringup diagnostic: like [`Self::diag_step0`] but at an arbitrary DMD
@@ -744,6 +1026,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         params: &GenerationParams,
         latent: &[f32],
         step_index: usize,
+        tap_block: usize,
         workspace: &mut Workspace<WgpuBackend>,
     ) -> Result<WanStep0Diag, GenerateError<S::Error>> {
         let h_lat = (params.height as usize) / VAE_SCALE;
@@ -800,9 +1083,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             timestep: t,
         };
 
-        // Block-0 per-op sinks: the driver only fills these GPU buffers; the
-        // caller allocates them (persistent) and reads them back after forward.
-        // Sized rows*inner except ffn_gelu (rows*ffn_dim).
+        // Per-op sinks for block `tap_block`: the driver only fills these GPU
+        // buffers; the caller allocates them (persistent) and reads them back
+        // after forward. Sized rows*inner except ffn_gelu (rows*ffn_dim).
         let bp = &self.dit.block;
         let rows = shape.n_tok as u32;
         let inner = self.cfg.inner() as u32;
@@ -852,6 +1135,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             text_proj: Some(&mut text_proj),
             per_block: Some(&mut per_block),
             block0: Some(block0),
+            tap_block,
             final_norm: Some(&mut final_norm),
             proj_out: Some(&mut proj_out),
         };
@@ -1049,6 +1333,37 @@ fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype) -> BlockWgslConfigs {
         ops,
         i8_sdpa: false,
         dense_acts: DenseActSites::default(),
+    }
+}
+
+/// Extract chunk frames `[f0, f0 + cf)` from a CTHW latent `[c, f_lat, hw]` into
+/// a contiguous `[c, cf, hw]` chunk. Per channel the frame block is contiguous,
+/// so this is `c` slice copies.
+fn slice_chunk(full: &[f32], c: usize, f_lat: usize, f0: usize, cf: usize, hw: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; c * cf * hw];
+    for ch in 0..c {
+        let src = ch * f_lat * hw + f0 * hw;
+        let dst = ch * cf * hw;
+        out[dst..dst + cf * hw].copy_from_slice(&full[src..src + cf * hw]);
+    }
+    out
+}
+
+/// Inverse of [`slice_chunk`]: write a `[c, cf, hw]` chunk back into frames
+/// `[f0, f0 + cf)` of the CTHW latent `[c, f_lat, hw]`.
+fn scatter_chunk(
+    full: &mut [f32],
+    chunk: &[f32],
+    c: usize,
+    f_lat: usize,
+    f0: usize,
+    cf: usize,
+    hw: usize,
+) {
+    for ch in 0..c {
+        let dst = ch * f_lat * hw + f0 * hw;
+        let src = ch * cf * hw;
+        full[dst..dst + cf * hw].copy_from_slice(&chunk[src..src + cf * hw]);
     }
 }
 

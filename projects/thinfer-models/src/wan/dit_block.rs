@@ -113,6 +113,15 @@ impl WanDitConfig {
         }
     }
 
+    /// LongLive-2.0-5B: the causal/AR finetune of the FastWan base, structurally
+    /// identical (verified tensor-by-tensor against the real `model_bf16.pt`:
+    /// dim 3072 / ffn 14336 / 24 heads / 30 blocks / in=out 48). Named separately
+    /// so the variant registry selects it by intent and the two can diverge later
+    /// without silently sharing a number.
+    pub fn longlive_2_0_5b() -> Self {
+        Self::fastwan_ti2v_5b()
+    }
+
     /// Model dim `num_heads * HEAD_DIM`.
     pub fn inner(&self) -> usize {
         self.num_heads * config::HEAD_DIM
@@ -584,8 +593,6 @@ impl WanDitBlock {
         let rows = s.seq as u32;
         let trows = s.text_seq as u32;
         let dim = s.dim as u32;
-        let inner = s.inner as u32;
-        let dff = s.ffn_dim as u32;
         let eps = s.norm_eps;
         let scale = s.sdpa_scale();
         let x_in = ActBuf::dense(x_in);
@@ -645,6 +652,40 @@ impl WanDitBlock {
             taps.after_self.as_ref(),
             bp.act_bytes(rows * dim),
         )?;
+
+        // ============== 2. cross-attention + 3. FFN (shared tail) ==============
+        self.cross_ffn(
+            scope, pipelines, x1, text, m, y_out, bufs, taps, rows, trows,
+        )
+    }
+
+    /// Cross-attention to the umT5 text states + the gelu-tanh FFN, the shared
+    /// tail after self-attention. `x1` is the residual stream after the self-attn
+    /// gated residual; `y_out` receives the block output. Factored out of
+    /// [`Self::forward`] so the AR path ([`Self::self_attn_ar`] + this) reuses the
+    /// exact same op sequence (FastWan stays numerically byte-identical: the ops
+    /// and their order are verbatim, only the self-attention differs in AR).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cross_ffn<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        x1: ActBuf<'wsp>,
+        text: BatchBuf<'wsp>,
+        m: &WanMod<'wsp>,
+        y_out: ActBuf<'wsp>,
+        bufs: &WanDitBlockBufs,
+        taps: &WanDitBlockTaps,
+        rows: u32,
+        trows: u32,
+    ) -> Result<(), WgpuError> {
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let dim = s.dim as u32;
+        let inner = s.inner as u32;
+        let dff = s.ffn_dim as u32;
+        let eps = s.norm_eps;
+        let scale = s.sdpa_scale();
 
         // ============== 2. cross-attention (to text) ==============
         // norm2 = affine LayerNorm: ln -> *weight -> +bias (channel-broadcast).
@@ -763,6 +804,140 @@ impl WanDitBlock {
         )?;
 
         op_gate_residual(scope, bp, x2, m.c_gate_mlp, downb, y_out, rows, dim)?;
+        Ok(())
+    }
+
+    /// AR (LongLive) self-attention for one chunk against a windowed KV cache.
+    /// Mirrors the `use_relative_rope=False` release path of
+    /// `CausalWanSelfAttention.forward`: q and the chunk's k are RoPE'd at the
+    /// chunk's ABSOLUTE frame position (carried in `chunk_freqs`), and the query
+    /// attends over `[prefix (committed, already-RoPE'd) ++ this chunk's k]` with
+    /// NO materialized mask (causality is the window contents). Produces the
+    /// post-self-attn residual `x1_out` and exports the chunk's roped-k / v
+    /// (`roped_k_out` / `v_out`) so the clean pass can commit them to the cache.
+    ///
+    /// `prefix_k` / `prefix_v` are the `prefix_rows` committed window tokens
+    /// uploaded from the host store (K already roped, V raw); `window_k` /
+    /// `window_v` are `window_rows = prefix_rows + chunk_rows` scratch buffers the
+    /// driver pre-allocates. When `prefix_rows == 0` (first chunk) the window is
+    /// just the chunk itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn self_attn_ar<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        x_in: BatchBuf<'wsp>,
+        chunk_freqs: BatchBuf<'wsp>,
+        m: &WanMod<'wsp>,
+        prefix_k: BatchBuf<'wsp>,
+        prefix_v: BatchBuf<'wsp>,
+        prefix_rows: u32,
+        window_k: BatchBuf<'wsp>,
+        window_v: BatchBuf<'wsp>,
+        roped_k_out: BatchBuf<'wsp>,
+        v_out: BatchBuf<'wsp>,
+        x1_out: BatchBuf<'wsp>,
+        chunk_rows: u32,
+        window_rows: u32,
+        w: &WanAttnBufs,
+    ) -> Result<(), WgpuError> {
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let dim = s.dim as u32;
+        let inner = s.inner as u32;
+        let eps = s.norm_eps;
+        let nh = s.n_heads as u32;
+        let hd = s.head_dim as u32;
+        let scale = s.sdpa_scale();
+        let x_in = ActBuf::dense(x_in);
+
+        // norm1 (no affine) -> modulate by (scale_msa, shift_msa).
+        let n1 = alloc_act(scope, bp, chunk_rows, dim)?;
+        op_layernorm(scope, bp, x_in, n1, chunk_rows, dim, eps)?;
+        let n1m = alloc_act(scope, bp, chunk_rows, dim)?;
+        op_modulate(
+            scope,
+            bp,
+            n1,
+            m.scale_msa,
+            m.shift_msa,
+            n1m,
+            chunk_rows,
+            dim,
+        )?;
+
+        // q/k/v projections + bias, qk-norm (RMSNorm across the full inner dim).
+        let q = self.biased_proj(scope, bp, n1m, w.q_w, w.q_b, chunk_rows, inner)?;
+        let k = self.biased_proj(scope, bp, n1m, w.k_w, w.k_b, chunk_rows, inner)?;
+        let vv = self.biased_proj(scope, bp, n1m, w.v_w, w.v_b, chunk_rows, inner)?;
+        let qn = alloc_act(scope, bp, chunk_rows, inner)?;
+        let nq = scope.import_copy(w.norm_q);
+        op_rmsnorm(scope, bp, q, nq, qn, chunk_rows, inner, eps)?;
+        let kn = alloc_act(scope, bp, chunk_rows, inner)?;
+        let nk = scope.import_copy(w.norm_k);
+        op_rmsnorm(scope, bp, k, nk, kn, chunk_rows, inner, eps)?;
+
+        // RoPE3D q -> qr; k -> roped_k_out (also the cache-commit export). V is
+        // never roped; copy straight into v_out.
+        let qr = alloc_act(scope, bp, chunk_rows, inner)?;
+        self.rope(scope, bp, qn, chunk_freqs, qr, chunk_rows)?;
+        self.rope(
+            scope,
+            bp,
+            kn,
+            chunk_freqs,
+            ActBuf::dense(roped_k_out),
+            chunk_rows,
+        )?;
+        scope.copy_buffer_to_buffer(vv.data, 0, v_out, 0, bp.act_bytes(chunk_rows * inner))?;
+
+        // Assemble the attended window K/V = [prefix ++ this chunk]. With no
+        // prefix (first chunk) window == chunk, so the SDPA is bidirectional over
+        // the chunk (matches the upstream block-causal mask within one chunk).
+        let prefix_bytes = bp.act_bytes(prefix_rows * inner);
+        let chunk_bytes = bp.act_bytes(chunk_rows * inner);
+        if prefix_rows > 0 {
+            scope.copy_buffer_to_buffer(prefix_k, 0, window_k, 0, prefix_bytes)?;
+            scope.copy_buffer_to_buffer(prefix_v, 0, window_v, 0, prefix_bytes)?;
+        }
+        scope.copy_buffer_to_buffer(roped_k_out, 0, window_k, prefix_bytes, chunk_bytes)?;
+        scope.copy_buffer_to_buffer(v_out, 0, window_v, prefix_bytes, chunk_bytes)?;
+
+        // SDPA: q = chunk rows, kv = the window. Mode 0 (no mask): the window
+        // only ever holds tokens at or before the chunk, so causality is the
+        // cache contents, not a materialized mask.
+        let sa = alloc_act(scope, bp, chunk_rows, inner)?;
+        let no_mask = scope.alloc(16)?;
+        op_sdpa(
+            scope,
+            bp,
+            qr,
+            ActBuf::dense(window_k),
+            ActBuf::dense(window_v),
+            no_mask,
+            sa,
+            1,
+            chunk_rows,
+            window_rows,
+            nh,
+            nh,
+            hd,
+            scale,
+            0,
+        )?;
+
+        // output projection + bias, then the gated residual into x1_out.
+        let sa_proj = self.attn_out_proj(scope, bp, sa, w, chunk_rows, inner)?;
+        op_gate_residual(
+            scope,
+            bp,
+            x_in,
+            m.gate_msa,
+            sa_proj,
+            ActBuf::dense(x1_out),
+            chunk_rows,
+            dim,
+        )?;
         Ok(())
     }
 
