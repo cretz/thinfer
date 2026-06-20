@@ -13,14 +13,15 @@ use crate::ops::{
     AddF32, BcastAddBufs, BcastAddF32, BcastAddOp, BcastAffineBufs, BcastAffineF32, BcastAffineOp,
     BcastFmaBufs, BcastFmaF32, BcastFmaOp, BcastModulateBufs, BcastModulateF32, BcastModulateOp,
     BcastMulF32, Conv2dBufs, Conv2dF32, Conv2dOp, Conv3dBufs, Conv3dF32, Conv3dOp, GeluMulF32,
-    LayerNormBufs, LayerNormF32, LayerNormOp, MatMulF32, MatmulBufs, MatmulOp, MulF32, Op,
-    RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp, RmsNormBufs, RmsNormF32, RmsNormOp, RopeBufs,
-    RopeF32, RopeF32HalfRot, RopeOp, SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32,
-    SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32, Transpose12Bufs, Transpose12F32, Transpose12Op,
-    WgslConfig, dispatch_bcast_add, dispatch_bcast_affine, dispatch_bcast_fma,
-    dispatch_bcast_modulate, dispatch_conv2d, dispatch_conv3d, dispatch_layernorm, dispatch_matmul,
-    dispatch_op, dispatch_rmsnorm, dispatch_rmsnorm3d, dispatch_rope, dispatch_sdpa,
-    dispatch_softmax, dispatch_transpose12,
+    LayerNormBufs, LayerNormF32, LayerNormOp, MatMulF32, MatmulBufs, MatmulOp, MemCatBufs,
+    MemCatOp, MulF32, Op, ReluF32, RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp, RmsNormBufs,
+    RmsNormF32, RmsNormOp, RopeBufs, RopeF32, RopeF32HalfRot, RopeOp, SdpaBufs, SdpaF32,
+    SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32, SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32,
+    Transpose12Bufs, Transpose12F32, Transpose12Op, WgslConfig, dispatch_bcast_add,
+    dispatch_bcast_affine, dispatch_bcast_fma, dispatch_bcast_modulate, dispatch_conv2d,
+    dispatch_conv3d, dispatch_layernorm, dispatch_matmul, dispatch_memcat, dispatch_op,
+    dispatch_rmsnorm, dispatch_rmsnorm3d, dispatch_rope, dispatch_sdpa, dispatch_softmax,
+    dispatch_transpose12,
 };
 use crate::tensor::ComputeDtype;
 use safetensors::SafeTensors;
@@ -89,6 +90,10 @@ pub enum OpSpec {
     Add,
     Mul,
     Silu,
+    Relu,
+    /// MemBlock input assembly: `[T,C,H,W]` -> `[T,2C,H,W]` (current frame ++
+    /// previous frame on the channel axis, zero at t=0). See `ops::memcat`.
+    Memcat,
     #[serde(rename = "silu_mul")]
     SiluMul,
     #[serde(rename = "gelu_mul")]
@@ -327,6 +332,41 @@ impl<'a> OpTestContext<'a> {
             None,
             out_len,
             |b, e, p, ins, _u, out| dispatch_op::<O, _>(b, e, p, ins, out),
+        )
+        .await
+    }
+
+    pub async fn run_memcat<O: MemCatOp>(&self) -> Vec<u8> {
+        // Input x is [T, C, H, W]; output [T, 2C, H, W].
+        let s = &self.case.inputs[0].shape;
+        let (tt, c, h, w) = (s[0] as u32, s[1] as u32, s[2] as u32, s[3] as u32);
+        let out_len =
+            (tt as u64) * 2 * (c as u64) * (h as u64) * (w as u64) * self.dtype.bytes_per_elem();
+        // U = { t, c, h, w, has_prev }; has_prev = 0 (no carry frame, the untiled
+        // zero-pad path). Padded to 32 bytes for the uniform min binding size.
+        let mut u = [0u8; 32];
+        u[0..16].copy_from_slice(&pack_u32x4(tt, c, h, w));
+        let n_out = tt * 2 * c * h * w;
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |b, e, p, ins, uf, out| {
+                dispatch_memcat::<O, _>(
+                    b,
+                    e,
+                    p,
+                    &MemCatBufs {
+                        x: &ins[0],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                        // No carry: bind x itself (unread when has_prev = 0).
+                        prev: &ins[0],
+                    },
+                    n_out,
+                )
+            },
         )
         .await
     }
@@ -890,6 +930,8 @@ pub fn registry() -> Vec<Box<dyn OpTest>> {
         Box::new(AddF32),
         Box::new(MulF32),
         Box::new(SiluF32),
+        Box::new(ReluF32),
+        Box::new(crate::ops::MemCatF32),
         Box::new(SiluMulF32),
         Box::new(GeluMulF32),
         Box::new(TanhF32),

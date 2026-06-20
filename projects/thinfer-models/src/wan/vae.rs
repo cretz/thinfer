@@ -3669,7 +3669,7 @@ impl WanVaeEncoder {
 }
 
 /// Act-dtype-aware readback conversion (`act_size == 2` decodes f16).
-fn act_bytes_to_f32_vec(act_size: u64, bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn act_bytes_to_f32_vec(act_size: u64, bytes: &[u8]) -> Vec<f32> {
     if act_size == 2 {
         bytes
             .chunks_exact(2)
@@ -3684,7 +3684,7 @@ fn act_bytes_to_f32_vec(act_size: u64, bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Act-dtype-aware upload conversion (`act_size == 2` encodes f16).
-fn f32s_to_act_bytes(act_size: u64, vals: &[f32]) -> Vec<u8> {
+pub(crate) fn f32s_to_act_bytes(act_size: u64, vals: &[f32]) -> Vec<u8> {
     if act_size == 2 {
         let mut out = Vec::with_capacity(vals.len() * 2);
         for v in vals {

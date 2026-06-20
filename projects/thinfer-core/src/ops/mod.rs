@@ -30,9 +30,11 @@ pub mod layernorm;
 pub mod matmul;
 pub mod matmul_i8;
 pub mod matmul_i8_bf16;
+pub mod memcat;
 pub mod mul;
 pub mod qkv_split;
 pub mod relpos_bias;
+pub mod relu;
 pub mod rmsnorm;
 pub mod rmsnorm3d;
 pub mod rope;
@@ -73,6 +75,8 @@ pub use group_norm::{GroupNormBufs, GroupNormF32, GroupNormOp};
 pub(crate) use layernorm::dispatch_layernorm;
 pub use layernorm::{LayerNormBufs, LayerNormF32, LayerNormOp};
 pub use matmul::{MatMulConfig, MatMulF32, MatmulBufs, MatmulOp, dispatch_matmul};
+pub(crate) use memcat::dispatch_memcat;
+pub use memcat::{MemCatBufs, MemCatF32, MemCatOp};
 pub use mul::MulF32;
 pub(crate) use qkv_split::dispatch_qkv_split;
 pub use qkv_split::{QkvSplitBufs, QkvSplitF32, QkvSplitOp};
@@ -80,6 +84,7 @@ pub(crate) use relpos_bias::dispatch_relpos_bias;
 pub use relpos_bias::{
     RelposBiasBufs, RelposBiasF32, RelposBiasOp, relative_position_bucket, relpos_bucket_map,
 };
+pub use relu::ReluF32;
 pub(crate) use rmsnorm::dispatch_rmsnorm;
 pub use rmsnorm::{RmsNormBufs, RmsNormF32, RmsNormOp};
 pub(crate) use rmsnorm3d::dispatch_rmsnorm3d;

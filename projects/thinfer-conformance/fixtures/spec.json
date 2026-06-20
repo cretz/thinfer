@@ -91,6 +91,51 @@
       ]
     },
     {
+      "name": "relu_basic",
+      "op": "relu",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            64
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -4.0,
+            "hi": 4.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "memcat_basic",
+      "op": "memcat",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            3,
+            2,
+            2
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -4.0,
+            "hi": 4.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32"
+      ]
+    },
+    {
       "name": "silu_mul_basic",
       "op": "silu_mul",
       "inputs": [

@@ -47,7 +47,7 @@ use thinfer_core::trace::{self, DIAG};
 use thinfer_core::workspace::Workspace;
 use thinfer_models::wan::manifest::{self, role};
 use thinfer_models::wan::pipeline::{
-    GenerationParams, WanModel, WanStepDiag, gaussian_noise, renoise_seed,
+    GenerationParams, VaeChoice, WanModel, WanStepDiag, gaussian_noise, renoise_seed,
 };
 use thinfer_models::wan::source::WanSource;
 use thinfer_models::z_image::pipeline::encode_png;
@@ -147,6 +147,12 @@ async fn video_e2e_safetensors() {
     let height = env_u32("THINFER_E2E_HEIGHT", 256);
     let num_frames = env_u32("THINFER_E2E_FRAMES", 5);
     let skip_pyref = std::env::var("THINFER_E2E_SKIP_PYREF").is_ok();
+    // THINFER_E2E_TINY=1 also exercises the LightTAE tiny decoder: loads its
+    // weights alongside the real VAE (the Full parity gate is untouched) and,
+    // after the gate, decodes the same latent single- vs multi-chunk to prove
+    // the temporal-tiling carry is exact, plus a NaN-free + clamp-range check.
+    // No pyref (no TAEHV reference); the whole-run TRUE_PEAK assert covers VRAM.
+    let want_tiny = std::env::var("THINFER_E2E_TINY").is_ok();
     // Prompt override (threaded to BOTH the engine and the pyref so a parity run
     // can localize a prompt-specific divergence, e.g. umT5 odd-token EOS pad).
     let prompt = std::env::var("THINFER_E2E_PROMPT").unwrap_or_else(|_| PROMPT.to_string());
@@ -174,6 +180,11 @@ async fn video_e2e_safetensors() {
     ];
     let mut needed: Vec<&str> = weight_roles.to_vec();
     needed.push(role::TOKENIZER_JSON);
+    // The LightTAE decoder weight is a separate lightx2v download; resolve it
+    // only when the tiny path is requested (else the gate never needs it).
+    if want_tiny {
+        needed.push(role::TINY_VAE);
+    }
     let mut resolved: Vec<(&str, PathBuf)> = Vec::with_capacity(needed.len());
     for r in needed {
         let fr = manifest::MANIFEST.get(r).expect("role in manifest");
@@ -294,6 +305,16 @@ async fn video_e2e_safetensors() {
                 .unwrap_or_else(|e| panic!("open {}: {e}", path.display())),
         );
     }
+    // Append the tiny decoder as an extra shard (its `decoder.{N}` keys are
+    // disjoint from the real VAE's), so both decoders load from one catalog.
+    if want_tiny {
+        let path = path_of(role::TINY_VAE);
+        openers.push(
+            MmapFileOpener::new(path)
+                .await
+                .unwrap_or_else(|e| panic!("open {}: {e}", path.display())),
+        );
+    }
     let source = WanSource::open(openers, None)
         .await
         .expect("parse weight files");
@@ -344,9 +365,23 @@ async fn video_e2e_safetensors() {
         Ok("f16") => Some(thinfer_core::ops::ActDtype::F16),
         _ => None,
     };
-    let model = WanModel::load_with_act(Arc::clone(&backend), residency, tokenizer, act_override)
-        .await
-        .expect("WanModel::load");
+    // The parity gate is the real VAE (`Full`). Loading `Tiny` additionally
+    // registers the LightTAE decoder (both are then available); the Full path
+    // is unchanged, so the gate is identical with or without the tiny add-on.
+    let load_vae = if want_tiny {
+        VaeChoice::Tiny
+    } else {
+        VaeChoice::Full
+    };
+    let model = WanModel::load_with_act(
+        Arc::clone(&backend),
+        residency,
+        tokenizer,
+        load_vae,
+        act_override,
+    )
+    .await
+    .expect("WanModel::load");
 
     // Safetensors path compiles the DiT matmuls against bf16. A misnamed rename
     // map / wrong probe would silently fall to some other dtype.
@@ -593,7 +628,7 @@ async fn video_e2e_safetensors() {
 
     // VAE decode -> CTHW fp32 frames [3, out_frames, H, W] (clamped to [-1, 1]).
     let frames = model
-        .decode_latent_to_video(&pre_vae, f_lat, h_lat, w_lat, &mut ws)
+        .decode_latent_to_video(&pre_vae, f_lat, h_lat, w_lat, VaeChoice::Full, &mut ws)
         .await
         .expect("decode_latent_to_video");
     tracing::info!(
@@ -613,6 +648,62 @@ async fn video_e2e_safetensors() {
         max_abs <= 1.5,
         "decoded frames exceed the clamp range: max_abs={max_abs:.4e}"
     );
+
+    // Tiny (LightTAE) decoder: NaN-free + clamp-range health, and the temporal
+    // tiling carry is EXACT -- decoding the same latent as one chunk vs one
+    // chunk-per-latent-frame must be bit-identical (memcat is the only temporal
+    // coupling, carried losslessly across boundaries). No pyref (no TAEHV
+    // reference); VRAM is covered by the whole-run TRUE_PEAK assert below, which
+    // now includes these tiny decodes. Runs the multi-chunk carry path even at
+    // the small parity grid, so it is a real (not single-chunk) tiling check.
+    if want_tiny {
+        let single = model
+            .decode_latent_to_video_chunked(
+                &pre_vae,
+                f_lat,
+                h_lat,
+                w_lat,
+                VaeChoice::Tiny,
+                &mut ws,
+                Some(f_lat.max(1)), // whole clip in one chunk (== untiled)
+            )
+            .await
+            .expect("tiny decode (single chunk)");
+        assert_eq!(single.len(), rgb_elems, "tiny decoded element count");
+        summarize("tiny frames single-chunk (CTHW [-1,1])", &single);
+        assert_healthy("tiny frames", &single);
+        let tiny_max = single.iter().copied().map(f32::abs).fold(0f32, f32::max);
+        assert!(
+            tiny_max <= 1.5,
+            "tiny decoded frames exceed clamp range: max_abs={tiny_max:.4e}"
+        );
+
+        let multi = model
+            .decode_latent_to_video_chunked(
+                &pre_vae,
+                f_lat,
+                h_lat,
+                w_lat,
+                VaeChoice::Tiny,
+                &mut ws,
+                Some(1), // one latent frame per chunk -> exercises every carry
+            )
+            .await
+            .expect("tiny decode (multi chunk)");
+        assert_eq!(multi.len(), single.len(), "tiny chunk lengths differ");
+        let chunk_diff = single
+            .iter()
+            .zip(&multi)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!(
+            "[tiny] single-vs-multi-chunk max_abs_diff={chunk_diff:.3e} (f_lat={f_lat}, chunks={f_lat})"
+        );
+        assert_eq!(
+            chunk_diff, 0.0,
+            "tiny temporal tiling not exact: single vs {f_lat}-chunk decode differ by {chunk_diff:.3e}"
+        );
+    }
 
     // Stage frames before the budget/parity assertions so a later failure still
     // leaves the visual output (ours, and theirs when the reference ran).

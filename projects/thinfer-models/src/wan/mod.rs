@@ -16,3 +16,4 @@ pub mod scheduler;
 pub mod source;
 pub mod umt5;
 pub mod vae;
+pub mod vae_tiny;

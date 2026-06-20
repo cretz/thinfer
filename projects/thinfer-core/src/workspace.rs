@@ -1631,6 +1631,37 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    /// `memcat` (MemBlock cat-with-prev-frame): `x [T,C,H,W]` -> `[T,2C,H,W]`
+    /// with the causal one-frame shift fused (see `ops::memcat`). `n_out` is the
+    /// output element count (`T*2C*H*W`).
+    pub fn memcat<O: crate::ops::MemCatOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        prev: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let prev = self.resolve(prev);
+        let bufs = crate::ops::MemCatBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+            prev: &prev,
+        };
+        crate::ops::dispatch_memcat::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
     /// Generic elementwise op dispatch (AddF32, MulF32, SiluF32, TanhF32).
     pub fn dispatch_op<O: crate::ops::Op>(
         &self,

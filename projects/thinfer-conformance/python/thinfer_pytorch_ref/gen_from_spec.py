@@ -61,6 +61,15 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
         return inputs["a"] * inputs["b"]
     if op == "silu":
         return F.silu(inputs["x"])
+    if op == "relu":
+        return F.relu(inputs["x"])
+    if op == "memcat":
+        # MemBlock input assembly: x is [T, C, H, W]; concat current frame with
+        # the previous frame (zero at t=0) on the channel axis -> [T, 2C, H, W].
+        x = inputs["x"]
+        past = torch.zeros_like(x)
+        past[1:] = x[:-1]
+        return torch.cat([x, past], dim=1)
     if op == "silu_mul":
         return F.silu(inputs["a"]) * inputs["b"]
     if op == "gelu_mul":

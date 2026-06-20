@@ -21,6 +21,43 @@ reusable, SkyReels-DF sections obsolete). Z-Image (shipped): `zimage-plan.md`.
   was umT5 f16 overflow, fixed by running umT5 in bf16 acts (see below). A full
   576x576x97 CLI clip is coherent NaN-free (5.00GiB peak @ 5GB budget).
 
+## Tiny VAE (LightTAE) -- SHIPPED, now the CLI default
+
+ONE NAME EVERYWHERE: "tiny" (the ecosystem/TAE name). `VaeChoice::Tiny`, `--vae
+tiny`, `role::TINY_VAE`; "turbo" is gone from the VAE surface (Z-Image-Turbo the
+model name is unrelated). `wan/vae_tiny.rs` LightTAE (`lighttaew2_2`) is the
+`--vae` default; `--vae full` is the opt-in parity path. Arch + bias/dtype map:
+`scratch/notes/lighttae_spec.md`. 576x576x97: end-to-end ~179s (DiT-bound, ~93%
+denoise); decode ~4.4s.
+
+DECODE TILING -- LANDED. Temporal-chunk over latent frames, sized from the VRAM
+budget (`plan_chunk`, `TINY_PEAK_K` calibrated; `THINFER_VAE_TINY_CHUNK` /
+`THINFER_VAE_TINY_MEM` for calibration). `memcat` is the ONLY temporal coupling
+(causal depth 1), so each chunk carries every MemBlock's trailing input frame
+into the next via a ping-pong device buffer; output frames concatenate exactly
+(no halo, no seam). `memcat` op extended with a `prev`-frame binding + `has_prev`
+flag (`has_prev=0` = the old zero-pad, conformance fixture bit-identical). A clip
+that fits runs as one chunk, bit-identical to untiled. VERIFIED: full 576x576x97
+holds a 2GB budget (TRUE_PEAK 2.00GiB, cf=7/4 chunks, NaN-free) -- was 4.98GiB
+untiled, the case that used to force `--vae full` on thin budgets.
+
+DURABLE TEST -- LANDED. `video_e2e` `THINFER_E2E_TINY=1` loads the tiny decoder
+alongside Full (gate untouched) and, post-gate, decodes the same latent single-
+vs multi-chunk: asserts bit-identical (proves the carry is exact, no pyref
+needed) + NaN-free + clamp range. The whole-run TRUE_PEAK assert now also covers
+the tiny decode. Exercises the multi-chunk carry even at the 256 grid.
+
+Follow-ups (open):
+- Conv tile is `Conv2dConfig::DEFAULT` (untuned; decode is no longer the
+  bottleneck so low priority).
+- TINY_PEAK_K is anchored to one measured point (576x576x97). Recalibrate if the
+  decoder graph changes or a new res/budget reveals the model is off (the
+  `set_transient_reserve` backstop prevents overshoot meanwhile).
+- A true same-latent A/B (Full vs Tiny, identical prompt+seed) was NOT run;
+  quality judged on the tiny clip alone. Worth one if a regression is suspected.
+- No decode-vs-TAEHV-pyref parity (the e2e tiny case is health + tiling-exactness
+  only); add one when wiring the TAEHV pyref.
+
 ## VRAM: VAE decode tiling (the hog at higher res, not DiT attention)
 
 The decode live set is `FIXED(tout) + area*PER_AREA(tout)` per spatial tile;

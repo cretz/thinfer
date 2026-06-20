@@ -13,7 +13,9 @@ use thinfer_core::policy::ResidencyBudget;
 use thinfer_core::residency::WeightResidency;
 use thinfer_core::trace::DIAG;
 use thinfer_models::wan::manifest as wanmf;
-use thinfer_models::wan::pipeline::{GenerationParams, ProgressEvent, WanModel, WanVideo};
+use thinfer_models::wan::pipeline::{
+    GenerationParams, ProgressEvent, VaeChoice, WanModel, WanVideo,
+};
 use thinfer_models::wan::source::WanSource;
 use thinfer_models::z_image::pipeline::encode_png;
 use thinfer_native::tokenizer::HfTokenizer;
@@ -96,6 +98,28 @@ pub struct GenerateVideo {
     /// Skip the TTY consent prompt and download missing weight files.
     #[arg(long, default_value_t = false)]
     pub download_as_needed: bool,
+    /// VAE decoder. Default `tiny` (LightTAE `lighttaew2_2`): a ~0.4GB tiny
+    /// decoder, ~50x faster decode at near-identical quality; downloads its own
+    /// weight file. `full` is the real AutoencoderKLWan (the bit-clean parity
+    /// path). Both temporally tile the decode to hold the VRAM budget.
+    #[arg(long, value_enum, default_value_t = VaeChoiceArg::Tiny)]
+    pub vae: VaeChoiceArg,
+}
+
+/// CLI mirror of [`VaeChoice`] (clap `ValueEnum`).
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum VaeChoiceArg {
+    Full,
+    Tiny,
+}
+
+impl From<VaeChoiceArg> for VaeChoice {
+    fn from(v: VaeChoiceArg) -> Self {
+        match v {
+            VaeChoiceArg::Full => VaeChoice::Full,
+            VaeChoiceArg::Tiny => VaeChoice::Tiny,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -157,7 +181,17 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
 
     let manifest = args.model.manifest();
     let variant = args.model.variant();
-    let all_files: Vec<FileRef> = variant.files().map(|(_, f)| *f).collect();
+    let vae: VaeChoice = args.vae.into();
+    let mut all_files: Vec<FileRef> = variant.files().map(|(_, f)| *f).collect();
+    // The tiny decoder weight is not in the static variant file set; pull it
+    // (and only it) in when `--vae tiny` so the parity path never downloads it.
+    if vae == VaeChoice::Tiny {
+        all_files.push(
+            *manifest
+                .get(wanmf::role::TINY_VAE)
+                .ok_or("manifest missing tiny VAE role")?,
+        );
+    }
     let (_resolved, missing) = cache::resolve_all(all_files.iter());
 
     if !missing.is_empty()
@@ -183,6 +217,18 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     let mut weight_openers: Vec<MmapFileOpener> = Vec::with_capacity(variant.weight_roles.len());
     for role in variant.weight_roles {
         let path = resolve_role(role)?;
+        weight_openers.push(
+            MmapFileOpener::new(&path)
+                .await
+                .map_err(|e| format!("open {}: {e}", path.display()))?,
+        );
+    }
+    // Append the tiny decoder as an extra safetensors shard (its `decoder.{N}`
+    // keys are disjoint from the real VAE's `decoder.conv_in/...`), so both live
+    // in one catalog. Only when selected, so the parity path is byte-for-byte
+    // the same source it always was.
+    if vae == VaeChoice::Tiny {
+        let path = resolve_role(wanmf::role::TINY_VAE)?;
         weight_openers.push(
             MmapFileOpener::new(&path)
                 .await
@@ -246,12 +292,12 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     let video = {
         let model = {
             let _s = tracing::info_span!("model_load").entered();
-            WanModel::load(backend, residency, tokenizer)
+            WanModel::load(backend, residency, tokenizer, vae)
                 .await
                 .map_err(|e| format!("model load: {e:?}"))?
         };
         model
-            .generate(&gen_params, Some(&progress))
+            .generate(&gen_params, vae, Some(&progress))
             .await
             .map_err(|e| format!("generate: {e:?}"))?
     };

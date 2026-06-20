@@ -18,6 +18,9 @@
 use thinfer_core::manifest::{FileRef, ModelManifest};
 
 const REPO_DIFFUSERS: &str = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers";
+/// LightTAE tiny decoder lives in lightx2v's standalone autoencoder repo (NOT
+/// the FastVideo bundle); downloaded only when `VaeChoice::Tiny` is selected.
+const REPO_LIGHTX2V_AE: &str = "lightx2v/Autoencoders";
 
 pub mod role {
     /// DMD-distilled Wan2.2-TI2V-5B DiT (`WanTransformer3DModel`), single file.
@@ -35,6 +38,8 @@ pub mod role {
     pub const VAE: &str = "vae/decoder";
     pub const VAE_CONFIG: &str = "vae/config";
     pub const SCHEDULER_CONFIG: &str = "scheduler/config";
+    /// LightTAE (`lighttaew2_2`) opt-in tiny decoder, single file.
+    pub const TINY_VAE: &str = "vae/tiny";
 }
 
 /// One loadable variant: the file set `WanModel::load` needs. Mirrors
@@ -154,6 +159,10 @@ pub static MANIFEST: ModelManifest = ModelManifest {
         (
             role::SCHEDULER_CONFIG,
             FileRef::new(REPO_DIFFUSERS, "scheduler/scheduler_config.json"),
+        ),
+        (
+            role::TINY_VAE,
+            FileRef::new(REPO_LIGHTX2V_AE, "lighttaew2_2.safetensors"),
         ),
     ],
 };

@@ -42,6 +42,10 @@ use crate::wan::vae::{
     VaeDecoderWeights, WanVaeConfig, WanVaeDecodeError, WanVaeDecoder, WanVaePipelines,
     register_decoder,
 };
+use crate::wan::vae_tiny::{
+    TinyDecoderWeights, WanVaeTinyDecodeError, WanVaeTinyDecoder, WanVaeTinyPipelines,
+    register_decoder_tiny,
+};
 
 /// umT5 rope-free context cap. The Wan DiT cross-attends to a fixed
 /// `max_sequence_length`; SkyReels-V2 ships 512.
@@ -122,6 +126,18 @@ pub enum ProgressEvent {
 
 pub type ProgressFn<'a> = Option<&'a dyn Fn(ProgressEvent)>;
 
+/// Which VAE decoder a generate/decode uses. No `Default`: callers state intent
+/// explicitly (the real VAE is the parity path; the LightTAE tiny decoder is
+/// opt-in and only loaded when selected). Requesting `Tiny` on a model loaded
+/// `Full` is a [`GenerateError::TinyVaeNotLoaded`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaeChoice {
+    /// Real `AutoencoderKLWan` decoder (`wan/vae.rs`); bit-clean parity default.
+    Full,
+    /// LightTAE `lighttaew2_2` tiny decoder (`wan/vae_tiny.rs`); fast, opt-in.
+    Tiny,
+}
+
 pub struct WanModel<S: WeightSource, T: Tokenizer> {
     backend: Arc<WgpuBackend>,
     residency: WeightResidency<S>,
@@ -135,6 +151,10 @@ pub struct WanModel<S: WeightSource, T: Tokenizer> {
     /// block dims, and the loader layer count.
     cfg: WanDitConfig,
     vae: WanVaeDecoder,
+    /// LightTAE tiny decoder, present only when the model was loaded with
+    /// `VaeChoice::Tiny` (the tiny weights are downloaded + registered +
+    /// compiled only then). `None` keeps the parity path free of tiny-VAE cost.
+    vae_tiny: Option<WanVaeTinyDecoder>,
     /// Weight dtype the DiT matmul kernels were compiled against (`Bf16` for the
     /// safetensors path, `Quant(k)` when the GGUF surfaced the matmuls). Lets
     /// the e2e assert the GGUF union actually fed the DiT.
@@ -177,11 +197,23 @@ pub enum GenerateError<SE: core::fmt::Debug> {
     Umt5(Umt5ForwardError<SE>),
     Dit(WanDitError<SE>),
     Vae(WanVaeDecodeError<SE>),
+    TinyVae(WanVaeTinyDecodeError<SE>),
+    /// `generate`/`decode` requested `VaeChoice::Tiny` but the model was loaded
+    /// `Full` (tiny weights never registered). Reload with `Tiny`.
+    TinyVaeNotLoaded,
     Wgpu(WgpuError),
     Residency(ResidencyError<SE, WgpuError>),
-    InvalidDims { height: u32, width: u32 },
-    InvalidFrames { num_frames: u32 },
-    PromptTooLong { tokens: usize, max: usize },
+    InvalidDims {
+        height: u32,
+        width: u32,
+    },
+    InvalidFrames {
+        num_frames: u32,
+    },
+    PromptTooLong {
+        tokens: usize,
+        max: usize,
+    },
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for GenerateError<SE> {
@@ -209,6 +241,11 @@ impl<SE: core::fmt::Debug> From<WanVaeDecodeError<SE>> for GenerateError<SE> {
         Self::Vae(e)
     }
 }
+impl<SE: core::fmt::Debug> From<WanVaeTinyDecodeError<SE>> for GenerateError<SE> {
+    fn from(e: WanVaeTinyDecodeError<SE>) -> Self {
+        Self::TinyVae(e)
+    }
+}
 
 impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
     /// Build the model: register every umT5 + DiT + VAE handle with residency
@@ -217,8 +254,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         backend: Arc<WgpuBackend>,
         residency: WeightResidency<S>,
         tokenizer: T,
+        vae: VaeChoice,
     ) -> Result<Self, ModelLoadError> {
-        Self::load_with_act(backend, residency, tokenizer, None).await
+        Self::load_with_act(backend, residency, tokenizer, vae, None).await
     }
 
     /// Diagnostic variant of [`load`] that forces the block activation dtype
@@ -229,6 +267,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         backend: Arc<WgpuBackend>,
         residency: WeightResidency<S>,
         tokenizer: T,
+        vae: VaeChoice,
         act_override: Option<ActDtype>,
     ) -> Result<Self, ModelLoadError> {
         let timing = tracing::enabled!(tracing::Level::INFO);
@@ -248,6 +287,15 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let before_vae_bytes = residency.total_registered_bytes();
         let vae_handles = register_decoder(&residency, &VaeDecoderWeights::new(&vae_cfg))?;
         let vae_weight_footprint = residency.total_registered_bytes() - before_vae_bytes;
+        // Tiny decoder registers only when selected (its weights are a separate
+        // download in the source). Keeps the parity path free of tiny-VAE cost.
+        let vae_tiny_handles = match vae {
+            VaeChoice::Full => None,
+            VaeChoice::Tiny => Some(register_decoder_tiny(
+                &residency,
+                &TinyDecoderWeights::new(),
+            )?),
+        };
 
         // Weights join the VRAM arbiter's reclaim chain so workspace/staging
         // growth evicts unpinned (LRU / prefetch-warmed) residents instead of
@@ -287,6 +335,14 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let umt5_pipelines =
             Umt5Pipelines::compile(&backend, &block_cfgs(umt5_w, umt5_act)).await?;
         let vae_pipelines = WanVaePipelines::compile(&backend).await?;
+        let vae_tiny = match vae_tiny_handles {
+            None => None,
+            Some(handles) => Some(WanVaeTinyDecoder {
+                pipelines: WanVaeTinyPipelines::compile(&backend).await?,
+                handles,
+                cfg: vae_cfg.clone(),
+            }),
+        };
 
         tracing::info!(
             elapsed_ms = t0.map_or(0, |t| t.elapsed().as_millis() as u64),
@@ -308,6 +364,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 cfg: vae_cfg,
                 weight_footprint: vae_weight_footprint,
             },
+            vae_tiny,
             dit_matmul_weight: dit_w,
         })
     }
@@ -324,10 +381,58 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         self.residency.arbiter()
     }
 
+    /// Dispatch a VAE decode to the chosen decoder. Both emit CTHW video
+    /// `[3, 4*f-3, h*16, w*16]` in `[-1, 1]` at the same dims, so callers are
+    /// decoder-agnostic. Tiny errors if the model was loaded `Full`.
+    async fn decode_video(
+        &self,
+        vae: VaeChoice,
+        workspace: &mut Workspace<WgpuBackend>,
+        latent: &[f32],
+        f_lat: usize,
+        h_lat: usize,
+        w_lat: usize,
+        tiny_chunk: Option<usize>,
+    ) -> Result<Vec<f32>, GenerateError<S::Error>> {
+        let _s = trace::scope!("vae_decode", f_lat = f_lat).entered();
+        Ok(match vae {
+            VaeChoice::Full => {
+                self.vae
+                    .decode(
+                        &self.backend,
+                        &self.residency,
+                        workspace,
+                        latent,
+                        f_lat,
+                        h_lat,
+                        w_lat,
+                    )
+                    .await?
+            }
+            VaeChoice::Tiny => {
+                self.vae_tiny
+                    .as_ref()
+                    .ok_or(GenerateError::TinyVaeNotLoaded)?
+                    .decode(
+                        &self.backend,
+                        &self.residency,
+                        workspace,
+                        latent,
+                        f_lat,
+                        h_lat,
+                        w_lat,
+                        tiny_chunk,
+                    )
+                    .await?
+            }
+        })
+    }
+
     /// Run the full pipeline and return decoded video frames.
     pub async fn generate(
         &self,
         params: &GenerationParams,
+        vae: VaeChoice,
         progress: ProgressFn<'_>,
     ) -> Result<WanVideo, GenerateError<S::Error>> {
         let mut workspace = Workspace::new(
@@ -341,20 +446,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         if let Some(p) = progress {
             p(ProgressEvent::VaeDecode);
         }
-        let frames = {
-            let _s = trace::scope!("vae_decode", f_lat = f_lat).entered();
-            self.vae
-                .decode(
-                    &self.backend,
-                    &self.residency,
-                    &mut workspace,
-                    &latent,
-                    f_lat,
-                    h_lat,
-                    w_lat,
-                )
-                .await?
-        };
+        let frames = self
+            .decode_video(vae, &mut workspace, &latent, f_lat, h_lat, w_lat, None)
+            .await?;
         // Phase boundary: nothing stays resident between generates.
         self.residency.evict_all_and_free(&*self.backend);
 
@@ -380,20 +474,28 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         f_lat: usize,
         h_lat: usize,
         w_lat: usize,
+        vae: VaeChoice,
         workspace: &mut Workspace<WgpuBackend>,
     ) -> Result<Vec<f32>, GenerateError<S::Error>> {
-        Ok(self
-            .vae
-            .decode(
-                &self.backend,
-                &self.residency,
-                workspace,
-                latent,
-                f_lat,
-                h_lat,
-                w_lat,
-            )
-            .await?)
+        self.decode_video(vae, workspace, latent, f_lat, h_lat, w_lat, None)
+            .await
+    }
+
+    /// [`decode_latent_to_video`] with an explicit tiny-decoder chunk size (the
+    /// `video_e2e` tiling-equivalence test forces single- vs multi-chunk to
+    /// prove the carry path is exact). `None` is the prod budget-derived size.
+    pub async fn decode_latent_to_video_chunked(
+        &self,
+        latent: &[f32],
+        f_lat: usize,
+        h_lat: usize,
+        w_lat: usize,
+        vae: VaeChoice,
+        workspace: &mut Workspace<WgpuBackend>,
+        tiny_chunk: Option<usize>,
+    ) -> Result<Vec<f32>, GenerateError<S::Error>> {
+        self.decode_video(vae, workspace, latent, f_lat, h_lat, w_lat, tiny_chunk)
+            .await
     }
 
     /// Tokenize -> umT5 encode -> DMD few-step denoise loop. Returns the final
