@@ -6,8 +6,98 @@ new generic ONNX executor (the reusable payoff).
 
 CLI: `thinfer generate face-swap --input-video <mp4> --source-image <png|jpg>
 --output <mp4> [--model hyperswap-1a|1b|1c] [--download-as-needed]`.
-Validated end-to-end (Obama->Biden clip): decode 48 frames -> swap (~0.34s/frame
-at f32) -> encode mp4. Output visually correct.
+Validated end-to-end (Obama->Biden clip): decode -> swap (~0.154s/frame after
+perf pass) -> encode mp4. Output visually correct.
+
+## NEXT (ACTIVE 2026-06-22): correctness + resource fixes (precede QUALITY)
+
+Found while validating face-swap on a real 4K phone clip
+(`/c/work/personal/intabai/notes/test-inputs/`: `face.jpg` + `video.mp4` =
+4096x2160, H.264 High profile, 2 B-frames, 224 frames @ 25fps; also
+`video-big-audio.mp4`). All four issues DONE (UNCOMMITTED); re-validate
+FastWan/LongLive mp4 output still byte-fine (shared encoder path touched) before
+commit.
+
+1. DONE: decode of High-profile / B-frame / 4K input. openh264 0.6->0.9 +
+   `DecoderConfig::flush_after_decode(NoFlush)` + `flush_remaining()` drain (the
+   crate's B-frame-safe pattern). 0.9 encoder API deltas in BOTH `video.rs` and
+   `faceswap.rs`.
+
+2. DONE: RAM/VRAM budget + STREAMING (was ~30GB: whole clip materialized twice).
+   `faceswap.rs` rewritten to STREAM decode -> swap -> encode one frame at a time
+   (`swap_video_streaming` + `Mp4VideoSink`), so peak host RAM is a few frames,
+   not the clip. Added `--ram-budget`/`--vram-budget` (parse_budget) +
+   `backend_for_stats`/`report_mem` `[mem]` rollup, matching video/image. NB: the
+   ONNX executor has no residency pager (small resident models), so the budgets
+   are informational/reporting here, not enforced -- the streaming is the real
+   bound. VALIDATED on the 4K clip: ran end-to-end, 224 frames, no blowup.
+
+3. DONE: encode resolution cap. `fit_encode_dims` downscales the swapped frame to
+   fit openh264's encoder cap (<=3840 long edge / <=2160 short edge), aspect-
+   preserved, even dims, applied per-frame in `Mp4VideoSink::push` before encode.
+   VALIDATED: 4096x2160 -> 3840x2024, all 224 frames encode (was dying at frame 0).
+
+4. DONE: audio passthrough. `extract_audio` reads the input AAC track and
+   `mux_mp4` (extended with `Option<AudioPassthrough>`) remuxes it verbatim (no
+   re-encode), timing preserved (sample start_time/duration in the audio
+   timescale). GOTCHA: the `mp4` 0.14 crate models AAC as only
+   `{profile,freq_index,chan_conf}` and DROPS the rest of the AudioSpecificConfig,
+   so HE-AAC (SBR/PS) cannot round-trip -- it would emit a broken esds
+   (96000Hz/0ch). So passthrough is gated to the object types that fully round-trip
+   (Main/LC/SSR/LTP); HE-AAC etc. are DROPPED with a clear warning (no corrupt
+   audio). VALIDATED: AAC-LC -> output 44100/2ch decodes clean; HE-AACv2 ->
+   video-only + warning. (Real phone clips are AAC-LC.) To passthrough HE-AAC
+   would need verbatim esds-byte copy, which the crate's high-level API can't do.
+
+Perf seen on the 4K clip (healthy, matches prior): hyperswap ~138ms, detect ~16ms,
+paste ~46ms, warp ~3ms per frame; streaming wall ~157s for 224 frames at 4K (paste
+over the full 4096x2160 frame dominates; perf is the separate deferred item).
+Run: `THINFER_TRACE=1 THINFER_FS_PROFILE=1 THINFER_POWER_PREF=high
+./target/release/thinfer.exe generate face-swap --source-image <face.jpg>
+--input-video <video.mp4> --output <out.mp4> --download-as-needed`.
+
+## NEXT (deferred direction = QUALITY, not perf)
+
+Current quality == intabai BASE path (SCRFD align -> HyperSwap 256 -> feathered
+ellipse paste): good for clean frontal faces, but NOT best-reasonable. To match
+intabai full quality, add (all are more ONNX models through the SAME executor +
+the existing warp/paste pipeline -- the cheap part is done):
+1. FACE ENHANCER (biggest perceptual win): GFPGAN 1.4 (facefusion/models-3.0.0
+   `gfpgan_1.4.onnx`, ~340MB) / CodeFormer / RestoreFormer++. After swap, warp
+   the swapped face to FFHQ-512 template (TEMPLATE_FFHQ_512, in pipeline.ts),
+   run enhancer ((p/255-0.5)/0.5 RGB in, *0.5+0.5 out), paste back. CodeFormer
+   takes a `weight` f64 input (0.7). See pipeline.ts `enhanceFace`. CLI flag
+   `--enhancer gfpgan|codeformer|none` (default gfpgan?).
+2. XSEG OCCLUSION MASK (facefusion/models-3.1.0 `xseg_1.onnx`, ~70MB, NEEDS the
+   patch in intabai `patches/xseg_1.patch.json` -- a Max-op patch; check if our
+   executor needs it or can run raw). Input 256 NHWC BGR /255. Output mask ->
+   clip -> gaussian blur -> clip(0.5,1)*2-1 stretch (pipeline.ts getOcclusionMask).
+   Combine with feathered via element-wise min in paste_back (cv.ts pasteBack
+   occlusionMask path). Makes occluders (hands/hair/glasses) show through.
+3. CHEAP: use HyperSwap's own `mask` output (2nd output, [1,1,256,256]) in the
+   paste instead of ignoring it (min with feather). Already decoded, just unused.
+NOTE: enhancer/xseg ONNX op coverage must be checked (run onnx_attrs.py on them);
+likely the same conv-net op set the executor already handles. XSeg is NHWC (our
+kernels assume NCHW) -- may need a transpose at the model boundary or an NHWC tap.
+
+OBSERVED FAILURE MODES (eyeballed on the 4K clip, 2026-06-22): swap degrades hard
+at (a) drastic head angle (strong yaw/pitch) and (b) face half off-screen / hands
+crossing the face -- ghosting + double-edges round the jaw, identity stops holding.
+ROOT CAUSE is the PIPELINE, not the swap net: (a) the rigid 5-pt SIMILARITY warp
+cannot model out-of-plane rotation, so the 256 crop is off-distribution at extreme
+pose; (b) the FIXED-ELLIPSE feather paste has no occlusion/segmentation awareness,
+so it paints swapped pixels over hands/neck/background and misses the true face
+boundary. Switching swap variant (1b/1c, same 256 arch) does NOT help these. The
+fixes ARE the QUALITY items above, in this value order: XSeg/face-parse occlusion
+mask (#2, the biggest fix for hands + off-screen bleed) > use HyperSwap's own mask
+output (#3, free) > enhancer (#1, frontal sharpness) > pose-gating (down-weight or
+skip the paste at extreme yaw). HyperSwap is a strong fast OPEN single-pass swapper
+(>> old inswapper_128) but not the quality ceiling; the real ceiling is the post
+stack (mask+enhancer), and beyond that, pose/occlusion-robust DIFFUSION swappers.
+CANDIDATE TO EVALUATE LATER (user, 2026-06-22): DreamID-V
+(github.com/bytedance/DreamID-V, weights hf.co/XuGuo699/DreamID-V) -- diffusion
+video face-swap, likely much better pose/occlusion but 1-2 orders more compute/frame
+(weigh against the thin-hardware goal + the per-frame budget below before adopting).
 
 ## What landed
 

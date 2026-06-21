@@ -23,7 +23,12 @@ use thinfer_core::onnx::OnnxModel;
 /// Minimal numpy `.npy` reader for C-order little-endian float32 arrays.
 fn read_npy_f32(path: &Path) -> (Vec<i64>, Vec<f32>) {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(&bytes[0..6], b"\x93NUMPY", "not an npy file: {}", path.display());
+    assert_eq!(
+        &bytes[0..6],
+        b"\x93NUMPY",
+        "not an npy file: {}",
+        path.display()
+    );
     let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
     let header = std::str::from_utf8(&bytes[10..10 + header_len]).unwrap();
     assert!(
@@ -53,7 +58,13 @@ struct Stats {
 }
 
 fn compare(got: &[f32], exp: &[f32]) -> Stats {
-    assert_eq!(got.len(), exp.len(), "length mismatch {} vs {}", got.len(), exp.len());
+    assert_eq!(
+        got.len(),
+        exp.len(),
+        "length mismatch {} vs {}",
+        got.len(),
+        exp.len()
+    );
     let mut max_abs = 0f32;
     let mut max_ref = 0f32;
     let mut nan = 0;
@@ -65,7 +76,11 @@ fn compare(got: &[f32], exp: &[f32]) -> Stats {
         max_abs = max_abs.max((g - e).abs());
         max_ref = max_ref.max(e.abs());
     }
-    Stats { max_abs, rel: max_abs / (max_ref + 1e-6), nan }
+    Stats {
+        max_abs,
+        rel: max_abs / (max_ref + 1e-6),
+        nan,
+    }
 }
 
 /// Run one model: load goldens by `tag`, build the executor at the golden input
@@ -109,7 +124,9 @@ async fn run_model(backend: std::sync::Arc<WgpuBackend>, env: &str, tag: &str, t
 
     let mut worst = 0f32;
     for (name, (exp_shape, exp)) in &outputs {
-        let (got_shape, got_data) = got.get(name).unwrap_or_else(|| panic!("missing output {name}"));
+        let (got_shape, got_data) = got
+            .get(name)
+            .unwrap_or_else(|| panic!("missing output {name}"));
         assert_eq!(got_shape, exp_shape, "output {name} shape");
         let s = compare(got_data, exp);
         eprintln!(
@@ -119,7 +136,10 @@ async fn run_model(backend: std::sync::Arc<WgpuBackend>, env: &str, tag: &str, t
         assert_eq!(s.nan, 0, "output {name} has non-finite values");
         worst = worst.max(s.rel);
     }
-    assert!(worst <= tol, "[{tag}] worst rel {worst:.5e} exceeds tol {tol:.1e}");
+    assert!(
+        worst <= tol,
+        "[{tag}] worst rel {worst:.5e} exceeds tol {tol:.1e}"
+    );
     true
 }
 
@@ -176,9 +196,17 @@ fn hyperswap_batch_spike() {
         })
         .await
         .expect("load b1");
-        let tname = m1.input_names.iter().find(|n| n.contains("target")).cloned()
+        let tname = m1
+            .input_names
+            .iter()
+            .find(|n| n.contains("target"))
+            .cloned()
             .unwrap_or_else(|| "target".into());
-        let sname = m1.input_names.iter().find(|n| n.contains("source")).cloned()
+        let sname = m1
+            .input_names
+            .iter()
+            .find(|n| n.contains("source"))
+            .cloned()
             .unwrap_or_else(|| "source".into());
 
         // Time batch-1 (5 runs).

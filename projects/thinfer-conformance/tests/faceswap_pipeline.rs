@@ -75,7 +75,9 @@ fn faceswap_pipeline_e2e() {
         env("THINFER_FS_SRC"),
         env("THINFER_FS_DST"),
     ) else {
-        eprintln!("faceswap_pipeline_e2e skipped (set THINFER_FS_{{SCRFD,ARCFACE,HYPERSWAP,SRC,DST}})");
+        eprintln!(
+            "faceswap_pipeline_e2e skipped (set THINFER_FS_{{SCRFD,ARCFACE,HYPERSWAP,SRC,DST}})"
+        );
         return;
     };
 
@@ -96,7 +98,11 @@ fn faceswap_pipeline_e2e() {
         // Detection finds real faces at sane locations (validates SCRFD decode).
         let src_faces = swapper.detect(&src_img).await.expect("detect src");
         let dst_faces = swapper.detect(&dst_img).await.expect("detect dst");
-        eprintln!("src faces: {}, dst faces: {}", src_faces.len(), dst_faces.len());
+        eprintln!(
+            "src faces: {}, dst faces: {}",
+            src_faces.len(),
+            dst_faces.len()
+        );
         assert!(!src_faces.is_empty(), "no face in source image");
         assert!(!dst_faces.is_empty(), "no face in target image");
         let f0 = &dst_faces[0];
@@ -114,7 +120,10 @@ fn faceswap_pipeline_e2e() {
         // Swap, then check NaN-free + localized change.
         let out = swapper.swap_frame(&dst_img, &emb).await.expect("swap");
         assert_eq!((out.w, out.h), (dst_img.w, dst_img.h));
-        assert!(out.data.iter().all(|x| x.is_finite()), "swap produced non-finite pixels");
+        assert!(
+            out.data.iter().all(|x| x.is_finite()),
+            "swap produced non-finite pixels"
+        );
 
         let (bx0, by0) = (f0.bbox[0].max(0.0) as usize, f0.bbox[1].max(0.0) as usize);
         let (bx1, by1) = (f0.bbox[2].max(0.0) as usize, f0.bbox[3].max(0.0) as usize);
@@ -122,7 +131,10 @@ fn faceswap_pipeline_e2e() {
         let corner_diff = region_diff(&dst_img, &out, 0, 0, 40, 40);
         eprintln!("face-region mean|diff| {face_diff:.2}, corner mean|diff| {corner_diff:.4}");
         assert!(face_diff > 5.0, "face region barely changed ({face_diff})");
-        assert!(corner_diff < 1.0, "corner changed too much ({corner_diff}) - paste leaked");
+        assert!(
+            corner_diff < 1.0,
+            "corner changed too much ({corner_diff}) - paste leaked"
+        );
 
         if let Some(out_path) = env("THINFER_FS_OUT") {
             write_png_rgb(Path::new(&out_path), &out);

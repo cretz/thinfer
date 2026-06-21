@@ -15,7 +15,10 @@ use thinfer_models::faceswap::FaceSwapper;
 use thinfer_models::faceswap::image::Image;
 use thinfer_native::cache;
 
-use super::{PercentLogger, confirm_download, init_backend};
+use super::video::{AudioPassthrough, annexb_to_avcc, mux_mp4};
+use super::{
+    PercentLogger, backend_for_stats, confirm_download, init_backend, parse_budget, report_mem,
+};
 
 /// HyperSwap checkpoint. 1a/1b/1c share architecture + speed; different visual
 /// character (FaceFusion `models-3.3.0`).
@@ -57,6 +60,14 @@ pub struct GenerateFaceSwap {
     /// Swap model checkpoint.
     #[arg(long, value_enum, default_value_t = SwapModel::Hyperswap1a)]
     pub model: SwapModel,
+    /// Host RAM budget. e.g. `8G`, `512M`, raw bytes. Face-swap streams the clip
+    /// frame-by-frame, so peak RAM is a few frames regardless; the flag exists
+    /// for parity with `generate video`/`image` and feeds the `[mem]` rollup.
+    #[arg(long)]
+    pub ram_budget: Option<String>,
+    /// GPU VRAM budget (parity flag; see `--ram-budget`).
+    #[arg(long)]
+    pub vram_budget: Option<String>,
     /// Skip the TTY consent prompt and download missing model files.
     #[arg(long, default_value_t = false)]
     pub download_as_needed: bool,
@@ -95,6 +106,9 @@ pub async fn run_faceswap(args: GenerateFaceSwap) -> Result<(), String> {
     let arcface_bytes = read(&path_of(&ARCFACE)?)?;
     let hyperswap_bytes = read(&path_of(&args.model.file())?)?;
 
+    let ram_bytes = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
+    let vram_bytes = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
+
     let t_run = std::time::Instant::now();
     let stamp = move || format!("[{:6.1}s]", t_run.elapsed().as_secs_f64());
 
@@ -102,27 +116,13 @@ pub async fn run_faceswap(args: GenerateFaceSwap) -> Result<(), String> {
     let source = load_image(&args.source_image)?;
     eprintln!("{} Loaded source {}x{}", stamp(), source.w, source.h);
 
-    // Decode input video.
-    eprintln!("{} Decoding input video", stamp());
-    let (frames, fps) = decode_video(&args.input_video)?;
-    if frames.is_empty() {
-        return Err("input video has no decodable frames".into());
-    }
-    eprintln!(
-        "{} Decoded {} frames at {} fps ({}x{})",
-        stamp(),
-        frames.len(),
-        fps,
-        frames[0].w,
-        frames[0].h
-    );
-
     let backend = init_backend().await?;
+    let stats = backend_for_stats(&backend);
     tracing::info!(
         target: DIAG,
         model = ?args.model,
-        frames = frames.len(),
-        fps,
+        ram_budget = ram_bytes,
+        vram_budget = vram_bytes,
         "face-swap start",
     );
 
@@ -136,33 +136,31 @@ pub async fn run_faceswap(args: GenerateFaceSwap) -> Result<(), String> {
         .map_err(|e| format!("source embedding (no face in source image?): {e}"))?;
     eprintln!("{} Extracted source face embedding", stamp());
 
-    let (w, h) = (frames[0].w, frames[0].h);
-    let mut out_frames: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
-    let n = frames.len();
-    for (i, frame) in frames.iter().enumerate() {
-        let swapped = swapper
-            .swap_frame(frame, &embedding)
-            .await
-            .map_err(|e| format!("swap frame {i}: {e}"))?;
-        out_frames.push(swapped.to_rgb8());
-        if (i + 1) % 10 == 0 || i + 1 == n {
-            eprintln!("{} Swapped frame {}/{}", stamp(), i + 1, n);
-        }
-    }
+    // Stream decode -> swap -> encode one frame at a time (never materialize the
+    // whole clip), remuxing the source audio track through verbatim.
+    let (w, h, fps, n) = swap_video_streaming(
+        &swapper,
+        &embedding,
+        &args.input_video,
+        &args.output,
+        &stamp,
+    )
+    .await?;
 
-    eprintln!("{} Encoding MP4 (H.264)", stamp());
-    encode_rgb8_mp4(&out_frames, w, h, fps, &args.output)?;
     eprintln!(
         "{} Wrote {} ({}x{}, {} frames @ {} fps) in {:.1}s",
         stamp(),
         args.output.display(),
         w,
         h,
-        out_frames.len(),
+        n,
         fps,
         t_run.elapsed().as_secs_f64(),
     );
     tracing::info!(target: DIAG, path = %args.output.display(), "wrote output");
+    if let Some(b) = stats {
+        report_mem(&b, ram_bytes, vram_bytes);
+    }
     Ok(())
 }
 
@@ -178,16 +176,24 @@ fn load_image(path: &Path) -> Result<Image, String> {
     Ok(Image::from_rgb8(w, h, rgb.as_raw()))
 }
 
-// --- Video decode (mp4 demux + openh264) ------------------------------------
+// --- Streaming swap (mp4 demux -> per-frame swap -> mp4 mux) -----------------
 
-/// Decode an mp4/H.264 video into RGB frames. Returns the frames + integer fps.
-fn decode_video(path: &Path) -> Result<(Vec<Image>, u32), String> {
+/// Decode the input, swap each frame, and encode the output one frame at a time
+/// so only a few frames are ever in RAM (the 4K clip otherwise materialized
+/// ~30GB). The source AAC audio track is remuxed through verbatim. Returns the
+/// output `(width, height, fps, frame_count)`.
+async fn swap_video_streaming(
+    swapper: &FaceSwapper,
+    embedding: &[f32],
+    input: &Path,
+    output: &Path,
+    stamp: &dyn Fn() -> String,
+) -> Result<(usize, usize, u32, usize), String> {
     use mp4::{Mp4Reader, TrackType};
     use openh264::OpenH264API;
-    use openh264::decoder::Decoder;
-    use openh264::formats::YUVSource;
+    use openh264::decoder::{Decoder, DecoderConfig, Flush};
 
-    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let file = std::fs::File::open(input).map_err(|e| format!("open {}: {e}", input.display()))?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     let mut mp4 = Mp4Reader::read_header(BufReader::new(file), size)
         .map_err(|e| format!("mp4 parse: {e}"))?;
@@ -222,6 +228,17 @@ fn decode_video(path: &Path) -> Result<(Vec<Image>, u32), String> {
         .map(|t| t.sample_count())
         .unwrap_or(0);
 
+    // Audio is read up front (compressed AAC, small) for verbatim passthrough.
+    let audio = extract_audio(&mut mp4)?;
+    match &audio {
+        Some(a) => eprintln!(
+            "{} Audio: {} AAC sample(s), passthrough",
+            stamp(),
+            a.samples.len()
+        ),
+        None => eprintln!("{} Audio: video-only output", stamp()),
+    }
+
     // Annex B SPS/PPS prefix, prepended to every access unit (decoders tolerate
     // repeats; keeps the first IDR self-contained).
     let mut prefix = Vec::new();
@@ -230,10 +247,20 @@ fn decode_video(path: &Path) -> Result<(Vec<Image>, u32), String> {
         prefix.extend_from_slice(nal);
     }
 
-    let mut decoder = Decoder::new().map_err(|e| format!("openh264 decoder init: {e}"))?;
-    let _ = OpenH264API::from_source(); // ensure the source build links
-    let mut frames = Vec::with_capacity(count as usize);
+    // Disable per-decode auto-flush: with B-frames (High/Main profile) openh264
+    // reorders internally and holds the reorder depth, so frames come ready in
+    // display order and the tail is drained with flush_remaining after the last
+    // AU (the crate's recommended B-frame-safe pattern).
+    let mut decoder = Decoder::with_api_config(
+        OpenH264API::from_source(),
+        DecoderConfig::new().flush_after_decode(Flush::NoFlush),
+    )
+    .map_err(|e| format!("openh264 decoder init: {e}"))?;
+
+    eprintln!("{} Streaming {count} frames at {fps} fps", stamp());
+    let mut sink = Mp4VideoSink::new(fps);
     let mut rgb: Vec<u8> = Vec::new();
+    let mut done = 0usize;
     for sid in 1..=count {
         let Some(sample) = mp4
             .read_sample(track_id, sid)
@@ -247,13 +274,130 @@ fn decode_video(path: &Path) -> Result<(Vec<Image>, u32), String> {
             .decode(&au)
             .map_err(|e| format!("decode sample {sid}: {e}"))?
         {
-            let (w, h) = yuv.dimensions();
-            rgb.resize(w * h * 3, 0);
-            yuv.write_rgb8(&mut rgb);
-            frames.push(Image::from_rgb8(w, h, &rgb));
+            swap_and_push(swapper, embedding, &yuv, &mut sink, &mut rgb).await?;
+            done += 1;
+            if done.is_multiple_of(10) {
+                eprintln!("{} Swapped frame {done}/{count}", stamp());
+            }
         }
     }
-    Ok((frames, fps))
+    for yuv in decoder
+        .flush_remaining()
+        .map_err(|e| format!("decode flush: {e}"))?
+    {
+        swap_and_push(swapper, embedding, &yuv, &mut sink, &mut rgb).await?;
+        done += 1;
+    }
+    if done == 0 {
+        return Err("input video has no decodable frames".into());
+    }
+
+    eprintln!(
+        "{} Encoding MP4 (H.264){}",
+        stamp(),
+        if audio.is_some() { " + audio" } else { "" }
+    );
+    let (out_w, out_h, n, enc_sps, enc_pps, samples) = sink.finish()?;
+    mux_mp4(
+        output, out_w, out_h, fps, &enc_sps, &enc_pps, &samples, audio,
+    )?;
+    Ok((out_w, out_h, fps, n))
+}
+
+/// Decode one YUV frame to an `Image`, swap, and feed it to the encoder sink.
+async fn swap_and_push(
+    swapper: &FaceSwapper,
+    embedding: &[f32],
+    yuv: &openh264::decoder::DecodedYUV<'_>,
+    sink: &mut Mp4VideoSink,
+    rgb: &mut Vec<u8>,
+) -> Result<(), String> {
+    use openh264::formats::YUVSource;
+    let (w, h) = yuv.dimensions();
+    rgb.resize(w * h * 3, 0);
+    yuv.write_rgb8(rgb);
+    let img = Image::from_rgb8(w, h, rgb);
+    let swapped = swapper
+        .swap_frame(&img, embedding)
+        .await
+        .map_err(|e| format!("swap frame: {e}"))?;
+    sink.push(&swapped)
+}
+
+/// Read the input's audio track (if any) for verbatim remux. Returns `None`
+/// (audio dropped, with a warning) when there is no audio, the codec is not AAC,
+/// or the AAC object type cannot be remuxed losslessly. The `mp4` crate models
+/// AAC as only `{profile, freq_index, chan_conf}` and discards the rest of the
+/// AudioSpecificConfig, so HE-AAC (SBR/PS) extension data is lost: those streams
+/// would produce a broken esds, so we drop them rather than emit unplayable
+/// audio. The common phone-clip case (AAC-LC) round-trips cleanly. The track id
+/// + config are copied out before the mutable per-sample reads (borrow checker).
+fn extract_audio<R: std::io::Read + std::io::Seek>(
+    mp4: &mut mp4::Mp4Reader<R>,
+) -> Result<Option<AudioPassthrough>, String> {
+    use mp4::{AudioObjectType, MediaType, TrackType};
+
+    let Some(id) = mp4
+        .tracks()
+        .iter()
+        .find_map(|(&id, t)| matches!(t.track_type(), Ok(TrackType::Audio)).then_some(id))
+    else {
+        return Ok(None); // no audio track at all
+    };
+
+    let (config, timescale, count) = {
+        let t = mp4.tracks().get(&id).ok_or("audio track vanished")?;
+        if !matches!(t.media_type(), Ok(MediaType::AAC)) {
+            eprintln!(
+                "[face-swap] dropping audio: input codec is not AAC (only AAC passthrough is supported)"
+            );
+            return Ok(None);
+        }
+        let profile = t
+            .audio_profile()
+            .map_err(|e| format!("audio profile: {e}"))?;
+        // Only the object types whose config is fully `{profile,freq_index,
+        // chan_conf}` survive the round-trip; HE-AAC and friends do not.
+        if !matches!(
+            profile,
+            AudioObjectType::AacMain
+                | AudioObjectType::AacLowComplexity
+                | AudioObjectType::AacScalableSampleRate
+                | AudioObjectType::AacLongTermPrediction
+        ) {
+            eprintln!(
+                "[face-swap] dropping audio: cannot losslessly remux {profile:?} (e.g. HE-AAC); \
+                 re-encode the input audio to AAC-LC to keep it"
+            );
+            return Ok(None);
+        }
+        let config = mp4::AacConfig {
+            bitrate: t.bitrate(),
+            profile,
+            freq_index: t
+                .sample_freq_index()
+                .map_err(|e| format!("audio freq index: {e}"))?,
+            chan_conf: t
+                .channel_config()
+                .map_err(|e| format!("audio channels: {e}"))?,
+        };
+        (config, t.timescale(), t.sample_count())
+    };
+
+    let mut samples = Vec::with_capacity(count as usize);
+    for sid in 1..=count {
+        if let Some(s) = mp4
+            .read_sample(id, sid)
+            .map_err(|e| format!("read audio sample {sid}: {e}"))?
+        {
+            samples.push(s);
+        }
+    }
+    Ok(Some(AudioPassthrough {
+        config,
+        timescale,
+        samples,
+    }))
 }
 
 /// Convert AVCC (4-byte length-prefixed NALs) to Annex B (start-code prefixed),
@@ -272,43 +416,101 @@ fn avcc_to_annexb(avcc: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-// --- Output encode (RGB8 frames -> mp4) -------------------------------------
+// --- Output encode (streaming RGB8 -> H.264 samples) ------------------------
 
-/// Encode interleaved-RGB8 frames to an H.264 mp4 at `fps`. Mirrors
-/// `video::encode_mp4` but takes ready RGB frames; reuses the shared muxer.
-fn encode_rgb8_mp4(
-    frames: &[Vec<u8>],
-    w: usize,
-    h: usize,
+/// Streaming H.264 encoder sink: each swapped frame is encoded immediately (one
+/// frame in RAM at a time) and accumulated as a compressed AVCC sample. The
+/// output resolution is fixed on the first frame, downscaled to fit openh264's
+/// encoder cap (max 3840 long edge / 2160 short edge), aspect-preserved.
+struct Mp4VideoSink {
     fps: u32,
-    out: &Path,
-) -> Result<(), String> {
-    use openh264::OpenH264API;
-    use openh264::encoder::{Encoder, EncoderConfig};
-    use openh264::formats::{RgbSliceU8, YUVBuffer};
+    enc: Option<openh264::encoder::Encoder>,
+    out_w: usize,
+    out_h: usize,
+    samples: Vec<(bool, Vec<u8>)>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
 
-    const BITS_PER_PIXEL: f64 = 0.2;
-    let bitrate = ((w as f64) * (h as f64) * (fps as f64) * BITS_PER_PIXEL).max(1_000_000.0) as u32;
-    let cfg = EncoderConfig::new()
-        .set_bitrate_bps(bitrate)
-        .enable_skip_frame(false)
-        .max_frame_rate(fps as f32);
-    let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)
-        .map_err(|e| format!("openh264 init: {e}"))?;
-
-    let mut samples: Vec<(bool, Vec<u8>)> = Vec::with_capacity(frames.len());
-    let mut sps: Option<Vec<u8>> = None;
-    let mut pps: Option<Vec<u8>> = None;
-    for (t, rgb) in frames.iter().enumerate() {
-        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(rgb, (w, h)));
-        let bitstream = enc
-            .encode(&yuv)
-            .map_err(|e| format!("openh264 encode frame {t}: {e}"))?;
-        let (sample, is_key) =
-            super::video::annexb_to_avcc(&bitstream.to_vec(), &mut sps, &mut pps);
-        samples.push((is_key, sample));
+impl Mp4VideoSink {
+    fn new(fps: u32) -> Self {
+        Self {
+            fps,
+            enc: None,
+            out_w: 0,
+            out_h: 0,
+            samples: Vec::new(),
+            sps: None,
+            pps: None,
+        }
     }
-    let sps = sps.ok_or("openh264 produced no SPS")?;
-    let pps = pps.ok_or("openh264 produced no PPS")?;
-    super::video::mux_mp4(out, w, h, fps, &sps, &pps, &samples)
+
+    /// Encode one swapped frame. The first call fixes the output resolution and
+    /// builds the encoder; the input resolution is assumed constant thereafter.
+    fn push(&mut self, frame: &Image) -> Result<(), String> {
+        use openh264::OpenH264API;
+        use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+
+        if self.enc.is_none() {
+            let (ow, oh) = fit_encode_dims(frame.w, frame.h);
+            if (ow, oh) != (frame.w, frame.h) {
+                eprintln!(
+                    "[face-swap] downscaling output {}x{} -> {ow}x{oh} (openh264 encoder cap)",
+                    frame.w, frame.h
+                );
+            }
+            const BITS_PER_PIXEL: f64 = 0.2;
+            let bitrate = ((ow as f64) * (oh as f64) * (self.fps as f64) * BITS_PER_PIXEL)
+                .max(1_000_000.0) as u32;
+            let cfg = EncoderConfig::new()
+                .bitrate(BitRate::from_bps(bitrate))
+                .skip_frames(false)
+                .max_frame_rate(FrameRate::from_hz(self.fps as f32));
+            self.enc = Some(
+                Encoder::with_api_config(OpenH264API::from_source(), cfg)
+                    .map_err(|e| format!("openh264 init: {e}"))?,
+            );
+            (self.out_w, self.out_h) = (ow, oh);
+        }
+
+        let rgb = if (self.out_w, self.out_h) == (frame.w, frame.h) {
+            frame.to_rgb8()
+        } else {
+            frame.resize(self.out_w, self.out_h).to_rgb8()
+        };
+        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (self.out_w, self.out_h)));
+        let bitstream = self
+            .enc
+            .as_mut()
+            .unwrap()
+            .encode(&yuv)
+            .map_err(|e| format!("openh264 encode frame {}: {e}", self.samples.len()))?;
+        let (sample, is_key) = annexb_to_avcc(&bitstream.to_vec(), &mut self.sps, &mut self.pps);
+        self.samples.push((is_key, sample));
+        Ok(())
+    }
+
+    /// Output `(width, height, frame_count, sps, pps, samples)`.
+    #[allow(clippy::type_complexity)]
+    fn finish(
+        self,
+    ) -> Result<(usize, usize, usize, Vec<u8>, Vec<u8>, Vec<(bool, Vec<u8>)>), String> {
+        let sps = self.sps.ok_or("openh264 produced no SPS")?;
+        let pps = self.pps.ok_or("openh264 produced no PPS")?;
+        let n = self.samples.len();
+        Ok((self.out_w, self.out_h, n, sps, pps, self.samples))
+    }
+}
+
+/// Largest aspect-preserving size within openh264's encoder cap (max 3840 on the
+/// long edge, 2160 on the short edge), rounded to even (4:2:0 needs even dims).
+/// Returns the input (even-clamped) when it already fits.
+fn fit_encode_dims(w: usize, h: usize) -> (usize, usize) {
+    const MAX_LONG: f64 = 3840.0;
+    const MAX_SHORT: f64 = 2160.0;
+    let (long, short) = (w.max(h) as f64, w.min(h) as f64);
+    let s = (MAX_LONG / long).min(MAX_SHORT / short).min(1.0);
+    let even = |x: f64| ((x.round() as usize) & !1).max(2);
+    (even(w as f64 * s), even(h as f64 * s))
 }

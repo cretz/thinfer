@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # Video output (CLI-only): H.264 encode (Cisco BSD, compiled from source) +
 # MP4 mux. Kept out of thinfer-native/-models so web stays free of a wasm
 # software encoder (it uses the browser's WebCodecs encoder instead).
-openh264 = "0.6"
+openh264 = "0.9"
 mp4 = "0.14"
 # Source-image decode for `generate face-swap` (PNG/JPEG only; no extra codecs).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

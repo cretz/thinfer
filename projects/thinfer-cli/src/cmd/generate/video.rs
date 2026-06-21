@@ -119,12 +119,14 @@ pub struct GenerateVideo {
     /// path). Both temporally tile the decode to hold the VRAM budget.
     #[arg(long, value_enum, default_value_t = VaeChoiceArg::Tiny)]
     pub vae: VaeChoiceArg,
-    /// Opt-in DP4A int8 matmul for the quantization-safe DiT sites (qkv +
-    /// ffn_up): transcodes those weights to Q8_0 at load and runs the i8xi8
-    /// `dot4I8Packed` path, ~6x faster on those matmuls (~-20% denoise) at
-    /// no measurable quality loss (parity-validated). Off => bf16 throughout.
-    #[arg(long, default_value_t = false)]
-    pub i8_matmul: bool,
+    /// Disable the default DP4A int8 matmul on the quantization-safe DiT sites
+    /// (self-attn qkv + ffn_up). By default those weights are transcoded to
+    /// Q8_0 at load and run the i8xi8 `dot4I8Packed` path (~5-6x on those
+    /// matmuls, ~-30% wall, no measurable quality loss -- parity-validated);
+    /// pass this to force the bf16 reference path throughout (e.g. for exact
+    /// parity against the reference, or maximum fidelity).
+    #[arg(long)]
+    pub no_i8_matmul: bool,
 }
 
 /// CLI mirror of [`VaeChoice`] (clap `ValueEnum`).
@@ -571,7 +573,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             &shots,
             &progress,
             true,
-            args.i8_matmul,
+            !args.no_i8_matmul,
         )
         .await?
     } else {
@@ -590,7 +592,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             &shots,
             &progress,
             false,
-            args.i8_matmul,
+            !args.no_i8_matmul,
         )
         .await?
     };
@@ -629,7 +631,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
 /// converted to RGB8, encoded with openh264, and muxed with the `mp4` crate.
 fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> {
     use openh264::OpenH264API;
-    use openh264::encoder::{Encoder, EncoderConfig};
+    use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
     use openh264::formats::{RgbSliceU8, YUVBuffer};
 
     let (w, h, n) = (video.width, video.height, video.num_frames);
@@ -644,9 +646,9 @@ fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> {
     const BITS_PER_PIXEL: f64 = 0.2; // visually near-lossless for H.264 at these dims
     let bitrate = ((w as f64) * (h as f64) * (fps as f64) * BITS_PER_PIXEL).max(1_000_000.0) as u32;
     let cfg = EncoderConfig::new()
-        .set_bitrate_bps(bitrate)
-        .enable_skip_frame(false)
-        .max_frame_rate(fps as f32);
+        .bitrate(BitRate::from_bps(bitrate))
+        .skip_frames(false)
+        .max_frame_rate(FrameRate::from_hz(fps as f32));
     let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)
         .map_err(|e| format!("openh264 init: {e}"))?;
 
@@ -668,11 +670,21 @@ fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> {
 
     let sps = sps.ok_or("openh264 produced no SPS")?;
     let pps = pps.ok_or("openh264 produced no PPS")?;
-    mux_mp4(out, w, h, fps, &sps, &pps, &samples)
+    mux_mp4(out, w, h, fps, &sps, &pps, &samples, None)
 }
 
-/// Mux length-prefixed (AVCC) H.264 samples into an MP4 file. Shared with the
-/// face-swap encoder (`super::faceswap`).
+/// An audio track copied verbatim from an input container, to be remuxed into
+/// the output without re-encoding (face-swap preserves the source clip's audio).
+/// `samples` carry their own `start_time`/`duration` in `timescale` units.
+pub(crate) struct AudioPassthrough {
+    pub config: mp4::AacConfig,
+    pub timescale: u32,
+    pub samples: Vec<mp4::Mp4Sample>,
+}
+
+/// Mux length-prefixed (AVCC) H.264 video samples into an MP4 file, optionally
+/// adding a verbatim audio track (`audio`). Shared with the face-swap encoder
+/// (`super::faceswap`); the t2v video path passes `None`.
 pub(crate) fn mux_mp4(
     out: &Path,
     w: usize,
@@ -681,6 +693,7 @@ pub(crate) fn mux_mp4(
     sps: &[u8],
     pps: &[u8],
     samples: &[(bool, Vec<u8>)],
+    audio: Option<AudioPassthrough>,
 ) -> Result<(), String> {
     use mp4::{
         AvcConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType,
@@ -714,6 +727,18 @@ pub(crate) fn mux_mp4(
         })
         .map_err(|e| format!("mp4 add_track: {e}"))?;
 
+    // Audio is track 2 (added before any sample write so both stbl tables exist).
+    if let Some(a) = &audio {
+        writer
+            .add_track(&TrackConfig {
+                track_type: TrackType::Audio,
+                timescale: a.timescale,
+                language: "und".to_string(),
+                media_conf: MediaConfig::AacConfig(a.config.clone()),
+            })
+            .map_err(|e| format!("mp4 add audio track: {e}"))?;
+    }
+
     for (i, (is_key, bytes)) in samples.iter().enumerate() {
         writer
             .write_sample(
@@ -727,6 +752,15 @@ pub(crate) fn mux_mp4(
                 },
             )
             .map_err(|e| format!("mp4 write_sample {i}: {e}"))?;
+    }
+    // Audio samples are copied through verbatim, preserving their original
+    // timing (start_time/duration are already in the audio timescale).
+    if let Some(a) = audio {
+        for (i, s) in a.samples.iter().enumerate() {
+            writer
+                .write_sample(2, s)
+                .map_err(|e| format!("mp4 write audio sample {i}: {e}"))?;
+        }
     }
     writer.write_end().map_err(|e| format!("mp4 end: {e}"))?;
     let data = writer.into_writer().into_inner();
