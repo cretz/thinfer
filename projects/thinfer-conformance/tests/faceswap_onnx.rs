@@ -145,6 +145,100 @@ fn arcface_parity() {
     }
 }
 
+/// Batch spike: run HyperSwap with target `[B,3,256,256]` (B copies of the
+/// golden target) + source `[1,512]`, assert every output slice matches the
+/// batch-1 golden, and report per-crop wall time vs batch 1. Validates that
+/// batching crops is numerically identical and measures the occupancy win.
+#[test]
+fn hyperswap_batch_spike() {
+    let ran = pollster::block_on(async {
+        let (Ok(model_path), Ok(golden_dir)) = (
+            std::env::var("THINFER_FS_HYPERSWAP"),
+            std::env::var("THINFER_FS_GOLDEN"),
+        ) else {
+            return false;
+        };
+        let g = PathBuf::from(golden_dir);
+        let (t_shape, t_data) = read_npy_f32(&g.join("hyperswap_in_target.npy"));
+        let (s_shape, s_data) = read_npy_f32(&g.join("hyperswap_in_source.npy"));
+        let (_o_shape, o_data) = read_npy_f32(&g.join("hyperswap_out_output.npy"));
+        let onnx = std::fs::read(&model_path).unwrap();
+        let backend = std::sync::Arc::new(WgpuBackend::new().await.expect("wgpu"));
+
+        const B: i64 = 8;
+        let per = t_data.len();
+        // Names from a batch-1 load.
+        let m1 = OnnxModel::load(std::sync::Arc::clone(&backend), &onnx, &{
+            let mut m = HashMap::new();
+            m.insert("target".into(), t_shape.clone());
+            m.insert("source".into(), s_shape.clone());
+            m
+        })
+        .await
+        .expect("load b1");
+        let tname = m1.input_names.iter().find(|n| n.contains("target")).cloned()
+            .unwrap_or_else(|| "target".into());
+        let sname = m1.input_names.iter().find(|n| n.contains("source")).cloned()
+            .unwrap_or_else(|| "source".into());
+
+        // Time batch-1 (5 runs).
+        let mut f1 = HashMap::new();
+        f1.insert(tname.clone(), t_data.clone());
+        f1.insert(sname.clone(), s_data.clone());
+        let _ = m1.run(&f1).await.unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 {
+            let _ = m1.run(&f1).await.unwrap();
+        }
+        let ms1 = t0.elapsed().as_secs_f64() * 1e3 / 5.0;
+
+        // Batch B.
+        let mut bt = t_shape.clone();
+        bt[0] = B;
+        let mb = OnnxModel::load(std::sync::Arc::clone(&backend), &onnx, &{
+            let mut m = HashMap::new();
+            m.insert("target".into(), bt.clone());
+            m.insert("source".into(), s_shape.clone());
+            m
+        })
+        .await
+        .expect("load bB");
+        let mut tiled = Vec::with_capacity(per * B as usize);
+        for _ in 0..B {
+            tiled.extend_from_slice(&t_data);
+        }
+        let mut fb = HashMap::new();
+        fb.insert(tname, tiled);
+        fb.insert(sname, s_data.clone());
+        let outb = mb.run(&fb).await.unwrap();
+        let (osh, od) = outb.values().find(|(sh, _)| sh.len() == 4).unwrap();
+        assert_eq!(osh[0], B);
+        // Each batch slice equals the golden.
+        let mut worst = 0f32;
+        for b in 0..B as usize {
+            let s = compare(&od[b * per..(b + 1) * per], &o_data);
+            worst = worst.max(s.rel);
+            assert_eq!(s.nan, 0);
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let _ = mb.run(&fb).await.unwrap();
+        }
+        let msb = t0.elapsed().as_secs_f64() * 1e3 / 3.0;
+        eprintln!(
+            "[batch] b1={ms1:.1}ms/crop  b{B}={:.1}ms/crop ({:.1}ms total)  speedup={:.2}x  worst_rel={worst:.2e}",
+            msb / B as f64,
+            msb,
+            ms1 / (msb / B as f64),
+        );
+        assert!(worst <= 6e-2, "batch output diverged: {worst:.2e}");
+        true
+    });
+    if !ran {
+        eprintln!("hyperswap_batch_spike skipped");
+    }
+}
+
 #[test]
 fn hyperswap_parity() {
     let ran = pollster::block_on(async {

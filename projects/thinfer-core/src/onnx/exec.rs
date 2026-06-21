@@ -154,6 +154,7 @@ struct Pipelines {
     resize: WgpuPipeline,
     maxpool: WgpuPipeline,
     zero_upsample: WgpuPipeline,
+    concat2: WgpuPipeline,
 }
 
 impl Pipelines {
@@ -199,6 +200,7 @@ impl Pipelines {
             resize: p("onnx_resize", kernels::RESIZE, 1).await?,
             maxpool: p("onnx_maxpool", kernels::MAXPOOL, 1).await?,
             zero_upsample: p("onnx_zero_upsample", kernels::ZERO_UPSAMPLE, 1).await?,
+            concat2: p("onnx_concat2", kernels::CONCAT2, 2).await?,
         })
     }
 }
@@ -1099,35 +1101,65 @@ impl OnnxModel {
                 acts.insert(out_name.clone(), out);
             }
             "Concat" => {
-                // Contiguous concat (N==1 / axis after unit dims): sequential
-                // copy into one output buffer. Holds for all face-swap concats
-                // (channel concat at batch 1).
                 let axis = {
                     let a = node.attr_i("axis", 0);
                     (if a < 0 { a + out_shape.len() as i64 } else { a }) as usize
                 };
-                let outer: i64 = out_shape[..axis].iter().product::<i64>().max(1);
-                if outer != 1 {
-                    return Err(OnnxError::Unsupported(format!(
-                        "Concat axis={axis} with non-unit outer dims {out_shape:?}"
-                    )));
-                }
-                let out = self.alloc_out(&out_shape, keepalive)?;
-                let mut off_elems: u64 = 0;
-                for inp in &node.inputs {
-                    let src = self.value_buf(acts, inp)?;
-                    let n = numel(self.plan.shape_of(inp)?);
-                    self.backend.copy_buffer_to_buffer(
+                if node.inputs.len() == 2 {
+                    // Batch-safe 2-input concat kernel (the U-Net skip joins).
+                    let a = self.value_buf(acts, &node.inputs[0])?;
+                    let b = self.value_buf(acts, &node.inputs[1])?;
+                    let ad = pad4(in_shape(0)?);
+                    let bd = pad4(in_shape(1)?);
+                    let od = pad4(&out_shape);
+                    // `axis` is over the (possibly <4D) logical shape; pad4 right-
+                    // aligns to 4D, so shift the axis index to match.
+                    let off = 4 - out_shape.len();
+                    let a_axis = ad[axis + off];
+                    let mut u = Uni::default()
+                        .u32(total)
+                        .u32((axis + off) as u32)
+                        .u32(a_axis)
+                        .u32(0);
+                    for v in od.iter().chain(ad.iter()).chain(bd.iter()) {
+                        u = u.u32(*v);
+                    }
+                    let uni = self.write_uniform(u.finish(), keepalive)?;
+                    let out = self.alloc_out(&out_shape, keepalive)?;
+                    self.backend.dispatch(
                         encoder,
-                        src.id,
-                        0,
-                        out.id,
-                        off_elems * 4,
-                        n * 4,
+                        &self.pipelines.concat2,
+                        &[a.binding(0), b.binding(1), out.binding(2), uni.binding(3)],
+                        wg,
                     )?;
-                    off_elems += n;
+                    acts.insert(out_name.clone(), out);
+                } else {
+                    // Contiguous fallback (N inputs): valid only when the axes
+                    // before `axis` are unit (e.g. batch 1, channel concat).
+                    let outer: i64 = out_shape[..axis].iter().product::<i64>().max(1);
+                    if outer != 1 {
+                        return Err(OnnxError::Unsupported(format!(
+                            "Concat of {} inputs at axis={axis} with non-unit outer dims {out_shape:?}",
+                            node.inputs.len()
+                        )));
+                    }
+                    let out = self.alloc_out(&out_shape, keepalive)?;
+                    let mut off_elems: u64 = 0;
+                    for inp in &node.inputs {
+                        let src = self.value_buf(acts, inp)?;
+                        let n = numel(self.plan.shape_of(inp)?);
+                        self.backend.copy_buffer_to_buffer(
+                            encoder,
+                            src.id,
+                            0,
+                            out.id,
+                            off_elems * 4,
+                            n * 4,
+                        )?;
+                        off_elems += n;
+                    }
+                    acts.insert(out_name.clone(), out);
                 }
-                acts.insert(out_name.clone(), out);
             }
             other => return Err(OnnxError::Unsupported(format!("compute op '{other}'"))),
         }

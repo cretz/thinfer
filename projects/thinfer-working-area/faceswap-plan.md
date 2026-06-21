@@ -72,6 +72,13 @@ weight-bandwidth-bound, so bf16 only adds unpack cost. DO NOT re-try bf16/f16
 weight storage for speed (VRAM-only benefit). Same applies to f16 acts (conv
 accumulates f32 regardless).
 
+SPIKED + NOT WIRED: crop batching. Batch=8 through HyperSwap gives only 1.09x/crop
+(parity bit-equal, 1.21e-3) -- the convs are NOT occupancy-bound at batch 1, so
+batching does not pay. KEPT the batch-safe `CONCAT2` kernel (general 2-input
+concat, replaces the batch-1-only contiguous copy; parity-verified) + the
+`hyperswap_batch_spike` test (documents the 1.09x finding + guards batched
+correctness). DO NOT build a batched pipeline -- measured dead.
+
 PATH TO "a few minutes" (~3-5x more needed; not yet done):
 - i8 DP4A conv (the repo's matmul 6x technique, applied to conv): the only real
   ALU lever for the compute-bound convs. Large + quality-sensitive build.

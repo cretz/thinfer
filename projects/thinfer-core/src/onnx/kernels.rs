@@ -422,6 +422,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+/// Concat of two NCHW tensors along `axis` (0..3). Output `[od]`; `a` occupies
+/// `[0, a_axis)` along `axis`, `b` the rest. Batch-safe (the contiguous-copy
+/// path in exec only holds at batch 1). Bindings: 0=a, 1=b, 2=out, 3=uniform.
+pub const CONCAT2: &str = r#"
+struct U { total: u32, axis: u32, a_axis: u32, _p: u32, od: vec4<u32>, ad: vec4<u32>, bd: vec4<u32> };
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> u: U;
+fn lin(d: vec4<u32>, c: vec4<u32>) -> u32 {
+  return ((c.x * d.y + c.y) * d.z + c.z) * d.w + c.w;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  let c3 = i % u.od.w;
+  let c2 = (i / u.od.w) % u.od.z;
+  let c1 = (i / (u.od.w * u.od.z)) % u.od.y;
+  let c0 = i / (u.od.w * u.od.z * u.od.y);
+  var coord = vec4<u32>(c0, c1, c2, c3);
+  let ax = coord[u.axis];
+  if (ax < u.a_axis) {
+    out[i] = a[lin(u.ad, coord)];
+  } else {
+    coord[u.axis] = ax - u.a_axis;
+    out[i] = b[lin(u.bd, coord)];
+  }
+}
+"#;
+
 /// Zero-upsample (NCHW): place each input pixel at `(y*s_h, x*s_w)` in a larger
 /// grid `[(h-1)*s_h+1, (w-1)*s_w+1]`, zeros elsewhere. Used to turn a strided
 /// ConvTranspose into a stride-1 conv (with a flipped/transposed kernel), so it
