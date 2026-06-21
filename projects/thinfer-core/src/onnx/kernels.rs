@@ -422,6 +422,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+/// Zero-upsample (NCHW): place each input pixel at `(y*s_h, x*s_w)` in a larger
+/// grid `[(h-1)*s_h+1, (w-1)*s_w+1]`, zeros elsewhere. Used to turn a strided
+/// ConvTranspose into a stride-1 conv (with a flipped/transposed kernel), so it
+/// can run through the tuned conv path. Bindings: 0=x, 1=out, 2=uniform.
+pub const ZERO_UPSAMPLE: &str = r#"
+struct U { total: u32, n: u32, c: u32, h: u32, w: u32, oh: u32, ow: u32, s_h: u32, s_w: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  let ow = i % u.ow;
+  let oh = (i / u.ow) % u.oh;
+  let c = (i / (u.ow * u.oh)) % u.c;
+  let no = i / (u.ow * u.oh * u.c);
+  if (ow % u.s_w == 0u && oh % u.s_h == 0u) {
+    let ih = oh / u.s_h;
+    let iw = ow / u.s_w;
+    out[i] = x[((no * u.c + c) * u.h + ih) * u.w + iw];
+  } else {
+    out[i] = 0.0;
+  }
+}
+"#;
+
 /// MaxPool 2D (NCHW) with kernel/stride/pad/dilation. Bindings: 0=x, 1=out,
 /// 2=uniform.
 pub const MAXPOOL: &str = r#"

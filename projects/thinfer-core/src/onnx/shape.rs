@@ -300,6 +300,20 @@ fn process_node(
             });
             return Ok(());
         }
+        // Expand only ever feeds broadcasting binary ops here (AdaIN scale/shift:
+        // Gemm -> Reshape -> Expand -> Mul/Add). The binary kernels broadcast
+        // from the small [1,C,1,1] buffer directly, so materializing the full
+        // [1,C,H,W] is pure waste: alias the input and keep its (small) shape.
+        "Expand" => {
+            let in_shape = get(vals, &node.inputs[0])?.shape.clone();
+            set_shape(vals, &node.outputs[0], in_shape.clone());
+            steps.push(Step::View {
+                out: node.outputs[0].clone(),
+                src: node.inputs[0].clone(),
+                shape: in_shape,
+            });
+            return Ok(());
+        }
         // All-f32 executor: an activation Cast is a no-op relabel.
         "Cast" | "Identity" | "Dropout" => {
             let in_shape = get(vals, &node.inputs[0])?.shape.clone();
@@ -668,16 +682,6 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
                 None => (0..x.len()).rev().collect(),
             };
             set_shape(vals, &node.outputs[0], perm.iter().map(|&p| x[p]).collect());
-        }
-        "Expand" => {
-            let x = in_shape(0)?;
-            let target = get(vals, &node.inputs[1])?
-                .data
-                .as_ref()
-                .ok_or_else(|| PlanError::Unsupported("Expand non-const shape".into()))?
-                .as_i64()
-                .to_vec();
-            set_shape(vals, &node.outputs[0], broadcast(&x, &target)?);
         }
         other => return Err(PlanError::Unsupported(format!("op '{other}'"))),
     }

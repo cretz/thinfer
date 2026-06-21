@@ -172,20 +172,44 @@ pub fn invert_affine(m: &Affine) -> Affine {
     ]
 }
 
+/// Number of worker threads for a host pass over `h` rows.
+fn n_threads(h: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(h.max(1))
+}
+
 /// Warp `src` by forward affine `matrix` (src->dst) into a `(w, h)` output with
-/// bilinear sampling + border-replicate.
+/// bilinear sampling + border-replicate. Rows are split across threads (the
+/// per-pixel math is unchanged, so output is identical to the serial version).
 pub fn warp_affine(src: &Image, matrix: &Affine, w: usize, h: usize) -> Image {
     let inv = invert_affine(matrix);
     let mut out = Image::new(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            let fx = inv[0] * x as f32 + inv[1] * y as f32 + inv[2];
-            let fy = inv[3] * x as f32 + inv[4] * y as f32 + inv[5];
-            let p = src.sample(fx, fy);
-            let di = (y * w + x) * 3;
-            out.data[di..di + 3].copy_from_slice(&p);
+    let nt = n_threads(h);
+    let rows_per = h.div_ceil(nt);
+    std::thread::scope(|s| {
+        let mut rest = out.data.as_mut_slice();
+        let mut y0 = 0;
+        while y0 < h {
+            let y1 = (y0 + rows_per).min(h);
+            let (chunk, tail) = rest.split_at_mut((y1 - y0) * w * 3);
+            rest = tail;
+            let src = &*src;
+            s.spawn(move || {
+                for (yy, row) in chunk.chunks_exact_mut(w * 3).enumerate() {
+                    let y = (y0 + yy) as f32;
+                    for x in 0..w {
+                        let fx = inv[0] * x as f32 + inv[1] * y + inv[2];
+                        let fy = inv[3] * x as f32 + inv[4] * y + inv[5];
+                        let p = src.sample(fx, fy);
+                        row[x * 3..x * 3 + 3].copy_from_slice(&p);
+                    }
+                }
+            });
+            y0 = y1;
         }
-    }
+    });
     out
 }
 
@@ -224,7 +248,13 @@ mod tests {
         let theta: f32 = 30f32.to_radians();
         let (s, c) = (theta.sin(), theta.cos());
         let scale = 1.5f32;
-        let src = [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0], [5.0, 3.0]];
+        let src = [
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [5.0, 3.0],
+        ];
         let mut dst = [[0.0f32; 2]; 5];
         for (i, p) in src.iter().enumerate() {
             dst[i][0] = scale * (c * p[0] - s * p[1]) + 10.0;
@@ -275,37 +305,51 @@ pub fn paste_back(frame: &Image, crop: &Image, matrix: &Affine) -> Image {
     let (cw, ch) = (crop.w, crop.h);
     let mask = feathered_mask(cw, ch, 15.0, 15.0);
     let mut out = frame.clone();
-    let m = matrix;
-    for y in 0..fh {
-        for x in 0..fw {
-            let cx = m[0] * x as f32 + m[1] * y as f32 + m[2];
-            let cy = m[3] * x as f32 + m[4] * y as f32 + m[5];
-            if cx < 0.0 || cx >= (cw - 1) as f32 || cy < 0.0 || cy >= (ch - 1) as f32 {
-                continue;
-            }
-            let x0 = cx.floor() as usize;
-            let y0 = cy.floor() as usize;
-            let x1 = x0 + 1;
-            let y1 = y0 + 1;
-            let fx = cx - x0 as f32;
-            let fy = cy - y0 as f32;
-            let m00 = mask[y0 * cw + x0];
-            let m10 = mask[y0 * cw + x1];
-            let m01 = mask[y1 * cw + x0];
-            let m11 = mask[y1 * cw + x1];
-            let alpha = m00 * (1.0 - fx) * (1.0 - fy)
-                + m10 * fx * (1.0 - fy)
-                + m01 * (1.0 - fx) * fy
-                + m11 * fx * fy;
-            if alpha < 0.001 {
-                continue;
-            }
-            let cp = crop.sample(cx, cy);
-            let di = (y * fw + x) * 3;
-            for (c, &v) in cp.iter().enumerate() {
-                out.data[di + c] = out.data[di + c] * (1.0 - alpha) + v * alpha;
-            }
+    let m = *matrix;
+    let nt = n_threads(fh);
+    let rows_per = fh.div_ceil(nt);
+    std::thread::scope(|s| {
+        let mut rest = out.data.as_mut_slice();
+        let mut row0 = 0usize;
+        while row0 < fh {
+            let row1 = (row0 + rows_per).min(fh);
+            let (chunk, tail) = rest.split_at_mut((row1 - row0) * fw * 3);
+            rest = tail;
+            let crop = &*crop;
+            let mask = &mask;
+            s.spawn(move || {
+                for (yy, row) in chunk.chunks_exact_mut(fw * 3).enumerate() {
+                    let y = (row0 + yy) as f32;
+                    for x in 0..fw {
+                        let cx = m[0] * x as f32 + m[1] * y + m[2];
+                        let cy = m[3] * x as f32 + m[4] * y + m[5];
+                        if cx < 0.0 || cx >= (cw - 1) as f32 || cy < 0.0 || cy >= (ch - 1) as f32 {
+                            continue;
+                        }
+                        let x0 = cx.floor() as usize;
+                        let y0 = cy.floor() as usize;
+                        let fx = cx - x0 as f32;
+                        let fy = cy - y0 as f32;
+                        let m00 = mask[y0 * cw + x0];
+                        let m10 = mask[y0 * cw + x0 + 1];
+                        let m01 = mask[(y0 + 1) * cw + x0];
+                        let m11 = mask[(y0 + 1) * cw + x0 + 1];
+                        let alpha = m00 * (1.0 - fx) * (1.0 - fy)
+                            + m10 * fx * (1.0 - fy)
+                            + m01 * (1.0 - fx) * fy
+                            + m11 * fx * fy;
+                        if alpha < 0.001 {
+                            continue;
+                        }
+                        let cp = crop.sample(cx, cy);
+                        for (c, &v) in cp.iter().enumerate() {
+                            row[x * 3 + c] = row[x * 3 + c] * (1.0 - alpha) + v * alpha;
+                        }
+                    }
+                }
+            });
+            row0 = row1;
         }
-    }
+    });
     out
 }

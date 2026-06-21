@@ -49,12 +49,38 @@ CLI + VIDEO (`thinfer-cli/.../generate/faceswap.rs`):
   openh264 Decoder (AVCC->AnnexB, SPS/PPS prefix per AU). Output: openh264
   encode reusing video.rs mux helpers (now `pub(crate)`).
 
-## Open follow-ups (low priority)
+## Perf (measured 2026-06-21, RTX 5070 Laptop, 960x2182 1-face frame)
 
-- PERF: convs are direct (1 thread/output elem), f32 weights. Wins available:
-  bf16/f16 weight storage (halve VRAM, ~2x bandwidth), tiled implicit-GEMM conv
-  (reuse ops/conv2d shape), batch frames, overlap decode/swap/encode. ~0.34s/
-  frame now; fine but not optimized.
+Per-frame 0.34s -> 0.154s (~2.2x); 48-frame clip 20.7s -> 12.2s. Breakdown now:
+hyperswap GPU ~127ms (was 280), detect ~13ms, paste ~11ms, warp ~2.5ms.
+Profilers (gated, kept): `THINFER_FS_PROFILE` (per-phase), `THINFER_ONNX_OPPROF`
+(per-op-type GPU; absolutes inflated by per-submit latency, use for ranking).
+
+LANDED (all quality-neutral, parity unchanged: hyperswap 1.2e-3, scrfd 1e-6):
+- Tiled implicit-GEMM conv for group=1/dilation=1 convs (reuse `ops/conv2d`,
+  3 tile regimes). The HyperSwap/ArcFace bulk. 280->157ms.
+- ConvTranspose via zero-upsample + flipped/transposed-weight tuned conv
+  (`ZERO_UPSAMPLE` kernel + load-time weight transform). 157->146ms.
+- Expand elimination: AdaIN broadcasts are zero-cost views; the binary kernels
+  broadcast from `[1,C,1,1]` directly. 146->127ms.
+- Host warp/paste parallelized over rows (`std::thread::scope`). Marginal
+  (paste is full-frame-scan + 25MB clone bound, not compute).
+
+TRIED + REVERTED: bf16 conv weights. MEASURED SLOWER (127->139ms) + parity loss
+(scrfd 6.4e-2). The HyperSwap convs are f32-FMA COMPUTE-bound on this GPU, not
+weight-bandwidth-bound, so bf16 only adds unpack cost. DO NOT re-try bf16/f16
+weight storage for speed (VRAM-only benefit). Same applies to f16 acts (conv
+accumulates f32 regardless).
+
+PATH TO "a few minutes" (~3-5x more needed; not yet done):
+- i8 DP4A conv (the repo's matmul 6x technique, applied to conv): the only real
+  ALU lever for the compute-bound convs. Large + quality-sensitive build.
+- Frame batching: deep-layer convs have tiny spatial (2x2/4x4) -> terrible
+  batch=1 occupancy; running B face-crops together amortizes. Medium effort,
+  helps occupancy-limited (not FLOP-limited) ops.
+- Cheap: detect every Nth frame (~10ms/frame), bbox-only paste (~7ms/frame).
+
+## Open follow-ups (low priority)
 - Durable committed fixtures: e2e tests are env-gated on scratch images. A
   committed tiny face fixture + pyref would make them CI-runnable.
 - XSeg occlusion mask + face enhancers (GFPGAN/CodeFormer) not ported (intabai

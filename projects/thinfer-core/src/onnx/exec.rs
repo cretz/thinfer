@@ -74,6 +74,9 @@ impl GpuBuf {
             size: self.len,
         }
     }
+    fn bufref(&self) -> crate::backend::BufRef {
+        crate::backend::BufRef::new(self.id, self.len)
+    }
 }
 impl Drop for GpuBuf {
     fn drop(&mut self) {
@@ -99,9 +102,45 @@ fn layout(n_read: usize) -> Vec<BindingLayout> {
     l
 }
 
+/// A tuned implicit-GEMM conv2d pipeline + the tile config it was built with
+/// (the op carries the tile shape needed to pick the dispatch grid).
+struct TiledConv {
+    pipeline: WgpuPipeline,
+    op: crate::ops::Conv2dF32,
+}
+
+impl TiledConv {
+    async fn compile(
+        backend: &WgpuBackend,
+        label: &str,
+        tile: crate::ops::Conv2dConfig,
+    ) -> Result<Self, WgpuError> {
+        use crate::ops::{Conv2dF32, Conv2dOp, WgslConfig};
+        // f32 weights: the HyperSwap convs are compute-bound (f32-FMA-limited)
+        // on this GPU, so bf16 weights only add unpack cost (measured slower)
+        // and lose precision. Keep f32; the ALU win would need i8 DP4A.
+        let op = Conv2dF32::new(tile);
+        let pipeline = backend
+            .create_pipeline(
+                label,
+                &op.wgsl(&WgslConfig::FP32),
+                "main",
+                <Conv2dF32 as Conv2dOp>::layout(),
+            )
+            .await?;
+        Ok(Self { pipeline, op })
+    }
+}
+
 /// Compiled kernel pipelines (one per op family; no compile-time variants).
 struct Pipelines {
+    /// Direct conv (groups / dilation): SCRFD depthwise etc.
     conv2d: WgpuPipeline,
+    /// Tuned implicit-GEMM conv (group=1, dilation=1): the HyperSwap/ArcFace
+    /// bulk. Three tile regimes by output shape (see `pick_tiled_conv`).
+    conv2d_tiled: TiledConv,
+    conv2d_tiled_wide: TiledConv,
+    conv2d_tiled_small_n: TiledConv,
     convt2d: WgpuPipeline,
     gemm: WgpuPipeline,
     instance_norm: WgpuPipeline,
@@ -114,6 +153,7 @@ struct Pipelines {
     depth_to_space: WgpuPipeline,
     resize: WgpuPipeline,
     maxpool: WgpuPipeline,
+    zero_upsample: WgpuPipeline,
 }
 
 impl Pipelines {
@@ -122,8 +162,30 @@ impl Pipelines {
             let lay = layout(n_read);
             async move { backend.create_pipeline(name, src, "main", &lay).await }
         };
+        use crate::ops::Conv2dConfig;
+        // Tile regimes (mirror the VAE's): default, wide (large spatial), and
+        // small-N (tiny Cout like the 3-channel output conv).
+        const WIDE: Conv2dConfig = Conv2dConfig {
+            bm: 64,
+            bn: 128,
+            bk: 32,
+            tm: 4,
+            tn: 8,
+        };
+        const SMALL_N: Conv2dConfig = Conv2dConfig {
+            bm: 4,
+            bn: 128,
+            bk: 32,
+            tm: 1,
+            tn: 2,
+        };
         Ok(Self {
             conv2d: p("onnx_conv2d", kernels::CONV2D, 3).await?,
+            conv2d_tiled: TiledConv::compile(backend, "onnx_conv2d_tiled", Conv2dConfig::DEFAULT)
+                .await?,
+            conv2d_tiled_wide: TiledConv::compile(backend, "onnx_conv2d_tiled_wide", WIDE).await?,
+            conv2d_tiled_small_n: TiledConv::compile(backend, "onnx_conv2d_tiled_small_n", SMALL_N)
+                .await?,
             convt2d: p("onnx_convt2d", kernels::CONVT2D, 3).await?,
             gemm: p("onnx_gemm", kernels::GEMM, 3).await?,
             instance_norm: p("onnx_instance_norm", kernels::INSTANCE_NORM, 3).await?,
@@ -136,6 +198,7 @@ impl Pipelines {
             depth_to_space: p("onnx_depth_to_space", kernels::DEPTH_TO_SPACE, 1).await?,
             resize: p("onnx_resize", kernels::RESIZE, 1).await?,
             maxpool: p("onnx_maxpool", kernels::MAXPOOL, 1).await?,
+            zero_upsample: p("onnx_zero_upsample", kernels::ZERO_UPSAMPLE, 1).await?,
         })
     }
 }
@@ -245,10 +308,21 @@ impl OnnxModel {
 
         let mut to_upload: HashSet<String> = HashSet::new();
         let mut bn_nodes: Vec<usize> = Vec::new();
+        let mut ct_nodes: Vec<usize> = Vec::new();
         for &idx in &compute {
             let node = &self.graph.nodes[idx];
             match node.op_type.as_str() {
                 "BatchNormalization" => bn_nodes.push(idx),
+                // ConvTranspose weight is transformed (flip+transpose) below for
+                // the tiled-conv path; only its bias uploads via the generic path.
+                "ConvTranspose" if ct_tiled_eligible(node) => {
+                    ct_nodes.push(idx);
+                    if let Some(b) = node.inputs.get(2).filter(|s| !s.is_empty())
+                        && self.plan.consts.contains_key(b)
+                    {
+                        to_upload.insert(b.clone());
+                    }
+                }
                 _ => {
                     for inp in data_operands(&node.op_type, &node.inputs) {
                         if self.plan.consts.contains_key(inp) {
@@ -292,6 +366,38 @@ impl OnnxModel {
             self.consts.insert(format!("{out}__bn_a"), ba);
             self.consts.insert(format!("{out}__bn_b"), bb);
         }
+
+        // ConvTranspose -> tiled conv: transform the weight `[Cin, Cout, kH, kW]`
+        // into a conv weight `[Cout, Cin, kH, kW]` that is spatially flipped and
+        // Cin/Cout-transposed. Stored under `{out}__ct_w`.
+        for idx in ct_nodes {
+            let node = &self.graph.nodes[idx];
+            let wname = &node.inputs[1];
+            let dims = self.plan.shape_of(wname)?.to_vec(); // [Cin, Cout, kH, kW]
+            let (cin, cout, kh, kw) = (
+                dims[0] as usize,
+                dims[1] as usize,
+                dims[2] as usize,
+                dims[3] as usize,
+            );
+            let src = self.const_f32(wname)?; // [Cin, Cout, kH, kW]
+            let mut dst = vec![0.0f32; cout * cin * kh * kw];
+            for ci in 0..cin {
+                for co in 0..cout {
+                    for r in 0..kh {
+                        for s in 0..kw {
+                            let si = ((ci * cout + co) * kh + r) * kw + s;
+                            // flip spatial, transpose (ci,co): W'[co,ci,kh-1-r,kw-1-s].
+                            let di = ((co * cin + ci) * kh + (kh - 1 - r)) * kw + (kw - 1 - s);
+                            dst[di] = src[si];
+                        }
+                    }
+                }
+            }
+            let out = node.outputs[0].clone();
+            let buf = self.upload_f32(&out, &dst)?;
+            self.consts.insert(format!("{out}__ct_w"), buf);
+        }
         Ok(())
     }
 
@@ -319,6 +425,13 @@ impl OnnxModel {
         // Keep uniforms + intermediate buffers alive until submit completes.
         let mut keepalive: Vec<Rc<GpuBuf>> = Vec::new();
 
+        // Diagnostic: when set, submit+await after each compute op and tally GPU
+        // wall time per op type. Adds per-submit overhead, so it's for relative
+        // ranking only - never on in the normal single-submit path.
+        let opprof = std::env::var_os("THINFER_ONNX_OPPROF").is_some();
+        let mut prof: std::collections::BTreeMap<&str, (f64, u32)> =
+            std::collections::BTreeMap::new();
+
         for step in &self.plan.steps {
             match step {
                 Step::View { out, src, .. } => {
@@ -327,11 +440,30 @@ impl OnnxModel {
                 }
                 Step::Compute { node_idx } => {
                     self.dispatch_node(*node_idx, &mut acts, &mut encoder, &mut keepalive)?;
+                    if opprof {
+                        let enc =
+                            std::mem::replace(&mut encoder, self.backend.create_command_encoder());
+                        let t = web_time::Instant::now();
+                        self.backend.submit(enc).await?;
+                        let dt = t.elapsed().as_secs_f64() * 1e3;
+                        let e = prof
+                            .entry(self.graph.nodes[*node_idx].op_type.as_str())
+                            .or_default();
+                        e.0 += dt;
+                        e.1 += 1;
+                    }
                 }
             }
         }
 
         self.backend.submit(encoder).await?;
+        if opprof {
+            let mut rows: Vec<_> = prof.iter().collect();
+            rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+            for (op, (ms, n)) in rows {
+                eprintln!("[onnx-opprof] {op:<22} total={ms:7.1}ms  count={n}");
+            }
+        }
 
         let mut out = HashMap::new();
         for name in &self.output_names {
@@ -358,6 +490,18 @@ impl OnnxModel {
             .or_else(|| self.consts.get(name))
             .cloned()
             .ok_or_else(|| OnnxError::Unsupported(format!("no buffer for value {name}")))
+    }
+
+    /// Pick the conv tile regime for an output shape: small-N for tiny Cout
+    /// (e.g. the 3-channel output conv), wide for large spatial, else default.
+    fn pick_tiled_conv(&self, cout: u32, m_spatial: u32) -> &TiledConv {
+        if cout <= 4 {
+            &self.pipelines.conv2d_tiled_small_n
+        } else if m_spatial >= 65536 && cout >= 64 {
+            &self.pipelines.conv2d_tiled_wide
+        } else {
+            &self.pipelines.conv2d_tiled
+        }
     }
 
     fn alloc_out(
@@ -398,6 +542,176 @@ impl OnnxModel {
         let wg = crate::ops::linear_workgroups(total, 64);
 
         match op {
+            // Tuned implicit-GEMM path for plain (group=1, dilation=1) convs:
+            // the HyperSwap/ArcFace bulk. Shared-memory weight + im2col reuse.
+            "Conv"
+                if node.attr_i("group", 1) == 1
+                    && node
+                        .attr_ints("dilations")
+                        .map(|d| d == [1, 1])
+                        .unwrap_or(true) =>
+            {
+                let x = self.value_buf(acts, &node.inputs[0])?;
+                let w = self.value_buf(acts, &node.inputs[1])?;
+                let xs = in_shape(0)?.to_vec();
+                let ws = in_shape(1)?.to_vec();
+                let bias = match node.inputs.get(2).filter(|s| !s.is_empty()) {
+                    Some(b) => self.value_buf(acts, b)?,
+                    None => self.zero_bias(out_shape[1] as usize, keepalive)?,
+                };
+                let strides = node.attr_ints("strides").unwrap_or(&[1, 1]);
+                let pads = node.attr_ints("pads").unwrap_or(&[0, 0, 0, 0]);
+                // conv2d.rs uniform U: b,cin,cout,h_in,w_in,h_out,w_out,kh,kw,
+                // pad_h,pad_w,stride_h,stride_w,_,_,_.
+                let u = Uni::default()
+                    .u32(xs[0] as u32)
+                    .u32(xs[1] as u32)
+                    .u32(out_shape[1] as u32)
+                    .u32(xs[2] as u32)
+                    .u32(xs[3] as u32)
+                    .u32(out_shape[2] as u32)
+                    .u32(out_shape[3] as u32)
+                    .u32(ws[2] as u32)
+                    .u32(ws[3] as u32)
+                    .u32(pads[0] as u32)
+                    .u32(pads[1] as u32)
+                    .u32(strides[0] as u32)
+                    .u32(strides[1] as u32)
+                    .u32(0)
+                    .u32(0)
+                    .u32(0)
+                    .finish();
+                let uni = self.write_uniform(u, keepalive)?;
+                let out = self.alloc_out(&out_shape, keepalive)?;
+                let cout = out_shape[1] as u32;
+                let m_spatial = (out_shape[2] * out_shape[3]) as u32;
+                let conv = self.pick_tiled_conv(cout, m_spatial);
+                let (xb, wb, bb, ub, ob) = (
+                    x.bufref(),
+                    w.bufref(),
+                    bias.bufref(),
+                    uni.bufref(),
+                    out.bufref(),
+                );
+                let bufs = crate::ops::Conv2dBufs {
+                    x: &xb,
+                    w: &wb,
+                    bias: &bb,
+                    uniform: &ub,
+                    out: &ob,
+                };
+                crate::ops::dispatch_conv2d::<crate::ops::Conv2dF32, _>(
+                    self.backend.as_ref(),
+                    encoder,
+                    &conv.pipeline,
+                    &conv.op,
+                    &bufs,
+                    cout,
+                    m_spatial,
+                    xs[0] as u32,
+                )?;
+                acts.insert(out_name.clone(), out);
+            }
+            // ConvTranspose via zero-upsample + tuned conv with the flipped/
+            // transposed weight (built at load as `{out}__ct_w`).
+            "ConvTranspose" if ct_tiled_eligible(node) => {
+                let x = self.value_buf(acts, &node.inputs[0])?;
+                let xs = in_shape(0)?.to_vec(); // [n, cin, h, w]
+                let ws = in_shape(1)?.to_vec(); // [cin, cout, kh, kw]
+                let (cin, kh, kw) = (xs[1] as u32, ws[2] as u32, ws[3] as u32);
+                let strides = node.attr_ints("strides").unwrap_or(&[1, 1]);
+                let pads = node.attr_ints("pads").unwrap_or(&[0, 0, 0, 0]);
+                let (sh, sw) = (strides[0] as u32, strides[1] as u32);
+                let up_h = (xs[2] as u32 - 1) * sh + 1;
+                let up_w = (xs[3] as u32 - 1) * sw + 1;
+
+                // 1) zero-upsample x -> x_up.
+                let up_shape = vec![xs[0], cin as i64, up_h as i64, up_w as i64];
+                let x_up = self.alloc_out(&up_shape, keepalive)?;
+                let total_up = numel(&up_shape) as u32;
+                let zu = Uni::default()
+                    .u32(total_up)
+                    .u32(xs[0] as u32)
+                    .u32(cin)
+                    .u32(xs[2] as u32)
+                    .u32(xs[3] as u32)
+                    .u32(up_h)
+                    .u32(up_w)
+                    .u32(sh)
+                    .u32(sw)
+                    .u32(0)
+                    .u32(0)
+                    .u32(0)
+                    .finish();
+                let zu_u = self.write_uniform(zu, keepalive)?;
+                self.backend.dispatch(
+                    encoder,
+                    &self.pipelines.zero_upsample,
+                    &[x.binding(0), x_up.binding(1), zu_u.binding(2)],
+                    crate::ops::linear_workgroups(total_up, 64),
+                )?;
+
+                // 2) stride-1 conv with the flipped/transposed weight, pad' = k-1-p.
+                let cout = out_shape[1] as u32;
+                let ct_w = self
+                    .consts
+                    .get(&format!("{out_name}__ct_w"))
+                    .cloned()
+                    .ok_or_else(|| OnnxError::Unsupported("convtranspose weight missing".into()))?;
+                let bias = match node.inputs.get(2).filter(|s| !s.is_empty()) {
+                    Some(b) => self.value_buf(acts, b)?,
+                    None => self.zero_bias(cout as usize, keepalive)?,
+                };
+                let pad_h = kh - 1 - pads[0] as u32;
+                let pad_w = kw - 1 - pads[1] as u32;
+                let u = Uni::default()
+                    .u32(xs[0] as u32)
+                    .u32(cin)
+                    .u32(cout)
+                    .u32(up_h)
+                    .u32(up_w)
+                    .u32(out_shape[2] as u32)
+                    .u32(out_shape[3] as u32)
+                    .u32(kh)
+                    .u32(kw)
+                    .u32(pad_h)
+                    .u32(pad_w)
+                    .u32(1)
+                    .u32(1)
+                    .u32(0)
+                    .u32(0)
+                    .u32(0)
+                    .finish();
+                let uni = self.write_uniform(u, keepalive)?;
+                let out = self.alloc_out(&out_shape, keepalive)?;
+                let m_spatial = (out_shape[2] * out_shape[3]) as u32;
+                let conv = self.pick_tiled_conv(cout, m_spatial);
+                let (xb, wb, bb, ub, ob) = (
+                    x_up.bufref(),
+                    ct_w.bufref(),
+                    bias.bufref(),
+                    uni.bufref(),
+                    out.bufref(),
+                );
+                let bufs = crate::ops::Conv2dBufs {
+                    x: &xb,
+                    w: &wb,
+                    bias: &bb,
+                    uniform: &ub,
+                    out: &ob,
+                };
+                crate::ops::dispatch_conv2d::<crate::ops::Conv2dF32, _>(
+                    self.backend.as_ref(),
+                    encoder,
+                    &conv.pipeline,
+                    &conv.op,
+                    &bufs,
+                    cout,
+                    m_spatial,
+                    xs[0] as u32,
+                )?;
+                acts.insert(out_name.clone(), out);
+            }
             "Conv" | "ConvTranspose" => {
                 let x = self.value_buf(acts, &node.inputs[0])?;
                 let w = self.value_buf(acts, &node.inputs[1])?;
@@ -407,7 +721,7 @@ impl OnnxModel {
                     Some(b) => self.value_buf(acts, b)?,
                     None => self.zero_bias(out_shape[1] as usize, keepalive)?,
                 };
-                let group = node.attr_i("group", 1) as u32;
+                let group = node.attr_i("group", 1) as u32; // direct-kernel path
                 let ksh = node
                     .attr_ints("kernel_shape")
                     .map(|v| (v[0] as u32, v[1] as u32))
@@ -838,6 +1152,20 @@ fn channel_hw(shape: &[i64]) -> (u32, u32) {
     let c = shape.get(1).copied().unwrap_or(1) as u32;
     let hw = shape.iter().skip(2).product::<i64>().max(1) as u32;
     (c, hw)
+}
+
+/// Whether a ConvTranspose can use the zero-upsample + tuned-conv path: plain
+/// group=1, dilation=1, no output_padding (the HyperSwap convtransposes).
+fn ct_tiled_eligible(node: &crate::onnx::proto::Node) -> bool {
+    node.attr_i("group", 1) == 1
+        && node
+            .attr_ints("dilations")
+            .map(|d| d == [1, 1])
+            .unwrap_or(true)
+        && node
+            .attr_ints("output_padding")
+            .map(|o| o.iter().all(|&v| v == 0))
+            .unwrap_or(true)
 }
 
 /// Indices of a node's inputs that are real data operands (not shape/param

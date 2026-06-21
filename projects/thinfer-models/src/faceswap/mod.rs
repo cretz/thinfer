@@ -129,10 +129,16 @@ impl FaceSwapper {
         frame: &Image,
         source_embedding: &[f32],
     ) -> Result<Image, OnnxError> {
+        let prof = std::env::var_os("THINFER_FS_PROFILE").is_some();
+        let t = std::time::Instant::now();
         let faces = detect::detect(&self.scrfd, frame).await?;
+        let detect_ms = t.elapsed().as_secs_f64() * 1e3;
         let mut result = frame.clone();
         for face in &faces {
             result = self.swap_one(&result, face, source_embedding).await?;
+        }
+        if prof {
+            eprintln!("[fs-profile] detect={detect_ms:.1}ms faces={}", faces.len());
         }
         Ok(result)
     }
@@ -149,17 +155,22 @@ impl FaceSwapper {
         face: &Face,
         source_embedding: &[f32],
     ) -> Result<Image, OnnxError> {
+        let prof = std::env::var_os("THINFER_FS_PROFILE").is_some();
+        let t = std::time::Instant::now();
         let (crop, matrix) =
             warp_to_template(frame, &face.landmark5, &TEMPLATE_ARCFACE_128, SWAP_SIZE);
         // HyperSwap target: RGB, (p/255 - 0.5)/0.5 == p/127.5 - 1.
         let target = to_nchw(&crop, false, 1.0 / 127.5, -1.0);
+        let warp_ms = t.elapsed().as_secs_f64() * 1e3;
         let mut feeds = HashMap::new();
         feeds.insert(self.hyperswap_target_name.clone(), target);
         feeds.insert(
             self.hyperswap_source_name.clone(),
             source_embedding.to_vec(),
         );
+        let t = std::time::Instant::now();
         let out = self.hyperswap.run(&feeds).await?;
+        let run_ms = t.elapsed().as_secs_f64() * 1e3;
         // Output: prefer the "output" tensor; fall back to the first non-mask.
         let (_shape, data) = out
             .iter()
@@ -170,7 +181,15 @@ impl FaceSwapper {
             .clone();
         // De-normalize CHW [-1, 1] -> HWC RGB [0, 255].
         let swapped = nchw_to_image(&data, SWAP_SIZE, SWAP_SIZE);
-        Ok(image::paste_back(frame, &swapped, &matrix))
+        let t = std::time::Instant::now();
+        let out_img = image::paste_back(frame, &swapped, &matrix);
+        if prof {
+            eprintln!(
+                "[fs-profile] warp={warp_ms:.1}ms hyperswap_run={run_ms:.1}ms paste={:.1}ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(out_img)
     }
 }
 
