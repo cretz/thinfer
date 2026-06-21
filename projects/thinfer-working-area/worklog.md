@@ -16,7 +16,11 @@ reusable, SkyReels-DF sections obsolete). Z-Image (shipped): `zimage-plan.md`.
   (per-forward DiT in band, AR path bit-identical to GREEN FastWan); the AR-depth
   compounding vs the bf16-locked pyref is TOLERATED via a two-tier band (tight
   per-forward `vel_c0s0`, gross floor on compounded tensors). Video CLI-confirmed
-  good (512x512x349, 11 chunks, faces stable). Remaining = AR perf + multi-shot e2e.
+  good (512x512x349, 11 chunks, faces stable). MULTI-SHOT LANDED + health-GREEN
+  (scene cuts via per-shot prompts + scene_cut_prefix + RoPE-phase advance + chunk
+  pin). SELF-ATTN QKV i8 LANDED (qkv site-split: self-attn DP4A, cross-attn bf16;
+  parity GREEN, self-attn qkv matmul 6.1x). Remaining = larger-res/warm perf
+  (streaming-overlap levers) + multi-shot pyref byte-parity (only health-tested).
 
 ## NEXT (active): LongLive-2.0-5B (AR/causal long video)
 
@@ -165,10 +169,19 @@ REMAINING:
    (4 chunks x [4 steps + 1 clean recache]) vs FastWan's 3 -- each re-pays per-block
    weight streaming + cross-attn over the full 512 text rows; the O(N)-streaming win is
    LENGTH/VRAM-bound generation, not shorter wall at a fixed length.
+   STATUS: TWO compute wins landed -- i8 DP4A ffn_up AND now self-attn qkv (the
+   qkv site-split, see the i8 SHIPPED section below). Measured 256x256x61 CLI
+   (tiny VAE, TRACE): self-attn qkv matmul 4237->699ms (6.1x; +430ms dequant net
+   ~3.75x), cross-attn qkv UNCHANGED at ~4.9s (stays bf16), wall 63.8->53.8s (-16%).
+   The streaming-overlap wins (a/b/d) target idle that is mostly a COLD-START disk
+   artifact: warm (page-cache hot) the AR forward at 576 is ~86% compute-bound (GPU
+   158s vs denoise wall 183s, ~14% idle that is NOT block-weight streaming).
+   Re-measure warm at 576 before chasing any of these.
    WINS, in value order (all quality-neutral, exact):
-   (a) PREFETCH OVERLAP in `forward_ar` (the ~15% idle): mirror `forward`'s
-       `join!(submit, next_acquire, prefetch_after)` so the next block's weights stream
-       during this block's compute. Highest value, cleanest.
+   (a) PREFETCH OVERLAP in `forward_ar`: mirror `forward`'s `join!(submit,
+       next_acquire, prefetch_after)`. TRIED + REVERTED: ~1% warm (noise); the "15%
+       idle" was cold-disk, not recoverable per-block streaming. Do NOT re-add without
+       a warm before/after showing real gain.
    (b) Upload the window prefix ONCE per chunk, not per forward: it is identical across
        a chunk's 5 forwards (host transfer, not in gpu_ms, but cuts HtoD traffic).
    (c) Activation-tile the AR self-attn (workspace ~= budget at 576): cuts the workspace
@@ -177,10 +190,21 @@ REMAINING:
        upstream bypasses it for cudagraphs, but we have no cudagraph, so it is a free win.
    (e) Skip the head (proj_out + unpatchify) on the clean recache pass (velocity
        discarded); small (proj_out is 192 cols).
-3. MULTI-SHOT / SCENE-CUT path is built in `kv_cache.rs` (pin/zero/advance_shot,
-   global+pinned sink, multi_shot_rope_offset) but UNEXERCISED e2e -- single-prompt T2V
-   only so far (no scene cuts -> no pinning, rope_offset 0). Wire shot boundaries
-   (`scene_cut_prefix` prompts) + a multi-shot e2e when multi-shot output is wanted.
+3. MULTI-SHOT / SCENE-CUT -- LANDED + health-GREEN (2026-06-21). CLI repeats
+   `--prompt` (one per shot); `--frames`/`--duration` is one value (split evenly in
+   chunk units, mirrors upstream `_even_durations`) or one-per-prompt, else error;
+   single prompt -> empty shots (the parity path, byte-unchanged). Engine: `Shot{prompt,
+   chunks}` + `shots: &[Shot]` on `generate_ar`/`denoise_ar`; `denoise_ar` builds the
+   per-chunk block-prompt list (first chunk of shots>0 gets `SCENE_CUT_PREFIX`), encodes
+   each unique prompt once, and at each boundary chunk calls `cache.advance_shot()`
+   before `begin_chunk` (RoPE phase, already plumbed to `forward_ar`) + `pin_current_chunk`
+   after commit. Release `shot_clean_recache=False`, so NO cache zero on a cut (only
+   advance + pin); the `zero_for_scene_cut` primitive stays for if it is ever enabled.
+   Tests: `longlive_multishot_e2e` (real weights, 2 shots, NaN-free + variance, PASS 56s);
+   `kv_cache::pinned_chunk_survives_eviction` unit test; CLI shot-resolution unit tests.
+   OPEN: only health-tested -- a multi-shot pyref byte-parity (extend
+   `gen_longlive_video_e2e_ref.py` to the multi-prompt block list) is the durable proof
+   if/when multi-shot quality must be guaranteed. `zero_for_scene_cut` path unexercised.
 
 KEY GOTCHA for the AR loop: within a chunk, `current_start` is CONSTANT across all 4
 UniPC steps + the clean pass; each forward recomputes the chunk's K/V at the same tail
@@ -256,17 +280,49 @@ NEXT levers if needed (all still conv-GPU bound): budget-aware larger tiles (few
 halos), packed/vec4 x-gathers (keep f32 accum order). DO NOT retry conv3d index-
 math: im2col loop-invariant-div hoist TRIED + REVERTED 2026-06-19 (262->301s).
 
+## SHIPPED: i8 DP4A matmul -- ffn_up + self-attn qkv (opt-in `--i8-matmul`)
+
+CLI `--i8-matmul` (off by default; threaded `WanModel::load(.., i8_matmul)` ->
+`WanI8Sites` in `wan/loader.rs`): transcodes the ffn_up AND self-attn qkv weights
+bf16->Q8_0 at load and routes those sites through the i8xi8 `matmul_i8` (`dot4I8Packed`)
+DP4A path. ffn_up op 42.3->6.9s (~6x: 4x ALU + better occupancy than the latency-bound
+bf16 kernel), denoise -20% / total wall -19% at 576x576x61. Pure COMPUTE win (not byte
+movement: GPU is 86% busy warm). Quality-neutral, parity GREEN BOTH models: FastWan
+`video_e2e` step0/1 vel rel ~0.3% (band <=1.2%); LongLive `longlive_parity` vel_c0s0
+slope 0.977 rel 3.1% (band <=6%). i8 error < the f16-vs-bf16 per-forward gap because
+these A-sides are layernorm/modulated (no outliers).
+
+QKV SITE-SPLIT (2026-06-21): qkv is now TWO matmul sites so only the safe half goes i8.
+self-attn qkv (normed A-side, DP4A-safe) -> `matmul_qkv_self` (i8 when `--i8-matmul`);
+cross-attn qkv -> `matmul_qkv` (ALWAYS bf16: its K/V project from UN-NORMED umT5 text and
+i8 acts overflow f16, latent -> 65504). The split is a new `matmul_qkv_self` slot in the
+shared `BlockWgslConfigs`/`BlockPipelines`/`BlockMatmuls` (== `matmul_qkv` unless pinned,
+so FastWan/Z-Image/umT5 byte-identical), a `QkvSite` selector in `wan/dit_block.rs`
+(`biased_proj`/`attention` route self vs cross), `WanI8Sites.qkv_self` + the loader
+transcoding self-attn qkv only, and `SiteOverride.qkv_self` in `block_cfgs`. Measured
+256x256x61: self-attn qkv matmul 4237->699ms (6.1x; +430ms dequant); cross-attn qkv
+UNCHANGED ~4.9s; parity vel_c0s0 0.97690 (was 0.977 ffn_up-only -- self qkv i8 adds ~0).
+NOT i8'd, kept bf16: proj + ffn_down (A-side = attention output / gelu, ~16k outliers;
+per-32 i8 act-quant crushes them); cross-attn qkv (above).
+NOTE: UNCOMMITTED on top of commit `1ce85c4` (an earlier env-var-only ffn_up version
+the current tree refactors into the flag). Same uncommitted batch also adds CLI
+`--duration <s>` (mutually exclusive with `--frames`, fps -> model default 24,
+snaps to the legal frame grid; `VideoModelId::{fps,snap_frames,validate_frames}` +
+unit tests in `generate/video.rs`).
+
 ## SHIPPED: DiT perf -- at the WGSL matmul ceiling (DEAD ENDS, do not retry)
 
 DiT denoise (576x576x97, 3 DMD steps, ~55s/step) is 100% matmul+sdpa GPU time.
-Quant does NOT help (no paging to hide; quant path runs the SAME bf16 matmul after
-dequant). FFN 49% / attn (qkv+proj+sdpa) 51%. matmul ~2.5-3.4 TFLOP/s = ~20-25%
+WEIGHT-ONLY quant does NOT help (dequant->bf16 matmul, same FLOPs); but i8 DP4A WITH
+i8 acts IS a real win -- SHIPPED for ffn_up (section above), 6x on that op.
+FFN 49% / attn (qkv+proj+sdpa) 51%. matmul ~2.5-3.4 TFLOP/s = ~20-25%
 of the f16 issue ceiling; latency/occupancy bound (NOT bandwidth), so bigger tiles
 backfire on the 28-SM mobile 5070. REGRESSED + reverted (tree clean): tile_b
 per-kk2 register hoist (36.4->40.4 ffn_down); bk 16->64 (36.4->43.7). Only large
 levers left are backend-level, NOT kernel tweaks: tensor-core matmul (5-10x; WGSL/
-naga expose no WMMA, likely blocked) or i8 DP4A FFN (2-4x; needs i8 acts =
-outlier-quality risk, gate hard on parity). Measure via e2e (NOT microbench):
+naga expose no WMMA, likely blocked) or i8 DP4A (DONE for ffn_up, 6x; qkv blocked on
+the shared cross-attn site, proj/ffn_down on outliers -- see i8 section above).
+Measure via e2e (NOT microbench):
 `THINFER_E2E_SKIP_PYREF=1 THINFER_E2E_FRAMES=13`, read `gpu_ms by pipeline`
 ms/disp. Baseline (f13): ffn_down 36.4 / ffn_up 26.5 / qkv 5.98 / proj 6.82 /
 sdpa_sg 3.40.

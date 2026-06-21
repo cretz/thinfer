@@ -14,6 +14,7 @@
 //! reuses this backbone with its own `DmdConfig` and an AR path (see
 //! `wan-plan.md`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use thinfer_core::arbiter::RECLAIM_EVICTABLE_WEIGHTS;
@@ -32,7 +33,7 @@ use crate::wan::dit::{
 };
 use crate::wan::dit_block::{WanDitBlockTaps, WanDitConfig, WanDitPipelines, config as dit_config};
 use crate::wan::kv_cache::{KvCacheConfig, KvWindowCache, RamKvStore};
-use crate::wan::loader::register_wan_dit_handles;
+use crate::wan::loader::{WanI8Sites, register_wan_dit_handles};
 use crate::wan::manifest::RECIPE;
 use crate::wan::scheduler::{DmdConfig, DmdSampler};
 use crate::wan::umt5::{
@@ -83,6 +84,27 @@ pub struct GenerationParams {
     /// Deterministic seed for the initial latent noise (and per-step renoise).
     pub seed: u64,
 }
+
+/// One shot of a multi-shot LongLive AR generation: a prompt that holds for
+/// `chunks` consecutive AR chunks (each chunk = `num_frame_per_block` latent
+/// frames). A scene cut between shots is signalled to the model in-band by
+/// prepending [`SCENE_CUT_PREFIX`] to the first chunk of every shot after the
+/// first (mirrors upstream `MultiTextConcatDataset._apply_shot_durations`), and
+/// in the cache by advancing the RoPE phase + pinning the new shot's sink. A
+/// single-shot long video is the empty-shots path ([`WanModel::denoise_ar`]).
+#[derive(Clone, Debug)]
+pub struct Shot {
+    pub prompt: String,
+    /// Length of this shot in AR chunks (>= 1). The sum across shots must equal
+    /// the run's total chunk count (`f_lat / num_frame_per_block`).
+    pub chunks: usize,
+}
+
+/// In-band scene-cut marker prepended to the first chunk's prompt of every shot
+/// after the first. The model was trained with this exact string as the cut
+/// signal (upstream `DEFAULT_SCENE_CUT_PREFIX`), so it is part of the umT5 text,
+/// not just a host-side flag.
+pub const SCENE_CUT_PREFIX: &str = "The scene transitions. ";
 
 /// Decoded video: CTHW f32 in `[-1, 1]` plus dims, ready for the caller's
 /// staging (per-frame PNG sequence + contact sheet). No codec here.
@@ -228,6 +250,12 @@ pub enum GenerateError<SE: core::fmt::Debug> {
         tokens: usize,
         max: usize,
     },
+    /// Multi-shot plan invalid: the shot chunk counts do not sum to the run's
+    /// total chunk count, or a shot has zero chunks. (AR path only.)
+    InvalidShots {
+        shot_chunks: usize,
+        num_chunks: usize,
+    },
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for GenerateError<SE> {
@@ -269,8 +297,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         residency: WeightResidency<S>,
         tokenizer: T,
         vae: VaeChoice,
+        i8_matmul: bool,
     ) -> Result<Self, ModelLoadError> {
-        Self::load_with_act(backend, residency, tokenizer, vae, None).await
+        Self::load_with_act(backend, residency, tokenizer, vae, None, i8_matmul).await
     }
 
     /// Diagnostic variant of [`load`] that forces the block activation dtype
@@ -283,6 +312,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         tokenizer: T,
         vae: VaeChoice,
         act_override: Option<ActDtype>,
+        i8_matmul: bool,
     ) -> Result<Self, ModelLoadError> {
         let timing = tracing::enabled!(tracing::Level::INFO);
         let t0 = timing.then(trace::Instant::now);
@@ -293,15 +323,24 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // umT5 GGUF ships matmuls quantized in-file; bf16/f32 safetensors stay
         // dense (no transcode for v1 -- keep the parity path bit-clean).
         let vae_cfg = WanVaeConfig::fastwan_ti2v_5b();
-        // Opt-in DP4A FFN: transcode the bf16 ffn_up weight to Q8_0 at load and
-        // route that one site through the i8xi8 `matmul_i8` (dot4I8Packed) path
-        // (ffn_up's A-side is the layernorm+modulated residual -> no massive
-        // outliers, unlike ffn_down's gelu output). Default off keeps the bf16
-        // parity path byte-identical (FastWan undisturbed).
-        let ffn_up_q8 =
-            std::env::var_os("THINFER_WAN_I8_FFN").map(|_| thinfer_core::quant::QuantKind::Q8_0);
+        // Opt-in DP4A matmul: transcode the DP4A-safe site weights (qkv + ffn_up)
+        // to Q8_0 at load and route them through the i8xi8 `matmul_i8`
+        // (dot4I8Packed) path. Those A-sides are norm-conditioned (no massive
+        // outliers), so it holds parity while cutting their matmul ~6x. o-proj /
+        // ffn_down stay bf16 (outlier-prone A-side). Off => bf16 byte-identical.
+        let q8 = i8_matmul.then_some(thinfer_core::quant::QuantKind::Q8_0);
+        // qkv is split into two sites so only the SAFE half goes i8: self-attn
+        // qkv has a normed A-side (DP4A-safe), so it takes Q8_0 + the i8 matmul;
+        // cross-attn qkv stays bf16 because its K/V project from the un-normed
+        // umT5 text and per-32 i8 act-quant there overflows f16 (latent saturates
+        // to 65504). The split is the separate `matmul_qkv_self` pipeline +
+        // `WanI8Sites.qkv_self` transcode. ffn_up's A-side is clean too.
+        let i8_sites = WanI8Sites {
+            qkv_self: q8,
+            ffn_up: q8,
+        };
         let umt5_handles = register_umt5_handles(&residency, None)?;
-        let dit_handles = register_wan_dit_handles(&residency, &cfg, None, ffn_up_q8)?;
+        let dit_handles = register_wan_dit_handles(&residency, &cfg, None, i8_sites)?;
         // VAE decoder weights all fit resident; diff the registered footprint
         // across registration so the decode can reserve exactly it (not a budget
         // fraction) when sizing its non-evictable tile workspace.
@@ -352,10 +391,24 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let umt5_act = act_override.unwrap_or(ActDtype::Bf16);
         tracing::info!(?dit_w, ?umt5_w, ?act, ?umt5_act, "Wan dtype selection");
 
-        let ffn_up_wd = ffn_up_q8.map(WeightDtype::Quant);
-        let dit = WanDitPipelines::compile(&backend, &block_cfgs(dit_w, act, ffn_up_wd)).await?;
-        let umt5_pipelines =
-            Umt5Pipelines::compile(&backend, &block_cfgs(umt5_w, umt5_act, None)).await?;
+        let ffn_up_wd = i8_sites.ffn_up.map(WeightDtype::Quant);
+        let dit = WanDitPipelines::compile(
+            &backend,
+            &block_cfgs(
+                dit_w,
+                act,
+                SiteOverride {
+                    qkv_self: i8_sites.qkv_self.map(WeightDtype::Quant),
+                    ffn_up: ffn_up_wd,
+                },
+            ),
+        )
+        .await?;
+        let umt5_pipelines = Umt5Pipelines::compile(
+            &backend,
+            &block_cfgs(umt5_w, umt5_act, SiteOverride::default()),
+        )
+        .await?;
         let vae_pipelines = WanVaePipelines::compile(&backend).await?;
         let vae_tiny = match vae_tiny_handles {
             None => None,
@@ -526,9 +579,14 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
     /// model from a `LongLiveSource` (the `.pt` DiT renamed to canonical) for the
     /// causal weights; the geometry is identical to FastWan so nothing else here
     /// changes.
+    ///
+    /// `shots`: multi-shot scene plan. Empty = single-shot long video from
+    /// `params.prompt` (the parity path). Non-empty = a prompt per shot with a
+    /// scene cut at each shot boundary (see [`Shot`] / [`WanModel::denoise_ar`]).
     pub async fn generate_ar(
         &self,
         params: &GenerationParams,
+        shots: &[Shot],
         vae: VaeChoice,
         progress: ProgressFn<'_>,
     ) -> Result<WanVideo, GenerateError<S::Error>> {
@@ -537,7 +595,16 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             Arc::clone(self.residency.arbiter()),
         );
         let (latent, f_lat, h_lat, w_lat) = self
-            .denoise_ar(params, None, &mut workspace, None, None, None, progress)
+            .denoise_ar(
+                params,
+                shots,
+                None,
+                &mut workspace,
+                None,
+                None,
+                None,
+                progress,
+            )
             .await?;
 
         if let Some(p) = progress {
@@ -568,9 +635,21 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
     /// future chunks (the streaming core). `f_lat` must be a multiple of the chunk
     /// size (`num_frame_per_block`, 8). `initial_noise`: full `[C, f_lat, h, w]`
     /// noise used verbatim when `Some` (parity byte-load), else seed-derived.
+    ///
+    /// `shots`: multi-shot plan. Empty = one shot spanning all chunks with
+    /// `params.prompt` (bit-identical to the single-prompt parity path). Non-empty
+    /// = `Shot{prompt, chunks}` list whose chunk counts sum to the run's total;
+    /// the first chunk of every shot after the first carries [`SCENE_CUT_PREFIX`]
+    /// into umT5 and, in the cache, advances the multi-shot RoPE phase before the
+    /// chunk and pins the chunk as the new shot's attention sink after its clean
+    /// commit (release `shot_clean_recache=False`, so no cache zeroing). Mirrors
+    /// upstream `causal_diffusion_inference.py` (shot-boundary branch) +
+    /// `MultiTextConcatDataset._apply_shot_durations`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn denoise_ar(
         &self,
         params: &GenerationParams,
+        shots: &[Shot],
         initial_noise: Option<&[f32]>,
         workspace: &mut Workspace<WgpuBackend>,
         mut chunk_diag: Option<&mut Vec<Vec<f32>>>,
@@ -609,39 +688,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
 
         let _denoise = trace::scope!("denoise_ar").entered();
 
-        // --- 1. tokenize + 2. umT5 encode -> padded text states ---
-        let token_ids = self
-            .tokenizer
-            .encode(&params.prompt, true)
-            .map_err(GenerateError::Tokenizer)?;
-        if token_ids.len() > MAX_PROMPT_TOKENS {
-            return Err(GenerateError::PromptTooLong {
-                tokens: token_ids.len(),
-                max: MAX_PROMPT_TOKENS,
-            });
-        }
-        if let Some(p) = progress {
-            p(ProgressEvent::TextEncode);
-        }
-        let text = {
-            let qout = self
-                .umt5
-                .forward(
-                    &self.backend,
-                    &self.umt5_pipelines,
-                    &self.residency,
-                    &*workspace,
-                    &self.umt5_handles,
-                    self.residency.source(),
-                    &token_ids,
-                )
-                .await?;
-            pad_text(&qout.hidden, qout.seq, dit_config::TEXT_DIM, TEXT_SEQ)
-        };
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 3. windowed KV cache (host-resident) + AR geometry ---
+        // --- AR geometry (needed before the shot plan: chunk count) ---
         let act_bytes = self.dit.block.act_dtype.bytes_per_elem() as usize;
         let frame_seq_len = (h_lat / dit_config::PATCH_H) * (w_lat / dit_config::PATCH_W);
         let kv_cfg = KvCacheConfig::longlive_runtime(
@@ -659,6 +706,87 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             });
         }
         let num_chunks = f_lat / chunk_frames;
+
+        // --- 1. shot plan: per-chunk prompt text + boundary flags ---
+        // Build the `num_chunks`-long block-prompt list exactly as upstream
+        // `MultiTextConcatDataset._apply_shot_durations`: each shot contributes
+        // `chunks` consecutive entries; the first entry of every shot after the
+        // first is `SCENE_CUT_PREFIX + caption`, the rest are the plain caption.
+        // Empty `shots` collapses to one shot over all chunks => the single
+        // prompt is reused unchanged (the parity path).
+        let plan_shots: Vec<Shot> = if shots.is_empty() {
+            vec![Shot {
+                prompt: params.prompt.clone(),
+                chunks: num_chunks,
+            }]
+        } else {
+            shots.to_vec()
+        };
+        let total_shot_chunks: usize = plan_shots.iter().map(|s| s.chunks).sum();
+        if total_shot_chunks != num_chunks || plan_shots.iter().any(|s| s.chunks == 0) {
+            return Err(GenerateError::InvalidShots {
+                shot_chunks: total_shot_chunks,
+                num_chunks,
+            });
+        }
+        let mut chunk_prompt: Vec<String> = Vec::with_capacity(num_chunks);
+        let mut chunk_is_boundary: Vec<bool> = Vec::with_capacity(num_chunks);
+        for (shot_idx, shot) in plan_shots.iter().enumerate() {
+            for block_in_shot in 0..shot.chunks {
+                let boundary = shot_idx > 0 && block_in_shot == 0;
+                chunk_prompt.push(if boundary {
+                    format!("{SCENE_CUT_PREFIX}{}", shot.prompt)
+                } else {
+                    shot.prompt.clone()
+                });
+                chunk_is_boundary.push(boundary);
+            }
+        }
+
+        // --- 2. tokenize + umT5 encode each UNIQUE block prompt once ---
+        if let Some(p) = progress {
+            p(ProgressEvent::TextEncode);
+        }
+        let mut text_by_prompt: HashMap<&str, Arc<Vec<f32>>> = HashMap::new();
+        for prompt in &chunk_prompt {
+            if text_by_prompt.contains_key(prompt.as_str()) {
+                continue;
+            }
+            let token_ids = self
+                .tokenizer
+                .encode(prompt, true)
+                .map_err(GenerateError::Tokenizer)?;
+            if token_ids.len() > MAX_PROMPT_TOKENS {
+                return Err(GenerateError::PromptTooLong {
+                    tokens: token_ids.len(),
+                    max: MAX_PROMPT_TOKENS,
+                });
+            }
+            let qout = self
+                .umt5
+                .forward(
+                    &self.backend,
+                    &self.umt5_pipelines,
+                    &self.residency,
+                    &*workspace,
+                    &self.umt5_handles,
+                    self.residency.source(),
+                    &token_ids,
+                )
+                .await?;
+            let padded = pad_text(&qout.hidden, qout.seq, dit_config::TEXT_DIM, TEXT_SEQ);
+            text_by_prompt.insert(prompt.as_str(), Arc::new(padded));
+        }
+        // Per-chunk text handles (cheap Arc clones; one encoded tensor per unique
+        // prompt, shared across the chunks that use it).
+        let chunk_text: Vec<Arc<Vec<f32>>> = chunk_prompt
+            .iter()
+            .map(|p| Arc::clone(&text_by_prompt[p.as_str()]))
+            .collect();
+        self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
+
+        // --- 3. windowed KV cache (host-resident) ---
         let mut cache = KvWindowCache::new(kv_cfg);
         let mut store = RamKvStore::new(kv_cfg.num_layers, kv_cfg.bytes_per_layer());
 
@@ -698,7 +826,16 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let _cs = trace::scope!("ar_chunk", chunk = chunk).entered();
             let f0 = chunk * chunk_frames;
             let current_start = chunk * chunk_frames * frame_seq_len;
+            // Scene cut: advance the multi-shot RoPE temporal phase BEFORE the
+            // window is planned, so this chunk's q/k rotate at the new shot's
+            // offset (`begin_chunk` folds the cached `temporal_offset` into the
+            // returned plan). Release order mirrors upstream: advance, denoise,
+            // clean recache, pin.
+            if chunk_is_boundary[chunk] {
+                cache.advance_shot();
+            }
             let plan = cache.begin_chunk(&mut store, current_start, chunk_frames);
+            let text = chunk_text[chunk].as_slice();
 
             let mut latents = slice_chunk(&full_noise, c, f_lat, f0, chunk_frames, hw);
 
@@ -714,7 +851,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 }
                 let inputs = WanDitInputs {
                     image: &latents,
-                    text: &text,
+                    text,
                     timestep: unipc.timestep(step),
                 };
                 // Per-block residual taps only on the very first forward (chunk 0,
@@ -760,7 +897,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let mut v_commit: Vec<Vec<u8>> = vec![Vec::new(); num_layers];
             let clean_inputs = WanDitInputs {
                 image: &latents,
-                text: &text,
+                text,
                 timestep: 0.0,
             };
             dit.forward_ar(
@@ -778,6 +915,14 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let k_refs: Vec<&[u8]> = k_commit.iter().map(|v| v.as_slice()).collect();
             let v_refs: Vec<&[u8]> = v_commit.iter().map(|v| v.as_slice()).collect();
             cache.commit_chunk(&mut store, &plan, &k_refs, &v_refs);
+
+            // Scene cut: pin this just-committed chunk as the new shot's
+            // attention sink (release `multi_shot_sink=true`, `sink_size>0`, so a
+            // shot boundary is always a scene cut). The next roll keeps it and
+            // relocates rolling data around it; no bytes move here.
+            if chunk_is_boundary[chunk] {
+                cache.pin_current_chunk(chunk_frames);
+            }
 
             debug_assert_eq!(chunk_len, latents.len());
         }
@@ -1322,11 +1467,20 @@ fn probe_weight<S: WeightSource>(residency: &WeightResidency<S>, id: &str) -> We
 
 /// Uniform `BlockWgslConfigs` for one submodel: every matmul slot takes
 /// `weight_dtype`, the ops template carries the chosen act dtype + recipe.
-fn block_cfgs(
-    weight_dtype: WeightDtype,
-    act: ActDtype,
-    ffn_up_weight_dtype: Option<WeightDtype>,
-) -> BlockWgslConfigs {
+/// Per-site weight-dtype override for the DP4A-safe matmul sites; `None` leaves a
+/// site at the probed `weight_dtype`. Must agree with the loader's
+/// [`WanI8Sites`] transcode so each matmul's pipeline encoding matches its
+/// registered weight.
+#[derive(Clone, Copy, Default)]
+struct SiteOverride {
+    /// Self-attention QKV (`matmul_qkv_self`). Cross-attention QKV
+    /// (`matmul_qkv`) is never overridden: its K/V project from un-normed umT5
+    /// text and overflow f16 under i8 acts, so it stays dense at `weight_dtype`.
+    qkv_self: Option<WeightDtype>,
+    ffn_up: Option<WeightDtype>,
+}
+
+fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype, ovr: SiteOverride) -> BlockWgslConfigs {
     let ops = WgslConfig {
         bf16_quant_writes: RECIPE.bf16_quant_writes,
         act_dtype: act,
@@ -1336,14 +1490,20 @@ fn block_cfgs(
         weight_dtype,
         ..ops
     };
-    // Per-site override: ffn_up may run a different (i8/Q8_0) weight encoding for
-    // the DP4A path while the rest of the block stays bf16.
+    // Per-site overrides: self-attn qkv / ffn_up may run an i8/Q8_0 weight
+    // encoding for the DP4A path while the rest of the block stays at
+    // `weight_dtype`. Cross-attn qkv (`matmul_qkv`) is left at the base dtype.
+    let mm_qkv_self = WgslConfig {
+        weight_dtype: ovr.qkv_self.unwrap_or(weight_dtype),
+        ..ops
+    };
     let mm_ffn_up = WgslConfig {
-        weight_dtype: ffn_up_weight_dtype.unwrap_or(weight_dtype),
+        weight_dtype: ovr.ffn_up.unwrap_or(weight_dtype),
         ..ops
     };
     BlockWgslConfigs {
         matmul_qkv: mm,
+        matmul_qkv_self: mm_qkv_self,
         matmul_proj: mm,
         matmul_ffn_up: mm_ffn_up,
         matmul_ffn_down: mm,

@@ -379,6 +379,7 @@ async fn video_e2e_safetensors() {
         tokenizer,
         load_vae,
         act_override,
+        std::env::var_os("THINFER_WAN_I8_FFN").is_some(),
     )
     .await
     .expect("WanModel::load");

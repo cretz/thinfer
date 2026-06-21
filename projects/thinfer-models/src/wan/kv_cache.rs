@@ -819,4 +819,59 @@ mod tests {
         let plan = cache.begin_chunk(&mut store, current_start, 2);
         assert_eq!(plan.prefix_tokens, c.global_sink_size * c.frame_seq_len);
     }
+
+    /// A pinned multi-shot sink survives evictions that would otherwise drop it.
+    /// Window 4 frames, global sink 1, chunk 1: pin frame 2 at a scene cut, then
+    /// roll far enough that (without the pin) frame 2 would be gone, and assert it
+    /// is still in the attended prefix while a non-pinned older frame is not.
+    #[test]
+    fn pinned_chunk_survives_eviction() {
+        let c = cfg(4, 1, 1, 1);
+        let fs = c.frame_seq_len as i64;
+        let mut cache = KvWindowCache::new(c);
+        let mut store = RamKvStore::new(c.num_layers, c.bytes_per_layer());
+
+        let commit =
+            |cache: &KvWindowCache, store: &mut RamKvStore, plan: &ChunkPlan, start: usize| {
+                let ids: Vec<i64> = (0..fs).map(|t| start as i64 + t).collect();
+                let b = tag_bytes(&ids);
+                let r: Vec<&[u8]> = (0..c.num_layers).map(|_| b.as_slice()).collect();
+                cache.commit_chunk(store, plan, &r, &r);
+            };
+
+        let mut current_start = 0usize;
+        // Chunks 0..3 fill the window; chunk 2 is the scene cut whose chunk we pin.
+        for chunk in 0..3 {
+            if chunk == 2 {
+                cache.advance_shot();
+            }
+            let plan = cache.begin_chunk(&mut store, current_start, 1);
+            commit(&cache, &mut store, &plan, current_start);
+            if chunk == 2 {
+                cache.pin_current_chunk(1);
+            }
+            current_start += c.frame_seq_len;
+        }
+
+        // Roll well past where frame 2 would normally age out (window 4 frames).
+        for _ in 3..9 {
+            let plan = cache.begin_chunk(&mut store, current_start, 1);
+            let g = gathered_prefix(&store, &plan);
+            // Frame 2's tokens (global ids [4, 5]) stay pinned in the prefix...
+            assert!(
+                g.windows(2).any(|w| w == [4i64, 5]),
+                "pinned frame 2 evicted at start={current_start}: {g:?}"
+            );
+            // ...while a non-pinned older frame (frame 3, ids [6, 7]) is dropped
+            // once the rolling window has advanced past it.
+            if current_start as i64 / fs >= 8 {
+                assert!(
+                    !g.windows(2).any(|w| w == [6i64, 7]),
+                    "non-pinned frame 3 should have aged out at start={current_start}: {g:?}"
+                );
+            }
+            commit(&cache, &mut store, &plan, current_start);
+            current_start += c.frame_seq_len;
+        }
+    }
 }

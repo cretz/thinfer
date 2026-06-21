@@ -85,6 +85,10 @@ pub struct BlockWeightBufs {
 /// compiles one shader per distinct config.
 pub struct BlockMatmuls {
     pub qkv: MatMulF32,
+    /// Self-attention QKV, split from `qkv` (cross-attention) so its weight can
+    /// take a distinct (e.g. i8/Q8_0) encoding. Same shape as `qkv`; identical to
+    /// it unless [`BlockWgslConfigs::matmul_qkv_self`] overrides the weight dtype.
+    pub qkv_self: MatMulF32,
     pub proj: MatMulF32,
     pub ffn_up: MatMulF32,
     pub ffn_down: MatMulF32,
@@ -159,6 +163,7 @@ impl BlockMatmuls {
         };
         Self {
             qkv: MatMulF32::new(square(cfgs.matmul_qkv.weight_dtype)),
+            qkv_self: MatMulF32::new(square(cfgs.matmul_qkv_self.weight_dtype)),
             proj: MatMulF32::new(square(cfgs.matmul_proj.weight_dtype)),
             ffn_up: MatMulF32::new(square(cfgs.matmul_ffn_up.weight_dtype)),
             ffn_down: MatMulF32::new(wide_k(cfgs.matmul_ffn_down.weight_dtype)),
@@ -188,6 +193,10 @@ pub struct DequantStep {
 pub struct BlockPipelines {
     pub matmuls: BlockMatmuls,
     pub matmul_qkv: WgpuPipeline,
+    /// Self-attention QKV pipeline (cross-attention uses `matmul_qkv`). Compiled
+    /// from [`BlockWgslConfigs::matmul_qkv_self`]; identical to `matmul_qkv`
+    /// unless that slot pins a distinct (i8/Q8_0) weight encoding.
+    pub matmul_qkv_self: WgpuPipeline,
     pub matmul_proj: WgpuPipeline,
     pub matmul_ffn_up: WgpuPipeline,
     pub matmul_ffn_down: WgpuPipeline,
@@ -198,6 +207,7 @@ pub struct BlockPipelines {
     /// matmul against the dense workspace. None means the matmul reads its
     /// weight buffer directly (bf16 or f32 path).
     pub dequant_qkv: Option<DequantStep>,
+    pub dequant_qkv_self: Option<DequantStep>,
     pub dequant_proj: Option<DequantStep>,
     pub dequant_ffn_up: Option<DequantStep>,
     pub dequant_ffn_down: Option<DequantStep>,
@@ -210,10 +220,12 @@ pub struct BlockPipelines {
     /// the legacy F16 matmul pipeline (`matmul_<site>` below) is still
     /// compiled in this case but goes unused on the I8 site.
     pub dequant_i8_qkv: Option<DequantStep>,
+    pub dequant_i8_qkv_self: Option<DequantStep>,
     pub dequant_i8_proj: Option<DequantStep>,
     pub dequant_i8_ffn_up: Option<DequantStep>,
     pub dequant_i8_ffn_down: Option<DequantStep>,
     pub matmul_i8_qkv: Option<WgpuPipeline>,
+    pub matmul_i8_qkv_self: Option<WgpuPipeline>,
     pub matmul_i8_proj: Option<WgpuPipeline>,
     pub matmul_i8_ffn_up: Option<WgpuPipeline>,
     pub matmul_i8_ffn_down: Option<WgpuPipeline>,
@@ -286,6 +298,12 @@ pub struct BlockPipelines {
 #[derive(Clone, Copy, Debug)]
 pub struct BlockWgslConfigs {
     pub matmul_qkv: WgslConfig,
+    /// Self-attention QKV. Split from `matmul_qkv` (which now serves only
+    /// cross-attention) so the self-attn projection can pin a distinct weight
+    /// encoding -- e.g. Q8_0 for the DP4A path -- while cross-attention, whose
+    /// K/V project from un-normed text and overflow under i8 acts, stays dense.
+    /// Set equal to `matmul_qkv` to keep the two identical (the default).
+    pub matmul_qkv_self: WgslConfig,
     pub matmul_proj: WgslConfig,
     pub matmul_ffn_up: WgslConfig,
     pub matmul_ffn_down: WgslConfig,
@@ -321,6 +339,7 @@ impl BlockWgslConfigs {
     pub fn uniform(cfg: WgslConfig) -> Self {
         Self {
             matmul_qkv: cfg,
+            matmul_qkv_self: cfg,
             matmul_proj: cfg,
             matmul_ffn_up: cfg,
             matmul_ffn_down: cfg,
@@ -346,6 +365,7 @@ impl BlockWgslConfigs {
         // inputs are block-stream activations.
         for c in [
             self.matmul_qkv,
+            self.matmul_qkv_self,
             self.matmul_proj,
             self.matmul_ffn_up,
             self.matmul_ffn_down,
@@ -427,10 +447,12 @@ impl BlockPipelines {
             }
         };
         let qkv_mm_cfg = matmul_cfg_for(cfgs.matmul_qkv);
+        let qkv_self_mm_cfg = matmul_cfg_for(cfgs.matmul_qkv_self);
         let proj_mm_cfg = matmul_cfg_for(cfgs.matmul_proj);
         let ffn_up_mm_cfg = matmul_cfg_for(cfgs.matmul_ffn_up);
         let ffn_down_mm_cfg = matmul_cfg_for(cfgs.matmul_ffn_down);
         let qkv_wgsl = matmuls.qkv.wgsl(&qkv_mm_cfg);
+        let qkv_self_wgsl = matmuls.qkv_self.wgsl(&qkv_self_mm_cfg);
         let proj_wgsl = matmuls.proj.wgsl(&proj_mm_cfg);
         let ffn_up_wgsl = matmuls.ffn_up.wgsl(&ffn_up_mm_cfg);
         let ffn_down_wgsl = matmuls.ffn_down.wgsl(&ffn_down_mm_cfg);
@@ -451,6 +473,8 @@ impl BlockPipelines {
                 }
             };
         let dequant_qkv = build_dq("dequant_qkv", cfgs.matmul_qkv.weight_dtype).await?;
+        let dequant_qkv_self =
+            build_dq("dequant_qkv_self", cfgs.matmul_qkv_self.weight_dtype).await?;
         let dequant_proj = build_dq("dequant_proj", cfgs.matmul_proj.weight_dtype).await?;
         let dequant_ffn_up = build_dq("dequant_ffn_up", cfgs.matmul_ffn_up.weight_dtype).await?;
         let dequant_ffn_down =
@@ -556,6 +580,12 @@ impl BlockPipelines {
             };
         let (dequant_i8_qkv, matmul_i8_qkv) =
             build_i8("qkv", cfgs.matmul_qkv.weight_dtype, cfgs.dense_acts.qkv).await?;
+        let (dequant_i8_qkv_self, matmul_i8_qkv_self) = build_i8(
+            "qkv_self",
+            cfgs.matmul_qkv_self.weight_dtype,
+            cfgs.dense_acts.qkv,
+        )
+        .await?;
         let (dequant_i8_proj, matmul_i8_proj) =
             build_i8("proj", cfgs.matmul_proj.weight_dtype, cfgs.dense_acts.proj).await?;
         let (dequant_i8_ffn_up, matmul_i8_ffn_up) = build_i8(
@@ -575,6 +605,7 @@ impl BlockPipelines {
         // when i8 attention is enabled.
         let any_i8_site = [
             matmul_i8_qkv.is_some(),
+            matmul_i8_qkv_self.is_some(),
             matmul_i8_proj.is_some(),
             matmul_i8_ffn_up.is_some(),
             matmul_i8_ffn_down.is_some(),
@@ -655,6 +686,9 @@ impl BlockPipelines {
             matmul_qkv: backend
                 .create_pipeline("matmul_qkv", &qkv_wgsl, "main", mm_layout)
                 .await?,
+            matmul_qkv_self: backend
+                .create_pipeline("matmul_qkv_self", &qkv_self_wgsl, "main", mm_layout)
+                .await?,
             matmul_proj: backend
                 .create_pipeline("matmul_proj", &proj_wgsl, "main", mm_layout)
                 .await?,
@@ -668,14 +702,17 @@ impl BlockPipelines {
                 .create_pipeline("matmul_adaln", &adaln_wgsl, "main", mm_layout)
                 .await?,
             dequant_qkv,
+            dequant_qkv_self,
             dequant_proj,
             dequant_ffn_up,
             dequant_ffn_down,
             dequant_i8_qkv,
+            dequant_i8_qkv_self,
             dequant_i8_proj,
             dequant_i8_ffn_up,
             dequant_i8_ffn_down,
             matmul_i8_qkv,
+            matmul_i8_qkv_self,
             matmul_i8_proj,
             matmul_i8_ffn_up,
             matmul_i8_ffn_down,

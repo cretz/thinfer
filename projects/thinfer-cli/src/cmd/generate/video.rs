@@ -14,7 +14,7 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::trace::DIAG;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::wan::pipeline::{
-    GenerationParams, ProgressEvent, VaeChoice, WanModel, WanVideo,
+    GenerationParams, ProgressEvent, Shot, VaeChoice, WanModel, WanVideo,
 };
 use thinfer_models::wan::source::{WanSource, open_longlive_source};
 use thinfer_models::z_image::pipeline::encode_png;
@@ -60,8 +60,11 @@ pub struct GenerateVideo {
     /// e2e-validated path). GGUF variants are deferred.
     #[arg(long, default_value_t = VideoModelId::FastwanTi2v5b, value_enum)]
     pub model: VideoModelId,
-    #[arg(long)]
-    pub prompt: String,
+    /// Text prompt. Repeat `--prompt` for a multi-shot video (LongLive only):
+    /// each prompt is one shot, with a scene cut between shots. A single
+    /// `--prompt` is an ordinary single-shot clip.
+    #[arg(long, required = true)]
+    pub prompt: Vec<String>,
     /// Output video file. A single file (e.g. `out.mp4`); no frame dir.
     #[arg(long)]
     pub output: PathBuf,
@@ -75,13 +78,25 @@ pub struct GenerateVideo {
     /// Frame height in pixels. Must be divisible by 32.
     #[arg(long, default_value_t = 544)]
     pub height: u32,
-    /// Output frame count. Must be `4 * k + 1` (causal-VAE temporal grid).
-    #[arg(long, default_value_t = 97)]
-    pub frames: u32,
-    /// Playback frames-per-second written into the MP4. Output-only metadata;
-    /// the DMD model takes no fps conditioning.
-    #[arg(long, default_value_t = 24)]
-    pub fps: u32,
+    /// Output frame count. Must be `4 * k + 1` (causal-VAE temporal grid);
+    /// LongLive additionally needs `(frames-1)/4+1` divisible by 8 (29, 61, 93,
+    /// ...). Mutually exclusive with `--duration`. Defaults to the model's
+    /// preferred clip length when neither is given. For multi-shot (multiple
+    /// `--prompt`): give one `--frames` to split it evenly across the shots, or
+    /// one `--frames` per `--prompt` to set each shot's length; any other count
+    /// is an error.
+    #[arg(long, conflicts_with = "duration")]
+    pub frames: Vec<u32>,
+    /// Target clip length in seconds (mutually exclusive with `--frames`):
+    /// frames = round(duration * fps), snapped to the model's legal frame grid.
+    /// Same one-or-per-shot rule as `--frames` for multi-shot.
+    #[arg(long, conflicts_with = "frames")]
+    pub duration: Vec<f32>,
+    /// Playback frames-per-second written into the MP4 (and used to convert
+    /// `--duration`). Output-only metadata; the DMD model takes no fps
+    /// conditioning. Defaults to the model's preferred fps (Wan TI2V = 24).
+    #[arg(long)]
+    pub fps: Option<u32>,
     /// Seed. Omit for a randomized seed.
     #[arg(long)]
     pub seed: Option<u64>,
@@ -104,6 +119,12 @@ pub struct GenerateVideo {
     /// path). Both temporally tile the decode to hold the VRAM budget.
     #[arg(long, value_enum, default_value_t = VaeChoiceArg::Tiny)]
     pub vae: VaeChoiceArg,
+    /// Opt-in DP4A int8 matmul for the quantization-safe DiT sites (qkv +
+    /// ffn_up): transcodes those weights to Q8_0 at load and runs the i8xi8
+    /// `dot4I8Packed` path, ~6x faster on those matmuls (~-20% denoise) at
+    /// no measurable quality loss (parity-validated). Off => bf16 throughout.
+    #[arg(long, default_value_t = false)]
+    pub i8_matmul: bool,
 }
 
 /// CLI mirror of [`VaeChoice`] (clap `ValueEnum`).
@@ -150,6 +171,188 @@ impl VideoModelId {
     fn is_ar(self) -> bool {
         matches!(self, VideoModelId::Longlive205b)
     }
+
+    /// Model-preferred playback fps: the default for `--fps` and the divisor that
+    /// converts `--duration` -> frames. The Wan TI2V line is authored at 24.
+    fn fps(self) -> u32 {
+        24
+    }
+
+    /// Default clip length (frames) when neither `--frames` nor `--duration` is
+    /// given: ~4s of the preferred grid, snapped legal per model (FastWan 97,
+    /// LongLive 93).
+    fn default_frames(self) -> u32 {
+        self.snap_frames(97)
+    }
+
+    /// Snap a raw frame count to this model's legal temporal grid and return the
+    /// nearest legal value. FastWan needs `4k+1` (causal-VAE grid); LongLive
+    /// additionally needs the latent frame count `(frames-1)/4+1` to be a positive
+    /// multiple of 8 (the AR chunk size) -> frames in {29, 61, 93, 125, ...}.
+    fn snap_frames(self, raw: u32) -> u32 {
+        let raw = raw.max(1);
+        if self.is_ar() {
+            // f_lat = (frames-1)/4 + 1; snap to the nearest positive multiple of 8.
+            let f_lat = (raw as f32 + 3.0) / 4.0;
+            let f_lat8 = ((f_lat / 8.0).round().max(1.0) as u32) * 8;
+            4 * f_lat8 - 3
+        } else {
+            let k = ((raw - 1) as f32 / 4.0).round() as u32;
+            4 * k + 1
+        }
+    }
+
+    /// Validate an explicit `--frames` against the model grid (see `snap_frames`).
+    fn validate_frames(self, frames: u32) -> Result<(), String> {
+        if frames == 0 || frames % 4 != 1 {
+            return Err(format!(
+                "--frames must be 4*k + 1 (got {frames}); e.g. 1, 5, 9, ..., 97"
+            ));
+        }
+        if self.is_ar() {
+            let f_lat = (frames - 1) / 4 + 1;
+            if !f_lat.is_multiple_of(8) {
+                return Err(format!(
+                    "--frames for {self} must have latent frame count (frames-1)/4+1 \
+                     divisible by 8 (got {frames} -> {f_lat}); e.g. 29, 61, 93, 125"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// AR chunk size in latent frames (`num_frame_per_block`). Multi-shot lengths
+    /// are split in chunk units (a scene cut can only land on a chunk boundary).
+    const AR_CHUNK_FLAT: u32 = 8;
+
+    /// AR-grid frame count -> whole AR chunks. Validates the grid first, so this
+    /// only succeeds for legal LongLive frame counts (`(frames-1)/4+1 % 8 == 0`).
+    fn frames_to_chunks(self, frames: u32) -> Result<usize, String> {
+        self.validate_frames(frames)?;
+        let f_lat = (frames - 1) / 4 + 1;
+        Ok((f_lat / Self::AR_CHUNK_FLAT) as usize)
+    }
+
+    /// Whole AR chunks -> the continuous clip's frame count. `chunks` latent
+    /// chunks = `chunks * 8` latent frames = `4 * f_lat - 3` output frames.
+    fn chunks_to_frames(self, chunks: usize) -> u32 {
+        4 * (chunks as u32 * Self::AR_CHUNK_FLAT) - 3
+    }
+}
+
+/// Resolve `--prompt` (one per shot) + `--frames`/`--duration` into the total
+/// frame count and the per-shot plan. The length rule (user-specified): a single
+/// `--frames`/`--duration` value splits the clip evenly across the shots (in
+/// chunk units, mirroring upstream `_even_durations`); exactly one value per
+/// prompt sets each shot independently; any other count is an error. A single
+/// prompt yields an empty shot list (the parity single-shot path is untouched).
+/// Multi-shot is LongLive-only (FastWan has no chunk/scene-cut concept).
+fn resolve_shot_plan(
+    model: VideoModelId,
+    prompts: &[String],
+    frames: &[u32],
+    durations: &[f32],
+    fps: u32,
+) -> Result<(u32, Vec<Shot>), String> {
+    let num_shots = prompts.len();
+    // Per-shot frame counts the user supplied (frames verbatim, or duration
+    // converted + snapped). clap makes --frames / --duration mutually exclusive,
+    // so at most one of these is non-empty.
+    let values: Vec<u32> = if !durations.is_empty() {
+        durations
+            .iter()
+            .map(|&d| {
+                if !(d.is_finite() && d > 0.0) {
+                    return Err(format!(
+                        "--duration must be a positive number of seconds (got {d})"
+                    ));
+                }
+                Ok(model.snap_frames((d * fps as f32).round() as u32))
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        frames.to_vec()
+    };
+
+    if !model.is_ar() {
+        // FastWan: single shot only; one length value at most (the legacy path).
+        if num_shots != 1 {
+            return Err(format!(
+                "multiple --prompt (multi-shot) is only supported by longlive-2.0-5b, not {model}"
+            ));
+        }
+        if values.len() > 1 {
+            return Err(format!(
+                "multiple --frames/--duration is only for multi-shot longlive-2.0-5b, not {model}"
+            ));
+        }
+        let frames = match values.first() {
+            Some(&f) if !frames.is_empty() => {
+                model.validate_frames(f)?;
+                f
+            }
+            Some(&f) => f, // from --duration, already snapped legal
+            None => model.default_frames(),
+        };
+        return Ok((frames, Vec::new()));
+    }
+
+    // LongLive: resolve per-shot chunk counts.
+    let shot_chunks: Vec<usize> = match values.len() {
+        // No explicit length: split the model default across the shots.
+        0 => even_chunk_split(model.frames_to_chunks(model.default_frames())?, num_shots)?,
+        // One length: the whole-clip total, split evenly across the shots.
+        1 => even_chunk_split(model.frames_to_chunks(values[0])?, num_shots)?,
+        // One length per shot: each shot sized independently.
+        n if n == num_shots => values
+            .iter()
+            .map(|&f| model.frames_to_chunks(f))
+            .collect::<Result<_, _>>()?,
+        n => {
+            return Err(format!(
+                "expected 1 --{} value (split evenly) or {num_shots} (one per --prompt), got {n}",
+                if durations.is_empty() {
+                    "frames"
+                } else {
+                    "duration"
+                }
+            ));
+        }
+    };
+
+    let total_chunks: usize = shot_chunks.iter().sum();
+    let frames = model.chunks_to_frames(total_chunks);
+    // Single prompt: keep the engine's single-shot path (empty shots) so the
+    // parity-validated code runs byte-for-byte as before.
+    if num_shots == 1 {
+        return Ok((frames, Vec::new()));
+    }
+    let shots = prompts
+        .iter()
+        .zip(shot_chunks)
+        .map(|(p, chunks)| Shot {
+            prompt: p.clone(),
+            chunks,
+        })
+        .collect();
+    Ok((frames, shots))
+}
+
+/// Split `total` chunks across `num_shots` shots as evenly as possible (the
+/// first `total % num_shots` shots get one extra), mirroring upstream
+/// `_even_durations`. Errors if there are fewer chunks than shots.
+fn even_chunk_split(total: usize, num_shots: usize) -> Result<Vec<usize>, String> {
+    if total < num_shots {
+        return Err(format!(
+            "clip is {total} chunk(s) but there are {num_shots} shots; give a longer \
+             --frames/--duration or fewer --prompt"
+        ));
+    }
+    let base = total / num_shots;
+    let extra = total % num_shots;
+    Ok((0..num_shots)
+        .map(|i| base + usize::from(i < extra))
+        .collect())
 }
 
 impl std::fmt::Display for VideoModelId {
@@ -165,6 +368,7 @@ impl std::fmt::Display for VideoModelId {
 /// LongLive AR). Generic over the weight source so both the safetensors
 /// (`WanSource`) and the `.pt`-backed (`LongLiveSource`) paths share the load +
 /// generate + error-mapping tail.
+#[allow(clippy::too_many_arguments)]
 async fn build_and_generate<S: thinfer_core::weight::WeightSource>(
     backend: std::sync::Arc<thinfer_core::backend::WgpuBackend>,
     source: S,
@@ -172,19 +376,21 @@ async fn build_and_generate<S: thinfer_core::weight::WeightSource>(
     tokenizer: HfTokenizer,
     vae: VaeChoice,
     gen_params: &GenerationParams,
+    shots: &[Shot],
     progress: &dyn Fn(ProgressEvent),
     ar: bool,
+    i8_matmul: bool,
 ) -> Result<WanVideo, String> {
     let residency = WeightResidency::new(source, budget);
     let model = {
         let _s = tracing::info_span!("model_load").entered();
-        WanModel::load(backend, residency, tokenizer, vae)
+        WanModel::load(backend, residency, tokenizer, vae, i8_matmul)
             .await
             .map_err(|e| format!("model load: {e:?}"))?
     };
     if ar {
         model
-            .generate_ar(gen_params, vae, Some(progress))
+            .generate_ar(gen_params, shots, vae, Some(progress))
             .await
             .map_err(|e| format!("generate: {e:?}"))
     } else {
@@ -198,16 +404,16 @@ async fn build_and_generate<S: thinfer_core::weight::WeightSource>(
 pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     validate_dim("height", args.height)?;
     validate_dim("width", args.width)?;
-    // Causal VAE temporal grid: frame count must be 4k+1.
-    if args.frames == 0 || args.frames % 4 != 1 {
-        return Err(format!(
-            "--frames must be 4*k + 1 (got {}); e.g. 1, 5, 9, ..., 97",
-            args.frames
-        ));
-    }
-    if args.fps == 0 {
+    // fps defaults to the model preference; it also converts --duration.
+    let fps = args.fps.unwrap_or_else(|| args.model.fps());
+    if fps == 0 {
         return Err("--fps must be > 0".into());
     }
+    // Resolve the total frame count + per-shot plan from the prompts and the
+    // --frames/--duration values (see `resolve_shot_plan`). Single prompt => no
+    // shots (the single-shot path); multiple prompts => one shot each.
+    let (frames, shots) =
+        resolve_shot_plan(args.model, &args.prompt, &args.frames, &args.duration, fps)?;
     if args.input_image.is_some() {
         return Err("--input-image (img2vid) not yet wired; the engine path is t2v-only".into());
     }
@@ -290,11 +496,12 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     tracing::info!(
         target: DIAG,
         model = %args.model,
-        prompt = %args.prompt,
+        prompts = ?args.prompt,
+        shots = shots.len().max(1),
         width = args.width,
         height = args.height,
-        frames = args.frames,
-        fps = args.fps,
+        frames,
+        fps,
         seed = ?args.seed,
         ram_budget = ram_bytes,
         vram_budget = vram_bytes,
@@ -308,12 +515,14 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     let t_run = std::time::Instant::now();
     let stamp = move || format!("[{:6.1}s]", t_run.elapsed().as_secs_f64());
     eprintln!(
-        "{} Generating {}x{} video, {} frames, {} fps, seed {} ({})",
+        "{} Generating {}x{} video, {} frames, {} fps (~{:.1}s), {} shot(s), seed {} ({})",
         stamp(),
         args.width,
         args.height,
-        args.frames,
-        args.fps,
+        frames,
+        fps,
+        frames as f32 / fps as f32,
+        shots.len().max(1),
         seed,
         args.model,
     );
@@ -332,10 +541,12 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         ProgressEvent::VaeDecode => eprintln!("{} Decoding latents (VAE)", stamp()),
     };
     let gen_params = GenerationParams {
-        prompt: args.prompt,
+        // Single-shot path reads this; multi-shot reads `shots` and ignores it
+        // (kept = the first shot's caption for logging consistency).
+        prompt: args.prompt[0].clone(),
         height: args.height,
         width: args.width,
-        num_frames: args.frames,
+        num_frames: frames,
         seed,
     };
     // FastWan loads the all-safetensors `WanSource`; LongLive unions the renamed
@@ -357,8 +568,10 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             tokenizer,
             vae,
             &gen_params,
+            &shots,
             &progress,
             true,
+            args.i8_matmul,
         )
         .await?
     } else {
@@ -374,8 +587,10 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             tokenizer,
             vae,
             &gen_params,
+            &shots,
             &progress,
             false,
+            args.i8_matmul,
         )
         .await?
     };
@@ -383,7 +598,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     match format {
         VideoFormat::Mp4 => {
             eprintln!("{} Encoding MP4 (H.264)", stamp());
-            encode_mp4(&video, args.fps, &args.output)?;
+            encode_mp4(&video, fps, &args.output)?;
         }
         VideoFormat::PngFrames => {
             eprintln!("{} Writing PNG frames", stamp());
@@ -397,7 +612,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         video.width,
         video.height,
         video.num_frames,
-        args.fps,
+        fps,
         seed,
         t_run.elapsed().as_secs_f64(),
     );
@@ -626,4 +841,124 @@ fn nal_units(annexb: &[u8]) -> Vec<&[u8]> {
         }
     }
     units
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VideoModelId::{FastwanTi2v5b as Fw, Longlive205b as Ll};
+    use super::{even_chunk_split, resolve_shot_plan};
+
+    const FPS: u32 = 24;
+
+    fn prompts(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("shot {i}")).collect()
+    }
+
+    #[test]
+    fn even_split_distributes_remainder_to_front() {
+        assert_eq!(even_chunk_split(6, 3).unwrap(), vec![2, 2, 2]);
+        assert_eq!(even_chunk_split(7, 3).unwrap(), vec![3, 2, 2]);
+        assert_eq!(even_chunk_split(8, 3).unwrap(), vec![3, 3, 2]);
+        assert_eq!(even_chunk_split(3, 3).unwrap(), vec![1, 1, 1]);
+        // Fewer chunks than shots is an error (cannot give every shot a chunk).
+        assert!(even_chunk_split(2, 3).is_err());
+    }
+
+    #[test]
+    fn single_prompt_yields_no_shots() {
+        // One prompt, explicit frames: the single-shot path (empty shots).
+        let (frames, shots) = resolve_shot_plan(Ll, &prompts(1), &[61], &[], FPS).unwrap();
+        assert_eq!(frames, 61);
+        assert!(shots.is_empty());
+        // FastWan single prompt, default frames.
+        let (frames, shots) = resolve_shot_plan(Fw, &prompts(1), &[], &[], FPS).unwrap();
+        assert_eq!(frames, Fw.default_frames());
+        assert!(shots.is_empty());
+    }
+
+    #[test]
+    fn one_frames_value_splits_evenly_across_shots() {
+        // 125 frames -> f_lat 32 -> 4 chunks, split across 2 shots = [2, 2].
+        let (frames, shots) = resolve_shot_plan(Ll, &prompts(2), &[125], &[], FPS).unwrap();
+        assert_eq!(frames, 125);
+        assert_eq!(shots.len(), 2);
+        assert_eq!((shots[0].chunks, shots[1].chunks), (2, 2));
+        assert_eq!(shots[0].prompt, "shot 0");
+        assert_eq!(shots[1].prompt, "shot 1");
+    }
+
+    #[test]
+    fn frames_per_shot_sizes_each_independently() {
+        // 29 frames -> 1 chunk, 61 -> 2 chunks; total 3 chunks -> 93 frames.
+        let (frames, shots) = resolve_shot_plan(Ll, &prompts(2), &[29, 61], &[], FPS).unwrap();
+        assert_eq!(shots.len(), 2);
+        assert_eq!((shots[0].chunks, shots[1].chunks), (1, 2));
+        assert_eq!(frames, Ll.chunks_to_frames(3));
+        assert_eq!(frames, 93);
+    }
+
+    #[test]
+    fn wrong_value_count_is_an_error() {
+        // 2 frames values for 3 prompts: neither 1 (split) nor 3 (per-shot).
+        assert!(resolve_shot_plan(Ll, &prompts(3), &[29, 61], &[], FPS).is_err());
+        // Multi-prompt on FastWan is rejected.
+        assert!(resolve_shot_plan(Fw, &prompts(2), &[], &[], FPS).is_err());
+        // Multiple length values on FastWan is rejected.
+        assert!(resolve_shot_plan(Fw, &prompts(1), &[61, 61], &[], FPS).is_err());
+    }
+
+    #[test]
+    fn duration_per_shot_converts_and_snaps() {
+        // 2 prompts, one duration each: ~1.2s and ~2.5s at 24fps snap to the grid.
+        let (frames, shots) = resolve_shot_plan(Ll, &prompts(2), &[], &[1.2, 2.5], FPS).unwrap();
+        assert_eq!(shots.len(), 2);
+        // Each shot's chunk count round-trips to a legal frame count.
+        for s in &shots {
+            assert!(s.chunks >= 1);
+        }
+        assert_eq!(
+            frames,
+            Ll.chunks_to_frames(shots.iter().map(|s| s.chunks).sum())
+        );
+    }
+
+    #[test]
+    fn fastwan_snaps_to_4k_plus_1() {
+        assert_eq!(Fw.snap_frames(97), 97);
+        assert_eq!(Fw.snap_frames(60), 61); // 2.5s @ 24fps -> 60 -> nearest 4k+1
+        assert_eq!(Fw.snap_frames(50), 49);
+        assert_eq!(Fw.snap_frames(1), 1);
+        assert_eq!(Fw.snap_frames(0), 1); // min clamp
+        assert_eq!(Fw.default_frames(), 97);
+    }
+
+    #[test]
+    fn longlive_snaps_to_latent_multiple_of_8() {
+        // frames = 4*f_lat - 3, f_lat a multiple of 8 -> {29, 61, 93, 125, ...}.
+        assert_eq!(Ll.snap_frames(61), 61); // f_lat 16
+        assert_eq!(Ll.snap_frames(50), 61);
+        assert_eq!(Ll.snap_frames(40), 29); // f_lat 8
+        assert_eq!(Ll.snap_frames(97), 93); // f_lat 24, not 25
+        assert_eq!(Ll.snap_frames(1), 29); // min legal clip
+        assert_eq!(Ll.default_frames(), 93);
+    }
+
+    #[test]
+    fn snapped_frames_always_validate() {
+        for raw in 1u32..400 {
+            for m in [Fw, Ll] {
+                m.validate_frames(m.snap_frames(raw))
+                    .unwrap_or_else(|e| panic!("{m} snap({raw}) not legal: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_off_grid() {
+        assert!(Fw.validate_frames(96).is_err()); // not 4k+1
+        assert!(Fw.validate_frames(97).is_ok());
+        assert!(Ll.validate_frames(97).is_err()); // 4k+1 but f_lat 25 not %8
+        assert!(Ll.validate_frames(61).is_ok());
+        assert!(Ll.validate_frames(29).is_ok());
+    }
 }

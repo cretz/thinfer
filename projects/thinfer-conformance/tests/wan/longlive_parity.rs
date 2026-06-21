@@ -262,6 +262,7 @@ async fn longlive_parity_ar() {
         tokenizer,
         VaeChoice::Full,
         act_override,
+        std::env::var_os("THINFER_WAN_I8_FFN").is_some(),
     )
     .await
     .expect("WanModel::load (LongLive)");
@@ -343,6 +344,7 @@ async fn longlive_parity_ar() {
     let (latent, gf, gh, gw) = model
         .denoise_ar(
             &params,
+            &[],
             Some(&noise),
             &mut workspace,
             Some(&mut chunk_diag),

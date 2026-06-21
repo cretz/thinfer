@@ -554,6 +554,15 @@ fn lin<'wsp>(
 // Block forward
 // ---------------------------------------------------------------------------
 
+/// Which QKV projection site a [`WanDitBlock::biased_proj`] call belongs to.
+/// They are separate matmul pipelines so self-attn can run the DP4A i8 weight
+/// while cross-attn (un-normed text K/V) stays dense; identical when i8 is off.
+#[derive(Clone, Copy)]
+enum QkvSite {
+    SelfAttn,
+    Cross,
+}
+
 pub struct WanDitBlock {
     pub shape: WanDitBlockShape,
 }
@@ -638,6 +647,7 @@ impl WanDitBlock {
             rows,
             rows,
             scale,
+            QkvSite::SelfAttn,
             taps.self_q.as_ref(),
             taps.self_k.as_ref(),
             taps.self_v.as_ref(),
@@ -718,6 +728,7 @@ impl WanDitBlock {
             rows,
             trows,
             scale,
+            QkvSite::Cross,
             None,
             None,
             None,
@@ -867,9 +878,36 @@ impl WanDitBlock {
         )?;
 
         // q/k/v projections + bias, qk-norm (RMSNorm across the full inner dim).
-        let q = self.biased_proj(scope, bp, n1m, w.q_w, w.q_b, chunk_rows, inner)?;
-        let k = self.biased_proj(scope, bp, n1m, w.k_w, w.k_b, chunk_rows, inner)?;
-        let vv = self.biased_proj(scope, bp, n1m, w.v_w, w.v_b, chunk_rows, inner)?;
+        let q = self.biased_proj(
+            scope,
+            bp,
+            n1m,
+            w.q_w,
+            w.q_b,
+            chunk_rows,
+            inner,
+            QkvSite::SelfAttn,
+        )?;
+        let k = self.biased_proj(
+            scope,
+            bp,
+            n1m,
+            w.k_w,
+            w.k_b,
+            chunk_rows,
+            inner,
+            QkvSite::SelfAttn,
+        )?;
+        let vv = self.biased_proj(
+            scope,
+            bp,
+            n1m,
+            w.v_w,
+            w.v_b,
+            chunk_rows,
+            inner,
+            QkvSite::SelfAttn,
+        )?;
         let qn = alloc_act(scope, bp, chunk_rows, inner)?;
         let nq = scope.import_copy(w.norm_q);
         op_rmsnorm(scope, bp, q, nq, qn, chunk_rows, inner, eps)?;
@@ -988,9 +1026,9 @@ impl WanDitBlock {
         op_modulate(scope, bp, n1, m.scale_msa, m.shift_msa, n1m, tr, dim)?;
 
         // q/k/v projections + bias, qk-norm (RMSNorm across the full inner dim).
-        let q = self.biased_proj(scope, bp, n1m, w.q_w, w.q_b, tr, inner)?;
-        let k = self.biased_proj(scope, bp, n1m, w.k_w, w.k_b, tr, inner)?;
-        let vv = self.biased_proj(scope, bp, n1m, w.v_w, w.v_b, tr, inner)?;
+        let q = self.biased_proj(scope, bp, n1m, w.q_w, w.q_b, tr, inner, QkvSite::SelfAttn)?;
+        let k = self.biased_proj(scope, bp, n1m, w.k_w, w.k_b, tr, inner, QkvSite::SelfAttn)?;
+        let vv = self.biased_proj(scope, bp, n1m, w.v_w, w.v_b, tr, inner, QkvSite::SelfAttn)?;
         let qn = alloc_act(scope, bp, tr, inner)?;
         let nq = scope.import_copy(w.norm_q);
         op_rmsnorm(scope, bp, q, nq, qn, tr, inner, eps)?;
@@ -1024,8 +1062,8 @@ impl WanDitBlock {
         let inner = s.inner as u32;
         let eps = s.norm_eps;
         let text = ActBuf::dense(text);
-        let k = self.biased_proj(scope, bp, text, w.k_w, w.k_b, trows, inner)?;
-        let vv = self.biased_proj(scope, bp, text, w.v_w, w.v_b, trows, inner)?;
+        let k = self.biased_proj(scope, bp, text, w.k_w, w.k_b, trows, inner, QkvSite::Cross)?;
+        let vv = self.biased_proj(scope, bp, text, w.v_w, w.v_b, trows, inner, QkvSite::Cross)?;
         let nk = scope.import_copy(w.norm_k);
         op_rmsnorm(scope, bp, k, nk, ActBuf::dense(ck), trows, inner, eps)?;
         scope.copy_buffer_to_buffer(vv.data, 0, cv, 0, bp.act_bytes(trows * inner))?;
@@ -1086,6 +1124,7 @@ impl WanDitBlock {
             bufs.cross_attn.q_b,
             tr,
             inner,
+            QkvSite::Cross,
         )?;
         let cq = alloc_act(scope, bp, tr, inner)?;
         let ncq = scope.import_copy(bufs.cross_attn.norm_q);
@@ -1263,6 +1302,7 @@ impl WanDitBlock {
         q_rows: u32,
         kv_rows: u32,
         scale: f32,
+        site: QkvSite,
         tap_q: Option<&BufRef>,
         tap_k: Option<&BufRef>,
         tap_v: Option<&BufRef>,
@@ -1278,9 +1318,9 @@ impl WanDitBlock {
         // q = norm_q(to_q(q_src) + b_q); k = norm_k(to_k(kv_src) + b_k);
         // v = to_v(kv_src) + b_v. qk-norm is RMSNorm over the FULL inner dim
         // (`rms_norm_across_heads`), applied before the head split.
-        let q = self.biased_proj(scope, bp, q_src, w.q_w, w.q_b, q_rows, inner)?;
-        let k = self.biased_proj(scope, bp, kv_src, w.k_w, w.k_b, kv_rows, inner)?;
-        let v = self.biased_proj(scope, bp, kv_src, w.v_w, w.v_b, kv_rows, inner)?;
+        let q = self.biased_proj(scope, bp, q_src, w.q_w, w.q_b, q_rows, inner, site)?;
+        let k = self.biased_proj(scope, bp, kv_src, w.k_w, w.k_b, kv_rows, inner, site)?;
+        let v = self.biased_proj(scope, bp, kv_src, w.v_w, w.v_b, kv_rows, inner, site)?;
         copy_tap(scope, q.data, tap_q, bp.act_bytes(q_rows * inner))?;
         copy_tap(scope, k.data, tap_k, bp.act_bytes(kv_rows * inner))?;
         copy_tap(scope, v.data, tap_v, bp.act_bytes(kv_rows * inner))?;
@@ -1319,7 +1359,9 @@ impl WanDitBlock {
         self.attn_out_proj(scope, bp, sa, w, q_rows, inner)
     }
 
-    /// `out = x @ wᵀ + bias` through the qkv matmul site.
+    /// `out = x @ wᵀ + bias` through the qkv matmul site (`site` selects the
+    /// self- vs cross-attention pipeline; see [`QkvSite`]).
+    #[allow(clippy::too_many_arguments)]
     fn biased_proj<'wsp>(
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
@@ -1329,24 +1371,30 @@ impl WanDitBlock {
         b: BufRef,
         rows: u32,
         n: u32,
+        site: QkvSite,
     ) -> Result<ActBuf<'wsp>, WgpuError> {
         let dim = self.shape.dim as u32;
         let out = alloc_matmul_out_buf(scope, bp, rows * n)?;
         let wv = scope.import_copy(w);
+        // Self-attn qkv may be i8 (normed A-side); cross-attn qkv stays dense.
+        let (mm_i8, dq_i8, dq, pipe, inst) = match site {
+            QkvSite::SelfAttn => (
+                bp.matmul_i8_qkv_self.as_ref(),
+                bp.dequant_i8_qkv_self.as_ref(),
+                bp.dequant_qkv_self.as_ref(),
+                &bp.matmul_qkv_self,
+                &bp.matmuls.qkv_self,
+            ),
+            QkvSite::Cross => (
+                bp.matmul_i8_qkv.as_ref(),
+                bp.dequant_i8_qkv.as_ref(),
+                bp.dequant_qkv.as_ref(),
+                &bp.matmul_qkv,
+                &bp.matmuls.qkv,
+            ),
+        };
         lin(
-            scope,
-            bp,
-            x,
-            wv,
-            out,
-            rows,
-            n,
-            dim,
-            bp.matmul_i8_qkv.as_ref(),
-            bp.dequant_i8_qkv.as_ref(),
-            bp.dequant_qkv.as_ref(),
-            &bp.matmul_qkv,
-            &bp.matmuls.qkv,
+            scope, bp, x, wv, out, rows, n, dim, mm_i8, dq_i8, dq, pipe, inst,
         )?;
         let bv = scope.import_copy(b);
         let biased = alloc_act(scope, bp, rows, n)?;

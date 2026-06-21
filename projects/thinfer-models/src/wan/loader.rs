@@ -180,26 +180,35 @@ impl WanDitBlockWeights {
 // Registration
 // ---------------------------------------------------------------------------
 
+/// Opt-in load-time i8 (Q8_0) transcode targets for the DP4A-safe matmul sites:
+/// the SELF-attention qkv projections and ffn_up. Their A-side is a
+/// norm-conditioned activation (no massive-activation outliers), so per-32 i8
+/// act-quant is lossless enough to hold parity, and the i8xi8 `matmul_i8`
+/// (dot4I8Packed) path is a pure compute win. The other matmul sites keep their
+/// file encoding: cross-attn qkv's K/V project from un-normed umT5 text (i8 acts
+/// overflow f16); o-proj / ffn_down A-sides (attention output, gelu) carry ~16k
+/// outliers that i8 act-quant would crush.
+#[derive(Clone, Copy, Default)]
+pub struct WanI8Sites {
+    /// Self-attention qkv only (cross-attention qkv always stays dense).
+    pub qkv_self: Option<thinfer_core::quant::QuantKind>,
+    pub ffn_up: Option<thinfer_core::quant::QuantKind>,
+}
+
 /// Register every Wan DiT weight with residency. `transcode`: optional
 /// load-time requantize target for the matmul weights (block q/k/v/o + ffn);
-/// embedders, patch, proj_out, and all norms/biases stay dense. Mirrors
-/// `z_image::loader::register_dit_handles`.
+/// embedders, patch, proj_out, and all norms/biases stay dense. `i8`: opt-in
+/// per-site i8 transcode for the DP4A-safe sites (qkv + ffn_up), overriding
+/// `transcode` for those weights only. Mirrors `z_image::loader`.
 pub fn register_wan_dit_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
     cfg: &WanDitConfig,
     transcode: Option<thinfer_core::quant::QuantKind>,
-    ffn_up_transcode: Option<thinfer_core::quant::QuantKind>,
+    i8: WanI8Sites,
 ) -> Result<LoadedWanDitHandles, LoadError> {
     let mw = WanDitModelWeights::new();
     let blocks = (0..cfg.num_layers)
-        .map(|i| {
-            register_block(
-                residency,
-                &WanDitBlockWeights::new(i),
-                transcode,
-                ffn_up_transcode,
-            )
-        })
+        .map(|i| register_block(residency, &WanDitBlockWeights::new(i), transcode, i8))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LoadedWanDitHandles {
         patch: register_conv_as_linear_bias(residency, &mw.patch_weight, &mw.patch_bias)?,
@@ -214,14 +223,16 @@ fn register_block<S: WeightSource>(
     residency: &WeightResidency<S>,
     w: &WanDitBlockWeights,
     transcode: Option<thinfer_core::quant::QuantKind>,
-    ffn_up_transcode: Option<thinfer_core::quant::QuantKind>,
+    i8: WanI8Sites,
 ) -> Result<WanDitBlockHandles, LoadError> {
     Ok(WanDitBlockHandles {
-        self_attn: register_attn(residency, &w.self_attn, transcode)?,
-        cross_attn: register_attn(residency, &w.cross_attn, transcode)?,
+        // Self-attn qkv takes the opt-in i8 transcode; cross-attn qkv never does
+        // (its K/V project from un-normed text -> i8 acts overflow f16).
+        self_attn: register_attn(residency, &w.self_attn, transcode, i8.qkv_self)?,
+        cross_attn: register_attn(residency, &w.cross_attn, transcode, None)?,
         norm2_w: register_passthrough(residency, &w.norm2.weight)?,
         norm2_b: register_passthrough(residency, &w.norm2.bias)?,
-        ffn_up_w: register_linear(residency, &w.ffn_up.weight, ffn_up_transcode.or(transcode))?,
+        ffn_up_w: register_linear(residency, &w.ffn_up.weight, i8.ffn_up.or(transcode))?,
         ffn_up_b: register_passthrough(residency, &w.ffn_up.bias)?,
         ffn_down_w: register_linear(residency, &w.ffn_down.weight, transcode)?,
         ffn_down_b: register_passthrough(residency, &w.ffn_down.bias)?,
@@ -233,13 +244,16 @@ fn register_attn<S: WeightSource>(
     residency: &WeightResidency<S>,
     w: &AttnNames,
     transcode: Option<thinfer_core::quant::QuantKind>,
+    qkv_i8: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<WanAttnHandles, LoadError> {
+    // q/k/v take the opt-in i8 transcode (normed A-side, DP4A-safe); o-proj keeps
+    // the base encoding (its A-side is the attention output -> outlier-prone).
     Ok(WanAttnHandles {
-        q_w: register_linear(residency, &w.q.weight, transcode)?,
+        q_w: register_linear(residency, &w.q.weight, qkv_i8.or(transcode))?,
         q_b: register_passthrough(residency, &w.q.bias)?,
-        k_w: register_linear(residency, &w.k.weight, transcode)?,
+        k_w: register_linear(residency, &w.k.weight, qkv_i8.or(transcode))?,
         k_b: register_passthrough(residency, &w.k.bias)?,
-        v_w: register_linear(residency, &w.v.weight, transcode)?,
+        v_w: register_linear(residency, &w.v.weight, qkv_i8.or(transcode))?,
         v_b: register_passthrough(residency, &w.v.bias)?,
         o_w: register_linear(residency, &w.o.weight, transcode)?,
         o_b: register_passthrough(residency, &w.o.bias)?,

@@ -1,24 +1,23 @@
-//! LongLive-2.0-5B AR (causal/streaming) end-to-end engine test on the real
-//! weights. Drives the full AR path - tokenize -> umT5 encode -> per-chunk
-//! 4-step FlowUniPC denoise over the windowed KV cache (with the timestep-0 clean
-//! recache between chunks) -> TI2V VAE decode -> CTHW frames - and asserts the
-//! output is finite, clamped, and non-trivial across a MULTI-CHUNK run (so the
-//! window/commit/causal path is actually exercised; a single-chunk run validates
-//! none of the new AR code).
+//! LongLive-2.0-5B multi-shot AR end-to-end test on the real weights. Drives the
+//! scene-cut path that single-prompt `longlive_e2e` never exercises: a per-shot
+//! prompt list, the in-band `SCENE_CUT_PREFIX` on each shot boundary, and the
+//! cache's shot-boundary bookkeeping (RoPE temporal-phase advance before the
+//! boundary chunk + chunk pinning after its clean commit). Asserts the decoded
+//! video is finite, clamped, and non-trivial across a >=2-shot run, so the
+//! boundary chunk's prefixed cross-attn + advanced RoPE + pinned sink all wire up
+//! without NaNs or a dead cache.
 //!
-//! This is the engine gate for the AR backbone, NOT the pyref byte-compare (that
-//! is the next step: the reference `inference.py` on the same `.pt` + pinned
-//! noise, ending in a user pause). Health plus multi-chunk coverage here proves
-//! the GPU AR self-attn, KV cache, and chunk loop wire up correctly.
+//! This is a health gate, not a pyref byte-compare: the single-forward parity is
+//! covered by `longlive_parity`, and the AR-depth precision compounding is
+//! tolerated by design (see worklog). Multi-shot adds no new ops, only cache
+//! routing, so finite + variance across a scene cut is the right bar.
 //!
-//! Gated on `THINFER_LONGLIVE_PT` pointing at `model_bf16.pt` (skips when unset)
-//! AND the FastWan base bundle (umT5 + VAE + tokenizer) being in the HF cache
-//! (skips, never downloads). Run:
+//! Gated on `THINFER_LONGLIVE_PT` (skips when unset) AND the FastWan base bundle
+//! (umT5 + VAE + tokenizer) being in the HF cache (skips, never downloads). Run:
 //!   `THINFER_LONGLIVE_PT=<path> cargo test -p thinfer-conformance --features \
-//!    wan-e2e --release longlive_e2e -- --nocapture --test-threads=1`
+//!    wan-e2e --release longlive_multishot -- --nocapture --test-threads=1`
 //!
-//! Knobs: `THINFER_LL_{WIDTH,HEIGHT,FRAMES}` (defaults 128x128, 61 frames = 16
-//! latent frames = 2 chunks of 8); `THINFER_LL_BUDGET_GB` residency budget.
+//! Knobs: `THINFER_LL_{WIDTH,HEIGHT}` (default 128x128); `THINFER_LL_BUDGET_GB`.
 
 #![cfg(feature = "wan-e2e")]
 
@@ -29,24 +28,27 @@ use thinfer_core::policy::ResidencyBudget;
 use thinfer_core::residency::WeightResidency;
 use thinfer_models::wan::dit_block::WanDitConfig;
 use thinfer_models::wan::manifest::{self, role};
-use thinfer_models::wan::pipeline::{GenerationParams, VaeChoice, WanModel};
+use thinfer_models::wan::pipeline::{GenerationParams, Shot, VaeChoice, WanModel};
 use thinfer_models::wan::source::open_longlive_source;
 use thinfer_native::MmapFileOpener;
 use thinfer_native::cache;
 use thinfer_native::tokenizer::HfTokenizer;
 
-const PROMPT: &str = "a red balloon drifting over a green field, smooth camera pan";
+/// Two shots, one chunk each -> 2 chunks = f_lat 16 = 61 output frames. The shot
+/// boundary at chunk 1 fires the scene-cut path; distinct prompts make the cut
+/// semantically real (cross-attn switches text mid-video).
+const SHOT_A: &str = "a red balloon drifting over a green field, smooth camera pan";
+const SHOT_B: &str = "a blue kite diving through grey storm clouds, fast motion";
 const SEED: u64 = 42;
 const TEMPORAL_SCALE: usize = 4;
-/// LongLive chunk size in latent frames (`num_frame_per_block`).
 const CHUNK_FRAMES: usize = 8;
 
 #[tokio::test(flavor = "current_thread")]
-async fn longlive_e2e_ar() {
+async fn longlive_multishot_e2e_ar() {
     let _ = thinfer_core::trace::init_from_env();
 
     let Some(pt_path) = std::env::var_os("THINFER_LONGLIVE_PT") else {
-        eprintln!("longlive_e2e: THINFER_LONGLIVE_PT unset; skipping");
+        eprintln!("longlive_multishot_e2e: THINFER_LONGLIVE_PT unset; skipping");
         return;
     };
 
@@ -58,25 +60,29 @@ async fn longlive_e2e_ar() {
     };
     let width = env_u32("THINFER_LL_WIDTH", 128);
     let height = env_u32("THINFER_LL_HEIGHT", 128);
-    // 61 frames -> f_lat = 16 = 2 chunks of 8. The multi-chunk run is the whole
-    // point: chunk 1 attends chunk 0's committed (clean-pass) window.
-    let num_frames = env_u32("THINFER_LL_FRAMES", 61);
     let budget_gb: u64 = env_u32("THINFER_LL_BUDGET_GB", 8) as u64;
 
-    let f_lat = (num_frames as usize - 1) / TEMPORAL_SCALE + 1;
-    let num_chunks = f_lat / CHUNK_FRAMES;
-    assert!(
-        f_lat.is_multiple_of(CHUNK_FRAMES) && num_chunks >= 2,
-        "longlive_e2e needs a >=2-chunk run: f_lat={f_lat} must be a multiple of {CHUNK_FRAMES} \
-         and >= {}",
-        2 * CHUNK_FRAMES
-    );
+    // Two single-chunk shots. num_frames must match the engine's chunk math:
+    // f_lat = sum(shot.chunks) * CHUNK_FRAMES, frames = 4 * f_lat - 3.
+    let shots = vec![
+        Shot {
+            prompt: SHOT_A.to_string(),
+            chunks: 1,
+        },
+        Shot {
+            prompt: SHOT_B.to_string(),
+            chunks: 1,
+        },
+    ];
+    let total_chunks: usize = shots.iter().map(|s| s.chunks).sum();
+    let f_lat = total_chunks * CHUNK_FRAMES;
+    let num_frames = (TEMPORAL_SCALE * f_lat - 3) as u32;
     eprintln!(
-        "longlive_e2e: {width}x{height} frames={num_frames} (f_lat={f_lat}, chunks={num_chunks})"
+        "longlive_multishot_e2e: {width}x{height} frames={num_frames} \
+         (f_lat={f_lat}, {} shots, chunks={total_chunks})",
+        shots.len()
     );
 
-    // Base bundle (umT5 + VAE + tokenizer) from the FastWan repo; the `.pt` DiT is
-    // the LongLive-specific file. Skip cleanly if the base misses the cache.
     let base_roles = [
         role::TEXT_ENCODER_SHARD_1,
         role::TEXT_ENCODER_SHARD_2,
@@ -120,7 +126,6 @@ async fn longlive_e2e_ar() {
 
     let cfg = WgpuConfig {
         power_preference: match std::env::var("THINFER_POWER_PREF").as_deref() {
-            Ok("high") => PowerPreference::HighPerformance,
             Ok("low") => PowerPreference::LowPower,
             _ => PowerPreference::HighPerformance,
         },
@@ -147,7 +152,7 @@ async fn longlive_e2e_ar() {
     .expect("WanModel::load (LongLive)");
 
     let params = GenerationParams {
-        prompt: PROMPT.to_string(),
+        prompt: SHOT_A.to_string(), // ignored on the multi-shot path; shots drive it
         height,
         width,
         num_frames,
@@ -155,9 +160,9 @@ async fn longlive_e2e_ar() {
     };
     let progress = |_ev: thinfer_models::wan::pipeline::ProgressEvent| {};
     let video = model
-        .generate_ar(&params, &[], VaeChoice::Full, Some(&progress))
+        .generate_ar(&params, &shots, VaeChoice::Full, Some(&progress))
         .await
-        .expect("generate_ar");
+        .expect("generate_ar (multi-shot)");
 
     // --- health: finite, clamped, non-trivial ---
     let out_frames = TEMPORAL_SCALE * f_lat - 3;
@@ -173,7 +178,7 @@ async fn longlive_e2e_ar() {
     let nonfinite = video.frames.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
         nonfinite, 0,
-        "decoded video has {nonfinite} non-finite samples"
+        "multi-shot video has {nonfinite} non-finite samples"
     );
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for &x in &video.frames {
@@ -184,8 +189,6 @@ async fn longlive_e2e_ar() {
             "decoded sample {x} out of [-1, 1]"
         );
     }
-    // Non-trivial: a NaN-free-but-constant frame (e.g. a dead cache) would pass
-    // the range check. Require real spatial variance.
     let n = video.frames.len() as f64;
     let mean = video.frames.iter().map(|&x| x as f64).sum::<f64>() / n;
     let var = video
@@ -194,11 +197,37 @@ async fn longlive_e2e_ar() {
         .map(|&x| (x as f64 - mean).powi(2))
         .sum::<f64>()
         / n;
-    eprintln!("longlive_e2e: range=[{lo:.4}, {hi:.4}] mean={mean:.4} var={var:.6}");
+    eprintln!("longlive_multishot_e2e: range=[{lo:.4}, {hi:.4}] mean={mean:.4} var={var:.6}");
     assert!(
         var > 1e-5,
-        "decoded video is ~constant (var={var:.3e}); AR path likely dead"
+        "decoded video is ~constant (var={var:.3e}); scene-cut path likely dead"
     );
 
-    eprintln!("longlive_e2e: OK ({num_chunks} chunks, {out_frames} frames, finite + clamped)");
+    // Diagnostic (not asserted: VAE temporal mixing blends across the boundary,
+    // so a strict cross-shot delta would be flaky at one chunk/shot): print the
+    // first- vs last-frame mean so a stuck-cache regression (shot B == shot A) is
+    // visible in the log. CTHW channel-planar, so gather each frame across C.
+    let hw = height as usize * width as usize;
+    let per_frame = 3 * hw;
+    let frame_mean = |t: usize| -> f64 {
+        let plane = out_frames * hw;
+        let base = t * hw;
+        let mut s = 0.0f64;
+        for c in 0..3 {
+            for px in 0..hw {
+                s += video.frames[c * plane + base + px] as f64;
+            }
+        }
+        s / per_frame as f64
+    };
+    eprintln!(
+        "longlive_multishot_e2e: first-frame mean={:.4} last-frame mean={:.4}",
+        frame_mean(0),
+        frame_mean(out_frames - 1)
+    );
+
+    eprintln!(
+        "longlive_multishot_e2e: OK ({} shots, {out_frames} frames, finite + clamped)",
+        shots.len()
+    );
 }

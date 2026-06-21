@@ -423,6 +423,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         for slots in &per_layer_weights {
             let cfgs = BlockWgslConfigs {
                 matmul_qkv: mk_main(slots[0]),
+                matmul_qkv_self: mk_main(slots[0]),
                 matmul_proj: mk_main(slots[1]),
                 matmul_ffn_up: mk_main(slots[2]),
                 matmul_ffn_down: mk_main(slots[3]),
@@ -472,6 +473,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         let transcoded = WeightDtype::Quant(encoder_transcode);
         let encoder_cfgs = BlockWgslConfigs {
             matmul_qkv: encoder_slot(&qwen3_l0.layers[0].q_proj, transcoded),
+            matmul_qkv_self: encoder_slot(&qwen3_l0.layers[0].q_proj, transcoded),
             matmul_proj: encoder_slot(&qwen3_l0.layers[0].o_proj, transcoded),
             matmul_ffn_up: encoder_slot(&qwen3_l0.layers[0].mlp_gate, transcoded),
             matmul_ffn_down: encoder_slot(&qwen3_l0.layers[0].mlp_down, WeightDtype::Bf16),
@@ -502,6 +504,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         };
         let dit_encoder_cfgs = BlockWgslConfigs {
             matmul_qkv: refiner_matmul_cfg,
+            matmul_qkv_self: refiner_matmul_cfg,
             matmul_proj: refiner_matmul_cfg,
             matmul_ffn_up: refiner_matmul_cfg,
             matmul_ffn_down: refiner_matmul_cfg,
@@ -517,6 +520,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // final-layer linears are never transcoded).
         let dit_embedder_cfgs = BlockWgslConfigs {
             matmul_qkv: dit_encoder_ops,
+            matmul_qkv_self: dit_encoder_ops,
             matmul_proj: dit_encoder_ops,
             matmul_ffn_up: dit_encoder_ops,
             matmul_ffn_down: dit_encoder_ops,
