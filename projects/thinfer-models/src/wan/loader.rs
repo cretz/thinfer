@@ -188,10 +188,18 @@ pub fn register_wan_dit_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
     cfg: &WanDitConfig,
     transcode: Option<thinfer_core::quant::QuantKind>,
+    ffn_up_transcode: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<LoadedWanDitHandles, LoadError> {
     let mw = WanDitModelWeights::new();
     let blocks = (0..cfg.num_layers)
-        .map(|i| register_block(residency, &WanDitBlockWeights::new(i), transcode))
+        .map(|i| {
+            register_block(
+                residency,
+                &WanDitBlockWeights::new(i),
+                transcode,
+                ffn_up_transcode,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LoadedWanDitHandles {
         patch: register_conv_as_linear_bias(residency, &mw.patch_weight, &mw.patch_bias)?,
@@ -206,13 +214,14 @@ fn register_block<S: WeightSource>(
     residency: &WeightResidency<S>,
     w: &WanDitBlockWeights,
     transcode: Option<thinfer_core::quant::QuantKind>,
+    ffn_up_transcode: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<WanDitBlockHandles, LoadError> {
     Ok(WanDitBlockHandles {
         self_attn: register_attn(residency, &w.self_attn, transcode)?,
         cross_attn: register_attn(residency, &w.cross_attn, transcode)?,
         norm2_w: register_passthrough(residency, &w.norm2.weight)?,
         norm2_b: register_passthrough(residency, &w.norm2.bias)?,
-        ffn_up_w: register_linear(residency, &w.ffn_up.weight, transcode)?,
+        ffn_up_w: register_linear(residency, &w.ffn_up.weight, ffn_up_transcode.or(transcode))?,
         ffn_up_b: register_passthrough(residency, &w.ffn_up.bias)?,
         ffn_down_w: register_linear(residency, &w.ffn_down.weight, transcode)?,
         ffn_down_b: register_passthrough(residency, &w.ffn_down.bias)?,

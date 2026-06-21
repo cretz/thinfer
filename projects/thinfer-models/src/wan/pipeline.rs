@@ -293,8 +293,15 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // umT5 GGUF ships matmuls quantized in-file; bf16/f32 safetensors stay
         // dense (no transcode for v1 -- keep the parity path bit-clean).
         let vae_cfg = WanVaeConfig::fastwan_ti2v_5b();
+        // Opt-in DP4A FFN: transcode the bf16 ffn_up weight to Q8_0 at load and
+        // route that one site through the i8xi8 `matmul_i8` (dot4I8Packed) path
+        // (ffn_up's A-side is the layernorm+modulated residual -> no massive
+        // outliers, unlike ffn_down's gelu output). Default off keeps the bf16
+        // parity path byte-identical (FastWan undisturbed).
+        let ffn_up_q8 =
+            std::env::var_os("THINFER_WAN_I8_FFN").map(|_| thinfer_core::quant::QuantKind::Q8_0);
         let umt5_handles = register_umt5_handles(&residency, None)?;
-        let dit_handles = register_wan_dit_handles(&residency, &cfg, None)?;
+        let dit_handles = register_wan_dit_handles(&residency, &cfg, None, ffn_up_q8)?;
         // VAE decoder weights all fit resident; diff the registered footprint
         // across registration so the decode can reserve exactly it (not a budget
         // fraction) when sizing its non-evictable tile workspace.
@@ -345,9 +352,10 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let umt5_act = act_override.unwrap_or(ActDtype::Bf16);
         tracing::info!(?dit_w, ?umt5_w, ?act, ?umt5_act, "Wan dtype selection");
 
-        let dit = WanDitPipelines::compile(&backend, &block_cfgs(dit_w, act)).await?;
+        let ffn_up_wd = ffn_up_q8.map(WeightDtype::Quant);
+        let dit = WanDitPipelines::compile(&backend, &block_cfgs(dit_w, act, ffn_up_wd)).await?;
         let umt5_pipelines =
-            Umt5Pipelines::compile(&backend, &block_cfgs(umt5_w, umt5_act)).await?;
+            Umt5Pipelines::compile(&backend, &block_cfgs(umt5_w, umt5_act, None)).await?;
         let vae_pipelines = WanVaePipelines::compile(&backend).await?;
         let vae_tiny = match vae_tiny_handles {
             None => None,
@@ -1314,7 +1322,11 @@ fn probe_weight<S: WeightSource>(residency: &WeightResidency<S>, id: &str) -> We
 
 /// Uniform `BlockWgslConfigs` for one submodel: every matmul slot takes
 /// `weight_dtype`, the ops template carries the chosen act dtype + recipe.
-fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype) -> BlockWgslConfigs {
+fn block_cfgs(
+    weight_dtype: WeightDtype,
+    act: ActDtype,
+    ffn_up_weight_dtype: Option<WeightDtype>,
+) -> BlockWgslConfigs {
     let ops = WgslConfig {
         bf16_quant_writes: RECIPE.bf16_quant_writes,
         act_dtype: act,
@@ -1324,10 +1336,16 @@ fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype) -> BlockWgslConfigs {
         weight_dtype,
         ..ops
     };
+    // Per-site override: ffn_up may run a different (i8/Q8_0) weight encoding for
+    // the DP4A path while the rest of the block stays bf16.
+    let mm_ffn_up = WgslConfig {
+        weight_dtype: ffn_up_weight_dtype.unwrap_or(weight_dtype),
+        ..ops
+    };
     BlockWgslConfigs {
         matmul_qkv: mm,
         matmul_proj: mm,
-        matmul_ffn_up: mm,
+        matmul_ffn_up: mm_ffn_up,
         matmul_ffn_down: mm,
         matmul_adaln: ops,
         ops,
