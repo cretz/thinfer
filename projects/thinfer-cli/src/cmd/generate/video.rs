@@ -671,8 +671,9 @@ fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> {
     mux_mp4(out, w, h, fps, &sps, &pps, &samples)
 }
 
-/// Mux length-prefixed (AVCC) H.264 samples into an MP4 file.
-fn mux_mp4(
+/// Mux length-prefixed (AVCC) H.264 samples into an MP4 file. Shared with the
+/// face-swap encoder (`super::faceswap`).
+pub(crate) fn mux_mp4(
     out: &Path,
     w: usize,
     h: usize,
@@ -777,7 +778,7 @@ fn write_png_frames(video: &WanVideo, dir: &Path) -> Result<(), String> {
 /// capturing the first SPS/PPS into `sps`/`pps` (excluded from the sample, they
 /// live in the avcC config box). Returns the sample bytes + whether it is an
 /// IDR keyframe.
-fn annexb_to_avcc(
+pub(crate) fn annexb_to_avcc(
     annexb: &[u8],
     sps: &mut Option<Vec<u8>>,
     pps: &mut Option<Vec<u8>>,
@@ -813,7 +814,7 @@ fn annexb_to_avcc(
 
 /// Split an Annex B buffer into NAL payloads (start codes stripped). Handles
 /// both 3-byte (`00 00 01`) and 4-byte (`00 00 00 01`) start codes.
-fn nal_units(annexb: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn nal_units(annexb: &[u8]) -> Vec<&[u8]> {
     let n = annexb.len();
     let mut sc_ends = Vec::new(); // index just past each `00 00 01`
     let mut i = 0;

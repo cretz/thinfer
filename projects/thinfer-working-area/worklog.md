@@ -7,6 +7,10 @@ reusable, SkyReels-DF sections obsolete). Z-Image (shipped): `zimage-plan.md`.
 
 ## Status
 
+- **Face-swap SHIPPED** (`thinfer generate face-swap`): video face swap via a new
+  generic ONNX executor (`thinfer-core/src/onnx/`) + HyperSwap/SCRFD/ArcFace
+  pipeline (`thinfer-models/src/faceswap/`). Separate from the video/LongLive
+  work below (untouched). Details + open perf follow-ups: `faceswap-plan.md`.
 - **FastWan2.2-TI2V-5B-FullAttn SHIPPED.** Parity GREEN at 256x256x5/6GB; coherent
   NaN-free 576x576x97 clips; fits a 2GB budget. bf16 full precision (no quant in
   path). DiT bf16 acts, umT5 bf16 acts. This is the baseline; DO NOT DISTURB it.

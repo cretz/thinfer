@@ -23,3 +23,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # software encoder (it uses the browser's WebCodecs encoder instead).
 openh264 = "0.6"
 mp4 = "0.14"
+# Source-image decode for `generate face-swap` (PNG/JPEG only; no extra codecs).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

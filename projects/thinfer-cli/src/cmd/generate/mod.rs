@@ -12,9 +12,11 @@ use thinfer_core::backend::{PowerPreference, WgpuBackend, WgpuConfig};
 use thinfer_core::manifest::FileRef;
 use thinfer_core::policy::parse_bytes;
 
+mod faceswap;
 mod image;
 mod video;
 
+use faceswap::GenerateFaceSwap;
 use image::GenerateImage;
 use video::GenerateVideo;
 
@@ -30,12 +32,16 @@ pub enum GenerateCmd {
     Image(GenerateImage),
     /// Generate a video from a prompt (t2v).
     Video(GenerateVideo),
+    /// Swap a face from a source image into every frame of an input video.
+    #[command(name = "face-swap")]
+    FaceSwap(GenerateFaceSwap),
 }
 
 pub async fn run(cmd: GenerateCmd) -> ExitCode {
     let result = match cmd {
         GenerateCmd::Image(args) => image::run_image(args).await,
         GenerateCmd::Video(args) => video::run_video(args).await,
+        GenerateCmd::FaceSwap(args) => faceswap::run_faceswap(args).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -17,6 +17,7 @@ serde_json = "1"
 
 [dev-dependencies]
 half = "2"
+png = "0.17"
 pollster = "0.4"
 safetensors = "0.4"
 tempfile = "3"
@@ -37,3 +38,7 @@ zimage-e2e = []
 # Opt-in SkyReels-V2 (Wan) video end-to-end parity test. Same discipline as
 # zimage-e2e: touches the local HF cache, skips cleanly when uncached.
 wan-e2e = []
+# Opt-in face-swap ONNX executor parity + pipeline e2e. Resolves the FaceFusion
+# ONNX models from the HF cache; compares the thinfer ONNX executor against
+# onnxruntime goldens. Skips cleanly when goldens/models are absent.
+faceswap-e2e = []

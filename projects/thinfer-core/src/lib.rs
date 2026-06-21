@@ -7,6 +7,7 @@ pub mod format;
 pub mod manifest;
 pub mod mem;
 pub mod module;
+pub mod onnx;
 pub mod ops;
 pub mod pipeline;
 pub mod policy;
