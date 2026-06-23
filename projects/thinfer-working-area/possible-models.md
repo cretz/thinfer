@@ -23,4 +23,5 @@ Video gen:
 * https://huggingface.co/unsloth/LTX-2.3-GGUF (with audio/talking?)
 * https://huggingface.co/SulphurAI/Sulphur-2-base (and quants)
 * https://huggingface.co/GAIR/daVinci-MagiHuman (with audio/talking?)
-* https://huggingface.co/zai-org/SCAIL-2 (needs reference character + reference video)
+* https://huggingface.co/zai-org/SCAIL-2 (https://huggingface.co/realrebelai/SCAIL-2_GGUF, needs reference character + reference video)
+* https://huggingface.co/neuregex/Bernini-R-GGUF (https://huggingface.co/ByteDance/Bernini-R)

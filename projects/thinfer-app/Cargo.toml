@@ -1,0 +1,51 @@
+[package]
+name = "thinfer-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Neutral orchestration lib above thinfer-native/-models, below the binaries
+# (thinfer-cli, future thinfer-serve / -desktop / -python). Owns the `Job`
+# concept, request types, the unified progress vocabulary, the shared
+# download/load/generate/encode dance, and the `LocalExecutor`. The codec deps
+# (openh264 + mp4) live here -- this is now the glue layer the CLI comment used
+# to point at; web keeps its own browser WebCodecs path and does NOT depend on
+# this crate.
+
+[dependencies]
+thinfer-core = { path = "../thinfer-core" }
+thinfer-native = { path = "../thinfer-native" }
+thinfer-models = { path = "../thinfer-models" }
+tracing = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+# Video output: H.264 encode (Cisco BSD, compiled from source) + MP4 mux. Kept
+# off thinfer-native/-models so web stays free of a wasm software codec.
+openh264 = "0.9"
+mp4 = "0.14"
+# Source-image decode for face-swap (PNG/JPEG only; no extra codecs).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Optional adapter derives, gated so non-consumers stay dep-clean.
+clap = { version = "4", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+utoipa = { version = "5", optional = true }
+# HTTP client for the `RemoteExecutor` (talks to a thinfer-serve box). rustls so
+# no OpenSSL/SChannel build dep; `stream` for tailing the SSE event body.
+serde_json = { version = "1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = []
+# clap `ValueEnum` derives on the canonical id enums, so thinfer-cli reuses the
+# app enums as its `--model` etc. value types (one name per concept).
+cli = ["dep:clap"]
+# serde derives on the canonical id enums (kebab-case ids matching the CLI).
+serde = ["dep:serde"]
+# serde + utoipa `ToSchema`, so thinfer-serve reuses the id enums as its OpenAPI
+# schema (single source for the variant lists).
+serve = ["serde", "dep:utoipa"]
+# The HTTP `RemoteExecutor` client (thinfer-cli --remote). Pulls reqwest; other
+# app consumers (serve) stay free of it.
+remote = ["serde", "dep:serde_json", "dep:reqwest", "dep:futures-util"]

@@ -13,15 +13,11 @@ path = "src/main.rs"
 [dependencies]
 thinfer-core = { path = "../thinfer-core", features = ["trace-subscriber"] }
 thinfer-native = { path = "../thinfer-native" }
-thinfer-models = { path = "../thinfer-models" }
+# The generate orchestration (Job + LocalExecutor + codec) lives here; the CLI
+# is a thin clap adapter. `cli` enables the clap `ValueEnum` derives on the
+# canonical id enums so we reuse them directly as `--model` etc. value types.
+thinfer-app = { path = "../thinfer-app", features = ["cli", "remote"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
-# Video output (CLI-only): H.264 encode (Cisco BSD, compiled from source) +
-# MP4 mux. Kept out of thinfer-native/-models so web stays free of a wasm
-# software encoder (it uses the browser's WebCodecs encoder instead).
-openh264 = "0.9"
-mp4 = "0.14"
-# Source-image decode for `generate face-swap` (PNG/JPEG only; no extra codecs).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

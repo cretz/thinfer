@@ -37,6 +37,20 @@ impl UniPcConfig {
             sigma_min: 0.001,
         }
     }
+
+    /// FastWan2.2-TI2V-5B served sampler. Matches the public HF Spaces that load
+    /// `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers`:
+    /// `UniPCMultistepScheduler.from_config(..., flow_shift=8.0)`, CFG-free.
+    /// `steps` is the user-facing denoise count (UI slider 1..=8, default 4); the
+    /// sparse-distill model is meant to run a handful of steps.
+    pub fn fastwan(steps: u32) -> Self {
+        Self {
+            sampling_steps: (steps.max(1)) as usize,
+            shift: 8.0,
+            num_train_timesteps: 1000.0,
+            sigma_min: 0.001,
+        }
+    }
 }
 
 const SOLVER_ORDER: usize = 2;

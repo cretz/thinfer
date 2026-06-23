@@ -21,7 +21,7 @@ enum Top {
     /// Generation entry points.
     Generate {
         #[command(subcommand)]
-        cmd: cmd::generate::GenerateCmd,
+        cmd: Box<cmd::generate::GenerateCmd>,
     },
 }
 
@@ -75,7 +75,7 @@ fn main() -> ExitCode {
     let code = rt.block_on(async {
         match cli.cmd {
             Top::Model { cmd: sub } => cmd::model::run(sub).await,
-            Top::Generate { cmd: sub } => cmd::generate::run(sub).await,
+            Top::Generate { cmd: sub } => cmd::generate::run(*sub).await,
         }
     });
     if let Some(h) = rollup_handle {

@@ -21,12 +21,150 @@ clearable -- nothing here depends on a scratch file.
 - **i8 DP4A matmul is ON by default** (opt out `--no-i8-matmul` = bf16 reference
   path); see the i8 lesson below.
 
-## NEXT (planned): `thinfer serve` + OpenAPI + web client
+## NEXT (active): FastWan UniPC sampling path -- LANDED, awaiting visual check
 
-Not started (design converged 2026-06-22). A long-running server exposing
-image/video/faceswap generation over a typesafe OpenAPI HTTP API + an example web
-page that runs the SAME generation either in-browser (wasm) or on the server, as a
-toggle. GOAL: usable from a phone against a `thinfer-serve` box.
+IMPLEMENTED (read the code, do not re-spec). UniPC is now the default FastWan
+sampler everywhere (CLI + serve + web UI); DMD stays reachable + is the parity
+path. PENDING = the user eyeballs a UniPC clip in the running thinfer-serve web UI
+vs the KingNish Space (matched prompt/seed/res). If it looks right, done; if not,
+fall back to the GPU upstream-pyref compare. What landed:
+- `UniPcConfig::fastwan(steps)` (`wan/unipc.rs`): shift=8.0, 1000 train steps,
+  sigma_min 0.001. Verified against the live KingNish `app.py`:
+  `UniPCMultistepScheduler.from_config(..., flow_shift=8.0)`, steps default 4 /
+  slider 1..=8, `guidance_scale=0` (CFG-free), 896x896 default.
+- `VideoSampler { Dmd (default), UniPc{steps} }` on `GenerationParams`; the denoise
+  loop in `denoise_with` branches on it. UniPc arm drives the existing `FlowUniPc`,
+  no renoise, no guidance; DiT forward byte-identical to DMD (perf unchanged, only
+  a tiny host-side latent history added -- no VRAM/residency change). step-diag taps
+  stay DMD-only (parity gate uses `VideoSampler::Dmd` explicitly, still GREEN-able).
+- Plumbed sampler + steps through `thinfer-app` (`model::VideoSampler`,
+  `VIDEO_DEFAULT_STEPS=4`, `VideoRequest`, `wire::VideoSpec`), `serve` (defaults
+  UniPC/4), CLI (`--sampler unipc|dmd`, `--steps`), and the web UI (Steps field
+  now shown for video, 1..=8 default 4; server defaults the sampler to UniPC).
+- Server rebuilt (release) + restarted (default config, 0.0.0.0:8080, embedded web);
+  openapi.json carries the new `sampler`/`steps` VideoSpec fields.
+
+ORIGINAL PROBLEM (kept for context): FastWan video looked bad at every res the user
+tried (512x288..960x544, tiny AND full VAE). Steps were correct (DMD 3-step
+`[1000,757,522]`, matches FastVideo official) and parity is GREEN at 256x256 -- so it
+was NOT a kernel/step bug. ROOT CAUSE (found via the reference HF Spaces the user
+trusts): they sample the SAME weights with a DIFFERENT denoiser. We used the DMD
+re-noise sampler; they use plain UniPC multistep.
+
+CONFIRMED RECIPE (two independent Spaces agree -- `KingNish/wan2-2-fast` app.py and
+`rahul7star/Wan2.2-T2V-A14B` app_fast.py, both load `FastVideo/FastWan2.2-TI2V-5B-
+FullAttn-Diffusers`): `UniPCMultistepScheduler.from_config(..., flow_shift=8.0)`,
+`num_inference_steps=4` (slider 1-8), `guidance_scale=0` (CFG-free). (app_fast also
+adds a content LoRA @0.95 -- INCIDENTAL, ignore.) Default res in both is 896x896
+square, so square is fine for this model (earlier "avoid square for video" was wrong
+for Wan2.2-TI2V).
+
+PLAN (DiT forward stays byte-unchanged; only the sampler around it changes):
+- REUSE the existing `FlowUniPc` solver (`wan/unipc.rs`, today only LongLive's). Its
+  `UniPcConfig` fields: `sigma_min`, `shift`, `num_train_timesteps`, `sampling_steps`.
+  For FastWan: `shift=8.0`, `sampling_steps=4`, `num_train_timesteps=1000`, sigma_min
+  as LongLive. NOT touching LongLive.
+- Add a NON-AR UniPC denoise loop in `wan/pipeline.rs::generate` as an alternative to
+  the `DmdSampler` loop (~line 1046-1149). Per step i: forward DiT at
+  `unipc.timestep(i)` -> velocity; `sample = unipc.step(&velocity, &sample)`. NO
+  re-noise, NO guidance (CFG-free). Mirrors how `denoise_ar` drives `FlowUniPc`, but
+  over the whole latent (no KV window).
+- KEEP DMD-3 intact as the parity default so the GREEN gate stays valid. Add a sampler
+  choice (DMD | UniPC) + a CONFIGURABLE step count to `VideoRequest`/`wire::VideoSpec`/
+  the web UI. DECIDED: step count is a user knob (default 4, range 1-8, per the Spaces),
+  NOT a fixed UniPC-4 -- the sparse-distill model is meant to run 3-5 steps. UniPC is
+  the serve/UI default sampler for FastWan; DMD-3 stays reachable + is the parity path.
+- VALIDATE by eyeballing a UniPC-4 clip vs the Space at matched prompt/seed/res. If it
+  looks right, wire it as default; if not, fall back to the GPU upstream-pyref compare.
+
+CARRY-FORWARD (already LIVE in the running `thinfer-serve` -- rebuilt + restarted this
+session; do not re-spec, read the code): web UI now has a Size-preset dropdown (trained
+aspects, /16 image & /32 video grids, hand-typed = "Custom"), a Quality (VAE) toggle
+(tiny default / full), and a Duration(s) field replacing Frames+FPS (sends `durations`).
+`default_frames` now = 5s @ model fps (`DEFAULT_DURATION_SECS`), snapping FastWan 121 /
+LongLive 125. `ProgressStage::ChunkStep` now serializes camelCase (`numChunks`/`numSteps`)
+so the LongLive progress line renders. Server diag probes muted by default
+(`info,thinfer::diag=warn`; re-enable via `RUST_LOG`). NB: the user keeps a server
+running and toys with it from a browser -- ASK before stopping/restarting it.
+
+## NEXT: `thinfer serve` + OpenAPI + web client
+
+Steps 1-4 LANDED (2026-06-23): the phone goal is reachable. `thinfer-app`
+extraction + `thinfer-serve` v1 + `RemoteExecutor`/`--remote` + a server-backed
+web UI all build green + clippy-clean; server boots + inits the 5070 worker, the
+HTTP surface verified by curl (static UI open + 200, `/jobs*` + openapi gated 401,
+valid-token-bad-spec 400 before any download). REMAINING here = the wasm<->http web
+toggle + the weights+GPU deferrals below. GOAL (met for server mode): usable from a
+phone against a `thinfer-serve` box. Image/video/faceswap over a typesafe OpenAPI
+HTTP API + a web page that runs the SAME generation on the server (wasm mode TBD).
+
+DONE THIS PASS (do not re-spec, read the code):
+- Wire DTOs live in `thinfer-app::wire` (serde-gated; utoipa `ToSchema` under
+  `serve`): `JobSpec`/`{Image,Video,FaceSwap}Spec`, `CreateResponse`, `JobStatus`,
+  `JobResult`, `ProgressStage` (+`From<Stage>`/`From<ProgressStage>`),
+  `JobStateKind`, `JobEvent` (+`kind`/`is_terminal`). serve re-uses them;
+  `spec_into_request` (server-only: artifact path + budget from config) is a free
+  fn in `serve::api`. job store/handle/SeqEvent stay server-side.
+- `RemoteExecutor` (`thinfer-app::remote`, `remote` feature = reqwest rustls +
+  futures-util + serde_json): POST spec -> tail SSE (own fetch-stream frame parser,
+  unit-tested) into a `ProgressSink` -> download artifact. Mirrors `LocalExecutor`.
+- CLI: `--remote <url>` + `--remote-token` (flattened `RemoteArgs`) on `generate
+  image|video`; builds a `JobSpec`, runs via `RemoteExecutor` through the same
+  `CliSink` lines. (faceswap remote intentionally absent: server-local path refs.)
+- `ServeConfig`: `bind` default `0.0.0.0:8080`; optional `auth_token` (Bearer
+  middleware on the `/jobs*`+openapi router only); optional `web_dir`.
+- Web UI in `thinfer-serve/web/{index.html,style.css,app.js}`, embedded via
+  `include_str!` (self-contained) or served from `web_dir` (dev). Vanilla JS,
+  fetch-based SSE so the token rides an `Authorization` header (EventSource can't).
+  Mounted outside the auth layer so it can load + prompt for the token. Assets
+  served `Cache-Control: no-store` (stale app.js was mis-reading event fields).
+- E2E result encryption: browser generates an RSA-OAEP keypair, sends only the
+  PUBLIC key in the spec (`public_key`/`publicKey`, optional). Server hybrid-
+  encrypts the artifact at rest (random AES-256-GCM key, RSA-OAEP-wrapped;
+  `serve::crypto`, ring provider), serves opaque bytes; browser unwraps + AES-
+  decrypts to an in-memory blob. No key => plaintext (CLI path). WebCrypto needs
+  a SECURE CONTEXT (https/localhost); app.js warns + falls back to plaintext on
+  insecure http.
+- Result is DELETE-ON-FETCH: `GET /jobs/{id}/result` reads bytes, removes the job
+  dir, returns them; second fetch 404s. Browser holds the only lasting copy.
+- Opt-in HTTPS for the secure context over LAN: `tls_self_signed` (rcgen self-
+  signed at startup, SANs = localhost+127.0.0.1+auto-detected LAN IP+`tls_sans`)
+  or BYO `tls_cert`/`tls_key`. axum-server+rustls(ring), no aws-lc C build.
+- MP4 faststart (`codec::faststart`): moov relocated before mdat, stco/co64 chunk
+  offsets patched; web/strict-player playback + seeking. Unit-tested.
+- Web result UI: explicit Download link with a `thinfer.{png,mp4}` filename (a
+  bare blob: save dropped the extension -> OS "can't play").
+
+STATE OF THE TREE:
+- `thinfer-app` (new lib): `model` (id enums + defaults + frame grid + manifest),
+  `request` (`JobRequest` + per-modality structs + shot-plan + `required_files`),
+  `progress` (`Stage` + `ProgressSink`), `download`, `codec` (mp4/png-frames/faceswap
+  stream), `executor::LocalExecutor`, `config` (`BackendConfig`/budget/mem). Features:
+  `cli` (clap ValueEnum), `serde`, `serve` (serde+utoipa ToSchema on the id enums).
+- `thinfer-cli`: thin clap adapters -> app requests; CLI keeps env->BackendConfig,
+  consent prompt, decile download logging, stamped `CliSink`, mem rollup. Behavior
+  preserved (--help defaults match; 10 shot-plan tests moved to app, green).
+- `thinfer-serve` (new bin): axum + utoipa. `POST /jobs` (image/video queue; faceswap
+  409-if-busy), `GET /jobs/{id}`, `GET /jobs/{id}/events` (SSE, in-mem log replay +
+  Last-Event-ID), `GET /jobs/{id}/result` (streams from disk), `POST /jobs/{id}/cancel`,
+  `GET /openapi.json` + `--emit-openapi`. Workers = OS threads w/ current-thread
+  runtime (avoids Send bound on `!Send` generate futures), one `LocalExecutor` each
+  (default 1). In-mem job metadata, on-disk artifacts under `artifact_dir/<id>/`, no
+  DB. TOML `ServeConfig`.
+
+DEFERRED (do these in step 2.5 / when running with weights):
+- Mid-generate cancel: NOT wired (would touch the shipped z_image/wan `generate`
+  signatures = DO-NOT-DISTURB FastWan). v1 cancel only dequeues a QUEUED job; a
+  running job finishes. Add a cancel token (or make `ProgressFn` return ControlFlow)
+  with a warm before/after, with sign-off.
+- serve==CLI byte-parity test: same request via `--remote` vs local -> identical
+  bytes (deterministic, fixed seed). The `--remote` vehicle now exists; needs
+  weights+GPU, add under `wan-e2e`-style gating. (HTTP surface itself is curl-checked
+  without weights; the SSE frame parser has unit tests in `remote.rs`.)
+- Disk-backed SSE ring buffer (survive restart) -- v1 keeps the event log in memory.
+- Server video is MP4-only (png-frames is a CLI debug format).
+- 422 vs 400: a well-formed-JSON-but-wrong-shape body returns axum's 422 (handler's
+  own semantic validation returns 400). Fine; revisit if a client needs 400.
 
 CORE ABSTRACTION -- one `Job`, one progress vocabulary, one `JobExecutor` trait,
 consumed everywhere: CLI (local/remote), serve (local pool), web (wasm/http).
@@ -108,14 +246,17 @@ docs UI; GPU on dedicated worker thread(s) / spawn_blocking. Feature-gate the ut
 `ToSchema` derives so they never reach a non-serve build.
 
 BUILD ORDER:
-1. `thinfer-app`: `Job`, request types, progress vocabulary, `JobExecutor` +
-   `LocalExecutor`; cancel token into `generate`; `ModelId::defaults()`. Re-point
-   `thinfer-cli` at it with NO behavior change. Durable proof: serve==CLI byte
-   parity test (deterministic engine, same request -> same bytes).
-2. `thinfer-serve`: TOML config, worker pool (1 default), queue, SSE + disk ring
-   buffer, disk artifacts, `openapi.json` emit.
-3. `RemoteExecutor` + `thinfer-cli --remote`.
-4. Web executor toggle (wasm<->http) + serve the built app. <- phone goal lands here.
+1. DONE -- `thinfer-app` + `ModelId::defaults()` + `thinfer-cli` re-pointed (cancel
+   token deferred, see DEFERRED).
+2. DONE (v1) -- `thinfer-serve` (TOML config, worker pool, queue, SSE w/ in-mem log,
+   disk artifacts, `openapi.json` + `--emit-openapi`). Disk ring buffer deferred.
+3. DONE -- DTO move to `thinfer-app::wire` + `RemoteExecutor` + `thinfer-cli
+   --remote`/`--remote-token`. See DONE THIS PASS above.
+4. DONE (server mode) -- server-backed web UI served by `thinfer-serve` (embedded /
+   `web_dir`). The wasm<->http toggle is NOT built (server-only by decision); when
+   adding it, the seam is a TS-level `Executor` swap + the `thinfer-web` wasm pkg
+   (image-only in-browser), and the user runs the web dev-server + reports browser
+   results.
 
 ## NEXT (active): LongLive-2.0-5B AR perf
 

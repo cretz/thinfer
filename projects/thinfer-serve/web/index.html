@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Served same-origin by thinfer-serve, so everything is 'self'. blob: is
+         the generated PNG (img) / MP4 (media) object URL. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src blob:; media-src blob:; base-uri 'none'; form-action 'none'"
+    />
+    <title>thinfer</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <h1>thinfer</h1>
+    <section id="server">
+      <label for="token">Auth token</label>
+      <input id="token" type="password" placeholder="(none, if the server is open)" />
+      <span id="token-hint">Stored in this browser only.</span>
+    </section>
+    <form id="form">
+      <fieldset id="fields">
+        <label for="kind">Type</label>
+        <select id="kind">
+          <option value="image" selected>Image</option>
+          <option value="video">Video</option>
+        </select>
+
+        <label for="model">Model</label>
+        <select id="model"></select>
+
+        <label for="prompt" id="prompt-label">Prompt</label>
+        <textarea id="prompt" rows="3" required>a corgi wearing a tiny wizard hat, studio photo</textarea>
+
+        <label for="preset">Size</label>
+        <select id="preset"></select>
+
+        <label for="width">Width</label>
+        <input id="width" type="number" value="768" min="16" step="16" />
+        <label for="height">Height</label>
+        <input id="height" type="number" value="768" min="16" step="16" />
+
+        <label for="steps">Steps</label>
+        <input id="steps" type="number" value="8" min="1" />
+
+        <label for="duration" class="video-only">Duration (s)</label>
+        <input id="duration" class="video-only" type="text" inputmode="decimal" placeholder="(model default ~4s)" />
+
+        <label for="vae" class="video-only">Quality</label>
+        <select id="vae" class="video-only">
+          <option value="tiny" selected>Tiny VAE (fast, default)</option>
+          <option value="full">Full VAE (clean, slower)</option>
+        </select>
+
+        <label for="seed">Seed</label>
+        <input id="seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />
+
+        <button id="generate" type="submit">Generate</button>
+      </fieldset>
+    </form>
+    <p id="status">Idle.</p>
+    <img id="image-out" alt="" hidden />
+    <video id="video-out" controls playsinline hidden></video>
+    <p><a id="download" hidden download>Download</a></p>
+    <!-- Progress + errors mirror here, since phones have no dev console. -->
+    <textarea id="log" rows="10" readonly></textarea>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

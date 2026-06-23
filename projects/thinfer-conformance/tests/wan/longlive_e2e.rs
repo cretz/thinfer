@@ -29,7 +29,7 @@ use thinfer_core::policy::ResidencyBudget;
 use thinfer_core::residency::WeightResidency;
 use thinfer_models::wan::dit_block::WanDitConfig;
 use thinfer_models::wan::manifest::{self, role};
-use thinfer_models::wan::pipeline::{GenerationParams, VaeChoice, WanModel};
+use thinfer_models::wan::pipeline::{GenerationParams, VaeChoice, VideoSampler, WanModel};
 use thinfer_models::wan::source::open_longlive_source;
 use thinfer_native::MmapFileOpener;
 use thinfer_native::cache;
@@ -152,6 +152,8 @@ async fn longlive_e2e_ar() {
         width,
         num_frames,
         seed: SEED,
+        // AR path drives its own UniPC; this field is ignored here.
+        sampler: VideoSampler::default(),
     };
     let progress = |_ev: thinfer_models::wan::pipeline::ProgressEvent| {};
     let video = model

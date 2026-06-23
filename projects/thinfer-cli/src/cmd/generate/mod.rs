@@ -1,16 +1,25 @@
-//! `thinfer generate` subcommands. The image and video paths live in their own
-//! modules (`image`, `video`); this parent holds the bits they share: backend
-//! init, residency-budget parsing, download consent, output-format inference,
-//! and the end-of-run mem rollup.
+//! `thinfer generate` subcommands. Each modality is a clap arg struct (its own
+//! module) that maps into a `thinfer_app::JobRequest`; the heavy lifting (load,
+//! generate, encode) lives in `thinfer-app`. This parent holds the CLI-only
+//! glue: env -> backend config, the interactive download consent prompt, decile
+//! download logging, the stamped stderr progress sink, and the mem rollup.
 
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Instant;
 
-use clap::Subcommand;
-use thinfer_core::backend::{PowerPreference, WgpuBackend, WgpuConfig};
+use clap::{Args, Subcommand};
+use thinfer_app::config::BackendConfig;
+use thinfer_app::download::{self, DownloadReporter};
+use thinfer_app::progress::{ProgressSink, Stage};
+use thinfer_app::remote::RemoteExecutor;
+use thinfer_app::wire::JobSpec;
+use thinfer_app::{JobRequest, JobSummary, LocalExecutor, report_mem};
+use thinfer_core::backend::PowerPreference;
 use thinfer_core::manifest::FileRef;
-use thinfer_core::policy::parse_bytes;
+use thinfer_native::cache::DownloadProgress;
 
 mod faceswap;
 mod image;
@@ -19,12 +28,6 @@ mod video;
 use faceswap::GenerateFaceSwap;
 use image::GenerateImage;
 use video::GenerateVideo;
-
-/// 2 GiB default for both RAM and VRAM. Chosen so a low-spec laptop can run
-/// at all; larger budgets help, but the residency manager pages weights so a
-/// small budget just means more disk traffic, not failure. Override with
-/// `--ram-budget` / `--vram-budget`.
-const DEFAULT_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Subcommand)]
 pub enum GenerateCmd {
@@ -52,133 +55,188 @@ pub async fn run(cmd: GenerateCmd) -> ExitCode {
     }
 }
 
-/// Resolve an output format: an explicit `--output-format` wins; otherwise
-/// infer from the `--output` file extension. A missing or unrecognized
-/// extension is a hard error so we never write (e.g.) PNG bytes into a `.jpg`.
-/// `from_ext` receives the lower-cased extension; `known` lists the recognized
-/// extensions for the failure message.
-fn resolve_output_format<T: Copy>(
-    explicit: Option<T>,
-    output: &std::path::Path,
-    from_ext: impl Fn(&str) -> Option<T>,
-    known: &str,
-) -> Result<T, String> {
-    if let Some(f) = explicit {
-        return Ok(f);
+/// Flags shared by the generate subcommands that can run against a remote
+/// `thinfer-serve` instead of this machine. Flattened into each modality's args.
+#[derive(Args)]
+pub struct RemoteArgs {
+    /// Run the job on a remote `thinfer-serve` at this base URL (e.g.
+    /// `http://box:8080`) instead of locally. The result is downloaded to
+    /// `--output`. Budgets / download policy are the server's; weight files live
+    /// on the server.
+    #[arg(long)]
+    pub remote: Option<String>,
+    /// Bearer token for an `auth_token`-protected `--remote` server.
+    #[arg(long, requires = "remote")]
+    pub remote_token: Option<String>,
+}
+
+/// Shared remote run path: submit `spec` to the `--remote` server, tail its SSE
+/// progress through the same stamped stderr sink as a local run, download the
+/// result to `output`, and print the footer.
+pub(super) async fn run_remote(
+    remote: &RemoteArgs,
+    spec: JobSpec,
+    output: PathBuf,
+) -> Result<(), String> {
+    let url = remote
+        .remote
+        .as_deref()
+        .expect("run_remote without --remote");
+    let executor = RemoteExecutor::new(url, remote.remote_token.clone())?;
+    let sink = CliSink::new();
+    let summary = executor.run(&spec, &output, &sink).await?;
+    sink.footer(&summary);
+    Ok(())
+}
+
+/// Shared run path: consent + download missing files, build the backend, run the
+/// job through a stamped stderr sink, print the footer, and (under
+/// `THINFER_TRACE`) the mem rollup. `ram`/`vram` are passed through for that
+/// rollup (they already live in the request budget).
+pub(super) async fn run_job(
+    req: JobRequest,
+    files: &[FileRef],
+    download_as_needed: bool,
+    ram: u64,
+    vram: u64,
+) -> Result<(), String> {
+    let missing = download::missing(files);
+    if !missing.is_empty()
+        && !confirm_download(&missing, download_as_needed).map_err(|e| e.to_string())?
+    {
+        return Err("declined download; rerun with --download-as-needed or `hf download …`".into());
     }
-    let ext = output.extension().and_then(|e| e.to_str()).ok_or_else(|| {
-        format!(
-            "cannot infer output format: {} has no file extension. Pass --output-format or use a known extension ({known}).",
-            output.display(),
-        )
-    })?;
-    from_ext(&ext.to_ascii_lowercase()).ok_or_else(|| {
-        format!("cannot infer output format from extension {ext:?}; known: {known}. Pass --output-format.")
-    })
-}
+    download::ensure(files, &CliReporter).await?;
 
-/// Build the wgpu backend with the shared power-preference + timestamp gating.
-async fn init_backend() -> Result<Arc<WgpuBackend>, String> {
-    let _s = tracing::info_span!("wgpu_init").entered();
-    // Default `HighPerformance` (not `None`) because Vulkan drivers treat an
-    // unset preference as a background-priority hint: on Intel Arc iGPU this
-    // clamps clocks / shrinks the subgroup_size range, slowing DiT by ~2.5x.
-    // Users who explicitly want thin-hardware-friendly scheduling can set
-    // `THINFER_POWER_PREF=low`.
-    let cfg = WgpuConfig {
-        power_preference: match std::env::var("THINFER_POWER_PREF")
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("high" | "highperformance" | "discrete") => PowerPreference::HighPerformance,
-            Some("low" | "lowpower" | "integrated") => PowerPreference::LowPower,
-            Some("none") => PowerPreference::None,
-            _ => PowerPreference::HighPerformance,
-        },
-        timestamps: std::env::var("THINFER_TRACE").is_ok(),
-    };
-    Ok(Arc::new(
-        WgpuBackend::new_with_config(cfg)
-            .await
-            .map_err(|e| format!("wgpu init: {e:?}"))?,
-    ))
-}
+    let backend_cfg = backend_config_from_env();
+    let executor = LocalExecutor::new(backend_cfg).await?;
 
-/// An `Arc<WgpuBackend>` clone retained only when `THINFER_TRACE` is set, used
-/// for the end-of-run mem rollup (same gate that enables the rollup table in
-/// `main.rs`, so a single env var turns on the full report).
-fn backend_for_stats(backend: &Arc<WgpuBackend>) -> Option<Arc<WgpuBackend>> {
-    std::env::var_os("THINFER_TRACE").map(|_| Arc::clone(backend))
-}
+    // Timer starts post-download + post-GPU-init, so it reflects generation work
+    // (matches the historical CLI placement).
+    let sink = CliSink::new();
+    let summary = executor.run(&req, &sink).await?;
+    sink.footer(&summary);
 
-/// Print the per-category VRAM/RAM peak rollup. No-op unless the caller kept a
-/// `backend_for_stats` handle (THINFER_TRACE).
-fn report_mem(backend: &WgpuBackend, ram_bytes: u64, vram_bytes: u64) {
-    let snap = thinfer_core::backend::Backend::mem_account(backend).snapshot();
-    eprintln!(
-        "[mem] vram TRUE_PEAK={} / budget {} | per-cat peaks: weights={} workspace={} staging={}",
-        fmt_mib(snap.vram_total_peak),
-        fmt_mib(vram_bytes),
-        fmt_mib(snap.vram_weights.1),
-        fmt_mib(snap.vram_workspace.1),
-        fmt_mib(snap.vram_staging.1),
-    );
-    eprintln!(
-        "[mem] ram  TRUE_PEAK={} / budget {} | per-cat peaks: upload={} readback={} other={}",
-        fmt_mib(snap.ram_total_peak),
-        fmt_mib(ram_bytes),
-        fmt_mib(snap.ram_upload.1),
-        fmt_mib(snap.ram_readback.1),
-        fmt_mib(snap.ram_other.1),
-    );
-}
-
-fn fmt_mib(bytes: u64) -> String {
-    if bytes >= 1 << 30 {
-        format!("{:.2}GiB", bytes as f64 / (1u64 << 30) as f64)
-    } else {
-        format!("{:.1}MiB", bytes as f64 / (1u64 << 20) as f64)
-    }
-}
-
-/// Non-cryptographic seed for `--seed`-omitted runs. Mixes nanos and pid so
-/// rapid successive invocations don't collide.
-fn random_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
-
-fn parse_budget(flag: &str, raw: Option<&str>) -> Result<u64, String> {
-    match raw {
-        Some(s) => parse_bytes(s).map_err(|e| format!("{flag}={s:?}: {e}")),
-        None => Ok(DEFAULT_BUDGET_BYTES),
-    }
-}
-
-fn validate_dim(name: &str, v: u32) -> Result<(), String> {
-    // Both models narrow by vae_scale = vae_factor*2 (16). No min/max bound
-    // upstream; UIs cap purely for UX.
-    const VAE_SCALE: u32 = 16;
-    if v == 0 {
-        return Err(format!("--{name} must be > 0"));
-    }
-    if !v.is_multiple_of(VAE_SCALE) {
-        return Err(format!(
-            "--{name} must be a multiple of {VAE_SCALE} (got {v})"
-        ));
+    if std::env::var_os("THINFER_TRACE").is_some() {
+        report_mem(executor.backend(), ram, vram);
     }
     Ok(())
 }
 
-/// Emits a stderr line at each 10% boundary. hf-hub fans chunks across tasks
-/// and the adapter clones the `Arc` per chunk, so `update` calls are racy -
-/// state lives in atomics.
+/// Build the wgpu backend config from `THINFER_*` env (the binary layer reads
+/// env; `thinfer-app` itself never does). Default `HighPerformance`: Vulkan
+/// drivers treat an unset preference as a background-priority hint, slowing DiT
+/// ~2.5x on some iGPUs. `THINFER_TRACE` enables GPU timestamps for the rollup.
+fn backend_config_from_env() -> BackendConfig {
+    let power_preference = match std::env::var("THINFER_POWER_PREF")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("high" | "highperformance" | "discrete") => PowerPreference::HighPerformance,
+        Some("low" | "lowpower" | "integrated") => PowerPreference::LowPower,
+        Some("none") => PowerPreference::None,
+        _ => PowerPreference::HighPerformance,
+    };
+    BackendConfig {
+        power_preference,
+        timestamps: std::env::var("THINFER_TRACE").is_ok(),
+    }
+}
+
+/// Stamped stderr progress sink: every line is prefixed with elapsed-from-start
+/// so per-stage durations read off directly. Structured [`Stage`]s render to the
+/// historical wording; free-form `note`s pass through.
+struct CliSink {
+    start: Instant,
+}
+
+impl CliSink {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+
+    fn stamp(&self) -> String {
+        format!("[{:6.1}s]", self.start.elapsed().as_secs_f64())
+    }
+
+    /// The end-of-run summary line (modality-shaped from the summary fields).
+    fn footer(&self, s: &JobSummary) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let out = s.output.display();
+        match (s.fps, s.seed) {
+            (None, seed) => eprintln!(
+                "{} Wrote {out} ({}x{}{}) in {elapsed:.1}s",
+                self.stamp(),
+                s.width,
+                s.height,
+                seed.map(|v| format!(", seed {v}")).unwrap_or_default(),
+            ),
+            (Some(fps), Some(seed)) => eprintln!(
+                "{} Wrote {out} ({}x{}, {} frames @ {fps} fps, seed {seed}) in {elapsed:.1}s",
+                self.stamp(),
+                s.width,
+                s.height,
+                s.frames,
+            ),
+            (Some(fps), None) => eprintln!(
+                "{} Wrote {out} ({}x{}, {} frames @ {fps} fps) in {elapsed:.1}s",
+                self.stamp(),
+                s.width,
+                s.height,
+                s.frames,
+            ),
+        }
+    }
+}
+
+impl ProgressSink for CliSink {
+    fn stage(&self, stage: Stage) {
+        match stage {
+            Stage::TextEncode => eprintln!("{} Encoding prompt", self.stamp()),
+            Stage::Step { i, n } => eprintln!("{} Denoising step {i}/{n}", self.stamp()),
+            Stage::ChunkStep {
+                chunk,
+                num_chunks,
+                step,
+                num_steps,
+            } => eprintln!(
+                "{} Denoising chunk {chunk}/{num_chunks} step {step}/{num_steps}",
+                self.stamp()
+            ),
+            Stage::VaeDecode => eprintln!("{} Decoding latents (VAE)", self.stamp()),
+            // Throttle to every 10th frame (matches the historical face-swap log).
+            Stage::FrameSwapped { done, total } => {
+                if done.is_multiple_of(10) {
+                    eprintln!("{} Swapped frame {done}/{total}", self.stamp());
+                }
+            }
+        }
+    }
+
+    fn note(&self, msg: &str) {
+        eprintln!("{} {msg}", self.stamp());
+    }
+}
+
+/// Attaches a [`PercentLogger`] per downloaded file.
+struct CliReporter;
+
+impl DownloadReporter for CliReporter {
+    fn for_file(&self, file: &FileRef) -> Option<Arc<dyn DownloadProgress>> {
+        Some(Arc::new(PercentLogger::new(format!(
+            "{}/{}",
+            file.repo, file.path
+        ))))
+    }
+}
+
+/// Emits a stderr line at each 10% boundary. hf-hub fans chunks across tasks and
+/// the adapter clones the `Arc` per chunk, so `update` calls are racy: state
+/// lives in atomics.
 struct PercentLogger {
     name: String,
     size: std::sync::atomic::AtomicU64,
@@ -197,7 +255,7 @@ impl PercentLogger {
     }
 }
 
-impl thinfer_native::cache::DownloadProgress for PercentLogger {
+impl DownloadProgress for PercentLogger {
     fn init(&self, size: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         self.size.store(size, Relaxed);
@@ -220,8 +278,6 @@ impl thinfer_native::cache::DownloadProgress for PercentLogger {
         let pct = ((new.min(size) * 10) / size) as u8;
         let prev = self.last_decile.fetch_max(pct, Relaxed);
         if pct > prev {
-            // Cover gaps when a single chunk crosses several deciles, and when
-            // hf-hub's resume update jumps from 0 to N0% in one call.
             for p in (prev + 1)..=pct {
                 tracing::info!(target: thinfer_core::trace::DIAG, name = %self.name, pct = p * 10, "download progress");
             }

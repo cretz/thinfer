@@ -1,0 +1,412 @@
+// Server-backed thinfer UI. Generation runs on the thinfer-serve box this page
+// is served from: POST a job, tail its SSE event stream, then download the
+// finished artifact. All three calls go through fetch (not EventSource) so the
+// optional bearer token rides an Authorization header the whole way.
+//
+// Privacy: the browser generates an RSA keypair and sends only the PUBLIC key
+// with each job. The server encrypts the result with it and cannot decrypt --
+// only this browser's private key (kept in memory, never sent) can. The result
+// is fetched as ciphertext, decrypted here, and shown from an in-memory blob;
+// nothing decrypted ever touches the server. WebCrypto needs a secure context
+// (https or localhost); over plain http we warn and fall back to plaintext.
+
+const $ = (id) => document.getElementById(id);
+const setStatus = (text) => {
+  $("status").textContent = text;
+};
+const log = (line) => {
+  const el = $("log");
+  el.value += `${line}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+
+const MODELS = {
+  image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16"],
+  video: ["fastwan-ti2v-5b", "longlive-2.0-5b"],
+};
+// Size presets per kind. First entry is the default. Hand-typed dims are still
+// allowed and flip the dropdown to "Custom". Dim rules differ by kind: image
+// (Z-Image VAE) needs /16, video (Wan2.2 16x16x4 VAE + patch 2) needs /32 --
+// `DIM_STEP` enforces it on both the presets and the number inputs.
+// Video presets follow Wan2.2-TI2V-5B's trained aspects (720p is natively
+// 1280x704 / 704x1280); the ladder steps down same-aspect for speed on the 8GB
+// card. Avoid square for video -- it is off the trained aspect and degrades
+// composition. Smaller = fewer latent tokens = faster (cost scales with w*h).
+const DIM_STEP = { image: 16, video: 32 };
+const PRESETS = {
+  image: [
+    { label: "768x768 (default)", width: 768, height: 768 },
+    { label: "1024x1024 (max detail, slower)", width: 1024, height: 1024 },
+    { label: "512x512 (fast)", width: 512, height: 512 },
+    { label: "768x1024 portrait", width: 768, height: 1024 },
+    { label: "1024x768 landscape", width: 1024, height: 768 },
+  ],
+  video: [
+    { label: "540p landscape (960x544, default)", width: 960, height: 544 },
+    { label: "720p landscape (1280x704, native, slowest)", width: 1280, height: 704 },
+    { label: "480p landscape (832x480)", width: 832, height: 480 },
+    { label: "small landscape (640x352, fast)", width: 640, height: 352 },
+    { label: "tiny landscape (512x288, fastest)", width: 512, height: 288 },
+    { label: "720p portrait (704x1280, native, slowest)", width: 704, height: 1280 },
+    { label: "540p portrait (544x960)", width: 544, height: 960 },
+    { label: "480p portrait (480x832)", width: 480, height: 832 },
+  ],
+};
+
+// Steps input config per kind. Image (Z-Image Turbo) defaults to 8, unbounded
+// above. Video (FastWan UniPC, the served sampler) defaults to 4, capped at 8 --
+// matching the public FastWan Spaces' 1..=8 slider. DMD (the parity sampler)
+// ignores steps and is reachable from the CLI, not exposed here.
+const STEPS = {
+  image: { value: 8, min: 1, max: "" },
+  video: { value: 4, min: 1, max: 8 },
+};
+
+const subtle = globalThis.crypto?.subtle;
+const SECURE = Boolean(subtle);
+if (!SECURE) {
+  log("WARNING: insecure context (http) - WebCrypto unavailable, results will NOT be encrypted. Use https or localhost to enable encryption.");
+}
+
+// --- base64 <-> bytes ---------------------------------------------------------
+const bytesToBase64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const base64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
+// --- token persistence (this browser only) ------------------------------------
+const TOKEN_KEY = "thinfer_token";
+$("token").value = localStorage.getItem(TOKEN_KEY) ?? "";
+$("token").addEventListener("change", () => {
+  const t = $("token").value.trim();
+  if (t) localStorage.setItem(TOKEN_KEY, t);
+  else localStorage.removeItem(TOKEN_KEY);
+});
+const authHeaders = (extra = {}) => {
+  const t = $("token").value.trim();
+  return t ? { ...extra, authorization: `Bearer ${t}` } : extra;
+};
+
+// --- result encryption keypair (in-browser, private key never leaves) ---------
+let keypairPromise = null;
+function ensureKeypair() {
+  if (!SECURE) return Promise.resolve(null);
+  if (!keypairPromise) {
+    keypairPromise = (async () => {
+      const kp = await subtle.generateKey(
+        {
+          name: "RSA-OAEP",
+          modulusLength: 2048,
+          publicExponent: new Uint8Array([1, 0, 1]),
+          hash: "SHA-256",
+        },
+        true,
+        ["encrypt", "decrypt"],
+      );
+      const spki = new Uint8Array(await subtle.exportKey("spki", kp.publicKey));
+      return { privateKey: kp.privateKey, publicKeyB64: bytesToBase64(spki) };
+    })();
+  }
+  return keypairPromise;
+}
+
+// Decrypt the server blob: [u16 wrappedLen][RSA-wrapped AES key][12B nonce][AES-GCM body].
+async function decryptResult(privateKey, blob) {
+  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const wlen = view.getUint16(0, false);
+  let off = 2;
+  const wrapped = blob.subarray(off, off + wlen);
+  off += wlen;
+  const nonce = blob.subarray(off, off + 12);
+  off += 12;
+  const body = blob.subarray(off);
+  const aesRaw = await subtle.decrypt({ name: "RSA-OAEP" }, privateKey, wrapped);
+  const aesKey = await subtle.importKey("raw", aesRaw, "AES-GCM", false, ["decrypt"]);
+  const plain = await subtle.decrypt({ name: "AES-GCM", iv: nonce }, aesKey, body);
+  return new Uint8Array(plain);
+}
+
+// --- per-type form wiring -----------------------------------------------------
+function applyKind() {
+  const kind = $("kind").value;
+  document.body.className = `kind-${kind}`;
+  const model = $("model");
+  model.replaceChildren(
+    ...MODELS[kind].map((m, i) => {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      o.selected = i === 0;
+      return o;
+    }),
+  );
+  // Number inputs enforce this kind's grid; presets all satisfy it.
+  const step = DIM_STEP[kind];
+  for (const id of ["width", "height"]) {
+    $(id).step = step;
+    $(id).min = step;
+  }
+  // Size dropdown: presets for this kind plus a trailing "Custom". Selecting a
+  // preset fills the dims; the first preset is the default.
+  $("preset").replaceChildren(
+    ...PRESETS[kind].map((p, i) => {
+      const o = document.createElement("option");
+      o.value = `${p.width}x${p.height}`;
+      o.textContent = p.label;
+      o.selected = i === 0;
+      return o;
+    }),
+    new Option("Custom", "custom"),
+  );
+  const first = PRESETS[kind][0];
+  $("width").value = first.width;
+  $("height").value = first.height;
+  // Steps default/range is kind-specific (see STEPS).
+  const st = STEPS[kind];
+  $("steps").value = st.value;
+  $("steps").min = st.min;
+  $("steps").max = st.max;
+}
+$("kind").addEventListener("change", applyKind);
+
+// Picking a preset fills the dims; typing dims that match no preset flips the
+// dropdown to "Custom" (hand-typed dims are always honored).
+$("preset").addEventListener("change", () => {
+  const v = $("preset").value;
+  if (v === "custom") return;
+  const [w, h] = v.split("x");
+  $("width").value = w;
+  $("height").value = h;
+});
+const syncPresetToDims = () => {
+  const v = `${$("width").value}x${$("height").value}`;
+  const sel = $("preset");
+  sel.value = [...sel.options].some((o) => o.value === v) ? v : "custom";
+};
+$("width").addEventListener("input", syncPresetToDims);
+$("height").addEventListener("input", syncPresetToDims);
+
+applyKind();
+
+// --- spec building ------------------------------------------------------------
+const intOrNull = (v) => {
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+};
+const floatOrNull = (v) => {
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+};
+
+function buildSpec() {
+  const kind = $("kind").value;
+  const seed = intOrNull($("seed").value);
+  const width = intOrNull($("width").value);
+  const height = intOrNull($("height").value);
+  const model = $("model").value;
+  if (kind === "image") {
+    return {
+      kind: "image",
+      model,
+      prompt: $("prompt").value,
+      width,
+      height,
+      steps: intOrNull($("steps").value),
+      seed,
+    };
+  }
+  // Video: each non-empty line of the prompt box is one shot (multi-shot is
+  // LongLive only; the server validates).
+  const prompts = $("prompt")
+    .value.split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // One duration (seconds) covers the whole clip; for multi-shot LongLive the
+  // server splits it evenly across shots. Blank = the model default (5s). fps
+  // is the model's native rate, so it is not exposed.
+  const duration = floatOrNull($("duration").value);
+  return {
+    kind: "video",
+    model,
+    prompts,
+    width,
+    height,
+    durations: duration === null ? null : [duration],
+    // FastWan UniPC step count (1..=8). Server default sampler is UniPC.
+    steps: intOrNull($("steps").value),
+    vae: $("vae").value,
+    seed,
+  };
+}
+
+// --- progress rendering (mirrors the CLI wording) -----------------------------
+function progressText(stage) {
+  switch (stage.stage) {
+    case "textEncode":
+      return "Encoding prompt";
+    case "step":
+      return `Denoising step ${stage.i}/${stage.n}`;
+    case "chunkStep":
+      return `Denoising chunk ${stage.chunk}/${stage.numChunks} step ${stage.step}/${stage.numSteps}`;
+    case "vaeDecode":
+      return "Decoding latents (VAE)";
+    case "frameSwapped":
+      return `Swapped frame ${stage.done}/${stage.total}`;
+    default:
+      return JSON.stringify(stage);
+  }
+}
+
+// --- SSE over fetch -----------------------------------------------------------
+// Reads the event body as a stream, splitting on blank-line frame boundaries and
+// JSON-parsing each frame's data: payload (one JobEvent). Resolves with the
+// `done` result, rejects on error/cancel or a dropped stream.
+async function streamEvents(id) {
+  const resp = await fetch(`jobs/${id}/events`, { headers: authHeaders() });
+  if (!resp.ok) throw new Error(await errorText(resp));
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep;
+    while ((sep = firstSep(buf)) !== -1) {
+      const frame = buf.slice(0, sep.at);
+      buf = buf.slice(sep.at + sep.len);
+      const ev = parseFrame(frame);
+      if (!ev) continue;
+      const result = handleEvent(ev);
+      if (result !== undefined) return result;
+    }
+  }
+  throw new Error("event stream ended before the job finished");
+}
+
+function firstSep(buf) {
+  const lf = buf.indexOf("\n\n");
+  const crlf = buf.indexOf("\r\n\r\n");
+  if (crlf !== -1 && (lf === -1 || crlf < lf)) return { at: crlf, len: 4 };
+  if (lf !== -1) return { at: lf, len: 2 };
+  return -1;
+}
+
+function parseFrame(frame) {
+  const data = frame
+    .split(/\r?\n/)
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => l.slice(5).replace(/^ /, ""))
+    .join("\n");
+  if (!data) return null;
+  return JSON.parse(data);
+}
+
+// Returns the `done` result to stop streaming, throws on terminal failure, or
+// returns undefined to keep going.
+function handleEvent(ev) {
+  switch (ev.type) {
+    case "queued":
+      setStatus(`Queued at position ${ev.position}`);
+      log(`Queued at position ${ev.position}`);
+      return undefined;
+    case "started":
+      setStatus("Started");
+      return undefined;
+    case "progress":
+      setStatus(progressText(ev.stage));
+      log(progressText(ev.stage));
+      return undefined;
+    case "log":
+      log(ev.message);
+      return undefined;
+    case "done":
+      return ev.result;
+    case "error":
+      throw new Error(ev.message);
+    case "cancelled":
+      throw new Error("job was cancelled");
+    default:
+      return undefined;
+  }
+}
+
+async function errorText(resp) {
+  const body = await resp.text().catch(() => "");
+  try {
+    const j = JSON.parse(body);
+    if (j.error) return `server returned ${resp.status}: ${j.error}`;
+  } catch {
+    /* not JSON */
+  }
+  return `server returned ${resp.status}: ${body || resp.statusText}`;
+}
+
+// --- result rendering (fetch ciphertext -> decrypt -> in-memory blob) ---------
+async function showResult(kind, result, privateKey) {
+  const resp = await fetch(result.resultUrl.replace(/^\//, ""), { headers: authHeaders() });
+  if (!resp.ok) throw new Error(await errorText(resp));
+  let bytes = new Uint8Array(await resp.arrayBuffer());
+  if (privateKey) bytes = await decryptResult(privateKey, bytes);
+  const mime = kind === "image" ? "image/png" : "video/mp4";
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  const img = $("image-out");
+  const video = $("video-out");
+  if (kind === "image") {
+    if (img.src) URL.revokeObjectURL(img.src);
+    img.src = url;
+    img.hidden = false;
+    video.hidden = true;
+  } else {
+    if (video.src) URL.revokeObjectURL(video.src);
+    video.src = url;
+    video.hidden = false;
+    img.hidden = true;
+  }
+  // A real download link with an explicit filename: saving the blob: URL
+  // directly would drop the extension and the OS would not know it is an mp4.
+  const filename = kind === "image" ? "thinfer.png" : "thinfer.mp4";
+  const dl = $("download");
+  dl.href = url;
+  dl.download = filename;
+  dl.textContent = `Download ${filename}`;
+  dl.hidden = false;
+}
+
+// --- submit -------------------------------------------------------------------
+$("form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  void generate();
+});
+
+async function generate() {
+  const kind = $("kind").value;
+  $("fields").disabled = true;
+  const t0 = performance.now();
+  setStatus("Submitting…");
+  try {
+    const keypair = await ensureKeypair();
+    const spec = buildSpec();
+    if (keypair) spec.publicKey = keypair.publicKeyB64;
+    const resp = await fetch("jobs", {
+      method: "POST",
+      headers: authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(spec),
+    });
+    if (!resp.ok) throw new Error(await errorText(resp));
+    const { id } = await resp.json();
+    log(`Submitted job ${id}${keypair ? " (encrypted)" : " (PLAINTEXT - insecure context)"}`);
+    const result = await streamEvents(id);
+    await showResult(kind, result, keypair?.privateKey ?? null);
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const seed = result.seed != null ? `seed ${result.seed}, ` : "";
+    setStatus(`Done: ${seed}${secs}s.${keypair ? "" : " (not encrypted)"}`);
+  } catch (e) {
+    setStatus(`Failed: ${e.message ?? e}`);
+    log(`Failed: ${e.message ?? e}`);
+  } finally {
+    $("fields").disabled = false;
+  }
+}

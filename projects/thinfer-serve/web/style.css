@@ -1,0 +1,67 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 48rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+#server {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+#server input {
+  flex: 1 1 16rem;
+}
+
+#token-hint {
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+#fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  border: none;
+  padding: 0;
+}
+
+#fields > button {
+  grid-column: 2;
+  justify-self: start;
+  padding: 0.4rem 1.2rem;
+}
+
+/* Per-type field visibility is toggled by a body class set in app.js. */
+.image-only,
+.video-only {
+  display: none;
+}
+body.kind-image .image-only,
+body.kind-video .video-only {
+  display: revert;
+}
+
+#status {
+  margin: 1rem 0;
+  font-variant-numeric: tabular-nums;
+  white-space: pre-wrap;
+}
+
+#image-out,
+#video-out {
+  max-width: 100%;
+}
+
+#log {
+  width: 100%;
+  margin-top: 1rem;
+  font-family: monospace;
+  font-size: 0.8rem;
+  white-space: pre;
+}

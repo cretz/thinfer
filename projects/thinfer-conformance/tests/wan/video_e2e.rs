@@ -47,7 +47,7 @@ use thinfer_core::trace::{self, DIAG};
 use thinfer_core::workspace::Workspace;
 use thinfer_models::wan::manifest::{self, role};
 use thinfer_models::wan::pipeline::{
-    GenerationParams, VaeChoice, WanModel, WanStepDiag, gaussian_noise, renoise_seed,
+    GenerationParams, VaeChoice, VideoSampler, WanModel, WanStepDiag, gaussian_noise, renoise_seed,
 };
 use thinfer_models::wan::source::WanSource;
 use thinfer_models::z_image::pipeline::encode_png;
@@ -396,6 +396,8 @@ async fn video_e2e_safetensors() {
         width,
         num_frames,
         seed: SEED,
+        // Parity gate: the DMD reference schedule (step-diag taps are DMD-only).
+        sampler: VideoSampler::Dmd,
     };
 
     // Step-0 stage telemetry (magnitudes only; no reference). Localizes a

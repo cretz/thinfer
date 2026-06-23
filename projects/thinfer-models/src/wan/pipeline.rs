@@ -70,9 +70,25 @@ const PREFETCH_STAGING_DEPTH: u64 = 2;
 /// fixed pad.
 const DIT_WORKSPACE_RESERVE: u64 = 64 * 1024 * 1024;
 
-/// Inputs to one `generate` call. The DMD distillation bakes the step schedule
-/// and is CFG-free, so there is no `steps`, `guidance_scale`, or
-/// `negative_prompt` knob (the abandoned SkyReels-V2-DF path had all three).
+/// FastWan (non-AR) denoise sampler. Both run the SAME DiT forward CFG-free; only
+/// the schedule around it differs. `Dmd` is the few-step renoise schedule the DMD
+/// distillation bakes (the parity default); `UniPc` is the plain UniPC multistep
+/// solver the public HF Spaces use (`flow_shift=8.0`), with a user step count.
+/// Ignored on the AR path ([`WanModel::generate_ar`] drives its own UniPC).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoSampler {
+    /// DMD 3-step renoise. The byte-parity reference path.
+    #[default]
+    Dmd,
+    /// UniPC multistep, `flow_shift=8.0`, CFG-free. `steps` denoise steps
+    /// (UI 1..=8, default 4). The served/UI default for FastWan.
+    UniPc { steps: u32 },
+}
+
+/// Inputs to one `generate` call. CFG-free (no `guidance_scale`/`negative_prompt`
+/// knob, as the DMD distillation and the UniPC Spaces both run guidance 0). The
+/// step count is not here: DMD bakes its schedule, UniPC carries it in
+/// [`VideoSampler::UniPc`].
 pub struct GenerationParams {
     pub prompt: String,
     /// Frame height in pixels. Divisible by `VAE_SCALE * PATCH_H` (32).
@@ -83,6 +99,8 @@ pub struct GenerationParams {
     pub num_frames: u32,
     /// Deterministic seed for the initial latent noise (and per-step renoise).
     pub seed: u64,
+    /// Denoise sampler (FastWan path only; AR ignores it).
+    pub sampler: VideoSampler,
 }
 
 /// One shot of a multi-shot LongLive AR generation: a prompt that holds for
@@ -1043,11 +1061,11 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             None => gaussian_noise(n_lat, params.seed),
         };
 
-        // --- 4. DiT + DMD sampler (fixed few-step schedule, CFG-free) ---
+        // --- 4. DiT denoise (CFG-free). The DiT forward is byte-identical for
+        // both samplers; only the schedule around it differs. UniPC (the served
+        // default) mirrors the public FastWan Spaces; DMD is the parity path. ---
         let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
         let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
-        let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
-        let n_steps = sampler.num_steps();
 
         // Cap the streamed DiT weight set below budget by the in-flight transient
         // envelope (overlapping prefetch stagings + the forward workspace), so the
@@ -1058,55 +1076,120 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 + DIT_WORKSPACE_RESERVE,
         );
 
-        // --- 5. step loop: one DiT forward per fixed timestep, renoise between ---
-        for i in 0..n_steps {
-            let _step = trace::scope!("step", i = i).entered();
-            if let Some(p) = progress {
-                p(ProgressEvent::Step {
-                    i: i as u32 + 1,
-                    n: n_steps as u32,
-                });
-            }
-            let t = sampler.timestep(i);
-            let inputs = WanDitInputs {
-                image: &sample,
-                text: &text,
-                timestep: t,
-            };
-            // Diag path captures per-block + final-stage taps via forward_with_taps;
-            // prod takes the plain forward.
-            let (velocity, per_block, temb, timestep_proj, final_norm, proj_out) =
-                if step_diag.is_some() {
-                    let mut per_block = Vec::new();
-                    let (mut temb, mut timestep_proj, mut final_norm, mut proj_out) =
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                    let taps = WanDitTaps {
-                        per_block: Some(&mut per_block),
-                        temb: Some(&mut temb),
-                        timestep_proj: Some(&mut timestep_proj),
-                        final_norm: Some(&mut final_norm),
-                        proj_out: Some(&mut proj_out),
-                        ..Default::default()
+        match params.sampler {
+            // --- DMD: one DiT forward per fixed timestep, renoise between. The
+            // step-diag taps live here (the parity/bisection path is DMD-only). ---
+            VideoSampler::Dmd => {
+                let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
+                let n_steps = sampler.num_steps();
+                for i in 0..n_steps {
+                    let _step = trace::scope!("step", i = i).entered();
+                    if let Some(p) = progress {
+                        p(ProgressEvent::Step {
+                            i: i as u32 + 1,
+                            n: n_steps as u32,
+                        });
+                    }
+                    let t = sampler.timestep(i);
+                    let inputs = WanDitInputs {
+                        image: &sample,
+                        text: &text,
+                        timestep: t,
                     };
-                    let out = dit
-                        .forward_with_taps(
-                            &self.backend,
-                            &self.dit,
-                            &self.residency,
-                            &*workspace,
-                            &inputs,
-                            taps,
-                        )
-                        .await?;
-                    (
-                        out.image,
-                        per_block,
-                        temb,
-                        timestep_proj,
-                        final_norm,
-                        proj_out,
-                    )
-                } else {
+                    // Diag path captures per-block + final-stage taps via forward_with_taps;
+                    // prod takes the plain forward.
+                    let (velocity, per_block, temb, timestep_proj, final_norm, proj_out) =
+                        if step_diag.is_some() {
+                            let mut per_block = Vec::new();
+                            let (mut temb, mut timestep_proj, mut final_norm, mut proj_out) =
+                                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                            let taps = WanDitTaps {
+                                per_block: Some(&mut per_block),
+                                temb: Some(&mut temb),
+                                timestep_proj: Some(&mut timestep_proj),
+                                final_norm: Some(&mut final_norm),
+                                proj_out: Some(&mut proj_out),
+                                ..Default::default()
+                            };
+                            let out = dit
+                                .forward_with_taps(
+                                    &self.backend,
+                                    &self.dit,
+                                    &self.residency,
+                                    &*workspace,
+                                    &inputs,
+                                    taps,
+                                )
+                                .await?;
+                            (
+                                out.image,
+                                per_block,
+                                temb,
+                                timestep_proj,
+                                final_norm,
+                                proj_out,
+                            )
+                        } else {
+                            let out = dit
+                                .forward(
+                                    &self.backend,
+                                    &self.dit,
+                                    &self.residency,
+                                    &*workspace,
+                                    &inputs,
+                                )
+                                .await?;
+                            (
+                                out.image,
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        };
+                    // DMD: convert the predicted flow velocity to x0 and renoise to the
+                    // next fixed timestep (the final step returns x0 unchanged). The
+                    // renoise Gaussian is independent per step, seeded deterministically.
+                    let noise = match sampler.noise_len(i, n_lat) {
+                        0 => Vec::new(),
+                        len => gaussian_noise(len, renoise_seed(params.seed, i)),
+                    };
+                    sample = sampler.step(i, &velocity, &sample, &noise);
+                    if let Some(sink) = step_diag.as_deref_mut() {
+                        sink.push(WanStepDiag {
+                            timestep: t,
+                            sigma: sampler.sigma(i),
+                            velocity, // moved; the flow velocity fed to the sampler
+                            post: sample.clone(),
+                            per_block,
+                            temb,
+                            timestep_proj,
+                            final_norm,
+                            proj_out,
+                        });
+                    }
+                }
+            }
+            // --- UniPC multistep (flow_shift=8.0, CFG-free): feed each step's DiT
+            // velocity into the FlowUniPc solver; no renoise, no guidance. Same DiT
+            // forward as DMD. Not a parity path, so no step-diag taps. ---
+            VideoSampler::UniPc { steps } => {
+                let mut unipc = FlowUniPc::new(&UniPcConfig::fastwan(steps));
+                let n_steps = unipc.num_steps();
+                for i in 0..n_steps {
+                    let _step = trace::scope!("step", i = i).entered();
+                    if let Some(p) = progress {
+                        p(ProgressEvent::Step {
+                            i: i as u32 + 1,
+                            n: n_steps as u32,
+                        });
+                    }
+                    let inputs = WanDitInputs {
+                        image: &sample,
+                        text: &text,
+                        timestep: unipc.timestep(i),
+                    };
                     let out = dit
                         .forward(
                             &self.backend,
@@ -1116,35 +1199,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                             &inputs,
                         )
                         .await?;
-                    (
-                        out.image,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                };
-            // DMD: convert the predicted flow velocity to x0 and renoise to the
-            // next fixed timestep (the final step returns x0 unchanged). The
-            // renoise Gaussian is independent per step, seeded deterministically.
-            let noise = match sampler.noise_len(i, n_lat) {
-                0 => Vec::new(),
-                len => gaussian_noise(len, renoise_seed(params.seed, i)),
-            };
-            sample = sampler.step(i, &velocity, &sample, &noise);
-            if let Some(sink) = step_diag.as_deref_mut() {
-                sink.push(WanStepDiag {
-                    timestep: t,
-                    sigma: sampler.sigma(i),
-                    velocity, // moved; the flow velocity fed to the sampler
-                    post: sample.clone(),
-                    per_block,
-                    temb,
-                    timestep_proj,
-                    final_norm,
-                    proj_out,
-                });
+                    sample = unipc.step(&out.image, &sample);
+                }
             }
         }
 
