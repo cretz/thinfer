@@ -12,6 +12,7 @@ pub mod config;
 pub mod download;
 pub mod executor;
 pub mod model;
+pub mod preprocess;
 pub mod progress;
 #[cfg(feature = "remote")]
 pub mod remote;

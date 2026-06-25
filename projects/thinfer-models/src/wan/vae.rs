@@ -1438,6 +1438,58 @@ fn vae_tile_dims(workspace_budget: u64, act_size: u64, max_tout: u32) -> (u32, u
     (tile, overlap)
 }
 
+/// Input-pixel halo radius added on every side of an encoder tile so its valid
+/// (non-halo) latent output is bit-exact through the CONV stack vs the untiled
+/// encode. Derived by walking one /8 latent output pixel back through the
+/// spatial conv stack (conv_in 3x3; per down stage 2 resnets = 4x 3x3 pad-1
+/// convs; 3 stride-2 3x3 downsamplers between stages 0/1/2; mid block 2 resnets
+/// = 4x 3x3): backward radius accumulates 4 (mid) +4 (stage3) -> 8 at /8;
+/// `*2+1` through each stride-2 downsampler with +4 convs per level lands at
+/// ~100 input px. Rounded UP to 128 (a clean 16-latent-px = 64-px-multiple
+/// band) for margin. The mid block's attention is GLOBAL over the tile's
+/// spatial positions (same as the decoder's per-tile mid attention), so it is
+/// NOT made exact by any finite halo; this 128-px context band is the same
+/// approximation the GREEN decoder tiling accepts, hidden here by cropping the
+/// halo (vs the decoder's feather blend). A single full tile bypasses tiling
+/// entirely and stays byte-identical.
+const ENC_HALO_PX: u32 = 128;
+
+/// Largest square INPUT tile (and its halo) whose encode working set fits
+/// `workspace_budget`. The encoder's early FULL-res stages dominate: conv_in +
+/// down stage 0 run at the tile's input H*W with `base_dim` channels before any
+/// spatial downsample, so the live set scales with the input tile AREA (in
+/// pixels, not latent). `tile`/`overlap` here are in LATENT pixels (so the
+/// valid output region is a clean multiple of 8 px = 1 latent px and crops
+/// align); the input extent encoded is `tile*8 + 2*halo`. Calibrated
+/// conservatively from the full-res activation footprint (96ch * area at
+/// `act_size`, times a stack-depth factor); recalibrate if the encoder graph
+/// changes.
+fn vae_encode_tile_dims(workspace_budget: u64, act_size: u64) -> (u32, u32) {
+    /// Workspace bytes per INPUT-px^2 at f16: `base_dim` (96) channels carried
+    /// through conv_in + stage-0 resnets at full res, times a depth factor for
+    /// the concurrent live buffers (conv in/out, residual, norm scratch).
+    const AREA_PER_INPX_F16: u64 = 96 * 12 / 2; // ~576 B / input px^2 at f16
+    /// Fixed overhead independent of tile area (uniforms, small buffers, the
+    /// downsampled deeper stages whose area is <=1/4 the full-res term).
+    const FIXED_F16: u64 = 64 * 1024 * 1024;
+    /// Upper cap so a huge budget doesn't pick a TDR-prone megatile.
+    const TILE_MAX: u32 = 48; // latent px (384 valid + 256 halo = 640 input px)
+    /// Floor: an 8-latent (64px valid) tile fits any usable device.
+    const TILE_MIN: u32 = 8;
+
+    let fixed = FIXED_F16 * act_size / 2;
+    let per_inpx = (AREA_PER_INPX_F16 * act_size / 2).max(1);
+    // Solve for the LATENT tile `t` whose INPUT area `(8t + 2*halo)^2` fits the
+    // area budget: input_area <= (budget - fixed) / per_inpx.
+    let in_area = workspace_budget.saturating_sub(fixed) / per_inpx;
+    let in_side = (in_area as f64).sqrt() as u32;
+    let valid_in = in_side.saturating_sub(2 * ENC_HALO_PX);
+    let tile = (valid_in / 8).clamp(TILE_MIN, TILE_MAX);
+    // Non-overlapping valid latent regions (halo gives the cross-tile context),
+    // so `overlap = 0`: `plan_tiles` steps by `tile`.
+    (tile, 0)
+}
+
 /// Tiles covering `[0, n)` latent pixels along one axis: `(start, extent)` pairs
 /// stepping by `tile - overlap`, each extent capped at `tile` and clamped to the
 /// end. A single `(0, n)` tile when `n <= tile` (the parity-res fast path).
@@ -3523,6 +3575,11 @@ pub struct WanVaeEncoder {
     pub pipelines: WanVaePipelines,
     pub handles: VaeEncoderHandles,
     pub cfg: WanVaeConfig,
+    /// Total GPU bytes of the encoder weights (all fit resident). Reserved out
+    /// of the VRAM budget when sizing the spatial input-tile workspace, so
+    /// weights stay resident (no per-tile re-streaming) and the true peak holds
+    /// the budget. Mirrors `WanVaeDecoder::weight_footprint`.
+    pub weight_footprint: u64,
 }
 
 #[derive(Debug)]
@@ -3601,66 +3658,183 @@ impl WanVaeEncoder {
             .instrument(tracing::debug_span!(target: PHASE, "wan_vae.acquire"))
             .await?;
         let bufs = views.bufs();
-        let mut fc = FeatCache::new();
 
         let n_chunks = 1 + (f - 1) / 4;
         // Latent CTHW: time axis concatenated across chunks (1 latent frame each).
         let mut latent = vec![0.0_f32; zc * n_chunks * hw_out];
-        for i in 0..n_chunks {
-            // Slice this chunk's frames (chunk 0 = frame 0; chunk i = frames
-            // [1+4(i-1), 1+4i)) into NCTHW [1, 3, tin, h, w].
-            let (f0, tin) = if i == 0 {
-                (0usize, 1usize)
-            } else {
-                (1 + 4 * (i - 1), 4usize)
-            };
-            let mut chunk = vec![0.0_f32; 3 * tin * hw_in];
-            for c in 0..3 {
-                for tt in 0..tin {
-                    let src = (c * f + (f0 + tt)) * hw_in;
-                    let dst = (c * tin + tt) * hw_in;
-                    chunk[dst..dst + hw_in].copy_from_slice(&video[src..src + hw_in]);
+
+        // --- budget-derived spatial input tiling ---
+        // Size an INPUT tile from the live VRAM budget (analogous to decode):
+        // the encoder's full-res early stages dominate, so peak scales with the
+        // input tile area. Reserve the resident weights + staging out of the
+        // budget before sizing the (non-evictable) tile workspace, and hold the
+        // rest as a transient reserve so weights stay resident while the tile
+        // workspace + staging cannot push the true peak past the budget.
+        let budget = residency.arbiter().budget_bytes();
+        const VAE_STAGING_RESERVE: u64 = 256 * 1024 * 1024;
+        let eff_budget = if budget == u64::MAX {
+            2 * 1024 * 1024 * 1024
+        } else {
+            budget
+        };
+        let reserve = self.weight_footprint + VAE_STAGING_RESERVE;
+        let workspace_budget = eff_budget.saturating_sub(reserve);
+        let (tile, overlap) = vae_encode_tile_dims(workspace_budget, asz);
+        if budget != u64::MAX {
+            residency.set_transient_reserve(eff_budget.saturating_sub(self.weight_footprint));
+        }
+
+        // Non-overlapping valid LATENT tiles per axis (the halo, not overlap,
+        // supplies cross-tile context). A single full tile at parity res ==
+        // the untiled encode, bit-identical.
+        let tiles_h = plan_tiles(h_out as u32, tile, overlap);
+        let tiles_w = plan_tiles(w_out as u32, tile, overlap);
+        let single = tiles_h.len() == 1 && tiles_w.len() == 1;
+        let halo = ENC_HALO_PX as usize;
+        let mem_dbg = std::env::var_os("THINFER_VAE_MEM").is_some();
+        if mem_dbg {
+            eprintln!(
+                "[vae_mem] ENCODE budget={}MiB weights={}MiB ws_budget={}MiB act_size={} tile={} halo={} grid={}x{} (h_in={} w_in={} f={})",
+                budget / (1024 * 1024),
+                self.weight_footprint / (1024 * 1024),
+                workspace_budget / (1024 * 1024),
+                asz,
+                tile,
+                halo,
+                tiles_h.len(),
+                tiles_w.len(),
+                h_in,
+                w_in,
+                f,
+            );
+        }
+
+        // Each spatial tile carries its OWN temporal feat_cache across chunks
+        // (the cache holds per-conv spatial buffers, so it is tile-local).
+        for &(lr0, lhext) in &tiles_h {
+            // Input rows: valid region [lr0*8, (lr0+lhext)*8) grown by the halo
+            // on each side, clamped to the image (true borders get no halo,
+            // exactly the untiled edge behavior).
+            let vr0 = lr0 as usize * 8;
+            let in_r0 = vr0.saturating_sub(halo);
+            let in_r1 = ((lr0 + lhext) as usize * 8 + halo).min(h_in);
+            let in_h = in_r1 - in_r0;
+            // Valid latent rows' offset within this tile's latent output.
+            let crop_r = (vr0 - in_r0) / 8;
+            for &(lc0, lwext) in &tiles_w {
+                let vc0 = lc0 as usize * 8;
+                let in_c0 = vc0.saturating_sub(halo);
+                let in_c1 = ((lc0 + lwext) as usize * 8 + halo).min(w_in);
+                let in_w = in_c1 - in_c0;
+                let crop_c = (vc0 - in_c0) / 8;
+                let tile_hw_in = in_h * in_w;
+                let tile_h_out = in_h / 8;
+                let tile_w_out = in_w / 8;
+                let tile_hw_out = tile_h_out * tile_w_out;
+
+                let mut fc = FeatCache::new();
+                for i in 0..n_chunks {
+                    // Slice this chunk's frames (chunk 0 = frame 0; chunk i =
+                    // frames [1+4(i-1), 1+4i)) restricted to the tile's input
+                    // window, into NCTHW [1, 3, tin, in_h, in_w].
+                    let (f0, tin) = if i == 0 {
+                        (0usize, 1usize)
+                    } else {
+                        (1 + 4 * (i - 1), 4usize)
+                    };
+                    let mut chunk = vec![0.0_f32; 3 * tin * tile_hw_in];
+                    for c in 0..3 {
+                        for tt in 0..tin {
+                            for rr in 0..in_h {
+                                let src = (c * f + (f0 + tt)) * hw_in + (in_r0 + rr) * w_in + in_c0;
+                                let dst = ((c * tin + tt) * in_h + rr) * in_w;
+                                chunk[dst..dst + in_w].copy_from_slice(&video[src..src + in_w]);
+                            }
+                        }
+                    }
+                    let in_bytes = f32s_to_act_bytes(asz, &chunk);
+                    let in_buf = workspace.alloc(in_bytes.len() as u64)?;
+                    backend.write_buffer(in_buf.id(), 0, &in_bytes)?;
+
+                    let out_bytes = (zc * tile_hw_out) as u64 * asz;
+                    let out_buf = workspace.alloc(out_bytes)?;
+                    let out_ref = out_buf.as_buf_ref();
+
+                    // Taps (parity bisection) only apply to the single full tile.
+                    let tile_taps = if single { taps.as_deref_mut() } else { None };
+                    if mem_dbg {
+                        use thinfer_core::backend::Backend;
+                        let mem = backend.mem_account();
+                        eprintln!(
+                            "[vae_mem]   tile h=[{}..{}] w=[{}..{}] in={}x{} chunk={} vram_total={}MiB (W={}MiB Ws={}MiB St={}MiB)",
+                            lr0,
+                            lr0 + lhext,
+                            lc0,
+                            lc0 + lwext,
+                            in_h,
+                            in_w,
+                            i,
+                            mem.vram_total_current() / (1024 * 1024),
+                            mem.vram_current(VramCategory::Weights) / (1024 * 1024),
+                            mem.vram_current(VramCategory::Workspace) / (1024 * 1024),
+                            mem.vram_current(VramCategory::Staging) / (1024 * 1024),
+                        );
+                    }
+                    let t_tile = std::time::Instant::now();
+                    let shape = encode_chunk(
+                        backend,
+                        &*workspace,
+                        &self.pipelines,
+                        cfg,
+                        &bufs,
+                        &mut fc,
+                        &in_buf.as_buf_ref(),
+                        tin as u32,
+                        in_h as u32,
+                        in_w as u32,
+                        &out_ref,
+                        i,
+                        tile_taps,
+                    )
+                    .await?;
+                    debug_assert_eq!(shape.t, 1);
+                    debug_assert_eq!(shape.c as usize, zc);
+                    debug_assert_eq!(shape.h as usize, tile_h_out);
+                    debug_assert_eq!(shape.w as usize, tile_w_out);
+
+                    let host = backend
+                        .read_buffer(out_ref.id, out_ref.offset, out_bytes)
+                        .instrument(
+                            tracing::debug_span!(target: PHASE, "wan_vae.readback", chunk = i),
+                        )
+                        .await?;
+                    if mem_dbg {
+                        eprintln!(
+                            "[vae_mem]   tile chunk={} encode+readback {}ms",
+                            i,
+                            t_tile.elapsed().as_millis()
+                        );
+                    }
+                    let vals = act_bytes_to_f32_vec(asz, &host);
+
+                    // Crop the halo and place this tile's valid [zc, lhext,
+                    // lwext] latent block into the full CTHW latent at time i.
+                    // Non-overlapping, so a plain copy (no feather blend).
+                    for ch in 0..zc {
+                        for rr in 0..lhext as usize {
+                            let src = (ch * tile_h_out + (crop_r + rr)) * tile_w_out + crop_c;
+                            let dst = ((ch * n_chunks + i) * h_out + (lr0 as usize + rr)) * w_out
+                                + lc0 as usize;
+                            latent[dst..dst + lwext as usize]
+                                .copy_from_slice(&vals[src..src + lwext as usize]);
+                        }
+                    }
+                    // Return this tile's idle buffers to the pool before the next
+                    // grows it, so the live set stays bounded to one tile.
+                    if !single {
+                        workspace.drain_pool();
+                    }
                 }
-            }
-            let in_bytes = f32s_to_act_bytes(asz, &chunk);
-            let in_buf = workspace.alloc(in_bytes.len() as u64)?;
-            backend.write_buffer(in_buf.id(), 0, &in_bytes)?;
-
-            let out_bytes = (zc * hw_out) as u64 * asz;
-            let out_buf = workspace.alloc(out_bytes)?;
-            let out_ref = out_buf.as_buf_ref();
-
-            let shape = encode_chunk(
-                backend,
-                &*workspace,
-                &self.pipelines,
-                cfg,
-                &bufs,
-                &mut fc,
-                &in_buf.as_buf_ref(),
-                tin as u32,
-                h_in as u32,
-                w_in as u32,
-                &out_ref,
-                i,
-                taps.as_deref_mut(),
-            )
-            .await?;
-            debug_assert_eq!(shape.t, 1);
-            debug_assert_eq!(shape.c as usize, zc);
-
-            let host = backend
-                .read_buffer(out_ref.id, out_ref.offset, out_bytes)
-                .instrument(tracing::debug_span!(target: PHASE, "wan_vae.readback", chunk = i))
-                .await?;
-            let vals = act_bytes_to_f32_vec(asz, &host);
-
-            // Scatter this chunk's [zc, 1, hw] block into the CTHW latent at
-            // time index i.
-            for ch in 0..zc {
-                let src = ch * hw_out;
-                let dst = (ch * n_chunks + i) * hw_out;
-                latent[dst..dst + hw_out].copy_from_slice(&vals[src..src + hw_out]);
             }
         }
 

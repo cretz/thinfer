@@ -431,6 +431,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 ops: ops_template_bf16w,
                 i8_sdpa,
                 dense_acts: DenseActSites::default(),
+                large_d_sdpa: false,
             };
             block_pipelines.push(BlockPipelines::compile(&backend, &cfgs).await?);
         }
@@ -481,6 +482,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ops: encoder_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            large_d_sdpa: false,
         };
         let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfgs).await?;
         // DiT-side encoder ops (x/t/cap embedders + refiners + final_layer):
@@ -512,6 +514,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ops: dit_encoder_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            large_d_sdpa: false,
         };
         let dit_encoder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_encoder_cfgs).await?;
@@ -528,6 +531,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ops: dit_encoder_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            large_d_sdpa: false,
         };
         let dit_embedder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_embedder_cfgs).await?;
@@ -542,6 +546,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             pipelines: vae_pipelines,
             handles: vae_handles,
             tile_cfg: VaeTileConfig::default(),
+            arch: crate::z_image::vae::Z_IMAGE_KL_VAE,
         };
         Ok(Self {
             backend,

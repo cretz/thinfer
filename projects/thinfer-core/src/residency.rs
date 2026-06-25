@@ -127,6 +127,9 @@ impl WeightMeta {
             (Some(k), _, _) => StorageEncoding::Quant(k),
             (None, StorageEncoding::Quant(_), TransposePolicy::Linear2D) => StorageEncoding::Bf16,
             (None, StorageEncoding::F32, _) => StorageEncoding::Bf16,
+            // F16 file (GGUF VAE convs): expand to the engine-wide bf16 weight
+            // storage, same as F32. Decode happens host-side at upload.
+            (None, StorageEncoding::F16, _) => StorageEncoding::Bf16,
             (None, e, _) => e,
         }
     }
@@ -936,19 +939,45 @@ impl<S: WeightSource> WeightResidency<S> {
                 Ok(transpose_bf16_cpu(&bytes, on_disk_len, storage_len, n, k))
             }
             (StorageEncoding::F32, transpose) => {
-                let tight_len = on_disk_len / 2; // bf16 halves the f32 bytes
+                // Narrow the tight element bytes only: GGUF pads tensor data to
+                // its 32-byte alignment, so `on_disk_len` can exceed the real
+                // `elements * 4`.
+                let elems = meta.elements() as usize;
+                let tight = &bytes[..elems * 4];
+                let bf16_len = elems * 2; // tight bf16 byte count
                 let narrowed = narrow_f32_to_bf16(
-                    &bytes,
+                    tight,
                     match transpose {
                         TransposePolicy::None => storage_len,
-                        TransposePolicy::Linear2D => tight_len,
+                        TransposePolicy::Linear2D => bf16_len,
                     },
                 );
                 match transpose {
                     TransposePolicy::None => Ok(narrowed),
                     TransposePolicy::Linear2D => {
                         let (n, k) = rank2(meta)?;
-                        Ok(transpose_bf16_cpu(&narrowed, tight_len, storage_len, n, k))
+                        Ok(transpose_bf16_cpu(&narrowed, bf16_len, storage_len, n, k))
+                    }
+                }
+            }
+            (StorageEncoding::F16, transpose) => {
+                // GGUF VAE conv weights ship fp16; narrow to the engine-wide
+                // bf16 weight storage. Tight element bytes only (see F32 note).
+                let elems = meta.elements() as usize;
+                let tight = &bytes[..elems * 2];
+                let bf16_len = elems * 2;
+                let narrowed = narrow_f16_to_bf16(
+                    tight,
+                    match transpose {
+                        TransposePolicy::None => storage_len,
+                        TransposePolicy::Linear2D => bf16_len,
+                    },
+                );
+                match transpose {
+                    TransposePolicy::None => Ok(narrowed),
+                    TransposePolicy::Linear2D => {
+                        let (n, k) = rank2(meta)?;
+                        Ok(transpose_bf16_cpu(&narrowed, bf16_len, storage_len, n, k))
                     }
                 }
             }
@@ -1317,6 +1346,13 @@ impl<S: WeightSource> WeightResidency<S> {
     /// `max(phase)`, not the sum across phases. Pinned entries (mid-forward)
     /// are skipped; they stay resident.
     pub fn evict_all_and_free<B: Backend>(&self, backend: &B) {
+        // A phase boundary ends the previous phase's transient envelope: the
+        // sticky reserve is sized for one phase's workspace (e.g. the VAE tile
+        // working set holds `budget - weights` free). Carrying it into the next
+        // phase would force that phase's weight admissions to keep a phantom
+        // multi-GiB reserve free, evicting weights it needs (the DiT block loop
+        // streaming right after a VAE encode). The next phase sets its own.
+        self.transient_reserve.store(0, Ordering::Relaxed);
         // Release the persistent prep staging band too: the next phase
         // re-allocates it lazily (while VRAM is empty again), so its reserved
         // headroom does not carry across a phase boundary.
@@ -1473,6 +1509,20 @@ fn narrow_f32_to_bf16(src: &[u8], out_len: usize) -> Vec<u8> {
     let dst: &mut [u16] = bytemuck::cast_slice_mut(&mut out[..values.len() * 2]);
     for (&v, d) in values.iter().zip(dst.iter_mut()) {
         *d = half::bf16::from_f32(v).to_bits();
+    }
+    out
+}
+
+/// Narrow fp16 storage to bf16 (via fp32) into a `out_len`-byte buffer. Same
+/// shape as [`narrow_f32_to_bf16`] but the source is 2-byte fp16. Used for the
+/// GGUF VAE conv weights, which ship fp16 but upload as bf16.
+fn narrow_f16_to_bf16(src: &[u8], out_len: usize) -> Vec<u8> {
+    let values: &[u16] = bytemuck::cast_slice(src);
+    debug_assert!(out_len >= values.len() * 2);
+    let mut out = vec![0u8; out_len];
+    let dst: &mut [u16] = bytemuck::cast_slice_mut(&mut out[..values.len() * 2]);
+    for (&v, d) in values.iter().zip(dst.iter_mut()) {
+        *d = half::bf16::from_f32(half::f16::from_bits(v).to_f32()).to_bits();
     }
     out
 }

@@ -102,6 +102,13 @@ pub struct ImageRequest {
     pub steps: u32,
     /// `None` -> randomized at run time; the resolved value is reported back.
     pub seed: Option<u64>,
+    /// DP4A i8 matmul on the DP4A-safe DiT sites (qkv + ffn_up). Default true;
+    /// `false` forces the bf16/dequant-once reference path. Ideogram-4 only
+    /// (Z-Image ignores it).
+    pub i8_matmul: bool,
+    /// Reference image for the image-EDIT path (Qwen-Image-Edit). REQUIRED for
+    /// the `QwenImageEdit` kind; rejected for the t2i kinds (Z-Image, Ideogram).
+    pub input_image: Option<PathBuf>,
     pub budget: ResidencyBudget,
     pub output: PathBuf,
     pub format: ImageFormat,
@@ -110,7 +117,23 @@ pub struct ImageRequest {
 impl ImageRequest {
     /// Files this request needs in the HF cache.
     pub fn required_files(&self) -> Vec<FileRef> {
-        self.model.variant().files().map(|(_, f)| *f).collect()
+        match self.model.kind() {
+            crate::model::ImageKind::ZImage => {
+                self.model.variant().files().map(|(_, f)| *f).collect()
+            }
+            // Ideogram-4 + Qwen-Image(-Edit) source by role (encoder + DiT GGUFs,
+            // VAE, mmproj/LoRA, tokenizer), not via the Z-Image variant registry.
+            crate::model::ImageKind::Ideogram4
+            | crate::model::ImageKind::QwenImageEdit
+            | crate::model::ImageKind::QwenImage => {
+                let m = self.model.manifest();
+                self.model
+                    .required_roles()
+                    .iter()
+                    .map(|r| *m.get(r).expect("image role in manifest"))
+                    .collect()
+            }
+        }
     }
 
     /// Validate everything that can fail before any GPU/network work.
@@ -119,6 +142,18 @@ impl ImageRequest {
         validate_dim("width", self.width)?;
         if self.steps == 0 {
             return Err("--steps must be > 0".into());
+        }
+        match self.model.kind() {
+            crate::model::ImageKind::QwenImageEdit => {
+                if self.input_image.is_none() {
+                    return Err(format!("--input-image is required for {}", self.model));
+                }
+            }
+            _ => {
+                if self.input_image.is_some() {
+                    return Err(format!("--input-image is not supported by {}", self.model));
+                }
+            }
         }
         Ok(())
     }

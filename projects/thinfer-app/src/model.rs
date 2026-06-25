@@ -5,6 +5,8 @@
 //! value names and the registry keys); the registry lookups key off it.
 
 use thinfer_core::manifest::ModelManifest;
+use thinfer_models::ideogram4::manifest as idmf;
+use thinfer_models::qwen_image::manifest as qimf;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::z_image::manifest as zmf;
 
@@ -54,25 +56,103 @@ pub enum ImageModelId {
     #[cfg_attr(feature = "cli", value(name = "zimage-turbo-bf16"))]
     #[cfg_attr(feature = "serde", serde(rename = "zimage-turbo-bf16"))]
     ZImageTurboBf16,
+    /// Ideogram-4 + the ostris turbotime LoRA (CFG-free): Q8_0 encoder + DiT,
+    /// LoRA folded to Q8_0 at load (near-lossless); FLUX.2 KL VAE. (A Q4_K DiT
+    /// default was tried and dropped: per-request re-fold to Q4_K was ~2x slower
+    /// than Q8_0 with worse quality -- not worth it for this fold-per-request
+    /// pipeline.)
+    #[cfg_attr(feature = "cli", value(name = "ideogram4-q8"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ideogram4-q8"))]
+    Ideogram4Q8,
+    /// Qwen-Image-Edit-Rapid-AIO: a 4-step distilled, CFG-free image-EDIT MMDiT.
+    /// Requires `--input-image` (the reference image to edit). Q8_0 DiT for now
+    /// (Q4_K_M streaming is a later perf task).
+    #[cfg_attr(feature = "cli", value(name = "qwen-image-edit-rapid"))]
+    #[cfg_attr(feature = "serde", serde(rename = "qwen-image-edit-rapid"))]
+    QwenImageEditRapid,
+    /// Qwen-Image-Rapid: the same 4-step distilled, CFG-free MMDiT as the edit
+    /// model, driven text-to-image (no reference image, no vision tower).
+    #[cfg_attr(feature = "cli", value(name = "qwen-image-rapid"))]
+    #[cfg_attr(feature = "serde", serde(rename = "qwen-image-rapid"))]
+    QwenImageRapid,
+}
+
+/// Which engine pipeline an image id drives. The executor branches on this:
+/// Z-Image and Ideogram-4 have different sources, tokenizers, and pipelines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageKind {
+    ZImage,
+    Ideogram4,
+    /// Qwen-Image-Edit (image->image; requires a reference image).
+    QwenImageEdit,
+    /// Qwen-Image (text->image; same MMDiT, no reference image).
+    QwenImage,
 }
 
 impl ImageModelId {
     pub const DEFAULT: ImageModelId = ImageModelId::ZImageTurboQ4;
 
-    pub fn manifest(self) -> &'static ModelManifest {
-        &zmf::MANIFEST
+    /// Which engine pipeline this id drives.
+    pub fn kind(self) -> ImageKind {
+        match self {
+            ImageModelId::Ideogram4Q8 => ImageKind::Ideogram4,
+            ImageModelId::QwenImageEditRapid => ImageKind::QwenImageEdit,
+            ImageModelId::QwenImageRapid => ImageKind::QwenImage,
+            _ => ImageKind::ZImage,
+        }
     }
 
-    /// File set from the shared variant registry (keyed by `Display`).
+    pub fn manifest(self) -> &'static ModelManifest {
+        match self.kind() {
+            ImageKind::ZImage => &zmf::MANIFEST,
+            ImageKind::Ideogram4 => &idmf::MANIFEST,
+            ImageKind::QwenImageEdit | ImageKind::QwenImage => &qimf::MANIFEST,
+        }
+    }
+
+    /// File set from the shared Z-Image variant registry (keyed by `Display`).
+    /// Z-Image only: Ideogram-4 sources its files by role (see
+    /// [`Self::required_roles`]); call sites must branch on [`Self::kind`].
     pub fn variant(self) -> &'static zmf::VariantFiles {
+        debug_assert_eq!(self.kind(), ImageKind::ZImage, "variant() is Z-Image only");
         zmf::variant(&self.to_string()).expect("ImageModelId missing from VARIANTS registry")
     }
 
+    /// For non-registry models (Ideogram-4), the manifest roles a generate
+    /// needs. Empty for Z-Image (it uses the variant registry instead).
+    pub fn required_roles(self) -> &'static [&'static str] {
+        match self {
+            ImageModelId::Ideogram4Q8 => idmf::RUNTIME_ROLES_Q8,
+            // Q8_0 DiT for now (Q4_K_M streaming is a later perf task).
+            ImageModelId::QwenImageEditRapid => qimf::RUNTIME_ROLES_Q8,
+            // t2i omits the vision tower (mmproj) + preprocessor.
+            ImageModelId::QwenImageRapid => qimf::RUNTIME_ROLES_T2I_Q8,
+            // Z-Image uses the variant registry, not roles.
+            _ => &[],
+        }
+    }
+
     pub fn defaults(self) -> ImageDefaults {
-        ImageDefaults {
-            width: IMAGE_DEFAULT_WIDTH,
-            height: IMAGE_DEFAULT_HEIGHT,
-            steps: IMAGE_DEFAULT_STEPS,
+        match self.kind() {
+            // Ideogram-4 trains at 1024 (resolution-aware schedule). The
+            // turbotime LoRA is a few-step distill (2/4/8); 4 is the balance
+            // default (8 = quality ceiling, 2 = fastest).
+            ImageKind::Ideogram4 => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 4,
+            },
+            // Qwen-Image(-Edit)-Rapid: 4-step distill, authored at 1024.
+            ImageKind::QwenImageEdit | ImageKind::QwenImage => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 4,
+            },
+            ImageKind::ZImage => ImageDefaults {
+                width: IMAGE_DEFAULT_WIDTH,
+                height: IMAGE_DEFAULT_HEIGHT,
+                steps: IMAGE_DEFAULT_STEPS,
+            },
         }
     }
 }
@@ -83,6 +163,9 @@ impl std::fmt::Display for ImageModelId {
             ImageModelId::ZImageTurboQ8 => "zimage-turbo-q8",
             ImageModelId::ZImageTurboQ4 => "zimage-turbo-q4",
             ImageModelId::ZImageTurboBf16 => "zimage-turbo-bf16",
+            ImageModelId::Ideogram4Q8 => "ideogram4-q8",
+            ImageModelId::QwenImageEditRapid => "qwen-image-edit-rapid",
+            ImageModelId::QwenImageRapid => "qwen-image-rapid",
         })
     }
 }

@@ -301,6 +301,7 @@ impl ZImageDit {
             norm_eps: eps,
             adaln_embed_dim: aed,
             modulation,
+            rope_halfrot: false,
         };
 
         let noise_refiner = (0..config::N_REFINER_LAYERS)

@@ -8,6 +8,7 @@
 //! (patchify, weight-name maps, the model's own embedders) stays in the model
 //! module.
 
+pub mod autoencoder_kl;
 pub mod block;
 pub mod embedders;
 pub mod loader;

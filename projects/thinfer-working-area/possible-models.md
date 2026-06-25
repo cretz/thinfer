@@ -5,6 +5,7 @@ Image gen:
 * https://huggingface.co/Boogu/Boogu-Image-0.1-Turbo (https://huggingface.co/Boogu/Boogu-Image-0.1-Turbo-fp8, https://huggingface.co/Boogu/Boogu-Image-0.1-Edit, https://huggingface.co/realrebelai/Boogu-Image-Edit_GGUFs, https://huggingface.co/Comfy-Org/Boogu-Image)
 * https://huggingface.co/ostris/ideogram_4_turbotime_lora (https://huggingface.co/ideogram-ai/ideogram-4-fp8, etc)
 * https://huggingface.co/Phr00t/Qwen-Image-Edit-Rapid-AIO
+* https://huggingface.co/krea/Krea-2-Turbo (https://huggingface.co/Abiray/Krea-2-Turbo-GGUF)
 
 
 Face swap:

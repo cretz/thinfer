@@ -37,6 +37,14 @@ body {
   padding: 0.4rem 1.2rem;
 }
 
+/* The reference-image row wraps a label+input pair in a div; `display: contents`
+   promotes them into the #fields grid so they align like every other row (label
+   in column 1, input in column 2) instead of cramming into one cell. Guarded
+   with :not([hidden]) so the `hidden` attribute still collapses the row. */
+#input-image-row:not([hidden]) {
+  display: contents;
+}
+
 /* Per-type field visibility is toggled by a body class set in app.js. */
 .image-only,
 .video-only {

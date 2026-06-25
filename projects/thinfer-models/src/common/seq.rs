@@ -94,6 +94,34 @@ pub fn causal_mask_bytes_act(seq: usize, act: ActDtype) -> Vec<u8> {
     }
 }
 
+/// Additive SDPA mask for a sequence even-padded with `n_masked_tail` trailing
+/// rows: `0.0` everywhere except the last `n_masked_tail` KEY columns, which are
+/// `-inf` so no real query attends the pad. The pad rows' own outputs are
+/// discarded by the caller (they sit after the read-back region). `seq` is the
+/// padded (even) length. Used by the Ideogram-4 DiT, whose packed
+/// `[text][image]` stream is odd when `num_text` is odd but whose F16 mask must
+/// be even for the `array<u32>` pair packing.
+pub fn attn_mask_pad_tail_bytes_act(seq: usize, n_masked_tail: usize, act: ActDtype) -> Vec<u8> {
+    let bpe = mask_bytes_per_elem(act);
+    let mut out = vec![0u8; seq * seq * bpe];
+    if n_masked_tail == 0 {
+        return out;
+    }
+    let neg_inf: &[u8] = match act {
+        ActDtype::F32 => &f32::NEG_INFINITY.to_le_bytes(),
+        ActDtype::Bf16 => &0xff80u16.to_le_bytes(), // bf16 -inf
+        ActDtype::F16 | ActDtype::I8 => &0xfc00u16.to_le_bytes(), // f16 -inf
+    };
+    let first_pad_col = seq - n_masked_tail;
+    for q in 0..seq {
+        for k in first_pad_col..seq {
+            let off = (q * seq + k) * bpe;
+            out[off..off + bpe].copy_from_slice(neg_inf);
+        }
+    }
+    out
+}
+
 /// Encode `slice` for upload into a RoPE freqs buffer (act-dtype layout).
 pub fn freqs_upload_bytes(act: ActDtype, slice: &[f32]) -> Vec<u8> {
     act_upload_bytes(act, slice)
@@ -339,6 +367,43 @@ mod tests {
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         assert_eq!(m, vec![0.0; 25]);
+    }
+
+    #[test]
+    fn pad_tail_mask_masks_only_tail_columns() {
+        // seq=4 (even), 1 masked tail column: F32 -> column 3 is -inf for every
+        // query row, the rest 0.
+        let bytes = attn_mask_pad_tail_bytes_act(4, 1, ActDtype::F32);
+        let m: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(m.len(), 16);
+        for q in 0..4 {
+            for k in 0..4 {
+                let v = m[q * 4 + k];
+                if k == 3 {
+                    assert_eq!(v, f32::NEG_INFINITY, "q{q} k{k}");
+                } else {
+                    assert_eq!(v, 0.0, "q{q} k{k}");
+                }
+            }
+        }
+        // n=0 -> all zeros (identical to attn_mask_zero_bytes_act).
+        assert_eq!(
+            attn_mask_pad_tail_bytes_act(4, 0, ActDtype::F16),
+            attn_mask_zero_bytes_act(4, ActDtype::F16)
+        );
+    }
+
+    #[test]
+    fn pad_tail_mask_f16_neg_inf_bits() {
+        // F16 -inf is 0xfc00; masked tail column carries those bits.
+        let bytes = attn_mask_pad_tail_bytes_act(2, 1, ActDtype::F16);
+        // row 0: [0x0000, 0xfc00], row 1: [0x0000, 0xfc00].
+        assert_eq!(&bytes[2..4], &0xfc00u16.to_le_bytes());
+        assert_eq!(&bytes[6..8], &0xfc00u16.to_le_bytes());
+        assert_eq!(&bytes[0..2], &[0, 0]);
     }
 
     #[test]

@@ -20,6 +20,10 @@ pub struct GenerateImage {
     pub model: ImageModelId,
     #[arg(long)]
     pub prompt: String,
+    /// Reference image to edit (REQUIRED for `qwen-image-edit-rapid`; rejected
+    /// for the t2i models). PNG/JPEG.
+    #[arg(long)]
+    pub input_image: Option<PathBuf>,
     #[arg(long)]
     pub output: PathBuf,
     /// Output format. Defaults to inferring from the `--output` extension;
@@ -45,6 +49,10 @@ pub struct GenerateImage {
     /// GPU VRAM budget for the weight residency manager.
     #[arg(long)]
     pub vram_budget: Option<String>,
+    /// Disable the DP4A i8 matmul on the DP4A-safe DiT sites (Ideogram-4 only;
+    /// forces the bf16 reference path). No effect on Z-Image.
+    #[arg(long)]
+    pub no_i8_matmul: bool,
     /// Skip the TTY consent prompt and download missing weight files.
     #[arg(long, default_value_t = false)]
     pub download_as_needed: bool,
@@ -62,6 +70,9 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
     )?;
 
     if args.remote.remote.is_some() {
+        if args.input_image.is_some() {
+            return Err("--input-image (image edit) is not supported over --remote yet".into());
+        }
         let spec = JobSpec::Image(ImageSpec {
             model: Some(args.model),
             prompt: args.prompt,
@@ -69,6 +80,9 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
             height: Some(args.height),
             steps: Some(args.steps),
             seed: args.seed,
+            // Edit-over-remote is guarded above (returns early), so no image here.
+            input_image: None,
+            i8_matmul: Some(!args.no_i8_matmul),
             public_key: None,
         });
         return super::run_remote(&args.remote, spec, args.output).await;
@@ -83,6 +97,8 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         height: args.height,
         steps: args.steps,
         seed: args.seed,
+        i8_matmul: !args.no_i8_matmul,
+        input_image: args.input_image,
         budget: ResidencyBudget {
             ram_bytes: ram,
             vram_bytes: vram,

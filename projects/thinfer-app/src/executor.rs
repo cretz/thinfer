@@ -8,7 +8,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 use thinfer_core::backend::WgpuBackend;
+use thinfer_core::format::gguf::GgufSource;
+use thinfer_core::format::safetensors::SafetensorsSource;
+use thinfer_core::format::union::{RenamedSource, UnionSource};
 use thinfer_core::residency::WeightResidency;
+use thinfer_core::tokenizer::Tokenizer;
+use thinfer_models::ideogram4::lora::LoraFoldSource;
+use thinfer_models::ideogram4::manifest::role as idrole;
+use thinfer_models::ideogram4::pipeline::{
+    self as idpipe, GenerationParams as IdParams, Ideogram4Pipeline,
+};
+use thinfer_models::qwen_image::manifest::role as qrole;
+use thinfer_models::qwen_image::pipeline::{self as qpipe, QwenImagePipeline};
+use thinfer_models::qwen_image::text_encoder::qwen2vl_gguf_renames;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::wan::pipeline::{
     self as wanpipe, GenerationParams as WanParams, Shot, VaeChoice, WanModel, WanVideo,
@@ -16,7 +28,9 @@ use thinfer_models::wan::pipeline::{
 use thinfer_models::wan::source::{WanSource, open_longlive_source};
 use thinfer_models::z_image::manifest::role as zrole;
 use thinfer_models::z_image::pipeline::{self as zpipe, GenerationParams as ZParams, ZImageModel};
+use thinfer_models::z_image::qwen3_gguf_renames;
 use thinfer_models::z_image::source::{GgufOpeners, ZImageSource};
+use thinfer_models::z_image::tokenizer::format_qwen3_prompt;
 use thinfer_native::MmapFileOpener;
 use thinfer_native::tokenizer::HfTokenizer;
 
@@ -64,6 +78,19 @@ impl LocalExecutor {
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         req.validate()?;
+        match req.model.kind() {
+            crate::model::ImageKind::ZImage => self.run_zimage(req, sink).await,
+            crate::model::ImageKind::Ideogram4 => self.run_ideogram4(req, sink).await,
+            crate::model::ImageKind::QwenImageEdit => self.run_qwen_image_edit(req, sink).await,
+            crate::model::ImageKind::QwenImage => self.run_qwen_image(req, sink).await,
+        }
+    }
+
+    async fn run_zimage(
+        &self,
+        req: &ImageRequest,
+        sink: &dyn ProgressSink,
+    ) -> Result<JobSummary, String> {
         let manifest = req.model.manifest();
         let variant = req.model.variant();
 
@@ -121,6 +148,304 @@ impl LocalExecutor {
             .generate(&params, Some(&progress))
             .await
             .map_err(|e| format!("generate: {e:?}"))?;
+        tokio::fs::write(&req.output, &png)
+            .await
+            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+
+        Ok(JobSummary {
+            output: req.output.clone(),
+            width: req.width,
+            height: req.height,
+            frames: 1,
+            fps: None,
+            seed: Some(seed),
+        })
+    }
+
+    /// Ideogram-4 + turbotime LoRA. Distinct from Z-Image: three weight files
+    /// (Qwen3-VL encoder GGUF, DiT GGUF folded with the LoRA, FLUX.2 VAE) unioned
+    /// into one residency, the DiT GGUF wrapped by [`LoraFoldSource`].
+    async fn run_ideogram4(
+        &self,
+        req: &ImageRequest,
+        sink: &dyn ProgressSink,
+    ) -> Result<JobSummary, String> {
+        let manifest = req.model.manifest();
+        // Ideogram-4 runs Q8_0 throughout: the LoRA fold dequantizes the base
+        // DiT and re-quantizes to Q8_0 (near-lossless). The encoder is Q8_0 too
+        // (the quantized Qwen3 GGUFs are mixed-precision and the encoder pipeline
+        // probes one dtype uniformly).
+        let (dit_role, fold_target) = (idrole::DIT_GGUF_Q8_0, thinfer_core::quant::QuantKind::Q8_0);
+        let enc_role = idrole::ENCODER_GGUF_Q8_0;
+        let enc = open_mmap(&resolve_role(manifest, enc_role)?).await?;
+        let dit = open_mmap(&resolve_role(manifest, dit_role)?).await?;
+        let vae = open_mmap(&resolve_role(manifest, idrole::VAE)?).await?;
+        let lora = open_mmap(&resolve_role(manifest, idrole::LORA)?).await?;
+        let tokenizer = load_tokenizer(&resolve_role(manifest, idrole::TOKENIZER)?).await?;
+
+        // union(encoder-renamed-gguf, lora-folded-dit-gguf, vae-safetensors).
+        let enc_src = RenamedSource::with_passthrough(
+            GgufSource::open(enc)
+                .await
+                .map_err(|e| format!("parse encoder gguf: {e:?}"))?,
+            qwen3_gguf_renames(),
+        );
+        let dit_src = LoraFoldSource::new(
+            GgufSource::open(dit)
+                .await
+                .map_err(|e| format!("parse dit gguf: {e:?}"))?,
+            SafetensorsSource::open(lora)
+                .await
+                .map_err(|e| format!("parse lora safetensors: {e:?}"))?,
+            fold_target,
+        );
+        let vae_src = SafetensorsSource::open(vae)
+            .await
+            .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
+        let source = UnionSource::new(UnionSource::new(dit_src, enc_src), vae_src);
+
+        let token_ids = tokenizer
+            .encode(&format_qwen3_prompt(&req.prompt), false)
+            .map_err(|e| format!("tokenize: {e:?}"))?;
+        if token_ids.is_empty() {
+            return Err("empty prompt produced no tokens".into());
+        }
+
+        let seed = req.seed.unwrap_or_else(random_seed);
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            model = %req.model, prompt = %req.prompt, width = req.width, height = req.height,
+            steps = req.steps, seed, tokens = token_ids.len(), "ideogram4 generate start",
+        );
+        sink.note(&format!(
+            "Generating {}x{} image, {} steps, seed {} ({})",
+            req.width, req.height, req.steps, seed, req.model,
+        ));
+
+        let progress = |ev: idpipe::ProgressEvent| sink.stage(map_ideo(ev));
+        let params = IdParams::new(token_ids, req.height, req.width, req.steps, seed);
+        let residency = WeightResidency::new(source, req.budget);
+        let pipeline = {
+            let _s = tracing::info_span!("model_load").entered();
+            Ideogram4Pipeline::load(self.backend.clone(), residency, req.i8_matmul)
+                .await
+                .map_err(|e| format!("model load: {e:?}"))?
+        };
+        let png = pipeline
+            .generate(&params, None, Some(&progress))
+            .await
+            .map_err(|e| format!("generate: {e:?}"))?;
+        tokio::fs::write(&req.output, &png)
+            .await
+            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+
+        Ok(JobSummary {
+            output: req.output.clone(),
+            width: req.width,
+            height: req.height,
+            frames: 1,
+            fps: None,
+            seed: Some(seed),
+        })
+    }
+
+    /// Qwen-Image-Edit-Rapid (image->image, CFG-free 4-step). Four sources union
+    /// into one residency: DiT GGUF (Q8_0, 1:1 keys), the Qwen2.5-VL encoder GGUF
+    /// (renamed), the f16 mmproj (native keys), and the full Qwen-Image KL VAE
+    /// (safetensors, encoder+decoder). Host-side input prep (image preprocess +
+    /// edit-template tokenization) lives in [`crate::preprocess`].
+    async fn run_qwen_image_edit(
+        &self,
+        req: &ImageRequest,
+        sink: &dyn ProgressSink,
+    ) -> Result<JobSummary, String> {
+        let manifest = req.model.manifest();
+        let input_image = req
+            .input_image
+            .as_ref()
+            .ok_or("--input-image is required for qwen-image-edit-rapid")?;
+
+        // --- 4-source union: dit(1:1) + encoder(renamed) + mmproj(native) + vae ---
+        let dit = open_mmap(&resolve_role(manifest, qrole::DIT_GGUF_Q8_0)?).await?;
+        let enc = open_mmap(&resolve_role(manifest, qrole::ENCODER_GGUF_Q8_0)?).await?;
+        let mmproj = open_mmap(&resolve_role(manifest, qrole::MMPROJ_F16)?).await?;
+        let vae = open_mmap(&resolve_role(manifest, qrole::VAE)?).await?;
+        let tokenizer = load_tokenizer(&resolve_role(manifest, qrole::TOKENIZER)?).await?;
+
+        let dit_src = GgufSource::open(dit)
+            .await
+            .map_err(|e| format!("parse dit gguf: {e:?}"))?;
+        let enc_src = RenamedSource::with_passthrough(
+            GgufSource::open(enc)
+                .await
+                .map_err(|e| format!("parse encoder gguf: {e:?}"))?,
+            qwen2vl_gguf_renames(),
+        );
+        let mmproj_src = GgufSource::open(mmproj)
+            .await
+            .map_err(|e| format!("parse mmproj gguf: {e:?}"))?;
+        let vae_src = SafetensorsSource::open(vae)
+            .await
+            .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
+        let source = UnionSource::new(
+            UnionSource::new(UnionSource::new(dit_src, enc_src), mmproj_src),
+            vae_src,
+        );
+
+        // --- host-side input prep: decode source, preprocess, tokenize ---
+        let rgb = {
+            let dynimg = image::open(input_image)
+                .map_err(|e| format!("decode {}: {e}", input_image.display()))?;
+            dynimg.to_rgb8()
+        };
+        sink.note(&format!(
+            "Loaded reference {}x{}",
+            rgb.width(),
+            rgb.height()
+        ));
+        let inputs = crate::preprocess::prepare_edit_inputs(&rgb, &req.prompt, &tokenizer)?;
+
+        let seed = req.seed.unwrap_or_else(random_seed);
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            model = %req.model, prompt = %req.prompt, width = req.width, height = req.height,
+            steps = req.steps, seed, tokens = inputs.token_ids.len(),
+            image_pad_start = inputs.image_pad_start,
+            vit_grid = ?inputs.vit_grid, vae_dims = ?inputs.vae_dims,
+            "qwen-image-edit generate start",
+        );
+        sink.note(&format!(
+            "Generating {}x{} image, {} steps, seed {} ({})",
+            req.width, req.height, req.steps, seed, req.model,
+        ));
+
+        let residency = WeightResidency::new(source, req.budget);
+        let pipeline = {
+            let _s = tracing::info_span!("model_load").entered();
+            // The edit encoder even-pads the sequence (mask layout wants even
+            // s_k), so size the rope table to the next even length.
+            let max_seq = (inputs.token_ids.len() + 1) & !1;
+            QwenImagePipeline::load(
+                self.backend.clone(),
+                residency,
+                max_seq,
+                req.i8_matmul,
+                true,
+            )
+            .await
+            .map_err(|e| format!("model load: {e:?}"))?
+        };
+        let progress = |ev: qpipe::ProgressEvent| sink.stage(map_qwen(ev));
+        let rgb_out = pipeline
+            .generate_edit_rgb(
+                &inputs.token_ids,
+                inputs.image_pad_start,
+                &inputs.vit_pixels,
+                inputs.vit_grid,
+                &inputs.vae_image,
+                inputs.vae_dims,
+                req.height,
+                req.width,
+                req.steps,
+                seed,
+                Some(&progress),
+            )
+            .await
+            .map_err(|e| format!("generate: {e:?}"))?;
+        let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
+            .map_err(|e| format!("encode png: {e}"))?;
+        tokio::fs::write(&req.output, &png)
+            .await
+            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+
+        Ok(JobSummary {
+            output: req.output.clone(),
+            width: req.width,
+            height: req.height,
+            frames: 1,
+            fps: None,
+            seed: Some(seed),
+        })
+    }
+
+    /// Qwen-Image-Rapid (text->image, CFG-free 4-step). Same MMDiT as the edit
+    /// path but text-only: three sources union into one residency (DiT GGUF
+    /// Q8_0, the renamed Qwen2.5-VL encoder GGUF, the Qwen-Image KL VAE), no
+    /// mmproj / vision tower. Host-side prep is just the t2i-template tokenize
+    /// (see [`crate::preprocess::tokenize_t2i`]).
+    async fn run_qwen_image(
+        &self,
+        req: &ImageRequest,
+        sink: &dyn ProgressSink,
+    ) -> Result<JobSummary, String> {
+        let manifest = req.model.manifest();
+
+        // --- 3-source union: dit(1:1) + encoder(renamed) + vae ---
+        let dit = open_mmap(&resolve_role(manifest, qrole::DIT_GGUF_Q8_0)?).await?;
+        let enc = open_mmap(&resolve_role(manifest, qrole::ENCODER_GGUF_Q8_0)?).await?;
+        let vae = open_mmap(&resolve_role(manifest, qrole::VAE)?).await?;
+        let tokenizer = load_tokenizer(&resolve_role(manifest, qrole::TOKENIZER)?).await?;
+
+        let dit_src = GgufSource::open(dit)
+            .await
+            .map_err(|e| format!("parse dit gguf: {e:?}"))?;
+        let enc_src = RenamedSource::with_passthrough(
+            GgufSource::open(enc)
+                .await
+                .map_err(|e| format!("parse encoder gguf: {e:?}"))?,
+            qwen2vl_gguf_renames(),
+        );
+        let vae_src = SafetensorsSource::open(vae)
+            .await
+            .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
+        let source = UnionSource::new(UnionSource::new(dit_src, enc_src), vae_src);
+
+        let token_ids = crate::preprocess::tokenize_t2i(&req.prompt, &tokenizer)?;
+
+        let seed = req.seed.unwrap_or_else(random_seed);
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            model = %req.model, prompt = %req.prompt, width = req.width, height = req.height,
+            steps = req.steps, seed, tokens = token_ids.len(), "qwen-image generate start",
+        );
+        sink.note(&format!(
+            "Generating {}x{} image, {} steps, seed {} ({})",
+            req.width, req.height, req.steps, seed, req.model,
+        ));
+
+        let residency = WeightResidency::new(source, req.budget);
+        let pipeline = {
+            let _s = tracing::info_span!("model_load").entered();
+            // The encoder even-pads to the next even length; size the rope table
+            // for it (+2 headroom, matching the e2e gate).
+            let max_seq = token_ids.len() + 2;
+            QwenImagePipeline::load(
+                self.backend.clone(),
+                residency,
+                max_seq,
+                req.i8_matmul,
+                false,
+            )
+            .await
+            .map_err(|e| format!("model load: {e:?}"))?
+        };
+        let progress = |ev: qpipe::ProgressEvent| sink.stage(map_qwen(ev));
+        let rgb_out = pipeline
+            .generate_rgb(
+                &token_ids,
+                req.height,
+                req.width,
+                req.steps,
+                seed,
+                Some(&progress),
+            )
+            .await
+            .map_err(|e| format!("generate: {e:?}"))?;
+        let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
+            .map_err(|e| format!("encode png: {e}"))?;
         tokio::fs::write(&req.output, &png)
             .await
             .map_err(|e| format!("write {}: {e}", req.output.display()))?;
@@ -360,6 +685,22 @@ fn map_z(ev: zpipe::ProgressEvent) -> Stage {
         zpipe::ProgressEvent::TextEncode => Stage::TextEncode,
         zpipe::ProgressEvent::Step { i, n } => Stage::Step { i, n },
         zpipe::ProgressEvent::VaeDecode => Stage::VaeDecode,
+    }
+}
+
+fn map_qwen(ev: qpipe::ProgressEvent) -> Stage {
+    match ev {
+        qpipe::ProgressEvent::TextEncode => Stage::TextEncode,
+        qpipe::ProgressEvent::Step { i, n } => Stage::Step { i, n },
+        qpipe::ProgressEvent::VaeDecode => Stage::VaeDecode,
+    }
+}
+
+fn map_ideo(ev: idpipe::ProgressEvent) -> Stage {
+    match ev {
+        idpipe::ProgressEvent::TextEncode => Stage::TextEncode,
+        idpipe::ProgressEvent::Step { i, n } => Stage::Step { i, n },
+        idpipe::ProgressEvent::VaeDecode => Stage::VaeDecode,
     }
 }
 

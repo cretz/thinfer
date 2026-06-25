@@ -196,6 +196,7 @@ async fn qwen3_parity() {
     };
     let cfgs = BlockWgslConfigs {
         matmul_qkv: matmul,
+        matmul_qkv_self: matmul,
         matmul_proj: matmul,
         matmul_ffn_up: matmul,
         // Mirrors pipeline.rs encoder_cfgs: ffn_down weights stay bf16
@@ -205,6 +206,7 @@ async fn qwen3_parity() {
         ops,
         i8_sdpa: false,
         dense_acts: DenseActSites::default(),
+        large_d_sdpa: false,
     };
     eprintln!("qwen3-parity: act_dtype={act:?}");
     let pipelines = BlockPipelines::compile(&backend, &cfgs)

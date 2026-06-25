@@ -1567,6 +1567,7 @@ fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype, ovr: SiteOverride) -> Bl
         ops,
         i8_sdpa: false,
         dense_acts: DenseActSites::default(),
+        large_d_sdpa: false,
     }
 }
 

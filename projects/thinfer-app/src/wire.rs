@@ -54,6 +54,13 @@ pub struct ImageSpec {
     pub height: Option<u32>,
     pub steps: Option<u32>,
     pub seed: Option<u64>,
+    /// DP4A i8 matmul on the DP4A-safe DiT sites (Ideogram-4 only). Default true.
+    pub i8_matmul: Option<bool>,
+    /// Base64-encoded reference image bytes (PNG/JPEG). REQUIRED for
+    /// qwen-image-edit, ignored otherwise. The server decodes it to a temp file
+    /// under the job dir and feeds it to the image-edit path.
+    #[serde(default)]
+    pub input_image: Option<String>,
     /// Base64 SPKI RSA-OAEP public key. When present, the server encrypts the
     /// result so only the holder of the matching private key can read it; absent
     /// = plaintext. See [`crate::wire`] / `thinfer-serve` crypto.

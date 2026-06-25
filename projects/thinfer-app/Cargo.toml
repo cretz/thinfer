@@ -49,3 +49,7 @@ serve = ["serde", "dep:utoipa"]
 # The HTTP `RemoteExecutor` client (thinfer-cli --remote). Pulls reqwest; other
 # app consumers (serve) stay free of it.
 remote = ["serde", "dep:serde_json", "dep:reqwest", "dep:futures-util"]
+# Opt-in Qwen-Image-Edit host PREPROCESS parity test (real PNG -> ViT/VAE/tokens
+# vs the HF/diffusers reference via `uv run`). Touches the HF cache for the
+# tokenizer/preprocessor; skips cleanly when uncached.
+preprocess-parity = []

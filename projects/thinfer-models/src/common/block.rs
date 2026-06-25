@@ -23,8 +23,8 @@ use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
     BcastFmaOp, BcastModulateF32, BcastModulateOp, BcastMulF32, LayerNormF32, LayerNormOp,
     MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, QkvSplitF32, QkvSplitOp, RmsNormF32, RmsNormOp,
-    RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaOp, SiluF32,
-    SiluMulF32, TanhF32, WeightDtype, WgslConfig,
+    RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaF32LargeD,
+    SdpaOp, SiluF32, SiluMulF32, TanhF32, WeightDtype, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace;
@@ -43,6 +43,10 @@ pub struct BlockConfig {
     pub norm_eps: f32,
     pub adaln_embed_dim: usize,
     pub modulation: bool,
+    /// RoPE convention for q/k. `false` (default) drives the interleaved-pair
+    /// `op_rope` (Z-Image / Wan). `true` drives the half-rot `op_rope_halfrot`
+    /// (HF `(k, k+D/2)` pairing) used by Ideogram-4's MRoPE and Qwen3.
+    pub rope_halfrot: bool,
 }
 
 impl BlockConfig {
@@ -261,6 +265,9 @@ pub struct BlockPipelines {
     /// Lane-cluster width (CL) baked into the `sdpa_sg` kernel: 8 when the
     /// adapter's subgroup min size >= 8, else 4. Sets BR = WG/CL at dispatch.
     pub sdpa_sg_cl: u32,
+    /// Large-D SDPA (`SdpaF32LargeD`, one workgroup per Q row). `Some` iff
+    /// `BlockWgslConfigs::large_d_sdpa`; dispatch routes `head_dim > 128` here.
+    pub sdpa_large_d: Option<WgpuPipeline>,
     pub qkv_split: WgpuPipeline,
     pub silu: WgpuPipeline,
     pub silu_mul: WgpuPipeline,
@@ -315,6 +322,12 @@ pub struct BlockWgslConfigs {
     pub i8_sdpa: bool,
     /// Per-site opt-out of the i8 activation path (see [`DenseActSites`]).
     pub dense_acts: DenseActSites,
+    /// Compile the large-D SDPA kernel (`SdpaF32LargeD`, one workgroup per Q
+    /// row, D split across threads) so a block with `head_dim > 128` (e.g.
+    /// Ideogram-4's 256) has a real attention path instead of overrunning the
+    /// `SdpaF32` `MAX_D=128` shared tile. Only F32/F16 acts (the kernel has no
+    /// bf16-packed variant); leave `false` for `head_dim <= 128`.
+    pub large_d_sdpa: bool,
 }
 
 /// Per-site DP4A opt-out: a site set here keeps its A-side dense at the
@@ -347,6 +360,7 @@ impl BlockWgslConfigs {
             ops: cfg,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            large_d_sdpa: false,
         }
     }
 
@@ -385,6 +399,12 @@ impl BlockWgslConfigs {
                 a,
                 ActDtype::F16,
                 "BlockWgslConfigs: i8_sdpa requires F16 ops (sdpa_i8 reads/writes f16-scaled pairs)"
+            );
+        }
+        if self.large_d_sdpa {
+            assert!(
+                matches!(a, ActDtype::F32 | ActDtype::F16),
+                "BlockWgslConfigs: large_d_sdpa supports only F32/F16 acts (no bf16-packed variant)"
             );
         }
     }
@@ -785,6 +805,20 @@ impl BlockPipelines {
                 None
             },
             sdpa_sg_cl,
+            sdpa_large_d: if cfgs.large_d_sdpa {
+                Some(
+                    backend
+                        .create_pipeline(
+                            "sdpa_large_d",
+                            <SdpaF32LargeD as SdpaOp>::wgsl(cfg_compat),
+                            "main",
+                            <SdpaF32LargeD as SdpaOp>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
             qkv_split: backend
                 .create_pipeline(
                     "qkv_split",
@@ -1211,7 +1245,11 @@ impl Block {
 
             let qr = alloc_act(scope, pipelines, rows, hq * hd)?;
             let kr = alloc_act(scope, pipelines, rows, hkv * hd)?;
-            op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+            if cfg.rope_halfrot {
+                op_rope_halfrot(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+            } else {
+                op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+            }
             copy_tap_act(
                 scope,
                 pipelines,
@@ -1220,7 +1258,11 @@ impl Block {
                 rows,
                 hq * hd,
             )?;
-            op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+            if cfg.rope_halfrot {
+                op_rope_halfrot(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+            } else {
+                op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+            }
             copy_tap_act(
                 scope,
                 pipelines,
@@ -1778,7 +1820,11 @@ impl Block {
 
                 let qr = alloc_act(scope, pipelines, rows, hq * hd)?;
                 let kr = alloc_act(scope, pipelines, rows, hkv * hd)?;
-                op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+                if cfg.rope_halfrot {
+                    op_rope_halfrot(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+                } else {
+                    op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+                }
                 copy_tap_act(
                     scope,
                     pipelines,
@@ -1787,7 +1833,11 @@ impl Block {
                     rows,
                     hq * hd,
                 )?;
-                op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+                if cfg.rope_halfrot {
+                    op_rope_halfrot(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+                } else {
+                    op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+                }
                 copy_tap_act(
                     scope,
                     pipelines,
@@ -2616,7 +2666,7 @@ fn op_qkv_split<'wsp>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn op_rope<'wsp>(
+pub(crate) fn op_rope<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     src: ActBuf<'wsp>,
@@ -2697,6 +2747,19 @@ pub(crate) fn op_sdpa<'wsp>(
         let o_fused = scope.fuse_pair(dd, ds);
         scope.sdpa_i8(
             sdpa_i8, q_fused, k_fused, v_fused, mask, o_fused, u, b, s_q, h_q, head_dim,
+        )
+    } else if let Some(sdpa_large_d) = pipelines.sdpa_large_d.as_ref().filter(|_| head_dim > 128) {
+        scope.sdpa::<SdpaF32LargeD>(
+            sdpa_large_d,
+            q.data,
+            k.data,
+            v.data,
+            mask,
+            u,
+            dst.data,
+            b,
+            s_q,
+            h_q,
         )
     } else if let Some(sdpa_sg) = pipelines
         .sdpa_sg
@@ -2946,7 +3009,7 @@ fn rmsnorm_uniform<'wsp>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sdpa_uniform<'wsp>(
+pub(crate) fn sdpa_uniform<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     b: u32,
     h_q: u32,

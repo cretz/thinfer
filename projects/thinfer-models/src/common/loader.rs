@@ -114,9 +114,11 @@ pub(crate) fn register_linear_transcode<S: WeightSource>(
         encoding: None,
         label: entry.encoding_label.clone(),
     })?;
-    // Linear weight tensors: bf16 (transposed to [K, N]; or requantized to
-    // the GGUF block layout when `transcode` is set) or GGUF quant (already
-    // block-major [N, K], no transpose). fp16/i8/i4 not supported here yet.
+    // Linear weight tensors: bf16/f16/f32 (transposed to [K, N]; or requantized
+    // to the GGUF block layout when `transcode` is set) or GGUF quant (already
+    // block-major [N, K], no transpose). F16 is the GGUF VAE/DiT
+    // sensitive-tensor dtype (img_in/proj_out/time_embed); it narrows to bf16 on
+    // upload (residency `read_for_gpu` F16 arm). i8/i4 not supported here yet.
     let (encoding, transpose, transcode) = match encoding {
         StorageEncoding::Bf16 if transcode.is_some() => {
             // Quant block layout is [N, K] N-major: keep the file's row
@@ -129,7 +131,9 @@ pub(crate) fn register_linear_transcode<S: WeightSource>(
             );
             (encoding, TransposePolicy::None, transcode)
         }
-        StorageEncoding::Bf16 | StorageEncoding::F32 => (encoding, TransposePolicy::Linear2D, None),
+        StorageEncoding::Bf16 | StorageEncoding::F32 | StorageEncoding::F16 => {
+            (encoding, TransposePolicy::Linear2D, None)
+        }
         StorageEncoding::Quant(_) => (encoding, TransposePolicy::None, None),
         _ => {
             return Err(LoadError::Undecodable {

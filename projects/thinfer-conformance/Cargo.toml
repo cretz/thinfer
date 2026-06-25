@@ -38,6 +38,12 @@ zimage-e2e = []
 # Opt-in SkyReels-V2 (Wan) video end-to-end parity test. Same discipline as
 # zimage-e2e: touches the local HF cache, skips cleanly when uncached.
 wan-e2e = []
+# Opt-in Ideogram-4 parity tests (encoder, DiT, VAE, e2e). Same discipline:
+# touches the local HF cache (GGUFs), skips cleanly when uncached.
+ideogram4-e2e = []
+# Opt-in Qwen-Image-Edit-Rapid-AIO parity tests (VAE, encoder, DiT, e2e). Same
+# discipline: touches the local HF cache (GGUFs), skips cleanly when uncached.
+qwen-image-e2e = []
 # Opt-in face-swap ONNX executor parity + pipeline e2e. Resolves the FaceFusion
 # ONNX models from the HF cache; compares the thinfer ONNX executor against
 # onnxruntime goldens. Skips cleanly when goldens/models are absent.

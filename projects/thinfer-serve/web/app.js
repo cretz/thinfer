@@ -21,9 +21,13 @@ const log = (line) => {
 };
 
 const MODELS = {
-  image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16"],
+  image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid"],
   video: ["fastwan-ti2v-5b", "longlive-2.0-5b"],
 };
+// Image models that edit a reference image instead of pure text-to-image: they
+// REQUIRE an uploaded input image (mirrors the server's QwenImageEdit kind).
+const EDIT_MODELS = new Set(["qwen-image-edit-rapid"]);
+const isEditModel = (model) => EDIT_MODELS.has(model);
 // Size presets per kind. First entry is the default. Hand-typed dims are still
 // allowed and flip the dropdown to "Custom". Dim rules differ by kind: image
 // (Z-Image VAE) needs /16, video (Wan2.2 16x16x4 VAE + patch 2) needs /32 --
@@ -61,6 +65,14 @@ const STEPS = {
   image: { value: 8, min: 1, max: "" },
   video: { value: 4, min: 1, max: 8 },
 };
+// Per-model steps default, mirroring the server's `ModelId::defaults()`. Models
+// not listed fall back to the kind default above. The 4-step distilled image
+// models (ideogram4, qwen-edit) differ from Z-Image Turbo's 8.
+const MODEL_STEPS = {
+  "ideogram4-q8": 4,
+  "qwen-image-rapid": 4,
+  "qwen-image-edit-rapid": 4,
+};
 
 const subtle = globalThis.crypto?.subtle;
 const SECURE = Boolean(subtle);
@@ -71,6 +83,16 @@ if (!SECURE) {
 // --- base64 <-> bytes ---------------------------------------------------------
 const bytesToBase64 = (bytes) => btoa(String.fromCharCode(...bytes));
 const base64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
+// Read a picked File as raw base64 (FileReader yields a `data:...;base64,XXXX`
+// data URL; strip the prefix to leave just the payload the server decodes).
+const fileToBase64 = (file) =>
+  new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onerror = () => reject(new Error("could not read the selected image"));
+    r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ""));
+    r.readAsDataURL(file);
+  });
 
 // --- token persistence (this browser only) ------------------------------------
 const TOKEN_KEY = "thinfer_token";
@@ -164,8 +186,22 @@ function applyKind() {
   $("steps").value = st.value;
   $("steps").min = st.min;
   $("steps").max = st.max;
+  applyModel();
 }
 $("kind").addEventListener("change", applyKind);
+
+// Show the reference-image picker only for edit models (qwen-image-edit). It is
+// required there and ignored otherwise, so hide it for plain text-to-image.
+function applyModel() {
+  const model = $("model").value;
+  const edit = $("kind").value === "image" && isEditModel(model);
+  $("input-image-row").hidden = !edit;
+  $("input-image").required = edit;
+  // Steps default is per-model (mirrors the server): the 4-step distilled image
+  // models start at 4, everything else at the kind default. User can override.
+  $("steps").value = MODEL_STEPS[model] ?? STEPS[$("kind").value].value;
+}
+$("model").addEventListener("change", applyModel);
 
 // Picking a preset fills the dims; typing dims that match no preset flips the
 // dropdown to "Custom" (hand-typed dims are always honored).
@@ -200,14 +236,14 @@ const floatOrNull = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-function buildSpec() {
+async function buildSpec() {
   const kind = $("kind").value;
   const seed = intOrNull($("seed").value);
   const width = intOrNull($("width").value);
   const height = intOrNull($("height").value);
   const model = $("model").value;
   if (kind === "image") {
-    return {
+    const spec = {
       kind: "image",
       model,
       prompt: $("prompt").value,
@@ -216,6 +252,14 @@ function buildSpec() {
       steps: intOrNull($("steps").value),
       seed,
     };
+    // Edit models (qwen-image-edit) consume a reference image; encode the
+    // picked file as base64 (camelCase `inputImage` matches the wire schema).
+    if (isEditModel(model)) {
+      const file = $("input-image").files[0];
+      if (!file) throw new Error(`${model} requires a reference image; choose one first`);
+      spec.inputImage = await fileToBase64(file);
+    }
+    return spec;
   }
   // Video: each non-empty line of the prompt box is one shot (multi-shot is
   // LongLive only; the server validates).
@@ -388,7 +432,7 @@ async function generate() {
   setStatus("Submitting…");
   try {
     const keypair = await ensureKeypair();
-    const spec = buildSpec();
+    const spec = await buildSpec();
     if (keypair) spec.publicKey = keypair.publicKeyB64;
     const resp = await fetch("jobs", {
       method: "POST",

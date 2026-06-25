@@ -33,6 +33,13 @@
         <label for="prompt" id="prompt-label">Prompt</label>
         <textarea id="prompt" rows="3" required>a corgi wearing a tiny wizard hat, studio photo</textarea>
 
+        <!-- Reference image for edit models (qwen-image-edit). app.js shows this
+             row only when an edit model is selected and requires a file then. -->
+        <div id="input-image-row" hidden>
+          <label for="input-image">Reference image</label>
+          <input id="input-image" type="file" accept="image/png,image/jpeg" />
+        </div>
+
         <label for="preset">Size</label>
         <select id="preset"></select>
 

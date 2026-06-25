@@ -48,6 +48,24 @@ fn spec_into_request(
         JobSpec::Image(s) => {
             let model = s.model.unwrap_or(ImageModelId::DEFAULT);
             let d = model.defaults();
+            // Image-edit reference image: base64-decode and stash under the job
+            // dir so the edit path reads it like a CLI --input-image. The dir
+            // must exist first. `ImageRequest::validate` enforces the
+            // present/required-by-kind rules (400 on mismatch).
+            let input_image = match s.input_image {
+                Some(b64) => {
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64.as_bytes())
+                        .map_err(|e| format!("input_image is not valid base64: {e}"))?;
+                    make_dir()?;
+                    let path = dir.join("input_image");
+                    std::fs::write(&path, &bytes)
+                        .map_err(|e| format!("write {}: {e}", path.display()))?;
+                    Some(path)
+                }
+                None => None,
+            };
             let req = ImageRequest {
                 model,
                 prompt: s.prompt,
@@ -55,6 +73,8 @@ fn spec_into_request(
                 height: s.height.unwrap_or(d.height),
                 steps: s.steps.unwrap_or(d.steps),
                 seed: s.seed,
+                i8_matmul: s.i8_matmul.unwrap_or(true),
+                input_image,
                 budget,
                 output: dir.join("output.png"),
                 format: ImageFormat::Png,

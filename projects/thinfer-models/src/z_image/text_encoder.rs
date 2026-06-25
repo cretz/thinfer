@@ -158,13 +158,25 @@ pub async fn embed_lookup<S: WeightSource>(
     source: &S,
     token_ids: &[u32],
 ) -> Result<Vec<f32>, EmbedLookupError> {
+    embed_lookup_hidden(source, token_ids, config::HIDDEN).await
+}
+
+/// As [`embed_lookup`], but for an arbitrary hidden width. Lets the Qwen3-VL-8B
+/// encoder (HIDDEN=4096) share the row-gather path with Z-Image's 4B encoder
+/// (HIDDEN=2560) without a second copy. The full `[VOCAB, hidden]` table is
+/// never paged in whole; only the prompt's rows are read + decoded.
+pub async fn embed_lookup_hidden<S: WeightSource>(
+    source: &S,
+    token_ids: &[u32],
+    hidden: usize,
+) -> Result<Vec<f32>, EmbedLookupError> {
     let id = WeightId("model.embed_tokens.weight".into());
     let entry = source
         .catalog()
         .get(&id)
         .ok_or(EmbedLookupError::MissingTable)?;
     let shape = &entry.shape.0;
-    if shape.len() != 2 || shape[1] != config::HIDDEN {
+    if shape.len() != 2 || shape[1] != hidden {
         return Err(EmbedLookupError::BadShape(shape.clone()));
     }
     let vocab = shape[0];
@@ -177,7 +189,7 @@ pub async fn embed_lookup<S: WeightSource>(
     let quant = match encoding {
         StorageEncoding::Bf16 | StorageEncoding::F32 => None,
         StorageEncoding::Quant(k) => {
-            if !config::HIDDEN.is_multiple_of(k.block_size() as usize) {
+            if !hidden.is_multiple_of(k.block_size() as usize) {
                 return Err(EmbedLookupError::Undecodable(encoding));
             }
             Some(k)
@@ -185,18 +197,18 @@ pub async fn embed_lookup<S: WeightSource>(
         enc => return Err(EmbedLookupError::Undecodable(enc)),
     };
     let row_src_bytes: u64 = match (encoding, quant) {
-        (_, Some(k)) => k.bytes_for_elements(config::HIDDEN as u64),
-        (StorageEncoding::Bf16, _) => (config::HIDDEN as u64) * 2,
-        _ => (config::HIDDEN as u64) * 4,
+        (_, Some(k)) => k.bytes_for_elements(hidden as u64),
+        (StorageEncoding::Bf16, _) => (hidden as u64) * 2,
+        _ => (hidden as u64) * 4,
     };
 
     let mut reader = source
         .open(&id)
         .await
         .map_err(|e| EmbedLookupError::Source(format!("{e:?}")))?;
-    let mut out = vec![0f32; token_ids.len() * config::HIDDEN];
+    let mut out = vec![0f32; token_ids.len() * hidden];
     let mut row_src = vec![0u8; row_src_bytes as usize];
-    let row_dst_bytes = config::HIDDEN * 4;
+    let row_dst_bytes = hidden * 4;
     for (i, &tok) in token_ids.iter().enumerate() {
         if (tok as usize) >= vocab {
             return Err(EmbedLookupError::TokenOutOfRange { id: tok, vocab });
@@ -208,7 +220,7 @@ pub async fn embed_lookup<S: WeightSource>(
             .map_err(|e| EmbedLookupError::Reader(format!("{e:?}")))?;
         let dst_byte_off = i * row_dst_bytes;
         if let Some(k) = quant {
-            let dst = &mut out[i * config::HIDDEN..(i + 1) * config::HIDDEN];
+            let dst = &mut out[i * hidden..(i + 1) * hidden];
             thinfer_core::quant::dequantize_row(k, &row_src, dst);
             continue;
         }
@@ -300,7 +312,7 @@ pub fn register_qwen3_handles<S: WeightSource>(
     Ok(Qwen3Handles { layers })
 }
 
-fn register_one<S: WeightSource>(
+pub(crate) fn register_one<S: WeightSource>(
     residency: &WeightResidency<S>,
     id: &WeightId,
     transpose: TransposePolicy,
