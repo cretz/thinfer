@@ -6,10 +6,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
-use thinfer_app::model::{
-    VIDEO_DEFAULT_HEIGHT, VIDEO_DEFAULT_STEPS, VIDEO_DEFAULT_WIDTH, VaeChoice, VideoModelId,
-    VideoSampler,
-};
+use thinfer_app::model::{EncoderQuant, VIDEO_DEFAULT_STEPS, VaeChoice, VideoModelId, VideoSampler};
 use thinfer_app::request::{VideoFormat, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
@@ -35,12 +32,14 @@ pub struct GenerateVideo {
     /// Output format. Defaults to inferring from the `--output` extension.
     #[arg(long, value_enum)]
     pub output_format: Option<VideoFormat>,
-    /// Frame width in pixels. Must be divisible by 32.
-    #[arg(long, default_value_t = VIDEO_DEFAULT_WIDTH)]
-    pub width: u32,
-    /// Frame height in pixels. Must be divisible by 32.
-    #[arg(long, default_value_t = VIDEO_DEFAULT_HEIGHT)]
-    pub height: u32,
+    /// Frame width in pixels. Defaults per model (FastWan/LongLive 960, LTX
+    /// 256). FastWan/LongLive need a multiple of 32; LTX a multiple of 64.
+    #[arg(long)]
+    pub width: Option<u32>,
+    /// Frame height in pixels. Defaults per model (FastWan/LongLive 544, LTX
+    /// 256). FastWan/LongLive need a multiple of 32; LTX a multiple of 64.
+    #[arg(long)]
+    pub height: Option<u32>,
     /// Output frame count. Must be `4 * k + 1`; LongLive additionally needs
     /// `(frames-1)/4+1` divisible by 8 (29, 61, 93, ...). Mutually exclusive
     /// with `--duration`. One value splits a multi-shot clip evenly; one per
@@ -81,10 +80,24 @@ pub struct GenerateVideo {
     /// near-identical quality. `full` is the bit-clean parity path.
     #[arg(long, value_enum, default_value_t = VaeChoice::Tiny)]
     pub vae: VaeChoice,
+    /// LTX-2.3 text encoder (all LTX/Sulphur models). `q8` (default) is the
+    /// conditioning-quality baseline; `q4` is Q4_K_M -- ~2.8x faster encode
+    /// (~16s -> ~6s) for lower-precision conditioning. Ignored by Wan.
+    #[arg(long, value_enum, default_value_t = EncoderQuant::Q8)]
+    pub encoder: EncoderQuant,
     /// Disable the default DP4A int8 matmul on the quantization-safe DiT sites
     /// (forces the bf16 reference path throughout).
     #[arg(long)]
     pub no_i8_matmul: bool,
+    /// Skip the audio track (LTX joint-AV only): decode video only, for a faster
+    /// silent MP4. Ignored by the silent Wan models.
+    #[arg(long)]
+    pub no_audio: bool,
+    /// LTX-2.3 distilled only: opt in to the 2x spatial-upscale refine path
+    /// (half-res denoise -> latent upscale -> refine), the cheaper route to high
+    /// res. Default off = single-stage denoise at the target res. Ignored by Wan.
+    #[arg(long)]
+    pub upscale: bool,
     #[command(flatten)]
     pub remote: super::RemoteArgs,
 }
@@ -104,8 +117,8 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         let spec = JobSpec::Video(VideoSpec {
             model: Some(args.model),
             prompts: args.prompt,
-            width: Some(args.width),
-            height: Some(args.height),
+            width: args.width,
+            height: args.height,
             frames: (!args.frames.is_empty()).then_some(args.frames),
             durations: (!args.duration.is_empty()).then_some(args.duration),
             fps: args.fps,
@@ -113,7 +126,10 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             sampler: Some(args.sampler),
             steps: Some(args.steps),
             vae: Some(args.vae),
+            encoder: Some(args.encoder),
             i8_matmul: Some(!args.no_i8_matmul),
+            audio: Some(!args.no_audio),
+            upscale: Some(args.upscale || args.model.two_stage_default()),
             public_key: None,
         });
         return super::run_remote(&args.remote, spec, args.output).await;
@@ -121,11 +137,12 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     let ram = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
     let vram = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
 
+    let (def_w, def_h) = args.model.video_defaults();
     let req = VideoRequest {
         model: args.model,
         prompts: args.prompt,
-        width: args.width,
-        height: args.height,
+        width: args.width.unwrap_or(def_w),
+        height: args.height.unwrap_or(def_h),
         frames: args.frames,
         durations: args.duration,
         fps: args.fps,
@@ -134,7 +151,13 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         sampler: args.sampler,
         steps: args.steps,
         vae: args.vae,
+        encoder: args.encoder,
         i8_matmul: !args.no_i8_matmul,
+        audio: !args.no_audio,
+        // LTX defaults to two-stage (single-stage at the widescreen default OOMs
+        // 8GB and low-res single-stage is OOD); `--upscale` is store-true, so OR
+        // with the model default. Wan ignores upscale.
+        upscale: args.upscale || args.model.two_stage_default(),
         budget: ResidencyBudget {
             ram_bytes: ram,
             vram_bytes: vram,

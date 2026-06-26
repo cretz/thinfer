@@ -41,10 +41,21 @@ fn main() -> ExitCode {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    if let Some(path) = flag(&args, "--emit-openapi") {
-        return emit_openapi(&path);
-    }
-    let config_path = flag(&args, "--config");
+    let cli = match parse_args(&args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("error: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let config_path = match cli {
+        Cli::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Cli::EmitOpenapi { path } => return emit_openapi(&path),
+        Cli::Serve { config } => config,
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -59,11 +70,52 @@ fn main() -> ExitCode {
     }
 }
 
-/// Value following `name` in the args, if present.
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1).cloned())
+const USAGE: &str = "\
+Usage:
+  thinfer-serve [--config <path.toml>]      run the server (default: built-in config)
+  thinfer-serve --emit-openapi <path.json>  write the OpenAPI doc and exit
+  thinfer-serve --help                      show this help";
+
+/// Parsed command line. Unknown / positional args are rejected (not silently
+/// dropped) so a misplaced config path can't boot the server with defaults.
+enum Cli {
+    Serve { config: Option<String> },
+    EmitOpenapi { path: String },
+    Help,
+}
+
+fn parse_args(args: &[String]) -> Result<Cli, String> {
+    let mut config = None;
+    let mut emit = None;
+    let mut i = 1; // skip argv[0]
+    // Consume the value following the flag at `i`, erroring if absent.
+    let value_after = |i: usize, label: &str| -> Result<String, String> {
+        args.get(i + 1)
+            .cloned()
+            .ok_or_else(|| format!("{label} requires a value"))
+    };
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => return Ok(Cli::Help),
+            "--config" => {
+                config = Some(value_after(i, "--config")?);
+                i += 2;
+            }
+            "--emit-openapi" => {
+                emit = Some(value_after(i, "--emit-openapi")?);
+                i += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument: {other:?} (the config path must follow --config)"
+                ));
+            }
+        }
+    }
+    if let Some(path) = emit {
+        return Ok(Cli::EmitOpenapi { path });
+    }
+    Ok(Cli::Serve { config })
 }
 
 fn emit_openapi(path: &str) -> ExitCode {
@@ -88,6 +140,10 @@ fn emit_openapi(path: &str) -> ExitCode {
 }
 
 async fn serve(config_path: Option<String>) -> Result<(), String> {
+    match &config_path {
+        Some(p) => tracing::info!(config = %p, "loading serve config"),
+        None => tracing::info!("no --config; using built-in defaults (HTTP, no TLS)"),
+    }
     let config = ServeConfig::load(config_path.as_deref().map(std::path::Path::new))?;
     std::fs::create_dir_all(&config.artifact_dir)
         .map_err(|e| format!("create {}: {e}", config.artifact_dir.display()))?;

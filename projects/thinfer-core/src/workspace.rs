@@ -137,6 +137,13 @@ pub struct Workspace<B: Backend> {
     /// runs. [`MemArbiter::unlimited`] disables the gate (unit tests that
     /// don't care about VRAM accounting).
     arbiter: Arc<MemArbiter>,
+    /// Strict (hard-ceiling) budget mode. When set, a pool-miss alloc that the
+    /// arbiter can't fit under the budget (reclaim ran dry) FAILS with
+    /// `budget_oom_error` instead of overshooting into `backend.allocate` (a
+    /// real device OOM). Default off (soft budget = overshoot + trace). The LTX
+    /// VAE turns it on so its adaptive tiler shrinks at the budget boundary
+    /// rather than after a device OOM (which can poison a long-lived device).
+    strict: std::sync::atomic::AtomicBool,
 }
 
 impl<B: Backend> Workspace<B> {
@@ -158,7 +165,16 @@ impl<B: Backend> Workspace<B> {
             backend,
             inner,
             arbiter,
+            strict: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Enable/disable strict (hard-ceiling) budget allocation. See the `strict`
+    /// field. Idempotent; cheap interior mutability so callers holding `&self`
+    /// (e.g. inside `decode`) can scope it.
+    pub fn set_strict_budget(&self, strict: bool) {
+        self.strict
+            .store(strict, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Current sum of idle pool bytes. Cheap. Used by dispatch-layer
@@ -199,12 +215,22 @@ impl<B: Backend> Workspace<B> {
             None => {
                 // Pool miss → about to grow VRAM. The arbiter reclaims
                 // (idle pool entries, then evictable weights) until the new
-                // class fits under the budget. If even the full chain can't
-                // make room, `backend.allocate` overshoots and the test
-                // budget assert surfaces the true working-set overrun rather
-                // than us silently failing.
-                self.arbiter
-                    .ensure_headroom(self.backend.mem_account(), class);
+                // class fits under the budget. In SOFT mode, if even the full
+                // chain can't make room, `backend.allocate` overshoots and the
+                // test budget assert surfaces the true working-set overrun. In
+                // STRICT mode, a dry reclaim FAILS here (budget = hard ceiling)
+                // so the caller shrinks + retries before any device OOM.
+                if self.strict.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !self
+                        .arbiter
+                        .reclaim_until_fits(self.backend.mem_account(), class)
+                    {
+                        return Err(self.backend.budget_oom_error(class));
+                    }
+                } else {
+                    self.arbiter
+                        .ensure_headroom(self.backend.mem_account(), class);
+                }
                 let id = self.backend.allocate(class)?;
                 (
                     OwnedBuffer {
@@ -1436,6 +1462,201 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    pub fn pixel_norm3d<O: crate::ops::PixelNorm3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_pos: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::PixelNorm3dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_pixel_norm3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_pos,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d<O: crate::ops::Conv1dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let bias = self.resolve(bias);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::Conv1dBufs {
+            x: &x,
+            w: &w,
+            bias: &bias,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_conv1d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d<O: crate::ops::ConvTranspose1dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let bias = self.resolve(bias);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ConvTranspose1dBufs {
+            x: &x,
+            w: &w,
+            bias: &bias,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_conv_transpose1d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
+    pub fn scale<O: crate::ops::ScaleOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ScaleBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_scale::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n,
+        )
+    }
+
+    pub fn replicate_pad1d<O: crate::ops::ReplicatePad1dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ReplicatePad1dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_replicate_pad1d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
+    pub fn snake_beta<O: crate::ops::SnakeBetaOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        alpha: BatchBuf<'wsp>,
+        beta: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let alpha = self.resolve(alpha);
+        let beta = self.resolve(beta);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::SnakeBetaBufs {
+            x: &x,
+            alpha: &alpha,
+            beta: &beta,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_snake_beta::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n,
+        )
+    }
+
+    pub fn depth_to_space3d<O: crate::ops::DepthToSpace3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::DepthToSpace3dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_depth_to_space3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
     pub fn concat_time<O: crate::ops::ConcatTimeOp>(
         &self,
         pipeline: &B::Pipeline,
@@ -2016,6 +2237,7 @@ mod tests {
             self.allocated.lock().unwrap().insert(id);
             Ok(id)
         }
+        fn budget_oom_error(&self, _bytes: u64) {}
         fn free(&self, id: GpuBufferId) {
             self.allocated.lock().unwrap().remove(&id);
         }

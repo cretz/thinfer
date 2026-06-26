@@ -19,11 +19,15 @@ pub mod bcast_mul;
 pub mod bf16_block_sum;
 pub mod cast_act;
 pub mod concat_time;
+pub mod conv1d;
 pub mod conv2d;
 pub mod conv3d;
+pub mod conv_transpose1d;
+pub mod depth_to_space3d;
 pub mod dequant;
 pub mod dequant_i8;
 pub mod dupup3d;
+pub mod gated_head_mul;
 pub mod gelu;
 pub mod gelu_mul;
 pub mod group_norm;
@@ -33,17 +37,21 @@ pub mod matmul_i8;
 pub mod matmul_i8_bf16;
 pub mod memcat;
 pub mod mul;
+pub mod pixel_norm3d;
 pub mod qkv_split;
 pub mod relpos_bias;
 pub mod relu;
+pub mod replicate_pad1d;
 pub mod rmsnorm;
 pub mod rmsnorm3d;
 pub mod rope;
+pub mod scale;
 pub mod scatter_pad_rows;
 pub mod sdpa;
 pub mod sdpa_i8;
 pub mod silu;
 pub mod silu_mul;
+pub mod snake_beta;
 pub mod softmax;
 pub mod tanh;
 pub mod transpose12;
@@ -63,13 +71,22 @@ pub use bcast_mul::BcastMulF32;
 pub use cast_act::{Bf16ToF16, F16ToBf16};
 pub(crate) use concat_time::dispatch_concat_time;
 pub use concat_time::{ConcatTimeBufs, ConcatTimeF32, ConcatTimeOp};
+pub(crate) use conv_transpose1d::dispatch_conv_transpose1d;
+pub use conv_transpose1d::{
+    ConvTranspose1dBufs, ConvTranspose1dF32, ConvTranspose1dOp, conv_transpose1d_lout,
+};
+pub(crate) use conv1d::dispatch_conv1d;
+pub use conv1d::{Conv1dBufs, Conv1dF32, Conv1dOp, conv1d_lout, conv1d_uniform_bytes};
 pub(crate) use conv2d::dispatch_conv2d;
 pub use conv2d::{Conv2dBufs, Conv2dConfig, Conv2dF32, Conv2dOp};
 pub(crate) use conv3d::dispatch_conv3d;
 pub use conv3d::{Conv3dBufs, Conv3dConfig, Conv3dF32, Conv3dOp};
+pub(crate) use depth_to_space3d::dispatch_depth_to_space3d;
+pub use depth_to_space3d::{DepthToSpace3dBufs, DepthToSpace3dF32, DepthToSpace3dOp};
 pub use dequant::{DequantBufs, dispatch_dequant};
 pub(crate) use dupup3d::dispatch_dupup3d;
 pub use dupup3d::{DupUp3dBufs, DupUp3dF32, DupUp3dOp};
+pub use gated_head_mul::GatedHeadMulF32;
 pub use gelu::GeluF32;
 pub use gelu_mul::GeluMulF32;
 pub(crate) use group_norm::dispatch_group_norm;
@@ -80,6 +97,8 @@ pub use matmul::{MatMulConfig, MatMulF32, MatmulBufs, MatmulOp, dispatch_matmul}
 pub(crate) use memcat::dispatch_memcat;
 pub use memcat::{MemCatBufs, MemCatF32, MemCatOp};
 pub use mul::MulF32;
+pub(crate) use pixel_norm3d::dispatch_pixel_norm3d;
+pub use pixel_norm3d::{PixelNorm3dBufs, PixelNorm3dF32, PixelNorm3dOp};
 pub(crate) use qkv_split::dispatch_qkv_split;
 pub use qkv_split::{QkvSplitBufs, QkvSplitF32, QkvSplitOp};
 pub(crate) use relpos_bias::dispatch_relpos_bias;
@@ -87,18 +106,27 @@ pub use relpos_bias::{
     RelposBiasBufs, RelposBiasF32, RelposBiasOp, relative_position_bucket, relpos_bucket_map,
 };
 pub use relu::ReluF32;
+pub(crate) use replicate_pad1d::dispatch_replicate_pad1d;
+pub use replicate_pad1d::{
+    ReplicatePad1dBufs, ReplicatePad1dF32, ReplicatePad1dOp, crop1d_uniform_bytes,
+    replicate_pad1d_uniform_bytes,
+};
 pub(crate) use rmsnorm::dispatch_rmsnorm;
 pub use rmsnorm::{RmsNormBufs, RmsNormF32, RmsNormOp};
 pub(crate) use rmsnorm3d::dispatch_rmsnorm3d;
 pub use rmsnorm3d::{RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp};
 pub(crate) use rope::dispatch_rope;
 pub use rope::{RopeBufs, RopeF32, RopeF32HalfRot, RopeF32Mrope, RopeOp};
+pub(crate) use scale::dispatch_scale;
+pub use scale::{ScaleBufs, ScaleF32, ScaleOp, scale_uniform_bytes};
 pub(crate) use scatter_pad_rows::dispatch_scatter_pad_rows;
 pub use scatter_pad_rows::{ScatterPadRowsBufs, ScatterPadRowsF32, ScatterPadRowsOp};
 pub use sdpa::{SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, build_f16_sg_wgsl, f16_sg_workgroups};
 pub(crate) use sdpa::{dispatch_sdpa, dispatch_sdpa_f16_sg};
 pub use silu::SiluF32;
 pub use silu_mul::SiluMulF32;
+pub(crate) use snake_beta::dispatch_snake_beta;
+pub use snake_beta::{SnakeBetaBufs, SnakeBetaF32, SnakeBetaOp, snake_beta_uniform_bytes};
 #[cfg(feature = "conformance")]
 pub(crate) use softmax::dispatch_softmax;
 pub use softmax::{SoftmaxBufs, SoftmaxF32, SoftmaxOp};

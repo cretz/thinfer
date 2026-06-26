@@ -12,14 +12,16 @@ use crate::backend::{Backend, BindingLayout, BufRef, WgpuBackend, WgpuError};
 use crate::ops::{
     AddF32, BcastAddBufs, BcastAddF32, BcastAddOp, BcastAffineBufs, BcastAffineF32, BcastAffineOp,
     BcastFmaBufs, BcastFmaF32, BcastFmaOp, BcastModulateBufs, BcastModulateF32, BcastModulateOp,
-    BcastMulF32, Conv2dBufs, Conv2dF32, Conv2dOp, Conv3dBufs, Conv3dF32, Conv3dOp, GeluMulF32,
+    BcastMulF32, Conv2dBufs, Conv2dF32, Conv2dOp, Conv3dBufs, Conv3dF32, Conv3dOp,
+    DepthToSpace3dBufs, DepthToSpace3dF32, DepthToSpace3dOp, GatedHeadMulF32, GeluMulF32,
     LayerNormBufs, LayerNormF32, LayerNormOp, MatMulF32, MatmulBufs, MatmulOp, MemCatBufs,
-    MemCatOp, MulF32, Op, ReluF32, RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp, RmsNormBufs,
-    RmsNormF32, RmsNormOp, RopeBufs, RopeF32, RopeF32HalfRot, RopeOp, SdpaBufs, SdpaF32,
-    SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32, SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32,
-    Transpose12Bufs, Transpose12F32, Transpose12Op, WgslConfig, dispatch_bcast_add,
-    dispatch_bcast_affine, dispatch_bcast_fma, dispatch_bcast_modulate, dispatch_conv2d,
-    dispatch_conv3d, dispatch_layernorm, dispatch_matmul, dispatch_memcat, dispatch_op,
+    MemCatOp, MulF32, Op, PixelNorm3dBufs, PixelNorm3dF32, PixelNorm3dOp, ReluF32, RmsNorm3dBufs,
+    RmsNorm3dF32, RmsNorm3dOp, RmsNormBufs, RmsNormF32, RmsNormOp, RopeBufs, RopeF32,
+    RopeF32HalfRot, RopeOp, SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32,
+    SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32, Transpose12Bufs, Transpose12F32, Transpose12Op,
+    WgslConfig, dispatch_bcast_add, dispatch_bcast_affine, dispatch_bcast_fma,
+    dispatch_bcast_modulate, dispatch_conv2d, dispatch_conv3d, dispatch_depth_to_space3d,
+    dispatch_layernorm, dispatch_matmul, dispatch_memcat, dispatch_op, dispatch_pixel_norm3d,
     dispatch_rmsnorm, dispatch_rmsnorm3d, dispatch_rope, dispatch_sdpa, dispatch_softmax,
     dispatch_transpose12,
 };
@@ -147,8 +149,62 @@ pub enum OpSpec {
         stride_h: u32,
         stride_w: u32,
     },
+    /// 1D conv with stride/dilation/groups + symmetric pad (BigVGAN vocoder).
+    /// See `ops::conv1d`.
+    Conv1d {
+        k: u32,
+        stride: u32,
+        dilation: u32,
+        pad: u32,
+        groups: u32,
+    },
+    /// 1D transposed conv (BigVGAN ups + anti-alias/Hann upsamplers).
+    /// See `ops::conv_transpose1d`.
+    #[serde(rename = "conv_transpose1d")]
+    ConvTranspose1d {
+        k: u32,
+        stride: u32,
+        dilation: u32,
+        pad: u32,
+        groups: u32,
+    },
+    /// BigVGAN v2 SnakeBeta per-channel activation (log-scale alpha/beta).
+    /// See `ops::snake_beta`.
+    #[serde(rename = "snake_beta")]
+    SnakeBeta {
+        eps: f32,
+    },
+    /// Edge-replicate length padding for NCL (BigVGAN anti-alias / resampler).
+    /// See `ops::replicate_pad1d`.
+    #[serde(rename = "replicate_pad1d")]
+    ReplicatePad1d {
+        lpad: u32,
+        rpad: u32,
+    },
+    /// Pointwise scalar multiply `out = x * scale`. See `ops::scale`.
+    Scale {
+        scale: f32,
+    },
     #[serde(rename = "rmsnorm3d")]
     RmsNorm3d,
+    /// Per-head sigmoid gating `out[i] = x[i] * 2*sigmoid(gate[i/head_dim])`
+    /// (head_dim inferred from buffer lengths; no params). See `ops::gated_head_mul`.
+    #[serde(rename = "gated_head_mul")]
+    GatedHeadMul,
+    /// Weightless per-location channel-RMS over NCTHW (LTX video VAE `PixelNorm`,
+    /// eps inside the mean). See `ops::pixel_norm3d`.
+    #[serde(rename = "pixel_norm3d")]
+    PixelNorm3d {
+        eps: f32,
+    },
+    /// 3D pixel-shuffle `b (c p1 p2 p3) t h w -> b c (t p1) (h p2) (w p3)` with a
+    /// leading-frame drop when `p1 == 2`. See `ops::depth_to_space3d`.
+    #[serde(rename = "depth_to_space3d")]
+    DepthToSpace3d {
+        p1: u32,
+        p2: u32,
+        p3: u32,
+    },
 }
 
 #[derive(Serialize, Clone)]
@@ -794,6 +850,85 @@ impl<'a> OpTestContext<'a> {
         .await
     }
 
+    pub async fn run_pixel_norm3d<O: PixelNorm3dOp>(&self) -> Vec<u8> {
+        let eps = match self.case.op {
+            OpSpec::PixelNorm3d { eps } => eps,
+            _ => panic!("run_pixel_norm3d called with non-pixel_norm3d OpSpec"),
+        };
+        let s = &self.case.inputs[0].shape; // NCTHW
+        let (b, channels) = (s[0] as u32, s[1] as u32);
+        let stride: u32 = s[2..].iter().map(|&d| d as u32).product();
+        let n_pos = b * stride;
+        let out_len = self.input_bytes(self.case.inputs[0].name).len() as u64;
+        let u = pack_u32x4(n_pos, channels, stride, eps.to_bits());
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |bk, e, p, ins, uf, out| {
+                dispatch_pixel_norm3d::<O, _>(
+                    bk,
+                    e,
+                    p,
+                    &PixelNorm3dBufs {
+                        x: &ins[0],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n_pos,
+                )
+            },
+        )
+        .await
+    }
+
+    pub async fn run_depth_to_space3d<O: DepthToSpace3dOp>(&self) -> Vec<u8> {
+        let (p1, p2, p3) = match self.case.op {
+            OpSpec::DepthToSpace3d { p1, p2, p3 } => (p1, p2, p3),
+            _ => panic!("run_depth_to_space3d called with non-depth_to_space3d OpSpec"),
+        };
+        let s = &self.case.inputs[0].shape; // [cin, t_in, h_in, w_in] (B=1)
+        let (cin, t_in, h_in, w_in) = (s[0] as u32, s[1] as u32, s[2] as u32, s[3] as u32);
+        let cout = cin / (p1 * p2 * p3);
+        let t_drop = if p1 == 2 { 1 } else { 0 };
+        let t_out = t_in * p1 - t_drop;
+        let h_out = h_in * p2;
+        let w_out = w_in * p3;
+        let n_out = cout * t_out * h_out * w_out;
+        let out_len = (n_out as u64) * self.dtype.bytes_per_elem();
+        // U = 12 u32 (cin,t_in,h_in,w_in, p1,p2,p3,t_drop, cout,t_out,h_out,w_out).
+        let mut u = [0u8; 48];
+        for (i, v) in [
+            cin, t_in, h_in, w_in, p1, p2, p3, t_drop, cout, t_out, h_out, w_out,
+        ]
+        .iter()
+        .enumerate()
+        {
+            u[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |bk, e, p, ins, uf, out| {
+                dispatch_depth_to_space3d::<O, _>(
+                    bk,
+                    e,
+                    p,
+                    &DepthToSpace3dBufs {
+                        x: &ins[0],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n_out,
+                )
+            },
+        )
+        .await
+    }
+
     #[allow(clippy::many_single_char_names)]
     pub async fn run_conv3d<O: Conv3dOp>(&self, op: O) -> Vec<u8> {
         let (kt, kh, kw, pad_t, pad_h, pad_w, stride_t, stride_h, stride_w) = match self.case.op {
@@ -862,6 +997,206 @@ impl<'a> OpTestContext<'a> {
                     cout,
                     t_out * h_out * w_out,
                     b,
+                )
+            },
+        )
+        .await
+    }
+
+    pub async fn run_conv1d<O: crate::ops::Conv1dOp>(&self) -> Vec<u8> {
+        let (k, stride, dilation, pad, groups) = match self.case.op {
+            OpSpec::Conv1d {
+                k,
+                stride,
+                dilation,
+                pad,
+                groups,
+            } => (k, stride, dilation, pad, groups),
+            _ => panic!("run_conv1d called with non-conv1d OpSpec"),
+        };
+        let xs = &self.case.inputs[0].shape; // [B, Cin, Lin]
+        let ws = &self.case.inputs[1].shape; // [Cout, Cin/groups, K]
+        let (b, cin, lin) = (xs[0] as u32, xs[1] as u32, xs[2] as u32);
+        let cout = ws[0] as u32;
+        assert_eq!(
+            ws[1] as u32,
+            cin / groups,
+            "conv1d weight cin/groups mismatch"
+        );
+        assert_eq!(ws[2] as u32, k, "conv1d weight k mismatch");
+        let lout = crate::ops::conv1d_lout(lin, k, stride, dilation, pad);
+        let n_out = b * cout * lout;
+        let out_len = (n_out as u64) * O::Dtype::SIZE as u64;
+        let u = crate::ops::conv1d_uniform_bytes(
+            b, cin, cout, lin, lout, k, stride, dilation, pad, groups,
+        );
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |bk, e, p, ins, uf, out| {
+                crate::ops::dispatch_conv1d::<O, _>(
+                    bk,
+                    e,
+                    p,
+                    &crate::ops::Conv1dBufs {
+                        x: &ins[0],
+                        w: &ins[1],
+                        bias: &ins[2],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n_out,
+                )
+            },
+        )
+        .await
+    }
+
+    pub async fn run_conv_transpose1d<O: crate::ops::ConvTranspose1dOp>(&self) -> Vec<u8> {
+        let (k, stride, dilation, pad, groups) = match self.case.op {
+            OpSpec::ConvTranspose1d {
+                k,
+                stride,
+                dilation,
+                pad,
+                groups,
+            } => (k, stride, dilation, pad, groups),
+            _ => panic!("run_conv_transpose1d called with non-conv_transpose1d OpSpec"),
+        };
+        let xs = &self.case.inputs[0].shape; // [B, Cin, Lin]
+        let ws = &self.case.inputs[1].shape; // [Cin, Cout/groups, K]
+        let (b, cin, lin) = (xs[0] as u32, xs[1] as u32, xs[2] as u32);
+        let cout = ws[1] as u32 * groups;
+        assert_eq!(ws[0] as u32, cin, "convt1d weight cin mismatch");
+        assert_eq!(ws[2] as u32, k, "convt1d weight k mismatch");
+        let lout = crate::ops::conv_transpose1d_lout(lin, k, stride, dilation, pad);
+        let n_out = b * cout * lout;
+        let out_len = (n_out as u64) * O::Dtype::SIZE as u64;
+        let u = crate::ops::conv1d_uniform_bytes(
+            b, cin, cout, lin, lout, k, stride, dilation, pad, groups,
+        );
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |bk, e, p, ins, uf, out| {
+                crate::ops::dispatch_conv_transpose1d::<O, _>(
+                    bk,
+                    e,
+                    p,
+                    &crate::ops::ConvTranspose1dBufs {
+                        x: &ins[0],
+                        w: &ins[1],
+                        bias: &ins[2],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n_out,
+                )
+            },
+        )
+        .await
+    }
+
+    pub async fn run_snake_beta<O: crate::ops::SnakeBetaOp>(&self) -> Vec<u8> {
+        let eps = match self.case.op {
+            OpSpec::SnakeBeta { eps } => eps,
+            _ => panic!("run_snake_beta called with non-snake_beta OpSpec"),
+        };
+        let s = &self.case.inputs[0].shape; // [B, C, L]
+        let channels = s[1] as u32;
+        let inner: u32 = s[2..].iter().map(|&d| d as u32).product();
+        let n: u32 = s.iter().map(|&d| d as u32).product();
+        let out_len = (n as u64) * O::Dtype::SIZE as u64;
+        let u = crate::ops::snake_beta_uniform_bytes(n, channels, inner, eps);
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |bk, e, p, ins, uf, out| {
+                crate::ops::dispatch_snake_beta::<O, _>(
+                    bk,
+                    e,
+                    p,
+                    &crate::ops::SnakeBetaBufs {
+                        x: &ins[0],
+                        alpha: &ins[1],
+                        beta: &ins[2],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n,
+                )
+            },
+        )
+        .await
+    }
+
+    pub async fn run_replicate_pad1d<O: crate::ops::ReplicatePad1dOp>(&self) -> Vec<u8> {
+        let (lpad, rpad) = match self.case.op {
+            OpSpec::ReplicatePad1d { lpad, rpad } => (lpad, rpad),
+            _ => panic!("run_replicate_pad1d called with non-replicate_pad1d OpSpec"),
+        };
+        let s = &self.case.inputs[0].shape; // [B, C, Lin]
+        let (b, channels, lin) = (s[0] as u32, s[1] as u32, s[2] as u32);
+        let lout = lin + lpad + rpad;
+        let n_out = b * channels * lout;
+        let out_len = (n_out as u64) * O::Dtype::SIZE as u64;
+        let u = crate::ops::replicate_pad1d_uniform_bytes(b, channels, lin, lpad, rpad);
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |bk, e, p, ins, uf, out| {
+                crate::ops::dispatch_replicate_pad1d::<O, _>(
+                    bk,
+                    e,
+                    p,
+                    &crate::ops::ReplicatePad1dBufs {
+                        x: &ins[0],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n_out,
+                )
+            },
+        )
+        .await
+    }
+
+    pub async fn run_scale<O: crate::ops::ScaleOp>(&self) -> Vec<u8> {
+        let scale = match self.case.op {
+            OpSpec::Scale { scale } => scale,
+            _ => panic!("run_scale called with non-scale OpSpec"),
+        };
+        let n: u32 = self.case.inputs[0]
+            .shape
+            .iter()
+            .map(|&d| d as u32)
+            .product();
+        let out_len = (n as u64) * O::Dtype::SIZE as u64;
+        let u = crate::ops::scale_uniform_bytes(n, scale);
+        self.run_op(
+            &O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |bk, e, p, ins, uf, out| {
+                crate::ops::dispatch_scale::<O, _>(
+                    bk,
+                    e,
+                    p,
+                    &crate::ops::ScaleBufs {
+                        x: &ins[0],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    n,
                 )
             },
         )
@@ -957,6 +1292,14 @@ pub fn registry() -> Vec<Box<dyn OpTest>> {
         Box::new(Conv2dF32::default_op()),
         Box::new(Conv3dF32::default_op()),
         Box::new(RmsNorm3dF32),
+        Box::new(GatedHeadMulF32),
+        Box::new(PixelNorm3dF32),
+        Box::new(DepthToSpace3dF32),
+        Box::new(crate::ops::Conv1dF32),
+        Box::new(crate::ops::ConvTranspose1dF32),
+        Box::new(crate::ops::SnakeBetaF32),
+        Box::new(crate::ops::ReplicatePad1dF32),
+        Box::new(crate::ops::ScaleF32),
     ]
 }
 

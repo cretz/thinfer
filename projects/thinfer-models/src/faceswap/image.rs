@@ -236,6 +236,62 @@ pub fn feathered_mask(w: usize, h: usize, erode_x: f32, erode_y: f32) -> Vec<f32
     mask
 }
 
+/// Paste `crop` back onto `frame` using the forward affine `matrix` (frame->crop)
+/// with a feathered elliptical mask (cv.ts `pasteBack`, no occlusion mask).
+pub fn paste_back(frame: &Image, crop: &Image, matrix: &Affine) -> Image {
+    let (fw, fh) = (frame.w, frame.h);
+    let (cw, ch) = (crop.w, crop.h);
+    let mask = feathered_mask(cw, ch, 15.0, 15.0);
+    let mut out = frame.clone();
+    let m = *matrix;
+    let nt = n_threads(fh);
+    let rows_per = fh.div_ceil(nt);
+    std::thread::scope(|s| {
+        let mut rest = out.data.as_mut_slice();
+        let mut row0 = 0usize;
+        while row0 < fh {
+            let row1 = (row0 + rows_per).min(fh);
+            let (chunk, tail) = rest.split_at_mut((row1 - row0) * fw * 3);
+            rest = tail;
+            let crop = &*crop;
+            let mask = &mask;
+            s.spawn(move || {
+                for (yy, row) in chunk.chunks_exact_mut(fw * 3).enumerate() {
+                    let y = (row0 + yy) as f32;
+                    for x in 0..fw {
+                        let cx = m[0] * x as f32 + m[1] * y + m[2];
+                        let cy = m[3] * x as f32 + m[4] * y + m[5];
+                        if cx < 0.0 || cx >= (cw - 1) as f32 || cy < 0.0 || cy >= (ch - 1) as f32 {
+                            continue;
+                        }
+                        let x0 = cx.floor() as usize;
+                        let y0 = cy.floor() as usize;
+                        let fx = cx - x0 as f32;
+                        let fy = cy - y0 as f32;
+                        let m00 = mask[y0 * cw + x0];
+                        let m10 = mask[y0 * cw + x0 + 1];
+                        let m01 = mask[(y0 + 1) * cw + x0];
+                        let m11 = mask[(y0 + 1) * cw + x0 + 1];
+                        let alpha = m00 * (1.0 - fx) * (1.0 - fy)
+                            + m10 * fx * (1.0 - fy)
+                            + m01 * (1.0 - fx) * fy
+                            + m11 * fx * fy;
+                        if alpha < 0.001 {
+                            continue;
+                        }
+                        let cp = crop.sample(cx, cy);
+                        for (c, &v) in cp.iter().enumerate() {
+                            row[x * 3 + c] = row[x * 3 + c] * (1.0 - alpha) + v * alpha;
+                        }
+                    }
+                }
+            });
+            row0 = row1;
+        }
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,60 +352,4 @@ mod tests {
             assert!((out.data[i] - img.data[i]).abs() < 1e-3);
         }
     }
-}
-
-/// Paste `crop` back onto `frame` using the forward affine `matrix` (frame->crop)
-/// with a feathered elliptical mask (cv.ts `pasteBack`, no occlusion mask).
-pub fn paste_back(frame: &Image, crop: &Image, matrix: &Affine) -> Image {
-    let (fw, fh) = (frame.w, frame.h);
-    let (cw, ch) = (crop.w, crop.h);
-    let mask = feathered_mask(cw, ch, 15.0, 15.0);
-    let mut out = frame.clone();
-    let m = *matrix;
-    let nt = n_threads(fh);
-    let rows_per = fh.div_ceil(nt);
-    std::thread::scope(|s| {
-        let mut rest = out.data.as_mut_slice();
-        let mut row0 = 0usize;
-        while row0 < fh {
-            let row1 = (row0 + rows_per).min(fh);
-            let (chunk, tail) = rest.split_at_mut((row1 - row0) * fw * 3);
-            rest = tail;
-            let crop = &*crop;
-            let mask = &mask;
-            s.spawn(move || {
-                for (yy, row) in chunk.chunks_exact_mut(fw * 3).enumerate() {
-                    let y = (row0 + yy) as f32;
-                    for x in 0..fw {
-                        let cx = m[0] * x as f32 + m[1] * y + m[2];
-                        let cy = m[3] * x as f32 + m[4] * y + m[5];
-                        if cx < 0.0 || cx >= (cw - 1) as f32 || cy < 0.0 || cy >= (ch - 1) as f32 {
-                            continue;
-                        }
-                        let x0 = cx.floor() as usize;
-                        let y0 = cy.floor() as usize;
-                        let fx = cx - x0 as f32;
-                        let fy = cy - y0 as f32;
-                        let m00 = mask[y0 * cw + x0];
-                        let m10 = mask[y0 * cw + x0 + 1];
-                        let m01 = mask[(y0 + 1) * cw + x0];
-                        let m11 = mask[(y0 + 1) * cw + x0 + 1];
-                        let alpha = m00 * (1.0 - fx) * (1.0 - fy)
-                            + m10 * fx * (1.0 - fy)
-                            + m01 * (1.0 - fx) * fy
-                            + m11 * fx * fy;
-                        if alpha < 0.001 {
-                            continue;
-                        }
-                        let cp = crop.sample(cx, cy);
-                        for (c, &v) in cp.iter().enumerate() {
-                            row[x * 3 + c] = row[x * 3 + c] * (1.0 - alpha) + v * alpha;
-                        }
-                    }
-                }
-            });
-            row0 = row1;
-        }
-    });
-    out
 }

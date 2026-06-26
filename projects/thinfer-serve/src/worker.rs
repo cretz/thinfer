@@ -1,8 +1,22 @@
 //! GPU worker. Each worker runs on its own OS thread with a current-thread
 //! tokio runtime so the (potentially `!Send`) model generate futures run
 //! directly via `block_on` -- no `Send` bound, no cross-thread GPU handoff. The
-//! worker owns one [`LocalExecutor`] (one resident model), pulls jobs from the
-//! shared [`JobStore`], and reports progress into the job's event log.
+//! worker pulls jobs from the shared [`JobStore`] and reports progress into the
+//! job's event log.
+//!
+//! ## A fresh GPU device per job (crash isolation, no VRAM leak)
+//!
+//! The worker builds a NEW [`LocalExecutor`] -- and therefore a new wgpu device
+//! -- for EACH job, and drops it when the job finishes. Nothing is kept resident
+//! across jobs: the executor holds only the device handle, and every model's
+//! weights are streamed in per request anyway (scoped residency), so a warm
+//! cache would buy nothing. What a long-lived device DID buy was a failure mode:
+//! a device-OOM / device-lost poisons the wgpu device, which then holds its VRAM
+//! allocations for the life of the process -- every later job fails until the
+//! server is killed. Recreating per job means that poison is reclaimed the
+//! instant the job ends; the next job gets a clean device. Device + pipeline
+//! creation is ~sub-second (the driver shader cache survives device recreation),
+//! negligible against a multi-minute generate.
 
 use std::sync::Arc;
 
@@ -30,25 +44,25 @@ pub fn spawn_worker(
                 .build()
                 .expect("build worker runtime");
             rt.block_on(async move {
-                let executor = match LocalExecutor::new(backend_cfg).await {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::error!("worker {index} backend init failed: {e}");
-                        return;
-                    }
-                };
                 tracing::info!("worker {index} ready");
-                worker_loop(store, executor, download_as_needed).await;
+                worker_loop(store, backend_cfg, download_as_needed).await;
             });
         })
         .expect("spawn worker thread");
 }
 
-async fn worker_loop(store: Arc<JobStore>, executor: LocalExecutor, download_as_needed: bool) {
+async fn worker_loop(store: Arc<JobStore>, backend_cfg: BackendConfig, download_as_needed: bool) {
     loop {
         match store.take_next() {
             Some(job) => {
-                process(&executor, &job, download_as_needed).await;
+                // Fresh device per job (see module docs); dropped at the end of
+                // this block, releasing all VRAM even if the job poisoned it.
+                match LocalExecutor::new(backend_cfg).await {
+                    Ok(executor) => process(&executor, &job, download_as_needed).await,
+                    Err(e) => job.push(JobEvent::Error {
+                        message: format!("backend init: {e}"),
+                    }),
+                }
                 store.finish();
                 // A freed worker may unblock another queued job.
                 store.notify.notify_one();

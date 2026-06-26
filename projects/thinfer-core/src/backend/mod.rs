@@ -97,6 +97,14 @@ pub trait Backend: 'static {
     type Pipeline;
 
     fn allocate(&self, bytes: u64) -> Result<GpuBufferId, Self::Error>;
+
+    /// Construct the backend's "allocation refused by the budget" error for a
+    /// `bytes`-sized request, WITHOUT touching the device. Used by strict-budget
+    /// workspace allocs (the arbiter's reclaim chain ran dry) so a hard-ceiling
+    /// caller fails at the budget boundary instead of overshooting into a real
+    /// device OOM. Callers that recover (e.g. the VAE tiler) match the same
+    /// variant they match for a device OOM.
+    fn budget_oom_error(&self, bytes: u64) -> Self::Error;
     /// Categorized allocation. Default implementation ignores the category
     /// (test mocks). Real backends override to attribute the bytes to the
     /// right `MemAccount` counter so eviction policy and budget assertions

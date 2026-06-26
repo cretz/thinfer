@@ -120,7 +120,7 @@ impl LocalExecutor {
         let seed = req.seed.unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
-            model = %req.model, prompt = %req.prompt, width = req.width, height = req.height,
+            model = %req.model, width = req.width, height = req.height,
             steps = req.steps, seed, ram_budget = req.budget.ram_bytes,
             vram_budget = req.budget.vram_bytes, "generate start",
         );
@@ -215,7 +215,7 @@ impl LocalExecutor {
         let seed = req.seed.unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
-            model = %req.model, prompt = %req.prompt, width = req.width, height = req.height,
+            model = %req.model, width = req.width, height = req.height,
             steps = req.steps, seed, tokens = token_ids.len(), "ideogram4 generate start",
         );
         sink.note(&format!(
@@ -310,7 +310,7 @@ impl LocalExecutor {
         let seed = req.seed.unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
-            model = %req.model, prompt = %req.prompt, width = req.width, height = req.height,
+            model = %req.model, width = req.width, height = req.height,
             steps = req.steps, seed, tokens = inputs.token_ids.len(),
             image_pad_start = inputs.image_pad_start,
             vit_grid = ?inputs.vit_grid, vae_dims = ?inputs.vae_dims,
@@ -408,7 +408,7 @@ impl LocalExecutor {
         let seed = req.seed.unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
-            model = %req.model, prompt = %req.prompt, width = req.width, height = req.height,
+            model = %req.model, width = req.width, height = req.height,
             steps = req.steps, seed, tokens = token_ids.len(), "qwen-image generate start",
         );
         sink.note(&format!(
@@ -466,7 +466,17 @@ impl LocalExecutor {
         req: &VideoRequest,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
+        // LTX-2.3 is a distinct joint-AV pipeline (Gemma encoder, dual-stream
+        // DiT, two VAEs + vocoder); it shares none of the Wan variant/sampler/vae
+        // machinery, so it dispatches to its own driver before any Wan lookup.
+        if req.model.is_ltx() {
+            return crate::ltx::run(&self.backend, req, sink).await;
+        }
         let plan = req.resolve()?;
+        for w in &plan.warnings {
+            tracing::warn!(target: thinfer_core::trace::DIAG, "{w}");
+            sink.note(w);
+        }
         let manifest = req.model.manifest();
         let variant = req.model.variant();
         let vae: VaeChoice = req.vae.into();
@@ -489,7 +499,7 @@ impl LocalExecutor {
         let seed = req.seed.unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
-            model = %req.model, prompts = ?req.prompts, shots = plan.shots.len().max(1),
+            model = %req.model, shots = plan.shots.len().max(1),
             width = req.width, height = req.height, frames = plan.frames, fps = plan.fps,
             seed, ram_budget = req.budget.ram_bytes, vram_budget = req.budget.vram_bytes,
             "generate video start",

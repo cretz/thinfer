@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler};
+use crate::model::{
+    EncoderQuant, ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler,
+};
 use crate::progress::Stage;
 
 /// A job request from a client. Internally tagged by `kind`. Carries only what a
@@ -89,7 +91,19 @@ pub struct VideoSpec {
     /// UniPC denoise steps (1..=8, default 4). DMD ignores it.
     pub steps: Option<u32>,
     pub vae: Option<VaeChoice>,
+    /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
+    /// baseline) or `q4` (Q4_K_M, ~2.8x faster encode, lower precision). Applies
+    /// to all LTX/Sulphur models; ignored by Wan.
+    pub encoder: Option<EncoderQuant>,
     pub i8_matmul: Option<bool>,
+    /// Decode + mux an audio track. LTX joint-AV only (silent Wan models ignore
+    /// it). Defaults to `true`; `false` skips the audio tail for a video-only,
+    /// faster MP4.
+    pub audio: Option<bool>,
+    /// LTX-2.3 distilled only: opt in to the 2x spatial-upscale refine path
+    /// (half-res denoise -> latent upscale -> refine). Defaults to `false` =
+    /// single-stage denoise at the target res. Ignored by the Wan models.
+    pub upscale: Option<bool>,
     /// Base64 SPKI RSA-OAEP public key for result encryption (see [`ImageSpec`]).
     #[serde(default)]
     pub public_key: Option<String>,

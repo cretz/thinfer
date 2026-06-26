@@ -14,16 +14,33 @@ const $ = (id) => document.getElementById(id);
 const setStatus = (text) => {
   $("status").textContent = text;
 };
+// Set when a generation starts; log lines are then prefixed with elapsed-from-
+// start, mirroring the CLI's stamped stderr sink (`[  12.3s] ...`, width-6 like
+// the CLI's `{:6.1}`). Null before/after a run, so pre-gen warnings are unstamped.
+let genStart = null;
+const stamp = () => (genStart === null ? "" : `[${((performance.now() - genStart) / 1000).toFixed(1).padStart(6)}s] `);
 const log = (line) => {
   const el = $("log");
-  el.value += `${line}\n`;
+  el.value += `${stamp()}${line}\n`;
   el.scrollTop = el.scrollHeight;
 };
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid"],
-  video: ["fastwan-ti2v-5b", "longlive-2.0-5b"],
+  video: ["fastwan-ti2v-5b", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
 };
+// LTX-2.3 is a joint audio-video model with its own grid (/64 dims, 8k+1 frames).
+// Its video VAE decode tiles to the VRAM budget, so larger dims are allowed (more
+// tiles = slower; the temporal dim is whole, so keep clips short). Dims default
+// to upstream's distilled 768x512 (3:2 landscape, what the model was distilled
+// for); 256x256 is the explicit "fastest" floor -- below that the model is out of
+// distribution and output is incoherent. LTX also exposes an Audio toggle.
+// Sulphur-2 is an LTX-2.3 DiT finetune: byte-identical architecture, same grid +
+// audio path, so it shares the whole LTX UI surface.
+const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.startsWith("sulphur-2");
+// Multi-shot video: only LongLive treats each prompt line as a separate shot.
+// Every other video model is single-prompt (the whole box is one prompt).
+const isMultiShotModel = (model) => model === "longlive-2.0-5b";
 // Image models that edit a reference image instead of pure text-to-image: they
 // REQUIRE an uploaded input image (mirrors the server's QwenImageEdit kind).
 const EDIT_MODELS = new Set(["qwen-image-edit-rapid"]);
@@ -56,6 +73,30 @@ const PRESETS = {
     { label: "480p portrait (480x832)", width: 480, height: 832 },
   ],
 };
+// LTX-2.3 has its own grid: dims must be a multiple of 64 and at least 256 (the
+// server rejects below 256). The decode tiles to the VRAM budget so larger dims
+// are allowed. Default first = 1280x704 (16:9 widescreen), the regime the
+// distilled model is in-distribution for: lower-res LTX stays coherent but
+// renders the wrong subject/action. The widescreen default is reached via the
+// two-stage upscale path (auto-enabled for LTX). The low-res entries are kept as
+// fast/preview options but are out of distribution -- expect off-prompt content.
+// All /64.
+const LTX_MIN_DIM = 256;
+const LTX_PRESETS = [
+  { label: "720p landscape (1280x704, default)", width: 1280, height: 704 },
+  { label: "720p portrait (704x1280)", width: 704, height: 1280 },
+  { label: "960x576 landscape (faster)", width: 960, height: 576 },
+  { label: "768x512 landscape (fast, less faithful)", width: 768, height: 512 },
+  { label: "512x320 landscape (fastest, off-prompt / OOD)", width: 512, height: 320 },
+];
+/// Size preset + grid step + min dim for a (kind, model): LTX overrides the video
+/// defaults with its /64 grid and 256 floor; everything else uses the per-kind
+/// presets (min = step).
+function sizeSpec(kind, model) {
+  if (kind === "video" && isLtxModel(model)) return { presets: LTX_PRESETS, step: 64, min: LTX_MIN_DIM };
+  const step = DIM_STEP[kind];
+  return { presets: PRESETS[kind], step, min: step };
+}
 
 // Steps input config per kind. Image (Z-Image Turbo) defaults to 8, unbounded
 // above. Video (FastWan UniPC, the served sampler) defaults to 4, capped at 8 --
@@ -72,6 +113,21 @@ const MODEL_STEPS = {
   "ideogram4-q8": 4,
   "qwen-image-rapid": 4,
   "qwen-image-edit-rapid": 4,
+};
+// Default clip length (seconds) shown in the duration PLACEHOLDER per video
+// model, mirroring the server's default_frames so a blank field advertises the
+// REAL default. Blank -> the server uses its default; typing overrides. LTX is
+// distilled for ~5s (121 frames), but on the 8GB card the per-resolution frame
+// cap (see ltx_max_frames) sizes the real default by dims: at the 1280x704
+// widescreen default that is 49 frames (~2s). Pick a lower-res preset for a
+// longer clip (e.g. 1024x576 -> ~3s). This 2s is the default-resolution figure.
+const VIDEO_DURATION = {
+  "fastwan-ti2v-5b": 5,
+  "longlive-2.0-5b": 5,
+  "ltx-2.3-distilled": 2,
+  "ltx-2.3-distilled-q4": 2,
+  "sulphur-2": 2,
+  "sulphur-2-q4": 2,
 };
 
 const subtle = globalThis.crypto?.subtle;
@@ -147,6 +203,31 @@ async function decryptResult(privateKey, blob) {
 }
 
 // --- per-type form wiring -----------------------------------------------------
+// Populate the size dropdown + dim grid for the active (kind, model). Kept
+// separate from applyKind so a model switch (e.g. to LTX, /64 grid) re-grids the
+// size controls without re-touching the rest of the form.
+function populateSize(kind, model) {
+  const { presets, step, min } = sizeSpec(kind, model);
+  // Number inputs enforce this grid; presets all satisfy it.
+  for (const id of ["width", "height"]) {
+    $(id).step = step;
+    $(id).min = min;
+  }
+  // Size dropdown: presets plus a trailing "Custom". The first preset is default.
+  $("preset").replaceChildren(
+    ...presets.map((p, i) => {
+      const o = document.createElement("option");
+      o.value = `${p.width}x${p.height}`;
+      o.textContent = p.label;
+      o.selected = i === 0;
+      return o;
+    }),
+    new Option("Custom", "custom"),
+  );
+  $("width").value = presets[0].width;
+  $("height").value = presets[0].height;
+}
+
 function applyKind() {
   const kind = $("kind").value;
   document.body.className = `kind-${kind}`;
@@ -160,46 +241,51 @@ function applyKind() {
       return o;
     }),
   );
-  // Number inputs enforce this kind's grid; presets all satisfy it.
-  const step = DIM_STEP[kind];
-  for (const id of ["width", "height"]) {
-    $(id).step = step;
-    $(id).min = step;
-  }
-  // Size dropdown: presets for this kind plus a trailing "Custom". Selecting a
-  // preset fills the dims; the first preset is the default.
-  $("preset").replaceChildren(
-    ...PRESETS[kind].map((p, i) => {
-      const o = document.createElement("option");
-      o.value = `${p.width}x${p.height}`;
-      o.textContent = p.label;
-      o.selected = i === 0;
-      return o;
-    }),
-    new Option("Custom", "custom"),
-  );
-  const first = PRESETS[kind][0];
-  $("width").value = first.width;
-  $("height").value = first.height;
-  // Steps default/range is kind-specific (see STEPS).
+  // Steps range is kind-specific (see STEPS); applyModel sets the per-model value.
   const st = STEPS[kind];
-  $("steps").value = st.value;
   $("steps").min = st.min;
   $("steps").max = st.max;
   applyModel();
 }
 $("kind").addEventListener("change", applyKind);
 
-// Show the reference-image picker only for edit models (qwen-image-edit). It is
-// required there and ignored otherwise, so hide it for plain text-to-image.
+// Re-grid the size controls + reference-image picker + steps for the selected
+// model. LTX switches to its /64 preset grid; edit models reveal the image
+// picker.
 function applyModel() {
   const model = $("model").value;
-  const edit = $("kind").value === "image" && isEditModel(model);
+  const kind = $("kind").value;
+  const edit = kind === "image" && isEditModel(model);
   $("input-image-row").hidden = !edit;
   $("input-image").required = edit;
+  // Audio toggle + upscale toggle are LTX-only (Wan models are silent and have
+  // no two-stage upscale path).
+  const isLtxVideo = kind === "video" && isLtxModel(model);
+  $("audio-row").hidden = !isLtxVideo;
+  $("upscale-row").hidden = !isLtxVideo;
+  // Text-encoder quant (q8/q4) is an LTX-only knob (shared Gemma encoder).
+  $("encoder-row").hidden = !isLtxVideo;
+  // Two-stage is the in-distribution path for LTX (the widescreen default OOMs
+  // single-stage and low-res single-stage is OOD), so default it on; the user can
+  // still uncheck it for a fast low-res single-stage preview.
+  $("upscale").checked = isLtxVideo;
+  // The Wan tiny/full VAE choice does not apply to LTX (own full VAE), so hide
+  // it rather than show a misleading "Tiny VAE" default on an LTX gen.
+  $("vae-row").hidden = isLtxVideo;
+  // LTX runs a fixed distilled schedule (8 steps single-stage, or 8 + 3 = 11 when
+  // upscaling) and ignores the steps field, so hide it for LTX.
+  $("steps-row").hidden = isLtxVideo;
+  populateSize(kind, model);
   // Steps default is per-model (mirrors the server): the 4-step distilled image
-  // models start at 4, everything else at the kind default. User can override.
-  $("steps").value = MODEL_STEPS[model] ?? STEPS[$("kind").value].value;
+  // models start at 4, everything else at the kind default. LTX ignores steps
+  // (fixed two-stage schedule); the field is hidden there.
+  $("steps").value = MODEL_STEPS[model] ?? STEPS[kind].value;
+  // Show the real per-model default in the duration PLACEHOLDER (blank field ->
+  // the server uses this default; typing overrides). Clear any value carried
+  // over from a previous model so blank truly means "use the shown default".
+  const dur = VIDEO_DURATION[model];
+  $("duration").value = "";
+  $("duration").placeholder = kind === "video" && dur != null ? `${dur}s (default)` : "(seconds)";
 }
 $("model").addEventListener("change", applyModel);
 
@@ -261,16 +347,39 @@ async function buildSpec() {
     }
     return spec;
   }
-  // Video: each non-empty line of the prompt box is one shot (multi-shot is
-  // LongLive only; the server validates).
-  const prompts = $("prompt")
-    .value.split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // Multi-shot (LongLive only): each non-empty line of the prompt box is one
+  // shot. Every other video model is single-prompt, so send the whole box
+  // verbatim -- splitting on newlines would turn one multi-line prompt into
+  // bogus extra "shots" and the server would 400.
+  const prompts = isMultiShotModel(model)
+    ? $("prompt")
+        .value.split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [$("prompt").value.trim()];
   // One duration (seconds) covers the whole clip; for multi-shot LongLive the
   // server splits it evenly across shots. Blank = the model default (5s). fps
   // is the model's native rate, so it is not exposed.
   const duration = floatOrNull($("duration").value);
+  // LTX honors dims (its /64 grid, from the LTX presets), duration (server snaps
+  // to 8k+1 frames then caps to the per-resolution 8GB frame budget), the Audio
+  // toggle, and Upscale (two-stage, default-on). It ignores the Wan sampler/vae/
+  // steps knobs, so omit them. Blank dims/duration -> the server's LTX defaults
+  // (1280x704 two-stage, ~2s with audio).
+  if (isLtxModel(model)) {
+    return {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      audio: $("audio").checked,
+      upscale: $("upscale").checked,
+      encoder: $("encoder").value,
+      seed,
+    };
+  }
   return {
     kind: "video",
     model,
@@ -429,6 +538,7 @@ async function generate() {
   const kind = $("kind").value;
   $("fields").disabled = true;
   const t0 = performance.now();
+  genStart = t0; // stamp every log line with elapsed-from-submit (see `stamp`)
   setStatus("Submitting…");
   try {
     const keypair = await ensureKeypair();
@@ -452,5 +562,6 @@ async function generate() {
     log(`Failed: ${e.message ?? e}`);
   } finally {
     $("fields").disabled = false;
+    genStart = null; // stop stamping; the next run re-arms it
   }
 }

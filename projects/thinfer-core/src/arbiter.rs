@@ -107,23 +107,42 @@ impl MemArbiter {
     /// total plus `bytes` exceeds the budget, run the reclaim chain until it
     /// fits. Best-effort; traces the overshoot if the chain runs dry.
     pub fn ensure_headroom(&self, mem: &MemAccount, bytes: u64) {
-        if self.budget_bytes == u64::MAX {
+        if self.reclaim_until_fits(mem, bytes) {
             return;
+        }
+        tracing::info!(
+            target: trace::ARBITER,
+            op = "overshoot",
+            bytes = bytes,
+            over = (self.tier_current(mem).saturating_add(bytes)).saturating_sub(self.budget_bytes),
+        );
+    }
+
+    /// Run the reclaim chain until `bytes` more fits under the budget. Returns
+    /// `true` if it now fits (or the budget is disabled), `false` if the chain
+    /// ran dry and the allocation would still overshoot. Callers that treat the
+    /// budget as a HARD ceiling (e.g. the LTX VAE's adaptive tiler) use the
+    /// `false` return to fail the alloc at the budget boundary -- so it shrinks
+    /// and retries WITHOUT ever pushing the device into a real OOM (which on a
+    /// long-lived process can poison the wgpu device). Soft callers
+    /// (`ensure_headroom`) instead proceed and trace the overshoot.
+    pub fn reclaim_until_fits(&self, mem: &MemAccount, bytes: u64) -> bool {
+        if self.budget_bytes == u64::MAX {
+            return true;
         }
         let over = |mem: &MemAccount| {
             (self.tier_current(mem).saturating_add(bytes)).saturating_sub(self.budget_bytes)
         };
         let mut want = over(mem);
         if want == 0 {
-            return;
+            return true;
         }
         let chain = self.reclaimers.lock().unwrap();
         for (_, r) in chain.iter() {
             let freed = r.reclaim(want);
             if freed > 0 {
                 // Eviction traffic: debug per the level semantics (info is
-                // stage milestones + rollups only); overshoot below stays
-                // info because it means the budget was actually busted.
+                // stage milestones + rollups only).
                 tracing::debug!(
                     target: trace::ARBITER,
                     op = "reclaim",
@@ -134,14 +153,9 @@ impl MemArbiter {
             }
             want = over(mem);
             if want == 0 {
-                return;
+                return true;
             }
         }
-        tracing::info!(
-            target: trace::ARBITER,
-            op = "overshoot",
-            bytes = bytes,
-            over = want,
-        );
+        false
     }
 }

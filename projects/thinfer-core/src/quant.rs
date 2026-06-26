@@ -216,7 +216,12 @@ fn f16_bits_to_f32(h: u32) -> f32 {
             e = e - 1;
             if (e < -10) { break; }
         }
-        let f_exp: u32 = u32(127 + e - 14);
+        // f16 subnormal value = mant * 2^-24. After normalizing the leading 1
+        // to bit 10 (e = top_bit_pos - 11), the unbiased f32 exponent is
+        // top_bit_pos - 24 = e - 13, so the bias-127 field is `127 + e - 13`.
+        // (Previously `- 14`, which halved every subnormal-scale block -- latent
+        // until Q8_0 weights with tiny f16 scales, e.g. gemma ffn_down.)
+        let f_exp: u32 = u32(127 + e - 13);
         let f_mant: u32 = (m & 0x3FFu) << 13u;
         return bitcast<f32>(sign | (f_exp << 23u) | f_mant);
     }

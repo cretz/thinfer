@@ -20,6 +20,6 @@
 - `worklog.md` - START HERE. Forward-looking state + what's next. Points to the active per-model plan. Keep it slim.
 - `orig-plan.md` - user's source-of-truth plan. Don't edit.
 - `plan-details.md` - engine-wide design + current kernel/runtime/web/operational reference (the "how" beyond orig-plan, reused across models). Per-model porting details go in their own file, not here.
-- `wan-plan.md` - ACTIVE per-model port (Wan video family; SkyReels-V2-DF-1.3B first).
-- `zimage-plan.md` - ARCHIVED per-model reference (Z-Image, shipped). Read only if touching Z-Image.
+- `ltx-plan.md` - ACTIVE per-model port (LTX-2.3 distilled-1.1; 22B joint audio-video). START HERE for current work.
+- `wan-plan.md`, `qwen-image-plan.md`, `zimage-plan.md` - shipped/archived per-model references. Read only if touching that model.
 - `agent-notes.md` - this file: working conventions.

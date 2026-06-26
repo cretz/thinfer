@@ -29,6 +29,18 @@ pub fn load_image(path: &Path) -> Result<Image, String> {
 
 /// Encode CTHW f32 `[-1, 1]` frames to an H.264 MP4 at `fps`.
 pub fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> {
+    encode_mp4_with_audio(video, fps, None, out)
+}
+
+/// Encode CTHW f32 `[-1, 1]` frames to an H.264 MP4 at `fps`, optionally muxing
+/// a pre-encoded AAC audio track (the LTX joint-AV path). The CTHW container is
+/// reused as a plain frame carrier; the audio rides alongside, faststart-muxed.
+pub fn encode_mp4_with_audio(
+    video: &WanVideo,
+    fps: u32,
+    audio: Option<AudioPassthrough>,
+    out: &Path,
+) -> Result<(), String> {
     use openh264::OpenH264API;
     use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
     use openh264::formats::{RgbSliceU8, YUVBuffer};
@@ -63,7 +75,93 @@ pub fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> 
 
     let sps = sps.ok_or("openh264 produced no SPS")?;
     let pps = pps.ok_or("openh264 produced no PPS")?;
-    mux_mp4(out, w, h, fps, &sps, &pps, &samples, None)
+    mux_mp4(out, w, h, fps, &sps, &pps, &samples, audio)
+}
+
+/// Encode planar stereo f32 PCM `[2, n]` (channel-major, `[-1, 1]`) to AAC-LC
+/// and package it as an [`AudioPassthrough`] ready for [`mux_mp4`]. The LTX
+/// vocoder emits exactly this layout (left then right). One AAC packet = 1024
+/// samples/channel; the audio track timescale is the sample rate, so each
+/// packet spans 1024 ticks. A trailing zero frame flushes the encoder's
+/// lookahead so the tail is not truncated.
+pub fn encode_aac_stereo(wav_planar: &[f32], sample_rate: u32) -> Result<AudioPassthrough, String> {
+    use fdk_aac::enc::{
+        AudioObjectType, BitRate, ChannelMode, Encoder as AacEncoder, EncoderParams, Transport,
+    };
+
+    const FRAME: usize = 1024; // AAC-LC samples per channel per packet.
+    let per_ch = wav_planar.len() / 2;
+    if per_ch == 0 {
+        return Err("empty audio".into());
+    }
+    // ~128 kbps stereo: transparent for speech/foley at 48kHz.
+    let bitrate = 128_000;
+    let enc = AacEncoder::new(EncoderParams {
+        bit_rate: BitRate::Cbr(bitrate),
+        sample_rate,
+        transport: Transport::Raw,
+        channels: ChannelMode::Stereo,
+        audio_object_type: AudioObjectType::Mpeg4LowComplexity,
+    })
+    .map_err(|e| format!("aac encoder init: {e}"))?;
+
+    // Interleave L/R to i16, zero-padded to a whole number of frames plus one
+    // flush frame.
+    let frames = per_ch.div_ceil(FRAME) + 1;
+    let mut pcm = vec![0i16; frames * FRAME * 2];
+    let to_i16 = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+    for i in 0..per_ch {
+        pcm[i * 2] = to_i16(wav_planar[i]);
+        pcm[i * 2 + 1] = to_i16(wav_planar[per_ch + i]);
+    }
+
+    let mut samples = Vec::with_capacity(frames);
+    let mut out_buf = vec![0u8; 8192];
+    let mut pos = 0usize; // interleaved-sample cursor.
+    while pos < pcm.len() {
+        let info = enc
+            .encode(&pcm[pos..], &mut out_buf)
+            .map_err(|e| format!("aac encode: {e}"))?;
+        if info.input_consumed == 0 && info.output_size == 0 {
+            break; // encoder made no progress: done.
+        }
+        pos += info.input_consumed;
+        if info.output_size > 0 {
+            let start = (samples.len() * FRAME) as u64;
+            samples.push(mp4::Mp4Sample {
+                start_time: start,
+                duration: FRAME as u32,
+                rendering_offset: 0,
+                is_sync: true,
+                bytes: mp4::Bytes::copy_from_slice(&out_buf[..info.output_size]),
+            });
+        }
+    }
+    if samples.is_empty() {
+        return Err("aac encoder produced no packets".into());
+    }
+    Ok(AudioPassthrough {
+        config: mp4::AacConfig {
+            bitrate,
+            profile: mp4::AudioObjectType::AacLowComplexity,
+            freq_index: freq_index_for(sample_rate)?,
+            chan_conf: mp4::ChannelConfig::Stereo,
+        },
+        timescale: sample_rate,
+        samples,
+    })
+}
+
+/// Map a sample rate to the MP4/AAC `SampleFreqIndex`. Only the rates the LTX
+/// vocoder emits are needed (48kHz); extend if other rates appear.
+fn freq_index_for(sample_rate: u32) -> Result<mp4::SampleFreqIndex, String> {
+    match sample_rate {
+        48000 => Ok(mp4::SampleFreqIndex::Freq48000),
+        44100 => Ok(mp4::SampleFreqIndex::Freq44100),
+        24000 => Ok(mp4::SampleFreqIndex::Freq24000),
+        16000 => Ok(mp4::SampleFreqIndex::Freq16000),
+        other => Err(format!("unsupported audio sample rate {other}")),
+    }
 }
 
 /// Write each decoded frame as `frame{n:03}.png` into directory `dir`. The

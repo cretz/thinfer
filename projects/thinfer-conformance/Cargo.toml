@@ -48,3 +48,6 @@ qwen-image-e2e = []
 # ONNX models from the HF cache; compares the thinfer ONNX executor against
 # onnxruntime goldens. Skips cleanly when goldens/models are absent.
 faceswap-e2e = []
+# Opt-in LTX-2.3 parity tests (Gemma encoder + FE V2, connector, VAE, DiT, e2e).
+# Needs the unsloth LTX-2.3 + gemma QAT GGUF bundle in cache + `uv`.
+ltx-e2e = []

@@ -10,7 +10,7 @@ use thinfer_core::manifest::FileRef;
 use thinfer_core::policy::ResidencyBudget;
 pub use thinfer_models::wan::pipeline::Shot;
 
-use crate::model::{ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler};
+use crate::model::{EncoderQuant, ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler};
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
 const VAE_SCALE: u32 = 16;
@@ -181,7 +181,22 @@ pub struct VideoRequest {
     /// UniPC denoise step count (1..=`VIDEO_MAX_STEPS`); DMD ignores it.
     pub steps: u32,
     pub vae: VaeChoice,
+    /// LTX-2.3 text-encoder quantization (Q8 baseline or Q4_K_M fast). Applies to
+    /// every LTX/Sulphur model (shared Gemma encoder); ignored by Wan.
+    pub encoder: EncoderQuant,
     pub i8_matmul: bool,
+    /// Decode + mux an audio track (LTX joint-AV only; ignored by the silent Wan
+    /// models). `false` skips the audio VAE + vocoder tail and writes a
+    /// video-only MP4 -- faster, and the choice users want when they only need
+    /// the video.
+    pub audio: bool,
+    /// LTX-2.3 distilled only: opt in to the 2x spatial-upscale refine path
+    /// (denoise at half res -> latent upscale x2 -> renoise + refine at full
+    /// res). Default `false` = single-stage denoise directly at the target
+    /// `width`x`height`, which stays in-distribution at low res and skips the
+    /// upscaler model swap. Two-stage is only the cheaper route to HIGH res.
+    /// Ignored by the Wan/LongLive models.
+    pub upscale: bool,
     pub budget: ResidencyBudget,
     pub output: PathBuf,
     pub format: VideoFormat,
@@ -194,10 +209,49 @@ pub struct VideoPlan {
     pub frames: u32,
     pub shots: Vec<Shot>,
     pub fps: u32,
+    /// Non-fatal notices the user should see (e.g. a requested duration capped
+    /// to the per-resolution VRAM envelope). Surfaced via the progress sink at
+    /// generate time so a silent cap is never silent.
+    pub warnings: Vec<String>,
 }
 
 impl VideoRequest {
     pub fn required_files(&self) -> Result<Vec<FileRef>, String> {
+        // LTX sources by role (joint-AV: encoder + tokenizer + connector + DiT +
+        // both VAEs + upscaler), not via the Wan variant registry.
+        if self.model.is_ltx() {
+            let m = self.model.manifest();
+            // Resolve the selected text encoder (Q8_0 baseline or Q4_K_M) in place
+            // of the role list's default, so the chosen file is fetched.
+            let enc_role = self.ltx_encoder_role();
+            let mut files: Vec<FileRef> = self
+                .model
+                .ltx_runtime_roles()
+                .iter()
+                .map(|r| {
+                    let r = if *r == thinfer_models::ltx::manifest::role::ENCODER_GGUF {
+                        enc_role
+                    } else {
+                        r
+                    };
+                    m.get(r)
+                        .copied()
+                        .ok_or_else(|| format!("LTX manifest missing role {r}"))
+                })
+                .collect::<Result<_, _>>()?;
+            // Sulphur folds a distill-LoRA stack into the dev DiT at load; fetch
+            // every LoRA in the env-selected stack (default = condsafe alone).
+            if self.model.is_sulphur() {
+                for (role, _strength) in self.model.sulphur_distill_stack() {
+                    files.push(
+                        m.get(role)
+                            .copied()
+                            .ok_or_else(|| format!("Sulphur manifest missing distill role {role}"))?,
+                    );
+                }
+            }
+            return Ok(files);
+        }
         let mut files: Vec<FileRef> = self.model.variant().files().map(|(_, f)| *f).collect();
         if self.vae == VaeChoice::Tiny {
             files.push(
@@ -211,11 +265,21 @@ impl VideoRequest {
         Ok(files)
     }
 
+    /// LTX text-encoder GGUF role for this request: the `encoder` choice, or
+    /// Q4 when `THINFER_LTX_ENCODER=q4_k_m` is set (a power-user/test override that
+    /// forces Q4 even on the default request). LTX-only.
+    pub fn ltx_encoder_role(&self) -> &'static str {
+        let env_q4 = matches!(
+            std::env::var("THINFER_LTX_ENCODER").ok().as_deref(),
+            Some("q4_k_m") | Some("q4")
+        );
+        let encoder = if env_q4 { EncoderQuant::Q4 } else { self.encoder };
+        self.model.ltx_encoder_role(encoder)
+    }
+
     /// Validate dims + resolve fps and the shot plan. Fails fast on every user
     /// error so a server can 400 at submit.
     pub fn resolve(&self) -> Result<VideoPlan, String> {
-        validate_dim("height", self.height)?;
-        validate_dim("width", self.width)?;
         if self.input_image.is_some() {
             return Err(
                 "--input-image (img2vid) not yet wired; the engine path is t2v-only".into(),
@@ -228,6 +292,13 @@ impl VideoRequest {
         if fps == 0 {
             return Err("--fps must be > 0".into());
         }
+        // LTX: its own grid (dims /64, frames 8k+1), single prompt only, and the
+        // FastWan sampler/vae/shot machinery does not apply.
+        if self.model.is_ltx() {
+            return self.resolve_ltx(fps);
+        }
+        validate_dim("height", self.height)?;
+        validate_dim("width", self.width)?;
         if self.steps == 0 {
             return Err("--steps must be > 0".into());
         }
@@ -238,7 +309,85 @@ impl VideoRequest {
             &self.durations,
             fps,
         )?;
-        Ok(VideoPlan { frames, shots, fps })
+        Ok(VideoPlan {
+            frames,
+            shots,
+            fps,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// LTX-2.3 plan resolution: single-prompt t2v on the LTX grid (dims a
+    /// multiple of 64, frames `8k+1`). No shots, no sampler/vae knobs. Returns
+    /// an empty shot list (the single-clip path).
+    fn resolve_ltx(&self, fps: u32) -> Result<VideoPlan, String> {
+        let mult = self.model.dim_multiple();
+        let min = VideoModelId::LTX_MIN_DIM;
+        for (name, v) in [("height", self.height), ("width", self.width)] {
+            if !v.is_multiple_of(mult) || v < min {
+                return Err(format!(
+                    "--{name} for {} must be a multiple of {mult} and at least {min} \
+                     (got {v}); 256 is the fastest tier, the default is 768x512",
+                    self.model
+                ));
+            }
+        }
+        if self.prompts.len() != 1 {
+            return Err(format!(
+                "{} is single-prompt t2v; multi-shot is LongLive-only",
+                self.model
+            ));
+        }
+        if self.frames.len() > 1 || self.durations.len() > 1 {
+            return Err(format!("{} takes a single --frames/--duration", self.model));
+        }
+        // The two-stage stage-2 denoise runs the DiT at full res, so the safe
+        // clip length depends on the dims: cap frames to the 8GB envelope (see
+        // `ltx_max_frames`). Explicit `--frames` over budget is a hard error
+        // (fail fast at submit instead of device-losing mid-denoise); `--duration`
+        // (approximate) and the default are capped down to fit.
+        let max_frames = self.model.ltx_max_frames(self.width, self.height);
+        // The requested length BEFORE the VRAM cap (explicit --frames errors above
+        // the cap; --duration and the default cap DOWN silently, so we record the
+        // pre-cap target to warn when it is reduced).
+        let requested = if let Some(&f) = self.frames.first() {
+            self.model.validate_frames(f)?;
+            if f > max_frames {
+                return Err(format!(
+                    "{} at {}x{} fits at most {max_frames} frames on the 8GB card \
+                     (got {f}); lower --frames, or reduce --width/--height for a \
+                     longer clip",
+                    self.model, self.width, self.height
+                ));
+            }
+            f
+        } else if let Some(&d) = self.durations.first() {
+            if !(d.is_finite() && d > 0.0) {
+                return Err(format!("--duration must be positive seconds (got {d})"));
+            }
+            self.model.snap_frames((d * fps as f32).round() as u32)
+        } else {
+            self.model.default_frames()
+        };
+        let frames = requested.min(max_frames);
+        let mut warnings = Vec::new();
+        if frames < requested {
+            warnings.push(format!(
+                "{}x{} fits at most {frames} frames (~{:.1}s) on the 8GB card; the \
+                 requested ~{:.1}s was capped. For a longer clip lower the resolution \
+                 (e.g. 1024x576 fits ~3s, 768x512 the full ~5s).",
+                self.width,
+                self.height,
+                frames as f32 / fps as f32,
+                requested as f32 / fps as f32,
+            ));
+        }
+        Ok(VideoPlan {
+            frames,
+            shots: Vec::new(),
+            fps,
+            warnings,
+        })
     }
 }
 
@@ -421,7 +570,7 @@ pub fn even_chunk_split(total: usize, num_shots: usize) -> Result<Vec<usize>, St
 
 #[cfg(test)]
 mod tests {
-    use super::{even_chunk_split, resolve_shot_plan};
+    use super::{VideoFormat, VideoRequest, even_chunk_split, resolve_shot_plan};
     use crate::model::VideoModelId::{FastwanTi2v5b as Fw, Longlive205b as Ll};
 
     const FPS: u32 = 24;
@@ -486,6 +635,75 @@ mod tests {
             frames,
             Ll.chunks_to_frames(shots.iter().map(|s| s.chunks).sum())
         );
+    }
+
+    // A minimal LTX t2v request for resolve() coverage. Only the fields resolve
+    // reads matter; the rest take inert defaults.
+    fn ltx_req(width: u32, height: u32, frames: Vec<u32>, durations: Vec<f32>) -> VideoRequest {
+        use crate::model::{EncoderQuant, VaeChoice, VideoModelId, VideoSampler};
+        use thinfer_core::policy::ResidencyBudget;
+        VideoRequest {
+            model: VideoModelId::Ltx23Distilled,
+            prompts: vec!["a candid clip".into()],
+            width,
+            height,
+            frames,
+            durations,
+            fps: None,
+            seed: None,
+            input_image: None,
+            sampler: VideoSampler::UniPc,
+            steps: 8,
+            vae: VaeChoice::Full,
+            encoder: EncoderQuant::Q8,
+            i8_matmul: true,
+            audio: true,
+            upscale: true,
+            budget: ResidencyBudget {
+                ram_bytes: 5 << 30,
+                vram_bytes: 5 << 30,
+            },
+            output: std::path::PathBuf::from("out.mp4"),
+            format: VideoFormat::Mp4,
+        }
+    }
+
+    #[test]
+    fn ltx_duration_cap_warns_and_caps() {
+        // 5s @ 1280x704 cannot fit on the 8GB card (max 49f ~2s). The request
+        // must succeed (cap down), land at 49f, AND surface a warning so the
+        // silent shortfall is never silent.
+        let plan = ltx_req(1280, 704, vec![], vec![5.0]).resolve().unwrap();
+        assert_eq!(plan.frames, 49);
+        assert_eq!(plan.warnings.len(), 1, "capped duration must warn");
+        assert!(plan.warnings[0].contains("capped"), "{:?}", plan.warnings);
+
+        // The unset default (121f target) is the same silent-cap path -> warns.
+        let plan = ltx_req(1280, 704, vec![], vec![]).resolve().unwrap();
+        assert_eq!(plan.frames, 49);
+        assert_eq!(plan.warnings.len(), 1);
+
+        // A duration that fits leaves no warning.
+        let plan = ltx_req(512, 320, vec![], vec![2.0]).resolve().unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+
+        // An explicit over-budget --frames stays a hard error (fail fast), not a
+        // silent cap.
+        assert!(ltx_req(1280, 704, vec![121], vec![]).resolve().is_err());
+    }
+
+    #[test]
+    fn ltx_frame_cap_tracks_resolution() {
+        use crate::model::VideoModelId::Ltx23Distilled as Ltx;
+        // The two proven-safe envelope points on the 8GB card (these become the
+        // per-resolution default clip lengths).
+        assert_eq!(Ltx.ltx_max_frames(1280, 704), 49);
+        assert_eq!(Ltx.ltx_max_frames(1024, 576), 73);
+        // Low res fits the full ideal 5s (121f) and then some.
+        assert!(Ltx.ltx_max_frames(512, 320) >= 121);
+        // The device-lost config (73f @ 1280x704) is above the cap, so it is
+        // rejected rather than attempted.
+        assert!(Ltx.ltx_max_frames(1280, 704) < 73);
     }
 
     #[test]

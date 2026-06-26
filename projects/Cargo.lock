@@ -864,6 +864,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdk-aac"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bb67e142688083cb9afb63f2424203fc98c4e7afb494bf912b60b55513b177e"
+dependencies = [
+ "fdk-aac-sys",
+]
+
+[[package]]
+name = "fdk-aac-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24516d2611506d5cb1833555adc75f6baf9fe2706b9c13e6fc33a6b22c51ca83"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3032,6 +3050,7 @@ name = "thinfer-app"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "fdk-aac",
  "futures-util",
  "image",
  "mp4",

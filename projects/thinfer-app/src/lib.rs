@@ -11,6 +11,7 @@ pub mod codec;
 pub mod config;
 pub mod download;
 pub mod executor;
+pub mod ltx;
 pub mod model;
 pub mod preprocess;
 pub mod progress;

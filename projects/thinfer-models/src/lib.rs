@@ -3,6 +3,7 @@
 pub mod common;
 pub mod faceswap;
 pub mod ideogram4;
+pub mod ltx;
 pub mod qwen_image;
 pub mod wan;
 pub mod z_image;

@@ -132,6 +132,13 @@ pub enum WgpuError {
         bytes: u64,
         source: wgpu::Error,
     },
+    /// A strict-budget workspace alloc the arbiter refused (reclaim chain dry,
+    /// would exceed the configured VRAM budget). Synthesized WITHOUT touching the
+    /// device, so it never poisons the wgpu device the way a real OOM can. Treat
+    /// like `Allocate` for OOM-recovery (shrink + retry).
+    BudgetExceeded {
+        bytes: u64,
+    },
     SubmitFailed {
         ordinal: u64,
         message: String,
@@ -634,6 +641,10 @@ impl Backend for WgpuBackend {
 
     fn allocate_in(&self, bytes: u64, cat: VramCategory) -> Result<GpuBufferId, Self::Error> {
         WgpuBackend::allocate_in(self, bytes, cat)
+    }
+
+    fn budget_oom_error(&self, bytes: u64) -> Self::Error {
+        WgpuError::BudgetExceeded { bytes }
     }
 
     fn mem_account(&self) -> &Arc<MemAccount> {

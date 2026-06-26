@@ -86,11 +86,12 @@ fn spec_into_request(
         }
         JobSpec::Video(s) => {
             let model = s.model.unwrap_or(VideoModelId::DEFAULT);
+            let (def_w, def_h) = model.video_defaults();
             let req = VideoRequest {
                 model,
                 prompts: s.prompts,
-                width: s.width.unwrap_or(thinfer_app::model::VIDEO_DEFAULT_WIDTH),
-                height: s.height.unwrap_or(thinfer_app::model::VIDEO_DEFAULT_HEIGHT),
+                width: s.width.unwrap_or(def_w),
+                height: s.height.unwrap_or(def_h),
                 frames: s.frames.unwrap_or_default(),
                 durations: s.durations.unwrap_or_default(),
                 fps: s.fps,
@@ -99,7 +100,10 @@ fn spec_into_request(
                 sampler: s.sampler.unwrap_or_default(),
                 steps: s.steps.unwrap_or(thinfer_app::model::VIDEO_DEFAULT_STEPS),
                 vae: s.vae.unwrap_or(VaeChoice::Tiny),
+                encoder: s.encoder.unwrap_or_default(),
                 i8_matmul: s.i8_matmul.unwrap_or(true),
+                audio: s.audio.unwrap_or(true),
+                upscale: s.upscale.unwrap_or(model.two_stage_default()),
                 budget,
                 // Server emits MP4 only (PNG-frames is a CLI debug format).
                 output: mp4(),

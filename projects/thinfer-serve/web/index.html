@@ -48,17 +48,56 @@
         <label for="height">Height</label>
         <input id="height" type="number" value="768" min="16" step="16" />
 
-        <label for="steps">Steps</label>
-        <input id="steps" type="number" value="8" min="1" />
+        <!-- Hidden for LTX (app.js): the distilled two-stage schedule is fixed
+             (8 + 3 = 11 steps), so the steps field does not apply there. -->
+        <div id="steps-row">
+          <label for="steps">Steps</label>
+          <input id="steps" type="number" value="8" min="1" />
+        </div>
 
         <label for="duration" class="video-only">Duration (s)</label>
-        <input id="duration" class="video-only" type="text" inputmode="decimal" placeholder="(model default ~4s)" />
+        <input id="duration" class="video-only" type="text" inputmode="decimal" placeholder="(seconds)" />
 
-        <label for="vae" class="video-only">Quality</label>
-        <select id="vae" class="video-only">
-          <option value="tiny" selected>Tiny VAE (fast, default)</option>
-          <option value="full">Full VAE (clean, slower)</option>
-        </select>
+        <!-- Wan-only: the LightTAE (tiny) vs full VAE choice. Hidden for LTX
+             (app.js), which always runs its own full CausalVideoAutoencoder and
+             ignores this knob. -->
+        <div id="vae-row" class="video-only">
+          <label for="vae">Quality</label>
+          <select id="vae">
+            <option value="tiny" selected>Tiny VAE (fast, default)</option>
+            <option value="full">Full VAE (clean, slower)</option>
+          </select>
+        </div>
+
+        <!-- LTX joint audio-video only. app.js reveals this row for LTX and
+             hides it otherwise (the Wan models are silent). Unchecking skips the
+             audio VAE + vocoder tail for a faster, video-only MP4. -->
+        <div id="audio-row" hidden>
+          <label for="audio">Audio</label>
+          <input id="audio" type="checkbox" checked />
+        </div>
+
+        <!-- LTX-2.3 distilled only. app.js reveals this for LTX and checks it by
+             default (the in-distribution widescreen regime needs two-stage). On =
+             stage-1 half-res denoise -> 2x latent upscale -> 3-step refine. Off =
+             single-stage at the target res: only useful as a fast low-res preview
+             (single-stage OOMs the widescreen default). -->
+        <div id="upscale-row" hidden>
+          <label for="upscale">Upscale (hi-res refine)</label>
+          <input id="upscale" type="checkbox" />
+        </div>
+
+        <!-- LTX-2.3 only (all LTX/Sulphur models share the Gemma encoder).
+             app.js reveals this for LTX and hides it otherwise. q4 is ~2.8x
+             faster to encode the prompt (~16s -> ~6s) at lower-precision
+             conditioning; q8 is the quality baseline. -->
+        <div id="encoder-row" hidden>
+          <label for="encoder">Text encoder</label>
+          <select id="encoder">
+            <option value="q8" selected>Q8 (quality, default)</option>
+            <option value="q4">Q4 (fast encode)</option>
+          </select>
+        </div>
 
         <label for="seed">Seed</label>
         <input id="seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />

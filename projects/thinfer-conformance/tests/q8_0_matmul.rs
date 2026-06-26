@@ -294,6 +294,263 @@ fn q8_0_matmul_prod_geom_ffn_down_f32_acts() {
     assert_close(&got, &exp, 15360);
 }
 
+/// Dequant-once path repro: dequant Q8_0 `[N,K]` -> bf16 workspace, then a
+/// plain `b_nmajor` bf16 matmul with F32 acts (the exact path the gemma encoder
+/// ffn_down hits). Distinct from the direct-quant tests above (`b_nmajor=false`,
+/// inline per-tile dequant). Large K=15360 stresses the workspace.
+async fn run_dequant_once(m: u32, n: u32, k: u32, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    use thinfer_core::ops::dequant::{DequantTarget, build_wgsl, dispatch_dequant, layout};
+    use thinfer_core::ops::{DequantBufs, dispatch_matmul};
+    assert!(k.is_multiple_of(32));
+    let mut s = seed;
+    let mut rand = || -> f32 {
+        s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ((s >> 33) as u32 as f32) / (u32::MAX as f32) * 2.0 - 1.0
+    };
+    // Large A magnitude (gemma ffn gelu*up acts reach ~200) + a few huge
+    // outlier elements, mirroring the real ffn_down A-side distribution.
+    let a: Vec<f32> = (0..(m * k))
+        .map(|i| {
+            let r = rand() * 40.0;
+            if i % 997 == 0 { r * 8.0 } else { r }
+        })
+        .collect();
+    let b_f32: Vec<f32> = (0..(n * k)).map(|_| rand() * 0.1).collect();
+    let mut b_q: Vec<u8> = Vec::with_capacity((n as usize) * (k as usize / 32) * 34);
+    let mut row_q = Vec::with_capacity((k as usize / 32) * 34);
+    for ni in 0..n as usize {
+        quantize_row_q8_0(&b_f32[ni * k as usize..(ni + 1) * k as usize], &mut row_q);
+        b_q.extend_from_slice(&row_q);
+    }
+    let expected = cpu_matmul_q8_0_ref(&a, m, k, &b_q, n);
+
+    let backend = WgpuBackend::new().await.expect("wgpu adapter");
+    let alloc_with = |bytes: &[u8]| -> BufRef {
+        let id = backend.allocate(bytes.len() as u64).expect("allocate");
+        backend.write_buffer(id, 0, bytes).expect("write");
+        BufRef::new(id, bytes.len() as u64)
+    };
+    // 1) dequant Q8_0 -> bf16-packed [N,K] workspace.
+    let dq_wgsl = build_wgsl(QuantKind::Q8_0, DequantTarget::Bf16);
+    let dq_pipe = backend
+        .create_pipeline("dq", &dq_wgsl, "main", layout())
+        .await
+        .expect("dq pipe");
+    let b_q_buf = alloc_with(&b_q);
+    let dense_len = (n as u64) * (k as u64) * 2; // bf16 packed
+    let dense_id = backend.allocate(dense_len).expect("alloc dense");
+    let dense_buf = BufRef::new(dense_id, dense_len);
+    let mut dq_dims = [0u8; 16];
+    dq_dims[0..4].copy_from_slice(&n.to_le_bytes());
+    dq_dims[4..8].copy_from_slice(&k.to_le_bytes());
+    let dq_dims_buf = alloc_with(&dq_dims);
+    let mut enc = backend.create_command_encoder();
+    dispatch_dequant(
+        &backend,
+        &mut enc,
+        &dq_pipe,
+        QuantKind::Q8_0,
+        &DequantBufs {
+            b_quant: &b_q_buf,
+            b_dense: &dense_buf,
+            dims: &dq_dims_buf,
+        },
+        n,
+        k,
+    )
+    .expect("dequant");
+    // 2) bf16 matmul, b_nmajor=true (reads the dense [N,K] workspace).
+    let cfg = WgslConfig {
+        bf16_quant_writes: false,
+        act_dtype: ActDtype::F32,
+        weight_dtype: WeightDtype::Bf16,
+    };
+    let op = MatMulF32::new(MatMulConfig {
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        tm: 4,
+        tn: 4,
+        b_nmajor: true,
+    });
+    let pipe = backend
+        .create_pipeline("mm", &op.wgsl(&cfg), "main", MatMulF32::layout())
+        .await
+        .expect("mm pipe");
+    let a_bytes: Vec<u8> = a.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let a_buf = alloc_with(&a_bytes);
+    let dims_buf = alloc_with(&pack_dims_u32x4(m, n, k));
+    let out_len = (m as u64) * (n as u64) * 4;
+    let out_id = backend.allocate(out_len).expect("alloc out");
+    let out_buf = BufRef::new(out_id, out_len);
+    dispatch_matmul::<MatMulF32, _>(
+        &backend,
+        &mut enc,
+        &pipe,
+        &op,
+        &MatmulBufs {
+            a: &a_buf,
+            b: &dense_buf,
+            dims: &dims_buf,
+            out: &out_buf,
+        },
+        m,
+        n,
+    )
+    .expect("dispatch");
+    backend.submit(enc).await.expect("submit");
+    let got_bytes = backend.read_buffer(out_id, 0, out_len).await.expect("read");
+    let got: Vec<f32> = got_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    (got, expected)
+}
+
+// Subnormal-f16-scale regression: tiny weights (~5e-3) quantize to Q8_0 scales
+// ~4e-5, which are f16 SUBNORMALS (< 2^-14 = 6.1e-5). The bf16-dequant path's
+// manual f16->f32 decode had an off-by-one in the subnormal exponent that halved
+// every such block (latent until gemma ffn_down, whose weights are this small).
+// This is the durable repro of that bug (the real gemma weights confirmed it).
+#[test]
+fn q8_0_dequant_once_subnormal_f16_scales() {
+    let (m, n, k) = (18u32, 256u32, 512u32);
+    let mut s = 0x5EED_5AB0_u64;
+    let mut rand = || -> f32 {
+        s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ((s >> 33) as u32 as f32) / (u32::MAX as f32) * 2.0 - 1.0
+    };
+    let a: Vec<f32> = (0..(m * k)).map(|_| rand()).collect();
+    // ~5e-3 magnitude -> Q8_0 d = max_abs/127 ~ 4e-5 (f16 subnormal).
+    let b_f32: Vec<f32> = (0..(n * k)).map(|_| rand() * 5e-3).collect();
+    let mut b_q: Vec<u8> = Vec::new();
+    let mut row_q = Vec::new();
+    for ni in 0..n as usize {
+        quantize_row_q8_0(&b_f32[ni * k as usize..(ni + 1) * k as usize], &mut row_q);
+        b_q.extend_from_slice(&row_q);
+    }
+    // sanity: at least some blocks have subnormal f16 scales (exp field == 0,
+    // mantissa != 0). The scale is the f16 at the start of each 34-byte block.
+    let n_subnormal = (0..n as usize * (k as usize / 32))
+        .filter(|&bi| {
+            let h = u16::from_le_bytes([b_q[bi * 34], b_q[bi * 34 + 1]]);
+            (h >> 10) & 0x1F == 0 && (h & 0x3FF) != 0
+        })
+        .count();
+    assert!(n_subnormal > 0, "test must exercise subnormal scales");
+    let expected = cpu_matmul_q8_0_ref(&a, m, k, &b_q, n);
+    let got = pollster::block_on(run_dequant_once_data(&a, &b_q, m, n, k));
+    let max_abs = expected.iter().copied().map(f32::abs).fold(0f32, f32::max);
+    let (max_err, idx) = max_abs_diff(&got, &expected);
+    assert!(
+        max_err <= 5e-3 * max_abs,
+        "subnormal-scale dequant-once ({n_subnormal} subnormal blocks): max abs diff \
+         {max_err:.3e} > tol {:.3e} at idx {idx} (got={} exp={})",
+        5e-3 * max_abs,
+        got[idx],
+        expected[idx]
+    );
+}
+
+async fn run_dequant_once_data(a: &[f32], b_q: &[u8], m: u32, n: u32, k: u32) -> Vec<f32> {
+    use thinfer_core::ops::dequant::{DequantTarget, build_wgsl, dispatch_dequant, layout};
+    use thinfer_core::ops::{DequantBufs, dispatch_matmul};
+    let backend = WgpuBackend::new().await.expect("wgpu adapter");
+    let alloc_with = |bytes: &[u8]| -> BufRef {
+        let id = backend.allocate(bytes.len() as u64).expect("allocate");
+        backend.write_buffer(id, 0, bytes).expect("write");
+        BufRef::new(id, bytes.len() as u64)
+    };
+    let dq_wgsl = build_wgsl(QuantKind::Q8_0, DequantTarget::Bf16);
+    let dq_pipe = backend
+        .create_pipeline("dq", &dq_wgsl, "main", layout())
+        .await
+        .expect("dq");
+    let b_q_buf = alloc_with(b_q);
+    let dense_len = (n as u64) * (k as u64) * 2;
+    let dense_id = backend.allocate(dense_len).expect("dense");
+    let dense_buf = BufRef::new(dense_id, dense_len);
+    let mut dq_dims = [0u8; 16];
+    dq_dims[0..4].copy_from_slice(&n.to_le_bytes());
+    dq_dims[4..8].copy_from_slice(&k.to_le_bytes());
+    let dq_dims_buf = alloc_with(&dq_dims);
+    let mut enc = backend.create_command_encoder();
+    dispatch_dequant(
+        &backend,
+        &mut enc,
+        &dq_pipe,
+        QuantKind::Q8_0,
+        &DequantBufs {
+            b_quant: &b_q_buf,
+            b_dense: &dense_buf,
+            dims: &dq_dims_buf,
+        },
+        n,
+        k,
+    )
+    .expect("dq");
+    let cfg = WgslConfig {
+        bf16_quant_writes: false,
+        act_dtype: ActDtype::F32,
+        weight_dtype: WeightDtype::Bf16,
+    };
+    let op = MatMulF32::new(MatMulConfig {
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        tm: 4,
+        tn: 4,
+        b_nmajor: true,
+    });
+    let pipe = backend
+        .create_pipeline("mm", &op.wgsl(&cfg), "main", MatMulF32::layout())
+        .await
+        .expect("mm");
+    let a_bytes: Vec<u8> = a.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let a_buf = alloc_with(&a_bytes);
+    let dims_buf = alloc_with(&pack_dims_u32x4(m, n, k));
+    let out_len = (m as u64) * (n as u64) * 4;
+    let out_id = backend.allocate(out_len).expect("out");
+    let out_buf = BufRef::new(out_id, out_len);
+    dispatch_matmul::<MatMulF32, _>(
+        &backend,
+        &mut enc,
+        &pipe,
+        &op,
+        &MatmulBufs {
+            a: &a_buf,
+            b: &dense_buf,
+            dims: &dims_buf,
+            out: &out_buf,
+        },
+        m,
+        n,
+    )
+    .expect("dispatch");
+    backend.submit(enc).await.expect("submit");
+    let got_bytes = backend.read_buffer(out_id, 0, out_len).await.expect("read");
+    got_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+#[test]
+fn q8_0_dequant_once_ffn_down_f32_acts() {
+    // gemma encoder ffn_down geometry (m=18 rows, n=3840, k=15360).
+    let (got, exp) = pollster::block_on(run_dequant_once(18, 3840, 15360, 0xD0_F00D));
+    // bf16 weight workspace: tol ~ one bf16 ULP * K-ish. Use relative.
+    let max_abs = exp.iter().copied().map(f32::abs).fold(0f32, f32::max);
+    let (max_err, idx) = max_abs_diff(&got, &exp);
+    assert!(
+        max_err <= 5e-3 * max_abs,
+        "dequant-once ffn_down: max abs diff {max_err:.3e} > tol {:.3e} at idx {idx} (got={} exp={})",
+        5e-3 * max_abs,
+        got[idx],
+        exp[idx]
+    );
+}
+
 /// Q8_0 weights × `ActDtype::Bf16` activations × packed-bf16 output.
 /// This is the production combo for Z-Image DiT main matmuls and was
 /// previously untested — `run_one` above only exercises `ActDtype::F32`.

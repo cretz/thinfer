@@ -6,6 +6,7 @@
 
 use thinfer_core::manifest::ModelManifest;
 use thinfer_models::ideogram4::manifest as idmf;
+use thinfer_models::ltx::manifest as ltxmf;
 use thinfer_models::qwen_image::manifest as qimf;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::z_image::manifest as zmf;
@@ -185,22 +186,180 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "longlive-2.0-5b"))]
     #[cfg_attr(feature = "serde", serde(rename = "longlive-2.0-5b"))]
     Longlive205b,
+    /// LTX-2.3 distilled-1.1: a 22B joint audio-video DiT (two-stage distilled).
+    /// Its own pipeline (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder);
+    /// ignores the FastWan sampler/vae/shot knobs. Output MP4 carries an AAC
+    /// audio track unless audio is disabled (`--no-audio`), which skips the audio
+    /// tail for a faster video-only MP4. The video VAE decode tiles spatially to
+    /// the residency budget, so larger dims fit (slower); keep clips short (the
+    /// temporal dim is decoded whole).
+    #[cfg_attr(feature = "cli", value(name = "ltx-2.3-distilled"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ltx-2.3-distilled"))]
+    Ltx23Distilled,
+    /// LTX-2.3 distilled-1.1 with the Q4_K_M DiT (footprint variant): same
+    /// pipeline as [`Self::Ltx23Distilled`] but the 14.2GB Q4_K_M DiT GGUF in
+    /// place of the 22.8GB Q8_0 (encoder/connector/VAEs/upscaler unchanged). The
+    /// DiT runs the per-quant-kind dense dequant path. Q8_0 stays the quality
+    /// baseline; this halves DiT VRAM/disk for tighter budgets. No per-step speed
+    /// change at product scale (the DiT is compute-bound, weight streaming hidden
+    /// by prefetch), so it is a footprint option, not a perf one.
+    #[cfg_attr(feature = "cli", value(name = "ltx-2.3-distilled-q4"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ltx-2.3-distilled-q4"))]
+    Ltx23DistilledQ4,
+    /// Sulphur-2 (SulphurAI): an uncensored LTX-2.3 DiT finetune. Byte-identical
+    /// DiT layout to [`Self::Ltx23Distilled`], so it runs the exact same pipeline
+    /// (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder, two-stage distilled
+    /// sampler); only the DiT weights differ (Q8_0 baseline). The
+    /// encoder/connector/VAEs/upscaler are the unchanged LTX-2.3 components.
+    #[cfg_attr(feature = "cli", value(name = "sulphur-2"))]
+    #[cfg_attr(feature = "serde", serde(rename = "sulphur-2"))]
+    Sulphur2,
+    /// Sulphur-2 with the Q4_K_M DiT (footprint variant): same pipeline as
+    /// [`Self::Sulphur2`] with the smaller DiT GGUF (per-quant-kind dense dequant
+    /// path), mirroring the LTX Q8/Q4 pair. Q8_0 stays the quality baseline.
+    #[cfg_attr(feature = "cli", value(name = "sulphur-2-q4"))]
+    #[cfg_attr(feature = "serde", serde(rename = "sulphur-2-q4"))]
+    Sulphur2Q4,
 }
 
 impl VideoModelId {
     pub const DEFAULT: VideoModelId = VideoModelId::FastwanTi2v5b;
 
     pub fn manifest(self) -> &'static ModelManifest {
-        &wanmf::MANIFEST
+        match self {
+            VideoModelId::Ltx23Distilled | VideoModelId::Ltx23DistilledQ4 => &ltxmf::MANIFEST,
+            VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4 => &ltxmf::SULPHUR_MANIFEST,
+            _ => &wanmf::MANIFEST,
+        }
     }
 
+    /// LTX DiT GGUF role for this variant: Q8_0 (quality baseline) or Q4_K_M
+    /// (footprint). Panics for non-LTX -- guard with [`Self::is_ltx`].
+    pub fn ltx_dit_role(self) -> &'static str {
+        match self {
+            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Sulphur2Q4 => {
+                ltxmf::role::DIT_GGUF_Q4_K_M
+            }
+            VideoModelId::Ltx23Distilled | VideoModelId::Sulphur2 => ltxmf::role::DIT_GGUF_Q8_0,
+            other => panic!("ltx_dit_role on non-LTX model {other}"),
+        }
+    }
+
+    /// LTX text-encoder GGUF role for an [`EncoderQuant`] choice: the Q8_0
+    /// baseline (uniform per-site, the conditioning-quality default) or the Q4_K_M
+    /// variant (7.3G vs 12.5G; ~2.8x faster encode, lower-precision conditioning).
+    /// The encoder's per-site dequant reads the Q4_K/Q6_K mix directly. Shared by
+    /// every LTX/Sulphur variant (the encoder is common to all).
+    pub fn ltx_encoder_role(self, encoder: EncoderQuant) -> &'static str {
+        debug_assert!(self.is_ltx());
+        match encoder {
+            EncoderQuant::Q4 => ltxmf::role::ENCODER_GGUF_Q4,
+            EncoderQuant::Q8 => ltxmf::role::ENCODER_GGUF,
+        }
+    }
+
+    /// The distill-LoRA stack to fold into the Sulphur `dev` DiT, as
+    /// `(role, strength)` pairs accumulated in order (see `ltx::lora`). Default =
+    /// the single rank-reduced `condsafe` distill at 1.0 (the shipped, eyeballed
+    /// path). `THINFER_SULPHUR_DISTILL`:
+    /// - `stack` -> the distilled ComfyUI workflow recipe: `condsafe @ 0.7` +
+    ///   official `distilled-lora-384 @ 0.5` (the distill applied at <1.0 may cut
+    ///   the illustrative skew of the 1.0 single-fold).
+    /// - `rank768` -> the `sulphur_lora_rank_768` content LoRA standalone
+    ///   (known-bad in the 8-step path: undercooked mush -- repro only).
+    ///
+    /// Sulphur-only.
+    pub fn sulphur_distill_stack(self) -> Vec<(&'static str, f32)> {
+        debug_assert!(self.is_sulphur());
+        match std::env::var("THINFER_SULPHUR_DISTILL").ok().as_deref() {
+            Some("stack") => vec![
+                (ltxmf::role::DISTILL_LORA, 0.7),
+                (ltxmf::role::DISTILL_LORA_384, 0.5),
+            ],
+            Some("rank768") | Some("r768") => vec![(ltxmf::role::DISTILL_LORA_R768, 1.0)],
+            _ => vec![(ltxmf::role::DISTILL_LORA, 1.0)],
+        }
+    }
+
+    /// LTX joint-AV runtime role list for this variant (Q8_0 vs Q4_K_M DiT).
+    pub fn ltx_runtime_roles(self) -> &'static [&'static str] {
+        match self {
+            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Sulphur2Q4 => ltxmf::RUNTIME_ROLES_AV_Q4,
+            _ => ltxmf::RUNTIME_ROLES_AV_Q8,
+        }
+    }
+
+    /// Wan variant-registry entry. Wan models only (LTX sources by role; see
+    /// [`Self::is_ltx`]). Panics for LTX -- guard call sites with `is_ltx`.
     pub fn variant(self) -> &'static wanmf::VariantFiles {
+        debug_assert!(!self.is_ltx(), "variant() is Wan-only; LTX sources by role");
         wanmf::variant(&self.to_string()).expect("VideoModelId missing from VARIANTS registry")
     }
 
     /// AR (LongLive) path: the `.pt` DiT + windowed-KV-cache chunk loop.
     pub fn is_ar(self) -> bool {
         matches!(self, VideoModelId::Longlive205b)
+    }
+
+    /// LTX-2.3 joint audio-video path: its own two-stage pipeline + audio tail,
+    /// none of the FastWan/LongLive (Wan-base) machinery applies.
+    pub fn is_ltx(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::Ltx23Distilled
+                | VideoModelId::Ltx23DistilledQ4
+                | VideoModelId::Sulphur2
+                | VideoModelId::Sulphur2Q4
+        )
+    }
+
+    /// Sulphur-2 variants: the published GGUF is the BASE (`dev`) checkpoint, so
+    /// the distill LoRA is folded into the DiT at load (see `ltx::lora`). The LTX
+    /// distilled models ship pre-distilled DiTs and need no fold.
+    pub fn is_sulphur(self) -> bool {
+        matches!(self, VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4)
+    }
+
+    /// Default frame dims for this model. FastWan/LongLive ship the 960x544
+    /// e2e baseline; LTX ships 1280x704 (16:9 widescreen), the regime the
+    /// distilled model is in-distribution for. Lower-res LTX (e.g. the old
+    /// 768x512 / 512x320 defaults) is OUT of distribution: the denoise stays
+    /// coherent but renders the wrong subject/action (eyeballed: a man instead
+    /// of the requested woman, off-script motion), because the distilled few-step
+    /// model was trained at widescreen high res. 1280x704 is reached via the
+    /// two-stage path (`upscale`, default-on for LTX): stage 1 denoises at half
+    /// res (640x352) then a 2x latent upscale + 3-step refine at full res, which
+    /// keeps the per-step DiT activation peak inside the 8GB card when paired
+    /// with the LTX vram-budget cap (see `ltx::LTX_VRAM_BUDGET_CAP`). The video
+    /// VAE decode tiles (spatial + temporal) to the residency budget. All callers
+    /// resolve unset `--width/--height` through this.
+    pub fn video_defaults(self) -> (u32, u32) {
+        if self.is_ltx() {
+            (1280, 704)
+        } else {
+            (VIDEO_DEFAULT_WIDTH, VIDEO_DEFAULT_HEIGHT)
+        }
+    }
+
+    /// Whether this model's default denoise path is the two-stage upscale-refine
+    /// (stage 1 half-res -> 2x latent upscale -> 3-step refine). True for LTX: on
+    /// the 8GB target card, single-stage at the in-distribution widescreen res
+    /// OOMs, and low-res single-stage is out of distribution, so two-stage is the
+    /// only good regime. Surfaces that leave `upscale` unset default to this.
+    pub fn two_stage_default(self) -> bool {
+        self.is_ltx()
+    }
+
+    /// Minimum LTX pixel dim. 256 (the "fastest" tier, stage 1 at 128) is the
+    /// floor: below it the model is so far out of distribution that output is
+    /// incoherent, so dims under this are rejected rather than silently bad.
+    pub const LTX_MIN_DIM: u32 = 256;
+
+    /// Pixel-dim divisor this model requires (`--width`/`--height` must be a
+    /// multiple). Wan narrows by 16; LTX's two-stage halving + /32 latent grid
+    /// needs a multiple of 64 (stage 1 runs at half res, /32-divisible).
+    pub fn dim_multiple(self) -> u32 {
+        if self.is_ltx() { 64 } else { 16 }
     }
 
     /// Model-preferred playback fps: default for fps and the `--duration`
@@ -216,18 +375,58 @@ impl VideoModelId {
 
     /// Default clip length (frames) when neither frames nor duration is given:
     /// [`Self::DEFAULT_DURATION_SECS`] at the model fps, snapped to its legal
-    /// grid. Same target seconds for both models; the snap lands FastWan at 121
-    /// and LongLive at 125 (its chunk-of-8 grid is coarser).
+    /// grid. Same target seconds for both Wan models; the snap lands FastWan at
+    /// 121 and LongLive at 125 (its chunk-of-8 grid is coarser). LTX overrides
+    /// this with a short default ([`Self::LTX_DEFAULT_FRAMES`]): the full chain
+    /// (single-submit VAE decode) fits only modest lengths on thin hardware.
     pub fn default_frames(self) -> u32 {
-        self.snap_frames(Self::DEFAULT_DURATION_SECS * self.fps())
+        if self.is_ltx() {
+            Self::LTX_DEFAULT_FRAMES
+        } else {
+            self.snap_frames(Self::DEFAULT_DURATION_SECS * self.fps())
+        }
+    }
+
+    /// LTX ideal clip length: 121 frames (latent frame count `(f-1)/8+1 = 16`,
+    /// ~5s @ 24fps) -- the length the model is distilled for (upstream
+    /// `num_frames=121`). This is the UPPER target only: the actual default is
+    /// `min(this, ltx_max_frames(w, h))`, because at the widescreen default the
+    /// 8GB card cannot hold 121 frames (see [`Self::ltx_max_frames`]). At low res
+    /// the cap is above 121, so the full 5s is used; at 1280x704 it lands at 49.
+    pub const LTX_DEFAULT_FRAMES: u32 = 121;
+
+    /// Max full-res latent cells (`f_lat * h/32 * w/32`) the 8GB card sustains
+    /// through the LTX two-stage stage-2 denoise (which runs the DiT at full res).
+    /// Above this the stage-2 activation peak, plus the per-block streaming
+    /// alloc/free churn's fragmentation, loses the device. Derived empirically on
+    /// the RTX 5070 Laptop (8GB): 49 frames @ 1280x704 = 6160 cells holds with
+    /// ~2.7GB margin (peak 5.4GB); 73 frames @ 1024x576 = 5760 holds (peak 5.2GB);
+    /// 73 frames @ 1280x704 = 8800 device-loses. 6300 sits just above both proven
+    /// points and well below the failure. Revisit for >8GB cards.
+    pub const LTX_MAX_LATENT_CELLS: u32 = 6300;
+
+    /// Largest legal LTX frame count (`8k+1`) whose full-res latent-cell count
+    /// stays within [`Self::LTX_MAX_LATENT_CELLS`] at the given pixel dims. Lower
+    /// res -> more frames fit; higher res -> fewer. Used to size the default clip
+    /// and to reject explicit over-budget requests before any GPU work (so a long
+    /// duration at high res fails fast instead of crashing mid-denoise).
+    pub fn ltx_max_frames(self, width: u32, height: u32) -> u32 {
+        debug_assert!(self.is_ltx());
+        let cells_per_lat_frame = (height / 32).max(1) * (width / 32).max(1);
+        let max_f_lat = (Self::LTX_MAX_LATENT_CELLS / cells_per_lat_frame).max(1);
+        8 * (max_f_lat - 1) + 1
     }
 
     /// Snap a raw frame count to this model's legal temporal grid. FastWan needs
     /// `4k+1` (causal-VAE grid); LongLive additionally needs latent frame count
     /// `(frames-1)/4+1` a positive multiple of 8 -> frames in {29, 61, 93, ...}.
+    /// LTX needs `8k+1` (its VAE has temporal factor 8).
     pub fn snap_frames(self, raw: u32) -> u32 {
         let raw = raw.max(1);
-        if self.is_ar() {
+        if self.is_ltx() {
+            let k = ((raw - 1) as f32 / 8.0).round() as u32;
+            8 * k + 1
+        } else if self.is_ar() {
             let f_lat = (raw as f32 + 3.0) / 4.0;
             let f_lat8 = ((f_lat / 8.0).round().max(1.0) as u32) * 8;
             4 * f_lat8 - 3
@@ -240,6 +439,14 @@ impl VideoModelId {
     /// Validate an explicit frame count against the model grid (see
     /// [`Self::snap_frames`]).
     pub fn validate_frames(self, frames: u32) -> Result<(), String> {
+        if self.is_ltx() {
+            if frames == 0 || !(frames - 1).is_multiple_of(8) {
+                return Err(format!(
+                    "--frames for {self} must be 8*k + 1 (got {frames}); e.g. 1, 9, 17, 25, 33"
+                ));
+            }
+            return Ok(());
+        }
         if frames == 0 || frames % 4 != 1 {
             return Err(format!(
                 "--frames must be 4*k + 1 (got {frames}); e.g. 1, 5, 9, ..., 97"
@@ -279,6 +486,10 @@ impl std::fmt::Display for VideoModelId {
         f.write_str(match self {
             VideoModelId::FastwanTi2v5b => "fastwan-ti2v-5b",
             VideoModelId::Longlive205b => "longlive-2.0-5b",
+            VideoModelId::Ltx23Distilled => "ltx-2.3-distilled",
+            VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
+            VideoModelId::Sulphur2 => "sulphur-2",
+            VideoModelId::Sulphur2Q4 => "sulphur-2-q4",
         })
     }
 }
@@ -309,6 +520,31 @@ impl std::fmt::Display for VaeChoice {
         f.write_str(match self {
             VaeChoice::Full => "full",
             VaeChoice::Tiny => "tiny",
+        })
+    }
+}
+
+/// LTX-2.3 text-encoder (Gemma-3-12B) quantization. Applies to ALL LTX models
+/// (the encoder is shared across `ltx-2.3-distilled{,-q4}` and `sulphur-2{,-q4}`).
+/// `Q8` is the conditioning-quality baseline (uniform Q8_0, 12.5G); `Q4` is the
+/// Q4_K_M variant (7.3G; mixed Q4_K/Q6_K) -- ~2.8x faster encode (~16s -> ~6s)
+/// for lower-precision conditioning. Ignored by the Wan models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum EncoderQuant {
+    #[default]
+    Q8,
+    Q4,
+}
+
+impl std::fmt::Display for EncoderQuant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EncoderQuant::Q8 => "q8",
+            EncoderQuant::Q4 => "q4",
         })
     }
 }

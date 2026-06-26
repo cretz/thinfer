@@ -37,11 +37,15 @@ body {
   padding: 0.4rem 1.2rem;
 }
 
-/* The reference-image row wraps a label+input pair in a div; `display: contents`
-   promotes them into the #fields grid so they align like every other row (label
-   in column 1, input in column 2) instead of cramming into one cell. Guarded
+/* The reference-image and audio rows each wrap a label+input pair in a div;
+   `display: contents` promotes them into the #fields grid so they align like
+   every other row (label in column 1, input in column 2) instead of cramming
+   into one cell (which shoves every following row's label into column 2). Guarded
    with :not([hidden]) so the `hidden` attribute still collapses the row. */
-#input-image-row:not([hidden]) {
+#input-image-row:not([hidden]),
+#audio-row:not([hidden]),
+#upscale-row:not([hidden]),
+#steps-row:not([hidden]) {
   display: contents;
 }
 
@@ -53,6 +57,12 @@ body {
 body.kind-image .image-only,
 body.kind-video .video-only {
   display: revert;
+}
+/* The `hidden` attribute must always win, even over the kind-based reveal above
+   (app.js hides e.g. the Wan VAE row for LTX). Author `!important` beats the
+   `display: revert` rule that would otherwise un-hide a `.video-only` element. */
+[hidden] {
+  display: none !important;
 }
 
 #status {

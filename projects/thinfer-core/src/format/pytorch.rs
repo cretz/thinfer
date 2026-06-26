@@ -833,14 +833,12 @@ mod tests {
     /// EMPTY_DICT, SETITEMS, tuples and ints end to end.
     #[test]
     fn parses_minimal_state_dict() {
-        let mut p: Vec<u8> = Vec::new();
-        p.push(0x80);
-        p.push(2); // PROTO 2
-        p.push(b'}'); // EMPTY_DICT
-        p.push(b'('); // MARK
-        // key "w"
-        p.push(0x8c);
-        p.push(1);
+        let mut p: Vec<u8> = vec![
+            0x80, 2,    // PROTO 2
+            b'}', // EMPTY_DICT
+            b'(', // MARK
+            0x8c, 1, // key "w": SHORT_BINUNICODE, length 1
+        ];
         p.extend_from_slice(b"w");
         // value: _rebuild_tensor_v2((storage, 0, (2,3), (3,1), False, dict))
         p.push(b'c');

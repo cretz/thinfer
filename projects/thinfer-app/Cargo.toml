@@ -24,6 +24,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # off thinfer-native/-models so web stays free of a wasm software codec.
 openh264 = "0.9"
 mp4 = "0.14"
+# AAC-LC audio encode for the LTX joint-AV MP4 audio track. libfdk-aac built
+# from bundled source via `cc` (same source-build pattern as openh264); no
+# system lib. Only the native binaries need it; web uses WebCodecs.
+fdk-aac = "0.8"
 # Source-image decode for face-swap (PNG/JPEG only; no extra codecs).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Optional adapter derives, gated so non-consumers stay dep-clean.
