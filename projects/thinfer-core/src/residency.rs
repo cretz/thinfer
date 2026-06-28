@@ -1008,9 +1008,16 @@ impl<S: WeightSource> WeightResidency<S> {
         meta: &WeightMeta,
         kind: QuantKind,
     ) -> Result<Vec<u8>, ResidencyError<S::Error, B::Error>> {
-        if meta.encoding != StorageEncoding::Bf16
-            || kind != QuantKind::Q8_0
+        // Q8_0 only, untransposed (the matmul reads quant B N-major). The source
+        // may be bf16 (the i8-DP4A sites) OR f32/f16 (the Wan2.2 GGUF module-level
+        // embedders/patch transcoded to match the folded Q8_0 block pipeline);
+        // f32/f16 narrow to bf16 first, then the shared Q8_0 encode.
+        if kind != QuantKind::Q8_0
             || !matches!(meta.transpose, TransposePolicy::None)
+            || !matches!(
+                meta.encoding,
+                StorageEncoding::Bf16 | StorageEncoding::F16 | StorageEncoding::F32
+            )
         {
             return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
                 meta.encoding,
@@ -1036,9 +1043,22 @@ impl<S: WeightSource> WeightResidency<S> {
             .await
             .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
         let read_ms = t_read.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        // Narrow f32/f16 -> bf16 (tight element bytes; GGUF pads to 32B) so the
+        // Q8_0 encode has a uniform bf16 input.
+        let elems = meta.elements() as usize;
+        let bf16: std::borrow::Cow<[u8]> = match meta.encoding {
+            StorageEncoding::Bf16 => std::borrow::Cow::Borrowed(&src),
+            StorageEncoding::F32 => {
+                std::borrow::Cow::Owned(narrow_f32_to_bf16(&src[..elems * 4], elems * 2))
+            }
+            StorageEncoding::F16 => {
+                std::borrow::Cow::Owned(narrow_f16_to_bf16(&src[..elems * 2], elems * 2))
+            }
+            _ => unreachable!("encoding guarded above"),
+        };
         let mut dst = vec![0u8; meta.storage_bytes() as usize];
         let t_enc = diag.then(crate::trace::Instant::now);
-        crate::quant::encode_q8_0_from_bf16(&src, &mut dst);
+        crate::quant::encode_q8_0_from_bf16(&bf16, &mut dst);
         tracing::debug!(
             target: "thinfer::diag",
             id = %meta.id.0,

@@ -220,6 +220,14 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "sulphur-2-q4"))]
     #[cfg_attr(feature = "serde", serde(rename = "sulphur-2-q4"))]
     Sulphur2Q4,
+    /// Wan2.2-T2V-A14B (MoE): two 14B experts (high/low noise) + the LightX2V
+    /// 4-step distill LoRA, GGUF Q5_K_M, on the Wan backbone. CFG-free distill
+    /// denoise (high expert steps 0-1, low expert 2-3); Wan2.1 VAE. The state-of-
+    /// the-art Wan-family quality tier; heavier than the 5B, so it defaults to
+    /// 832x480 on the 8GB card.
+    #[cfg_attr(feature = "cli", value(name = "wan2.2-t2v-a14b"))]
+    #[cfg_attr(feature = "serde", serde(rename = "wan2.2-t2v-a14b"))]
+    Wan22T2vA14b,
 }
 
 impl VideoModelId {
@@ -336,6 +344,14 @@ impl VideoModelId {
     pub fn video_defaults(self) -> (u32, u32) {
         if self.is_ltx() {
             (1280, 704)
+        } else if matches!(self, VideoModelId::Wan22T2vA14b) {
+            // The 14B DiT faults above ~4096 latent cells (see
+            // WAN22_MAX_LATENT_CELLS), and clip length scales as cells/(h/16*w/16),
+            // so a lower-res default buys a usable length: 512x288 (/16-clean,
+            // 16:9) fits 25f (~1.6s) under the cap, vs 832x480's 5f (~0.3s). The
+            // form still offers 832x480 (the lightx2v 480p distill regime) as a
+            // max-quality / short-clip option.
+            (512, 288)
         } else {
             (VIDEO_DEFAULT_WIDTH, VIDEO_DEFAULT_HEIGHT)
         }
@@ -363,9 +379,13 @@ impl VideoModelId {
     }
 
     /// Model-preferred playback fps: default for fps and the `--duration`
-    /// divisor. The Wan TI2V line is authored at 24.
+    /// divisor. The Wan TI2V line is authored at 24; Wan2.2-A14B at 16 (upstream).
     pub fn fps(self) -> u32 {
-        24
+        if matches!(self, VideoModelId::Wan22T2vA14b) {
+            16
+        } else {
+            24
+        }
     }
 
     /// Default clip length in seconds when neither frames nor duration is
@@ -382,10 +402,20 @@ impl VideoModelId {
     pub fn default_frames(self) -> u32 {
         if self.is_ltx() {
             Self::LTX_DEFAULT_FRAMES
+        } else if matches!(self, VideoModelId::Wan22T2vA14b) {
+            Self::WAN22_DEFAULT_FRAMES
         } else {
             self.snap_frames(Self::DEFAULT_DURATION_SECS * self.fps())
         }
     }
+
+    /// Wan2.2-A14B default clip length (frames), sized to the activation/fault
+    /// envelope ([`Self::WAN22_MAX_LATENT_CELLS`]) at the 512x288 default res:
+    /// f_lat 7 = 7*32*18 = 4032 cells (just under the 4096 cap), 25f ~1.6s @16fps.
+    /// Picking the per-res max as the default mirrors LTX. At a higher res the
+    /// envelope cap in `VideoRequest::resolve` trims this down (with a warning);
+    /// at a lower res an explicit `--frames` up to [`Self::max_frames`] runs longer.
+    pub const WAN22_DEFAULT_FRAMES: u32 = 25;
 
     /// LTX ideal clip length: 121 frames (latent frame count `(f-1)/8+1 = 16`,
     /// ~5s @ 24fps) -- the length the model is distilled for (upstream
@@ -405,16 +435,67 @@ impl VideoModelId {
     /// points and well below the failure. Revisit for >8GB cards.
     pub const LTX_MAX_LATENT_CELLS: u32 = 6300;
 
-    /// Largest legal LTX frame count (`8k+1`) whose full-res latent-cell count
-    /// stays within [`Self::LTX_MAX_LATENT_CELLS`] at the given pixel dims. Lower
-    /// res -> more frames fit; higher res -> fewer. Used to size the default clip
-    /// and to reject explicit over-budget requests before any GPU work (so a long
-    /// duration at high res fails fast instead of crashing mid-denoise).
+    /// Max DiT latent cells (`f_lat * h/16 * w/16`, == the per-forward token/row
+    /// count) the Wan2.2-A14B 14B DiT sustains on the RTX 5070 Laptop (8GB) before
+    /// the device is LOST. Telemetry (nvlddmkm Event 153 GPU engine reset; NO TDR
+    /// Event 4101 and NO VRAM pinning at 8151MiB) shows this is a GPU FAULT
+    /// (out-of-bounds shader access at high sequence length), NOT a VRAM-budget
+    /// overflow: it is INDEPENDENT of the weight budget (2G and 5G both fault at
+    /// 6240 rows) and INDEPENDENT of f_lat (256x256x61f = 4096 rows / f_lat 16
+    /// completes fine). Empirical rows: 2048 / 3120 / 4096 complete; 6240 faults.
+    /// 4096 is the confirmed-safe ceiling (a 1.5x margin under the fault). The
+    /// root-cause DiT shader OOB is a separate follow-up (needs GPU-assisted
+    /// validation / op bisection); until it is fixed this cap is the guard. Wan2.1
+    /// VAE is 8x spatial + patch 2 -> /16 grid (4x denser than LTX's /32).
+    pub const WAN22_MAX_LATENT_CELLS: u32 = 4096;
+
+    /// Per-spatial-axis latent downscale (VAE spatial factor * patch): the DiT
+    /// token grid is `h/div * w/div` per latent frame. LTX /32; Wan2.1 VAE /16.
+    fn latent_spatial_divisor(self) -> u32 {
+        if self.is_ltx() { 32 } else { 16 }
+    }
+
+    /// VAE temporal downscale (latent frames = `(frames-1)/factor + 1`). LTX 8,
+    /// Wan 4. Inverse: `frames = factor*(f_lat-1) + 1`.
+    fn temporal_factor(self) -> u32 {
+        if self.is_ltx() { 8 } else { 4 }
+    }
+
+    /// The per-resolution VRAM activation-envelope cap, in latent cells, or `None`
+    /// for models that fit at every legal dim on the 8GB card (FastWan/LongLive
+    /// ship low-res defaults well inside the envelope). LTX and Wan2.2-A14B run
+    /// the DiT at full res over a large token grid and need an explicit cap.
+    fn max_latent_cells(self) -> Option<u32> {
+        if self.is_ltx() {
+            Some(Self::LTX_MAX_LATENT_CELLS)
+        } else if matches!(self, VideoModelId::Wan22T2vA14b) {
+            Some(Self::WAN22_MAX_LATENT_CELLS)
+        } else {
+            None
+        }
+    }
+
+    /// Largest legal frame count whose full-res latent-cell count stays within
+    /// this model's activation envelope ([`Self::max_latent_cells`]) at the given
+    /// pixel dims, or `None` for an uncapped model. Lower res -> more frames fit;
+    /// higher res -> fewer. Used to size the default clip and to reject explicit
+    /// over-budget requests before any GPU work (so a long duration at high res
+    /// fails fast at submit instead of device-losing mid-denoise). The returned
+    /// count is on the model's temporal grid (`factor*k + 1`).
+    pub fn max_frames(self, width: u32, height: u32) -> Option<u32> {
+        let max_cells = self.max_latent_cells()?;
+        let div = self.latent_spatial_divisor();
+        let cells_per_lat_frame = (height / div).max(1) * (width / div).max(1);
+        let max_f_lat = (max_cells / cells_per_lat_frame).max(1);
+        Some(self.temporal_factor() * (max_f_lat - 1) + 1)
+    }
+
+    /// LTX alias of [`Self::max_frames`] (always `Some` for LTX). Kept for the
+    /// LTX resolve path + its regression tests. Panics for non-LTX.
     pub fn ltx_max_frames(self, width: u32, height: u32) -> u32 {
         debug_assert!(self.is_ltx());
-        let cells_per_lat_frame = (height / 32).max(1) * (width / 32).max(1);
-        let max_f_lat = (Self::LTX_MAX_LATENT_CELLS / cells_per_lat_frame).max(1);
-        8 * (max_f_lat - 1) + 1
+        self.max_frames(width, height)
+            .expect("LTX always has an envelope cap")
     }
 
     /// Snap a raw frame count to this model's legal temporal grid. FastWan needs
@@ -490,6 +571,7 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
             VideoModelId::Sulphur2 => "sulphur-2",
             VideoModelId::Sulphur2Q4 => "sulphur-2-q4",
+            VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
         })
     }
 }

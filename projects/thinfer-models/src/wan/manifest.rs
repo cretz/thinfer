@@ -25,6 +25,17 @@ const REPO_LIGHTX2V_AE: &str = "lightx2v/Autoencoders";
 /// merged generator). umT5 + VAE + tokenizer reuse the FastVideo base bundle, so
 /// only this one file is LongLive-specific.
 const REPO_LONGLIVE: &str = "Efficient-Large-Model/LongLive-2.0-5B";
+/// Wan2.2-T2V-A14B GGUF bundle: both MoE experts (high/low noise) in every quant,
+/// plus the Wan2.1 VAE. We consume Q5_K_M (the user-requested footprint tier;
+/// blocks stream per-block so VRAM is bounded by activations, not quant size).
+const REPO_WAN22_GGUF: &str = "QuantStack/Wan2.2-T2V-A14B-GGUF";
+/// LightX2V step-distill LoRAs (one per expert, rank 64, 4-step CFG-free).
+const REPO_WAN22_LORA: &str = "lightx2v/Wan2.2-Distill-Loras";
+/// Wan2.2-A14B diffusers bundle: source of the Wan2.1 VAE in DIFFUSERS tensor
+/// naming (`decoder.up_blocks.*`). The QuantStack GGUF repo also ships a
+/// `Wan2.1_VAE.safetensors`, but in ORIGINAL-Wan naming (`decoder.middle.*`,
+/// `decoder.conv1`), which the engine's diffusers-named VAE loader can't read.
+const REPO_WAN22_DIFFUSERS: &str = "Wan-AI/Wan2.2-T2V-A14B-Diffusers";
 
 pub mod role {
     /// DMD-distilled Wan2.2-TI2V-5B DiT (`WanTransformer3DModel`), single file.
@@ -44,6 +55,13 @@ pub mod role {
     /// Wan2.2-TI2V high-compression VAE (`AutoencoderKLWan`), single file.
     pub const VAE: &str = "vae/decoder";
     pub const VAE_CONFIG: &str = "vae/config";
+    /// Wan2.1 VAE (`AutoencoderKLWan`, z16 4x8x8), used by the Wan2.2-A14B model.
+    pub const VAE_WAN21: &str = "vae/wan21";
+    /// Wan2.2-A14B MoE experts (GGUF, original-Wan names) + LightX2V distill LoRAs.
+    pub const DIT_HIGH_NOISE: &str = "dit/wan22_high";
+    pub const DIT_LOW_NOISE: &str = "dit/wan22_low";
+    pub const LORA_HIGH_NOISE: &str = "lora/wan22_high";
+    pub const LORA_LOW_NOISE: &str = "lora/wan22_low";
     pub const SCHEDULER_CONFIG: &str = "scheduler/config";
     /// LightTAE (`lighttaew2_2`) opt-in tiny decoder, single file.
     pub const TINY_VAE: &str = "vae/tiny";
@@ -63,6 +81,13 @@ pub struct VariantFiles {
     /// VAE safetensors and this role is the `.pt` consumed by
     /// `open_longlive_source`. `None` for the all-safetensors FastWan bundle.
     pub dit_pt_role: Option<&'static str>,
+    /// Wan2.2-A14B MoE: the two expert GGUFs + their LightX2V LoRAs (consumed by
+    /// `open_wan22_source`). When set, `weight_roles` carries only the safetensors
+    /// TAIL (umT5 shards + Wan2.1 VAE). `None` for single-DiT variants.
+    pub gguf_high_role: Option<&'static str>,
+    pub gguf_low_role: Option<&'static str>,
+    pub lora_high_role: Option<&'static str>,
+    pub lora_low_role: Option<&'static str>,
 }
 
 const WEIGHT_ROLES: &[&str] = &[
@@ -83,18 +108,45 @@ const LONGLIVE_WEIGHT_ROLES: &[&str] = &[
     role::VAE,
 ];
 
+/// Wan2.2-A14B safetensors tail: umT5 (reused from the FastWan bundle) + the
+/// Wan2.1 VAE. The two expert DiTs + LoRAs come via the gguf/lora roles.
+const WAN22_TAIL_ROLES: &[&str] = &[
+    role::TEXT_ENCODER_SHARD_1,
+    role::TEXT_ENCODER_SHARD_2,
+    role::TEXT_ENCODER_SHARD_3,
+    role::VAE_WAN21,
+];
+
 pub static VARIANTS: &[VariantFiles] = &[
     VariantFiles {
         id: "fastwan-ti2v-5b",
         weight_roles: WEIGHT_ROLES,
         aux_roles: AUX_ROLES,
         dit_pt_role: None,
+        gguf_high_role: None,
+        gguf_low_role: None,
+        lora_high_role: None,
+        lora_low_role: None,
     },
     VariantFiles {
         id: "longlive-2.0-5b",
         weight_roles: LONGLIVE_WEIGHT_ROLES,
         aux_roles: AUX_ROLES,
         dit_pt_role: Some(role::LONGLIVE_DIT),
+        gguf_high_role: None,
+        gguf_low_role: None,
+        lora_high_role: None,
+        lora_low_role: None,
+    },
+    VariantFiles {
+        id: "wan2.2-t2v-a14b",
+        weight_roles: WAN22_TAIL_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_pt_role: None,
+        gguf_high_role: Some(role::DIT_HIGH_NOISE),
+        gguf_low_role: Some(role::DIT_LOW_NOISE),
+        lora_high_role: Some(role::LORA_HIGH_NOISE),
+        lora_low_role: Some(role::LORA_LOW_NOISE),
     },
 ];
 
@@ -108,6 +160,10 @@ impl VariantFiles {
         // so resolution/caching pulls it alongside the safetensors + aux files.
         self.dit_pt_role
             .iter()
+            .chain(self.gguf_high_role.iter())
+            .chain(self.gguf_low_role.iter())
+            .chain(self.lora_high_role.iter())
+            .chain(self.lora_low_role.iter())
             .chain(self.weight_roles.iter())
             .chain(self.aux_roles.iter())
             .map(|r| {
@@ -201,6 +257,42 @@ pub static MANIFEST: ModelManifest = ModelManifest {
             role::TINY_VAE,
             FileRef::new(REPO_LIGHTX2V_AE, "lighttaew2_2.safetensors"),
         ),
+        // --- Wan2.2-T2V-A14B (MoE) ---
+        (
+            role::DIT_HIGH_NOISE,
+            FileRef::new(
+                REPO_WAN22_GGUF,
+                "HighNoise/Wan2.2-T2V-A14B-HighNoise-Q5_K_M.gguf",
+            ),
+        ),
+        (
+            role::DIT_LOW_NOISE,
+            FileRef::new(
+                REPO_WAN22_GGUF,
+                "LowNoise/Wan2.2-T2V-A14B-LowNoise-Q5_K_M.gguf",
+            ),
+        ),
+        (
+            role::VAE_WAN21,
+            FileRef::new(
+                REPO_WAN22_DIFFUSERS,
+                "vae/diffusion_pytorch_model.safetensors",
+            ),
+        ),
+        (
+            role::LORA_HIGH_NOISE,
+            FileRef::new(
+                REPO_WAN22_LORA,
+                "wan2.2_t2v_A14b_high_noise_lora_rank64_lightx2v_4step_1217.safetensors",
+            ),
+        ),
+        (
+            role::LORA_LOW_NOISE,
+            FileRef::new(
+                REPO_WAN22_LORA,
+                "wan2.2_t2v_A14b_low_noise_lora_rank64_lightx2v_4step_1217.safetensors",
+            ),
+        ),
     ],
 };
 
@@ -212,11 +304,15 @@ mod tests {
     fn variants_resolve() {
         for v in VARIANTS {
             assert_eq!(variant(v.id).map(|x| x.id), Some(v.id));
-            let dit_pt = usize::from(v.dit_pt_role.is_some());
+            let extra = usize::from(v.dit_pt_role.is_some())
+                + usize::from(v.gguf_high_role.is_some())
+                + usize::from(v.gguf_low_role.is_some())
+                + usize::from(v.lora_high_role.is_some())
+                + usize::from(v.lora_low_role.is_some());
             // `files()` also panics if any declared role is missing from MANIFEST.
             assert_eq!(
                 v.files().count(),
-                dit_pt + v.weight_roles.len() + v.aux_roles.len()
+                extra + v.weight_roles.len() + v.aux_roles.len()
             );
         }
         assert!(variant("no-such-model").is_none());

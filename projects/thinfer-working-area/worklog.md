@@ -7,224 +7,158 @@ files (see Status). Scratch is ephemeral; nothing here depends on a scratch file
 
 ## NOW / NEXT
 
-**Video session shipped 3 knobs (2026-06-27, assistant on auto, GPU):**
-1. **Duration cap is no longer SILENT.** `VideoPlan.warnings` (request.rs) carries a
-   notice when a `--duration`/default is capped to the per-res VRAM envelope;
-   surfaced via the progress sink in `ltx.rs` + `executor.rs` (CLI stderr + web
-   SSE). Explicit over-budget `--frames` stays a hard error. Fixes the "asked 5s,
-   got 2s, no idea why" complaint -- at 1280x704 the user now sees "requested ~5.0s
-   was capped... lower the resolution (1024x576 ~3s, 768x512 ~5s)". Test
-   `ltx_duration_cap_warns_and_caps`. (5s physically cannot fit at 1280x704 on 8GB;
-   the cap is real, only the silence was the bug.)
-2. **Q4_K_M Gemma text encoder = SHIPPED as a real option (CLI + web + wire),
-   APPLIES TO ALL LTX/SULPHUR MODELS.** New role `ENCODER_GGUF_Q4`
-   (`gemma-3-12b-it-Q4_K_M.gguf`, 7.3G vs 12.5G) in BOTH manifests. The encoder
-   gained a per-site `dense_dequant` map + kind-probe (mirrors `ltx::dit`'s
-   mixed-quant path) so it reads the Q4_K/Q6_K mix directly -- the matmul pipeline
-   is bf16-reading regardless, only the dequant step varies by probed kind.
-   GPU-measured on the PLAIN-LTX manifest (`encoder_perf LTX_ENC_QUANT=q4_k_m`):
-   **Q8 forward 15.7s vs Q4 5.6s (~2.8x)**, all 49 states finite. End-to-end smoke
-   (`--encoder q4`, 512x320) = coherent, photoreal, on-prompt. Surface: new
-   `EncoderQuant {Q8,Q4}` enum (model.rs) -> `VideoRequest.encoder` -> wire
-   `encoder: Option<EncoderQuant>` -> CLI `--encoder q8|q4` (default q8) -> serve
-   api -> web "Text encoder" dropdown (LTX-only, app.js reveals). Role resolved by
-   `VideoRequest::ltx_encoder_role()` (request field; `THINFER_LTX_ENCODER=q4_k_m`
-   still forces Q4 as a power-user/test override). Q8 stays the default
-   (conditioning quality). Cold/RAM-pressured loads (the 103s case) also benefit
-   from the 42%-smaller file + less page-cache evict. **The encoder + cap fix are
-   LTX-WIDE (shared encoder, `is_ltx()`-gated, `resolve_ltx`); only the distill
-   experiment (#3) was Sulphur-only.** Serve REDEPLOYED with all of this.
-3. **Sulphur distill-LoRA experiments = NO win; condsafe@1.0 stays the default.**
-   The fold (`ltx::lora`) now stacks N `(lora, strength)` pairs
-   (`re-encode(dequant(base) + Σ strength_i·B_i@A_i)`) -- a real, durable upgrade
-   from the single-lora fold. Behind `THINFER_SULPHUR_DISTILL`: `stack` =
-   `condsafe@0.7 + distilled-lora-384@0.5` (the official ComfyUI distilled-workflow
-   recipe; new role `DISTILL_LORA_384`, Lightricks 7.6G); `rank768` = the
-   `sulphur_lora_rank_768` standalone. Default unchanged = `[condsafe@1.0]`.
-   **GPU-eyeballed all three (1280x704, seed 42, candid-smile prompt):**
-   - `rank768` = UNDERCOOKED MUSH (brown blur, faint lattice). Root cause:
-     `sulphur_lora_rank_768.safetensors` is NOT a step-distill LoRA -- it is a
-     CONTENT lora for the standard CFG workflow (the distilled workflow never loads
-     it). Folding a non-distill lora into the 8-step CFG-free path can't converge.
-     So "did we pick an old/weak distill?" = **NO**: our `condsafe` IS the correct
-     distill artifact. (kept as repro-only.)
-   - `stack` = coherent + sharp, but MORE illustrative/anime + still off-prompt
-     (3 stylized girls, not the candid woman). Lower distill strength did NOT cut
-     the illustrative skew -- it increased it. NOT a win for photoreal.
-   - `condsafe@1.0` (run6, the shipped default) = the most realistic of the three.
-   **Verdict: distill-LoRA choice does not move photorealism/adherence.** The
-   illustrative skew + off-prompt subject is the CFG-free regime ceiling (already
-   established), NOT the distill. The Sulphur content is ALREADY in our `sulphur_dev`
-   GGUF base (the workflow instead uses generic dev + `sulphur_final` content lora;
-   `sulphur_final` isn't in any public repo -- a user-renamed file). COST seen: the
-   fold pushes host RAM to ~40GB (rank768) / ~40GB (stack); fine on the 63G box.
-- Grid-artifact report (user saw a lattice on 720p): our 1280x704 two-stage CLI
-  mp4 is PROVABLY clean (high-pass + Laplacian + 4x-contrast flat regions show only
-  subject edges, no VAE-seam/upscaler-checkerboard/macroblock grid). The user's grid
-  is browser-export/viewer-side (contact-sheet preview, lower-bitrate re-encode, or
-  motion-only shimmer) -- need their actual clip to close.
-- **DONE: Q4 encoder promoted to a real CLI/web/wire option (see #2) + serve
-  redeployed.** Possible follow-up: default `--encoder q4` for the `*-q4` model
-  variants (they already signal a footprint/speed tradeoff) -- not done (Q8 is the
-  conditioning-quality default everywhere for now). The distill knobs
-  (`stack`/`rank768`) stay env repro-only (no quality win). If chasing photoreal
-  further, the lever is the regime/CFG (vetoed) or a different base, NOT the
-  distill. The multi-lora-stack fold + per-lora strength is in place for any future
-  recipe. Bound the unbounded host fold cache before any stacked fold ships.
+**ACTIVE: Wan 2.2 14B A14B (MoE) + LightX2V distill, GGUF Q5_K_M.** New target on
+the shipped Wan backbone. Numerics CORRECT (coherent, on-prompt). Frame-envelope
+cap + per-model `max_frames` + form fixes done; default validated at
+512x288x25f. NOT committed (user browser-verifies first).
 
-**Sulphur-2 = FIXED + served + eyeballed sharp (2026-06-26).** The blurry/
-undercooked output is RESOLVED by folding the distill LoRA into the dev DiT at
-load. Root cause confirmed from the Sulphur ComfyUI workflows: the published GGUF
-(`vantagewithai/Sulphur-2-Base-GGUF`, `sulphur_dev-{Q8_0,Q4_K_M}.gguf`) is the
-BASE (`dev`) checkpoint, NOT distilled -- the `t2v distilled` workflow loads dev +
-the distill LoRA at strength 1.0 (CFG=1), while `t2v base` (no LoRA) needs ~50
-steps + CFG 3.6. Running dev un-distilled through our 8-step CFG-free sampler was
-the undercooked denoise. Re-eyeball (512x320, 25f, seed 42, the original prompt):
-sharp, coherent, temporally consistent -- the denoise converges. (Style skewed
-illustrative; that is prompt-adherence under our CFG-free veto, not the bug.)
-- **Fix = `ltx::lora::LoraFoldSource`** (new, self-contained; shipped Ideogram
-  fold left untouched per DO-NOT-DISTURB). Wraps the DiT GGUF + LoRA, serves
-  `re-encode(dequant(base) + B@A)` at auto-discovered sites, passes the rest
-  through. ENCODING-PRESERVING (Q8_0 stays Q8_0, bf16 stays bf16, same [N,K] +
-  exact byte size) so it is a byte-shape drop-in for the DiT loader -- no loader/
-  register changes. Folded bytes cached in RAM (residency re-acquires per step).
-- **LoRA specifics** (`distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_
-    condsafe.safetensors`, repo `SulphurAI/Sulphur-2-base`): bf16, keys
-  `diffusion_model.{X}.lora_{A,B}.weight`; NO `.alpha` -> scale 1.0 (rerank baked
-  it in) -> plain B@A. Rank VARIES per tensor (read from `lora_A.shape[0]`: attn
-  36, ff 45-72, gate_logits 14-27). Non-zero sites = video/audio self-attn
-  (`attn1`/`audio_attn1`, incl `to_gate_logits`) + per-modality FFN +
-  patchify/proj_out; cross-attn (`attn2`/`audio_attn2`/`*_to_*_attn`) + all adaLN
-  are zeroed in the file (B==0) and auto-skipped. Same STAGE1_SIGMAS 8-step CFG-
-  free path; CFG stays vetoed.
-- **Wiring**: `SULPHUR_MANIFEST` adds role `DISTILL_LORA` (Sulphur-only;
-  `required_files` appends it when `is_sulphur`); `ltx.rs` wraps the DiT source in
-  a `DitSource` enum (Plain GGUF | Folded) so the DiT-resident phase stays one
-  monomorphic type. LTX distilled models = Plain passthrough (already distilled).
-- Tests: `ltx::lora` unit tests (fold_add, encode_rows Q8/bf16 round-trip,
-  discover_specs zero-skip + rank read) GREEN. Serve rebuilt --release +
-  relaunched (HTTPS up). NEXT (optional, not blocking): if illustrative style is
-  unwanted, the only CFG-free lever is a different sigma schedule (the distilled
-  workflow uses a shorter manual schedule) -- tune only if user asks.
-- **`sulphur-2-q4`**: folded matmul sites re-encode to Q8_0 (`fold_out_enc`), which
-  `register_attn/ff` already hint -> no Q4_K-align / Q6_K-requant hazard; non-folded
-  tensors stay Q4_K. Should work but GPU-UNVALIDATED (default `sulphur-2` Q8 is the
-  validated fix; q4 mirrors the LTX-q4 unvalidated status).
+**ROOT CAUSE CORRECTED: the 832x480x81f default device-loss was NOT a VRAM-budget
+overflow -- it is a GPU FAULT in the 14B DiT above a SEQUENCE-LENGTH threshold.**
+The earlier "activation envelope overshoots 8GB" framing was wrong. Telemetry
+(`nvidia-smi` + Windows System log) is decisive:
+- nvlddmkm **Event 153 (GPU engine reset)** at each crash, with NO Event 4101/13
+  (TDR "display driver stopped responding") and NO VRAM pinning at 8151MiB. That
+  signature = a GPU OOB shader fault (MMU fault -> engine reset -> "device lost" on
+  the wgpu poll thread), not a timeout and not a clean alloc-OOM. wgpu's
+  uncaptured-error handler never fires (it is a hardware fault, not a CPU-side
+  validation error), so the root error stays masked behind "Parent device is lost".
+- It is **rows-bound, independent of weight budget and f_lat**: 2G and 5G both
+  fault at 6240 rows; 256x256x61f (4096 rows, f_lat 16) COMPLETES. Empirical DiT
+  rows (= f_lat*(h/16)*(w/16)): 2048 / 3120 / 4096 complete; 6240 faults. So the
+  machine tolerates long GPU work (5f step = 184s, no TDR) -- it is a fault, not a
+  budget or a timeout.
+- **SHIPPED GUARD (not the real fix): a frame-envelope cap.** `WAN22_MAX_LATENT_CELLS
+  = 4096` (confirmed-safe ceiling, ~1.5x under the 6240 fault). Generalized
+  `ltx_max_frames` -> per-model `VideoModelId::max_frames(w,h)` (LTX /32 grid +
+  6300 cells; Wan /16 grid + 4096). `resolve()` now caps ALL video models: explicit
+  over-cap `--frames` = hard error, `--duration`/default cap DOWN with a warning.
+  Default res LOWERED to 512x288 (clip length scales as cells/(h/16*w/16), so
+  lower res = more frames): default 512x288x25f = 4032 cells ~1.6s. 832x480 stays a
+  form option but caps to 5f (~0.3s).
+- **REAL FOLLOW-UP (lifts the cap): root-cause the DiT shader OOB at >~4096-6240
+  rows.** Needs GPU-assisted validation (DEBUG_PRINTF / robustness) or op-bisection
+  of the block forward -- too slow to brute-force (184s/step). Suspects ruled OUT:
+  storage-buffer binding (NVIDIA maxStorageBufferRange = 4GB), the bcast/elementwise
+  ops (they spill the 1D grid past 65535 via `linear_workgroups`), matmul/SDPA grid
+  dims (all < 65535 at these rows), ROPE_MAX_SEQ_LEN 1024 (per-axis, never hit).
+  NOT yet checked op-by-op for a hardcoded seq buffer or a Y/Z dispatch dim. Fixing
+  it (or row-tiling the DiT forward) would lift the cap and unlock 832x480 at real
+  lengths.
+- LESSON: pull DRIVER telemetry (Event log Id 153 vs 4101, nvidia-smi peak) BEFORE
+  theorizing OOM-vs-TDR-vs-fault; do not bracket by guess-and-check. And never
+  redeploy a video model at an unvalidated default res x frames. (Wan2.2-14B,
+  2026-06-27.)
+- A hung `thinfer.exe`/`thinfer-serve.exe` (device-lost, ~12GB) must be KILLED
+  before any GPU run.
 
-**USER COMPLAINTS post-fold = RESOLVED + shipped (2026-06-27, assistant ran GPU).**
-The "coherent but wrong subject/action" (man for a woman, off-script, animated-not-
-photoreal) was REGIME: low-res single-stage is OOD. Fixed by defaulting LTX/Sulphur
-to the in-distribution WIDESCREEN TWO-STAGE regime. Eyeballed at 1280x704 + 1024x576
-(seed 42, the candid-smile-says-Hi prompt): photoreal woman, slow smile to camera,
-correct scene, audio "Hi" present. Samples in scratch/ltx-regime (run2 1280x704x49f,
-run5 1024x576x73f).
-- **New shipped LTX defaults** (validated end-to-end via bare CLI = 1280x704 / 49f /
-  two-stage / 11 steps): `video_defaults` LTX -> **1280x704** (was 768x512);
-  `two_stage_default()=is_ltx()` so `upscale` defaults ON for LTX in serve/cli/web
-  (single-stage at the widescreen default OOMs and low-res single-stage is OOD, so
-  two-stage is the only good 8GB regime); web LTX presets are widescreen-first +
-  upscale box pre-checked.
-- **8GB frame envelope (the real constraint = FRAMES dominate VRAM, not just dims).**
-  The two-stage stage-2 denoise runs the DiT at FULL res, and its activation peak +
-  per-block streaming alloc/free fragmentation set the ceiling. Empirical (RTX 5070
-  8GB, `peak_live`): 25f@1280x704=4.2G, **49f@1280x704=5.4G (safe, the default)**,
-  73f@1280x704 DEVICE-LOST, 97f@1280x704 OOM (6.5G at fail); 73f@1024x576=5.2G safe.
-  Encoded as `LTX_MAX_LATENT_CELLS=6300` (full-res `f_lat*h/32*w/32`) +
-  `ltx_max_frames(w,h)`: `resolve_ltx` defaults frames to `min(121, max)` and
-  REJECTS explicit over-budget `--frames` at submit (fail fast, no mid-denoise
-  device-loss). Unit test `ltx_frame_cap_tracks_resolution`. So 1280x704->49f(~2s),
-  1024x576->73f(~3s), low-res still gets the full 5s.
-- **`LTX_VRAM_BUDGET_CAP=2G` (ltx.rs).** The DiT (22.8GB) always streams per-block,
-  so a high budget only steals the device slack stage-2 needs -> clamp LTX weight
-  residency to 2G (serve's 5G default OOMs stage 2; per-step time unchanged, streaming
-  dominates either way). Only lowers an over-large budget; cap point = ltx.rs `run`.
-- **GOTCHA: a stage-2 OOM at high (res x frames) loses the DEVICE (hard panic in the
-  wgpu poll thread), not a catchable alloc error** -> leaves a hung 22GB process
-  holding VRAM (had to `Stop-Process`). The frame cap keeps the default well clear;
-  but engine-side, stage-2 has no graceful-OOM-retry like the VAE decode reseed (a
-  follow-up: catch + fail the job instead of device-loss).
-- **Old NB "assistant must NOT run GPU" is LIFTED for solo/overnight sessions** (user
-  asleep, explicitly set me on auto to run GPU). The contention rule only applies
-  when the user is actively using the card. Clean up any hung thinfer.exe after a
-  device-loss before the next run (`Get-Process thinfer` / `Stop-Process`).
-- **WATCH: Sulphur fold host-RAM cache.** `LoraFoldSource` caches every folded site
-  (video+audio self-attn + FFN + patchify/proj_out across 48 blocks) as Q8 bytes in
-  an unbounded host `HashMap` (NOT governed by `ram_budget`), on top of the mmap'd
-  GGUF. For 22B that is ~12-18GB host RAM. Fine on a big-RAM box; revisit (bound the
-  cache / evict folded bytes after upload) if host RAM is tight. Not the cause of
-  the VRAM OOM above, but a Sulphur-only footprint cost vs plain LTX.
+**BUG FIXED (the flat/NaN garbage): the module-level matmul sites bypassed the
+dequant pre-pass.** The patch embed (`dit.rs:linear_bias`), condition embedder
+(`condition_embedder.rs:linear_bias_into`), and proj_out all called `scope.matmul`
+on the block's shared `matmul_qkv` pipeline with the RAW weight buffer + no dequant.
+On the Q8 GGUF path `matmul_qkv` is rebuilt for the dequant WORKSPACE (b_nmajor=true,
+workspace dtype), so feeding it a raw module weight -> inf/NaN. (The earlier bisect
+mis-located this inside `dispatch_matmul_site`'s dense-dequant branch; those module
+sites never reach that branch.) Fix:
+- Module weights now stay DENSE BF16 (`module_transcode` removed; F16/F32 narrow to
+  bf16 at upload via residency gpu_encoding). Tiny matmuls, run once/forward -> zero
+  perf cost, slightly better quality than Q8.
+- New dedicated `matmul_module` pipeline in `common/block.rs` (always bf16 weight,
+  `square` 64x64 tiling), wired into the 3 module sites. Decoupled from the block's
+  per-site quant pipeline for ALL Wan models (no-op for the bf16 5B path).
+- `WanVariant::wan22.act_pref` F32 -> Bf16 (F32 was a diagnostic; bf16 holds the
+  14B residual range, ~2x faster, matches pyref dtype).
+- All WIP diagnostics removed (MoE step-0 taps, pre-VAE latent stats, residency q8
+  transcode-roundtrip log). fmt+clippy clean.
+- Perf profile unchanged from the accepted ceiling: bf16 acts, Q8 block weights via
+  dequant-once, no DP4A (the 14B residual overflows f16 so the F16-gated i8/sg-SDPA
+  paths stay off). `matmul_module` adds ~0.28s total (negligible vs ~80s of block
+  matmuls/4 steps).
+- Everything else WORKS: VAE name fix (use Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  vae/, NOT QuantStack's original-named one), the 2-expert source/load/denoise,
+  the step-distill scheduler, wiring. (Default frame cap = the BLOCKED item above.)
+- Engine done: `WanDitConfig::wan22_14b`, `WanVaeConfig::wan2_1`, generalized LoRA
+  fold (`ltx::lora` discover accepts `lora_down`/`lora_up`), `open_wan22_source`
+  (two folded GGUF experts, prefixed `high.`/`low.`, unioned with reused umT5 +
+  diffusers Wan2.1 VAE), `WanModel::load_variant` + `WanVariant`, MoE step-distill
+  denoise (`Wan22DistillSampler`, expert switch + boundary evict), loader prefix,
+  per-config `vae_scale`. Wired: `VideoModelId::Wan22T2vA14b`,
+  manifest two-expert `VariantFiles`, executor arm, web dropdown.
+- KEY DECISIONS that worked: LoRA covers EVERY block matmul -> fold re-encodes all
+  to Q8_0 (uniform). Module-level weights (patch, condition embedder, proj_out) stay
+  DENSE BF16 on a dedicated `matmul_module` pipeline -- they are NOT folded by the
+  LoRA so quantizing them bought nothing, and they bypass the per-site quant block
+  pipeline cleanly. F16/F32 module weights + norms/biases/scale_shift_table
+  upload-narrow to bf16 automatically (residency gpu_encoding), no extra work.
+- GOTCHA fixed: QuantStack `Wan2.1_VAE.safetensors` is ORIGINAL-Wan naming
+  (`decoder.middle.*`, `decoder.conv1`) which the diffusers-named VAE loader can't
+  read. Use the diffusers VAE from `Wan-AI/Wan2.2-T2V-A14B-Diffusers` (vae/) ->
+  `decoder.up_blocks.*`. VAE_WAN21 points there.
+- DOWNLOAD GOTCHA: bare `hf download QuantStack/Wan2.2-T2V-A14B-GGUF` pulls EVERY
+  quant (150GB+); always name the specific file.
+- PARITY: full-14B pyref INFEASIBLE on this box (fp32 ~56GB, same as the abandoned
+  LTX-22B pyref). Validation = unit tests (schedule, fold) + reused-validated
+  components (umT5, Wan DiT arch both 5B-parity-green) + the new Wan2.1 VAE
+  exercised in the real decode + GPU eyeball. A component Wan2.1-VAE pyref gate is
+  a possible follow-up (ask first; GPU).
+- Original verified facts below.
+- **Two 14B experts (MoE), identical config**: dim 5120 (40 heads x 128), 40
+  layers, ffn 13824, in/out 16, freq 256, eps 1e-6, text_len 512, patch (1,2,2),
+  qk rms_norm_across_heads, cross_attn_norm, RoPE theta 10000. CONTRAST with our
+  5B TI2V (24 heads/30 layers/14336 ffn/48 ch) -- genuinely different, NOT a
+  layer-count tweak.
+- **Expert switch by noise level**: high-noise expert (index 0) when
+  `t >= boundary*1000`, low-noise (index 1) below. T2V boundary 0.875 (I2V 0.900).
+  DISTILLED switches by STEP INDEX: `step_index < boundary_step_index(=2)` -> high,
+  else low (4 steps = 2 high / 2 low).
+- **VAE = Wan2.1** (z_dim 16, 4x8x8, non-residual, patch_size 1), NOT the TI2V-5B
+  VAE (z48, 4x16x16, residual). latents_mean/std are 16-vecs (from VAE config).
+  Engine `WanVaeConfig` is already parameterized; needs a `wan2_1()` ctor + the
+  non-residual/patch1 decode path EXERCISED (5B e2e never hit it).
+- **LightX2V distill**: 4-step CFG-free. denoising_step_list [1000,750,500,250],
+  sample_shift 5.0, CFG off. TWO separate rank-64 LoRAs (one per expert,
+  strength 1.0), name-matched to expert at load. Fold each into its expert GGUF via
+  the LoRA-fold machinery (`ltx::lora`, generalize the key map; ideally lift to a
+  shared module).
+- **Weights (HF cache, downloading)**: QuantStack/Wan2.2-T2V-A14B-GGUF
+  (HighNoise/LowNoise Q5_K_M + VAE/Wan2.1_VAE.safetensors); lightx2v/
+  Wan2.2-Distill-Loras (t2v high+low rank64 1217). umT5-XXL REUSED from the
+  FastWan diffusers bundle (already cached); tokenizer reused.
+- **Engine touch-points** (from code map): `WanDitConfig::wan22_14b()` +
+  `WanVaeConfig::wan2_1()`; de-hardcode `WanModel::load` 5B config (pipeline.rs:338,
+  343) and module consts `VAE_SCALE=16`/`TEMPORAL_SCALE=4` (pipeline.rs:59-60) ->
+  per-config (Wan2.1 VAE is 8x spatial). Two-expert dispatch at the DiT forward
+  sites (pipeline.rs:1114/1193) keyed on the in-scope `timestep`/step index.
+  `VariantFiles` must carry TWO DiT roles (currently single leading DiT). New
+  `ModelManifest` + `manifest()` arm; `VideoModelId` variant + web dropdown string.
+- **Defaults (upstream)**: 1280x720 (832x480 for the 480p/distill config), 81
+  frames (4n+1, the Wan rule), fps 16, flow shift 5.0 (distill). Respect 8GB:
+  DiT streams per-block so VRAM is bounded by activations, not weights; size the
+  default to the frame envelope like LTX.
+- **Plan: don't commit; user verifies in browser.**
 
-**LTX-2.3 distilled = functionally COMPLETE + served (CLI + thinfer-serve + web).**
-22B joint audio-video (Lightricks LTX-2). All components parity GREEN, e2e health
-GREEN, eyeballed. Architecture + porting detail live in `ltx-plan.md` + the code.
-Models: `ltx-2.3-distilled` (Q8 DiT, default/quality baseline) +
-`ltx-2.3-distilled-q4` (Q4_K_M, footprint-only option). Perf defaults: f16dp4a DiT
-+ f16 VAE decode.
+**LTX-2.3 + Sulphur-2 family = SHIPPED (commit a48a81b, 2026-06-27).** 22B joint
+audio-video. Two-stage widescreen default + per-res frame/duration caps, Q4 Gemma
+encoder option, Sulphur distill-LoRA fold. Detail in git + `ltx-plan.md`. Forward
+notes retained below; the rest is git history.
 
-**PROMPT LOGGING REMOVED (2026-06-26).** Stripped prompt text from all generate
-DIAG logs (`executor.rs` x5: 4 image + 1 video `prompts`; `ltx.rs` x1). Structural
-fields (model/dims/steps/seed/tokens/budgets) stay; prompt content never logged.
-Serve rebuilt + relaunched with this change. See [[feedback_no_prompt_logging]].
+## LTX (shipped) -- forward notes only
 
-**SERVE IS CURRENT (redeployed 2026-06-26).** `thinfer-serve --release` rebuilt +
-relaunched; now carries everything: **single-stage distilled DEFAULT** + opt-in
-`--upscale` / `upscale` / web "Upscale (hi-res refine)" checkbox (see ltx-plan
-two-render-paths decision), f16 VAE decode default, f16dp4a DiT default, per-job
-fresh wgpu device (VRAM-leak fix), serve `--config` hardening, web tiny-vae label
-fix + q4 dropdown. Both e2e paths GREEN (single-stage @512x320, two-stage @64x64
-via `THINFER_E2E_UPSCALE=1`). Web prompt-splitter fixed: only LongLive splits the
-box into per-line shots; LTX/Wan send the whole box (blank-line prompts no longer
-400). Relaunch recipe under Crate layout.
-
-**PENDING (small, decided not done): rename the knob `upscale`/`--upscale` -> `fast`
-/`--fast`** (default off = single-stage quality; on = two-stage half-res+upscale,
-faster but lower quality on small dims). User chose "Fast" naming. Pure rename of
-the bool already wired across request/wire/api/cli/ltx.rs/e2e/web; help+tooltip
-should say "faster; lower quality below ~1024px".
-
-**Open validation (user, in browser):** (1) SUPERSEDED -- 512x320 single-stage is
-OOD (off-prompt), confirmed; the default is now 1280x704 two-stage (see RESOLVED
-block). (2) deliberate-OOM smoke -> next job runs clean (per-job device); (3) Q4_K_M
-DiT GPU finite check + smoke gen (`dit_perf LTX_DIT_QUANT=q4_k_m` was interrupted by
-GPU contention).
-
-**LTX adherence RESOLVED (2026-06-26): it was REGIME, not a thinfer bug.** The bad
-runs were 512x320 SINGLE-STAGE = out-of-distribution for the distilled model; user
-confirmed the character speaks the requested words once dims/regime are right.
-Verified faithful to upstream (so none is the cause): Gemma enc, FE V2, connector
-KV, AdaLN + `prompt_adaln` KV modulation, full DiT block (cross-attn + per-head
-gating + av-cross), sampler -- all bit-tight; product tokenization correct (66 clean
-tokens, quoted `Hi` survives); `build_video/audio_positions` (the only un-gated
-serve path) match upstream `get_patch_grid_bounds`+`get_pixel_coords`+`/fps`
-bit-for-bit. Ecosystem norm for distilled (ComfyUI): TWO-STAGE, WIDESCREEN 16:9/21:9
-(portrait/square distort), dims /32, ~1280x704+, 8-step+upscale, **CFG=1 (off; do
-NOT add CFG -- user vetoed the 2x cost)**, frames 8n+1.
-- Full-e2e-pyref plan ABANDONED: 22B won't fit this box even with offload (bf16
-  ~44GB host > ~10GB pyref ceiling) and diffusers has no GGUF LTX2 transformer path.
-  thinfer is the only engine here that runs the full 22B pipeline.
-
-**NEXT (forward):**
-- **DONE: product defaults no longer push users OOD** -- LTX now defaults to
-  1280x704 two-stage with the per-res frame cap (see RESOLVED block above). Possible
-  follow-ups: (a) stage-2 graceful-OOM retry so an over-budget config fails the job
-  instead of device-losing; (b) a dynamic vram cap keyed to detected card VRAM
-  instead of the hardcoded 2G (for >8GB cards); (c) make the web duration placeholder
-  recompute per selected preset (now static 2s = the 1280x704 figure).
-- **Parity-test tokenizer hole.** encoder/connector pyref tokenizes via
-  `AutoTokenizer(gguf_file=...)` = DEGENERATE 145-token char-frags; engine is fed
-  those same garbage ids, so the gates validate correct math on the WRONG token
-  distribution. Fix = point the pyref at the product `tokenizer.json` (role
-  TOKENIZER, 66 clean tokens); re-run encoder_parity + connector_parity to
-  re-confirm the bands on real tokens (GPU; ask first).
-
-**Open / not blocking:**
-- LTX VAE further speed (ONLY if wanted -- it is < DiT now): split `run_graph` into
-  per-up-block submits (bound peak to one block -> fewer/larger tiles), or a
-  TAE-style tiny video autoencoder (new weights + decoder, larger scope).
-- Smaller Gemma encoder (~16s, stream-bound, ~2% of e2e): BLOCKED on a user call --
-  needs a ~7-9GB Q4_K_M/Q5_K_M gemma download + the per-quant-kind dequant dispatch
-  ported to the encoder `mm` helper (template = `ltx/dit.rs` AttnDequant/FfDequant)
-  + revisits the deliberate Q8 conditioning-quality choice (user rejected Q4 QAT).
+- Adherence was REGIME, not a bug: low-res single-stage is OOD. Default = in-distrib
+  WIDESCREEN TWO-STAGE, CFG=1 (CFG is vetoed: 2x cost). Distill-LoRA choice does NOT
+  move photorealism (the illustrative/off-subject skew is the CFG-free regime
+  ceiling). condsafe@1.0 is the correct distill artifact; the standalone rank768 is a
+  CONTENT lora, not step-distill (mush if folded into the 8-step path).
+- **8GB frame envelope = frames dominate VRAM** (stage-2 runs the DiT at full res).
+  `LTX_MAX_LATENT_CELLS=6300` + `ltx_max_frames`: 1280x704->49f(~2s),
+  1024x576->73f(~3s). Over-budget explicit `--frames` rejected at submit.
+- **Stage-2 OOM at high (res x frames) LOSES THE DEVICE** (hard wgpu poll-thread
+  panic), not a catchable alloc error -> hung process holding VRAM. No graceful-OOM
+  retry yet (follow-up). Clean up hung thinfer.exe before the next run.
+- `LTX_VRAM_BUDGET_CAP=2G`: the 22.8GB DiT always streams per-block, so a high weight
+  budget only steals device slack stage-2 needs.
+- **Sulphur fold host-RAM cache is UNBOUNDED** (`LoraFoldSource` caches every folded
+  site as Q8 bytes, ~12-18GB for 22B, not governed by ram_budget). Fine on big-RAM;
+  bound it before any stacked fold ships. (Applies to the Wan fold too -- watch it.)
 
 ## Lessons / dead-ends (do not retry)
 
@@ -248,7 +182,7 @@ NOT add CFG -- user vetoed the 2x cost)**, frames 8n+1.
   large-outlier channels > f16's 65504; full-f16 diverges badly even with clip.
   bf16 residual is load-bearing. (Whole i8-DP4A block path also needs f16 acts ->
   same wall.) Keep residual bf16. NB this is the DiT RESIDUAL only -- f16 acts in
-  the VAE decode + the LTX-distilled DiT acts are fine (validated, see LTX below).
+  the VAE decode + the LTX-distilled DiT acts are fine (validated).
 - **VAE decode is conv-GPU bound** (~95% conv time; metric = `gpu_disp_ms` for
   `vae_decode`, NOT nvidia-smi). DO NOT retry the conv3d im2col loop-invariant-div
   hoist (REVERTED, slower).
@@ -268,14 +202,11 @@ NOT add CFG -- user vetoed the 2x cost)**, frames 8n+1.
     budget (SEED_SAFETY) and re-seed balanced on OOM -- a per-axis halve explodes
     the tile count.
   - Gemma-3 encoder MUST run F32 acts: head_dim 256 needs `large_d_sdpa` (no bf16
-    variant) AND the residual overflows f16. All sites dense (no i8: massive-
-    activation outliers; once-per-request anyway).
-  - The gemma `(1+w)` norm bake is REAL and STAYS: llama.cpp pre-bakes +1 into
-    norm.weight; both engine (UnitOffset) and pyref (HF `1+w`) add +1 -> they match.
-    Don't "fix" it.
+    variant) AND the residual overflows f16. All sites dense (no i8).
+  - The gemma `(1+w)` norm bake is REAL and STAYS (llama.cpp pre-bakes +1; both
+    engine UnitOffset and pyref HF `1+w` add +1 -> match). Don't "fix" it.
   - DON'T flip the DiT to strict budget: it relies on overshooting into device
-    slack at the 768x512 default; strict would reject configs that work today (it
-    has no adaptive smaller-retry). DiT soft budget is BY DESIGN.
+    slack; strict would reject configs that work today (no adaptive smaller-retry).
 
 ## Carry-forward gotchas (engine-general)
 
@@ -293,6 +224,14 @@ NOT add CFG -- user vetoed the 2x cost)**, frames 8n+1.
 - **umT5 / large-residual encoders MUST run bf16 acts** -- residual grows past f16's
   65504 -> inf -> NaN (token-uniform "washed blob", prompt-dependent). Check
   non-finite NOT just NaN (`inf.is_nan()` is false).
+- **Module-level matmuls bypass `dispatch_matmul_site`.** Sites like Wan's patch
+  embed / condition embedder / proj_out call `scope.matmul` DIRECTLY with a raw
+  weight + no dequant pre-pass. They reuse a block pipeline (`matmul_qkv`), which on
+  a quant DiT is rebuilt for the dequant WORKSPACE (b_nmajor + workspace dtype) -> a
+  raw module weight there reads as garbage (inf/NaN), AND a bf16 weight misreads
+  under F16 acts. Rule: module-level dense linears get their OWN bf16 `matmul_module`
+  pipeline (block.rs), weights kept bf16. Don't quantize a weight whose matmul site
+  has no dequant step. (Wan2.2-14B garbage-output bug, 2026-06-27.)
 - **RoPE dtype**: freqs MUST pack to the act dtype (`freqs_upload_bytes`); f32 freqs
   into an f16 kernel -> inf -> NaN. Wan RoPE3D = interleaved-pair; Qwen3 + LTX-2.3 =
   half-rot ("split"). Pick the right one per model.
@@ -308,8 +247,9 @@ NOT add CFG -- user vetoed the 2x cost)**, frames 8n+1.
 
 ## Status (shipped -- DO NOT DISTURB)
 
-- **LTX-2.3 distilled** (22B joint audio-video) -- shipped, see NOW/NEXT +
-  `ltx-plan.md`. Q8 default + Q4_K_M option; f16dp4a DiT + f16 VAE.
+- **LTX-2.3 distilled + Sulphur-2** (22B joint audio-video) -- shipped, see
+  `ltx-plan.md`. Q8 default + Q4_K_M; f16dp4a DiT + f16 VAE; two-stage widescreen
+  default; Sulphur distill-LoRA fold.
 - **FastWan2.2-TI2V-5B-FullAttn** -- parity GREEN, bf16 acts. UniPC is the default
   sampler (CLI+serve+web); DMD is the parity path. PENDING: user eyeballs a UniPC
   clip vs the KingNish Space; else fall back to GPU upstream-pyref compare.
@@ -324,9 +264,7 @@ NOT add CFG -- user vetoed the 2x cost)**, frames 8n+1.
   FLUX.2 KL VAE, i8 DP4A. 512x512/4-step ~79s.
 - **Z-Image** -- shipped; `zimage-plan.md` (read only if touching it).
 - **Qwen-Image-Edit-Rapid + Qwen-Image-Rapid** (20B MMDiT, 4-step CFG-free; t2i +
-  image-edit) -- shipped, deployed to serve (CLI+serve+web+OpenAPI), all components
-  parity GREEN, e2e health GREEN. `qwen-image-plan.md`. OPEN: user eyeballs a
-  browser gen (full-DiT t2i pyref OOMs); opt-in `--ref-size` perf knob (edit-only).
+  image-edit) -- shipped, deployed to serve. `qwen-image-plan.md`.
 - **i8 DP4A matmul ON by default** (`--no-i8-matmul` = bf16 reference path).
 
 ## Crate layout + serve (shipped reference)
@@ -358,8 +296,7 @@ NOT add CFG -- user vetoed the 2x cost)**, frames 8n+1.
     `projects/thinfer-artifacts` as before), stderr -> `scratch/serve.log` (tracing),
     stdout -> `scratch/serve.stdout.log`, `-WindowStyle Hidden`. Confirm via the log:
     must show `serving HTTPS with a self-signed cert` + `listening (https)`. NEVER run
-    the exe in a foreground Bash call (it blocks = "hang"). (The CLI now rejects a
-    bare-positional config instead of silently booting HTTP defaults.)
+    the exe in a foreground Bash call (it blocks = "hang").
 - DEFERRED: mid-generate cancel (touches shipped generate sigs); serve==CLI
   byte-parity test (weights+GPU gated); disk-backed SSE ring buffer; wasm<->http web
   toggle (server-only by decision).
@@ -371,12 +308,10 @@ Card = RTX 5070 Laptop (8GB); keep budgets <8GB (8GB OOMs the device). All seria
 - LTX e2e: `THINFER_POWER_PREF=high THINFER_TRACE=1 THINFER_E2E_FRAMES=121
   THINFER_E2E_HEIGHT=320 THINFER_E2E_WIDTH=512 THINFER_E2E_VRAM_GB=6
   THINFER_E2E_PNG_DIR=<dir> cargo test -p thinfer-conformance --features ltx-e2e
-  --release t2v_e2e_health -- --nocapture --test-threads=1` (env dims default to the
-  tiny health gate). Component parity gates: `vae_parity`, `audio_vae_parity`,
-  `vocoder_parity`, `dit_parity`/`dit_full_parity`/`modulation_parity`,
-  `connector_parity`, `encoder_parity` (run ONE AT A TIME -- the 12.5GB encoder OOMs
-  a multi-test binary). `dit_perf` = engine-only perf bench (env dims, dumps the
-  trace rollup the e2e never does).
+  --release t2v_e2e_health -- --nocapture --test-threads=1`. Component parity gates:
+  `vae_parity`, `audio_vae_parity`, `vocoder_parity`, `dit_parity`/`dit_full_parity`/
+  `modulation_parity`, `connector_parity`, `encoder_parity` (run ONE AT A TIME -- the
+  12.5GB encoder OOMs a multi-test binary). `dit_perf` = engine-only perf bench.
 - FastWan parity gate: `THINFER_TRACE=1 THINFER_POWER_PREF=high
   THINFER_E2E_BUDGET_GB=6 THINFER_E2E_WIDTH=256 THINFER_E2E_HEIGHT=256
   THINFER_E2E_PNG_DIR=<dir> cargo test -p thinfer-conformance --features wan-e2e

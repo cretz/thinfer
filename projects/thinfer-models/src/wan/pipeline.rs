@@ -35,7 +35,7 @@ use crate::wan::dit_block::{WanDitBlockTaps, WanDitConfig, WanDitPipelines, conf
 use crate::wan::kv_cache::{KvCacheConfig, KvWindowCache, RamKvStore};
 use crate::wan::loader::{WanI8Sites, register_wan_dit_handles};
 use crate::wan::manifest::RECIPE;
-use crate::wan::scheduler::{DmdConfig, DmdSampler};
+use crate::wan::scheduler::{DmdConfig, DmdSampler, Wan22DistillConfig, Wan22DistillSampler};
 use crate::wan::umt5::{
     Umt5BlockOpsHost, Umt5Encoder, Umt5ForwardError, Umt5Handles, Umt5Pipelines, Umt5Taps,
     register_umt5_handles,
@@ -54,9 +54,10 @@ use crate::wan::vae_tiny::{
 /// `max_sequence_length`; SkyReels-V2 ships 512.
 const TEXT_SEQ: usize = dit_config::TEXT_SEQ;
 const MAX_PROMPT_TOKENS: usize = TEXT_SEQ;
-/// Wan2.2-TI2V high-compression VAE: 16x spatial, 4x temporal (the new module,
-/// `wan/vae.rs`). The latent grid the DiT sees derives from these.
-const VAE_SCALE: usize = 16;
+/// VAE temporal compression: 4x for BOTH the Wan2.1 VAE (14B) and the
+/// Wan2.2-TI2V high-compression VAE (5B). Spatial compression DIFFERS (8x Wan2.1
+/// vs 16x TI2V) and is per-model (`WanModel.vae_scale`, from the loaded
+/// `WanVaeConfig`); the latent grid the DiT sees derives from both.
 const TEMPORAL_SCALE: usize = 4;
 
 /// The DiT step loop prefetches two blocks ahead (next-acquire + prefetch via
@@ -91,9 +92,10 @@ pub enum VideoSampler {
 /// [`VideoSampler::UniPc`].
 pub struct GenerationParams {
     pub prompt: String,
-    /// Frame height in pixels. Divisible by `VAE_SCALE * PATCH_H` (32).
+    /// Frame height in pixels. Divisible by `vae_scale * PATCH_H` (32 for the
+    /// TI2V 5B VAE, 16 for the Wan2.1 14B VAE).
     pub height: u32,
-    /// Frame width in pixels. Divisible by `VAE_SCALE * PATCH_W` (32).
+    /// Frame width in pixels. Divisible by `vae_scale * PATCH_W`.
     pub width: u32,
     /// Output frame count. Must be `4 * k + 1` (the causal-VAE temporal grid).
     pub num_frames: u32,
@@ -200,9 +202,17 @@ pub struct WanModel<S: WeightSource, T: Tokenizer> {
     umt5_pipelines: Umt5Pipelines,
     umt5_handles: Umt5Handles,
     dit: WanDitPipelines,
+    /// The (high-noise, for MoE) DiT handle set, registered under the `high.`
+    /// prefix on the Wan2.2 path or unprefixed otherwise.
     dit_handles: LoadedWanDitHandles,
-    /// Per-variant DiT geometry (FastWan 5B today). Drives latent channels, the
-    /// block dims, and the loader layer count.
+    /// Wan2.2-A14B low-noise expert (`low.` prefix). `Some` switches `denoise`
+    /// to the step-distill MoE path (high steps `0..boundary`, low after).
+    dit_handles_low: Option<LoadedWanDitHandles>,
+    /// VAE spatial compression (8 for the Wan2.1 14B VAE, 16 for the TI2V 5B).
+    /// Latent <-> pixel dim math reads this (temporal is the const TEMPORAL_SCALE).
+    vae_scale: usize,
+    /// Per-variant DiT geometry. Drives latent channels, the block dims, and the
+    /// loader layer count.
     cfg: WanDitConfig,
     vae: WanVaeDecoder,
     /// LightTAE tiny decoder, present only when the model was loaded with
@@ -307,9 +317,52 @@ impl<SE: core::fmt::Debug> From<WanVaeTinyDecodeError<SE>> for GenerateError<SE>
     }
 }
 
+/// Which Wan variant to build: DiT geometry, VAE config, and the quant/MoE
+/// policy. Keeps `WanModel::load_variant` model-agnostic.
+#[derive(Clone)]
+pub struct WanVariant {
+    pub dit: WanDitConfig,
+    pub vae: WanVaeConfig,
+    /// Two-expert MoE: register `high.`/`low.` handle sets + run the step-distill
+    /// denoise with the per-step expert switch.
+    pub moe: bool,
+    /// Forced block activation dtype (overrides the f16-probe). The 14B residual
+    /// stream has large-outlier channels that exceed f16's 65504 ceiling over its
+    /// 40 layers (f16 saturates -> flat), so it runs bf16 acts (f32 exponent range,
+    /// matches the pyref dtype). The 5B (3072 dim) fits f16. `None` = probe (F16
+    /// when supported).
+    pub act_pref: Option<ActDtype>,
+}
+
+impl WanVariant {
+    /// FastWan2.2-TI2V-5B / LongLive-2.0-5B: single expert, bf16 safetensors,
+    /// the TI2V high-compression VAE.
+    pub fn fastwan_ti2v_5b() -> Self {
+        Self {
+            dit: WanDitConfig::fastwan_ti2v_5b(),
+            vae: WanVaeConfig::fastwan_ti2v_5b(),
+            moe: false,
+            act_pref: None,
+        }
+    }
+
+    /// Wan2.2-T2V-A14B: two 14B experts (GGUF, LightX2V distill folded -> Q8_0
+    /// blocks; dense module-level weights stay bf16), the Wan2.1 VAE, distill MoE
+    /// denoise. Bf16 acts (the 14B residual overflows f16).
+    pub fn wan22_t2v_a14b() -> Self {
+        Self {
+            dit: WanDitConfig::wan22_14b(),
+            vae: WanVaeConfig::wan2_1(),
+            moe: true,
+            act_pref: Some(ActDtype::Bf16),
+        }
+    }
+}
+
 impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
     /// Build the model: register every umT5 + DiT + VAE handle with residency
     /// and compile every WGSL kernel once. No bytes flow until `generate`.
+    /// Single-expert FastWan/LongLive 5B; probe-driven act dtype.
     pub async fn load(
         backend: Arc<WgpuBackend>,
         residency: WeightResidency<S>,
@@ -317,13 +370,21 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         vae: VaeChoice,
         i8_matmul: bool,
     ) -> Result<Self, ModelLoadError> {
-        Self::load_with_act(backend, residency, tokenizer, vae, None, i8_matmul).await
+        Self::load_variant(
+            backend,
+            residency,
+            tokenizer,
+            vae,
+            WanVariant::fastwan_ti2v_5b(),
+            None,
+            i8_matmul,
+        )
+        .await
     }
 
-    /// Diagnostic variant of [`load`] that forces the block activation dtype
-    /// instead of probing device f16 support. Lets the e2e run an fp32-acts
-    /// forward to separate amplified-bf16 rounding from algorithmic (dtype-
-    /// independent) error. Prod callers use [`load`] (probe-driven).
+    /// Diagnostic [`load`] that forces the block activation dtype instead of
+    /// probing device f16 support (the fp32-acts e2e, to separate amplified-bf16
+    /// rounding from algorithmic error). FastWan/LongLive 5B variant.
     pub async fn load_with_act(
         backend: Arc<WgpuBackend>,
         residency: WeightResidency<S>,
@@ -332,15 +393,38 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         act_override: Option<ActDtype>,
         i8_matmul: bool,
     ) -> Result<Self, ModelLoadError> {
+        Self::load_variant(
+            backend,
+            residency,
+            tokenizer,
+            vae,
+            WanVariant::fastwan_ti2v_5b(),
+            act_override,
+            i8_matmul,
+        )
+        .await
+    }
+
+    /// Build a specific Wan variant (DiT geometry + VAE + MoE/quant policy).
+    /// `WanVariant::fastwan_ti2v_5b` = the single-expert 5B path; `wan22_t2v_a14b`
+    /// = the two-expert A14B (Q8_0 module transcode, distill denoise).
+    pub async fn load_variant(
+        backend: Arc<WgpuBackend>,
+        residency: WeightResidency<S>,
+        tokenizer: T,
+        vae: VaeChoice,
+        variant: WanVariant,
+        act_override: Option<ActDtype>,
+        i8_matmul: bool,
+    ) -> Result<Self, ModelLoadError> {
         let timing = tracing::enabled!(tracing::Level::INFO);
         let t0 = timing.then(trace::Instant::now);
 
-        let cfg = WanDitConfig::fastwan_ti2v_5b();
+        let cfg = variant.dit;
 
         // --- handle registration (no upload) ---
-        // umT5 GGUF ships matmuls quantized in-file; bf16/f32 safetensors stay
-        // dense (no transcode for v1 -- keep the parity path bit-clean).
-        let vae_cfg = WanVaeConfig::fastwan_ti2v_5b();
+        let vae_cfg = variant.vae.clone();
+        let vae_scale = vae_cfg.spatial_compression;
         // Opt-in DP4A matmul: transcode the DP4A-safe site weights (qkv + ffn_up)
         // to Q8_0 at load and route them through the i8xi8 `matmul_i8`
         // (dot4I8Packed) path. Those A-sides are norm-conditioned (no massive
@@ -358,7 +442,19 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             ffn_up: q8,
         };
         let umt5_handles = register_umt5_handles(&residency, None)?;
-        let dit_handles = register_wan_dit_handles(&residency, &cfg, None, i8_sites)?;
+        // MoE registers two expert handle sets under `high.`/`low.` prefixes so
+        // both coexist in one residency; single-expert uses no prefix. Block
+        // matmuls carry no load transcode (bf16 path) or are already Q8_0 (the
+        // Wan2.2 GGUF, folded); the dense module-level weights always stay bf16.
+        let (dit_handles, dit_handles_low) = if variant.moe {
+            let high = register_wan_dit_handles(&residency, &cfg, "high.", None, i8_sites)?;
+            let low = register_wan_dit_handles(&residency, &cfg, "low.", None, i8_sites)?;
+            (high, Some(low))
+        } else {
+            let h = register_wan_dit_handles(&residency, &cfg, "", None, i8_sites)?;
+            (h, None)
+        };
+        let dit_probe_prefix = if variant.moe { "high." } else { "" };
         // VAE decoder weights all fit resident; diff the registered footprint
         // across registration so the decode can reserve exactly it (not a budget
         // fraction) when sizing its non-evictable tile workspace.
@@ -391,13 +487,21 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // pipeline set for every matmul site (patch, condition embedder, all 30
         // blocks, proj_out), so the dtype must be uniform; the ComfyUI GGUF
         // quantizes those big linears uniformly (norms/biases stay F32).
-        let dit_w = probe_weight(&residency, "blocks.0.attn1.to_q.weight");
+        let dit_w = probe_weight(
+            &residency,
+            &format!("{dit_probe_prefix}blocks.0.attn1.to_q.weight"),
+        );
         let umt5_w = probe_weight(&residency, "encoder.block.0.layer.0.SelfAttention.q.weight");
-        let act = act_override.unwrap_or(if backend.supports_shader_f16() {
-            ActDtype::F16
-        } else {
-            ActDtype::F32
-        });
+        // `act_override` (the fp32 diagnostic) wins; else the variant's forced
+        // dtype (14B -> Bf16, its residual overflows f16); else probe (F16 when
+        // the device supports it).
+        let act = act_override
+            .or(variant.act_pref)
+            .unwrap_or(if backend.supports_shader_f16() {
+                ActDtype::F16
+            } else {
+                ActDtype::F32
+            });
         // umT5 must NOT use f16 acts: T5-family residual streams are large and
         // ours grow monotonically through the 24 blocks, exceeding f16's 65504
         // ceiling around block ~20 (overflow -> inf -> NaN in final_layer_norm).
@@ -410,6 +514,22 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         tracing::info!(?dit_w, ?umt5_w, ?act, ?umt5_act, "Wan dtype selection");
 
         let ffn_up_wd = i8_sites.ffn_up.map(WeightDtype::Quant);
+        // On a Q8 DiT (Wan2.2 GGUF: every matmul weight is Quant), the i8 DP4A
+        // path would be selected for ALL sites -- but the cross-attn qkv (un-normed
+        // text K/V), proj, and ffn_down acts are outlier-heavy and overflow i8
+        // act_quant's f16 scale (-> inf). Force those to the dense dequant-once
+        // path; only ffn_up (normed A-side) keeps i8. FastWan (bf16 DiT) leaves the
+        // non-i8 sites bf16 so this never triggers.
+        let dense_acts = if matches!(dit_w, WeightDtype::Quant(_)) {
+            DenseActSites {
+                qkv: true,
+                proj: true,
+                ffn_up: false,
+                ffn_down: true,
+            }
+        } else {
+            DenseActSites::default()
+        };
         let dit = WanDitPipelines::compile(
             &backend,
             &block_cfgs(
@@ -418,6 +538,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 SiteOverride {
                     qkv_self: i8_sites.qkv_self.map(WeightDtype::Quant),
                     ffn_up: ffn_up_wd,
+                    dense_acts,
                 },
             ),
         )
@@ -450,6 +571,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             umt5_handles,
             dit,
             dit_handles,
+            dit_handles_low,
+            vae_scale,
             cfg,
             vae: WanVaeDecoder {
                 pipelines: vae_pipelines,
@@ -553,8 +676,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         Ok(WanVideo {
             frames,
             num_frames,
-            height: h_lat * VAE_SCALE,
-            width: w_lat * VAE_SCALE,
+            height: h_lat * self.vae_scale,
+            width: w_lat * self.vae_scale,
         })
     }
 
@@ -641,8 +764,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         Ok(WanVideo {
             frames,
             num_frames,
-            height: h_lat * VAE_SCALE,
-            width: w_lat * VAE_SCALE,
+            height: h_lat * self.vae_scale,
+            width: w_lat * self.vae_scale,
         })
     }
 
@@ -684,7 +807,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         if let Some(sink) = block_res_diag.as_deref_mut() {
             sink.clear();
         }
-        let div = (VAE_SCALE * dit_config::PATCH_H) as u32;
+        let div = (self.vae_scale * dit_config::PATCH_H) as u32;
         if params.height == 0
             || params.width == 0
             || !params.height.is_multiple_of(div)
@@ -700,8 +823,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 num_frames: params.num_frames,
             });
         }
-        let h_lat = (params.height as usize) / VAE_SCALE;
-        let w_lat = (params.width as usize) / VAE_SCALE;
+        let h_lat = (params.height as usize) / self.vae_scale;
+        let w_lat = (params.width as usize) / self.vae_scale;
         let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
 
         let _denoise = trace::scope!("denoise_ar").entered();
@@ -972,7 +1095,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         if let Some(sink) = step_diag.as_deref_mut() {
             sink.clear();
         }
-        let div = (VAE_SCALE * dit_config::PATCH_H) as u32;
+        let div = (self.vae_scale * dit_config::PATCH_H) as u32;
         if params.height == 0
             || params.width == 0
             || !params.height.is_multiple_of(div)
@@ -989,8 +1112,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 num_frames: params.num_frames,
             });
         }
-        let h_lat = (params.height as usize) / VAE_SCALE;
-        let w_lat = (params.width as usize) / VAE_SCALE;
+        let h_lat = (params.height as usize) / self.vae_scale;
+        let w_lat = (params.width as usize) / self.vae_scale;
         let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
 
         let _denoise = trace::scope!("denoise").entered();
@@ -1064,8 +1187,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // --- 4. DiT denoise (CFG-free). The DiT forward is byte-identical for
         // both samplers; only the schedule around it differs. UniPC (the served
         // default) mirrors the public FastWan Spaces; DMD is the parity path. ---
-        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
-        let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
+        let shape = || WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
 
         // Cap the streamed DiT weight set below budget by the in-flight transient
         // envelope (overlapping prefetch stagings + the forward workspace), so the
@@ -1076,6 +1198,55 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 + DIT_WORKSPACE_RESERVE,
         );
 
+        // --- Wan2.2-A14B MoE step-distill path (two experts). 4-step flow-Euler,
+        // CFG-free; the high-noise expert runs the early steps, the low-noise
+        // expert the rest. At the switch, evict the high expert's streamed blocks
+        // so the low expert streams into freed VRAM (the experts never overlap in
+        // residency). `params.sampler` is ignored here (the schedule is fixed). ---
+        if let Some(low_handles) = self.dit_handles_low.clone() {
+            let high = WanDit::assemble(self.dit_handles.clone(), shape(), self.cfg);
+            let low = WanDit::assemble(low_handles, shape(), self.cfg);
+            let sampler = Wan22DistillSampler::new(&Wan22DistillConfig::wan22_t2v_a14b());
+            let n_steps = sampler.num_steps();
+            for i in 0..n_steps {
+                let _step = trace::scope!("step", i = i).entered();
+                if let Some(p) = progress {
+                    p(ProgressEvent::Step {
+                        i: i as u32 + 1,
+                        n: n_steps as u32,
+                    });
+                }
+                if i > 0 && sampler.is_high_noise(i - 1) && !sampler.is_high_noise(i) {
+                    self.residency.evict_all_and_free(&*self.backend);
+                    workspace.drain_pool();
+                }
+                let dit = if sampler.is_high_noise(i) {
+                    &high
+                } else {
+                    &low
+                };
+                let inputs = WanDitInputs {
+                    image: &sample,
+                    text: &text,
+                    timestep: sampler.timestep(i),
+                };
+                let out = dit
+                    .forward(
+                        &self.backend,
+                        &self.dit,
+                        &self.residency,
+                        &*workspace,
+                        &inputs,
+                    )
+                    .await?;
+                sample = sampler.step(i, &out.image, &sample);
+            }
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+            return Ok((sample, f_lat, h_lat, w_lat));
+        }
+
+        let dit = WanDit::assemble(self.dit_handles.clone(), shape(), self.cfg);
         match params.sampler {
             // --- DMD: one DiT forward per fixed timestep, renoise between. The
             // step-diag taps live here (the parity/bisection path is DMD-only). ---
@@ -1238,8 +1409,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         tap_block: usize,
         workspace: &mut Workspace<WgpuBackend>,
     ) -> Result<WanStep0Diag, GenerateError<S::Error>> {
-        let h_lat = (params.height as usize) / VAE_SCALE;
-        let w_lat = (params.width as usize) / VAE_SCALE;
+        let h_lat = (params.height as usize) / self.vae_scale;
+        let w_lat = (params.width as usize) / self.vae_scale;
         let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
 
         let token_ids = self
@@ -1425,8 +1596,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         step_index: usize,
         workspace: &mut Workspace<WgpuBackend>,
     ) -> Result<Vec<f32>, GenerateError<S::Error>> {
-        let h_lat = (params.height as usize) / VAE_SCALE;
-        let w_lat = (params.width as usize) / VAE_SCALE;
+        let h_lat = (params.height as usize) / self.vae_scale;
+        let w_lat = (params.width as usize) / self.vae_scale;
         let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
         let n_lat = self.cfg.in_channels * f_lat * h_lat * w_lat;
         assert_eq!(latent.len(), n_lat, "forward_velocity_at latent len");
@@ -1534,6 +1705,12 @@ struct SiteOverride {
     /// text and overflow f16 under i8 acts, so it stays dense at `weight_dtype`.
     qkv_self: Option<WeightDtype>,
     ffn_up: Option<WeightDtype>,
+    /// Sites that must use the dense (dequant-once -> bf16 matmul) path instead of
+    /// i8 DP4A even when their weight is Quant. On a Q8 DiT (Wan2.2 GGUF, every
+    /// site Quant) the cross-attn qkv, proj, and ffn_down acts are un-normed /
+    /// outlier-heavy: i8 act_quant's f16 scale overflows -> inf. FastWan keeps
+    /// these bf16 so the issue never arises; here we force the dense path.
+    dense_acts: DenseActSites,
 }
 
 fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype, ovr: SiteOverride) -> BlockWgslConfigs {
@@ -1566,7 +1743,7 @@ fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype, ovr: SiteOverride) -> Bl
         matmul_adaln: ops,
         ops,
         i8_sdpa: false,
-        dense_acts: DenseActSites::default(),
+        dense_acts: ovr.dense_acts,
         large_d_sdpa: false,
     }
 }

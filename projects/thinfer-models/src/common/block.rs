@@ -97,6 +97,13 @@ pub struct BlockMatmuls {
     pub ffn_up: MatMulF32,
     pub ffn_down: MatMulF32,
     pub adaln: MatMulF32,
+    /// Module-level dense linears (patch embed, condition embedder, proj_out):
+    /// weights that are NOT folded into the quant block set and so stay bf16
+    /// (`Linear2D [K, N]`). Always bf16-weight, independent of whatever encoding
+    /// the block matmul sites take, so these sites never touch the per-site
+    /// dequant/i8 block pipeline. Square 64x64 tiling (the patch/proj_out M can
+    /// be large, unlike adaln's M=1).
+    pub module: MatMulF32,
 }
 
 impl BlockMatmuls {
@@ -180,6 +187,9 @@ impl BlockMatmuls {
                 tn: 2,
                 ..MatMulConfig::DEFAULT
             }),
+            // Bf16 square (b_nmajor=false): module weights are dense bf16
+            // `Linear2D [K, N]`, never the N-major dequant workspace.
+            module: MatMulF32::new(square(WeightDtype::Bf16)),
         }
     }
 }
@@ -205,6 +215,10 @@ pub struct BlockPipelines {
     pub matmul_ffn_up: WgpuPipeline,
     pub matmul_ffn_down: WgpuPipeline,
     pub matmul_adaln: WgpuPipeline,
+    /// Module-level dense bf16 matmul (patch embed, condition embedder,
+    /// proj_out). Always reads a bf16 `Linear2D [K, N]` weight directly, so the
+    /// module sites are decoupled from the block's per-site quant pipeline.
+    pub matmul_module: WgpuPipeline,
     /// Per-site dequant pre-pass. `Some` iff the corresponding matmul's
     /// weight_dtype is Quant. When present, the layer forward dequants the
     /// quant weight into a workspace buffer, then runs the bf16-nmajor
@@ -477,6 +491,13 @@ impl BlockPipelines {
         let ffn_up_wgsl = matmuls.ffn_up.wgsl(&ffn_up_mm_cfg);
         let ffn_down_wgsl = matmuls.ffn_down.wgsl(&ffn_down_mm_cfg);
         let adaln_wgsl = matmuls.adaln.wgsl(&cfgs.matmul_adaln);
+        // Module-level dense linears: force a bf16 weight regardless of the
+        // block's quant choice (the patch/embedder/proj_out weights stay bf16).
+        let module_cfg = WgslConfig {
+            weight_dtype: WeightDtype::Bf16,
+            ..*cfg
+        };
+        let module_wgsl = matmuls.module.wgsl(&module_cfg);
         // Build dequant pipelines for sites whose source weight is Quant.
         let dq_layout = thinfer_core::ops::dequant::layout();
         let build_dq =
@@ -720,6 +741,9 @@ impl BlockPipelines {
                 .await?,
             matmul_adaln: backend
                 .create_pipeline("matmul_adaln", &adaln_wgsl, "main", mm_layout)
+                .await?,
+            matmul_module: backend
+                .create_pipeline("matmul_module", &module_wgsl, "main", mm_layout)
                 .await?,
             dequant_qkv,
             dequant_qkv_self,

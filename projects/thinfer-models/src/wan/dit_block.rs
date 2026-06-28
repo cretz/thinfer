@@ -122,6 +122,22 @@ impl WanDitConfig {
         Self::fastwan_ti2v_5b()
     }
 
+    /// Wan2.2-T2V-A14B (each MoE expert). Audited against the upstream
+    /// `high/low_noise_model/config.json` (`WanModel`): dim 5120 (num_heads 40 *
+    /// head_dim 128), num_layers 40, ffn_dim 13824, in/out 16 (the Wan2.1 VAE
+    /// z_dim). Both experts share this config; they differ only in weights. The
+    /// 14B is NOT a layer-count tweak of the 5B (different heads/ffn/channels +
+    /// the Wan2.1 VAE instead of the TI2V high-compression one).
+    pub fn wan22_14b() -> Self {
+        Self {
+            num_heads: 40,
+            ffn_dim: 13824,
+            num_layers: 40,
+            in_channels: 16,
+            out_channels: 16,
+        }
+    }
+
     /// Model dim `num_heads * HEAD_DIM`.
     pub fn inner(&self) -> usize {
         self.num_heads * config::HEAD_DIM

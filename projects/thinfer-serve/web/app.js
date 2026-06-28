@@ -27,7 +27,7 @@ const log = (line) => {
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid"],
-  video: ["fastwan-ti2v-5b", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
+  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
 };
 // LTX-2.3 is a joint audio-video model with its own grid (/64 dims, 8k+1 frames).
 // Its video VAE decode tiles to the VRAM budget, so larger dims are allowed (more
@@ -38,6 +38,13 @@ const MODELS = {
 // Sulphur-2 is an LTX-2.3 DiT finetune: byte-identical architecture, same grid +
 // audio path, so it shares the whole LTX UI surface.
 const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.startsWith("sulphur-2");
+// Wan2.2-T2V-A14B (MoE 14B): a heavier Wan-family tier with its own surface. It
+// runs a fixed 4-step LightX2V distill schedule (the steps/sampler knobs do not
+// apply) and only the full Wan2.1 VAE (no tiny-VAE path), so the Steps + Quality
+// rows are hidden for it. The 14B per-step activation envelope is large, so it
+// defaults to 832x480 on the 8GB card and the server caps the clip length to the
+// per-resolution VRAM frame budget (lower the resolution for a longer clip).
+const isWan22Model = (model) => model === "wan2.2-t2v-a14b";
 // Multi-shot video: only LongLive treats each prompt line as a separate shot.
 // Every other video model is single-prompt (the whole box is one prompt).
 const isMultiShotModel = (model) => model === "longlive-2.0-5b";
@@ -89,11 +96,26 @@ const LTX_PRESETS = [
   { label: "768x512 landscape (fast, less faithful)", width: 768, height: 512 },
   { label: "512x320 landscape (fastest, off-prompt / OOD)", width: 512, height: 320 },
 ];
+// Wan2.2-T2V-A14B size ladder (/16 grid, the Wan2.1 VAE 8x + patch 2). The 14B
+// DiT faults above ~4096 latent cells on the 8GB card (a sequence-length GPU
+// fault, not a budget overflow), and clip length scales as cells/(h/16*w/16), so
+// the default is the lower-res 512x288 (16:9) -- it fits 25f (~1.6s) under the
+// cap, vs 832x480's 5f (~0.3s). Higher-res entries are sharper but the server
+// trims the clip to the per-resolution frame budget (832x480 -> ~5f). First =
+// default.
+const WAN22_PRESETS = [
+  { label: "288p landscape (512x288, default, ~1.6s)", width: 512, height: 288 },
+  { label: "288p portrait (288x512)", width: 288, height: 512 },
+  { label: "small landscape (640x384, sharper, shorter)", width: 640, height: 384 },
+  { label: "480p landscape (832x480, sharpest, ~0.3s)", width: 832, height: 480 },
+  { label: "480p portrait (480x832, sharpest, ~0.3s)", width: 480, height: 832 },
+];
 /// Size preset + grid step + min dim for a (kind, model): LTX overrides the video
-/// defaults with its /64 grid and 256 floor; everything else uses the per-kind
-/// presets (min = step).
+/// defaults with its /64 grid and 256 floor; Wan2.2-A14B uses its /16 ladder led
+/// by 832x480; everything else uses the per-kind presets (min = step).
 function sizeSpec(kind, model) {
   if (kind === "video" && isLtxModel(model)) return { presets: LTX_PRESETS, step: 64, min: LTX_MIN_DIM };
+  if (kind === "video" && isWan22Model(model)) return { presets: WAN22_PRESETS, step: 16, min: 16 };
   const step = DIM_STEP[kind];
   return { presets: PRESETS[kind], step, min: step };
 }
@@ -121,8 +143,13 @@ const MODEL_STEPS = {
 // cap (see ltx_max_frames) sizes the real default by dims: at the 1280x704
 // widescreen default that is 49 frames (~2s). Pick a lower-res preset for a
 // longer clip (e.g. 1024x576 -> ~3s). This 2s is the default-resolution figure.
+// Wan2.2-A14B: the 14B DiT's per-resolution frame cap (see WAN22_MAX_LATENT_CELLS)
+// sizes the real default by dims. At the 512x288 default that is 25 frames
+// (~1.6s @16fps). Like LTX, this is the default-resolution figure; a higher-res
+// preset yields a shorter clip (832x480 -> ~5f / ~0.3s), a lower-res one longer.
 const VIDEO_DURATION = {
   "fastwan-ti2v-5b": 5,
+  "wan2.2-t2v-a14b": 1.6,
   "longlive-2.0-5b": 5,
   "ltx-2.3-distilled": 2,
   "ltx-2.3-distilled-q4": 2,
@@ -269,12 +296,15 @@ function applyModel() {
   // single-stage and low-res single-stage is OOD), so default it on; the user can
   // still uncheck it for a fast low-res single-stage preview.
   $("upscale").checked = isLtxVideo;
-  // The Wan tiny/full VAE choice does not apply to LTX (own full VAE), so hide
-  // it rather than show a misleading "Tiny VAE" default on an LTX gen.
-  $("vae-row").hidden = isLtxVideo;
+  // The Wan tiny/full VAE choice does not apply to LTX (own full VAE) or to
+  // Wan2.2-A14B (full Wan2.1 VAE only, no tiny path), so hide it rather than show
+  // a misleading "Tiny VAE" default those models ignore.
+  const isWan22 = kind === "video" && isWan22Model(model);
+  $("vae-row").hidden = isLtxVideo || isWan22;
   // LTX runs a fixed distilled schedule (8 steps single-stage, or 8 + 3 = 11 when
-  // upscaling) and ignores the steps field, so hide it for LTX.
-  $("steps-row").hidden = isLtxVideo;
+  // upscaling) and Wan2.2-A14B a fixed 4-step LightX2V distill; both ignore the
+  // steps/sampler knobs, so hide the field for them.
+  $("steps-row").hidden = isLtxVideo || isWan22;
   populateSize(kind, model);
   // Steps default is per-model (mirrors the server): the 4-step distilled image
   // models start at 4, everything else at the kind default. LTX ignores steps
@@ -377,6 +407,22 @@ async function buildSpec() {
       audio: $("audio").checked,
       upscale: $("upscale").checked,
       encoder: $("encoder").value,
+      seed,
+    };
+  }
+  // Wan2.2-A14B runs a fixed 4-step LightX2V distill (steps/sampler ignored) and
+  // only the full Wan2.1 VAE, so omit steps and pin vae=full (sending vae=tiny
+  // would trigger a pointless tiny-VAE fetch the server then ignores). The server
+  // snaps duration to 4n+1 frames then caps to the per-resolution 8GB budget.
+  if (isWan22Model(model)) {
+    return {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      vae: "full",
       seed,
     };
   }

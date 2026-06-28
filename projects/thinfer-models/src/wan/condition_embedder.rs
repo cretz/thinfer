@@ -189,8 +189,8 @@ impl ConditionEmbedder {
         let dims = scope.u32x4_uniform(rows, out_dim, in_dim, 0)?;
         let weight = scope.import_copy(w.weight);
         scope.matmul(
-            &pipelines.matmul_qkv,
-            &pipelines.matmuls.qkv,
+            &pipelines.matmul_module,
+            &pipelines.matmuls.module,
             x,
             weight,
             dims,

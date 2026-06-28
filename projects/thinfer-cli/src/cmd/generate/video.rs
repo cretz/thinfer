@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
-use thinfer_app::model::{EncoderQuant, VIDEO_DEFAULT_STEPS, VaeChoice, VideoModelId, VideoSampler};
+use thinfer_app::model::{
+    EncoderQuant, VIDEO_DEFAULT_STEPS, VaeChoice, VideoModelId, VideoSampler,
+};
 use thinfer_app::request::{VideoFormat, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};

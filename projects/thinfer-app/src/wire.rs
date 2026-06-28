@@ -12,9 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{
-    EncoderQuant, ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler,
-};
+use crate::model::{EncoderQuant, ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler};
 use crate::progress::Stage;
 
 /// A job request from a client. Internally tagged by `kind`. Carries only what a

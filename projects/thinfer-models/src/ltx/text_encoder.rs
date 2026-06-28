@@ -175,9 +175,16 @@ pub fn register_handles<S: WeightSource>(
     // weight is requantized to `k` at load, so the resident kind is `k`; with
     // `None` it stays the on-disk kind (uniform Q8_0, or the Q4_K_M mix).
     let kind = |id: &WeightId, requant: Option<QuantKind>| -> Option<QuantKind> {
-        requant.or_else(|| match residency.source().catalog().get(id).and_then(|e| e.encoding) {
-            Some(StorageEncoding::Quant(k)) => Some(k),
-            _ => None,
+        requant.or_else(|| {
+            match residency
+                .source()
+                .catalog()
+                .get(id)
+                .and_then(|e| e.encoding)
+            {
+                Some(StorageEncoding::Quant(k)) => Some(k),
+                _ => None,
+            }
         })
     };
     let mut layers = Vec::with_capacity(gemma::N_LAYERS);
@@ -380,7 +387,12 @@ impl GemmaEncoderPipelines {
         use thinfer_core::ops::dequant::{DequantTarget, build_wgsl, layout};
         let dq_layout = layout();
         let mut dense_dequant = HashMap::new();
-        for scheme in [QuantKind::Q8_0, QuantKind::Q4_K, QuantKind::Q5_K, QuantKind::Q6_K] {
+        for scheme in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_K,
+            QuantKind::Q5_K,
+            QuantKind::Q6_K,
+        ] {
             let wgsl = build_wgsl(scheme, DequantTarget::Bf16);
             let pipeline = backend
                 .create_pipeline(
@@ -682,7 +694,9 @@ impl GemmaEncoder {
             let mask_h = scope.import(&mask_ref);
             let nxt_h = scope.import(&nxt_ref);
             let kinds = handles.layers[idx].kinds;
-            block.forward(&scope, pipelines, cur_h, freqs_h, mask_h, nxt_h, &bufs, kinds)?;
+            block.forward(
+                &scope, pipelines, cur_h, freqs_h, mask_h, nxt_h, &bufs, kinds,
+            )?;
 
             let next_idx = idx + 1;
             let next_acquire = async {

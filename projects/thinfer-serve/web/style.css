@@ -37,15 +37,24 @@ body {
   padding: 0.4rem 1.2rem;
 }
 
-/* The reference-image and audio rows each wrap a label+input pair in a div;
-   `display: contents` promotes them into the #fields grid so they align like
-   every other row (label in column 1, input in column 2) instead of cramming
-   into one cell (which shoves every following row's label into column 2). Guarded
-   with :not([hidden]) so the `hidden` attribute still collapses the row. */
+/* The reference-image, audio, encoder, steps, etc. rows each wrap a label+input
+   pair in a div; `display: contents` promotes them into the #fields grid so they
+   align like every other row (label in column 1, input in column 2) instead of
+   cramming into one cell (which shoves every following row's label into column 2,
+   visibly mis-wrapping the rows below -- e.g. Quality/Seed). Guarded with
+   :not([hidden]) so the `hidden` attribute still collapses the row. */
 #input-image-row:not([hidden]),
 #audio-row:not([hidden]),
 #upscale-row:not([hidden]),
+#encoder-row:not([hidden]),
 #steps-row:not([hidden]) {
+  display: contents;
+}
+/* The Quality (VAE) row is `.video-only` (hidden in image mode via the class, not
+   the `hidden` attribute), so gate its contents-promotion on video mode -- an
+   ungated `#vae-row` (id) would beat the `.video-only` (class) display:none and
+   leak the row onto image gens. */
+body.kind-video #vae-row:not([hidden]) {
   display: contents;
 }
 

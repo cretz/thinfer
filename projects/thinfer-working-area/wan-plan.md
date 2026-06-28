@@ -1,160 +1,118 @@
-# Wan-family video plan (BEING REPURPOSED -- see worklog.md "Direction" pivot)
+# Wan 2.2 14B A14B (MoE) + LightX2V distill -- ACTIVE port
 
-> 2026-06-19: SkyReels-V2-DF ABANDONED. New targets:
-> FastWan2.2-TI2V-5B-FullAttn (next) then LongLive-2.0-5B, both Wan2.2-TI2V-5B
-> base. SkyReels-DF-specific sections below (synchronous-DF scheduler, CFG
-> wiring, DF thesis) are OBSOLETE; the Wan-backbone / RoPE3D / umT5 / VAE-tiling /
-> GGUF lore is reusable. Prune to the 2.2 line during the port.
+Shipped Wan models (FastWan2.2-TI2V-5B, LongLive-2.0-5B) are the backbone. This
+file = the 14B-specific deltas. Engine-wide design: `plan-details.md`. All numbers
+below VERIFIED against upstream (config.json / GGUF KV / diffusers / lightx2v),
+not inferred from our 5B.
 
-## Thesis
+## Verified facts
 
-Port the Wan backbone once, unlock a family. Five candidate models share it.
-First target = SkyReels-V2-DF-1.3B-540P: lowest resource (1.3B), infinite length
-(Diffusion Forcing), commercial license, GGUF already exists, closest to the
-existing diffusion denoise loop. Scale to 5B and audio later off the same core.
+**DiT (both experts identical, upstream `high/low_noise_model/config.json`):**
+dim 5120 (40 heads x 128), num_layers 40, ffn_dim 13824, in_dim 16, out_dim 16,
+freq_dim 256, eps 1e-6, text_len 512, model_type t2v. patch (1,2,2),
+qk rms_norm_across_heads, cross_attn_norm, RoPE theta 10000 (interleaved-pair,
+the Wan family default -- NOT half-rot). Family-invariant consts (HEAD_DIM 128,
+TEXT_DIM 4096, FREQ_DIM 256, patch, rope axis split) already in
+`dit_block::config`.
 
-## Targets (priority order)
+**GGUF (QuantStack/Wan2.2-T2V-A14B-GGUF, Q5_K_M, 1095 tensors, arch "wan"):**
+ORIGINAL-Wan single-file names (blocks.{i}.self_attn.{q,k,v,o}, cross_attn.*,
+norm3, ffn.0/ffn.2, head.head, head.modulation, time_embedding.0/2,
+time_projection.1, text_embedding.0/2, patch_embedding) -> `dit_gguf_renames(40)`
+maps these to diffusers canonical EXACTLY (already in source.rs; verified shapes).
+Block matmuls MIXED quant: q/k/o = Q5_K, v + ffn.2(down) = Q6_K. Module-level =
+F16 (embedders, head.head, modulations) / F32 (patch_embedding). 40 blocks.
 
-1. SkyReels-V2-DF-1.3B-540P. Base Wan2.1-T2V-1.3B. Diffusion Forcing -> infinite
-   length. 540P. T2V + I2V variants. License: commercial OK. GGUF:
-   wsbagnsv1/SkyReels-V2-DF-1.3B-540P-GGUF (+ ...-I2V-...).
-2. LongLive-2.0-5B. Base Wan2.2-TI2V-5B. AR long multi-shot, 720p real-time.
-   Quality tier. License: NVIDIA Open Model.
-3. NAVA. Wan2.2-TI2V-5B video backbone + LTX2.3 audio VAE/vocoder. Joint
-   audio+video MMDiT, 6.3B. License: Apache-2.0. Audio bonus.
+**LoRA (lightx2v/Wan2.2-Distill-Loras, t2v high+low rank64 1217, 800 keys each):**
+keys `diffusion_model.blocks.{i}.{self_attn,cross_attn}.{q,k,v,o}.lora_{down,up}.
+weight` + `ffn.{0,2}.lora_{down,up}.weight`. **lora_down = A [rank,K], lora_up =
+B [N,rank]** (NOT lora_A/lora_B -- discover_specs must accept down/up). rank 64,
+strength 1.0, no alpha -> plain B@A. **Covers EVERY block matmul site** (self +
+cross attn qkvo + ffn up/down). Names are ORIGINAL-Wan -> fold on the GGUF's
+original names, BEFORE the canonical rename.
 
-Same backbone, cheap adds once Wan is ported: Phantom_Wan-1.3B (subject->video,
-identity), LongLive-1.3B (real-time AR, KV-cache).
+**VAE = Wan2.1 (QuantStack VAE/Wan2.1_VAE.safetensors, diffusers AutoencoderKLWan
+defaults):** base_dim 96 (decoder_base_dim None -> 96), z_dim 16, in/out 3,
+dim_mult [1,2,4,4], num_res_blocks 2, temperal_downsample [F,T,T], is_residual
+False, patch_size None->1, 8x spatial / 4x temporal, norm_eps 1e-12. latents_mean/
+std = the 16-vecs in autoencoder_kl_wan.py:986-1021. Engine `WanVaeConfig` already
+parameterized + non-residual/patch1 branches coded but UNEXERCISED (5B only hit
+residual) -> add `wan2_1()` ctor + verify decode path at e2e.
 
-## New engine work (done once for the family)
+**MoE expert switch:** high-noise expert (index 0) at high noise, low-noise
+(index 1) at low. DISTILLED (our path) switches by STEP INDEX:
+`step_index < boundary_step_index(=2)` -> high, else low. 4 steps = 2 high / 2 low.
+(Full-model timestep boundary 0.875 T2V is the non-distill path; we ship distill.)
 
-- Wan DiT block: DiT, full attention (reuse existing sdpa), cross-attention to
-  text, 3D RoPE over (T,H,W) patches, patchify (1,2,2).
-- Wan 3D causal video VAE: temporal compression (Wan2.1 VAE ~4x8x8;
-  Wan2.2-TI2V 4x16x16). Biggest genuinely-new piece vs Z-Image per-frame VAE.
-  Heed the single-heavy-submit VAE rule (plan-details); 3D adds temporal tiles.
-- umT5-XXL text encoder: encoder-decoder T5 family, relative-position bias. New
-  vs decoder-only Qwen3. Shared across the whole Wan family (and NAVA). ~5.5B;
-  quantizable (umt5_xxl fp8/gguf exists in the Wan ecosystem). The recurring
-  encoder tax.
-- Diffusion Forcing sampler: per-token independent noise levels; extend by
-  conditioning on the prior segment's last frames. Stays inside the existing
-  diffusion denoise loop. LongLive's AR/KV-cache redesign is deferred.
+**Distill sampler (lightx2v Wan22StepDistillScheduler):** 4 steps, CFG off.
+denoising_step_list [1000,750,500,250]; sigmas = linspace(1,0,1001)[:-1] then
+shift s'=shift*s/(1+(shift-1)*s) with shift 5.0; timesteps = s'*1000. Euler flow:
+x_next = x_t - (sigma_i - sigma_{i+1})*v (v = predicted flow). Two separate LoRAs
+(one per expert), each folded into its own expert.
 
-## Pinned config (SkyReels-V2-DF-1.3B-540P)
+**Defaults (upstream):** 1280x720 (832x480 for 480p/distill); 81 frames (4n+1);
+fps 16; flow shift 5.0 (distill). 8GB: DiT streams per-block.
 
-Refs (third-party/): convert_skyreelsv2_to_diffusers.py (canonical),
-transformer_skyreels_v2.py, autoencoder_kl_wan.py, umt5; GGUF repos.
+## Architecture decision (key)
 
-DiT (SkyReelsV2Transformer3DModel):
-- patch (1,2,2); in/out ch 16; heads 12 x head_dim 128 -> inner 1536
-- num_layers 30; ffn_dim 8960; freq_dim 256; text_dim 4096; eps 1e-6
-- qk_norm rms_norm_across_heads (over full inner, affine); cross_attn_norm True
-- added_kv_proj_dim/image_dim None (T2V/DF, no image branch)
-- inject_sample_info True (DF-1.3B only: fps_embedding+fps_projection into
-  timestep_proj; 14B False)
-- DF: per-frame timesteps -> 4D temb broadcast over f*pp_h*pp_w; 6-way
-  modulation (shift/scale/gate x self+ffn)
-- RoPE3D head_dim 128 -> t=44,h=42,w=42 (h=w=2*(128//6)); theta 10000;
-  interleaved-pair (repeat_interleave_real), NOT half-rot (cf Qwen3 fix)
+**Q8_0 block matmuls (LoRA-folded) + DENSE BF16 module-level matmuls.** Because the
+LoRA covers every block matmul, folding re-encodes ALL block matmuls to Q8_0
+(fold_out_enc default). The module-level weights (patch embed, condition embedder,
+proj_out) are NOT folded and are tiny + run once/forward, so they stay dense bf16
+(F16/F32 narrow to bf16 at upload) on a dedicated `matmul_module` pipeline -- they
+do NOT go through the per-site quant block pipeline. (Transcoding them to Q8 to
+"reuse one pipeline" was the original plan but it FAILED: the module sites call
+`scope.matmul` with a raw weight and no dequant pre-pass, so a Q8 -- or any non-
+workspace-dtype -- weight there reads as garbage -> inf/NaN. bf16 module weights +
+the bf16 `matmul_module` pipeline is the fix.) i8 DP4A is OFF for the 14B (it needs
+F16 acts; the residual overflows f16 so acts are bf16). Parity is BAND-based (fp32
+pyref vs Q8_0 engine), standard for quantized models (q8 = canary).
 
-VAE (AutoencoderKLWan / Wan2.1): base_dim 96, z_dim 16, dim_mult [1,2,4,4],
-res_blocks 2, temperal_downsample [F,T,T] -> 4x8x8; causal conv3d + feat_cache;
-latents_mean/std baked (16-vec). Single-heavy-submit + temporal tiling.
+**Two experts, single residency, name-prefixed.** Each expert source =
+`fold(gguf_original, lora) -> rename canonical -> prefix "high."/"low."`; union
+both with umt5 + vae into ONE residency. Loader registers two DiT handle sets
+(prefix param). Denoise picks the set per step (steps 0-1 high, 2-3 low); evict
+the high blocks at the boundary (existing phase-evict pattern). Fold cache cost:
+~13GB/expert Q8 in host RAM, both coexist per-generate (~26GB) -- fine on 63GB,
+flagged to bound (worklog WATCH).
 
-Text enc (umT5-XXL google/umt5-xxl, encoder-only): d_model 4096, d_ff 10240
-(gated gelu_new), d_kv 64, heads 64, layers 24, vocab 256384, rel-pos bias
-(32 buckets, max 128), ln eps 1e-6. Context 512.
+## Engine touch-points (build order)
 
-540P (DF defaults 544x960, 97f, 1 block): latent 16x25x68x120 (T=(97-1)/4+1);
-DiT tokens 25*34*60=51000 full self-attn; cross-attn ctx 512. >97f stitched via
-overlap_history.
+1. `dit_block::WanDitConfig::wan22_14b()` {40,13824,40,16,16}. `vae::WanVaeConfig::
+   wan2_1()` (values above).
+2. LoRA fold generalized: `discover_specs` accepts `lora_down`/`lora_up` (and keep
+   lora_A/lora_B). Lift `ltx::lora` -> shared `common::lora` (LTX + Wan both use).
+3. `loader::register_wan_dit_handles`: add `prefix: &str` + `module_transcode:
+   Option<QuantKind>` (-> Q8_0 for module-level embedders/proj_out/patch on the
+   GGUF path). Thread prefix into the name builders.
+4. `source.rs`: `open_wan22_source` -> per-expert fold+rename+prefix, union with
+   umt5(reused) + vae. PrefixSource helper (or full rename map).
+5. `pipeline.rs`: de-hardcode `WanModel::load` cfg/vae_cfg (pass model spec); make
+   `VAE_SCALE`/`TEMPORAL_SCALE` per-`WanVaeConfig` (Wan2.1 = 8/4). Hold two DiT
+   handle sets. New `VideoSampler::Wan22Distill`/denoise path with per-step expert
+   pick + the step-distill scheduler (`wan/scheduler.rs` or new module).
+6. `model.rs`: `VideoModelId::Wan22T2vA14b` ("wan2.2-t2v-a14b"), manifest arm,
+   video_defaults (832x480 or 1280x720), dim_multiple (Wan2.1 -> 8*2=16, same),
+   frames 4n+1, fps 16.
+7. `manifest.rs`: REPO_WAN22 + roles DIT_HIGH/DIT_LOW/LORA_HIGH/LORA_LOW/VAE
+   (+ reuse umt5 from REPO_DIFFUSERS); VariantFiles two-DiT; new ModelManifest.
+8. `executor.rs`: wan22 arm -> open_wan22_source -> WanModel::load.
+9. CLI auto (ValueEnum). Web: app.js dropdown string + VIDEO_DURATION.
+10. e2e parity test (`wan-e2e`) + RAM-light pyref (component-wise, tiny dims).
+11. Bench + perf (trace; i8 DP4A on; f16 SDPA if applicable).
 
-Weights (all DiT-only GGUF, Z-Image lesson holds):
-- DiT wsbagnsv1/SkyReels-V2-DF-1.3B-540P-GGUF: BF16 2.87 GB, Q4_K_M 992 MB,
-  Q8_0 1.55 GB (13 quants)
-- umT5 city96/umt5-xxl-encoder-gguf: Q4_K_M 3.66 GB .. Q8_0 6.04 GB .. F16 11.4
-- VAE Wan2.1_VAE.pth (Wan-AI/Wan2.1-T2V-14B), safetensors path like Z-Image
+## RAM-light pyref (parity)
 
-## Sources
+pyref loads the GGUF (dequant to fp32) + folds the LoRA (fp32) per expert, tiny
+dims (64x64, F=5 -> f_lat=2; or 4n+1 min), 2-4 steps, CFG off. 14B fp32 won't fit
+-> COMPONENT-WISE only (one block, VAE encode+decode, condition embedder), never
+full-DiT (OOM). Mirror the existing FastWan `video_e2e` harness + the LTX
+component-gate discipline. q8 canary band; do NOT attempt full 14B pyref.
 
-- SkyReels-V2: github.com/SkyworkAI/SkyReels-V2; arxiv 2504.13074;
-  Skywork/SkyReels-V2-DF-1.3B-540P; GGUF wsbagnsv1/SkyReels-V2-DF-1.3B-540P-GGUF.
-- Wan2.1: Wan-AI/Wan2.1-T2V-1.3B. Wan2.2-TI2V-5B: Wan-AI + QuantStack GGUF.
-- LongLive: arxiv 2509.22622 / Efficient-Large-Model/LongLive-1.3B; LongLive-2.0
-  arxiv 2605.18739 / Efficient-Large-Model/LongLive-2.0-5B.
-- NAVA: ernie-research.github.io/NAVA; baidu/NAVA (Apache-2.0).
-- diffusers SkyReels-V2 pipeline docs.
+## Do-not-retry / gotchas
 
-## umT5 encoder specifics
-
-Mirror `z_image/text_encoder.rs`. Arch deltas vs Qwen3: T5LayerNorm = RMSNorm
-(reuse op_rmsnorm); sdpa scale=1.0 (no qk scaling); bidirectional (no causal
-mask); no q/k norm, no RoPE; gated-gelu FF (`gelu_new(wi_0)*wi_1 -> wo`, use
-`GeluMulF32`); per-layer relative-position bias; runs final_layer_norm. Inner =
-heads*d_kv = 4096 = d_model; separate q/k/v (no fused qkv). Weights:
-`encoder.block.{i}.layer.0.{layer_norm, SelfAttention.{q,k,v,o,
-relative_attention_bias}}`, `.layer.1.{layer_norm, DenseReluDense.{wi_0,wi_1,
-wo}}`, `shared`/`encoder.embed_tokens`, `encoder.final_layer_norm`.
-
-Relpos bias (keep the flash kernel generic): SDPA `has_mask` is a MODE -
-0=none, 1=shared `[B,S,S]`, 2=per-head `[B,H,S,S]` (only the mask row index
-gains `+hq`, no new bindings). A dedicated `relpos_bias` act op expands compact
-`table [num_buckets,H]` + CPU `bucket_map [S,S]` (u32) into `[H,S,S]`:
-`out[h,i,j] = table[bucket_map[i,j]*H + h]`. bucket = HF
-relative_position_bucket (bidirectional, 32 buckets, max_dist 128) of
-(key - query); table = relative_attention_bias.weight (HF
-Embedding[num_buckets, n_heads]). Identical math to HF's dense `[1,H,S,S]`
-bias; compact uploads, no dense materialize.
-
-## e2e parity (pinned design)
-
-Foundation must land before the test (modules are complete but no pipeline yet).
-Build order: DF sampler -> WanSource -> WanModel (glue + taps) -> video_e2e_parity
-+ gen_video_e2e_parity_ref.py. Mirror `zimage/e2e_parity.rs` + `ZImageSource`/
-`ZImageModel` (shared by CLI/web/test); reuse pinned-noise byte-load, per-stage
-tap+tolerance+linfit compare, budget asserts, PNG dump.
-
-Pinned config (lowest pyref that still validates both branches everywhere):
-- prompt "a red balloon over a green field" (content irrelevant; we byte-compare)
-- 64x64, F=5 -> f_lat=2, h_lat=w_lat=8; DiT tokens = 2*4*4 = 32
-- steps 2, seed 42, guidance_scale 1.0 (NO CFG: one DiT forward/step)
-- noise [16, 2, 8, 8] = 2048 f32, byte-loaded both sides
-- WHY F=5/f_lat=2: minimum that hits BOTH causal-VAE branches each side -
-  decoder frame0=Rep/no-double + frame1=time_conv double (out 1+4=5 frames);
-  encoder chunk0=downsample3d passthrough + chunk1=time_conv-with-cache (4->2->1).
-  f_lat=1 would only hit the Rep/passthrough branch. pyref floor = umT5-XXL
-  (5.5B, runs once); dims below 64 don't reduce it, so 64 is the sweet spot.
-- stages to tap+compare: umt5_out, step{i}.prev_sample, pre_vae_latent,
-  vae.<stage>, vae_frames. Add a VAE-ENCODE stage (fixed pinned input video ->
-  WanVaeEncoder::encode vs pyref `_encode`) so the encoder is actually validated
-  (t2v path only uses the decoder).
-- tolerances start broken-vs-noisy, tighten after first clean run (zimage habit).
-- staging: per-frame PNG seq ours_/py_ + tiled contact-sheet (worklog carry-fwd).
-
-DF sampler: SYNCHRONOUS mode only for parity (ar_step=0, causal_block_size=1).
-`generate_timestep_matrix` then collapses to "all frames share timesteps[i] at
-step i", so the loop = standard flow-match denoise over latent video
-[16,f_lat,h,w] with per-frame timesteps broadcast equal (DiT already takes
-per-frame timesteps). Async/causal-block staggering + overlap_history segment
-stitching deferred to long-video (not parity-blocking).
-
-Scheduler DECISION: implement UniPCMultistepScheduler (the shipped
-`scheduler_config.json`), NOT Euler. Config: flow_prediction, use_flow_sigmas,
-flow_shift 1.0, solver_order 2, solver_type bh2, final_sigmas_type zero,
-lower_order_final true, timestep_spacing linspace, num_train_timesteps 1000.
-Permanent/production path, reused family-wide; e2e validates the real scheduler.
-(At 2 steps it largely degenerates to order-1, but the fixed-shift flow-sigmas +
-flow-prediction->x0 conversion still differ from z_image's dynamic-exponential
-Euler, so it is its own module: `wan/scheduler.rs`.) pyref must use the bundle's
-default UniPC so both sides match.
-
-## Open questions
-
-- umT5-XXL port effort + which quant form to consume.
-- Wan 3D VAE tiling vs the single-submit-per-tile rule (temporal tiles added).
-- Diffusion Forcing segment length / overlap tuning at 540P.
-- License confirm for commercial intent (SkyReels OK; LongLive NVIDIA Open;
-  verify Phantom / Wan base).
-- SANA-Video (linear-attn, 2B) set aside: research-only license, no GGUF, new
-  kernel family. Revisit only if the linear-attention frontier becomes the goal.
+- Wan RoPE3D = interleaved-pair (NOT half-rot). Already correct in rope3d.rs.
+- Fold on ORIGINAL gguf names then rename (LoRA keys are original-Wan).
+- The full-repo `hf download QuantStack/...` pulls EVERY quant (150GB+) -- always
+  name the specific file.
+- Don't commit until user browser-verifies.

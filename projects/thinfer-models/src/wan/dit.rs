@@ -1054,8 +1054,8 @@ impl WanDit {
         let dims = scope.u32x4_uniform(rows, out_dim, in_dim, 0)?;
         let weight = scope.import_copy(w.weight);
         scope.matmul(
-            &bp.matmul_qkv,
-            &bp.matmuls.qkv,
+            &bp.matmul_module,
+            &bp.matmuls.module,
             x,
             weight,
             dims,

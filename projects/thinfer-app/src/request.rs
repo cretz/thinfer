@@ -244,9 +244,9 @@ impl VideoRequest {
             if self.model.is_sulphur() {
                 for (role, _strength) in self.model.sulphur_distill_stack() {
                     files.push(
-                        m.get(role)
-                            .copied()
-                            .ok_or_else(|| format!("Sulphur manifest missing distill role {role}"))?,
+                        m.get(role).copied().ok_or_else(|| {
+                            format!("Sulphur manifest missing distill role {role}")
+                        })?,
                     );
                 }
             }
@@ -273,7 +273,11 @@ impl VideoRequest {
             std::env::var("THINFER_LTX_ENCODER").ok().as_deref(),
             Some("q4_k_m") | Some("q4")
         );
-        let encoder = if env_q4 { EncoderQuant::Q4 } else { self.encoder };
+        let encoder = if env_q4 {
+            EncoderQuant::Q4
+        } else {
+            self.encoder
+        };
         self.model.ltx_encoder_role(encoder)
     }
 
@@ -302,18 +306,46 @@ impl VideoRequest {
         if self.steps == 0 {
             return Err("--steps must be > 0".into());
         }
-        let (frames, shots) = resolve_shot_plan(
+        let (mut frames, shots) = resolve_shot_plan(
             self.model,
             &self.prompts,
             &self.frames,
             &self.durations,
             fps,
         )?;
+        // Per-resolution VRAM activation-envelope cap (Wan2.2-A14B: the 14B DiT
+        // runs the full token grid per step, so the safe clip length depends on
+        // the dims -- see `VideoModelId::max_frames`). Explicit `--frames` over
+        // budget is a hard error (fail fast at submit instead of device-losing
+        // mid-denoise); `--duration` and the default cap DOWN with a warning.
+        // Uncapped models (FastWan/LongLive) return `None` -> no-op.
+        let mut warnings = Vec::new();
+        if let Some(max_frames) = self.model.max_frames(self.width, self.height)
+            && frames > max_frames
+        {
+            if !self.frames.is_empty() {
+                return Err(format!(
+                    "{} at {}x{} fits at most {max_frames} frames on the 8GB card \
+                     (got {frames}); lower --frames, or reduce --width/--height for \
+                     a longer clip",
+                    self.model, self.width, self.height
+                ));
+            }
+            warnings.push(format!(
+                "{}x{} fits at most {max_frames} frames (~{:.1}s) on the 8GB card; \
+                 the requested ~{:.1}s was capped. Lower the resolution for a longer clip.",
+                self.width,
+                self.height,
+                max_frames as f32 / fps as f32,
+                frames as f32 / fps as f32,
+            ));
+            frames = max_frames;
+        }
         Ok(VideoPlan {
             frames,
             shots,
             fps,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -704,6 +736,67 @@ mod tests {
         // The device-lost config (73f @ 1280x704) is above the cap, so it is
         // rejected rather than attempted.
         assert!(Ltx.ltx_max_frames(1280, 704) < 73);
+    }
+
+    // A minimal Wan2.2-A14B t2v request for resolve() coverage.
+    fn wan22_req(width: u32, height: u32, frames: Vec<u32>, durations: Vec<f32>) -> VideoRequest {
+        use crate::model::{EncoderQuant, VaeChoice, VideoModelId, VideoSampler};
+        use thinfer_core::policy::ResidencyBudget;
+        VideoRequest {
+            model: VideoModelId::Wan22T2vA14b,
+            prompts: vec!["a candid clip".into()],
+            width,
+            height,
+            frames,
+            durations,
+            fps: None,
+            seed: None,
+            input_image: None,
+            sampler: VideoSampler::UniPc,
+            steps: 4,
+            vae: VaeChoice::Full,
+            encoder: EncoderQuant::Q8,
+            i8_matmul: true,
+            audio: false,
+            upscale: false,
+            budget: ResidencyBudget {
+                ram_bytes: 5 << 30,
+                vram_bytes: 5 << 30,
+            },
+            output: std::path::PathBuf::from("out.mp4"),
+            format: VideoFormat::Mp4,
+        }
+    }
+
+    #[test]
+    fn wan22_frame_cap_tracks_resolution() {
+        use crate::model::VideoModelId::Wan22T2vA14b as W;
+        // The fault-safe envelope is 4096 latent cells (f_lat*h/16*w/16). At the
+        // 512x288 default (576 cells/lat-frame) that is f_lat 7 -> 25f; at 832x480
+        // (1560/lat-frame) only f_lat 2 -> 5f; at 256x256 (256/lat-frame) f_lat 16
+        // -> 61f. All on the 4k+1 grid.
+        assert_eq!(W.max_frames(512, 288), Some(25));
+        assert_eq!(W.max_frames(832, 480), Some(5));
+        assert_eq!(W.max_frames(256, 256), Some(61));
+        // The default config (512x288 x 25f) sits exactly at the cap (no warning).
+        let plan = wan22_req(512, 288, vec![], vec![]).resolve().unwrap();
+        assert_eq!(plan.frames, 25);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn wan22_over_envelope_frames_error_duration_caps() {
+        // Explicit over-cap --frames at 832x480 (9f > the 5f cap) is a hard error
+        // (fail fast at submit, not a device-losing mid-denoise).
+        assert!(wan22_req(832, 480, vec![9], vec![]).resolve().is_err());
+        // A duration over the envelope caps DOWN to the cap with a warning.
+        let plan = wan22_req(832, 480, vec![], vec![3.0]).resolve().unwrap();
+        assert_eq!(plan.frames, 5);
+        assert_eq!(plan.warnings.len(), 1, "capped duration must warn");
+        // A request inside the envelope is untouched and silent.
+        let plan = wan22_req(512, 288, vec![17], vec![]).resolve().unwrap();
+        assert_eq!(plan.frames, 17);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]

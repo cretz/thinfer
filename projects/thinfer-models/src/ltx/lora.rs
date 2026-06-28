@@ -98,34 +98,48 @@ fn exact_bytes(enc: StorageEncoding, elems: usize) -> Result<usize, String> {
     })
 }
 
+/// The two LoRA key conventions this fold understands: `(A-suffix, B-suffix)`.
+/// ai-toolkit (LTX/Sulphur) uses `lora_A`/`lora_B`; the LightX2V (Wan) LoRAs use
+/// `lora_down`/`lora_up`. A == down == `[rank, K]`; B == up == `[N, rank]`.
+const LORA_SUFFIXES: [(&str, &str); 2] = [
+    (".lora_A.weight", ".lora_B.weight"),
+    (".lora_down.weight", ".lora_up.weight"),
+];
+
 /// Discover the fold set from the LoRA catalog. For each `diffusion_model.{X}
-/// .lora_A.weight` whose `lora_B` and base `{X}.weight` both exist, build a spec
-/// -- unless `lora_B` is entirely zero (a deliberately-zeroed site, e.g. the
-/// cross-attn and adaLN modules in this checkpoint), which is skipped.
+/// .lora_{A,down}.weight` whose paired `lora_{B,up}` and base `{X}.weight` both
+/// exist, build a spec -- unless the B/up tensor is entirely zero (a
+/// deliberately-zeroed site, e.g. the cross-attn and adaLN modules in the LTX
+/// checkpoint), which is skipped. Handles both key conventions ([`LORA_SUFFIXES`]).
 pub async fn discover_specs<B: WeightSource, L: WeightSource>(
     base: &B,
     lora: &L,
 ) -> Result<Vec<FoldSpec>, FoldError<B::Error, L::Error>> {
     let mut specs = Vec::new();
     // Deterministic order: sort the lora keys so the fold (and its logs) are
-    // reproducible across runs.
-    let mut a_keys: Vec<&String> = lora
+    // reproducible across runs. Each A-key carries which suffix pair it matched.
+    let mut a_keys: Vec<(&String, usize)> = lora
         .catalog()
         .entries
         .keys()
         .map(|k| &k.0)
-        .filter(|k| k.starts_with("diffusion_model.") && k.ends_with(".lora_A.weight"))
+        .filter_map(|k| {
+            k.starts_with("diffusion_model.").then_some(())?;
+            let si = LORA_SUFFIXES.iter().position(|(a, _)| k.ends_with(a))?;
+            Some((k, si))
+        })
         .collect();
     a_keys.sort();
 
-    for a_key in a_keys {
-        // diffusion_model.{X}.lora_A.weight -> X
+    for (a_key, si) in a_keys {
+        let (a_suf, b_suf) = LORA_SUFFIXES[si];
+        // diffusion_model.{X}.lora_{A,down}.weight -> X
         let x = a_key
             .strip_prefix("diffusion_model.")
-            .and_then(|s| s.strip_suffix(".lora_A.weight"))
+            .and_then(|s| s.strip_suffix(a_suf))
             .expect("filtered above");
         let a_id = id(a_key.clone());
-        let b_id = id(format!("diffusion_model.{x}.lora_B.weight"));
+        let b_id = id(format!("diffusion_model.{x}{b_suf}"));
         let base_id = id(format!("{x}.weight"));
 
         let (Some(ae), Some(be), Some(base_e)) = (
@@ -231,7 +245,10 @@ impl<B: WeightSource, L: WeightSource> LoraFoldSource<B, L> {
                     _ => entry.encoding_label.clone(),
                 };
                 entry.size = exact_bytes(out_enc, spec.n * spec.k)? as u64;
-                folds.entry(spec.base.clone()).or_default().push((idx, spec));
+                folds
+                    .entry(spec.base.clone())
+                    .or_default()
+                    .push((idx, spec));
             }
             loras.push(lora);
             strengths.push(strength);
@@ -325,7 +342,11 @@ impl<B: WeightSource, L: WeightSource> LoraFoldSource<B, L> {
         // Each stacked LoRA: A [rank, K], B [N, rank] -> f32, then
         // acc += strength · (B @ A).
         for (idx, spec) in specs {
-            debug_assert_eq!((spec.n, spec.k), (n, k), "stacked fold dims must match base");
+            debug_assert_eq!(
+                (spec.n, spec.k),
+                (n, k),
+                "stacked fold dims must match base"
+            );
             let lora = &self.loras[*idx];
             let a = self.lora_to_f32(lora, &spec.a, spec.rank * k).await?;
             let b = self.lora_to_f32(lora, &spec.b, n * spec.rank).await?;

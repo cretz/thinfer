@@ -114,6 +114,97 @@ impl<O: FileOpener> WeightSource for WanSource<O> {
 }
 
 // ---------------------------------------------------------------------------
+// Wan 2.2 14B A14B (MoE) source: two folded GGUF experts + umT5 + Wan2.1 VAE
+// ---------------------------------------------------------------------------
+//
+// Each expert = `fold(gguf_original, lightx2v_lora)` (the LoRA covers every block
+// matmul, so the fold re-encodes them all to Q8_0 -> uniform block dtype) ->
+// rename original-Wan names to diffusers canonical -> prefix `high.`/`low.` so
+// both experts' handles coexist in ONE residency. Both are unioned over the
+// safetensors tail (umT5 shards, reused from the FastWan bundle, + the Wan2.1
+// VAE). The denoise picks the expert per step; the loader registers two handle
+// sets via `register_wan_dit_handles(prefix=...)`.
+
+/// One folded + renamed + prefixed expert.
+type Wan22Expert<O> = RenamedSource<
+    RenamedSource<crate::ltx::lora::LoraFoldSource<GgufSource<O>, SafetensorsSide<O>>>,
+>;
+/// The one weight source a Wan2.2 MoE model loads from: high expert, then low
+/// expert, then the safetensors tail (umT5 + VAE). Namespaces are disjoint
+/// (`high.`/`low.` prefixes; canonical umT5/VAE ids), so union order is just
+/// lookup order.
+pub type Wan22Source<O> =
+    UnionSource<Wan22Expert<O>, UnionSource<Wan22Expert<O>, SafetensorsSide<O>>>;
+
+#[derive(Debug)]
+pub enum Wan22OpenError<E: core::fmt::Debug> {
+    Gguf(gguf::SourceError<E>),
+    Safetensors(safetensors::SourceError<E>),
+    /// LoRA discovery or fold construction failed (carries a formatted message;
+    /// the fold error type is generic over both source error types).
+    Fold(String),
+}
+
+/// Build one expert: open the GGUF (original-Wan names) + its LoRA, discover the
+/// fold sites, fold (-> Q8_0 block matmuls), rename to canonical, then prefix.
+async fn fold_wan22_expert<O: FileOpener>(
+    gguf_opener: O,
+    lora_opener: O,
+    num_layers: usize,
+    prefix: &str,
+) -> Result<Wan22Expert<O>, Wan22OpenError<O::Error>> {
+    let gguf = GgufSource::open(gguf_opener)
+        .await
+        .map_err(Wan22OpenError::Gguf)?;
+    let lora = ShardedSafetensorsSource::open(vec![lora_opener])
+        .await
+        .map_err(Wan22OpenError::Safetensors)?;
+    let specs = crate::ltx::lora::discover_specs(&gguf, &lora)
+        .await
+        .map_err(|e| Wan22OpenError::Fold(format!("discover {prefix}: {e:?}")))?;
+    let n_specs = specs.len();
+    let folded = crate::ltx::lora::LoraFoldSource::new(gguf, vec![(lora, 1.0, specs)])
+        .map_err(|e| Wan22OpenError::Fold(format!("fold {prefix}: {e}")))?;
+    tracing::info!(
+        target: thinfer_core::trace::DIAG,
+        prefix,
+        discovered = n_specs,
+        folded = folded.fold_count(),
+        "wan2.2 expert LoRA fold"
+    );
+    let renamed = RenamedSource::with_passthrough(folded, dit_gguf_renames(num_layers));
+    // Prefix every (now-canonical) DiT id so the two experts are disjoint in the
+    // single residency. Build the map from the renamed catalog (all keys mapped;
+    // none pass through).
+    let pmap: HashMap<WeightId, WeightId> = renamed
+        .catalog()
+        .entries
+        .keys()
+        .map(|k| (k.clone(), WeightId(format!("{prefix}{}", k.0))))
+        .collect();
+    Ok(RenamedSource::with_passthrough(renamed, pmap))
+}
+
+/// Build the [`Wan22Source`]. `high_gguf`/`low_gguf` are the two expert GGUFs;
+/// `high_lora`/`low_lora` their matching LightX2V distill LoRAs; `tail_openers`
+/// the safetensors tail (umT5 shards + Wan2.1 VAE, in role order).
+pub async fn open_wan22_source<O: FileOpener>(
+    high_gguf: O,
+    high_lora: O,
+    low_gguf: O,
+    low_lora: O,
+    tail_openers: Vec<O>,
+    num_layers: usize,
+) -> Result<Wan22Source<O>, Wan22OpenError<O::Error>> {
+    let high = fold_wan22_expert(high_gguf, high_lora, num_layers, "high.").await?;
+    let low = fold_wan22_expert(low_gguf, low_lora, num_layers, "low.").await?;
+    let tail = ShardedSafetensorsSource::open(tail_openers)
+        .await
+        .map_err(Wan22OpenError::Safetensors)?;
+    Ok(UnionSource::new(high, UnionSource::new(low, tail)))
+}
+
+// ---------------------------------------------------------------------------
 // LongLive-2.0-5B source (DiT from a `.pt`, umT5 + VAE from the base bundle)
 // ---------------------------------------------------------------------------
 //

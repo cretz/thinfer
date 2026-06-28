@@ -50,13 +50,15 @@ pub struct WanDitModelWeights {
 
 impl Default for WanDitModelWeights {
     fn default() -> Self {
-        Self::new()
+        Self::new("")
     }
 }
 
 impl WanDitModelWeights {
-    pub fn new() -> Self {
-        let id = |s: &str| WeightId(s.to_string());
+    /// `pre` namespaces every id (a per-expert prefix like `"high."` for the
+    /// Wan2.2 MoE, or `""` for a single-expert model).
+    pub fn new(pre: &str) -> Self {
+        let id = |s: &str| WeightId(format!("{pre}{s}"));
         Self {
             patch_weight: id("patch_embedding.weight"),
             patch_bias: id("patch_embedding.bias"),
@@ -86,10 +88,10 @@ struct ConditionEmbedderNames {
 }
 
 impl ConditionEmbedderNames {
-    fn new() -> Self {
+    fn new(pre: &str) -> Self {
         let lin = |w: &str, b: &str| LinearNames {
-            weight: WeightId(w.to_string()),
-            bias: WeightId(b.to_string()),
+            weight: WeightId(format!("{pre}{w}")),
+            bias: WeightId(format!("{pre}{b}")),
         };
         Self {
             time_linear_1: lin(
@@ -154,8 +156,8 @@ pub struct WanDitBlockWeights {
 }
 
 impl WanDitBlockWeights {
-    pub fn new(idx: usize) -> Self {
-        let p = format!("blocks.{idx}");
+    pub fn new(pre: &str, idx: usize) -> Self {
+        let p = format!("{pre}blocks.{idx}");
         Self {
             self_attn: AttnNames::new(&format!("{p}.attn1")),
             cross_attn: AttnNames::new(&format!("{p}.attn2")),
@@ -200,22 +202,35 @@ pub struct WanI8Sites {
 /// embedders, patch, proj_out, and all norms/biases stay dense. `i8`: opt-in
 /// per-site i8 transcode for the DP4A-safe sites (qkv + ffn_up), overriding
 /// `transcode` for those weights only. Mirrors `z_image::loader`.
+/// `prefix` namespaces every weight id (e.g. `"high."`/`"low."` for the Wan2.2
+/// MoE so both experts' handle sets coexist in one residency; `""` otherwise).
+/// The module-level matmul weights (patch + condition embedder + proj_out) always
+/// stay dense bf16 (F16/F32 narrow to bf16 at upload); they run on the dedicated
+/// bf16 `matmul_module` pipeline, decoupled from the (possibly quant) block sites.
 pub fn register_wan_dit_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
     cfg: &WanDitConfig,
+    prefix: &str,
     transcode: Option<thinfer_core::quant::QuantKind>,
     i8: WanI8Sites,
 ) -> Result<LoadedWanDitHandles, LoadError> {
-    let mw = WanDitModelWeights::new();
+    let mw = WanDitModelWeights::new(prefix);
     let blocks = (0..cfg.num_layers)
-        .map(|i| register_block(residency, &WanDitBlockWeights::new(i), transcode, i8))
+        .map(|i| {
+            register_block(
+                residency,
+                &WanDitBlockWeights::new(prefix, i),
+                transcode,
+                i8,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LoadedWanDitHandles {
         patch: register_conv_as_linear_bias(residency, &mw.patch_weight, &mw.patch_bias)?,
-        condition: register_condition_embedder(residency, &ConditionEmbedderNames::new())?,
+        condition: register_condition_embedder(residency, &ConditionEmbedderNames::new(prefix))?,
         blocks,
         scale_shift_table: register_passthrough(residency, &mw.scale_shift_table)?,
-        proj_out: register_linear_bias(residency, &mw.proj_out_weight, &mw.proj_out_bias, None)?,
+        proj_out: register_linear_bias(residency, &mw.proj_out_weight, &mw.proj_out_bias)?,
     })
 }
 
@@ -266,7 +281,7 @@ fn register_condition_embedder<S: WeightSource>(
     residency: &WeightResidency<S>,
     w: &ConditionEmbedderNames,
 ) -> Result<ConditionEmbedderHandles, LoadError> {
-    let lb = |l: &LinearNames| register_linear_bias(residency, &l.weight, &l.bias, None);
+    let lb = |l: &LinearNames| register_linear_bias(residency, &l.weight, &l.bias);
     Ok(ConditionEmbedderHandles {
         time_linear_1: lb(&w.time_linear_1)?,
         time_linear_2: lb(&w.time_linear_2)?,
@@ -276,14 +291,15 @@ fn register_condition_embedder<S: WeightSource>(
     })
 }
 
+/// Module-level linear+bias: weight stays dense bf16 (`Linear2D [K, N]`), run on
+/// the `matmul_module` pipeline. F16/F32 sources narrow to bf16 at upload.
 fn register_linear_bias<S: WeightSource>(
     residency: &WeightResidency<S>,
     weight: &WeightId,
     bias: &WeightId,
-    transcode: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<LinearBiasHandles, LoadError> {
     Ok(LinearBiasHandles {
-        weight: register_linear(residency, weight, transcode)?,
+        weight: register_linear(residency, weight, None)?,
         bias: register_passthrough(residency, bias)?,
     })
 }
@@ -306,7 +322,12 @@ fn register_conv_as_linear_bias<S: WeightSource>(
     );
     let n = dims[0];
     let k: usize = dims[1..].iter().product();
-    let (encoding, transpose, transcode) = linear_layout(weight, encoding, &entry, None)?;
+    // `linear_layout` asserts a 2-D shape for the transcode arm; the conv entry is
+    // 5-D, so hand it the post-collapse [n, k] shape (the only field it inspects
+    // besides the encoding).
+    let mut entry2d = entry.clone();
+    entry2d.shape = Shape(vec![n, k]);
+    let (encoding, transpose, transcode) = linear_layout(weight, encoding, &entry2d, None)?;
     let meta = WeightMeta {
         id: weight.clone(),
         shape: Shape(vec![n, k]),
@@ -359,7 +380,13 @@ fn linear_layout(
     LoadError,
 > {
     Ok(match encoding {
-        StorageEncoding::Bf16 if transcode.is_some() => {
+        // Dense bf16/f16/f32 with a transcode target: requantize to the GGUF
+        // block layout (N-major, no transpose). Used by the block matmul sites
+        // when a load-time transcode is requested; module-level weights never
+        // pass a transcode here (they stay dense bf16).
+        StorageEncoding::Bf16 | StorageEncoding::F16 | StorageEncoding::F32
+            if transcode.is_some() =>
+        {
             assert_eq!(entry.shape.0.len(), 2, "transcode target must be 2-D");
             assert_eq!(
                 entry.shape.0[1] % 32,
@@ -368,7 +395,9 @@ fn linear_layout(
             );
             (encoding, TransposePolicy::None, transcode)
         }
-        StorageEncoding::Bf16 | StorageEncoding::F32 => (encoding, TransposePolicy::Linear2D, None),
+        StorageEncoding::Bf16 | StorageEncoding::F16 | StorageEncoding::F32 => {
+            (encoding, TransposePolicy::Linear2D, None)
+        }
         StorageEncoding::Quant(_) => (encoding, TransposePolicy::None, None),
         _ => {
             return Err(LoadError::Undecodable {

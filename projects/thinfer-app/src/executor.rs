@@ -23,9 +23,9 @@ use thinfer_models::qwen_image::pipeline::{self as qpipe, QwenImagePipeline};
 use thinfer_models::qwen_image::text_encoder::qwen2vl_gguf_renames;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::wan::pipeline::{
-    self as wanpipe, GenerationParams as WanParams, Shot, VaeChoice, WanModel, WanVideo,
+    self as wanpipe, GenerationParams as WanParams, Shot, VaeChoice, WanModel, WanVariant, WanVideo,
 };
-use thinfer_models::wan::source::{WanSource, open_longlive_source};
+use thinfer_models::wan::source::{WanSource, open_longlive_source, open_wan22_source};
 use thinfer_models::z_image::manifest::role as zrole;
 use thinfer_models::z_image::pipeline::{self as zpipe, GenerationParams as ZParams, ZImageModel};
 use thinfer_models::z_image::qwen3_gguf_renames;
@@ -37,6 +37,7 @@ use thinfer_native::tokenizer::HfTokenizer;
 use crate::codec;
 use crate::config::{BackendConfig, init_backend, random_seed};
 use crate::download::{resolve_file, resolve_role};
+use crate::model::VideoModelId;
 use crate::progress::{ProgressSink, Stage};
 use crate::request::{
     FaceSwapRequest, ImageRequest, JobRequest, JobSummary, VideoFormat, VideoRequest,
@@ -479,7 +480,12 @@ impl LocalExecutor {
         }
         let manifest = req.model.manifest();
         let variant = req.model.variant();
-        let vae: VaeChoice = req.vae.into();
+        // Wan2.2-A14B has only the full Wan2.1 VAE (no tiny decoder path).
+        let vae: VaeChoice = if matches!(req.model, VideoModelId::Wan22T2vA14b) {
+            VaeChoice::Full
+        } else {
+            req.vae.into()
+        };
 
         let mut weight_openers: Vec<MmapFileOpener> =
             Vec::with_capacity(variant.weight_roles.len());
@@ -543,6 +549,42 @@ impl LocalExecutor {
                 &plan.shots,
                 vae,
                 true,
+                WanVariant::fastwan_ti2v_5b(),
+                &progress,
+            )
+            .await?
+        } else if matches!(req.model, VideoModelId::Wan22T2vA14b) {
+            // Wan2.2-A14B MoE: two folded GGUF experts + the safetensors tail
+            // (umT5 reused from the FastWan bundle + the Wan2.1 VAE; both already in
+            // `weight_openers` from the variant tail roles).
+            let hi_gguf =
+                open_mmap(&resolve_role(manifest, variant.gguf_high_role.unwrap())?).await?;
+            let lo_gguf =
+                open_mmap(&resolve_role(manifest, variant.gguf_low_role.unwrap())?).await?;
+            let hi_lora =
+                open_mmap(&resolve_role(manifest, variant.lora_high_role.unwrap())?).await?;
+            let lo_lora =
+                open_mmap(&resolve_role(manifest, variant.lora_low_role.unwrap())?).await?;
+            let num_layers = thinfer_models::wan::dit_block::WanDitConfig::wan22_14b().num_layers;
+            let source = open_wan22_source(
+                hi_gguf,
+                hi_lora,
+                lo_gguf,
+                lo_lora,
+                weight_openers,
+                num_layers,
+            )
+            .await
+            .map_err(|e| format!("parse Wan2.2 weights: {e:?}"))?;
+            self.run_wan(
+                source,
+                req,
+                tokenizer,
+                &params,
+                &plan.shots,
+                vae,
+                false,
+                WanVariant::wan22_t2v_a14b(),
                 &progress,
             )
             .await?
@@ -560,6 +602,7 @@ impl LocalExecutor {
                 &plan.shots,
                 vae,
                 false,
+                WanVariant::fastwan_ti2v_5b(),
                 &progress,
             )
             .await?
@@ -600,16 +643,19 @@ impl LocalExecutor {
         shots: &[Shot],
         vae: VaeChoice,
         ar: bool,
+        variant: WanVariant,
         progress: &dyn Fn(wanpipe::ProgressEvent),
     ) -> Result<WanVideo, String> {
         let residency = WeightResidency::new(source, req.budget);
         let model = {
             let _s = tracing::info_span!("model_load").entered();
-            WanModel::load(
+            WanModel::load_variant(
                 self.backend.clone(),
                 residency,
                 tokenizer,
                 vae,
+                variant,
+                None,
                 req.i8_matmul,
             )
             .await
