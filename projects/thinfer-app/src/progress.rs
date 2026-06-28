@@ -38,6 +38,12 @@ pub trait ProgressSink {
     /// event). Default no-op so sinks that only care about structured stages
     /// can ignore it.
     fn note(&self, _msg: &str) {}
+    /// Cooperative cancellation: the generate loop polls this at step
+    /// boundaries and aborts when it returns `true`. Default `false` (the CLI
+    /// runs to completion); the server sink returns the job's cancel flag.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// A sink that drops everything. Useful for non-interactive callers and tests.

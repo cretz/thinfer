@@ -299,11 +299,14 @@ fn connector_block_cfgs() -> BlockWgslConfigs {
         i8_sdpa: false,
         dense_acts: DenseActSites {
             qkv: true,
+            qkv_self: true,
             proj: true,
             ffn_up: true,
             ffn_down: true,
         },
+        coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: false,
+        fast_sdpa: false,
     }
 }
 

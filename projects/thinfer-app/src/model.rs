@@ -345,13 +345,15 @@ impl VideoModelId {
         if self.is_ltx() {
             (1280, 704)
         } else if matches!(self, VideoModelId::Wan22T2vA14b) {
-            // The 14B DiT faults above ~4096 latent cells (see
-            // WAN22_MAX_LATENT_CELLS), and clip length scales as cells/(h/16*w/16),
-            // so a lower-res default buys a usable length: 512x288 (/16-clean,
-            // 16:9) fits 25f (~1.6s) under the cap, vs 832x480's 5f (~0.3s). The
-            // form still offers 832x480 (the lightx2v 480p distill regime) as a
-            // max-quality / short-clip option.
-            (512, 288)
+            // 832x480: the lightx2v 480p distill regime, the industry-norm res for
+            // this model. The old <=512x288 default existed only to dodge a
+            // device-loss that was MISDIAGNOSED as a >4096-cell shader fault; the
+            // real cause is the 2s Windows GPU watchdog (TDR) tripping on a single
+            // long self-attention dispatch, now fixed by per-dispatch query
+            // chunking in `op_sdpa` (bit-exact, scales to any sequence length). So
+            // 832x480 is the default again; clip length is bounded by wall time /
+            // VRAM, not a fault (see WAN22_MAX_LATENT_CELLS).
+            (832, 480)
         } else {
             (VIDEO_DEFAULT_WIDTH, VIDEO_DEFAULT_HEIGHT)
         }
@@ -409,13 +411,16 @@ impl VideoModelId {
         }
     }
 
-    /// Wan2.2-A14B default clip length (frames), sized to the activation/fault
-    /// envelope ([`Self::WAN22_MAX_LATENT_CELLS`]) at the 512x288 default res:
-    /// f_lat 7 = 7*32*18 = 4032 cells (just under the 4096 cap), 25f ~1.6s @16fps.
-    /// Picking the per-res max as the default mirrors LTX. At a higher res the
-    /// envelope cap in `VideoRequest::resolve` trims this down (with a warning);
-    /// at a lower res an explicit `--frames` up to [`Self::max_frames`] runs longer.
-    pub const WAN22_DEFAULT_FRAMES: u32 = 25;
+    /// Wan2.2-A14B default clip length (frames) at the 832x480 default res. Length
+    /// is a wall-time choice now, not a fault envelope: the TDR crash is fixed (see
+    /// `op_sdpa` query chunking, which removes the watchdog trip at ANY row count).
+    /// 33f = f_lat 9 = 14040 DiT rows (~2.1s @16fps), ~2.25x the 13f/6240-row point
+    /// that is validated e2e (`fixed_full.mp4`); 33f itself is browser-confirmed,
+    /// not yet eyeballed in a parity gate. Longer is allowed up to
+    /// [`Self::max_frames`] (the model's 81f design envelope) via explicit
+    /// `--frames`/`--duration`; at 832x480 those run progressively slower (the
+    /// self-attention is O(rows^2), ~70min for 33f / hours for 81f on the 8GB card).
+    pub const WAN22_DEFAULT_FRAMES: u32 = 33;
 
     /// LTX ideal clip length: 121 frames (latent frame count `(f-1)/8+1 = 16`,
     /// ~5s @ 24fps) -- the length the model is distilled for (upstream
@@ -436,18 +441,21 @@ impl VideoModelId {
     pub const LTX_MAX_LATENT_CELLS: u32 = 6300;
 
     /// Max DiT latent cells (`f_lat * h/16 * w/16`, == the per-forward token/row
-    /// count) the Wan2.2-A14B 14B DiT sustains on the RTX 5070 Laptop (8GB) before
-    /// the device is LOST. Telemetry (nvlddmkm Event 153 GPU engine reset; NO TDR
-    /// Event 4101 and NO VRAM pinning at 8151MiB) shows this is a GPU FAULT
-    /// (out-of-bounds shader access at high sequence length), NOT a VRAM-budget
-    /// overflow: it is INDEPENDENT of the weight budget (2G and 5G both fault at
-    /// 6240 rows) and INDEPENDENT of f_lat (256x256x61f = 4096 rows / f_lat 16
-    /// completes fine). Empirical rows: 2048 / 3120 / 4096 complete; 6240 faults.
-    /// 4096 is the confirmed-safe ceiling (a 1.5x margin under the fault). The
-    /// root-cause DiT shader OOB is a separate follow-up (needs GPU-assisted
-    /// validation / op bisection); until it is fixed this cap is the guard. Wan2.1
-    /// VAE is 8x spatial + patch 2 -> /16 grid (4x denser than LTX's /32).
-    pub const WAN22_MAX_LATENT_CELLS: u32 = 4096;
+    /// count) allowed for a Wan2.2-A14B clip. This is the model's 81-frame design
+    /// envelope (81f @ 832x480 = f_lat 21 * 30 * 52 = 32760 rows), NOT a fault
+    /// guard: the old "device LOST above ~6240 rows" was a 2s Windows GPU watchdog
+    /// (TDR) tripping on a single long self-attention dispatch (nvlddmkm Event 153
+    /// = an engine reset on watchdog timeout, NOT the shader OOB it was first read
+    /// as). That is fixed by per-dispatch query chunking in `op_sdpa` (each SDPA
+    /// dispatch is bounded to ~10M q*k pairs, <1s, in its own submit), which is
+    /// bit-exact and scales to any row count. So this cap now just bounds wall
+    /// time / VRAM to the model's intended envelope; explicit over-cap `--frames`
+    /// still errors (fail fast) and a default/`--duration` caps down with a
+    /// warning. Wan2.1 VAE is 8x spatial + patch 2 -> /16 grid (4x denser than
+    /// LTX's /32). NB the longest length actually validated e2e is tracked by
+    /// [`Self::WAN22_DEFAULT_FRAMES`]; lengths between that and this cap run but
+    /// are progressively slower (O(rows^2) attention) and not yet eyeballed.
+    pub const WAN22_MAX_LATENT_CELLS: u32 = 32760;
 
     /// Per-spatial-axis latent downscale (VAE spatial factor * patch): the DiT
     /// token grid is `h/div * w/div` per latent frame. LTX /32; Wan2.1 VAE /16.

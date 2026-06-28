@@ -33,6 +33,7 @@ pub mod gelu_mul;
 pub mod group_norm;
 pub mod layernorm;
 pub mod matmul;
+pub mod matmul_coopmat;
 pub mod matmul_i8;
 pub mod matmul_i8_bf16;
 pub mod memcat;

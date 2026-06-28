@@ -346,6 +346,7 @@ async fn video_e2e_safetensors() {
             _ => PowerPreference::HighPerformance,
         },
         timestamps: std::env::var("THINFER_TRACE").is_ok(),
+        disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
     };
     let backend = Arc::new(
         WgpuBackend::new_with_config(cfg)
@@ -594,7 +595,14 @@ async fn video_e2e_safetensors() {
     // Capture per-step velocity + post for the parity compare (cleared on entry).
     let mut step_diag: Vec<WanStepDiag> = Vec::with_capacity(DMD_STEPS);
     let (pre_vae, got_f_lat, got_h_lat, got_w_lat) = model
-        .denoise_with(&params, Some(&noise), &mut ws, Some(&mut step_diag), None)
+        .denoise_with(
+            &params,
+            Some(&noise),
+            &mut ws,
+            Some(&mut step_diag),
+            None,
+            None,
+        )
         .await
         .expect("denoise_with");
     tracing::info!(

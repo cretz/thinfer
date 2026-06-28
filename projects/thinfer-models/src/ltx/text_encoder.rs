@@ -345,11 +345,14 @@ pub fn gemma_encoder_cfgs(weight_dtype: thinfer_core::ops::WeightDtype) -> Block
         i8_sdpa: false,
         dense_acts: crate::common::block::DenseActSites {
             qkv: true,
+            qkv_self: true,
             proj: true,
             ffn_up: true,
             ffn_down: true,
         },
+        coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: true,
+        fast_sdpa: false,
     }
 }
 

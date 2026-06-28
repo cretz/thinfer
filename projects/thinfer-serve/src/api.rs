@@ -27,23 +27,42 @@ use crate::job::{JobStore, SeqEvent};
 pub struct AppState {
     pub store: Arc<JobStore>,
     pub config: Arc<ServeConfig>,
+    /// Whether this server's GPU exposes the cooperative-matrix (tensor-core)
+    /// path. Probed once at startup; surfaced via `GET /capabilities` so the web
+    /// UI can grey the coopmat toggle on hardware that can't accelerate.
+    pub coopmat_supported: bool,
+}
+
+/// `GET /capabilities` body: static server/GPU capabilities the UI adapts to.
+#[derive(serde::Serialize)]
+struct CapabilitiesResponse {
+    /// GPU supports the coopmat (tensor-core) matmul path.
+    coopmat: bool,
+}
+
+async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
+    Json(CapabilitiesResponse {
+        coopmat: state.coopmat_supported,
+    })
 }
 
 /// Build the executable request for `spec`, placing the artifact under
 /// `artifact_dir/<id>/`. Validates eagerly so a bad spec fails the POST. The
 /// spec is the client wire shape (`thinfer_app::wire`); this is where the server
 /// fills in what a client does not send (artifact path, budgets, output format).
+#[allow(clippy::type_complexity)]
 fn spec_into_request(
     spec: JobSpec,
     id: &str,
     config: &ServeConfig,
-) -> Result<(JobRequest, PathBuf, Option<String>), String> {
+) -> Result<(JobRequest, PathBuf, Option<String>, Option<bool>), String> {
     let budget = config.budget()?;
     let dir = config.artifact_dir.join(id);
     let mp4 = || dir.join("output.mp4");
     let make_dir =
         || std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()));
     let public_key = spec.public_key().map(str::to_string);
+    let disable_coopmat = spec.disable_coopmat();
     match spec {
         JobSpec::Image(s) => {
             let model = s.model.unwrap_or(ImageModelId::DEFAULT);
@@ -82,7 +101,7 @@ fn spec_into_request(
             req.validate()?;
             make_dir()?;
             let out = req.output.clone();
-            Ok((JobRequest::Image(req), out, public_key))
+            Ok((JobRequest::Image(req), out, public_key, disable_coopmat))
         }
         JobSpec::Video(s) => {
             let model = s.model.unwrap_or(VideoModelId::DEFAULT);
@@ -112,7 +131,7 @@ fn spec_into_request(
             req.resolve()?;
             make_dir()?;
             let out = req.output.clone();
-            Ok((JobRequest::Video(req), out, public_key))
+            Ok((JobRequest::Video(req), out, public_key, disable_coopmat))
         }
         JobSpec::FaceSwap(s) => {
             let req = FaceSwapRequest {
@@ -125,7 +144,7 @@ fn spec_into_request(
             req.validate()?;
             make_dir()?;
             let out = req.output.clone();
-            Ok((JobRequest::FaceSwap(req), out, public_key))
+            Ok((JobRequest::FaceSwap(req), out, public_key, disable_coopmat))
         }
     }
 }
@@ -141,6 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}/events", get(events))
         .route("/jobs/{id}/result", get(get_result))
         .route("/jobs/{id}/cancel", post(cancel))
+        .route("/capabilities", get(capabilities))
         .route("/openapi.json", get(openapi))
         .layer(middleware::from_fn(move |req, next| {
             require_auth(auth.clone(), req, next)

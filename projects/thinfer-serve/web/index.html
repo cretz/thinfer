@@ -99,12 +99,22 @@
           </select>
         </div>
 
+        <!-- Cooperative-matrix (tensor-core) acceleration for the Wan video DiT
+             matmuls. On by default; app.js greys this out via GET /capabilities
+             when the server GPU doesn't expose a usable coopmat config. Unticking
+             forces the dense/i8 path (A/B, debugging). -->
+        <div id="coopmat-row">
+          <label for="coopmat">Tensor-core (coopmat)</label>
+          <input id="coopmat" type="checkbox" checked />
+        </div>
+
         <label for="seed">Seed</label>
         <input id="seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />
 
         <button id="generate" type="submit">Generate</button>
       </fieldset>
     </form>
+    <button id="cancel" type="button" hidden>Cancel</button>
     <p id="status">Idle.</p>
     <img id="image-out" alt="" hidden />
     <video id="video-out" controls playsinline hidden></video>

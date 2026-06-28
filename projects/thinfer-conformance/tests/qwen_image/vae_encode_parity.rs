@@ -128,6 +128,7 @@ async fn run_case(tag: &str, width: usize, height: usize, vram_bytes: u64) {
                 _ => PowerPreference::HighPerformance,
             },
             timestamps: std::env::var("THINFER_TRACE").is_ok(),
+            disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
         })
         .await
         .expect("wgpu adapter unavailable for tests"),

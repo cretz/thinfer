@@ -84,6 +84,9 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
             input_image: None,
             i8_matmul: Some(!args.no_i8_matmul),
             public_key: None,
+            // Remote path defers coopmat to the server default; local runs read
+            // THINFER_NO_COOPMAT via BackendConfig.
+            disable_coopmat: None,
         });
         return super::run_remote(&args.remote, spec, args.output).await;
     }

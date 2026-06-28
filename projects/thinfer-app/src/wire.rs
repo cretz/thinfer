@@ -42,6 +42,18 @@ impl JobSpec {
             JobSpec::FaceSwap(s) => s.public_key.as_deref(),
         }
     }
+
+    /// Per-request opt-out of the cooperative-matrix (tensor-core) path. `None`
+    /// = use the server default. `Some(true)` forces the dense/i8 kernels even
+    /// on a coopmat-capable GPU (A/B, debugging). A no-op when the GPU lacks
+    /// coopmat support (it falls back regardless).
+    pub fn disable_coopmat(&self) -> Option<bool> {
+        match self {
+            JobSpec::Image(s) => s.disable_coopmat,
+            JobSpec::Video(s) => s.disable_coopmat,
+            JobSpec::FaceSwap(s) => s.disable_coopmat,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +78,10 @@ pub struct ImageSpec {
     /// = plaintext. See [`crate::wire`] / `thinfer-serve` crypto.
     #[serde(default)]
     pub public_key: Option<String>,
+    /// Opt out of the cooperative-matrix (tensor-core) path; see
+    /// [`JobSpec::disable_coopmat`].
+    #[serde(default)]
+    pub disable_coopmat: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -105,6 +121,10 @@ pub struct VideoSpec {
     /// Base64 SPKI RSA-OAEP public key for result encryption (see [`ImageSpec`]).
     #[serde(default)]
     pub public_key: Option<String>,
+    /// Opt out of the cooperative-matrix (tensor-core) path; see
+    /// [`JobSpec::disable_coopmat`].
+    #[serde(default)]
+    pub disable_coopmat: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +140,10 @@ pub struct FaceSwapSpec {
     /// Base64 SPKI RSA-OAEP public key for result encryption (see [`ImageSpec`]).
     #[serde(default)]
     pub public_key: Option<String>,
+    /// Opt out of the cooperative-matrix (tensor-core) path; see
+    /// [`JobSpec::disable_coopmat`].
+    #[serde(default)]
+    pub disable_coopmat: Option<bool>,
 }
 
 /// The `POST /jobs` response.

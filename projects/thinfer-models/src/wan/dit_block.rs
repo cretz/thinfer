@@ -46,8 +46,17 @@ use thinfer_core::workspace::{BatchBuf, BatchScope};
 
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, alloc_act, alloc_matmul_out_buf, copy_tap, op_add, op_rmsnorm,
-    op_sdpa,
+    op_sdpa, op_sdpa_f16,
 };
+
+/// Query rows per FFN chunk. The FFN is position-wise, so it is processed in
+/// row tiles to cap the peak `rows * ffn_dim` transient working set: a long clip
+/// (81f @ 832x480 = 32760 rows) would otherwise reserve multiple GB of FFN
+/// scratch and starve the streamed 14B weight cache on the 8GB card. 8192 keeps
+/// each chunk's FFN intermediate near ~0.45GB (bf16) while staying large enough
+/// for full matmul efficiency; short clips collapse to a single chunk. The
+/// denoise driver reads this to size its transient-reserve estimate.
+pub(crate) const FFN_TILE_ROWS: u32 = 8192;
 
 /// Wan-family-invariant DiT constants (the same across SkyReels-1.3B, FastWan
 /// 5B, Wan2.2-14B): only `num_heads`, `ffn_dim`, `num_layers`, and the latent
@@ -554,6 +563,7 @@ fn lin<'wsp>(
     rows: u32,
     n: u32,
     k: u32,
+    coopmat: Option<&crate::common::block::CoopmatStep>,
     i8: Option<&WgpuPipeline>,
     dq_i8: Option<&crate::common::block::DequantStep>,
     dq: Option<&crate::common::block::DequantStep>,
@@ -561,8 +571,8 @@ fn lin<'wsp>(
     inst: &MatMulF32,
 ) -> Result<(), WgpuError> {
     let dims = scope.u32x4_uniform(rows, n, k, 0)?;
-    Block::dispatch_matmul_site(
-        scope, bp, input, w, out, dims, i8, dq_i8, dq, pipe, inst, rows, n, k,
+    Block::dispatch_matmul_site_coopmat(
+        scope, bp, input, w, out, dims, coopmat, i8, dq_i8, dq, pipe, inst, rows, n, k,
     )
 }
 
@@ -761,76 +771,105 @@ impl WanDitBlock {
         )?;
 
         // ============== 3. feed-forward (gelu-tanh, non-gated) ==============
-        let n3 = alloc_act(scope, bp, rows, dim)?;
-        op_layernorm(scope, bp, x2, n3, rows, dim, eps)?;
-        let n3m = alloc_act(scope, bp, rows, dim)?;
-        op_modulate(scope, bp, n3, m.c_scale_mlp, m.c_shift_mlp, n3m, rows, dim)?;
-        copy_tap(
-            scope,
-            n3m.data,
-            taps.norm3.as_ref(),
-            bp.act_bytes(rows * dim),
-        )?;
-
-        // up: [rows, inner] @ [ffn_dim, inner]ᵀ + bias -> [rows, ffn_dim]
-        let up = alloc_matmul_out_buf(scope, bp, rows * dff)?;
+        // Tiled over query rows. The FFN is purely position-wise (every op acts
+        // per row), so processing the rows in chunks is BIT-EXACT and bounds the
+        // peak transient working set to `FFN_TILE_ROWS * ffn_dim` instead of
+        // `rows * ffn_dim`. Without this, a long clip (e.g. 81f @ 832x480 = 32760
+        // rows) reserves multiple GB of FFN scratch, which on the 8GB card starves
+        // the 14B weight cache and the whole DiT thrashes on weight re-streaming.
+        // The weights are imported once; the per-chunk matmul re-runs the Q8
+        // dequant pre-pass, a negligible cost paid only for multi-chunk clips.
+        // Taps force a single whole-rows chunk so the parity copy stays correct
+        // (they are None in production, where chunking is active).
+        let ffn_tile = if taps.norm3.is_some() || taps.ffn_gelu.is_some() || taps.ffn_down.is_some()
+        {
+            rows
+        } else {
+            FFN_TILE_ROWS.min(rows).max(1)
+        };
         let wi = scope.import_copy(bufs.ffn_up_w);
-        lin(
-            scope,
-            bp,
-            n3m,
-            wi,
-            up,
-            rows,
-            dff,
-            inner,
-            bp.matmul_i8_ffn_up.as_ref(),
-            bp.dequant_i8_ffn_up.as_ref(),
-            bp.dequant_ffn_up.as_ref(),
-            &bp.matmul_ffn_up,
-            &bp.matmuls.ffn_up,
-        )?;
         let bi = scope.import_copy(bufs.ffn_up_b);
-        let upb = alloc_act(scope, bp, rows, dff)?;
-        op_bias_add(scope, bp, ActBuf::dense(up), bi, upb, rows, dff)?;
-        // gelu-tanh
-        let gelu = alloc_act(scope, bp, rows, dff)?;
-        scope.dispatch_op::<GeluF32>(&pipelines.gelu, &[upb.data], gelu.data)?;
-        copy_tap(
-            scope,
-            gelu.data,
-            taps.ffn_gelu.as_ref(),
-            bp.act_bytes(rows * dff),
-        )?;
-        // down: [rows, ffn_dim] @ [inner, ffn_dim]ᵀ + bias -> [rows, inner]
-        let down = alloc_matmul_out_buf(scope, bp, rows * dim)?;
         let wo = scope.import_copy(bufs.ffn_down_w);
-        lin(
-            scope,
-            bp,
-            gelu,
-            wo,
-            down,
-            rows,
-            dim,
-            dff,
-            bp.matmul_i8_ffn_down.as_ref(),
-            bp.dequant_i8_ffn_down.as_ref(),
-            bp.dequant_ffn_down.as_ref(),
-            &bp.matmul_ffn_down,
-            &bp.matmuls.ffn_down,
-        )?;
         let bo = scope.import_copy(bufs.ffn_down_b);
-        let downb = alloc_act(scope, bp, rows, dim)?;
-        op_bias_add(scope, bp, ActBuf::dense(down), bo, downb, rows, dim)?;
-        copy_tap(
-            scope,
-            downb.data,
-            taps.ffn_down.as_ref(),
-            bp.act_bytes(rows * dim),
-        )?;
+        let mut r0 = 0u32;
+        while r0 < rows {
+            let rc = (rows - r0).min(ffn_tile);
+            let x2_c = ActBuf::dense(scope.subview(
+                &x2.data,
+                bp.act_bytes(r0 * dim),
+                bp.act_bytes(rc * dim),
+            ));
+            let y_c = ActBuf::dense(scope.subview(
+                &y_out.data,
+                bp.act_bytes(r0 * dim),
+                bp.act_bytes(rc * dim),
+            ));
 
-        op_gate_residual(scope, bp, x2, m.c_gate_mlp, downb, y_out, rows, dim)?;
+            let n3 = alloc_act(scope, bp, rc, dim)?;
+            op_layernorm(scope, bp, x2_c, n3, rc, dim, eps)?;
+            let n3m = alloc_act(scope, bp, rc, dim)?;
+            op_modulate(scope, bp, n3, m.c_scale_mlp, m.c_shift_mlp, n3m, rc, dim)?;
+            copy_tap(scope, n3m.data, taps.norm3.as_ref(), bp.act_bytes(rc * dim))?;
+
+            // up: [rc, inner] @ [ffn_dim, inner]ᵀ + bias -> [rc, ffn_dim]
+            let up = alloc_matmul_out_buf(scope, bp, rc * dff)?;
+            lin(
+                scope,
+                bp,
+                n3m,
+                wi,
+                up,
+                rc,
+                dff,
+                inner,
+                None,
+                bp.matmul_i8_ffn_up.as_ref(),
+                bp.dequant_i8_ffn_up.as_ref(),
+                bp.dequant_ffn_up.as_ref(),
+                &bp.matmul_ffn_up,
+                &bp.matmuls.ffn_up,
+            )?;
+            let upb = alloc_act(scope, bp, rc, dff)?;
+            op_bias_add(scope, bp, ActBuf::dense(up), bi, upb, rc, dff)?;
+            // gelu-tanh
+            let gelu = alloc_act(scope, bp, rc, dff)?;
+            scope.dispatch_op::<GeluF32>(&pipelines.gelu, &[upb.data], gelu.data)?;
+            copy_tap(
+                scope,
+                gelu.data,
+                taps.ffn_gelu.as_ref(),
+                bp.act_bytes(rc * dff),
+            )?;
+            // down: [rc, ffn_dim] @ [inner, ffn_dim]ᵀ + bias -> [rc, inner]
+            let down = alloc_matmul_out_buf(scope, bp, rc * dim)?;
+            lin(
+                scope,
+                bp,
+                gelu,
+                wo,
+                down,
+                rc,
+                dim,
+                dff,
+                bp.coopmat_ffn_down.as_ref(),
+                bp.matmul_i8_ffn_down.as_ref(),
+                bp.dequant_i8_ffn_down.as_ref(),
+                bp.dequant_ffn_down.as_ref(),
+                &bp.matmul_ffn_down,
+                &bp.matmuls.ffn_down,
+            )?;
+            let downb = alloc_act(scope, bp, rc, dim)?;
+            op_bias_add(scope, bp, ActBuf::dense(down), bo, downb, rc, dim)?;
+            copy_tap(
+                scope,
+                downb.data,
+                taps.ffn_down.as_ref(),
+                bp.act_bytes(rc * dim),
+            )?;
+
+            op_gate_residual(scope, bp, x2_c, m.c_gate_mlp, downb, y_c, rc, dim)?;
+            r0 += rc;
+        }
         Ok(())
     }
 
@@ -962,7 +1001,7 @@ impl WanDitBlock {
         // cache contents, not a materialized mask.
         let sa = alloc_act(scope, bp, chunk_rows, inner)?;
         let no_mask = scope.alloc(16)?;
-        op_sdpa(
+        op_sdpa_f16(
             scope,
             bp,
             qr,
@@ -1185,6 +1224,7 @@ impl WanDitBlock {
             tr,
             dff,
             inner,
+            None,
             bp.matmul_i8_ffn_up.as_ref(),
             bp.dequant_i8_ffn_up.as_ref(),
             bp.dequant_ffn_up.as_ref(),
@@ -1207,6 +1247,7 @@ impl WanDitBlock {
             tr,
             dim,
             dff,
+            bp.coopmat_ffn_down.as_ref(),
             bp.matmul_i8_ffn_down.as_ref(),
             bp.dequant_i8_ffn_down.as_ref(),
             bp.dequant_ffn_down.as_ref(),
@@ -1248,7 +1289,7 @@ impl WanDitBlock {
         let hd = s.head_dim as u32;
         let scale = s.sdpa_scale();
         let no_mask = scope.alloc(16)?;
-        op_sdpa(
+        op_sdpa_f16(
             scope,
             bp,
             ActBuf::dense(qx),
@@ -1290,6 +1331,7 @@ impl WanDitBlock {
             rows,
             inner,
             inner,
+            bp.coopmat_proj.as_ref(),
             bp.matmul_i8_proj.as_ref(),
             bp.dequant_i8_proj.as_ref(),
             bp.dequant_proj.as_ref(),
@@ -1392,9 +1434,11 @@ impl WanDitBlock {
         let dim = self.shape.dim as u32;
         let out = alloc_matmul_out_buf(scope, bp, rows * n)?;
         let wv = scope.import_copy(w);
-        // Self-attn qkv may be i8 (normed A-side); cross-attn qkv stays dense.
-        let (mm_i8, dq_i8, dq, pipe, inst) = match site {
+        // Self-attn qkv may be i8 (normed A-side); cross-attn qkv stays dense
+        // (un-normed umT5 text K/V), or runs coopmat when opted in.
+        let (coopmat, mm_i8, dq_i8, dq, pipe, inst) = match site {
             QkvSite::SelfAttn => (
+                None,
                 bp.matmul_i8_qkv_self.as_ref(),
                 bp.dequant_i8_qkv_self.as_ref(),
                 bp.dequant_qkv_self.as_ref(),
@@ -1402,6 +1446,7 @@ impl WanDitBlock {
                 &bp.matmuls.qkv_self,
             ),
             QkvSite::Cross => (
+                bp.coopmat_qkv.as_ref(),
                 bp.matmul_i8_qkv.as_ref(),
                 bp.dequant_i8_qkv.as_ref(),
                 bp.dequant_qkv.as_ref(),
@@ -1410,7 +1455,7 @@ impl WanDitBlock {
             ),
         };
         lin(
-            scope, bp, x, wv, out, rows, n, dim, mm_i8, dq_i8, dq, pipe, inst,
+            scope, bp, x, wv, out, rows, n, dim, coopmat, mm_i8, dq_i8, dq, pipe, inst,
         )?;
         let bv = scope.import_copy(b);
         let biased = alloc_act(scope, bp, rows, n)?;

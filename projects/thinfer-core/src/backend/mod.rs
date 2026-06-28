@@ -156,6 +156,16 @@ pub trait Backend: 'static {
         encoder: Self::CommandEncoder,
     ) -> impl Future<Output = Result<(), Self::Error>>;
 
+    /// Submit `encoder`'s accumulated commands as a standalone command buffer
+    /// WITHOUT awaiting GPU completion, error-scope capture, or timestamp
+    /// resolution. Used to break one logical scope into several command buffers
+    /// so no single submit's GPU time exceeds the OS GPU watchdog (~2s Windows
+    /// TDR) — e.g. a video DiT's multi-second self-attention. The caller
+    /// installs a fresh encoder and keeps the scope's buffer guards alive, so
+    /// the flushed work reads valid resources; any device-loss surfaces at the
+    /// next awaited [`Self::submit`].
+    fn flush_encoder(&self, encoder: Self::CommandEncoder) -> Result<(), Self::Error>;
+
     /// `label` names the pipeline for telemetry (compile/dispatch events,
     /// rollup tables) and backend debug labels; `entry` stays the WGSL entry
     /// point (almost always "main").

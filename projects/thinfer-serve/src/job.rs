@@ -43,6 +43,11 @@ pub struct JobHandle {
     /// `Some` => the worker encrypts the artifact in place and the result is
     /// served as opaque ciphertext; `None` => plaintext.
     pub public_key: Option<String>,
+    /// Per-request coopmat opt-out (see `JobSpec::disable_coopmat`). `None` =
+    /// use the server default; `Some(true)` forces the dense/i8 path for this
+    /// job. The worker layers this over the server `BackendConfig` at device
+    /// creation.
+    pub disable_coopmat: Option<bool>,
     inner: Mutex<Inner>,
     tx: broadcast::Sender<SeqEvent>,
     cancel: AtomicBool,
@@ -54,6 +59,7 @@ impl JobHandle {
         request: JobRequest,
         output_path: PathBuf,
         public_key: Option<String>,
+        disable_coopmat: Option<bool>,
     ) -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
@@ -61,6 +67,7 @@ impl JobHandle {
             request,
             output_path,
             public_key,
+            disable_coopmat,
             inner: Mutex::new(Inner {
                 kind: JobStateKind::Queued,
                 last_progress: None,
@@ -169,15 +176,21 @@ impl JobStore {
     /// place the artifact path), then register + enqueue. `make` runs before any
     /// lock is held, so it may touch the filesystem (create the job dir). Returns
     /// (handle, queue position).
+    #[allow(clippy::type_complexity)]
     pub fn submit(
         &self,
-        make: impl FnOnce(&str) -> Result<(JobRequest, PathBuf, Option<String>), String>,
+        make: impl FnOnce(&str) -> Result<(JobRequest, PathBuf, Option<String>, Option<bool>), String>,
     ) -> Result<(std::sync::Arc<JobHandle>, usize), String> {
         let n = self.next_id.fetch_add(1, Ordering::SeqCst);
         let id = format!("job-{n}");
-        let (request, output_path, public_key) = make(&id)?;
-        let handle =
-            std::sync::Arc::new(JobHandle::new(id.clone(), request, output_path, public_key));
+        let (request, output_path, public_key, disable_coopmat) = make(&id)?;
+        let handle = std::sync::Arc::new(JobHandle::new(
+            id.clone(),
+            request,
+            output_path,
+            public_key,
+            disable_coopmat,
+        ));
         self.jobs.lock().unwrap().insert(id, handle.clone());
         let position = {
             let mut q = self.queue.lock().unwrap();

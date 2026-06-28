@@ -169,7 +169,9 @@ pub fn block_cfgs() -> BlockWgslConfigs {
         ops,
         i8_sdpa: false,
         dense_acts: DenseActSites::default(),
+        coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: false,
+        fast_sdpa: false,
     }
 }
 

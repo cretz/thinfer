@@ -27,7 +27,7 @@ use thinfer_core::trace;
 use thinfer_core::weight::{WeightId, WeightSource};
 use thinfer_core::workspace::Workspace;
 
-use crate::common::block::{BlockWgslConfigs, DenseActSites};
+use crate::common::block::{BlockWgslConfigs, CoopmatSites, DenseActSites};
 use crate::wan::dit::{
     LoadedWanDitHandles, WanDit, WanDitError, WanDitInputs, WanDitShape, WanDitTaps, read_into_f32,
 };
@@ -182,6 +182,12 @@ pub enum ProgressEvent {
 
 pub type ProgressFn<'a> = Option<&'a dyn Fn(ProgressEvent)>;
 
+/// Cooperative cancellation hook. Returns `true` when the caller wants the
+/// in-flight generate to stop; the denoise loops poll it at each step boundary
+/// and bail with [`GenerateError::Cancelled`]. `None` (CLI default) never
+/// cancels. The server passes a closure backed by the job's cancel flag.
+pub type Cancel<'a> = Option<&'a dyn Fn() -> bool>;
+
 /// Which VAE decoder a generate/decode uses. No `Default`: callers state intent
 /// explicitly (the real VAE is the parity path; the LightTAE tiny decoder is
 /// opt-in and only loaded when selected). Requesting `Tiny` on a model loaded
@@ -284,6 +290,10 @@ pub enum GenerateError<SE: core::fmt::Debug> {
         shot_chunks: usize,
         num_chunks: usize,
     },
+    /// The caller's [`Cancel`] hook asked the in-flight generate to stop; the
+    /// denoise loop bailed at a step boundary. Not an error condition -- the
+    /// front end maps it to a "cancelled" job state, not a failure.
+    Cancelled,
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for GenerateError<SE> {
@@ -518,11 +528,12 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // path would be selected for ALL sites -- but the cross-attn qkv (un-normed
         // text K/V), proj, and ffn_down acts are outlier-heavy and overflow i8
         // act_quant's f16 scale (-> inf). Force those to the dense dequant-once
-        // path; only ffn_up (normed A-side) keeps i8. FastWan (bf16 DiT) leaves the
-        // non-i8 sites bf16 so this never triggers.
+        // path; the normed A-sides (self-attn qkv + ffn_up) keep i8. FastWan
+        // (bf16 DiT) leaves the non-i8 sites bf16 so this never triggers.
         let dense_acts = if matches!(dit_w, WeightDtype::Quant(_)) {
             DenseActSites {
                 qkv: true,
+                qkv_self: false,
                 proj: true,
                 ffn_up: false,
                 ffn_down: true,
@@ -540,12 +551,18 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     ffn_up: ffn_up_wd,
                     dense_acts,
                 },
+                // Mixed-precision f16 self-attention: only the bf16-act DiT (the
+                // 14B, whose residual forces bf16) uses it; the F16-act FastWan
+                // already runs the native f16 subgroup SDPA.
+                true,
             ),
         )
         .await?;
         let umt5_pipelines = Umt5Pipelines::compile(
             &backend,
-            &block_cfgs(umt5_w, umt5_act, SiteOverride::default()),
+            // umT5 keeps bf16 SDPA: its residual is raw (un-normed) and the f16
+            // path is only validated for normed DiT Q/K/V.
+            &block_cfgs(umt5_w, umt5_act, SiteOverride::default(), false),
         )
         .await?;
         let vae_pipelines = WanVaePipelines::compile(&backend).await?;
@@ -650,13 +667,14 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         params: &GenerationParams,
         vae: VaeChoice,
         progress: ProgressFn<'_>,
+        cancel: Cancel<'_>,
     ) -> Result<WanVideo, GenerateError<S::Error>> {
         let mut workspace = Workspace::new(
             Arc::clone(&self.backend),
             Arc::clone(self.residency.arbiter()),
         );
         let (latent, f_lat, h_lat, w_lat) = self
-            .denoise_with(params, None, &mut workspace, None, progress)
+            .denoise_with(params, None, &mut workspace, None, progress, cancel)
             .await?;
 
         if let Some(p) = progress {
@@ -1091,6 +1109,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         workspace: &mut Workspace<WgpuBackend>,
         mut step_diag: Option<&mut Vec<WanStepDiag>>,
         progress: ProgressFn<'_>,
+        cancel: Cancel<'_>,
     ) -> Result<(Vec<f32>, usize, usize, usize), GenerateError<S::Error>> {
         if let Some(sink) = step_diag.as_deref_mut() {
             sink.clear();
@@ -1189,13 +1208,40 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // default) mirrors the public FastWan Spaces; DMD is the parity path. ---
         let shape = || WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
 
-        // Cap the streamed DiT weight set below budget by the in-flight transient
-        // envelope (overlapping prefetch stagings + the forward workspace), so the
-        // VRAM true peak holds under the (hard) budget ceiling even at the thin
-        // 2 GB default. Budget-independent; set once for the whole step loop.
+        // Hold the DiT forward's full non-weight working set free on every weight
+        // admission, so weight residency only ever fills `budget - working_set`
+        // and the activation+dequant peak stays UNDER budget instead of spilling
+        // into device slack. (The old fixed `DIT_WORKSPACE_RESERVE` pad was
+        // calibrated at the tiny e2e dims -- ~64 MiB -- so at video dims the
+        // ~1 GiB of pooled activation + Q8->bf16 dequant scratch overflowed the
+        // budget into the physical card.)
+        //
+        // The reserve is MAX-of-phase, not sum-of-phases. The self-attention and
+        // FFN phases never coexist (q/k/v are freed before the FFN runs), so
+        // reserving `rows*(dff + 8*dim)` -- the OLD formula -- double-counted both
+        // and, at a long clip (81f @ 832x480 = 32760 rows), held ~4GB free per
+        // weight admission. That left <1GB for the 14B weight cache and the DiT
+        // thrashed on constant re-streaming. Now the FFN is row-tiled
+        // (`dit_block::FFN_TILE_ROWS`), so its `rows*ffn_dim` intermediate is
+        // bounded to a tile; the residency-visible peak is whichever phase is
+        // larger plus the weight dequant scratch:
+        //   - self-attn / residual: ~6x the rows*dim residual (x + qr/kr/v/sa,
+        //     the q/k/qn/kn intermediates reuse the pool), scales with the grid;
+        //   - tiled FFN: TILE rows * (2*ffn_dim + 2*dim), constant in clip length;
+        //   - weight dequant: ~4x the FFN weight (dim*ffn_dim), the largest site.
+        // Generous within each phase on purpose (overflow PREVENTED up front; a
+        // rare residual peak rides soft budget mode), but no longer quadratic in
+        // practice. Set once for the whole step loop.
+        let rows = shape().n_tok as u64;
+        let dim = self.cfg.inner() as u64;
+        let dff = self.cfg.ffn_dim as u64;
+        let tile = (super::dit_block::FFN_TILE_ROWS as u64).min(rows.max(1));
+        let bpe = self.dit.block.act_bytes(1);
+        let attn_phase = rows * 6 * dim * bpe;
+        let ffn_phase = rows * 2 * dim * bpe + tile * 2 * dff * bpe;
+        let dit_workspace = attn_phase.max(ffn_phase) + 4 * dim * dff * bpe;
         self.residency.set_transient_reserve(
-            PREFETCH_STAGING_DEPTH * self.residency.vram_staging_reserve_bytes()
-                + DIT_WORKSPACE_RESERVE,
+            PREFETCH_STAGING_DEPTH * self.residency.vram_staging_reserve_bytes() + dit_workspace,
         );
 
         // --- Wan2.2-A14B MoE step-distill path (two experts). 4-step flow-Euler,
@@ -1210,6 +1256,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let n_steps = sampler.num_steps();
             for i in 0..n_steps {
                 let _step = trace::scope!("step", i = i).entered();
+                if cancel.is_some_and(|c| c()) {
+                    return Err(GenerateError::Cancelled);
+                }
                 if let Some(p) = progress {
                     p(ProgressEvent::Step {
                         i: i as u32 + 1,
@@ -1255,6 +1304,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 let n_steps = sampler.num_steps();
                 for i in 0..n_steps {
                     let _step = trace::scope!("step", i = i).entered();
+                    if cancel.is_some_and(|c| c()) {
+                        return Err(GenerateError::Cancelled);
+                    }
                     if let Some(p) = progress {
                         p(ProgressEvent::Step {
                             i: i as u32 + 1,
@@ -1350,6 +1402,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 let n_steps = unipc.num_steps();
                 for i in 0..n_steps {
                     let _step = trace::scope!("step", i = i).entered();
+                    if cancel.is_some_and(|c| c()) {
+                        return Err(GenerateError::Cancelled);
+                    }
                     if let Some(p) = progress {
                         p(ProgressEvent::Step {
                             i: i as u32 + 1,
@@ -1713,7 +1768,12 @@ struct SiteOverride {
     dense_acts: DenseActSites,
 }
 
-fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype, ovr: SiteOverride) -> BlockWgslConfigs {
+fn block_cfgs(
+    weight_dtype: WeightDtype,
+    act: ActDtype,
+    ovr: SiteOverride,
+    fast_sdpa: bool,
+) -> BlockWgslConfigs {
     let ops = WgslConfig {
         bf16_quant_writes: RECIPE.bf16_quant_writes,
         act_dtype: act,
@@ -1744,7 +1804,28 @@ fn block_cfgs(weight_dtype: WeightDtype, act: ActDtype, ovr: SiteOverride) -> Bl
         ops,
         i8_sdpa: false,
         dense_acts: ovr.dense_acts,
+        // Coopmat (tensor-core) on the outlier-bound bf16 sites i8 can't take:
+        // proj (attn-out) + ffn_down (gelu product). Only on the bf16 14B path
+        // (fast_sdpa); honored only when the device exposes a coopmat config
+        // (else the compile gate falls back). Cross-attn qkv stays OFF: its
+        // un-normed umT5 text K/V overflow f16 (same reason it stays dense for
+        // i8). Validate via wan22 5f e2e parity before widening.
+        coopmat_acts: if fast_sdpa {
+            CoopmatSites {
+                proj: true,
+                ffn_down: true,
+                // Cross-attn qkv stays OFF coopmat: TESTED 2026-06-28 -> DEVICE
+                // LOST at denoise step 1 (un-normed umT5 text K/V overflow f16,
+                // as the i8 note predicted). It is the #1 remaining matmul (30.6
+                // ms/disp), so it's the prize, but needs a CLAMPED bf16->f16
+                // cast on the A-side + quality validation before it can ship.
+                qkv: false,
+            }
+        } else {
+            CoopmatSites::default()
+        },
         large_d_sdpa: false,
+        fast_sdpa,
     }
 }
 

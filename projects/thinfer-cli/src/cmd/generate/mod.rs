@@ -142,6 +142,7 @@ fn backend_config_from_env() -> BackendConfig {
     BackendConfig {
         power_preference,
         timestamps: std::env::var("THINFER_TRACE").is_ok(),
+        disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
     }
 }
 

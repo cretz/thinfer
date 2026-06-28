@@ -54,6 +54,14 @@ pub const DISPATCH_GPU: &str = "thinfer::dispatch.gpu";
 /// time waiting for `on_submitted_work_done`).
 pub const SUBMIT: &str = "thinfer::submit";
 
+/// DIAGNOSTIC: per-op GPU fence. When enabled at TRACE, the backend submits and
+/// BLOCKS on `device.poll(Wait)` after EVERY dispatch, logging the pipeline name
+/// before and after the drain. Used to localize a GPU device-loss / shader OOB to
+/// a single op: the last "submitting" line without a matching "drained" line is
+/// the faulting op. Massively slows execution (one submit+fence per dispatch);
+/// native-only, for debugging a faulting config. Fields: `pipeline`, `wg_x/y/z`.
+pub const OP_FENCE: &str = "thinfer::op.fence";
+
 /// Backend buffer allocate / free. Fields: `op` ("alloc" | "free"), `id`,
 /// `bytes` (alloc only).
 pub const BUF: &str = "thinfer::buf";

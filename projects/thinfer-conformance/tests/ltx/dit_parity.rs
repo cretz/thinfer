@@ -84,6 +84,7 @@ async fn dit_parity() {
                 _ => PowerPreference::HighPerformance,
             },
             timestamps: std::env::var("THINFER_TRACE").is_ok(),
+            disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
         })
         .await
         .expect("wgpu adapter unavailable for tests"),
@@ -261,6 +262,7 @@ async fn dit_full_parity() {
                 _ => PowerPreference::HighPerformance,
             },
             timestamps: std::env::var("THINFER_TRACE").is_ok(),
+            disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
         })
         .await
         .expect("wgpu adapter unavailable for tests"),
@@ -352,6 +354,7 @@ async fn modulation_parity() {
                 _ => PowerPreference::HighPerformance,
             },
             timestamps: std::env::var("THINFER_TRACE").is_ok(),
+            disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
         })
         .await
         .expect("wgpu adapter unavailable for tests"),

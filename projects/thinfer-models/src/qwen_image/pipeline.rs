@@ -221,7 +221,9 @@ impl<S: WeightSource> QwenImagePipeline<S> {
             ops: enc_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: false,
+            fast_sdpa: false,
         };
         let encoder_pipelines = BlockPipelines::compile(&backend, &enc_cfgs).await?;
 

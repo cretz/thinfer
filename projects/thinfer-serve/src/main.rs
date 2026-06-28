@@ -150,6 +150,17 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
 
     let store = Arc::new(JobStore::default());
     let backend_cfg = config.backend_config();
+    // Probe coopmat (tensor-core) support once at startup: build a throwaway
+    // device, check, drop it (no VRAM held across jobs). Surfaced to the web UI
+    // via GET /capabilities so the toggle greys out on unsupported hardware.
+    let coopmat_supported = match thinfer_app::config::init_backend(backend_cfg).await {
+        Ok(b) => b.supports_coopmat(),
+        Err(e) => {
+            tracing::warn!(error = %e, "coopmat probe: backend init failed; reporting unsupported");
+            false
+        }
+    };
+    tracing::info!(coopmat_supported, "coopmat capability probe");
     let workers = config.workers.max(1);
     for i in 0..workers {
         worker::spawn_worker(i, store.clone(), backend_cfg, config.download_as_needed);
@@ -163,6 +174,7 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
     let state = AppState {
         store,
         config: Arc::new(config.clone()),
+        coopmat_supported,
     };
     let app = api::router(state).merge(web);
 

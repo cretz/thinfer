@@ -78,6 +78,8 @@ impl WasmEngine {
         let cfg = WgpuConfig {
             power_preference,
             timestamps: false,
+            // Coopmat is a native-Vulkan path; never available on the web.
+            disable_coopmat: true,
         };
         let backend = WgpuBackend::new_with_config(cfg)
             .await

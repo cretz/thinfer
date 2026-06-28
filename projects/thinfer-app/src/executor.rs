@@ -523,6 +523,7 @@ impl LocalExecutor {
         ));
 
         let progress = |ev: wanpipe::ProgressEvent| sink.stage(map_wan(ev));
+        let cancel = || sink.cancelled();
         let params = WanParams {
             // Single-shot reads this; multi-shot reads `shots` and ignores it
             // (kept = the first shot's caption for logging consistency).
@@ -551,6 +552,7 @@ impl LocalExecutor {
                 true,
                 WanVariant::fastwan_ti2v_5b(),
                 &progress,
+                &cancel,
             )
             .await?
         } else if matches!(req.model, VideoModelId::Wan22T2vA14b) {
@@ -586,6 +588,7 @@ impl LocalExecutor {
                 false,
                 WanVariant::wan22_t2v_a14b(),
                 &progress,
+                &cancel,
             )
             .await?
         } else {
@@ -604,6 +607,7 @@ impl LocalExecutor {
                 false,
                 WanVariant::fastwan_ti2v_5b(),
                 &progress,
+                &cancel,
             )
             .await?
         };
@@ -645,6 +649,7 @@ impl LocalExecutor {
         ar: bool,
         variant: WanVariant,
         progress: &dyn Fn(wanpipe::ProgressEvent),
+        cancel: &dyn Fn() -> bool,
     ) -> Result<WanVideo, String> {
         let residency = WeightResidency::new(source, req.budget);
         let model = {
@@ -661,6 +666,9 @@ impl LocalExecutor {
             .await
             .map_err(|e| format!("model load: {e:?}"))?
         };
+        // Cooperative cancellation: the denoise loop polls `cancel` between steps
+        // and aborts with GenerateError::Cancelled, which the worker maps to a
+        // cancelled job state (the AR path is not yet cancel-wired).
         if ar {
             model
                 .generate_ar(params, shots, vae, Some(progress))
@@ -668,7 +676,7 @@ impl LocalExecutor {
                 .map_err(|e| format!("generate: {e:?}"))
         } else {
             model
-                .generate(params, vae, Some(progress))
+                .generate(params, vae, Some(progress), Some(&cancel))
                 .await
                 .map_err(|e| format!("generate: {e:?}"))
         }

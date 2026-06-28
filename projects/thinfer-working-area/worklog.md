@@ -7,158 +7,151 @@ files (see Status). Scratch is ephemeral; nothing here depends on a scratch file
 
 ## NOW / NEXT
 
-**ACTIVE: Wan 2.2 14B A14B (MoE) + LightX2V distill, GGUF Q5_K_M.** New target on
-the shipped Wan backbone. Numerics CORRECT (coherent, on-prompt). Frame-envelope
-cap + per-model `max_frames` + form fixes done; default validated at
-512x288x25f. NOT committed (user browser-verifies first).
+**>>> TOP PRIORITY (post-/clear): 5s CLIP IS ATTENTION-BOUND. Coopmat MATMUL
+landed + validated (1.31x at 5f) but barely dents the full 5s clip -- SDPA is
+O(frames^2) so at 81f `sdpa_sg` dominates and the matmul win is in the noise.
+NEXT LEVERS MUST HIT ATTENTION.** Ranked:
+  1. **Coopmat FLASH-ATTENTION SDPA** (tensor-core QK^T + AV). The big one for 5s:
+     attention is the dominant term at 81f. Reuse the validated coopmat kernel
+     infra (`ops/matmul_coopmat.rs`, `backend.coopmat()`); write a coopmat
+     flash-attn (online softmax, f16 Q/K/V already produced by fast_mixed). Gate +
+     fallback like the matmul path. THIS is what makes 5s fast.
+  2. **i8-SDPA on self-attn** (`i8_sdpa`/`sdpa_i8` infra EXISTS but asserts
+     act_dtype==F16; Wan22 14B is Bf16+fast_mixed -> needs the fast_mixed q/k/v
+     bf16->f16->i8 treatment, like the matmul i8 path). ~1.5-2x the sdpa term.
+  3. **cross-qkv coopmat** (matmul_qkv, the #1 *matmul* at 30.6 ms/disp). TESTED
+     2026-06-28 -> DEVICE LOST at step 1 (un-normed umT5 text K/V overflow f16).
+     Needs a CLAMPED bf16->f16 cast (new op, clamp to +-65504 pre-coopmat) +
+     quality validation. Reverted to `qkv:false` in `block_cfgs`.
+  4. Algorithmic (bigger, changes semantics): windowed/sparse attention for long
+     clips. Only if 1-3 don't get 5s usable.
 
-**ROOT CAUSE CORRECTED: the 832x480x81f default device-loss was NOT a VRAM-budget
-overflow -- it is a GPU FAULT in the 14B DiT above a SEQUENCE-LENGTH threshold.**
-The earlier "activation envelope overshoots 8GB" framing was wrong. Telemetry
-(`nvidia-smi` + Windows System log) is decisive:
-- nvlddmkm **Event 153 (GPU engine reset)** at each crash, with NO Event 4101/13
-  (TDR "display driver stopped responding") and NO VRAM pinning at 8151MiB. That
-  signature = a GPU OOB shader fault (MMU fault -> engine reset -> "device lost" on
-  the wgpu poll thread), not a timeout and not a clean alloc-OOM. wgpu's
-  uncaptured-error handler never fires (it is a hardware fault, not a CPU-side
-  validation error), so the root error stays masked behind "Parent device is lost".
-- It is **rows-bound, independent of weight budget and f_lat**: 2G and 5G both
-  fault at 6240 rows; 256x256x61f (4096 rows, f_lat 16) COMPLETES. Empirical DiT
-  rows (= f_lat*(h/16)*(w/16)): 2048 / 3120 / 4096 complete; 6240 faults. So the
-  machine tolerates long GPU work (5f step = 184s, no TDR) -- it is a fault, not a
-  budget or a timeout.
-- **SHIPPED GUARD (not the real fix): a frame-envelope cap.** `WAN22_MAX_LATENT_CELLS
-  = 4096` (confirmed-safe ceiling, ~1.5x under the 6240 fault). Generalized
-  `ltx_max_frames` -> per-model `VideoModelId::max_frames(w,h)` (LTX /32 grid +
-  6300 cells; Wan /16 grid + 4096). `resolve()` now caps ALL video models: explicit
-  over-cap `--frames` = hard error, `--duration`/default cap DOWN with a warning.
-  Default res LOWERED to 512x288 (clip length scales as cells/(h/16*w/16), so
-  lower res = more frames): default 512x288x25f = 4032 cells ~1.6s. 832x480 stays a
-  form option but caps to 5f (~0.3s).
-- **REAL FOLLOW-UP (lifts the cap): root-cause the DiT shader OOB at >~4096-6240
-  rows.** Needs GPU-assisted validation (DEBUG_PRINTF / robustness) or op-bisection
-  of the block forward -- too slow to brute-force (184s/step). Suspects ruled OUT:
-  storage-buffer binding (NVIDIA maxStorageBufferRange = 4GB), the bcast/elementwise
-  ops (they spill the 1D grid past 65535 via `linear_workgroups`), matmul/SDPA grid
-  dims (all < 65535 at these rows), ROPE_MAX_SEQ_LEN 1024 (per-axis, never hit).
-  NOT yet checked op-by-op for a hardcoded seq buffer or a Y/Z dispatch dim. Fixing
-  it (or row-tiling the DiT forward) would lift the cap and unlock 832x480 at real
-  lengths.
-- LESSON: pull DRIVER telemetry (Event log Id 153 vs 4101, nvidia-smi peak) BEFORE
-  theorizing OOM-vs-TDR-vs-fault; do not bracket by guess-and-check. And never
-  redeploy a video model at an unvalidated default res x frames. (Wan2.2-14B,
-  2026-06-27.)
-- A hung `thinfer.exe`/`thinfer-serve.exe` (device-lost, ~12GB) must be KILLED
-  before any GPU run.
+**Coopmat MATMUL = LANDED + VALIDATED (proj+ffn_down on Wan22 14B).** Scope NARROW
+(see memory feedback_coopmat_scope). A/B 832x480/5f/seed42 vs THINFER_NO_COOPMAT=1:
+**1.31x e2e (346.1s->264.4s); ffn_down 102.9->19.7 ms/disp (5.2x), proj 37.0->6.9
+(5.4x).** The 5x (not the synthetic-bench 2.3x) is because dense bf16 on the real
+DiT shapes (K=14336, latency-bound) runs FAR below 3 TFLOPS. No OOM/overshoot at 5f.
+Clips: scratch/wan22_coopmat.mp4 vs wan22_nocoopmat.mp4 (OPEN: user eyeball quality).
+- KEY FACTS: 5070 square 16x16x16 f16->f32 config is DISCRETE-adapter only
+  (HighPerformance; Arc iGPU exposes only non-square 8x8x16, unusable -- naga is
+  square-only). `coopmat()` filters to square f16/f32. `enable wgpu_cooperative_
+  matrix;` is native-only (web needs the future standardized subgroup-matrix
+  spelling). `cooperativeMatrixRobustBufferAccess=true` -> ragged M/N need no pad.
+  Throughput ceiling ~6.5-7.6 TFLOPS (naga codegen + 1-subgroup-per-wg latency;
+  shared-mem staging measured SLOWER; tm/tn past 2x2 spills). Do NOT chase SPIR-V
+  passthrough (breaks stays-wgpu / free-web-later).
+- FILES (all landed): `thinfer-core/src/ops/matmul_coopmat.rs` (register-tiled GEMM,
+  tm2_tn2 best, F32+F16 out, `b_col_major`); backend `wgpu.rs` (coopmat probe,
+  Vulkan-preferred adapter, experimental feature, `WgpuConfig.disable_coopmat`);
+  `workspace.rs::coopmat`; `common/block.rs` (`CoopmatStep`, `CoopmatSites`,
+  `BlockPipelines.coopmat_{proj,ffn_down,qkv}`, `build_coopmat` in compile,
+  `dispatch_matmul_site_coopmat`); `wan/dit_block.rs` (`lin` coopmat arg);
+  `wan/pipeline.rs` (`block_cfgs` coopmat_acts proj+ffn_down). CLI `THINFER_NO_COOPMAT`.
+  conformance `tests/coopmat.rs`. To add a site: f16 dequant (DequantTarget::F16,
+  [N,K] nmajor, byte-compat with coopmat `array<f16>` B) + cast A bf16->f16 +
+  coopmat(b_col_major,F16 out) + cast out->bf16; all in dispatch_matmul_site_coopmat.
 
-**BUG FIXED (the flat/NaN garbage): the module-level matmul sites bypassed the
-dequant pre-pass.** The patch embed (`dit.rs:linear_bias`), condition embedder
-(`condition_embedder.rs:linear_bias_into`), and proj_out all called `scope.matmul`
-on the block's shared `matmul_qkv` pipeline with the RAW weight buffer + no dequant.
-On the Q8 GGUF path `matmul_qkv` is rebuilt for the dequant WORKSPACE (b_nmajor=true,
-workspace dtype), so feeding it a raw module weight -> inf/NaN. (The earlier bisect
-mis-located this inside `dispatch_matmul_site`'s dense-dequant branch; those module
-sites never reach that branch.) Fix:
-- Module weights now stay DENSE BF16 (`module_transcode` removed; F16/F32 narrow to
-  bf16 at upload via residency gpu_encoding). Tiny matmuls, run once/forward -> zero
-  perf cost, slightly better quality than Q8.
-- New dedicated `matmul_module` pipeline in `common/block.rs` (always bf16 weight,
-  `square` 64x64 tiling), wired into the 3 module sites. Decoupled from the block's
-  per-site quant pipeline for ALL Wan models (no-op for the bf16 5B path).
-- `WanVariant::wan22.act_pref` F32 -> Bf16 (F32 was a diagnostic; bf16 holds the
-  14B residual range, ~2x faster, matches pyref dtype).
-- All WIP diagnostics removed (MoE step-0 taps, pre-VAE latent stats, residency q8
-  transcode-roundtrip log). fmt+clippy clean.
-- Perf profile unchanged from the accepted ceiling: bf16 acts, Q8 block weights via
-  dequant-once, no DP4A (the 14B residual overflows f16 so the F16-gated i8/sg-SDPA
-  paths stay off). `matmul_module` adds ~0.28s total (negligible vs ~80s of block
-  matmuls/4 steps).
-- Everything else WORKS: VAE name fix (use Wan-AI/Wan2.2-T2V-A14B-Diffusers
-  vae/, NOT QuantStack's original-named one), the 2-expert source/load/denoise,
-  the step-distill scheduler, wiring. (Default frame cap = the BLOCKED item above.)
-- Engine done: `WanDitConfig::wan22_14b`, `WanVaeConfig::wan2_1`, generalized LoRA
-  fold (`ltx::lora` discover accepts `lora_down`/`lora_up`), `open_wan22_source`
-  (two folded GGUF experts, prefixed `high.`/`low.`, unioned with reused umT5 +
-  diffusers Wan2.1 VAE), `WanModel::load_variant` + `WanVariant`, MoE step-distill
-  denoise (`Wan22DistillSampler`, expert switch + boundary evict), loader prefix,
-  per-config `vae_scale`. Wired: `VideoModelId::Wan22T2vA14b`,
-  manifest two-expert `VariantFiles`, executor arm, web dropdown.
-- KEY DECISIONS that worked: LoRA covers EVERY block matmul -> fold re-encodes all
-  to Q8_0 (uniform). Module-level weights (patch, condition embedder, proj_out) stay
-  DENSE BF16 on a dedicated `matmul_module` pipeline -- they are NOT folded by the
-  LoRA so quantizing them bought nothing, and they bypass the per-site quant block
-  pipeline cleanly. F16/F32 module weights + norms/biases/scale_shift_table
-  upload-narrow to bf16 automatically (residency gpu_encoding), no extra work.
-- GOTCHA fixed: QuantStack `Wan2.1_VAE.safetensors` is ORIGINAL-Wan naming
-  (`decoder.middle.*`, `decoder.conv1`) which the diffusers-named VAE loader can't
-  read. Use the diffusers VAE from `Wan-AI/Wan2.2-T2V-A14B-Diffusers` (vae/) ->
-  `decoder.up_blocks.*`. VAE_WAN21 points there.
-- DOWNLOAD GOTCHA: bare `hf download QuantStack/Wan2.2-T2V-A14B-GGUF` pulls EVERY
-  quant (150GB+); always name the specific file.
-- PARITY: full-14B pyref INFEASIBLE on this box (fp32 ~56GB, same as the abandoned
-  LTX-22B pyref). Validation = unit tests (schedule, fold) + reused-validated
-  components (umT5, Wan DiT arch both 5B-parity-green) + the new Wan2.1 VAE
-  exercised in the real decode + GPU eyeball. A component Wan2.1-VAE pyref gate is
-  a possible follow-up (ask first; GPU).
-- Original verified facts below.
-- **Two 14B experts (MoE), identical config**: dim 5120 (40 heads x 128), 40
-  layers, ffn 13824, in/out 16, freq 256, eps 1e-6, text_len 512, patch (1,2,2),
-  qk rms_norm_across_heads, cross_attn_norm, RoPE theta 10000. CONTRAST with our
-  5B TI2V (24 heads/30 layers/14336 ffn/48 ch) -- genuinely different, NOT a
-  layer-count tweak.
-- **Expert switch by noise level**: high-noise expert (index 0) when
-  `t >= boundary*1000`, low-noise (index 1) below. T2V boundary 0.875 (I2V 0.900).
-  DISTILLED switches by STEP INDEX: `step_index < boundary_step_index(=2)` -> high,
-  else low (4 steps = 2 high / 2 low).
-- **VAE = Wan2.1** (z_dim 16, 4x8x8, non-residual, patch_size 1), NOT the TI2V-5B
-  VAE (z48, 4x16x16, residual). latents_mean/std are 16-vecs (from VAE config).
-  Engine `WanVaeConfig` is already parameterized; needs a `wan2_1()` ctor + the
-  non-residual/patch1 decode path EXERCISED (5B e2e never hit it).
-- **LightX2V distill**: 4-step CFG-free. denoising_step_list [1000,750,500,250],
-  sample_shift 5.0, CFG off. TWO separate rank-64 LoRAs (one per expert,
-  strength 1.0), name-matched to expert at load. Fold each into its expert GGUF via
-  the LoRA-fold machinery (`ltx::lora`, generalize the key map; ideally lift to a
-  shared module).
-- **Weights (HF cache, downloading)**: QuantStack/Wan2.2-T2V-A14B-GGUF
-  (HighNoise/LowNoise Q5_K_M + VAE/Wan2.1_VAE.safetensors); lightx2v/
-  Wan2.2-Distill-Loras (t2v high+low rank64 1217). umT5-XXL REUSED from the
-  FastWan diffusers bundle (already cached); tokenizer reused.
-- **Engine touch-points** (from code map): `WanDitConfig::wan22_14b()` +
-  `WanVaeConfig::wan2_1()`; de-hardcode `WanModel::load` 5B config (pipeline.rs:338,
-  343) and module consts `VAE_SCALE=16`/`TEMPORAL_SCALE=4` (pipeline.rs:59-60) ->
-  per-config (Wan2.1 VAE is 8x spatial). Two-expert dispatch at the DiT forward
-  sites (pipeline.rs:1114/1193) keyed on the in-scope `timestep`/step index.
-  `VariantFiles` must carry TWO DiT roles (currently single leading DiT). New
-  `ModelManifest` + `manifest()` arm; `VideoModelId` variant + web dropdown string.
-- **Defaults (upstream)**: 1280x720 (832x480 for the 480p/distill config), 81
-  frames (4n+1, the Wan rule), fps 16, flow shift 5.0 (distill). Respect 8GB:
-  DiT streams per-block so VRAM is bounded by activations, not weights; size the
-  default to the frame envelope like LTX.
-- **Plan: don't commit; user verifies in browser.**
+**Serve web UI coopmat toggle = CODE COMPLETE (compiles clean), NOT YET DEPLOYED.**
+- DONE (Rust): `wire.rs` `disable_coopmat: Option<bool>` on all 3 specs + `JobSpec::
+  disable_coopmat()`; `api.rs` `spec_into_request` captures it (tuple widened to 4)
+  + `AppState.coopmat_supported` + `GET /capabilities` ({coopmat:bool}); `job.rs`
+  `JobHandle.disable_coopmat` + submit tuple; `worker.rs` layers per-job opt-out
+  over `BackendConfig` at device build; `main.rs` startup probe (throwaway backend
+  -> `supports_coopmat()` -> AppState). CLI image.rs/video.rs remote specs set
+  `disable_coopmat: None`.
+- DONE (web): `web/index.html` `#coopmat-row` checkbox (checked = on); `web/app.js`
+  sends `spec.disableCoopmat=true` only when unticked + `refreshCapabilities()`
+  greys/disables the box when `GET /capabilities` reports `coopmat:false`.
+- REMAINING: serve REBUILD + DEPLOY (web is include_str!-baked). ASK before
+  stopping the user's running server, then `cargo build -p thinfer-serve --release`
+  + relaunch per the deploy note below. Verify in-browser: toggle present, greyed
+  on a non-coopmat GPU; a run with it unticked logs the dense path (no coopmat).
 
-**LTX-2.3 + Sulphur-2 family = SHIPPED (commit a48a81b, 2026-06-27).** 22B joint
-audio-video. Two-stage widescreen default + per-res frame/duration caps, Q4 Gemma
-encoder option, Sulphur distill-LoRA fold. Detail in git + `ltx-plan.md`. Forward
-notes retained below; the rest is git history.
+**Wan2.2-T2V-A14B (MoE 14B + LightX2V 4-step distill, GGUF Q5_K_M) = numerics
+correct + both device-loss modes FIXED; the live blocker is PERF, not crashes.**
+Default 832x480 x 33f, wired CLI + serve web UI. Config + wiring all
+in code (`WanDitConfig::wan22_14b`, `WanVaeConfig::wan2_1`, `Wan22DistillConfig`;
+`open_wan22_source` = two folded GGUF experts; expert switch by step index: <2
+high-noise else low; Wan2.1 VAE z16/4x8x8/non-residual/patch1).
 
-## LTX (shipped) -- forward notes only
+- **TOP TWO NEXT: (1) EXTREME perf overhaul -- 81f@832x480 is ~4hr on this 8GB/28-SM
+  card and that is the whole user-facing blocker; aim for an order-of-magnitude, not
+  a marginal gain; (2) make cancel BLOCK-granular (per-step cancel is useless at
+  ~1hr/step).** Both detailed below. 81f is correct but a ~4hr render; usable clips
+  today = short (13-17f ~20min) or the 5B FastWan for longer. Only 13f@832x480 is
+  validated to completion (rest correct by construction); >13f e2e eyeball still open.
+- **FIX 1 -- TDR device-loss: one long SDPA dispatch tripped the 2s Windows GPU
+  watchdog** (`TdrDelay` unset = 2s, `TdrLevel` 3 -> nvlddmkm **Event 153** engine
+  reset). NOT a shader OOB (the prior note theorizing one was wrong; 4096 rows was
+  just where O(rows^2) attention nears 2s). FIX: `common/block.rs::op_sdpa`
+  row-chunks queries (`sdpa_chunk_rows(s_k)=10M/s_k`, BR=64 multiple) and flushes
+  each chunk to its OWN submit (the watchdog is per-submit). Bit-exact, scales to
+  any N. LESSON: a ~2s "device lost" + Event 153 + NO Event 4101 = the COMPUTE TDR;
+  check `TdrDelay`/`TdrLevel` + per-op dispatch DURATION before theorizing an OOB;
+  bound any dispatch that can exceed ~1.5s and split submits.
+- **FIX 2 -- long clips crawled: the residency `transient_reserve` was
+  sum-of-phases + an unbounded FFN.** Old `rows*(dff + 8*dim)` (pipeline.rs)
+  reserved ~4GB at 81f -- it summed the self-attn (8*dim) and FFN (dff) phases that
+  never coexist (q/k/v free before the FFN) and never bounded the rows*dff FFN
+  intermediate -- starving the 14B weight cache to <1GB -> constant re-streaming =
+  the `arbiter overshoot` storm. FIX: (1) row-tile the FFN (`dit_block.rs`,
+  `FFN_TILE_ROWS=8192`; position-wise so BIT-EXACT, short clips = 1 chunk);
+  (2) reserve = MAX-of-phase with the tiled FFN -> ~2.6GB at 81f. LESSON: the
+  overshoot `bytes` is the RESERVE, not a real buffer, and `ensure_headroom` fires
+  from RESIDENCY (weight admission), not just `workspace.alloc` -- a workspace-only
+  alloc probe misses it.
+- **CANCEL shipped but STEP-granular -> must be BLOCK-granular (open).** wan
+  `Cancel` closure threaded generate -> denoise_with, polled per STEP;
+  `GenerateError::Cancelled` -> worker emits `JobEvent::Cancelled`; web Cancel
+  button POSTs `/jobs/{id}/cancel`. PROBLEM CONFIRMED: at 81f one step is ~1hr, so
+  per-step cancel "hangs" (flag set, never polled until the step ends). NEXT: thread
+  `Cancel` into `WanDit::forward` and poll at the block loop top (`dit.rs:367`) for
+  ~seconds latency. AR (LongLive) cancel also not wired.
+- **EXTREME PERF OVERHAUL (2 of 3 levers LANDED + committed): 14B 5f@832x480
+  denoise 622s -> 331s (1.88x); 5s clip (81f) projects ~4hr -> ~40min (6.3x),
+  quality-neutral (eyeballed clean).** Both fast paths were gated off Wan22 by the
+  `act_dtype==F16` coupling; the fix decouples them via a `fast_sdpa` opt-in on the
+  bf16 DiT block that builds the bf16<->f16 act casts, so f16-compute kernels run
+  while the residual stays bf16. Mechanism (common/block.rs): `BlockWgslConfigs.
+  fast_sdpa` (Wan DiT only; umt5/FastWan/others unaffected -- FastWan is F16-act so it
+  already had the native path), `fast_mixed` builds `sdpa_sg` + `cast_to_f16/bf16` +
+  enables `use_dp4a` for bf16; `op_sdpa_f16` (self-attn only) does the chunked f16 SDPA;
+  `dispatch_matmul_site` casts the i8 path's A-side bf16->f16->i8 and its f16 out->bf16.
+  `DenseActSites.qkv_self` split out from `.qkv` so self-attn qkv goes i8 while
+  cross-attn stays dense.
+  1. **f16-SUBGROUP SDPA -- DONE.** self-attn sdpa 204 ms/disp -> 16.3 (12.9x; the old
+     bf16 SdpaF32 was the 0.22-TFLOPS spill path). Mirrors the Qwen-Image bf16-residual
+     FastSdpa. Cross-attn stays bf16 (un-normed text K/V not f16-proven). cast overhead
+     ~0.1%.
+  2. **i8 DP4A matmul (qkv_self + ffn_up) -- DONE.** each 7x (67.7s->9.3s, 65s->9.2s
+     incl dequant_i8). cast+act_quant overhead ~0.2%. proj + ffn_down + cross-qkv STAY
+     bf16 (outlier A-sides: gelu product / attn-out / un-normed text -> per-32 i8 NaNs
+     or crushes; the f16-clamp now prevents NaN but quality still suspect -- untested).
+  3. **NOT done -- chunked-SDPA submit batching**: sdpa_chunk_rows_f16 already 2x the
+     bf16 budget (20M); could batch further. Minor vs levers 1-2.
+- **NEXT decision (5s still ~40min = maybe not "usable"; user pushed hard on this):**
+  remaining 81f cost is co-dominant sdpa_sg (~1460s) + the 3 outlier-bound bf16 matmuls
+  (ffn_down+proj+cross-qkv ~1560s). Levers: (a) **i8-SDPA** (`sdpa_i8`/`i8_sdpa` flag
+  exists) on self-attn -> ~1.5-2x the sdpa term -> ~28-30min, but i8 attention =
+  real quality risk, must validate. (b) The 3 bf16 matmuls resist i8 (outliers). FLOOR:
+  WGSL has NO tensor cores (no wmma) -> minutes (ComfyUI/llama via CUDA) is NOT
+  reachable here; ~30min is ~the 14B-5s WGSL floor on this 8GB card. For genuinely fast
+  long clips: 5B FastWan (already F16 fast path) or shorter/smaller (attention O(frames^2)).
+  Validate numerics each step (eyeball + short parity band) + measure `gpu_ms by pipeline`.
+- **Cap** `WAN22_MAX_LATENT_CELLS=32760` = the 81f@832x480 envelope (a
+  wall-time/VRAM bound, not a crash guard); `resolve()` errors explicit over-cap
+  `--frames`, caps `--duration`/default DOWN with a warning.
+- OPERATIONAL: bare `hf download QuantStack/Wan2.2-T2V-A14B-GGUF` pulls EVERY quant
+  (150GB+) -- name the file. Wan2.1 VAE MUST be the diffusers-named one
+  (`Wan-AI/Wan2.2-T2V-A14B-Diffusers` vae/, `decoder.up_blocks.*`), NOT QuantStack's
+  original-named `Wan2.1_VAE.safetensors`. Full-14B pyref infeasible (fp32 ~56GB);
+  validation = unit tests + 5B-parity-green components + GPU eyeball. Kill a hung
+  `thinfer*.exe` (device-lost, ~12GB) before any GPU run.
 
-- Adherence was REGIME, not a bug: low-res single-stage is OOD. Default = in-distrib
-  WIDESCREEN TWO-STAGE, CFG=1 (CFG is vetoed: 2x cost). Distill-LoRA choice does NOT
-  move photorealism (the illustrative/off-subject skew is the CFG-free regime
-  ceiling). condsafe@1.0 is the correct distill artifact; the standalone rank768 is a
-  CONTENT lora, not step-distill (mush if folded into the 8-step path).
-- **8GB frame envelope = frames dominate VRAM** (stage-2 runs the DiT at full res).
-  `LTX_MAX_LATENT_CELLS=6300` + `ltx_max_frames`: 1280x704->49f(~2s),
-  1024x576->73f(~3s). Over-budget explicit `--frames` rejected at submit.
-- **Stage-2 OOM at high (res x frames) LOSES THE DEVICE** (hard wgpu poll-thread
-  panic), not a catchable alloc error -> hung process holding VRAM. No graceful-OOM
-  retry yet (follow-up). Clean up hung thinfer.exe before the next run.
-- `LTX_VRAM_BUDGET_CAP=2G`: the 22.8GB DiT always streams per-block, so a high weight
-  budget only steals device slack stage-2 needs.
-- **Sulphur fold host-RAM cache is UNBOUNDED** (`LoraFoldSource` caches every folded
-  site as Q8 bytes, ~12-18GB for 22B, not governed by ram_budget). Fine on big-RAM;
-  bound it before any stacked fold ships. (Applies to the Wan fold too -- watch it.)
+**LTX-2.3 + Sulphur-2 = SHIPPED (commit a48a81b).** Done; detail in git +
+`ltx-plan.md`. One carry-over to watch on the Wan fold too: the LoRA-fold host-RAM
+cache (`LoraFoldSource`) is UNBOUNDED (caches every folded site as Q8 bytes); fine
+on big-RAM, bound it before any STACKED fold ships.
 
 ## Lessons / dead-ends (do not retry)
 

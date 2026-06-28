@@ -771,31 +771,35 @@ mod tests {
     #[test]
     fn wan22_frame_cap_tracks_resolution() {
         use crate::model::VideoModelId::Wan22T2vA14b as W;
-        // The fault-safe envelope is 4096 latent cells (f_lat*h/16*w/16). At the
-        // 512x288 default (576 cells/lat-frame) that is f_lat 7 -> 25f; at 832x480
-        // (1560/lat-frame) only f_lat 2 -> 5f; at 256x256 (256/lat-frame) f_lat 16
-        // -> 61f. All on the 4k+1 grid.
-        assert_eq!(W.max_frames(512, 288), Some(25));
-        assert_eq!(W.max_frames(832, 480), Some(5));
-        assert_eq!(W.max_frames(256, 256), Some(61));
-        // The default config (512x288 x 25f) sits exactly at the cap (no warning).
-        let plan = wan22_req(512, 288, vec![], vec![]).resolve().unwrap();
-        assert_eq!(plan.frames, 25);
+        // The cap is now the model's 81f @ 832x480 design envelope (32760 latent
+        // cells = f_lat*h/16*w/16), NOT a TDR-fault guard (the crash is fixed by
+        // op_sdpa query chunking). At 832x480 (1560 cells/lat-frame) that is
+        // f_lat 21 -> 81f; at 512x288 (576/lat-frame) f_lat 56 -> 221f; at 256x256
+        // (256/lat-frame) f_lat 127 -> 505f. All on the 4k+1 grid.
+        assert_eq!(W.max_frames(832, 480), Some(81));
+        assert_eq!(W.max_frames(512, 288), Some(221));
+        assert_eq!(W.max_frames(256, 256), Some(505));
+        // The default config (832x480 x 33f, the validated length) sits well under
+        // the envelope, so no cap warning.
+        let plan = wan22_req(832, 480, vec![], vec![]).resolve().unwrap();
+        assert_eq!(plan.frames, 33);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]
     fn wan22_over_envelope_frames_error_duration_caps() {
-        // Explicit over-cap --frames at 832x480 (9f > the 5f cap) is a hard error
-        // (fail fast at submit, not a device-losing mid-denoise).
-        assert!(wan22_req(832, 480, vec![9], vec![]).resolve().is_err());
-        // A duration over the envelope caps DOWN to the cap with a warning.
-        let plan = wan22_req(832, 480, vec![], vec![3.0]).resolve().unwrap();
-        assert_eq!(plan.frames, 5);
+        // Explicit over-cap --frames at 832x480 (85f > the 81f cap) is a hard error
+        // (fail fast at submit rather than start a multi-hour job that overruns the
+        // model's design envelope).
+        assert!(wan22_req(832, 480, vec![85], vec![]).resolve().is_err());
+        // A duration over the envelope caps DOWN to the cap with a warning
+        // (6s @ 16fps = 97f > the 81f cap).
+        let plan = wan22_req(832, 480, vec![], vec![6.0]).resolve().unwrap();
+        assert_eq!(plan.frames, 81);
         assert_eq!(plan.warnings.len(), 1, "capped duration must warn");
         // A request inside the envelope is untouched and silent.
-        let plan = wan22_req(512, 288, vec![17], vec![]).resolve().unwrap();
-        assert_eq!(plan.frames, 17);
+        let plan = wan22_req(832, 480, vec![49], vec![]).resolve().unwrap();
+        assert_eq!(plan.frames, 49);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 

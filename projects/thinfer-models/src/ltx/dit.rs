@@ -498,6 +498,7 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
     // whole AUDIO stream kept dense.
     let dense_acts = DenseActSites {
         qkv: !dp4a,
+        qkv_self: !dp4a,
         proj: true,
         ffn_up: !dp4a,
         ffn_down: true,
@@ -512,7 +513,9 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
         ops,
         i8_sdpa: false,
         dense_acts,
+        coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: false,
+        fast_sdpa: false,
     }
 }
 

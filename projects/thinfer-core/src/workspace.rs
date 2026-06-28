@@ -492,6 +492,26 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         Ok((fused, a, b))
     }
 
+    /// A sub-view of an existing scope buffer at `byte_offset` for `byte_len`
+    /// bytes (same backing allocation, no new alloc). Used to slice a
+    /// query-row range out of an sdpa Q/Out buffer for watchdog-safe chunked
+    /// dispatch. `byte_offset` must satisfy the backend's storage-binding
+    /// alignment (256B on the wgpu path); callers chunk on 64-row boundaries,
+    /// which is aligned for every act dtype in use. Borrows `src` (BatchBuf is
+    /// not Copy) so the caller can re-slice the same buffer across chunks.
+    pub fn subview(&self, src: &BatchBuf<'wsp>, byte_offset: u64, byte_len: u64) -> BatchBuf<'wsp> {
+        debug_assert!(
+            byte_offset + byte_len <= src.buf.len,
+            "subview out of range: {byte_offset}+{byte_len} > {}",
+            src.buf.len
+        );
+        BatchBuf {
+            buf: BufRef::view(src.buf.id, src.buf.offset + byte_offset, byte_len),
+            scope_id: self.scope_id,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Recompose a fused storage view from two BatchBufs that were minted as
     /// adjacent halves of one `alloc_pair` allocation. Asserts shared id and
     /// adjacency. Used to rebuild an `ActBuf::fused` after pack/unpack across
@@ -579,6 +599,22 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         RefMut::map(self.encoder.borrow_mut(), |o| {
             o.as_mut().expect("BatchScope encoder already taken")
         })
+    }
+
+    /// Submit the commands encoded so far as a standalone command buffer and
+    /// keep encoding into a fresh one, WITHOUT consuming the scope or awaiting
+    /// GPU completion (see [`Backend::flush_encoder`]). Scratch guards are
+    /// retained, so the flushed work reads valid buffers. Used to bound a single
+    /// submit's GPU time under the OS GPU watchdog when one scope would otherwise
+    /// encode a multi-second run of heavy dispatches (the video DiT
+    /// self-attention). A no-op-shaped flush is cheap but not free (a real
+    /// submit), so callers flush only when they have actually split heavy work.
+    pub fn flush(&self) -> Result<(), B::Error> {
+        let mut slot = self.encoder.borrow_mut();
+        let enc = slot.take().expect("BatchScope encoder already taken");
+        self.backend.flush_encoder(enc)?;
+        *slot = Some(self.backend.create_command_encoder());
+        Ok(())
     }
 
     /// Consume the scope: submit the encoder, await GPU completion, then
@@ -761,6 +797,41 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             &mut self.encoder_mut(),
             pipeline,
             op,
+            &bufs,
+            m,
+            n,
+        )
+    }
+
+    /// Dispatch the cooperative-matrix (tensor-core) matmul: `out[M,N] =
+    /// a[M,K] @ b`, with `a` f16 row-major, `b` f16 (layout per `cfg.b_col_major`),
+    /// `dims` the `(m,n,k,_)` uniform. See `ops::matmul_coopmat`.
+    pub fn coopmat(
+        &self,
+        pipeline: &B::Pipeline,
+        cfg: &crate::ops::matmul_coopmat::CoopmatMatmulConfig,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+        let out = self.resolve(out);
+        let dims = self.resolve(dims);
+        let bufs = crate::ops::matmul_coopmat::CoopmatBufs {
+            a: &a,
+            b: &b,
+            out: &out,
+            dims: &dims,
+        };
+        crate::ops::matmul_coopmat::dispatch_coopmat(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            cfg,
             &bufs,
             m,
             n,
@@ -2269,6 +2340,9 @@ mod tests {
             Ok(())
         }
         async fn submit(&self, _: ()) -> Result<(), ()> {
+            Ok(())
+        }
+        fn flush_encoder(&self, _: ()) -> Result<(), ()> {
             Ok(())
         }
         async fn create_pipeline(

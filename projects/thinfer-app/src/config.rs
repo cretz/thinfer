@@ -21,6 +21,9 @@ pub struct BackendConfig {
     pub power_preference: PowerPreference,
     /// GPU timestamp queries (the trace/rollup machinery). Off in normal runs.
     pub timestamps: bool,
+    /// Opt OUT of the cooperative-matrix (tensor-core) path. Default false
+    /// (ON when the GPU supports it). CLI maps `THINFER_NO_COOPMAT` here.
+    pub disable_coopmat: bool,
 }
 
 impl Default for BackendConfig {
@@ -31,6 +34,7 @@ impl Default for BackendConfig {
         Self {
             power_preference: PowerPreference::HighPerformance,
             timestamps: false,
+            disable_coopmat: false,
         }
     }
 }
@@ -41,6 +45,7 @@ pub async fn init_backend(cfg: BackendConfig) -> Result<Arc<WgpuBackend>, String
     let wcfg = WgpuConfig {
         power_preference: cfg.power_preference,
         timestamps: cfg.timestamps,
+        disable_coopmat: cfg.disable_coopmat,
     };
     Ok(Arc::new(
         WgpuBackend::new_with_config(wcfg)

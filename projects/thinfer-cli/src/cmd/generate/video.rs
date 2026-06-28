@@ -133,6 +133,9 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             audio: Some(!args.no_audio),
             upscale: Some(args.upscale || args.model.two_stage_default()),
             public_key: None,
+            // Remote path defers coopmat to the server default; local runs read
+            // THINFER_NO_COOPMAT via BackendConfig.
+            disable_coopmat: None,
         });
         return super::run_remote(&args.remote, spec, args.output).await;
     }

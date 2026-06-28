@@ -222,7 +222,9 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
             ops: enc_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: false,
+            fast_sdpa: false,
         };
         let encoder_pipelines = BlockPipelines::compile(&backend, &enc_cfgs).await?;
 
@@ -266,6 +268,7 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
         let dense_acts = if i8_matmul {
             DenseActSites {
                 qkv: false,
+                qkv_self: false,
                 proj: true,
                 ffn_up: false,
                 ffn_down: true,
@@ -273,6 +276,7 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
         } else {
             DenseActSites {
                 qkv: true,
+                qkv_self: true,
                 proj: true,
                 ffn_up: true,
                 ffn_down: true,
@@ -288,7 +292,9 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
             ops: dit_ops,
             i8_sdpa: false,
             dense_acts,
+            coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: true,
+            fast_sdpa: false,
         };
         let dit_main_pipelines = BlockPipelines::compile(&backend, &main_cfgs).await?;
         let dit_dense_pipelines =

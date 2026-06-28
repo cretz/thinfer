@@ -99,6 +99,8 @@ impl ServeConfig {
             power_preference,
             // Server runs do not drive the trace rollup.
             timestamps: false,
+            // Coopmat (tensor-core) path stays ON when the GPU supports it.
+            disable_coopmat: false,
         }
     }
 

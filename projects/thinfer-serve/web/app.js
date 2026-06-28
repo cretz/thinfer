@@ -41,9 +41,10 @@ const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.sta
 // Wan2.2-T2V-A14B (MoE 14B): a heavier Wan-family tier with its own surface. It
 // runs a fixed 4-step LightX2V distill schedule (the steps/sampler knobs do not
 // apply) and only the full Wan2.1 VAE (no tiny-VAE path), so the Steps + Quality
-// rows are hidden for it. The 14B per-step activation envelope is large, so it
-// defaults to 832x480 on the 8GB card and the server caps the clip length to the
-// per-resolution VRAM frame budget (lower the resolution for a longer clip).
+// rows are hidden for it. Defaults to 832x480 (the industry-norm 480p distill
+// regime). Longer clips up to the model's ~5s (81f) envelope are allowed via the
+// duration field, but on the 8GB card the 14B self-attention is O(rows^2), so
+// longer = slower (the default 33f ~2.1s is the longest length validated e2e).
 const isWan22Model = (model) => model === "wan2.2-t2v-a14b";
 // Multi-shot video: only LongLive treats each prompt line as a separate shot.
 // Every other video model is single-prompt (the whole box is one prompt).
@@ -96,19 +97,19 @@ const LTX_PRESETS = [
   { label: "768x512 landscape (fast, less faithful)", width: 768, height: 512 },
   { label: "512x320 landscape (fastest, off-prompt / OOD)", width: 512, height: 320 },
 ];
-// Wan2.2-T2V-A14B size ladder (/16 grid, the Wan2.1 VAE 8x + patch 2). The 14B
-// DiT faults above ~4096 latent cells on the 8GB card (a sequence-length GPU
-// fault, not a budget overflow), and clip length scales as cells/(h/16*w/16), so
-// the default is the lower-res 512x288 (16:9) -- it fits 25f (~1.6s) under the
-// cap, vs 832x480's 5f (~0.3s). Higher-res entries are sharper but the server
-// trims the clip to the per-resolution frame budget (832x480 -> ~5f). First =
-// default.
+// Wan2.2-T2V-A14B size ladder (/16 grid, the Wan2.1 VAE 8x + patch 2). The
+// default is 832x480, the industry-norm 480p distill regime. (The earlier
+// low-res default existed only to dodge a device-loss that turned out to be the
+// 2s Windows GPU watchdog tripping on one long self-attention dispatch, now fixed
+// by per-dispatch query chunking; it was never a resolution/VRAM ceiling.) Clip
+// length is a wall-time choice now: the server defaults to 33f and allows up to
+// the 81f envelope via the duration field. First = default.
 const WAN22_PRESETS = [
-  { label: "288p landscape (512x288, default, ~1.6s)", width: 512, height: 288 },
+  { label: "480p landscape (832x480, default)", width: 832, height: 480 },
+  { label: "480p portrait (480x832)", width: 480, height: 832 },
+  { label: "small landscape (640x384, faster)", width: 640, height: 384 },
+  { label: "288p landscape (512x288, fastest)", width: 512, height: 288 },
   { label: "288p portrait (288x512)", width: 288, height: 512 },
-  { label: "small landscape (640x384, sharper, shorter)", width: 640, height: 384 },
-  { label: "480p landscape (832x480, sharpest, ~0.3s)", width: 832, height: 480 },
-  { label: "480p portrait (480x832, sharpest, ~0.3s)", width: 480, height: 832 },
 ];
 /// Size preset + grid step + min dim for a (kind, model): LTX overrides the video
 /// defaults with its /64 grid and 256 floor; Wan2.2-A14B uses its /16 ladder led
@@ -143,13 +144,12 @@ const MODEL_STEPS = {
 // cap (see ltx_max_frames) sizes the real default by dims: at the 1280x704
 // widescreen default that is 49 frames (~2s). Pick a lower-res preset for a
 // longer clip (e.g. 1024x576 -> ~3s). This 2s is the default-resolution figure.
-// Wan2.2-A14B: the 14B DiT's per-resolution frame cap (see WAN22_MAX_LATENT_CELLS)
-// sizes the real default by dims. At the 512x288 default that is 25 frames
-// (~1.6s @16fps). Like LTX, this is the default-resolution figure; a higher-res
-// preset yields a shorter clip (832x480 -> ~5f / ~0.3s), a lower-res one longer.
+// Wan2.2-A14B: defaults to 33 frames (~2.1s @16fps) at 832x480, the longest
+// length validated e2e. Longer (up to ~5s / 81f) is allowed by typing a duration;
+// it runs progressively slower (the 14B self-attention is O(rows^2)).
 const VIDEO_DURATION = {
   "fastwan-ti2v-5b": 5,
-  "wan2.2-t2v-a14b": 1.6,
+  "wan2.2-t2v-a14b": 2.1,
   "longlive-2.0-5b": 5,
   "ltx-2.3-distilled": 2,
   "ltx-2.3-distilled-q4": 2,
@@ -337,6 +337,27 @@ $("width").addEventListener("input", syncPresetToDims);
 $("height").addEventListener("input", syncPresetToDims);
 
 applyKind();
+
+// Grey out the coopmat toggle on a server whose GPU can't accelerate it. Best
+// effort: on any error (older server without /capabilities, auth not yet set)
+// leave the toggle as-is (the server falls back gracefully regardless).
+async function refreshCapabilities() {
+  try {
+    const resp = await fetch("capabilities", { headers: authHeaders() });
+    if (!resp.ok) return;
+    const caps = await resp.json();
+    if (!caps.coopmat) {
+      const cb = $("coopmat");
+      cb.checked = false;
+      cb.disabled = true;
+      const row = $("coopmat-row");
+      if (row) row.title = "This server's GPU has no tensor-core (coopmat) support.";
+    }
+  } catch {
+    /* leave the toggle interactive; the backend degrades gracefully */
+  }
+}
+refreshCapabilities();
 
 // --- spec building ------------------------------------------------------------
 const intOrNull = (v) => {
@@ -580,6 +601,25 @@ $("form").addEventListener("submit", (ev) => {
   void generate();
 });
 
+// Job id of the in-flight run, for the Cancel button. Null when idle.
+let currentJobId = null;
+$("cancel").addEventListener("click", async () => {
+  if (!currentJobId) return;
+  $("cancel").disabled = true;
+  setStatus("Cancelling…");
+  try {
+    // A queued job is dropped immediately; a running one is flagged and stops
+    // at the next denoise step boundary. The events stream then ends in
+    // `cancelled` and `generate()`'s catch reports it.
+    await fetch(`jobs/${currentJobId}/cancel`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+  } catch (e) {
+    log(`Cancel request failed: ${e.message ?? e}`);
+  }
+});
+
 async function generate() {
   const kind = $("kind").value;
   $("fields").disabled = true;
@@ -590,6 +630,9 @@ async function generate() {
     const keypair = await ensureKeypair();
     const spec = await buildSpec();
     if (keypair) spec.publicKey = keypair.publicKeyB64;
+    // Coopmat is opt-OUT: only send the flag when the user unticked it (the
+    // server treats absent as "use default"). A no-op on GPUs without support.
+    if (!$("coopmat").checked) spec.disableCoopmat = true;
     const resp = await fetch("jobs", {
       method: "POST",
       headers: authHeaders({ "content-type": "application/json" }),
@@ -597,6 +640,10 @@ async function generate() {
     });
     if (!resp.ok) throw new Error(await errorText(resp));
     const { id } = await resp.json();
+    currentJobId = id;
+    const cancelBtn = $("cancel");
+    cancelBtn.disabled = false;
+    cancelBtn.hidden = false;
     log(`Submitted job ${id}${keypair ? " (encrypted)" : " (PLAINTEXT - insecure context)"}`);
     const result = await streamEvents(id);
     await showResult(kind, result, keypair?.privateKey ?? null);
@@ -609,5 +656,7 @@ async function generate() {
   } finally {
     $("fields").disabled = false;
     genStart = null; // stop stamping; the next run re-arms it
+    currentJobId = null;
+    $("cancel").hidden = true;
   }
 }

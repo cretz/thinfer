@@ -57,7 +57,12 @@ async fn worker_loop(store: Arc<JobStore>, backend_cfg: BackendConfig, download_
             Some(job) => {
                 // Fresh device per job (see module docs); dropped at the end of
                 // this block, releasing all VRAM even if the job poisoned it.
-                match LocalExecutor::new(backend_cfg).await {
+                // Layer the per-request coopmat opt-out over the server default.
+                let mut cfg = backend_cfg;
+                if let Some(disable) = job.disable_coopmat {
+                    cfg.disable_coopmat = disable;
+                }
+                match LocalExecutor::new(cfg).await {
                     Ok(executor) => process(&executor, &job, download_as_needed).await,
                     Err(e) => job.push(JobEvent::Error {
                         message: format!("backend init: {e}"),
@@ -100,7 +105,16 @@ async fn process(executor: &LocalExecutor, job: &Arc<JobHandle>, download_as_nee
     let sink = ServeSink { job: job.clone() };
     let summary = match executor.run(&job.request, &sink).await {
         Ok(summary) => summary,
-        Err(message) => return job.push(JobEvent::Error { message }),
+        // A cancel-requested job that errored out was interrupted by the user's
+        // cancel (the denoise loop bails with GenerateError::Cancelled); report
+        // it as Cancelled, not a failure. Any other error is a real failure.
+        Err(message) => {
+            return if job.is_cancel_requested() {
+                job.push(JobEvent::Cancelled)
+            } else {
+                job.push(JobEvent::Error { message })
+            };
+        }
     };
 
     // Encrypt the artifact at rest when the client supplied a public key, so the
@@ -156,5 +170,8 @@ impl ProgressSink for ServeSink {
         self.job.push(JobEvent::Log {
             message: msg.to_string(),
         });
+    }
+    fn cancelled(&self) -> bool {
+        self.job.is_cancel_requested()
     }
 }
