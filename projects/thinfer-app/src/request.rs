@@ -180,6 +180,12 @@ pub struct VideoRequest {
     pub sampler: VideoSampler,
     /// UniPC denoise step count (1..=`VIDEO_MAX_STEPS`); DMD ignores it.
     pub steps: u32,
+    /// Temporal self-attention window radius in LATENT frames. `Some(W)`
+    /// restricts DiT self-attention to keys within `±W` latent frames (trades
+    /// long-range temporal coherence for breaking the O(frames^2) attention cost
+    /// on long clips); `None` (default) runs full self-attention. Honored only on
+    /// the activation-tiled long-clip path; short clips run full attention.
+    pub attn_window: Option<u32>,
     pub vae: VaeChoice,
     /// LTX-2.3 text-encoder quantization (Q8 baseline or Q4_K_M fast). Applies to
     /// every LTX/Sulphur model (shared Gemma encoder); ignored by Wan.
@@ -686,6 +692,7 @@ mod tests {
             input_image: None,
             sampler: VideoSampler::UniPc,
             steps: 8,
+            attn_window: None,
             vae: VaeChoice::Full,
             encoder: EncoderQuant::Q8,
             i8_matmul: true,
@@ -754,6 +761,7 @@ mod tests {
             input_image: None,
             sampler: VideoSampler::UniPc,
             steps: 4,
+            attn_window: None,
             vae: VaeChoice::Full,
             encoder: EncoderQuant::Q8,
             i8_matmul: true,

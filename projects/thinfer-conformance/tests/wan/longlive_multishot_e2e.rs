@@ -159,6 +159,7 @@ async fn longlive_multishot_e2e_ar() {
         num_frames,
         seed: SEED,
         sampler: VideoSampler::default(), // AR path; ignored
+        attn_window: None,
     };
     let progress = |_ev: thinfer_models::wan::pipeline::ProgressEvent| {};
     let video = model

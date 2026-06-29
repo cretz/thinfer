@@ -533,6 +533,7 @@ impl LocalExecutor {
             num_frames: plan.frames,
             seed,
             sampler: req.sampler.into_engine(req.steps),
+            attn_window: req.attn_window,
         };
 
         let video = if req.model.is_ar() {

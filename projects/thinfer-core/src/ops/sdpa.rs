@@ -527,6 +527,27 @@ fn main(
 // required, so the model layer prepends `backend.subgroup_enable_directive()`
 // to this source at the build site.
 pub fn build_f16_sg_wgsl(cl: u32) -> String {
+    build_f16_sg(cl, false)
+}
+
+/// Temporal sliding-window variant of [`build_f16_sg_wgsl`]. Each query attends
+/// only to keys whose latent frame is within `±window` of the query's frame,
+/// where the token layout is frame-major (`(f, h, w)` row-major) so frame =
+/// `token / period` and `period` = tokens per latent frame. The uniform carries
+/// three extra fields (`period`, `window`, `row_off`); `row_off` is the global
+/// row index of the first query in this (possibly chunked) dispatch, so the
+/// kernel recovers each query's GLOBAL frame. Two savings vs the dense kernel:
+/// per-workgroup the key-tile loop is clamped to the window's frame span (the
+/// O(frames^2) -> O(frames * window) win), and per-key out-of-window scores are
+/// folded to `-FLT_MAX` (p_j = 0) for the exact boundary. K/V are still the full
+/// sequence (only the Q range is ever chunked), so `key_global` indexes globally.
+/// This CHANGES the attention output (it is a different operation, not an
+/// approximation of full attention); gate it behind the run-time flag.
+pub fn build_f16_sg_windowed_wgsl(cl: u32) -> String {
+    build_f16_sg(cl, true)
+}
+
+fn build_f16_sg(cl: u32, windowed: bool) -> String {
     assert!(cl == 4 || cl == 8, "sdpa_sg: CL must be 4 or 8, got {cl}");
     let br = 128 / cl; // WG=128 lanes / CL lanes-per-row
     let max_nl = 32 / cl; // MAX_DV4=32 vec4 (D=128) split across CL lanes
@@ -565,15 +586,23 @@ pub fn build_f16_sg_wgsl(cl: u32) -> String {
         off <<= 1;
     }
 
-    let mut s = String::from(
+    let u_window = if windowed {
+        "\n    period: u32, window: u32, row_off: u32,"
+    } else {
+        ""
+    };
+    let mut s = format!(
         r#"enable f16;
 
-struct U {
+struct U {{
     b: u32, h_q: u32, h_kv: u32, s_q: u32,
-    s_k: u32, d: u32, scale: f32, has_mask: u32,
-};
+    s_k: u32, d: u32, scale: f32, has_mask: u32,{u_window}
+}};
 
-@group(0) @binding(0) var<storage, read> q: array<vec4<f16>>;
+@group(0) @binding(0) var<storage, read> q: array<vec4<f16>>;"#
+    );
+    s.push_str(
+        r#"
 @group(0) @binding(1) var<storage, read> k: array<vec4<f16>>;
 @group(0) @binding(2) var<storage, read> v: array<vec4<f16>>;
 @group(0) @binding(3) var<storage, read> mask: array<vec2<f16>>;
@@ -617,6 +646,10 @@ fn main(
 
 "#,
     );
+    if windowed {
+        // Global query frame (frame-major layout); row_off shifts the chunk.
+        s.push_str("    let fq = (u.row_off + sq_c) / u.period;\n\n");
+    }
     s.push_str(&q_decls);
     s.push_str(&q_loads);
     s.push('\n');
@@ -625,11 +658,35 @@ fn main(
         r#"    var m: f32 = NEG_MAX;
     var l: f32 = 0.0;
 
-    let n_tiles = (u.s_k + BC - 1u) / BC;
     let v4_per_tile = BC * d_v4;
+"#,
+    );
+    if windowed {
+        // Clamp the key-tile loop to the frame window spanning this workgroup's
+        // BR global query rows: keys in frames [min_fq - W, max_fq + W].
+        s.push_str(
+            r#"    let wg_first = u.row_off + wgid.x * BR;
+    let wg_last  = u.row_off + min(wgid.x * BR + BR - 1u, u.s_q - 1u);
+    let n_f      = u.s_k / u.period;
+    let fq_lo    = wg_first / u.period;
+    let kf_lo    = select(fq_lo - u.window, 0u, fq_lo < u.window);
+    let kf_hi    = min(n_f - 1u, wg_last / u.period + u.window);
+    let kt_lo    = (kf_lo * u.period) / BC;
+    let kt_hi    = ((kf_hi + 1u) * u.period + BC - 1u) / BC;
+
+    for (var kt = kt_lo; kt < kt_hi; kt = kt + 1u) {
+"#,
+        );
+    } else {
+        s.push_str(
+            r#"    let n_tiles = (u.s_k + BC - 1u) / BC;
 
     for (var kt = 0u; kt < n_tiles; kt = kt + 1u) {
-        let kc_base = kt * BC;
+"#,
+        );
+    }
+    s.push_str(
+        r#"        let kc_base = kt * BC;
 
         for (var idx = t; idx < v4_per_tile; idx = idx + WG) {
             let kc = idx / d_v4;
@@ -662,9 +719,25 @@ fn main(
                 let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (key_global >> 1u)]);
                 bias = select(mw.x, mw.y, (key_global & 1u) == 1u);
             }
-            // Tail keys score -FLT_MAX -> p_j = 0, alpha = 1: no-op fold.
+"#,
+    );
+    if windowed {
+        // Out-of-window (and tail) keys score -FLT_MAX -> p_j = 0: exact fold.
+        s.push_str(
+            r#"            let fk = key_global / u.period;
+            let in_win = (max(fq, fk) - min(fq, fk)) <= u.window;
+            let s_j = select(NEG_MAX, part * u.scale + bias, key_global < u.s_k && in_win);
+"#,
+        );
+    } else {
+        s.push_str(
+            r#"            // Tail keys score -FLT_MAX -> p_j = 0, alpha = 1: no-op fold.
             let s_j = select(NEG_MAX, part * u.scale + bias, key_global < u.s_k);
-            let m_new = max(m, s_j);
+"#,
+        );
+    }
+    s.push_str(
+        r#"            let m_new = max(m, s_j);
             let alpha = exp(m - m_new);
             let p_j   = exp(s_j - m_new);
 "#,

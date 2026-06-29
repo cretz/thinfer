@@ -122,7 +122,10 @@ pub(crate) use scale::dispatch_scale;
 pub use scale::{ScaleBufs, ScaleF32, ScaleOp, scale_uniform_bytes};
 pub(crate) use scatter_pad_rows::dispatch_scatter_pad_rows;
 pub use scatter_pad_rows::{ScatterPadRowsBufs, ScatterPadRowsF32, ScatterPadRowsOp};
-pub use sdpa::{SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, build_f16_sg_wgsl, f16_sg_workgroups};
+pub use sdpa::{
+    SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, build_f16_sg_wgsl, build_f16_sg_windowed_wgsl,
+    f16_sg_workgroups,
+};
 pub(crate) use sdpa::{dispatch_sdpa, dispatch_sdpa_f16_sg};
 pub use silu::SiluF32;
 pub use silu_mul::SiluMulF32;

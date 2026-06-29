@@ -391,6 +391,14 @@ async fn video_e2e_safetensors() {
     eprintln!("[safetensors] DiT matmul weight dtype: {dit_w:?} (expected Bf16)");
     assert_eq!(dit_w, WeightDtype::Bf16, "safetensors DiT matmul dtype");
 
+    // Temporal self-attention window (latent frames) for perf/quality A/B. Set
+    // THINFER_E2E_ATTN_WINDOW=W to restrict self-attention to +-W latent frames;
+    // unset = full attention (the parity reference). Windowing CHANGES the output
+    // (it is a different op), so a windowed run is a rust-vs-rust quality/perf
+    // comparison, not a pyref-parity run.
+    let attn_window = std::env::var("THINFER_E2E_ATTN_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
     let params = GenerationParams {
         prompt: prompt.clone(),
         height,
@@ -399,6 +407,7 @@ async fn video_e2e_safetensors() {
         seed: SEED,
         // Parity gate: the DMD reference schedule (step-diag taps are DMD-only).
         sampler: VideoSampler::Dmd,
+        attn_window,
     };
 
     // Step-0 stage telemetry (magnitudes only; no reference). Localizes a

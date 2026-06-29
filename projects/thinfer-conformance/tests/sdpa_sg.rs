@@ -9,7 +9,9 @@ mod i8_common;
 
 use i8_common::*;
 use thinfer_core::backend::Backend;
-use thinfer_core::ops::{SdpaF32, SdpaOp, build_f16_sg_wgsl, f16_sg_workgroups};
+use thinfer_core::ops::{
+    SdpaF32, SdpaOp, build_f16_sg_wgsl, build_f16_sg_windowed_wgsl, f16_sg_workgroups,
+};
 
 fn gen_f16_rows(n: usize, seed: u64) -> Vec<f32> {
     let mut rng = Rng::new(seed);
@@ -180,6 +182,130 @@ async fn try_run(
     Some((got, exp))
 }
 
+/// Temporal sliding-window subgroup SDPA vs reference. The reference is the
+/// dense `cpu_ref` fed a synthesized additive mask that is 0 inside the window
+/// (`|fq - fk| <= window`, frame = token / period) and a large negative outside,
+/// so out-of-window keys get p_j = 0 -- exactly what the windowed kernel's
+/// in-kernel fold computes (with `has_mask == 0`). `row_off` exercises the
+/// chunked-Q path: each query's GLOBAL frame is `(row_off + sq) / period`.
+#[allow(clippy::too_many_arguments)]
+async fn try_run_windowed(
+    cl: u32,
+    s_q: u32,
+    s_k: u32,
+    d: u32,
+    period: u32,
+    window: u32,
+    row_off: u32,
+    seed: u64,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let backend = make_backend_with_f16().await?;
+    if !backend.supports_subgroups() {
+        eprintln!("skip: adapter does not expose SUBGROUP");
+        return None;
+    }
+    let (sg_min, _) = backend.subgroup_size_range();
+    if sg_min < cl {
+        eprintln!("skip: subgroup floor {sg_min} < CL {cl}");
+        return None;
+    }
+    assert!(s_k.is_multiple_of(period) && s_k.is_multiple_of(2));
+
+    let (b, h_q, h_kv) = (1u32, 1u32, 1u32);
+    let q = gen_f16_rows((s_q * d) as usize, seed);
+    let k = gen_f16_rows((s_k * d) as usize, seed ^ 0x1010);
+    let v = gen_f16_rows((s_k * d) as usize, seed ^ 0x2020);
+
+    // Window as an additive mask for the dense reference: 0 in-window, -3e38 out.
+    let mut win_mask = vec![0f32; (s_q * s_k) as usize];
+    for sq in 0..s_q {
+        let fq = (row_off + sq) / period;
+        for sk in 0..s_k {
+            let fk = sk / period;
+            let dfr = fq.abs_diff(fk);
+            win_mask[(sq * s_k + sk) as usize] = if dfr <= window { 0.0 } else { -3.0e38 };
+        }
+    }
+    let sm_scale = 1.0 / (d as f32).sqrt();
+    let exp = cpu_ref(
+        &q,
+        &k,
+        &v,
+        Some(&win_mask),
+        b as usize,
+        h_q as usize,
+        h_kv as usize,
+        s_q as usize,
+        s_k as usize,
+        d as usize,
+        sm_scale,
+    );
+
+    let q_buf = alloc_with(&backend, &pack_f16_vec(&q));
+    let k_buf = alloc_with(&backend, &pack_f16_vec(&k));
+    let v_buf = alloc_with(&backend, &pack_f16_vec(&v));
+    // has_mask == 0: the mask binding is unread, but slot 3 still needs a buffer.
+    let mask_buf = alloc_zero(&backend, 16);
+    let out_buf = alloc_zero(&backend, (s_q * d * 2) as u64);
+
+    // 48-byte uniform: 8 base fields + period, window, row_off (+ 4 pad).
+    let mut u = [0u8; 48];
+    u[0..4].copy_from_slice(&b.to_le_bytes());
+    u[4..8].copy_from_slice(&h_q.to_le_bytes());
+    u[8..12].copy_from_slice(&h_kv.to_le_bytes());
+    u[12..16].copy_from_slice(&s_q.to_le_bytes());
+    u[16..20].copy_from_slice(&s_k.to_le_bytes());
+    u[20..24].copy_from_slice(&d.to_le_bytes());
+    u[24..28].copy_from_slice(&sm_scale.to_le_bytes());
+    u[28..32].copy_from_slice(&0u32.to_le_bytes()); // has_mask
+    u[32..36].copy_from_slice(&period.to_le_bytes());
+    u[36..40].copy_from_slice(&window.to_le_bytes());
+    u[40..44].copy_from_slice(&row_off.to_le_bytes());
+    let u_buf = alloc_with(&backend, &u);
+
+    let pipeline = backend
+        .create_pipeline(
+            "sdpa_sg_win_conf",
+            &build_f16_sg_windowed_wgsl(cl),
+            "main",
+            <SdpaF32 as SdpaOp>::layout(),
+        )
+        .await
+        .expect("pipeline");
+    let mut enc = backend.create_command_encoder();
+    let bindings = [
+        q_buf.binding(0),
+        k_buf.binding(1),
+        v_buf.binding(2),
+        mask_buf.binding(3),
+        out_buf.binding(4),
+        u_buf.binding(5),
+    ];
+    backend
+        .dispatch(
+            &mut enc,
+            &pipeline,
+            &bindings,
+            f16_sg_workgroups(cl, b, s_q, h_q),
+        )
+        .expect("dispatch");
+    backend.submit(enc).await.expect("submit");
+
+    let out_bytes = backend
+        .read_buffer(out_buf.id, out_buf.offset, out_buf.len)
+        .await
+        .expect("read out");
+    let got: Vec<f32> = out_bytes
+        .chunks_exact(2)
+        .map(|p| f16_bits_to_f32(u16::from_le_bytes([p[0], p[1]])))
+        .collect();
+
+    for buf in [q_buf, k_buf, v_buf, mask_buf, out_buf, u_buf] {
+        backend.free(buf.id);
+    }
+    Some((got, exp))
+}
+
 fn assert_dense_close(got: &[f32], exp: &[f32], rel_tol: f32, abs_tol: f32, label: &str) {
     assert_eq!(got.len(), exp.len(), "{label}: length mismatch");
     let max_abs_exp = exp.iter().fold(0f32, |a, &x| a.max(x.abs()));
@@ -210,8 +336,40 @@ fn sdpa_sg_wgsl_sanity() {
         assert!(src.contains(&format!("const CL: u32 = {cl}u")));
         // Cluster dot-reduce; present in any form of this kernel.
         assert!(src.contains("subgroupShuffleXor"));
+        // The dense kernel has no window machinery.
+        assert!(!src.contains("u.window"));
+        let win = build_f16_sg_windowed_wgsl(cl);
+        assert!(win.contains("period: u32, window: u32, row_off: u32"));
+        assert!(win.contains("u.window"));
+        assert!(win.contains("subgroupShuffleXor"));
     }
     assert_eq!(<SdpaF32 as SdpaOp>::layout().len(), 6);
+}
+
+#[test]
+fn sdpa_sg_windowed() {
+    // 6 frames of 16 tokens (period=16), window=±1: each query frame attends to
+    // 3 frames (or 2 at the ends). Two BC=32 tiles span the kept range; the
+    // tile-skip + per-key fold must reproduce the masked reference.
+    let Some((got, exp)) =
+        pollster::block_on(try_run_windowed(8, 96, 96, 128, 16, 1, 0, 0x5D9A_3F00))
+    else {
+        return;
+    };
+    assert_dense_close(&got, &exp, 1e-2, 2e-3, "sdpa_sg_windowed");
+}
+
+#[test]
+fn sdpa_sg_windowed_chunked() {
+    // Chunked-Q path: this dispatch covers global rows [32, 64) (row_off=32),
+    // so query frames are (32 + sq)/16. Validates the global-frame recovery the
+    // chunked f16 SDPA relies on. window=0 -> strictly intra-frame attention.
+    let Some((got, exp)) =
+        pollster::block_on(try_run_windowed(8, 32, 96, 128, 16, 0, 32, 0x5D9A_44C0))
+    else {
+        return;
+    };
+    assert_dense_close(&got, &exp, 1e-2, 2e-3, "sdpa_sg_windowed_chunked");
 }
 
 #[test]

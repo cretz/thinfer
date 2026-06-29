@@ -292,6 +292,12 @@ pub struct BlockPipelines {
     /// Lane-cluster width (CL) baked into the `sdpa_sg` kernel: 8 when the
     /// adapter's subgroup min size >= 8, else 4. Sets BR = WG/CL at dispatch.
     pub sdpa_sg_cl: u32,
+    /// Temporal sliding-window twin of `sdpa_sg` (`build_f16_sg_windowed_wgsl`).
+    /// Built alongside `sdpa_sg` whenever the subgroup f16 SDPA is. Dispatched
+    /// in place of `sdpa_sg` only when a run sets `attn_window > 0` (video DiT
+    /// self-attention); restricts each query to keys within +-W latent frames,
+    /// breaking the O(frames^2) cost. Changes the output, so it is opt-in.
+    pub sdpa_sg_win: Option<WgpuPipeline>,
     /// Large-D SDPA (`SdpaF32LargeD`, one workgroup per Q row). `Some` iff
     /// `BlockWgslConfigs::large_d_sdpa`; dispatch routes `head_dim > 128` here.
     pub sdpa_large_d: Option<WgpuPipeline>,
@@ -964,6 +970,28 @@ impl BlockPipelines {
                         .create_pipeline(
                             "sdpa_sg",
                             &sdpa_sg_wgsl,
+                            "main",
+                            thinfer_core::ops::sdpa::sg_layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
+            sdpa_sg_win: if build_sdpa_sg {
+                // Same subgroup kernel as `sdpa_sg` plus the temporal-window
+                // tile-skip + per-key fold. Built unconditionally with `sdpa_sg`
+                // (cheap) so a run can switch it on via the uniform at dispatch.
+                let win_wgsl = format!(
+                    "{}{}",
+                    backend.subgroup_enable_directive(),
+                    thinfer_core::ops::sdpa::build_f16_sg_windowed_wgsl(sdpa_sg_cl),
+                );
+                Some(
+                    backend
+                        .create_pipeline(
+                            "sdpa_sg_win",
+                            &win_wgsl,
                             "main",
                             thinfer_core::ops::sdpa::sg_layout(),
                         )
@@ -3046,7 +3074,7 @@ pub(crate) fn op_sdpa<'wsp>(
 ) -> Result<(), WgpuError> {
     op_sdpa_impl(
         scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
-        false,
+        false, 0, 0,
     )
 }
 
@@ -3074,7 +3102,38 @@ pub(crate) fn op_sdpa_f16<'wsp>(
 ) -> Result<(), WgpuError> {
     op_sdpa_impl(
         scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
-        true,
+        true, 0, 0,
+    )
+}
+
+/// Mixed-precision f16 SDPA restricted to a temporal sliding window: each query
+/// attends only to keys within `±window` latent frames, where `period` is the
+/// token count per latent frame (frame-major `(f, h, w)` layout). Falls back to
+/// the full [`op_sdpa_f16`] behavior when `window == 0` or the windowed pipeline
+/// was not built. Use ONLY for video DiT self-attention (Q/K/V normed/roped).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_sdpa_f16_win<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    s_k: u32,
+    h_q: u32,
+    h_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    has_mask: u32,
+    period: u32,
+    window: u32,
+) -> Result<(), WgpuError> {
+    op_sdpa_impl(
+        scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
+        true, period, window,
     )
 }
 
@@ -3096,6 +3155,8 @@ fn op_sdpa_impl<'wsp>(
     scale: f32,
     has_mask: u32,
     allow_f16: bool,
+    period: u32,
+    window: u32,
 ) -> Result<(), WgpuError> {
     // The i8 paired path (opt-in, short-seq sites) dispatches whole, unchunked.
     if let Some(sdpa_i8) = pipelines.sdpa_i8.as_ref() {
@@ -3148,6 +3209,16 @@ fn op_sdpa_impl<'wsp>(
         } else {
             s_q.max(1)
         };
+        // Temporal sliding window: dispatch the windowed twin kernel when a run
+        // requested it (`window > 0`) and it compiled. `row_off = r0` lets a
+        // chunked Q range recover each query's GLOBAL latent frame.
+        let windowed =
+            window > 0 && period > 0 && b == 1 && has_mask == 0 && pipelines.sdpa_sg_win.is_some();
+        let sg_pipe = if windowed {
+            pipelines.sdpa_sg_win.as_ref().unwrap()
+        } else {
+            sdpa_sg
+        };
         let chunked = max_rows < s_q;
         let mut r0 = 0u32;
         while r0 < s_q {
@@ -3158,9 +3229,15 @@ fn op_sdpa_impl<'wsp>(
             scope.dispatch_op::<Bf16ToF16>(to_f16, &[scope.subview(&q, off, len)], q_f16)?;
             let o_f16 = scope.alloc(len)?;
             let m_c = scope.subview(&mask, 0, mask.len());
-            let u = sdpa_uniform(scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask)?;
+            let u = if windowed {
+                sdpa_uniform_win(
+                    scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask, period, window, r0,
+                )?
+            } else {
+                sdpa_uniform(scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask)?
+            };
             scope.sdpa_sg(
-                sdpa_sg,
+                sg_pipe,
                 q_f16,
                 k_f16,
                 v_f16,
@@ -3529,6 +3606,41 @@ pub(crate) fn sdpa_uniform<'wsp>(
     bytes[20..24].copy_from_slice(&d.to_le_bytes());
     bytes[24..28].copy_from_slice(&scale.to_le_bytes());
     bytes[28..32].copy_from_slice(&has_mask.to_le_bytes());
+    scope.write_uniform(&bytes)
+}
+
+/// Uniform for the windowed subgroup SDPA: the 8 base fields plus `period`
+/// (tokens per latent frame), `window` (radius in frames), and `row_off` (the
+/// global row index of this dispatch's first query, so a chunked Q range still
+/// recovers each query's global frame). 48 bytes (11 u32 + 4 pad) keeps the
+/// uniform 16-byte aligned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_uniform_win<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    b: u32,
+    h_q: u32,
+    h_kv: u32,
+    s_q: u32,
+    s_k: u32,
+    d: u32,
+    scale: f32,
+    has_mask: u32,
+    period: u32,
+    window: u32,
+    row_off: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 48];
+    bytes[0..4].copy_from_slice(&b.to_le_bytes());
+    bytes[4..8].copy_from_slice(&h_q.to_le_bytes());
+    bytes[8..12].copy_from_slice(&h_kv.to_le_bytes());
+    bytes[12..16].copy_from_slice(&s_q.to_le_bytes());
+    bytes[16..20].copy_from_slice(&s_k.to_le_bytes());
+    bytes[20..24].copy_from_slice(&d.to_le_bytes());
+    bytes[24..28].copy_from_slice(&scale.to_le_bytes());
+    bytes[28..32].copy_from_slice(&has_mask.to_le_bytes());
+    bytes[32..36].copy_from_slice(&period.to_le_bytes());
+    bytes[36..40].copy_from_slice(&window.to_le_bytes());
+    bytes[40..44].copy_from_slice(&row_off.to_le_bytes());
     scope.write_uniform(&bytes)
 }
 

@@ -275,6 +275,7 @@ async fn longlive_parity_ar() {
         num_frames,
         seed: SEED,
         sampler: VideoSampler::default(), // AR path; ignored
+        attn_window: None,
     };
 
     let mut workspace = Workspace::new(Arc::clone(&backend), Arc::clone(model.arbiter()));
@@ -303,6 +304,7 @@ async fn longlive_parity_ar() {
             num_frames: (CHUNK_FRAMES as u32 - 1) * TEMPORAL_SCALE as u32 + 1,
             seed: SEED,
             sampler: VideoSampler::default(), // AR path; ignored
+            attn_window: None,
         };
         let tap_blocks: Vec<usize> = std::env::var("THINFER_LL_TAP_BLOCKS")
             .ok()
@@ -401,6 +403,7 @@ async fn longlive_parity_ar() {
             num_frames: (CHUNK_FRAMES as u32 - 1) * TEMPORAL_SCALE as u32 + 1, // f_lat=8 (29)
             seed: SEED,
             sampler: VideoSampler::default(), // AR path; ignored
+            attn_window: None,
         };
         let full_attn_vel = model
             .forward_velocity_at(&params1, &chunk0, 0, &mut workspace)

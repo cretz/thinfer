@@ -46,7 +46,7 @@ use thinfer_core::workspace::{BatchBuf, BatchScope};
 
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, alloc_act, alloc_matmul_out_buf, copy_tap, op_add, op_rmsnorm,
-    op_sdpa, op_sdpa_f16,
+    op_sdpa, op_sdpa_f16, op_sdpa_f16_win,
 };
 
 /// Query rows per FFN chunk. The FFN is position-wise, so it is processed in
@@ -1273,6 +1273,13 @@ impl WanDitBlock {
     /// Global self-attention barrier for the tiled path: `sa = softmax(qx kxᵀ)
     /// v` over the full token sequence (the one all-to-all op in the block).
     #[allow(clippy::too_many_arguments)]
+    /// Global self-attention over the whole token sequence. When `window > 0`
+    /// the attention is restricted to a temporal sliding window: each query
+    /// attends only to keys within `±window` latent frames, where `period` is
+    /// the token count per latent frame (frame-major `(f, h, w)` layout). This
+    /// breaks the O(frames^2) cost at long clips; it changes the output, so the
+    /// caller gates it on the run's `attn_window` flag.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn self_sdpa<'wsp>(
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
@@ -1282,6 +1289,8 @@ impl WanDitBlock {
         v: BatchBuf<'wsp>,
         sa: BatchBuf<'wsp>,
         rows: u32,
+        period: u32,
+        window: u32,
     ) -> Result<(), WgpuError> {
         let s = &self.shape;
         let bp = &pipelines.block;
@@ -1289,7 +1298,7 @@ impl WanDitBlock {
         let hd = s.head_dim as u32;
         let scale = s.sdpa_scale();
         let no_mask = scope.alloc(16)?;
-        op_sdpa_f16(
+        op_sdpa_f16_win(
             scope,
             bp,
             ActBuf::dense(qx),
@@ -1305,6 +1314,8 @@ impl WanDitBlock {
             hd,
             scale,
             0,
+            period,
+            window,
         )
     }
 

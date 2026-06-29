@@ -106,6 +106,11 @@ pub struct WanDitInputs<'a> {
     /// Scalar diffusion timestep, uniform over the whole clip (the distilled
     /// T2V line is plain flow-matching, not per-frame Diffusion Forcing).
     pub timestep: f32,
+    /// Temporal self-attention window radius in latent frames. `Some(W)`
+    /// restricts each query to keys within `±W` latent frames (the O(frames^2)
+    /// attack for long clips); `None` runs full self-attention. Set per run from
+    /// the `--attn-window` flag.
+    pub attn_window: Option<u32>,
 }
 
 /// One DiT forward output, ready for VAE decode.
@@ -431,6 +436,7 @@ impl WanDit {
                             nxt.as_act_ref(),
                             tb,
                             n_tiles,
+                            inputs.attn_window.unwrap_or(0),
                         )
                         .instrument(tracing::debug_span!(target: PHASE, "wan.tiled", idx));
                     let (c_res, n_res, p_res) =
@@ -820,6 +826,7 @@ impl WanDit {
         y_out: BufRef,
         tb: &TileBufs,
         n_tiles: u32,
+        window: u32,
     ) -> Result<(), WgpuError> {
         let bp = &pipelines.block;
         let inner = self.cfg.inner() as u32;
@@ -880,8 +887,11 @@ impl WanDit {
             let kx = scope.import_copy(tb.kx.as_buf_ref());
             let v = scope.import_copy(tb.v.as_buf_ref());
             let sa = scope.import_copy(tb.sa.as_buf_ref());
+            // Tokens per latent frame (frame-major `(f, h, w)`): the windowed
+            // kernel's `period`. `window == 0` runs full self-attention.
+            let period = (self.shape.grid.pph * self.shape.grid.ppw) as u32;
             self.block
-                .self_sdpa(&scope, pipelines, qx, kx, v, sa, rows)?;
+                .self_sdpa(&scope, pipelines, qx, kx, v, sa, rows, period, window)?;
             scope.submit_void().await?;
         }
 

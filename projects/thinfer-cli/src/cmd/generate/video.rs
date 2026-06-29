@@ -66,6 +66,13 @@ pub struct GenerateVideo {
     /// UniPC denoise steps (1..=8). Ignored when `--sampler dmd`.
     #[arg(long, default_value_t = VIDEO_DEFAULT_STEPS)]
     pub steps: u32,
+    /// Temporal self-attention window radius in LATENT frames (Wan DiT). When
+    /// set, each query attends only to keys within `±N` latent frames, breaking
+    /// the O(frames^2) self-attention cost on long clips at the price of
+    /// long-range temporal coherence. Omit for full attention. Honored only on
+    /// the long-clip activation-tiled path.
+    #[arg(long)]
+    pub attn_window: Option<u32>,
     /// img2vid conditioning image. Not yet wired (engine path is t2v-only).
     #[arg(long)]
     pub input_image: Option<PathBuf>,
@@ -155,6 +162,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         input_image: args.input_image,
         sampler: args.sampler,
         steps: args.steps,
+        attn_window: args.attn_window,
         vae: args.vae,
         encoder: args.encoder,
         i8_matmul: !args.no_i8_matmul,

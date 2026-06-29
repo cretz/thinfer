@@ -103,6 +103,12 @@ pub struct GenerationParams {
     pub seed: u64,
     /// Denoise sampler (FastWan path only; AR ignores it).
     pub sampler: VideoSampler,
+    /// Temporal self-attention window radius in latent frames. `Some(W)`
+    /// restricts DiT self-attention to keys within `±W` latent frames (breaks
+    /// the O(frames^2) cost on long clips at the price of dropping long-range
+    /// temporal links); `None` runs full self-attention. Honored only on the
+    /// activation-tiled path (long clips); short clips run full attention.
+    pub attn_window: Option<u32>,
 }
 
 /// One shot of a multi-shot LongLive AR generation: a prompt that holds for
@@ -1012,6 +1018,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     image: &latents,
                     text,
                     timestep: unipc.timestep(step),
+                    // AR self-attention uses its own windowed KV cache, not the
+                    // dense self-SDPA window.
+                    attn_window: None,
                 };
                 // Per-block residual taps only on the very first forward (chunk 0,
                 // step 0): isolates where the AR forward first diverges from the
@@ -1058,6 +1067,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 image: &latents,
                 text,
                 timestep: 0.0,
+                attn_window: None,
             };
             dit.forward_ar(
                 &self.backend,
@@ -1278,6 +1288,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     image: &sample,
                     text: &text,
                     timestep: sampler.timestep(i),
+                    attn_window: params.attn_window,
                 };
                 let out = dit
                     .forward(
@@ -1318,6 +1329,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         image: &sample,
                         text: &text,
                         timestep: t,
+                        attn_window: params.attn_window,
                     };
                     // Diag path captures per-block + final-stage taps via forward_with_taps;
                     // prod takes the plain forward.
@@ -1415,6 +1427,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         image: &sample,
                         text: &text,
                         timestep: unipc.timestep(i),
+                        attn_window: params.attn_window,
                     };
                     let out = dit
                         .forward(
@@ -1516,6 +1529,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             image: &sample,
             text: &text,
             timestep: t,
+            // Parity/bisection diagnostic: always full attention.
+            attn_window: None,
         };
 
         // Per-op sinks for block `tap_block`: the driver only fills these GPU
@@ -1684,6 +1699,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             image: latent,
             text: &text,
             timestep: sampler.timestep(step_index),
+            attn_window: None,
         };
         let out = dit
             .forward(
