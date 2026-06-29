@@ -533,7 +533,10 @@ impl LocalExecutor {
             num_frames: plan.frames,
             seed,
             sampler: req.sampler.into_engine(req.steps),
-            attn_window: req.attn_window,
+            // Unset -> the model default (Some(3) for Wan22, on the long-clip
+            // tiled path only); an explicit 0 flows through as full attention.
+            // Single source for both CLI and serve so they cannot drift.
+            attn_window: req.attn_window.or_else(|| req.model.default_attn_window()),
         };
 
         let video = if req.model.is_ar() {

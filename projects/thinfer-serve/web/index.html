@@ -108,6 +108,16 @@
           <input id="coopmat" type="checkbox" checked />
         </div>
 
+        <!-- Wan2.2 14B only (app.js reveals it for that model). Temporal
+             self-attention window radius in LATENT frames: restricts DiT
+             self-attention to +-N latent frames, cutting the O(frames^2) cost on
+             long clips at the price of long-range temporal coherence. Empty =
+             full attention. Only affects the long-clip activation-tiled path. -->
+        <div id="attn-window-row" hidden>
+          <label for="attn-window">Attention window (frames)</label>
+          <input id="attn-window" type="number" min="0" value="3" title="Latent-frame radius. Default 3 (long clips only). 0 = full attention." />
+        </div>
+
         <label for="seed">Seed</label>
         <input id="seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />
 

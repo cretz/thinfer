@@ -118,6 +118,7 @@ fn spec_into_request(
                 input_image: None,
                 sampler: s.sampler.unwrap_or_default(),
                 steps: s.steps.unwrap_or(thinfer_app::model::VIDEO_DEFAULT_STEPS),
+                attn_window: s.attn_window,
                 vae: s.vae.unwrap_or(VaeChoice::Tiny),
                 encoder: s.encoder.unwrap_or_default(),
                 i8_matmul: s.i8_matmul.unwrap_or(true),

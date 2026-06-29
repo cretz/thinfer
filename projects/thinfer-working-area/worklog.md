@@ -7,19 +7,26 @@ files (see Status). Scratch is ephemeral; nothing here depends on a scratch file
 
 ## NOW / NEXT
 
-**>>> TOP PRIORITY (post-/clear): THE 81f e2e WALL IS NOW THE MATMULS, not attention.**
-Windowing made self-attn cheap (below); the 81f W=3 trace shows the DiT is matmul-
-bound: **matmul_qkv 250s** (single biggest term), coopmat_ffn_down 135s, coopmat_proj
-92s, i8_qkv_self 67s, i8_ffn_up 65s (~609s GPU). ffn_down/proj already on coopmat;
-qkv_self/ffn_up already i8 -> near their WGSL floor. The fat unoptimized term is
-**matmul_qkv (250s) = CROSS-attn qkv, forced DENSE bf16** (dense_acts.qkv=true) because
-the text K/V are un-normed outliers (overflow i8/f16). CONCRETE LEVER (untried): the
-cross-attn **Q projection runs over ALL 32760 latent rows and is from the NORMED x1
-(i8-safe)** -- only cross K/V (512 text rows) must stay dense. SPLIT cross-qkv like
-`qkv_self` was split: i8 the cross-Q (big, normed), keep cross-K/V dense (small,
-outlier). Likely the largest remaining 81f win. Also re-check whether matmul_qkv
-folds in module-level matmuls (patch/proj_out) -- separate sites. MEASURE via the same
-A/B once the telemetry gap below is fixed.
+**>>> TOP PRIORITY (post-/clear): 81f W=3 is CO-DOMINATED by self-attn AND matmuls;
+attack BOTH. FIRST fix the telemetry gap (it misled the analysis once already).** The
+81f gpu_ms rollup OMITS `sdpa_sg_win` (telemetry gap below) so it FALSELY reads as
+matmul-bound. By wall-clock subtraction (1544s wall - ~893s timed - host) the windowed
+self-attn is **~480s = STILL the single biggest term** at W=3. Real ranked picture:
+self-attn ~480s > matmul_qkv 250s > coopmat ffn_down+proj 227s > i8 self-qkv+ffn_up
+(+dequant) ~175s > VAE ~148s > cross sdpa 19s. So two co-equal levers:
+- **(a) matmul: SPLIT cross-attn qkv** (the untried win). `matmul_qkv` 250s is almost
+  entirely the cross-attn **Q projection over all 32760 latent rows**, forced DENSE
+  bf16 (dense_acts.qkv=true) ONLY because the text K/V are un-normed outliers. But the
+  Q is NORMED (i8-safe). Split like `qkv_self` was: i8 the big cross-Q, keep the tiny
+  (512-row) cross-K/V dense. i8 DP4A ~5x -> 250s -> ~70s, save ~180s (~3min). (Check:
+  module matmuls patch/proj_out are SEPARATE sites, not in matmul_qkv.)
+- **(b) self-attn: a tighter window.** Self-attn ~480s scales with (2W+1)/21: W=2
+  ~350s (-130s), W=1 ~210s (-270s). REAL e2e lever, gated on quality (W=2 = +-8 output
+  frames context; W=1 = +-4, likely too tight for a 5s pan). Needs a quality eyeball
+  per W. (User eyeballed W=3 = good; W=2 untested.)
+- **REALISTIC FLOOR: (a)+(b@W=2) ~= 26min -> ~20-21min.** NOT minutes. WGSL has no
+  tensor cores (lessons) -> ComfyUI/CUDA minutes is unreachable here; ~20min is ~the
+  81f@832x480 14B floor on the 8GB card. Set expectations accordingly.
 
 **TEMPORAL WINDOWED SELF-ATTENTION = LANDED + VALIDATED + quality-confirmed
 (2026-06-28, committed 229af27 + pushed).** Opt-in `--attn-window W` (latent-frame
@@ -28,18 +35,19 @@ frame = token/period, period = pph*ppw. Conformance bit-exact vs a windowed CPU 
 (incl chunked row_off): `tests/sdpa_sg.rs::sdpa_sg_windowed{,_chunked}`. A/B 256x256/33f
 (ppf=9,W=1): self-attn **36.0->11.8 ms/disp = 3.05x** (= F/(2W+1)). **81f@832x480 W=3:
 1544s (~25.7min) vs ~40min full = 1.55x e2e, USER EYEBALLED W=3 = GOOD** (clip
-scratch/win81_w3.mp4). Default OFF (DECISION PENDING: default-on + which W; serve/web
-not wired -- see below).
-- **WHY only 1.55x e2e (not the 10x ask): windowing attacks the SDPA half ONLY.** It
-  worked (self-attn now cheap); the matmuls (above) are the rest and are the new wall.
-  Order-of-magnitude = windowing + the matmul lever above. This is the honest ceiling
-  for windowing alone; do not chase more from it.
-- **81f@832x480 W=3 MEASURED: 1544s (~25.7min) e2e vs ~40min full = ~1.55x**, clean
-  (no device-loss/NaN/overshoot), clip scratch/win81_w3.mp4. Self-consistent with the
-  model: full ~2400s w/ sdpa ~1460s; windowing self-attn 7/21 saves ~970s -> ~1430s
-  (measured 1544 incl streaming/VAE noise). Confirms windowing 3x's the sdpa HALF;
-  matmuls (matmul_qkv 250s, coopmat_ffn_down 135s, coopmat_proj 92s, i8_qkv_self 67s,
-  i8_ffn_up 65s = ~609s GPU) now utterly dominate the DiT -> THE e2e wall is matmuls.
+scratch/win81_w3.mp4). **Default ON at W=3 for Wan2.2-14B** (`VideoModelId::
+default_attn_window`, applied in executor.rs = single source for CLI+serve; explicit
+`0` = full attention; long-clip tiled path only). **CLI + serve wire + web UI all
+wired + deployed** (server rebuilt + running, attn-window control prefilled 3, revealed
+for Wan22).
+- **WHY only 1.55x e2e (not the 10x ask): windowing 3x'd self-attn but self-attn was
+  ~half the cost, so e2e ~= 1/(0.5/3 + 0.5) = 1.6x** -- matches. At W=3 self-attn is
+  STILL the top term (~480s); a tighter W + the cross-Q split (above) stack toward the
+  ~20min floor. Order-of-magnitude is NOT on the table in WGSL (no tensor cores).
+- **W=1 vs W=3 (projected; only W=3 measured @81f): self-attn 7/21 -> 3/21 = ~480s ->
+  ~206s, e2e ~1544s -> ~1270s (~21min). Only ~4.5min between them = diminishing
+  returns** (the ~800s matmul+VAE floor doesn't move). W=1 = +-4 output frames context
+  (likely seams on a 5s pan) -> W=3 is the right default; don't drop lower blind.
 - **TELEMETRY GAP (follow-up): `sdpa_sg_win` is in the per-scope dispatch counts
   (228/block) but ABSENT from the `gpu_ms by pipeline` TIMESTAMP rollup at 81f** (it
   IS present at the small 256x256 run). Likely the chunked windowed self-attn (57
@@ -53,13 +61,13 @@ not wired -- see below).
   sdpa_sg_win` built whenever the mixed f16 SDPA is (cheap, always present on 14B);
   `sdpa_uniform_win` (48B); `op_sdpa_f16_win` selects it when `window>0`. Threaded:
   `GenerationParams.attn_window` -> `WanDitInputs.attn_window` -> `forward_block_tiled`
-  -> `self_sdpa(period,window)`. CLI `--attn-window`; e2e env THINFER_E2E_ATTN_WINDOW.
+  -> `self_sdpa(period,window)`. CLI `--attn-window`; e2e env THINFER_E2E_ATTN_WINDOW;
+  serve `VideoSpec.attn_window` (wire camelCase `attnWindow`) -> api spec_into_request;
+  web `#attn-window` input (Wan22-only reveal). Default in `default_attn_window` only.
 - **SCOPE LIMITS (by design)**: (1) only the TILED long-clip path honors it (short
   clips / n_tiles==1 run full attention -- windowing is meaningless when ppf is tiny);
   (2) only the bf16 mixed f16-SDPA path = Wan2.2 14B (FastWan is F16-act, different
   branch -- unaffected); (3) AR (LongLive) uses its own windowed KV cache, untouched.
-- **NOT wired**: serve wire field + web UI toggle (CLI + e2e env only so far). Add
-  `attn_window` to `VideoSpec`/wire + a web control if we keep the feature.
 - OTHER LEVERS still open: i8-SDPA on self-attn (same ~12-TFLOPS bar, quality-risky);
   attacking the 3 outlier bf16 matmuls (the other e2e half).
 

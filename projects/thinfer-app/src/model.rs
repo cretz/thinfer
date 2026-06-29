@@ -359,6 +359,19 @@ impl VideoModelId {
         }
     }
 
+    /// Default temporal self-attention window (latent-frame radius) when the
+    /// caller leaves `--attn-window` unset. `Some(3)` for Wan2.2-14B: windowing
+    /// the long-clip self-attention to +-3 latent frames is the user-eyeballed
+    /// quality/perf point (81f@832x480: ~1.55x e2e, coherence held); it only
+    /// engages on the activation-tiled long-clip path, so short clips are
+    /// unaffected. `None` (full attention) elsewhere. An explicit `0` disables it.
+    pub fn default_attn_window(self) -> Option<u32> {
+        match self {
+            VideoModelId::Wan22T2vA14b => Some(3),
+            _ => None,
+        }
+    }
+
     /// Whether this model's default denoise path is the two-stage upscale-refine
     /// (stage 1 half-res -> 2x latent upscale -> 3-step refine). True for LTX: on
     /// the 8GB target card, single-stage at the in-distribution widescreen res

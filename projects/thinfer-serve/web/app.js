@@ -305,6 +305,8 @@ function applyModel() {
   // upscaling) and Wan2.2-A14B a fixed 4-step LightX2V distill; both ignore the
   // steps/sampler knobs, so hide the field for them.
   $("steps-row").hidden = isLtxVideo || isWan22;
+  // Temporal attention window is a Wan2.2-14B-only long-clip perf knob.
+  $("attn-window-row").hidden = !isWan22;
   populateSize(kind, model);
   // Steps default is per-model (mirrors the server): the 4-step distilled image
   // models start at 4, everything else at the kind default. LTX ignores steps
@@ -444,6 +446,9 @@ async function buildSpec() {
       height,
       durations: duration === null ? null : [duration],
       vae: "full",
+      // Temporal self-attention window radius in latent frames; blank = full
+      // attention. Only the long-clip activation-tiled path honors it.
+      attnWindow: intOrNull($("attn-window").value),
       seed,
     };
   }

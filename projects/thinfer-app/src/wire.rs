@@ -104,6 +104,13 @@ pub struct VideoSpec {
     pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8, default 4). DMD ignores it.
     pub steps: Option<u32>,
+    /// Temporal self-attention window radius in LATENT frames (Wan2.2 14B). When
+    /// set, DiT self-attention is restricted to keys within `±N` latent frames,
+    /// breaking the O(frames^2) cost on long clips at the price of long-range
+    /// temporal coherence. `None`/omitted = full attention. Honored only on the
+    /// long-clip activation-tiled path; ignored by other models.
+    #[serde(default)]
+    pub attn_window: Option<u32>,
     pub vae: Option<VaeChoice>,
     /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
     /// baseline) or `q4` (Q4_K_M, ~2.8x faster encode, lower precision). Applies
