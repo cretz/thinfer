@@ -21,10 +21,11 @@ use thinfer_core::backend::{BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::cache::KernelKey;
 use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
-    BcastFmaOp, BcastModulateF32, BcastModulateOp, BcastMulF32, Bf16ToF16, F16ToBf16, LayerNormF32,
-    LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, QkvSplitF32, QkvSplitOp,
-    RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32, ScatterPadRowsOp,
-    SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32, TanhF32, WeightDtype, WgslConfig,
+    BcastFmaOp, BcastModulateF32, BcastModulateOp, BcastMulF32, Bf16ToF16, F16ToBf16, GeluF32,
+    LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, QkvSplitF32,
+    QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32,
+    ScatterPadRowsOp, SdpaDecode, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32, TanhF32,
+    WeightDtype, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::trace;
@@ -301,9 +302,19 @@ pub struct BlockPipelines {
     /// Large-D SDPA (`SdpaF32LargeD`, one workgroup per Q row). `Some` iff
     /// `BlockWgslConfigs::large_d_sdpa`; dispatch routes `head_dim > 128` here.
     pub sdpa_large_d: Option<WgpuPipeline>,
+    /// Decode SDPA (`SdpaDecode`, one workgroup per Q row, the workgroup
+    /// cooperates over the KV length). `Some` iff `BlockWgslConfigs::decode_sdpa`.
+    /// For single-query decode against a long KV cache this is ~1-2 orders faster
+    /// than `SdpaF32` (which runs the whole per-head softmax in one thread); the
+    /// caller opts in per-call via [`op_sdpa_decode`]. `head_dim <= 128`.
+    pub sdpa_decode: Option<WgpuPipeline>,
     pub qkv_split: WgpuPipeline,
     pub silu: WgpuPipeline,
     pub silu_mul: WgpuPipeline,
+    /// gelu-tanh activation. Built always (cheap), used by the Hunyuan
+    /// dual-stream block's gelu-tanh FFN; Z-Image/Wan FFNs are SwiGLU and
+    /// drive `silu_mul` instead.
+    pub gelu: WgpuPipeline,
     pub add: WgpuPipeline,
     pub mul: WgpuPipeline,
     pub tanh: WgpuPipeline,
@@ -389,6 +400,12 @@ pub struct BlockWgslConfigs {
     /// SDPA Q/K/V are post-rmsnorm/rope and O(1) (DiT self-attention); leave it
     /// off for raw-residual encoder attention (umT5 et al.).
     pub fast_sdpa: bool,
+    /// Compile the decode SDPA kernel (`SdpaDecode`, one workgroup per Q row, the
+    /// workgroup cooperates over the KV length). Set on autoregressive generators
+    /// (the rewriter LM) so single-token decode against a long KV cache is not
+    /// bottlenecked by `SdpaF32`'s one-thread-per-head softmax. `head_dim <= 128`,
+    /// F32/Bf16 acts. The caller opts into it per-call via [`op_sdpa_decode`].
+    pub decode_sdpa: bool,
 }
 
 /// Per-site DP4A opt-out: a site set here keeps its A-side dense at the
@@ -442,6 +459,7 @@ impl BlockWgslConfigs {
             coopmat_acts: CoopmatSites::default(),
             large_d_sdpa: false,
             fast_sdpa: false,
+            decode_sdpa: false,
         }
     }
 
@@ -1015,6 +1033,20 @@ impl BlockPipelines {
             } else {
                 None
             },
+            sdpa_decode: if cfgs.decode_sdpa {
+                Some(
+                    backend
+                        .create_pipeline(
+                            "sdpa_decode",
+                            <thinfer_core::ops::SdpaDecode as SdpaOp>::wgsl(cfg_compat),
+                            "main",
+                            <thinfer_core::ops::SdpaDecode as SdpaOp>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
             qkv_split: backend
                 .create_pipeline(
                     "qkv_split",
@@ -1033,6 +1065,9 @@ impl BlockPipelines {
                     "main",
                     SiluMulF32::layout(),
                 )
+                .await?,
+            gelu: backend
+                .create_pipeline("gelu", GeluF32::wgsl(cfg_compat), "main", GeluF32::layout())
                 .await?,
             add: backend
                 .create_pipeline("add", AddF32::wgsl(cfg_compat), "main", AddF32::layout())
@@ -2372,8 +2407,15 @@ impl Block {
         n: u32,
         k: u32,
     ) -> Result<(), WgpuError> {
+        // Coopmat only when the dispatch spans at least one full workgroup row
+        // block (`M >= WM`). A sub-WM dispatch (e.g. a short text stream, M=16 <
+        // WM=32) DEVICE-LOSES on the RTX 5070 despite the kernel's ragged/robust
+        // design -- the degenerate single-partial-workgroup case. The dense
+        // fallback is the reference path and such tensors are tiny anyway (the
+        // hot large-M image stream always clears WM).
         if let Some(cm) = coopmat
             && a.scale.is_none()
+            && m >= cm.cfg.wm()
         {
             // (1) dequant Quant weight -> f16 [N,K] nmajor.
             let b_f16 = scope.alloc(pipelines.act_bytes(n * k))?;
@@ -2845,6 +2887,47 @@ pub(crate) fn alloc_act<'wsp>(
     Ok(ActBuf::dense(scope.alloc(pipelines.act_bytes(rows * dim))?))
 }
 
+/// Quantize a dense (bf16/f16) A-side to the paired i8 form `[m, k]` ONCE, so
+/// several DP4A matmul sites that share the SAME A-side (the separate q/k/v
+/// projections, whose input is the one modulated stream) consume it without
+/// each re-running `act_quant` (+ the bf16->f16 cast) internally. The result is
+/// BIT-IDENTICAL to letting every `dispatch_matmul_site` quantize on its own
+/// (act_quant is deterministic), so it preserves parity exactly. ONLY valid
+/// when the consuming sites take the DP4A path (Quant weight, so `act_quant`/
+/// the i8 matmul are built); on a dense path pass the dense `ActBuf` instead.
+/// Mirrors the dense->paired transcode inside `dispatch_matmul_site_diag`.
+pub(crate) fn quantize_act_paired<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    a: BatchBuf<'wsp>,
+    m: u32,
+    k: u32,
+) -> Result<ActBuf<'wsp>, WgpuError> {
+    let aq = pipelines
+        .act_quant
+        .as_ref()
+        .expect("quantize_act_paired called off the i8 path (no act_quant pipeline)");
+    // bf16 block: act_quant reads vec2<f16>, so cast the bf16 A-side to f16
+    // first (these A-sides are normed/modulated and O(1), so the clamp never
+    // bites). An f16-act block feeds straight through.
+    let a_src = if pipelines.act_dtype == ActDtype::Bf16 {
+        let a_f16 = scope.alloc(pipelines.act_bytes(m * k))?;
+        let to_f16 = pipelines
+            .cast_to_f16
+            .as_ref()
+            .expect("cast_to_f16 built on the bf16 i8 path");
+        scope.dispatch_op::<Bf16ToF16>(to_f16, &[a], a_f16)?;
+        a_f16
+    } else {
+        a
+    };
+    let a_i8 = scope.alloc(m as u64 * k as u64)?;
+    let a_p = scope.alloc(m as u64 * (k as u64 / 32) * 4)?;
+    let aq_dims = scope.u32x4_uniform(m, k, 0, 0)?;
+    scope.act_quant(aq, a_src, a_i8, a_p, aq_dims, m, k)?;
+    Ok(ActBuf::paired(a_i8, a_p))
+}
+
 /// Allocate an ActBuf for an sdpa_i8 input/output slot. The data half is
 /// packed i8 (`rows * dim` bytes); data and scale halves are co-located in
 /// one underlying buffer via `alloc_pair` (data at offset 0, scale right
@@ -3074,8 +3157,48 @@ pub(crate) fn op_sdpa<'wsp>(
 ) -> Result<(), WgpuError> {
     op_sdpa_impl(
         scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
-        false, 0, 0,
+        false, 0, 0, 0,
     )
+}
+
+/// Decode-optimized SDPA: dispatches `SdpaDecode` (one workgroup per query row,
+/// the workgroup cooperates over the KV length via per-tile barriers). For
+/// single-token decode (`s_q == 1`) against a long KV cache this replaces
+/// `SdpaF32`'s one-thread-per-head serial softmax with a full workgroup, ~1-2
+/// orders faster. Requires the `sdpa_decode` pipeline (`decode_sdpa` config);
+/// falls back to [`op_sdpa`] when it was not built. Bit-equivalent to `op_sdpa`
+/// (identical f32 online-softmax math). Whole-tensor single dispatch: at `s_q`
+/// small the per-row cost is `~O(s_k)` on a full workgroup, well under the TDR.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_sdpa_decode<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    s_k: u32,
+    h_q: u32,
+    h_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    has_mask: u32,
+) -> Result<(), WgpuError> {
+    let Some(dec) = pipelines.sdpa_decode.as_ref() else {
+        return op_sdpa(
+            scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
+        );
+    };
+    let q = q.data;
+    let k = k.data;
+    let v = v.data;
+    let dst = dst.data;
+    let u = sdpa_uniform(scope, b, h_q, h_kv, s_q, s_k, head_dim, scale, has_mask)?;
+    let m_c = scope.subview(&mask, 0, mask.len());
+    scope.sdpa::<SdpaDecode>(dec, q, k, v, m_c, u, dst, b, s_q, h_q)
 }
 
 /// SDPA that opts into the mixed-precision f16 path when the block compiled it
@@ -3102,15 +3225,18 @@ pub(crate) fn op_sdpa_f16<'wsp>(
 ) -> Result<(), WgpuError> {
     op_sdpa_impl(
         scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
-        true, 0, 0,
+        true, 0, 0, 0,
     )
 }
 
 /// Mixed-precision f16 SDPA restricted to a temporal sliding window: each query
 /// attends only to keys within `±window` latent frames, where `period` is the
-/// token count per latent frame (frame-major `(f, h, w)` layout). Falls back to
-/// the full [`op_sdpa_f16`] behavior when `window == 0` or the windowed pipeline
-/// was not built. Use ONLY for video DiT self-attention (Q/K/V normed/roped).
+/// token count per latent frame (frame-major `(f, h, w)` layout). `txt_start` is
+/// the first joint-token index that is text (always-in-window; image queries
+/// attend all text, text queries attend everything) -- pure-video callers pass
+/// `s_k`. Falls back to the full [`op_sdpa_f16`] behavior when `window == 0` or
+/// the windowed pipeline was not built. Use ONLY for video DiT self-attention
+/// (Q/K/V normed/roped).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn op_sdpa_f16_win<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
@@ -3130,10 +3256,11 @@ pub(crate) fn op_sdpa_f16_win<'wsp>(
     has_mask: u32,
     period: u32,
     window: u32,
+    txt_start: u32,
 ) -> Result<(), WgpuError> {
     op_sdpa_impl(
         scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
-        true, period, window,
+        true, period, window, txt_start,
     )
 }
 
@@ -3157,6 +3284,7 @@ fn op_sdpa_impl<'wsp>(
     allow_f16: bool,
     period: u32,
     window: u32,
+    txt_start: u32,
 ) -> Result<(), WgpuError> {
     // The i8 paired path (opt-in, short-seq sites) dispatches whole, unchunked.
     if let Some(sdpa_i8) = pipelines.sdpa_i8.as_ref() {
@@ -3232,6 +3360,7 @@ fn op_sdpa_impl<'wsp>(
             let u = if windowed {
                 sdpa_uniform_win(
                     scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask, period, window, r0,
+                    txt_start,
                 )?
             } else {
                 sdpa_uniform(scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask)?
@@ -3610,10 +3739,11 @@ pub(crate) fn sdpa_uniform<'wsp>(
 }
 
 /// Uniform for the windowed subgroup SDPA: the 8 base fields plus `period`
-/// (tokens per latent frame), `window` (radius in frames), and `row_off` (the
+/// (tokens per latent frame), `window` (radius in frames), `row_off` (the
 /// global row index of this dispatch's first query, so a chunked Q range still
-/// recovers each query's global frame). 48 bytes (11 u32 + 4 pad) keeps the
-/// uniform 16-byte aligned.
+/// recovers each query's global frame), and `txt_start` (first joint-token index
+/// that is text -- always-in-window; pure-video callers pass `s_k`). 48 bytes
+/// (12 u32) keeps the uniform 16-byte aligned.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sdpa_uniform_win<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
@@ -3628,6 +3758,7 @@ pub(crate) fn sdpa_uniform_win<'wsp>(
     period: u32,
     window: u32,
     row_off: u32,
+    txt_start: u32,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
     let mut bytes = [0u8; 48];
     bytes[0..4].copy_from_slice(&b.to_le_bytes());
@@ -3641,6 +3772,7 @@ pub(crate) fn sdpa_uniform_win<'wsp>(
     bytes[32..36].copy_from_slice(&period.to_le_bytes());
     bytes[36..40].copy_from_slice(&window.to_le_bytes());
     bytes[40..44].copy_from_slice(&row_off.to_le_bytes());
+    bytes[44..48].copy_from_slice(&txt_start.to_le_bytes());
     scope.write_uniform(&bytes)
 }
 

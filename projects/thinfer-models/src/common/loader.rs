@@ -120,7 +120,16 @@ pub(crate) fn register_linear_transcode<S: WeightSource>(
     // sensitive-tensor dtype (img_in/proj_out/time_embed); it narrows to bf16 on
     // upload (residency `read_for_gpu` F16 arm). i8/i4 not supported here yet.
     let (encoding, transpose, transcode) = match encoding {
-        StorageEncoding::Bf16 if transcode.is_some() => {
+        // bf16/f16/f32 sources all requantize through `read_transcoded` (f16/f32
+        // narrow to bf16 first, then the shared Q8_0 encode). This arm MUST
+        // catch every float encoding when `transcode` is set: falling through
+        // to the dense Linear2D arm uploads a transposed bf16 buffer that the
+        // site's quant pipeline then reads as a Q8_0 block stream -> garbage
+        // (bit the F32-sourced minWM I2V DiT, 2026-07-01; never showed on the
+        // T2V DiT because that file is BF16).
+        StorageEncoding::Bf16 | StorageEncoding::F16 | StorageEncoding::F32
+            if transcode.is_some() =>
+        {
             // Quant block layout is [N, K] N-major: keep the file's row
             // order, no transpose. K must be whole 32-elem blocks.
             assert_eq!(entry.shape.0.len(), 2, "transcode target must be 2-D");
@@ -155,6 +164,39 @@ pub(crate) fn register_linear_transcode<S: WeightSource>(
         Some(r) => residency.register_in_ring(meta, r)?,
         None => residency.register(meta),
     })
+}
+
+/// Register a conv kernel whose spatial dims are all 1 (a 1x1x1 conv) as a
+/// dense linear. The on-disk weight `[out, in, 1, 1, 1]` is row-major identical
+/// to `[out, in]`, so we flatten the shape to 2D and ride the `Linear2D`
+/// transpose into the matmul `[in, out]` layout. F16 narrows to bf16 on upload
+/// (Hunyuan `img_in.proj.weight` is fp16 `[2048, 65, 1, 1, 1]`).
+pub(crate) fn register_linear_flatten<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    id: &WeightId,
+) -> Result<WeightHandle, LoadError> {
+    let entry = residency
+        .source()
+        .catalog()
+        .get(id)
+        .ok_or_else(|| LoadError::UnknownWeight(id.clone()))?;
+    let encoding = entry.encoding.ok_or_else(|| LoadError::Undecodable {
+        id: id.clone(),
+        encoding: None,
+        label: entry.encoding_label.clone(),
+    })?;
+    let dims = &entry.shape.0;
+    let n = dims[0];
+    let k: usize = dims[1..].iter().product();
+    let meta = WeightMeta {
+        id: id.clone(),
+        shape: thinfer_core::tensor::Shape(vec![n, k]),
+        encoding,
+        on_disk_bytes: entry.size,
+        transpose: TransposePolicy::Linear2D,
+        transcode: None,
+    };
+    Ok(residency.register(meta))
 }
 
 pub(crate) fn register_passthrough<S: WeightSource>(

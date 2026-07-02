@@ -225,6 +225,7 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
             coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: false,
             fast_sdpa: false,
+            decode_sdpa: false,
         };
         let encoder_pipelines = BlockPipelines::compile(&backend, &enc_cfgs).await?;
 
@@ -295,6 +296,7 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
             coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: true,
             fast_sdpa: false,
+            decode_sdpa: false,
         };
         let dit_main_pipelines = BlockPipelines::compile(&backend, &main_cfgs).await?;
         let dit_dense_pipelines =

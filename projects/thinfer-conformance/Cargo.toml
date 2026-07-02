@@ -51,3 +51,10 @@ faceswap-e2e = []
 # Opt-in LTX-2.3 parity tests (Gemma encoder + FE V2, connector, VAE, DiT, e2e).
 # Needs the unsloth LTX-2.3 + gemma QAT GGUF bundle in cache + `uv`.
 ltx-e2e = []
+# Opt-in HunyuanVideo 1.5 (480p T2V) parity tests (VAE, encoder, refiner, DiT,
+# e2e). Same discipline: touches the local HF cache, skips cleanly when uncached.
+hunyuan-e2e = []
+# Opt-in native prompt-rewriter (Qwen3-VL-8B-Instruct) load-smoke test. Loads the
+# cached Q5_K_M GGUF, audits tensor names/shapes, registers all weights. GPU-free.
+# Same discipline: touches the local HF cache, skips cleanly when uncached.
+qwen3-lm = []

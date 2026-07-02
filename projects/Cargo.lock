@@ -3070,6 +3070,7 @@ dependencies = [
 name = "thinfer-cli"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "thinfer-app",
  "thinfer-core",

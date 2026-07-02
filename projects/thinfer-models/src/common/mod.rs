@@ -14,3 +14,5 @@ pub mod embedders;
 pub mod loader;
 pub mod rope_embedder;
 pub mod seq;
+pub mod vae_taehv;
+pub mod vae_tiling;

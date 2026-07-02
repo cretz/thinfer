@@ -47,7 +47,11 @@ body {
 #audio-row:not([hidden]),
 #upscale-row:not([hidden]),
 #encoder-row:not([hidden]),
-#steps-row:not([hidden]) {
+#steps-row:not([hidden]),
+#coopmat-row:not([hidden]),
+#rewrite-row:not([hidden]),
+#rewrite-quality-row:not([hidden]),
+#attn-window-row:not([hidden]) {
   display: contents;
 }
 /* The Quality (VAE) row is `.video-only` (hidden in image mode via the class, not

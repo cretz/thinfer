@@ -577,7 +577,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             Some(handles) => Some(WanVaeTinyDecoder {
                 pipelines: WanVaeTinyPipelines::compile(&backend).await?,
                 handles,
-                cfg: vae_cfg.clone(),
+                cfg: (&vae_cfg).into(),
             }),
         };
 
@@ -1842,6 +1842,7 @@ fn block_cfgs(
         },
         large_d_sdpa: false,
         fast_sdpa,
+        decode_sdpa: false,
     }
 }
 

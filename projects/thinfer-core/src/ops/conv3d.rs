@@ -310,7 +310,7 @@ struct U {{
     h_in: u32, w_in: u32, t_out: u32, h_out: u32,
     w_out: u32, kt: u32, kh: u32, kw: u32,
     pad_t: u32, pad_h: u32, pad_w: u32, stride_t: u32,
-    stride_h: u32, stride_w: u32, _pad0: u32, _pad1: u32,
+    stride_h: u32, stride_w: u32, pad_mode: u32, _pad1: u32,
 }};
 
 {x_elem_decl}
@@ -399,7 +399,16 @@ fn main(
                     let ti: i32 = i32(to * u.stride_t + dt) - i32(u.pad_t);
                     let hi: i32 = i32(ho * u.stride_h + dh) - i32(u.pad_h);
                     let wi: i32 = i32(wo * u.stride_w + dw) - i32(u.pad_w);
-                    if (ti >= 0 && ti < i32(u.t_in) && hi >= 0 && hi < i32(u.h_in)
+                    if (u.pad_mode == 1u) {{
+                        // Replicate-edge padding (PyTorch F.pad mode='replicate'):
+                        // clamp OOB indices to the border and always load. pad_mode
+                        // defaults to 0 (zero-fill) for every existing caller.
+                        let cti: u32 = u32(clamp(ti, 0, i32(u.t_in) - 1));
+                        let chi: u32 = u32(clamp(hi, 0, i32(u.h_in) - 1));
+                        let cwi: u32 = u32(clamp(wi, 0, i32(u.w_in) - 1));
+                        v = load_x(x_base + ci * thw_in + cti * hw_in
+                            + chi * u.w_in + cwi);
+                    }} else if (ti >= 0 && ti < i32(u.t_in) && hi >= 0 && hi < i32(u.h_in)
                         && wi >= 0 && wi < i32(u.w_in)) {{
                         v = load_x(x_base + ci * thw_in + u32(ti) * hw_in
                             + u32(hi) * u.w_in + u32(wi));

@@ -473,6 +473,15 @@ impl LocalExecutor {
         if req.model.is_ltx() {
             return crate::ltx::run(&self.backend, req, sink).await;
         }
+        // HunyuanVideo 1.5: its own encoder/refiner/DiT/VAE pipeline, no Wan
+        // variant/sampler/vae machinery. Dispatch before any Wan lookup; the
+        // causal I2V variant has its own driver (chunked AR + image cond).
+        if req.model.is_hunyuan_i2v() {
+            return crate::hunyuan::run_i2v(&self.backend, req, sink).await;
+        }
+        if req.model.is_hunyuan() {
+            return crate::hunyuan::run(&self.backend, req, sink).await;
+        }
         let plan = req.resolve()?;
         for w in &plan.warnings {
             tracing::warn!(target: thinfer_core::trace::DIAG, "{w}");
@@ -495,6 +504,8 @@ impl LocalExecutor {
         // The tiny decoder is an extra safetensors shard (disjoint keys), unioned
         // into the same catalog. Only when selected, so the parity path is
         // byte-for-byte the source it always was.
+        // `vae` here is the Wan-mapped choice (`req.vae.into()`), so a Hunyuan-only
+        // `TinyFt` request has already collapsed to `Tiny` -- this load covers it.
         if vae == VaeChoice::Tiny {
             weight_openers.push(open_mmap(&resolve_role(manifest, wanmf::role::TINY_VAE)?).await?);
         }

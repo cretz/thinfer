@@ -44,12 +44,17 @@ futures-util = { version = "0.3", optional = true }
 default = []
 # clap `ValueEnum` derives on the canonical id enums, so thinfer-cli reuses the
 # app enums as its `--model` etc. value types (one name per concept).
-cli = ["dep:clap"]
+cli = ["dep:clap", "rewrite"]
 # serde derives on the canonical id enums (kebab-case ids matching the CLI).
 serde = ["dep:serde"]
 # serde + utoipa `ToSchema`, so thinfer-serve reuses the id enums as its OpenAPI
 # schema (single source for the variant lists).
-serve = ["serde", "dep:utoipa"]
+serve = ["serde", "dep:utoipa", "rewrite"]
+# Optional HunyuanVideo 1.5 prompt rewriting: runs the cached Qwen3-VL-8B GGUF
+# on-device (native wgpu, `thinfer_models::qwen3_lm`), no HTTP/Python sidecar.
+# Just gates the `rewrite` module + the Phase-0 call; no extra deps. Enabled by
+# both `cli` and `serve` so the capability is at parity.
+rewrite = []
 # The HTTP `RemoteExecutor` client (thinfer-cli --remote). Pulls reqwest; other
 # app consumers (serve) stay free of it.
 remote = ["serde", "dep:serde_json", "dep:reqwest", "dep:futures-util"]

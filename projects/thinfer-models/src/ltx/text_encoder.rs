@@ -353,6 +353,7 @@ pub fn gemma_encoder_cfgs(weight_dtype: thinfer_core::ops::WeightDtype) -> Block
         coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: true,
         fast_sdpa: false,
+        decode_sdpa: false,
     }
 }
 

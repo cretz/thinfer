@@ -1923,6 +1923,35 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn hunyuan_upsample3d<O: crate::ops::HunyuanUpsample3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        h: BatchBuf<'wsp>,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out_elems: u32,
+    ) -> Result<(), B::Error> {
+        let h = self.resolve(h);
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::HunyuanUpsample3dBufs {
+            h: &h,
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_hunyuan_upsample3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out_elems,
+        )
+    }
+
     /// `memcat` (MemBlock cat-with-prev-frame): `x [T,C,H,W]` -> `[T,2C,H,W]`
     /// with the causal one-frame shift fused (see `ops::memcat`). `n_out` is the
     /// output element count (`T*2C*H*W`).

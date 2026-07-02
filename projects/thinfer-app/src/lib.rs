@@ -11,6 +11,7 @@ pub mod codec;
 pub mod config;
 pub mod download;
 pub mod executor;
+pub mod hunyuan;
 pub mod ltx;
 pub mod model;
 pub mod preprocess;
@@ -18,6 +19,8 @@ pub mod progress;
 #[cfg(feature = "remote")]
 pub mod remote;
 pub mod request;
+#[cfg(feature = "rewrite")]
+pub mod rewrite;
 #[cfg(feature = "serde")]
 pub mod wire;
 

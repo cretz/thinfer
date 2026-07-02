@@ -31,6 +31,7 @@ pub mod gated_head_mul;
 pub mod gelu;
 pub mod gelu_mul;
 pub mod group_norm;
+pub mod hunyuan_upsample3d;
 pub mod layernorm;
 pub mod matmul;
 pub mod matmul_coopmat;
@@ -92,6 +93,8 @@ pub use gelu::GeluF32;
 pub use gelu_mul::GeluMulF32;
 pub(crate) use group_norm::dispatch_group_norm;
 pub use group_norm::{GroupNormBufs, GroupNormF32, GroupNormOp};
+pub(crate) use hunyuan_upsample3d::dispatch_hunyuan_upsample3d;
+pub use hunyuan_upsample3d::{HunyuanUpsample3dBufs, HunyuanUpsample3dF32, HunyuanUpsample3dOp};
 pub(crate) use layernorm::dispatch_layernorm;
 pub use layernorm::{LayerNormBufs, LayerNormF32, LayerNormOp};
 pub use matmul::{MatMulConfig, MatMulF32, MatmulBufs, MatmulOp, dispatch_matmul};
@@ -123,8 +126,8 @@ pub use scale::{ScaleBufs, ScaleF32, ScaleOp, scale_uniform_bytes};
 pub(crate) use scatter_pad_rows::dispatch_scatter_pad_rows;
 pub use scatter_pad_rows::{ScatterPadRowsBufs, ScatterPadRowsF32, ScatterPadRowsOp};
 pub use sdpa::{
-    SdpaBufs, SdpaF32, SdpaF32LargeD, SdpaOp, build_f16_sg_wgsl, build_f16_sg_windowed_wgsl,
-    f16_sg_workgroups,
+    SdpaBufs, SdpaDecode, SdpaF32, SdpaF32LargeD, SdpaF32LargeDCausal, SdpaOp, build_f16_sg_wgsl,
+    build_f16_sg_windowed_wgsl, f16_sg_workgroups,
 };
 pub(crate) use sdpa::{dispatch_sdpa, dispatch_sdpa_f16_sg};
 pub use silu::SiluF32;

@@ -615,6 +615,142 @@
       ]
     },
     {
+      "name": "sdpa_decode_sq1",
+      "op": "sdpa",
+      "scale": 0.35355338,
+      "inputs": [
+        {
+          "name": "q",
+          "shape": [
+            1,
+            1,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "k",
+          "shape": [
+            1,
+            40,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 1.5
+          }
+        },
+        {
+          "name": "v",
+          "shape": [
+            1,
+            40,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.25,
+            "hi": 0.75,
+            "flip": true
+          }
+        },
+        {
+          "name": "mask",
+          "shape": [
+            1,
+            1,
+            40
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.0,
+            "hi": 0.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "sdpa_decode_multirow",
+      "op": "sdpa",
+      "scale": 0.35355338,
+      "inputs": [
+        {
+          "name": "q",
+          "shape": [
+            1,
+            4,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "k",
+          "shape": [
+            1,
+            4,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.5,
+            "hi": 1.5
+          }
+        },
+        {
+          "name": "v",
+          "shape": [
+            1,
+            4,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.25,
+            "hi": 0.75,
+            "flip": true
+          }
+        },
+        {
+          "name": "mask",
+          "shape": [
+            1,
+            4,
+            4
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": 0.0,
+            "hi": 0.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
       "name": "transpose12_basic",
       "op": "transpose12",
       "inputs": [

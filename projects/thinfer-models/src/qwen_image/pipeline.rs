@@ -11,14 +11,12 @@
 use std::sync::Arc;
 
 use thinfer_core::backend::WgpuBackend;
-use thinfer_core::ops::{ActDtype, WeightDtype, WgslConfig};
-use thinfer_core::quant::QuantKind;
 use thinfer_core::residency::WeightResidency;
 use thinfer_core::trace;
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 
-use crate::common::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
+use crate::common::block::BlockPipelines;
 use crate::qwen_image::config;
 use crate::qwen_image::dit::{QwenImageDit, QwenImageDitPipelines};
 use crate::qwen_image::loader::{DitHandles, register_handles as register_dit_handles};
@@ -200,31 +198,10 @@ impl<S: WeightSource> QwenImagePipeline<S> {
         i8_matmul: bool,
         edit: bool,
     ) -> Result<Self, LoadError> {
-        // encoder: bf16 acts, all matmul sites Q8_0.
+        // encoder: bf16 acts, all matmul sites Q8_0 (shared config, see
+        // `text_encoder::encoder_block_cfgs`).
         let encoder_handles = register_encoder_handles(&residency, None)?;
-        let enc_ops = WgslConfig {
-            bf16_quant_writes: false,
-            act_dtype: ActDtype::Bf16,
-            weight_dtype: WeightDtype::Bf16,
-        };
-        let enc_q8 = WgslConfig {
-            weight_dtype: WeightDtype::Quant(QuantKind::Q8_0),
-            ..enc_ops
-        };
-        let enc_cfgs = BlockWgslConfigs {
-            matmul_qkv: enc_q8,
-            matmul_qkv_self: enc_q8,
-            matmul_proj: enc_q8,
-            matmul_ffn_up: enc_q8,
-            matmul_ffn_down: enc_q8,
-            matmul_adaln: enc_ops,
-            ops: enc_ops,
-            i8_sdpa: false,
-            dense_acts: DenseActSites::default(),
-            coopmat_acts: crate::common::block::CoopmatSites::default(),
-            large_d_sdpa: false,
-            fast_sdpa: false,
-        };
+        let enc_cfgs = crate::qwen_image::text_encoder::encoder_block_cfgs();
         let encoder_pipelines = BlockPipelines::compile(&backend, &enc_cfgs).await?;
 
         // DiT: bf16 acts (the residual stream exceeds f16 range); Q8_0 block

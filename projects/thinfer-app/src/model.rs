@@ -5,6 +5,7 @@
 //! value names and the registry keys); the registry lookups key off it.
 
 use thinfer_core::manifest::ModelManifest;
+use thinfer_models::hunyuan::manifest as hunmf;
 use thinfer_models::ideogram4::manifest as idmf;
 use thinfer_models::ltx::manifest as ltxmf;
 use thinfer_models::qwen_image::manifest as qimf;
@@ -228,6 +229,25 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "wan2.2-t2v-a14b"))]
     #[cfg_attr(feature = "serde", serde(rename = "wan2.2-t2v-a14b"))]
     Wan22T2vA14b,
+    /// HunyuanVideo 1.5 T2V, lightx2v 4-step flow-match distill (CFG-free). Its
+    /// own pipeline (Qwen2.5-VL encoder + SingleTokenRefiner, 54-block dual-stream
+    /// MMDiT, 16x-spatial/4x-temporal causal-conv VAE); shares none of the
+    /// Wan/LTX machinery. Industry-norm 480p default (832x480, 81f @ 16fps, 4
+    /// step). FastWan-class quality target with stronger faces.
+    #[cfg_attr(feature = "cli", value(name = "hunyuan-video-1.5-t2v"))]
+    #[cfg_attr(feature = "serde", serde(rename = "hunyuan-video-1.5-t2v"))]
+    Hunyuan15T2v,
+    /// HunyuanVideo 1.5 causal TI2V (minWM WorldPlay `HY15/TI2V/dmd`, 4-step
+    /// DMD). Same 8B MMDiT family as the T2V, run chunk-autoregressively over a
+    /// KV cache: 4 flow-match Euler steps + a recache pass per 4-latent-frame
+    /// chunk. `--input-image` is OPTIONAL: with it the run is image-conditioned
+    /// (SigLIP + VAE-encoded first frame); without it the model generates from
+    /// the prompt alone (probe-validated coherent despite the i2v training).
+    /// 832x480, 77f @ 16fps default (latent frames must chunk by 4 -> frames in
+    /// {13, 29, 45, 61, 77, ...}).
+    #[cfg_attr(feature = "cli", value(name = "hunyuan-video-1.5-ti2v"))]
+    #[cfg_attr(feature = "serde", serde(rename = "hunyuan-video-1.5-ti2v"))]
+    Hunyuan15I2v,
 }
 
 impl VideoModelId {
@@ -237,6 +257,7 @@ impl VideoModelId {
         match self {
             VideoModelId::Ltx23Distilled | VideoModelId::Ltx23DistilledQ4 => &ltxmf::MANIFEST,
             VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4 => &ltxmf::SULPHUR_MANIFEST,
+            VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v => &hunmf::MANIFEST,
             _ => &wanmf::MANIFEST,
         }
     }
@@ -309,6 +330,24 @@ impl VideoModelId {
         matches!(self, VideoModelId::Longlive205b)
     }
 
+    /// HunyuanVideo 1.5 path: its own Qwen2.5-VL-encoder + dual-stream-MMDiT +
+    /// causal-conv-VAE pipeline (`crate::hunyuan`); none of the Wan/LTX variant,
+    /// sampler, or VAE-choice machinery applies. Covers the T2V and causal I2V
+    /// variants; dispatch checks [`Self::is_hunyuan_i2v`] first.
+    pub fn is_hunyuan(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v
+        )
+    }
+
+    /// Causal I2V variant: chunked AR denoise over a KV cache, first-frame
+    /// image conditioning (`--input-image` required), SigLIP + VAE-encoder
+    /// components on top of the shared Hunyuan stack.
+    pub fn is_hunyuan_i2v(self) -> bool {
+        matches!(self, VideoModelId::Hunyuan15I2v)
+    }
+
     /// LTX-2.3 joint audio-video path: its own two-stage pipeline + audio tail,
     /// none of the FastWan/LongLive (Wan-base) machinery applies.
     pub fn is_ltx(self) -> bool {
@@ -344,6 +383,10 @@ impl VideoModelId {
     pub fn video_defaults(self) -> (u32, u32) {
         if self.is_ltx() {
             (1280, 704)
+        } else if self.is_hunyuan() {
+            // 832x480: HunyuanVideo 1.5's native 480p T2V regime (the res the
+            // lightx2v 4-step distill was trained for). 16:9, /16-divisible.
+            (832, 480)
         } else if matches!(self, VideoModelId::Wan22T2vA14b) {
             // 832x480: the lightx2v 480p distill regime, the industry-norm res for
             // this model. The old <=512x288 default existed only to dodge a
@@ -360,11 +403,12 @@ impl VideoModelId {
     }
 
     /// Default temporal self-attention window (latent-frame radius) when the
-    /// caller leaves `--attn-window` unset. `Some(3)` for Wan2.2-14B: windowing
-    /// the long-clip self-attention to +-3 latent frames is the user-eyeballed
-    /// quality/perf point (81f@832x480: ~1.55x e2e, coherence held); it only
-    /// engages on the activation-tiled long-clip path, so short clips are
-    /// unaffected. `None` (full attention) elsewhere. An explicit `0` disables it.
+    /// caller leaves `--attn-window` unset. `Some(3)` for Wan2.2-14B (~1.55x e2e,
+    /// user-eyeballed). `None` (full attention) for HunyuanVideo 1.5: W=3 looked
+    /// clean on a single-subject clip (~2x DiT) but breaks multi-subject
+    /// coherence -- a second cat spawned at latent frame ~14 once the +-3 window
+    /// could no longer see the opening frames (browser eyeball 2026-07-01) -- so
+    /// windowing there is opt-in via `--attn-window`. An explicit `0` disables it.
     pub fn default_attn_window(self) -> Option<u32> {
         match self {
             VideoModelId::Wan22T2vA14b => Some(3),
@@ -396,7 +440,7 @@ impl VideoModelId {
     /// Model-preferred playback fps: default for fps and the `--duration`
     /// divisor. The Wan TI2V line is authored at 24; Wan2.2-A14B at 16 (upstream).
     pub fn fps(self) -> u32 {
-        if matches!(self, VideoModelId::Wan22T2vA14b) {
+        if matches!(self, VideoModelId::Wan22T2vA14b) || self.is_hunyuan() {
             16
         } else {
             24
@@ -532,6 +576,13 @@ impl VideoModelId {
             let f_lat = (raw as f32 + 3.0) / 4.0;
             let f_lat8 = ((f_lat / 8.0).round().max(1.0) as u32) * 8;
             4 * f_lat8 - 3
+        } else if self.is_hunyuan_i2v() {
+            // Causal I2V chunks 4 latent frames at a time: latent frame count
+            // (frames-1)/4+1 must be a positive multiple of 4 -> frames in
+            // {13, 29, 45, 61, 77, ...}.
+            let f_lat = (raw as f32 + 3.0) / 4.0;
+            let f_lat4 = ((f_lat / 4.0).round().max(1.0) as u32) * 4;
+            4 * f_lat4 - 3
         } else {
             let k = ((raw - 1) as f32 / 4.0).round() as u32;
             4 * k + 1
@@ -593,6 +644,8 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::Sulphur2 => "sulphur-2",
             VideoModelId::Sulphur2Q4 => "sulphur-2-q4",
             VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
+            VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",
+            VideoModelId::Hunyuan15I2v => "hunyuan-video-1.5-ti2v",
         })
     }
 }
@@ -603,17 +656,24 @@ impl std::fmt::Display for VideoModelId {
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum VaeChoice {
     Full,
     Tiny,
+    /// Hunyuan-1.5 fine-tuned TAEHV: tiny-VAE speed (~seconds), better fidelity
+    /// than the base tiny. Hunyuan-only; other models fall back to `Tiny`.
+    #[cfg_attr(feature = "cli", value(name = "tiny-ft"))]
+    TinyFt,
 }
 
 impl From<VaeChoice> for thinfer_models::wan::pipeline::VaeChoice {
     fn from(v: VaeChoice) -> Self {
         match v {
             VaeChoice::Full => Self::Full,
-            VaeChoice::Tiny => Self::Tiny,
+            // Wan has no fine-tuned tiny decoder; a `tiny-ft` request on a Wan
+            // model degrades to its own tiny (the ft is a Hunyuan-only option,
+            // and the web only offers it for Hunyuan).
+            VaeChoice::Tiny | VaeChoice::TinyFt => Self::Tiny,
         }
     }
 }
@@ -623,6 +683,7 @@ impl std::fmt::Display for VaeChoice {
         f.write_str(match self {
             VaeChoice::Full => "full",
             VaeChoice::Tiny => "tiny",
+            VaeChoice::TinyFt => "tiny-ft",
         })
     }
 }
@@ -648,6 +709,53 @@ impl std::fmt::Display for EncoderQuant {
         f.write_str(match self {
             EncoderQuant::Q8 => "q8",
             EncoderQuant::Q4 => "q4",
+        })
+    }
+}
+
+/// HunyuanVideo 1.5 prompt-rewriter model choice. The rewriter expands a terse
+/// prompt into the long, structured caption the DiT was trained on. `Fast` (the
+/// default) runs the Qwen3-VL-4B GGUF (~2.5GB): small enough to decode quickly
+/// even under a tight VRAM budget, so it is the budget-honest default. `Full`
+/// runs the Qwen3-VL-8B (~5.85GB) for slightly richer captions at a much higher
+/// time cost (it streams weights under a normal budget). Both share the same
+/// runtime-parameterized `qwen3_lm` stack; only the weights + dims differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum RewriteQuality {
+    #[default]
+    Fast,
+    Full,
+}
+
+impl RewriteQuality {
+    /// The Hunyuan manifest role for this quality's rewriter GGUF.
+    pub fn gguf_role(self) -> &'static str {
+        use thinfer_models::hunyuan::manifest::role;
+        match self {
+            RewriteQuality::Fast => role::REWRITER_GGUF_4B_Q5_K_M,
+            RewriteQuality::Full => role::REWRITER_GGUF_8B_Q5_K_M,
+        }
+    }
+
+    /// The `qwen3_lm` architecture config for this quality's GGUF.
+    pub fn lm_config(self) -> thinfer_models::qwen3_lm::Qwen3LmConfig {
+        use thinfer_models::qwen3_lm::Qwen3LmConfig;
+        match self {
+            RewriteQuality::Fast => Qwen3LmConfig::qwen3_vl_4b(),
+            RewriteQuality::Full => Qwen3LmConfig::qwen3_vl_8b(),
+        }
+    }
+}
+
+impl std::fmt::Display for RewriteQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RewriteQuality::Fast => "fast",
+            RewriteQuality::Full => "full",
         })
     }
 }

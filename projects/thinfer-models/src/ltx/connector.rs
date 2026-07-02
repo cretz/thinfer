@@ -307,6 +307,7 @@ fn connector_block_cfgs() -> BlockWgslConfigs {
         coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: false,
         fast_sdpa: false,
+        decode_sdpa: false,
     }
 }
 

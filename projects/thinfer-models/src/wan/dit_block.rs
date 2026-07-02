@@ -1316,6 +1316,9 @@ impl WanDitBlock {
             0,
             period,
             window,
+            // Pure-video self-attention: no text tokens, so `txt_start = s_k`
+            // leaves the joint-windowing branches dead (bit-identical windowing).
+            rows,
         )
     }
 

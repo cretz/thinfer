@@ -28,8 +28,8 @@ use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 use tracing::Instrument;
 
 use crate::common::block::{
-    ActBuf, Block, BlockPipelines, BlockWgslConfigs, alloc_act, alloc_matmul_out_buf, op_add,
-    op_rmsnorm, op_rope_halfrot, op_sdpa, op_silu_mul,
+    ActBuf, Block, BlockPipelines, BlockWgslConfigs, CoopmatSites, DenseActSites, alloc_act,
+    alloc_matmul_out_buf, op_add, op_rmsnorm, op_rope_halfrot, op_sdpa, op_silu_mul,
 };
 use crate::common::embedders::bcast_add_uniform;
 use crate::common::rope_embedder::RopeEmbedder;
@@ -83,6 +83,39 @@ pub fn qwen2vl_gguf_renames() -> HashMap<WeightId, WeightId> {
         put(g("ffn_down.weight"), h("mlp.down_proj.weight"));
     }
     m
+}
+
+/// The Qwen2.5-VL text-encoder block config: bf16 acts (the residual stream
+/// exceeds f16 range, same lesson as umT5), every matmul site Q8_0 dequant-once,
+/// no i8/coopmat/fast-SDPA (the encoder runs once per generate; the kernel-fast
+/// paths are the DiT's). Shared by the qwen_image t2i/edit pipelines AND the
+/// HunyuanVideo 1.5 text encoder (identical Qwen2.5-VL-7B stack) so the two
+/// cannot drift.
+pub fn encoder_block_cfgs() -> BlockWgslConfigs {
+    let ops = thinfer_core::ops::WgslConfig {
+        bf16_quant_writes: false,
+        act_dtype: thinfer_core::ops::ActDtype::Bf16,
+        weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
+    };
+    let q8 = thinfer_core::ops::WgslConfig {
+        weight_dtype: thinfer_core::ops::WeightDtype::Quant(thinfer_core::quant::QuantKind::Q8_0),
+        ..ops
+    };
+    BlockWgslConfigs {
+        matmul_qkv: q8,
+        matmul_qkv_self: q8,
+        matmul_proj: q8,
+        matmul_ffn_up: q8,
+        matmul_ffn_down: q8,
+        matmul_adaln: ops,
+        ops,
+        i8_sdpa: false,
+        dense_acts: DenseActSites::default(),
+        coopmat_acts: CoopmatSites::default(),
+        large_d_sdpa: false,
+        fast_sdpa: false,
+        decode_sdpa: false,
+    }
 }
 
 // ---------------------------------------------------------------------------

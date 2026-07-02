@@ -10,7 +10,9 @@ use thinfer_core::manifest::FileRef;
 use thinfer_core::policy::ResidencyBudget;
 pub use thinfer_models::wan::pipeline::Shot;
 
-use crate::model::{EncoderQuant, ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler};
+use crate::model::{
+    EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId, VideoSampler,
+};
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
 const VAE_SCALE: u32 = 16;
@@ -203,6 +205,16 @@ pub struct VideoRequest {
     /// upscaler model swap. Two-stage is only the cheaper route to HIGH res.
     /// Ignored by the Wan/LongLive models.
     pub upscale: bool,
+    /// HunyuanVideo 1.5 only: expand a short prompt into a detailed, structured
+    /// caption via the rewrite endpoint before encoding (the model is trained on
+    /// long captions; short raw prompts are out-of-distribution). Default `true`;
+    /// gracefully falls back to the original prompt if the endpoint is
+    /// unreachable. Other models ignore it.
+    pub rewrite: bool,
+    /// Which rewriter model to use when `rewrite` is set (HunyuanVideo 1.5 only):
+    /// `Fast` = the ~2.5GB Qwen3-VL-4B (default, budget-honest), `Full` = the
+    /// ~5.85GB Qwen3-VL-8B. Ignored when `rewrite` is false or by other models.
+    pub rewrite_quality: RewriteQuality,
     pub budget: ResidencyBudget,
     pub output: PathBuf,
     pub format: VideoFormat,
@@ -258,8 +270,57 @@ impl VideoRequest {
             }
             return Ok(files);
         }
+        // Hunyuan sources by role (DiT + VAE + shared Qwen2.5-VL encoder GGUF +
+        // tokenizer), not via the Wan variant registry. The VAE role follows the
+        // `--vae` choice so Tiny pulls only the ~5MB TAEHV (not the ~500MB full
+        // VAE) -- download footprint is first-class.
+        if self.model.is_hunyuan() {
+            use thinfer_models::hunyuan::manifest::role as hyrole;
+            let m = self.model.manifest();
+            let i2v = self.model.is_hunyuan_i2v();
+            let vae_role = match self.vae {
+                VaeChoice::Tiny => hyrole::TINY_VAE,
+                VaeChoice::TinyFt => hyrole::TINY_VAE_FT,
+                VaeChoice::Full => hyrole::VAE,
+            };
+            let mut roles = vec![
+                hyrole::ENCODER_GGUF_Q8_0,
+                if i2v { hyrole::DIT_I2V } else { hyrole::DIT },
+                vae_role,
+                hyrole::TOKENIZER,
+            ];
+            if i2v && self.input_image.is_some() {
+                // Image conditioning additionally needs the SigLIP vision tower
+                // and the FULL VAE (its encoder half conditions the first
+                // frame) even when a tiny decoder is selected. A text-only run
+                // on the TI2V model needs neither.
+                roles.push(hyrole::SIGLIP);
+                if vae_role != hyrole::VAE {
+                    roles.push(hyrole::VAE);
+                }
+            }
+            // Prompt rewriter is opt-in: only pull the SELECTED size's GGUF +
+            // tokenizer when the request enables rewriting (download footprint is
+            // first-class -- a rewrite-off run fetches neither, and Fast pulls the
+            // ~2.5GB 4B rather than the ~5.85GB 8B). On the TI2V model the
+            // rewriter runs only for TEXT-ONLY requests (the text-only rewriter
+            // cannot see a conditioning image).
+            if self.rewrite && (!i2v || self.input_image.is_none()) {
+                roles.push(self.rewrite_quality.gguf_role());
+                roles.push(hyrole::REWRITER_TOKENIZER);
+            }
+            return roles
+                .iter()
+                .map(|r| {
+                    m.get(r)
+                        .copied()
+                        .ok_or_else(|| format!("Hunyuan manifest missing role {r}"))
+                })
+                .collect();
+        }
         let mut files: Vec<FileRef> = self.model.variant().files().map(|(_, f)| *f).collect();
-        if self.vae == VaeChoice::Tiny {
+        // `TinyFt` (Hunyuan-only) degrades to Wan's tiny decoder here.
+        if matches!(self.vae, VaeChoice::Tiny | VaeChoice::TinyFt) {
             files.push(
                 *self
                     .model
@@ -290,10 +351,16 @@ impl VideoRequest {
     /// Validate dims + resolve fps and the shot plan. Fails fast on every user
     /// error so a server can 400 at submit.
     pub fn resolve(&self) -> Result<VideoPlan, String> {
-        if self.input_image.is_some() {
-            return Err(
-                "--input-image (img2vid) not yet wired; the engine path is t2v-only".into(),
-            );
+        // First-frame image conditioning exists only on the causal Hunyuan TI2V
+        // model, where it is OPTIONAL: with an image the run is I2V; without it
+        // the model runs text-only (the upstream `mask_type="t2v"` shape --
+        // probe-validated to produce coherent prompt-following video despite the
+        // i2v-trained checkpoint). Every other model rejects it.
+        if !self.model.is_hunyuan_i2v() && self.input_image.is_some() {
+            return Err(format!(
+                "--input-image is only supported by hunyuan-video-1.5-ti2v (got {})",
+                self.model
+            ));
         }
         if self.prompts.is_empty() {
             return Err("at least one prompt is required".into());
@@ -698,6 +765,8 @@ mod tests {
             i8_matmul: true,
             audio: true,
             upscale: true,
+            rewrite: false,
+            rewrite_quality: crate::model::RewriteQuality::Fast,
             budget: ResidencyBudget {
                 ram_bytes: 5 << 30,
                 vram_bytes: 5 << 30,
@@ -767,6 +836,8 @@ mod tests {
             i8_matmul: true,
             audio: false,
             upscale: false,
+            rewrite: false,
+            rewrite_quality: crate::model::RewriteQuality::Fast,
             budget: ResidencyBudget {
                 ram_bytes: 5 << 30,
                 vram_bytes: 5 << 30,

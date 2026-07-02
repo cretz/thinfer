@@ -110,7 +110,7 @@ impl MemArbiter {
         if self.reclaim_until_fits(mem, bytes) {
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             target: trace::ARBITER,
             op = "overshoot",
             bytes = bytes,

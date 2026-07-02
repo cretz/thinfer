@@ -20,6 +20,7 @@
 - `worklog.md` - START HERE. Forward-looking state + what's next. Points to the active per-model plan. Keep it slim.
 - `orig-plan.md` - user's source-of-truth plan. Don't edit.
 - `plan-details.md` - engine-wide design + current kernel/runtime/web/operational reference (the "how" beyond orig-plan, reused across models). Per-model porting details go in their own file, not here.
-- `ltx-plan.md` - ACTIVE per-model port (LTX-2.3 distilled-1.1; 22B joint audio-video). START HERE for current work.
+- `hy15-causal-plan.md` - ACTIVE per-model port (HunyuanVideo 1.5 causal I2V, minWM dmd). START HERE for current work.
+- `ltx-plan.md` - shipped per-model port (LTX-2.3 distilled-1.1; 22B joint audio-video).
 - `wan-plan.md`, `qwen-image-plan.md`, `zimage-plan.md` - shipped/archived per-model references. Read only if touching that model.
 - `agent-notes.md` - this file: working conventions.

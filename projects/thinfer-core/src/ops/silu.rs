@@ -42,9 +42,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 );
 
 // Native f16 path. Storage is `array<vec2<f16>>` — 2 f16 elements per word,
-// same dispatch shape as bf16-packed. Compute stays in `vec2<f16>` throughout;
-// silu = x * sigmoid(x) is well-behaved at f16 precision for the post-norm
-// activations Z-Image produces (|x| < ~8 typical, exp(-x) won't saturate).
+// same dispatch shape as bf16-packed. The COMPUTE upcasts to f32: silu's
+// `exp(-x)` saturates f16 at |x| > ~11 (`exp(11) > 65504`), which the Hunyuan
+// VAE's pre-norm conv activations (|x| up to ~140) hit -> inf -> downstream NaN.
+// f32 compute is also strictly closer to the f32 reference; the f16 store clamps
+// to the representable range. (The values themselves are well within f16 range;
+// only the intermediate `exp` overflowed.)
 const WGSL_F16_PACKED: &str = concat!(
     act_f16_prelude!(),
     r#"
@@ -55,9 +58,9 @@ const WGSL_F16_PACKED: &str = concat!(
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
     let w = gid.y * (ng.x * 64u) + gid.x;
     if (w >= arrayLength(&out)) { return; }
-    let xv: vec2<f16> = x[w];
-    let one: vec2<f16> = vec2<f16>(f16(1.0), f16(1.0));
-    out[w] = xv / (one + exp(-xv));
+    let xv: vec2<f32> = vec2<f32>(x[w]);
+    let r: vec2<f32> = xv / (vec2<f32>(1.0, 1.0) + exp(-xv));
+    out[w] = vec2<f16>(clamp(r, vec2<f32>(-65504.0, -65504.0), vec2<f32>(65504.0, 65504.0)));
 }
 "#
 );

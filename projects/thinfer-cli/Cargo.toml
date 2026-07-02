@@ -21,3 +21,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+# --remote input-image payloads (the wire carries base64 image bytes).
+base64 = "0.22"

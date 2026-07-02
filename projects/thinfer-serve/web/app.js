@@ -27,7 +27,7 @@ const log = (line) => {
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid"],
-  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
+  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
 };
 // LTX-2.3 is a joint audio-video model with its own grid (/64 dims, 8k+1 frames).
 // Its video VAE decode tiles to the VRAM budget, so larger dims are allowed (more
@@ -46,6 +46,12 @@ const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.sta
 // duration field, but on the 8GB card the 14B self-attention is O(rows^2), so
 // longer = slower (the default 33f ~2.1s is the longest length validated e2e).
 const isWan22Model = (model) => model === "wan2.2-t2v-a14b";
+// HunyuanVideo 1.5 T2V: its own pipeline (Qwen2.5-VL encoder, dual-stream MMDiT,
+// causal-conv VAE). Fixed lightx2v 4-step flow-match schedule (the steps/sampler
+// knobs do not apply) and its own VAE (no tiny path), so those rows are hidden.
+// /16 grid, industry-norm 832x480 / 81f @ 16fps default.
+const isHunyuanModel = (model) => model.startsWith("hunyuan-video-1.5");
+const isHunyuanI2vModel = (model) => model === "hunyuan-video-1.5-ti2v";
 // Multi-shot video: only LongLive treats each prompt line as a separate shot.
 // Every other video model is single-prompt (the whole box is one prompt).
 const isMultiShotModel = (model) => model === "longlive-2.0-5b";
@@ -111,12 +117,23 @@ const WAN22_PRESETS = [
   { label: "288p landscape (512x288, fastest)", width: 512, height: 288 },
   { label: "288p portrait (288x512)", width: 288, height: 512 },
 ];
+// HunyuanVideo 1.5 size ladder (/16 grid: 16x spatial VAE, patch 1). Default =
+// 832x480, the model's native 480p T2V regime. Smaller = fewer latent tokens =
+// faster on the 8GB card (cost scales with w*h and frames).
+const HUNYUAN_PRESETS = [
+  { label: "480p landscape (832x480, default)", width: 832, height: 480 },
+  { label: "480p portrait (480x832)", width: 480, height: 832 },
+  { label: "small landscape (640x368, faster)", width: 640, height: 368 },
+  { label: "288p landscape (512x288, fastest)", width: 512, height: 288 },
+  { label: "288p portrait (288x512)", width: 288, height: 512 },
+];
 /// Size preset + grid step + min dim for a (kind, model): LTX overrides the video
 /// defaults with its /64 grid and 256 floor; Wan2.2-A14B uses its /16 ladder led
 /// by 832x480; everything else uses the per-kind presets (min = step).
 function sizeSpec(kind, model) {
   if (kind === "video" && isLtxModel(model)) return { presets: LTX_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isWan22Model(model)) return { presets: WAN22_PRESETS, step: 16, min: 16 };
+  if (kind === "video" && isHunyuanModel(model)) return { presets: HUNYUAN_PRESETS, step: 16, min: 16 };
   const step = DIM_STEP[kind];
   return { presets: PRESETS[kind], step, min: step };
 }
@@ -155,6 +172,8 @@ const VIDEO_DURATION = {
   "ltx-2.3-distilled-q4": 2,
   "sulphur-2": 2,
   "sulphur-2-q4": 2,
+  "hunyuan-video-1.5-t2v": 5,
+  "hunyuan-video-1.5-ti2v": 5,
 };
 
 const subtle = globalThis.crypto?.subtle;
@@ -283,7 +302,10 @@ function applyModel() {
   const model = $("model").value;
   const kind = $("kind").value;
   const edit = kind === "image" && isEditModel(model);
-  $("input-image-row").hidden = !edit;
+  // The causal Hunyuan TI2V optionally animates a first-frame image: same
+  // picker as the image-edit models, but NOT required (no image = text-only).
+  const i2v = kind === "video" && isHunyuanI2vModel(model);
+  $("input-image-row").hidden = !edit && !i2v;
   $("input-image").required = edit;
   // Audio toggle + upscale toggle are LTX-only (Wan models are silent and have
   // no two-stage upscale path).
@@ -296,17 +318,36 @@ function applyModel() {
   // single-stage and low-res single-stage is OOD), so default it on; the user can
   // still uncheck it for a fast low-res single-stage preview.
   $("upscale").checked = isLtxVideo;
-  // The Wan tiny/full VAE choice does not apply to LTX (own full VAE) or to
+  // The tiny/full VAE choice does not apply to LTX (own full VAE) or to
   // Wan2.2-A14B (full Wan2.1 VAE only, no tiny path), so hide it rather than show
-  // a misleading "Tiny VAE" default those models ignore.
+  // a misleading "Tiny VAE" default those models ignore. Hunyuan 1.5 HAS both (a
+  // TAEHV tiny default + the conv3d full VAE), so it keeps the dropdown.
   const isWan22 = kind === "video" && isWan22Model(model);
+  const isHunyuan = kind === "video" && isHunyuanModel(model);
   $("vae-row").hidden = isLtxVideo || isWan22;
+  // The Hunyuan-tuned tiny VAE is a Hunyuan-only checkpoint; only offer it there.
+  // If a non-Hunyuan model is selected while it was chosen, fall back to tiny.
+  $("vae-opt-tiny-ft").hidden = !isHunyuan;
+  if (!isHunyuan && $("vae").value === "tiny-ft") $("vae").value = "tiny";
   // LTX runs a fixed distilled schedule (8 steps single-stage, or 8 + 3 = 11 when
-  // upscaling) and Wan2.2-A14B a fixed 4-step LightX2V distill; both ignore the
-  // steps/sampler knobs, so hide the field for them.
-  $("steps-row").hidden = isLtxVideo || isWan22;
-  // Temporal attention window is a Wan2.2-14B-only long-clip perf knob.
-  $("attn-window-row").hidden = !isWan22;
+  // upscaling), Wan2.2-A14B a fixed 4-step LightX2V distill, and Hunyuan 1.5 a
+  // fixed lightx2v 4-step flow-match schedule; all ignore the steps/sampler knobs,
+  // so hide the field for them.
+  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan;
+  // Temporal attention window is a video-DiT perf knob: Wan2.2-14B long clips and
+  // Hunyuan 1.5 (joint windowed attention -- image queries see ±W latent frames +
+  // all text). 0 = full attention. Wan ships an eyeballed W=3 default; Hunyuan
+  // defaults to FULL attention (blank field): W=3 broke multi-subject coherence
+  // (second-cat spawn at latent frame ~14, 2026-07-01 eyeball), so it is opt-in.
+  $("attn-window-row").hidden = !isWan22 && !(isHunyuan && !i2v);
+  $("attn-window").value = isWan22 ? "3" : "";
+  // Prompt rewrite (Hunyuan only): the model needs detailed captions, so the
+  // "Enhance prompt" toggle is on by default and shown only for Hunyuan. The
+  // rewriter-model picker (Fast 4B / Full 8B) rides alongside it.
+  // On TI2V the rewriter applies to text-only runs (skipped server-side when
+  // an image is attached), so the toggle stays visible.
+  $("rewrite-row").hidden = !isHunyuan;
+  $("rewrite-quality-row").hidden = !isHunyuan;
   populateSize(kind, model);
   // Steps default is per-model (mirrors the server): the 4-step distilled image
   // models start at 4, everything else at the kind default. LTX ignores steps
@@ -449,6 +490,53 @@ async function buildSpec() {
       // Temporal self-attention window radius in latent frames; blank = full
       // attention. Only the long-clip activation-tiled path honors it.
       attnWindow: intOrNull($("attn-window").value),
+      seed,
+    };
+  }
+  // Causal Hunyuan TI2V: optional first-frame image (with = I2V, without =
+  // text-only) + prompt; fixed 4-step chunked AR schedule (steps/sampler/
+  // attn-window do not apply); the tiny/full VAE choice governs the decode;
+  // the rewriter runs on text-only requests.
+  if (isHunyuanI2vModel(model)) {
+    const file = $("input-image").files[0];
+    const spec = {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      vae: $("vae").value,
+      rewrite: $("rewrite").checked,
+      rewriteQuality: $("rewrite-quality").value,
+      seed,
+    };
+    if (file) spec.inputImage = await fileToBase64(file);
+    return spec;
+  }
+  // HunyuanVideo 1.5 runs a fixed lightx2v 4-step flow-match schedule (steps/
+  // sampler ignored) but DOES honor the tiny/full VAE choice (Tiny TAEHV is the
+  // fast default; Full is the conv3d parity VAE).
+  if (isHunyuanModel(model)) {
+    return {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      vae: $("vae").value,
+      // Temporal joint-windowed attention radius in latent frames; blank = full
+      // attention (the O(frames²)→O(frames·W) DiT lever). Was MISSING here, so
+      // the web field was silently dropped and Hunyuan always ran full attention.
+      attnWindow: intOrNull($("attn-window").value),
+      // Expand a short prompt into a detailed, structured caption before
+      // encoding (the model is trained on long captions; raw short prompts are
+      // out-of-distribution). Needs the rewrite endpoint running; serve falls
+      // back to the raw prompt if it is unreachable.
+      rewrite: $("rewrite").checked,
+      // Which rewriter model: fast (4B, default) or full (8B, slower).
+      rewriteQuality: $("rewrite-quality").value,
       seed,
     };
   }

@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{EncoderQuant, ImageModelId, SwapModel, VaeChoice, VideoModelId, VideoSampler};
+use crate::model::{
+    EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId, VideoSampler,
+};
 use crate::progress::Stage;
 
 /// A job request from a client. Internally tagged by `kind`. Carries only what a
@@ -104,14 +106,22 @@ pub struct VideoSpec {
     pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8, default 4). DMD ignores it.
     pub steps: Option<u32>,
-    /// Temporal self-attention window radius in LATENT frames (Wan2.2 14B). When
-    /// set, DiT self-attention is restricted to keys within `±N` latent frames,
-    /// breaking the O(frames^2) cost on long clips at the price of long-range
-    /// temporal coherence. `None`/omitted = full attention. Honored only on the
-    /// long-clip activation-tiled path; ignored by other models.
+    /// Temporal self-attention window radius in LATENT frames (Wan2.2 14B and
+    /// Hunyuan 1.5). When set, DiT self-attention is restricted to keys within
+    /// `±N` latent frames, breaking the O(frames^2) cost on long clips at the
+    /// price of long-range temporal coherence. `None`/omitted = the model
+    /// default (Wan2.2-14B: 3; Hunyuan and others: full attention). `0` = full
+    /// attention. Ignored by models without a windowed path.
     #[serde(default)]
     pub attn_window: Option<u32>,
     pub vae: Option<VaeChoice>,
+    /// Base64-encoded first-frame image bytes (PNG/JPEG). OPTIONAL on
+    /// hunyuan-video-1.5-ti2v: with it the run is image-conditioned (I2V),
+    /// without it the model generates text-only. Rejected by every other model.
+    /// The server decodes it to a temp file under the job dir like the
+    /// image-edit path.
+    #[serde(default)]
+    pub input_image: Option<String>,
     /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
     /// baseline) or `q4` (Q4_K_M, ~2.8x faster encode, lower precision). Applies
     /// to all LTX/Sulphur models; ignored by Wan.
@@ -125,6 +135,16 @@ pub struct VideoSpec {
     /// (half-res denoise -> latent upscale -> refine). Defaults to `false` =
     /// single-stage denoise at the target res. Ignored by the Wan models.
     pub upscale: Option<bool>,
+    /// HunyuanVideo 1.5 only: expand a short prompt into a detailed caption via
+    /// the rewrite endpoint before encoding. Defaults to `true` (the model needs
+    /// detailed captions); `false` sends the raw prompt. Other models ignore it.
+    #[serde(default)]
+    pub rewrite: Option<bool>,
+    /// HunyuanVideo 1.5 only: which rewriter model to run when `rewrite` is set.
+    /// `fast` (default) = the ~2.5GB Qwen3-VL-4B (budget-honest), `full` = the
+    /// ~5.85GB Qwen3-VL-8B. Ignored when `rewrite` is false or by other models.
+    #[serde(default)]
+    pub rewrite_quality: Option<RewriteQuality>,
     /// Base64 SPKI RSA-OAEP public key for result encryption (see [`ImageSpec`]).
     #[serde(default)]
     pub public_key: Option<String>,

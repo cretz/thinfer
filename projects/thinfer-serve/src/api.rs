@@ -106,6 +106,23 @@ fn spec_into_request(
         JobSpec::Video(s) => {
             let model = s.model.unwrap_or(VideoModelId::DEFAULT);
             let (def_w, def_h) = model.video_defaults();
+            // First-frame conditioning image (hunyuan-video-1.5-i2v): decode the
+            // base64 payload to the job dir like the image-edit path;
+            // `VideoRequest::resolve` enforces required/rejected per model.
+            let input_image = match s.input_image {
+                Some(b64) => {
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64.as_bytes())
+                        .map_err(|e| format!("input_image is not valid base64: {e}"))?;
+                    make_dir()?;
+                    let path = dir.join("input_image");
+                    std::fs::write(&path, &bytes)
+                        .map_err(|e| format!("write {}: {e}", path.display()))?;
+                    Some(path)
+                }
+                None => None,
+            };
             let req = VideoRequest {
                 model,
                 prompts: s.prompts,
@@ -115,7 +132,7 @@ fn spec_into_request(
                 durations: s.durations.unwrap_or_default(),
                 fps: s.fps,
                 seed: s.seed,
-                input_image: None,
+                input_image,
                 sampler: s.sampler.unwrap_or_default(),
                 steps: s.steps.unwrap_or(thinfer_app::model::VIDEO_DEFAULT_STEPS),
                 attn_window: s.attn_window,
@@ -124,6 +141,8 @@ fn spec_into_request(
                 i8_matmul: s.i8_matmul.unwrap_or(true),
                 audio: s.audio.unwrap_or(true),
                 upscale: s.upscale.unwrap_or(model.two_stage_default()),
+                rewrite: s.rewrite.unwrap_or(true),
+                rewrite_quality: s.rewrite_quality.unwrap_or_default(),
                 budget,
                 // Server emits MP4 only (PNG-frames is a CLI debug format).
                 output: mp4(),

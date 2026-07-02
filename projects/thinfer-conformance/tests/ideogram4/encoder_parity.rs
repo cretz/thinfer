@@ -151,7 +151,10 @@ async fn encoder_parity() {
         ops,
         i8_sdpa: false,
         dense_acts: DenseActSites::default(),
+        coopmat_acts: Default::default(),
         large_d_sdpa: false,
+        fast_sdpa: false,
+        decode_sdpa: false,
     };
     let pipelines = BlockPipelines::compile(&backend, &cfgs)
         .await

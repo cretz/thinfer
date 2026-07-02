@@ -434,6 +434,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 coopmat_acts: crate::common::block::CoopmatSites::default(),
                 large_d_sdpa: false,
                 fast_sdpa: false,
+                decode_sdpa: false,
             };
             block_pipelines.push(BlockPipelines::compile(&backend, &cfgs).await?);
         }
@@ -487,6 +488,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: false,
             fast_sdpa: false,
+            decode_sdpa: false,
         };
         let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfgs).await?;
         // DiT-side encoder ops (x/t/cap embedders + refiners + final_layer):
@@ -521,6 +523,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: false,
             fast_sdpa: false,
+            decode_sdpa: false,
         };
         let dit_encoder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_encoder_cfgs).await?;
@@ -540,6 +543,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             coopmat_acts: crate::common::block::CoopmatSites::default(),
             large_d_sdpa: false,
             fast_sdpa: false,
+            decode_sdpa: false,
         };
         let dit_embedder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_embedder_cfgs).await?;

@@ -36,4 +36,10 @@ impl Tokenizer for HfTokenizer {
             .map_err(|e| TokenizerError::Encode(e.to_string()))?;
         Ok(enc.get_ids().to_vec())
     }
+
+    fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, TokenizerError> {
+        self.inner
+            .decode(ids, skip_special_tokens)
+            .map_err(|e| TokenizerError::Decode(e.to_string()))
+    }
 }

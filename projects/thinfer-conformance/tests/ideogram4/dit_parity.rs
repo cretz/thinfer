@@ -150,11 +150,15 @@ async fn dit_parity() {
         i8_sdpa: false,
         dense_acts: DenseActSites {
             qkv: true,
+            qkv_self: true,
             proj: true,
             ffn_up: true,
             ffn_down: true,
         },
+        coopmat_acts: Default::default(),
         large_d_sdpa: true, // head_dim 256 -> SdpaF32LargeD
+        fast_sdpa: false,
+        decode_sdpa: false,
     };
     let dense_cfgs = BlockWgslConfigs::uniform(ops);
     let main_pipelines = BlockPipelines::compile(&backend, &main_cfgs)

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::{
-    EncoderQuant, VIDEO_DEFAULT_STEPS, VaeChoice, VideoModelId, VideoSampler,
+    EncoderQuant, RewriteQuality, VIDEO_DEFAULT_STEPS, VaeChoice, VideoModelId, VideoSampler,
 };
 use thinfer_app::request::{VideoFormat, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
@@ -74,7 +74,9 @@ pub struct GenerateVideo {
     /// tiled long-clip path.
     #[arg(long)]
     pub attn_window: Option<u32>,
-    /// img2vid conditioning image. Not yet wired (engine path is t2v-only).
+    /// First-frame conditioning image (PNG/JPEG). Optional, and only on
+    /// hunyuan-video-1.5-ti2v: with it the run animates the image (I2V);
+    /// without it the model generates from the prompt alone.
     #[arg(long)]
     pub input_image: Option<PathBuf>,
     /// Host RAM budget for the weight residency manager. e.g. `8G`, `512M`.
@@ -108,6 +110,18 @@ pub struct GenerateVideo {
     /// res. Default off = single-stage denoise at the target res. Ignored by Wan.
     #[arg(long)]
     pub upscale: bool,
+    /// HunyuanVideo 1.5 only: skip prompt rewriting and send the raw prompt. By
+    /// default a short prompt is expanded into a detailed, structured caption by
+    /// the on-device Qwen3-VL rewriter (the model is trained on long captions;
+    /// raw short prompts are out-of-distribution and yield incoherent video).
+    #[arg(long)]
+    pub no_rewrite: bool,
+    /// HunyuanVideo 1.5 only: which rewriter model to use. `fast` (default) runs
+    /// the ~2.5GB Qwen3-VL-4B (quick even under a tight VRAM budget); `full` runs
+    /// the ~5.85GB Qwen3-VL-8B (slightly richer captions, much slower). Ignored
+    /// with `--no-rewrite` or on non-Hunyuan models.
+    #[arg(long, value_enum, default_value_t = RewriteQuality::Fast)]
+    pub rewrite_quality: RewriteQuality,
     #[command(flatten)]
     pub remote: super::RemoteArgs,
 }
@@ -137,10 +151,21 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             steps: Some(args.steps),
             attn_window: args.attn_window,
             vae: Some(args.vae),
+            input_image: match &args.input_image {
+                Some(p) => {
+                    use base64::Engine;
+                    let bytes =
+                        std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+                    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                }
+                None => None,
+            },
             encoder: Some(args.encoder),
             i8_matmul: Some(!args.no_i8_matmul),
             audio: Some(!args.no_audio),
             upscale: Some(args.upscale || args.model.two_stage_default()),
+            rewrite: Some(!args.no_rewrite),
+            rewrite_quality: Some(args.rewrite_quality),
             public_key: None,
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
@@ -173,6 +198,8 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         // 8GB and low-res single-stage is OOD); `--upscale` is store-true, so OR
         // with the model default. Wan ignores upscale.
         upscale: args.upscale || args.model.two_stage_default(),
+        rewrite: !args.no_rewrite,
+        rewrite_quality: args.rewrite_quality,
         budget: ResidencyBudget {
             ram_bytes: ram,
             vram_bytes: vram,

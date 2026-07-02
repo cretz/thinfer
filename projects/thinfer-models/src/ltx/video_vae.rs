@@ -37,6 +37,10 @@ use thinfer_core::weight::{WeightId, WeightSource};
 use thinfer_core::workspace::{BatchScope, Workspace};
 
 use crate::common::loader::{LoadError, register_passthrough};
+use crate::common::vae_tiling::{
+    accumulate_spatial_wsum, blend_tile, feather_1d, gather_subtile, plan_temporal_tiles,
+    plan_tiles, trapezoid_mask,
+};
 
 // ============================================================================
 // Config: decoder geometry derived from the safetensors config.
@@ -881,7 +885,7 @@ impl LtxVaeDecoder {
         let (oh, ow) = (h * SPATIAL_SCALE, w * SPATIAL_SCALE);
         let plane = f_px * oh * ow; // per-channel stride of the output.
 
-        let ttiles = plan_temporal_tiles(f, tf, t_overlap);
+        let ttiles = plan_temporal_tiles(f, tf, t_overlap, TEMPORAL_SCALE);
         let tiles_h = plan_tiles(h as u32, tile, overlap);
         let tiles_w = plan_tiles(w as u32, tile, overlap);
         let single = ttiles.len() == 1 && tiles_h.len() == 1 && tiles_w.len() == 1;
@@ -905,7 +909,6 @@ impl LtxVaeDecoder {
                 let ww = feather_1d(wext, overlap, scale, c0 > 0, c0 + wext < w as u32);
                 accumulate_spatial_wsum(
                     &mut wsum_s,
-                    oh,
                     ow,
                     (r0 as usize) * SPATIAL_SCALE,
                     (c0 as usize) * SPATIAL_SCALE,
@@ -930,8 +933,19 @@ impl LtxVaeDecoder {
                 for &(c0, wext) in &tiles_w {
                     let ww = feather_1d(wext, overlap, scale, c0 > 0, c0 + wext < w as u32);
                     let (he, we) = (hext as usize, wext as usize);
-                    let z_sub =
-                        gather_subtile(z, f, h, w, tt.l0, tflen, r0 as usize, c0 as usize, he, we);
+                    let z_sub = gather_subtile(
+                        z,
+                        LATENT_CHANNELS,
+                        f,
+                        h,
+                        w,
+                        tt.l0,
+                        tflen,
+                        r0 as usize,
+                        c0 as usize,
+                        he,
+                        we,
+                    );
                     let (packed, cos) = self
                         .run_graph(backend, workspace, bufs, &z_sub, tflen, he, we, None)
                         .await?;
@@ -939,6 +953,7 @@ impl LtxVaeDecoder {
                     blend_tile(
                         &mut video,
                         &pix,
+                        OUT_CHANNELS,
                         oh,
                         ow,
                         plane,
@@ -1319,302 +1334,6 @@ fn initial_tiles(workspace_budget: u64, f: usize, act_size: u32) -> (usize, u32)
     (tf, initial_tile(workspace_budget, f_px_tile, act_size))
 }
 
-/// One temporal tile in the decode plan: latent frame range `[l0, l1)`, the
-/// output frame range `[o0, o1)` it lands in, and the trapezoidal blend mask's
-/// output-space ramp lengths (`lr`/`rr`). Mirrors upstream `split_temporal_causal`
-/// + `map_temporal_slice` (`ltx_core/tiling.py`, `video_vae.py`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TempTile {
-    l0: usize,
-    l1: usize,
-    o0: usize,
-    o1: usize,
-    lr: usize,
-    rr: usize,
-}
-
-/// Plan temporal tiles over `f` latent frames with latent depth `tf` and latent
-/// overlap `overlap`. A single tile (`f <= tf`) spans all frames with unit ramps
-/// (-> bit-identical decode). Else: `split_by_size` then the causal shift (each
-/// tile after the first starts one latent frame earlier, left ramp +1) then map
-/// to output frames (`o0 = l0*8`, `o1 = (l1-1)*8+1`, `lr = 1+(lr-1)*8`,
-/// `rr = rr*8`). The decoder emits exactly `o1-o0` frames per tile (the
-/// architectural first-frame-drop makes `(l1-l0-1)*8+1` outputs).
-fn plan_temporal_tiles(f: usize, tf: usize, overlap: usize) -> Vec<TempTile> {
-    let s = TEMPORAL_SCALE;
-    let map = |l0: usize, l1: usize, lr: usize, rr: usize| TempTile {
-        l0,
-        l1,
-        o0: l0 * s,
-        o1: (l1 - 1) * s + 1,
-        lr: if lr == 0 { 0 } else { 1 + (lr - 1) * s },
-        rr: rr * s,
-    };
-    if f <= tf {
-        return vec![map(0, f, 0, 0)];
-    }
-    let step = tf.saturating_sub(overlap).max(1);
-    let amount = ((f + tf - 2 * overlap).saturating_sub(1) / step).max(2);
-    // Raw `split_by_size` intervals (start, end, left_ramp, right_ramp).
-    let mut raw: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(amount);
-    raw.push((0, tf, 0, overlap));
-    for i in 1..amount - 1 {
-        raw.push((i * step, i * step + tf, overlap, overlap));
-    }
-    raw.push(((amount - 1) * step, f, overlap, 0));
-    // Causal shift on every tile after the first; then map to output space.
-    raw.into_iter()
-        .enumerate()
-        .map(|(i, (st, en, lr, rr))| {
-            if i == 0 {
-                map(st, en, lr, rr)
-            } else {
-                map(st - 1, en, lr + 1, rr)
-            }
-        })
-        .collect()
-}
-
-/// 1-D trapezoidal blend mask of `length` with linear `ramp_left` fade-in
-/// (starting from 0) and `ramp_right` fade-out, holding 1 between. Mirrors
-/// upstream `compute_trapezoidal_mask_1d(..., left_starts_from_0=True)`.
-fn trapezoid_mask(length: usize, ramp_left: usize, ramp_right: usize) -> Vec<f32> {
-    let rl = ramp_left.min(length);
-    let rr = ramp_right.min(length);
-    let mut m = vec![1.0f32; length];
-    if rl > 0 {
-        // linspace(0,1,rl+1)[:-1] = [0, 1/rl, ..., (rl-1)/rl].
-        for (i, v) in m.iter_mut().take(rl).enumerate() {
-            *v *= i as f32 / rl as f32;
-        }
-    }
-    if rr > 0 {
-        // linspace(1,0,rr+2)[1:-1] = [1-1/(rr+1), ..., 1-rr/(rr+1)].
-        for k in 0..rr {
-            m[length - rr + k] *= 1.0 - (k + 1) as f32 / (rr + 1) as f32;
-        }
-    }
-    m
-}
-
-/// Tiles covering `[0, n)` latent cells: `(start, extent)` pairs stepping by
-/// `tile - overlap`, each extent capped at `tile`. A single `(0, n)` when
-/// `n <= tile` (budget-fits-whole / parity fast path -> bit-identical).
-fn plan_tiles(n: u32, tile: u32, overlap: u32) -> Vec<(u32, u32)> {
-    if n <= tile {
-        return vec![(0, n)];
-    }
-    let step = (tile - overlap).max(1);
-    let mut tiles = Vec::new();
-    let mut start = 0;
-    loop {
-        let ext = (n - start).min(tile);
-        tiles.push((start, ext));
-        if start + ext >= n {
-            break;
-        }
-        start += step;
-    }
-    tiles
-}
-
-/// Per-output-pixel feather weights along one tiled axis (length `ext*scale`):
-/// ramps 0->1 over the `overlap*scale` band on any edge abutting a neighbor,
-/// holds 1 elsewhere. Adjacent tiles' complementary ramps sum to ~1 over the
-/// shared overlap (partition of unity); a tiny floor keeps `wsum` positive.
-fn feather_1d(ext: u32, overlap: u32, scale: u32, has_prev: bool, has_next: bool) -> Vec<f32> {
-    let len = (ext * scale) as usize;
-    let ramp = ((overlap * scale) as usize).min(len).max(1) as f32;
-    (0..len)
-        .map(|i| {
-            let mut wt = 1.0f32;
-            if has_prev {
-                wt = wt.min((i as f32 + 0.5) / ramp);
-            }
-            if has_next {
-                wt = wt.min(((len - i) as f32 - 0.5) / ramp);
-            }
-            wt.clamp(0.0, 1.0).max(1e-4)
-        })
-        .collect()
-}
-
-/// Gather a spatio-temporal sub-tile `[128, tlen, hext, wext]` (contiguous
-/// CTHW) from the full latent `z [128, f, h, w]` at latent offset `(t0, r0, c0)`.
-#[allow(clippy::too_many_arguments)]
-fn gather_subtile(
-    z: &[f32],
-    f: usize,
-    h: usize,
-    w: usize,
-    t0: usize,
-    tlen: usize,
-    r0: usize,
-    c0: usize,
-    hext: usize,
-    wext: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; LATENT_CHANNELS * tlen * hext * wext];
-    for c in 0..LATENT_CHANNELS {
-        for t in 0..tlen {
-            let src_ct = (c * f + (t0 + t)) * h * w;
-            let dst_ct = (c * tlen + t) * hext * wext;
-            for yy in 0..hext {
-                let src = src_ct + (r0 + yy) * w + c0;
-                let dst = dst_ct + yy * wext;
-                out[dst..dst + wext].copy_from_slice(&z[src..src + wext]);
-            }
-        }
-    }
-    out
-}
-
-/// Accumulate one spatial tile's feather window into the spatial weight sum
-/// `[oh*ow]` at output offset `(y0, x0)`. `wh`/`ww` hold one weight per output
-/// pixel along H/W. Channel/time/temporal-tile independent, so done once.
-fn accumulate_spatial_wsum(
-    wsum_s: &mut [f32],
-    oh: usize,
-    ow: usize,
-    y0: usize,
-    x0: usize,
-    wh: &[f32],
-    ww: &[f32],
-) {
-    let _ = oh;
-    for (yy, &wy) in wh.iter().enumerate() {
-        let row = (y0 + yy) * ow + x0;
-        for (xx, &wx) in ww.iter().enumerate() {
-            wsum_s[row + xx] += wy * wx;
-        }
-    }
-}
-
-/// Blend-accumulate a decoded pixel tile `[3, tlen, th, tw]` into `video`
-/// `[3, f_px, oh, ow]` at output offset `(t0, y0, x0)`, weighting each voxel by
-/// `tmask[t] * wh[y] * ww[x]` (the separable temporal x spatial blend window).
-/// Normalization by the weight-sum product happens once in `decode_tiled`.
-#[allow(clippy::too_many_arguments)]
-fn blend_tile(
-    video: &mut [f32],
-    pix: &[f32],
-    oh: usize,
-    ow: usize,
-    plane: usize,
-    t0: usize,
-    y0: usize,
-    x0: usize,
-    tlen: usize,
-    th: usize,
-    tw: usize,
-    tmask: &[f32],
-    wh: &[f32],
-    ww: &[f32],
-) {
-    for c in 0..OUT_CHANNELS {
-        for (t, &wt) in tmask.iter().enumerate().take(tlen) {
-            let dst_ct = c * plane + (t0 + t) * oh * ow;
-            let src_ct = (c * tlen + t) * th * tw;
-            for (yy, &wy) in wh.iter().enumerate() {
-                let dst_row = dst_ct + (y0 + yy) * ow + x0;
-                let src_row = src_ct + yy * tw;
-                let wyt = wt * wy;
-                for (xx, &wx) in ww.iter().enumerate() {
-                    video[dst_row + xx] += pix[src_row + xx] * (wyt * wx);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tiling_tests {
-    use super::*;
-
-    #[test]
-    fn plan_tiles_single_when_fits() {
-        assert_eq!(plan_tiles(8, 8, 2), vec![(0, 8)]);
-        assert_eq!(plan_tiles(5, 8, 2), vec![(0, 5)]);
-    }
-
-    #[test]
-    fn plan_tiles_covers_and_overlaps() {
-        let t = plan_tiles(16, 6, 2); // step 4
-        assert_eq!(t, [(0, 6), (4, 6), (8, 6), (12, 4)]);
-        // every cell covered.
-        let mut covered = [false; 16];
-        for (s, e) in t {
-            for i in s..s + e {
-                covered[i as usize] = true;
-            }
-        }
-        assert!(covered.iter().all(|&c| c));
-    }
-
-    #[test]
-    fn temporal_single_tile_is_unit() {
-        // f <= tf -> one tile spanning all output frames with no ramps.
-        let t = plan_temporal_tiles(3, 8, 2);
-        assert_eq!(t.len(), 1);
-        let tt = t[0];
-        assert_eq!((tt.l0, tt.l1), (0, 3));
-        assert_eq!((tt.o0, tt.o1), (0, TEMPORAL_SCALE * 2 + 1)); // 8*(3-1)+1 = 17
-        assert_eq!((tt.lr, tt.rr), (0, 0));
-        assert!(
-            trapezoid_mask(tt.o1 - tt.o0, tt.lr, tt.rr)
-                .iter()
-                .all(|&w| w == 1.0)
-        );
-    }
-
-    #[test]
-    fn temporal_tiles_cover_output_and_match_decoder_len() {
-        let (f, tf, ov) = (16usize, 6usize, 2usize);
-        let tiles = plan_temporal_tiles(f, tf, ov);
-        assert!(tiles.len() > 1);
-        let f_px = TEMPORAL_SCALE * (f - 1) + 1;
-        // First starts at 0, last ends at the full output length.
-        assert_eq!(tiles.first().unwrap().o0, 0);
-        assert_eq!(tiles.last().unwrap().o1, f_px);
-        let mut wsum = vec![0.0f32; f_px];
-        for tt in &tiles {
-            // Mask length == decoder output length for the latent depth.
-            let dec_len = TEMPORAL_SCALE * (tt.l1 - tt.l0 - 1) + 1;
-            assert_eq!(tt.o1 - tt.o0, dec_len, "mask vs decoder length");
-            let m = trapezoid_mask(tt.o1 - tt.o0, tt.lr, tt.rr);
-            for (i, &w) in m.iter().enumerate() {
-                wsum[tt.o0 + i] += w;
-            }
-        }
-        // Every output frame covered with positive blend weight.
-        assert!(wsum.iter().all(|&w| w > 1e-3), "wsum {wsum:?}");
-    }
-
-    #[test]
-    fn trapezoid_mask_ramps() {
-        // Left fade-in from 0, right fade-out toward 0, ones between.
-        let m = trapezoid_mask(8, 2, 2);
-        assert_eq!(m[0], 0.0);
-        assert!((m[1] - 0.5).abs() < 1e-6);
-        assert_eq!(m[2], 1.0);
-        assert_eq!(m[5], 1.0);
-        assert!((m[6] - (1.0 - 1.0 / 3.0)).abs() < 1e-6);
-        assert!((m[7] - (1.0 - 2.0 / 3.0)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn feather_partition_of_unity_on_shared_overlap() {
-        // Two adjacent tiles sharing an overlap: complementary ramps ~sum to 1.
-        let overlap = 2u32;
-        let scale = 32u32;
-        let left = feather_1d(6, overlap, scale, false, true); // has next neighbor
-        let right = feather_1d(6, overlap, scale, true, false); // has prev neighbor
-        // The left tile's last `overlap*scale` px overlap the right tile's first.
-        let band = (overlap * scale) as usize;
-        for k in 0..band {
-            let l = left[left.len() - band + k];
-            let r = right[k];
-            assert!((l + r - 1.0).abs() < 0.05, "sum {} at {k}", l + r);
-        }
-    }
-}
+// Tiling geometry (plan/feather/trapezoid/gather/blend) is shared across video
+// VAEs in `common::vae_tiling`; LTX passes `TEMPORAL_SCALE`/`SPATIAL_SCALE` /
+// channel counts as arguments. CPU `vae_tiling::tests` gate the math.
