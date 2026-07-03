@@ -16,7 +16,9 @@
 //! denoise 3 steps @ full-res] -> video VAE decode -> frames.
 
 use super::config as dit;
-use super::dit::{DitError, DitModel, DitPipelines, HostFreqs, Streams, build_split_freqs};
+use super::dit::{
+    DitError, DitLoopInputs, DitModel, DitPipelines, HostFreqs, Streams, build_split_freqs,
+};
 use super::patchify;
 use super::sampler::{self, AudioLatentDims, VideoLatentDims};
 
@@ -146,12 +148,15 @@ pub async fn denoise_loop<S: WeightSource>(
     freqs: &HostFreqs,
     progress: Option<&dyn Fn(usize)>,
 ) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
+    // Step-invariant inputs (caption KV, rope freqs, ones gains) upload ONCE;
+    // every step's forward binds the same buffers.
+    let inputs = DitLoopInputs::upload(backend, pipes, workspace, vtext, atext, freqs)
+        .map_err(DitError::Wgpu)?;
     for (step, w) in sigmas.windows(2).enumerate() {
         let (sigma, sigma_next) = (w[0], w[1]);
         let (vel_v, vel_a) = model
-            .forward(
-                backend, pipes, residency, workspace, s, &latent_v, &latent_a, vtext, atext, sigma,
-                freqs,
+            .forward_prepared(
+                backend, pipes, residency, workspace, s, &latent_v, &latent_a, &inputs, sigma,
             )
             .await?;
         let x0_v = sampler::to_denoised(&latent_v, &vel_v, sigma);

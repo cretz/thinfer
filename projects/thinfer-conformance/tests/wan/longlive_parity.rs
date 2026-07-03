@@ -257,11 +257,12 @@ async fn longlive_parity_ar() {
     if let Some(a) = act_override {
         eprintln!("longlive_parity: forcing block act dtype = {a:?}");
     }
-    let model = WanModel::load_with_act(
+    let model = WanModel::load_variant(
         Arc::clone(&backend),
         residency,
         tokenizer,
         VaeChoice::Full,
+        thinfer_models::wan::pipeline::WanVariant::longlive_2_0_5b(),
         act_override,
         std::env::var_os("THINFER_WAN_I8_FFN").is_some(),
     )

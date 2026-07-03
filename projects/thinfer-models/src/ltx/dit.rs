@@ -43,7 +43,7 @@ use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 use super::config as dit;
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, BlockWgslConfigs, DenseActSites, DequantStep, alloc_act,
-    alloc_matmul_out_buf, op_rmsnorm, op_rope_halfrot, op_sdpa,
+    alloc_matmul_out_buf, op_rmsnorm, op_rope_halfrot, op_sdpa, quantize_act_paired,
 };
 use crate::common::embedders::bcast_add_uniform;
 use crate::z_image::text_encoder::{LoadError, register_one};
@@ -432,6 +432,11 @@ pub fn register_io<S: WeightSource>(
 ///   A-sides normed). The AUDIO stream stays fully dense: i8 on the small audio
 ///   dim is too lossy at the block-residual level (audio block rel 0.86% > the
 ///   0.5% gate; fully-dense audio = 0.32%). proj / ffn_down / gate dense too.
+///   `THINFER_LTX_I8_EXTRA=1` (opt-in, default OFF) additionally routes the
+///   audio-stream qkv/ffn_up + the v2a cross (all normed/modulated A-sides, so
+///   DP4A-eligible; only rejected on the audio-precision gate above) through i8.
+///   to_out (post-gate) / ffn_down (post-gelu) / gate carry outlier or
+///   bandwidth-trivial A-sides and are never i8, even with the opt-in.
 ///
 /// f16 acts put the residual stream in f16 (5-bit exponent, max 65504); the
 /// worklog flags this as a dead-end for the big WAN/Qwen DiTs (residual outliers
@@ -495,7 +500,9 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
     // routing (`I8Site` in `biased_proj`, driven by `attention`/`feed_forward`)
     // decides which projections actually use them -- the VIDEO-stream qkv/ffn_up
     // (all normed A-sides), with proj (post-gate) + ffn_down (post-gelu) + the
-    // whole AUDIO stream kept dense.
+    // whole AUDIO stream kept dense by default (`THINFER_LTX_I8_EXTRA=1` opts
+    // the audio qkv/ffn_up + v2a, also normed A-sides, into i8; see
+    // `DitPipelines::i8_extra`).
     let dense_acts = DenseActSites {
         qkv: !dp4a,
         qkv_self: !dp4a,
@@ -535,6 +542,13 @@ pub struct DitPipelines {
     /// pipeline cache dedups, so the unused kinds cost ~nothing). DP4A i8 stays
     /// Q8_0-only (its i8 dequant is scheme-specific); the Q4 variant runs dense.
     dense_dequant: std::collections::HashMap<QuantKind, DequantStep>,
+    /// `THINFER_LTX_I8_EXTRA=1`: also route the audio-stream qkv/ffn_up and the
+    /// v2a cross through DP4A i8. Their A-sides are all normed/modulated
+    /// (ada_zero or connector norm_out + modulate), so the i8 act contract
+    /// holds; the default stays dense because audio-block residual rel (0.86%)
+    /// exceeds the 0.5% quality gate. Only meaningful on the `F16Dp4a` path
+    /// (the i8 pipelines are `None` otherwise and every site falls back dense).
+    i8_extra: bool,
 }
 
 impl DitPipelines {
@@ -545,7 +559,9 @@ impl DitPipelines {
 
     pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
         let acts = DitActs::from_env(backend);
-        tracing::info!(?acts, "ltx dit acts");
+        let i8_extra = acts == DitActs::F16Dp4a
+            && std::env::var_os("THINFER_LTX_I8_EXTRA").is_some_and(|v| v != "0");
+        tracing::info!(?acts, i8_extra, "ltx dit acts");
         let cfgs = dit_block_cfgs(acts.act_dtype(), acts == DitActs::F16Dp4a);
         let block = BlockPipelines::compile(backend, &cfgs).await?;
         // Dense dequant steps keyed by quant kind. Target matches the block's
@@ -605,6 +621,7 @@ impl DitPipelines {
             gate,
             silu,
             dense_dequant,
+            i8_extra,
         })
     }
 }
@@ -1058,14 +1075,15 @@ impl<'a> BlockViewsAll<'a> {
 /// rope (per-(pos,head) freq rows; q via `q_freqs`, k via `k_freqs`), non-causal
 /// SDPA, per-head sigmoid gate (`to_gate_logits(gate_src)`), then biased
 /// `to_out`. Returns `[q_rows, q_dim]`. No outer AdaLN gate here (the caller
-/// applies it at the residual).
+/// applies it at the residual). `kv_src = None` means self-attention (K/V read
+/// `q_src`), which also lets the shared-A-side act-quant below cover Q.
 #[allow(clippy::too_many_arguments)]
 fn attention<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipes: &DitPipelines,
     g: AttnGeom,
     q_src: ActBuf<'wsp>,
-    kv_src: ActBuf<'wsp>,
+    kv_src: Option<ActBuf<'wsp>>,
     gate_src: ActBuf<'wsp>,
     q_freqs: Option<BatchBuf<'wsp>>,
     k_freqs: Option<BatchBuf<'wsp>>,
@@ -1082,11 +1100,16 @@ fn attention<'wsp>(
     let hd = g.head_dim as u32;
     let q_dim = g.q_dim as u32;
     let kv_dim = g.kv_dim as u32;
+    let self_attn = kv_src.is_none();
+    let kv_src = kv_src.unwrap_or(q_src);
     // DP4A for the q/k/v projections when `qkv_i8`. Their A-sides are all normed
     // (self-attn: the sandwich-normed residual; text-cross: the connector output,
     // `norm_output=true`, modulated; av-cross: ada_zero-normed) -> DP4A-safe
-    // (validated: cross-attn i8 adds <0.02% rel). gate (tiny) + to_out (post-gate
-    // outliers) stay dense (`I8Site::None`). The i8 dequant is Q8_0-specific, so
+    // (validated: cross-attn i8 adds <0.02% rel). gate stays dense even though
+    // its A-side is normed: n=heads makes it bandwidth-trivial, and the i8 route
+    // would add an act_quant pass over the full A-side that costs more than the
+    // dense matmul saves. to_out (post-gate outliers) stays dense
+    // (`I8Site::None`). The i8 dequant is Q8_0-specific, so
     // any non-Q8_0 weight (the Q4_K_M variant) falls to the dense per-kind path.
     let qkv_site = |d: Option<&DequantStep>| {
         if qkv_i8 && d.is_some_and(|s| s.scheme == QuantKind::Q8_0) {
@@ -1095,42 +1118,42 @@ fn attention<'wsp>(
             I8Site::None
         }
     };
+    let q_site = qkv_site(dq.q);
+    let k_site = qkv_site(dq.k);
+    let v_site = qkv_site(dq.v);
+
+    // Act-quant the shared A-side ONCE when its consumers take the DP4A path
+    // (bit-identical to each site quantizing internally; see
+    // `quantize_act_paired`): K and V always share `kv_src`, and in self-attn Q
+    // shares it too. Dense sites keep the dense buffer. Gated on the i8
+    // pipelines actually being built (`I8Site::Qkv` falls through to dense on
+    // the F32/F16 non-dp4a paths, which must keep a dense A-side).
+    let i8_built = bp.matmul_i8_qkv.is_some() && bp.dequant_i8_qkv.is_some();
+    let kv_paired = if i8_built && k_site == I8Site::Qkv && v_site == I8Site::Qkv {
+        Some(quantize_act_paired(
+            scope,
+            bp,
+            kv_src.data,
+            kv_rows,
+            kv_dim,
+        )?)
+    } else {
+        None
+    };
+    let kv_a = kv_paired.unwrap_or(kv_src);
+    let q_a = match kv_paired {
+        Some(p) if self_attn && q_site == I8Site::Qkv => p,
+        _ => q_src,
+    };
 
     let q = biased_proj(
-        scope,
-        bp,
-        q_src,
-        w.q_w,
-        w.q_b,
-        q_rows,
-        inner,
-        q_dim,
-        qkv_site(dq.q),
-        dq.q,
+        scope, bp, q_a, w.q_w, w.q_b, q_rows, inner, q_dim, q_site, dq.q,
     )?;
     let k = biased_proj(
-        scope,
-        bp,
-        kv_src,
-        w.k_w,
-        w.k_b,
-        kv_rows,
-        inner,
-        kv_dim,
-        qkv_site(dq.k),
-        dq.k,
+        scope, bp, kv_a, w.k_w, w.k_b, kv_rows, inner, kv_dim, k_site, dq.k,
     )?;
     let v = biased_proj(
-        scope,
-        bp,
-        kv_src,
-        w.v_w,
-        w.v_b,
-        kv_rows,
-        inner,
-        kv_dim,
-        qkv_site(dq.v),
-        dq.v,
+        scope, bp, kv_a, w.v_w, w.v_b, kv_rows, inner, kv_dim, v_site, dq.v,
     )?;
 
     // learned qk rms-norm over the FULL inner dim.
@@ -1227,9 +1250,11 @@ fn feed_forward<'wsp>(
     let ff_hidden = 4 * inner;
     // ffn_up A-side is the sandwich-normed residual (DP4A-safe); ffn_down reads
     // the post-gelu product (outlier-prone), so it stays dense. `up_i8` is set
-    // for the VIDEO ffn only -- the audio stream (small dim, fewer tokens) is too
-    // sensitive to i8 at the block-residual level, so it stays fully dense. i8 is
-    // Q8_0-specific; a non-Q8_0 ffn_up (Q4_K_M variant) runs the dense per-kind path.
+    // for the VIDEO ffn by default -- the audio stream (small dim, fewer tokens)
+    // is too sensitive to i8 at the block-residual level, so it stays dense
+    // unless `THINFER_LTX_I8_EXTRA=1` opts it in (its A-side is equally normed).
+    // i8 is Q8_0-specific; a non-Q8_0 ffn_up (Q4_K_M variant) runs the dense
+    // per-kind path.
     let up = if up_i8 && dq.up.is_some_and(|s| s.scheme == QuantKind::Q8_0) {
         I8Site::FfnUp
     } else {
@@ -1344,7 +1369,7 @@ fn block_forward<'wsp>(
         pipes,
         geom::VIDEO_SELF,
         norm_vx,
-        norm_vx,
+        None,
         norm_vx,
         Some(freqs.video_self),
         Some(freqs.video_self),
@@ -1397,7 +1422,7 @@ fn block_forward<'wsp>(
         pipes,
         geom::VIDEO_CROSS,
         attn_in,
-        enc,
+        Some(enc),
         attn_in,
         None,
         None,
@@ -1437,7 +1462,7 @@ fn block_forward<'wsp>(
         pipes,
         geom::AUDIO_SELF,
         norm_ax,
-        norm_ax,
+        None,
         norm_ax,
         Some(freqs.audio_self),
         Some(freqs.audio_self),
@@ -1445,7 +1470,7 @@ fn block_forward<'wsp>(
         sa,
         sa,
         eps,
-        false,
+        pipes.i8_extra,
         adq,
     )?;
     let ax1 = alloc_act(scope, bp, sa, ad)?;
@@ -1488,7 +1513,7 @@ fn block_forward<'wsp>(
         pipes,
         geom::AUDIO_CROSS,
         a_attn_in,
-        a_enc,
+        Some(a_enc),
         a_attn_in,
         None,
         None,
@@ -1496,7 +1521,7 @@ fn block_forward<'wsp>(
         sa,
         s.audio_text as u32,
         eps,
-        false,
+        pipes.i8_extra,
         adq,
     )?;
     let ax2 = alloc_act(scope, bp, sa, ad)?;
@@ -1541,7 +1566,7 @@ fn block_forward<'wsp>(
         pipes,
         geom::A2V,
         a2v_vx,
-        a2v_ax,
+        Some(a2v_ax),
         a2v_vx,
         Some(freqs.video_cross),
         Some(freqs.audio_cross),
@@ -1591,7 +1616,7 @@ fn block_forward<'wsp>(
         pipes,
         geom::V2A,
         v2a_ax,
-        v2a_vx,
+        Some(v2a_vx),
         v2a_ax,
         Some(freqs.audio_cross),
         Some(freqs.video_cross),
@@ -1599,7 +1624,7 @@ fn block_forward<'wsp>(
         sa,
         sv,
         eps,
-        false,
+        pipes.i8_extra,
         adq,
     )?;
     let ax3 = alloc_act(scope, bp, sa, ad)?;
@@ -1656,7 +1681,7 @@ fn block_forward<'wsp>(
         &bufs.audio_ff,
         sa,
         ad,
-        false,
+        pipes.i8_extra,
         aff_dq,
     )?;
     op_gate_residual(
@@ -1934,6 +1959,53 @@ fn upload_mod(
         .collect()
 }
 
+/// Step-invariant GPU inputs for a denoise loop: the caption KV, the rope freq
+/// tables, and the bf16-ones rms-norm gains depend only on the request (prompt +
+/// latent grid), not on sigma. `denoise_loop` uploads them ONCE and every
+/// per-step forward binds the same buffers; the per-step path used to re-upload
+/// tens of MB (freqs + text) every forward. Bit-identical: same bytes, same
+/// kernels, uploaded less often.
+pub struct DitLoopInputs {
+    vtext: WsBuf,
+    atext: WsBuf,
+    video_self: WsBuf,
+    audio_self: WsBuf,
+    video_cross: WsBuf,
+    audio_cross: WsBuf,
+    ones_v: WsBuf,
+    ones_a: WsBuf,
+}
+
+impl DitLoopInputs {
+    /// Upload the step-invariant inputs in the block act dtype.
+    pub fn upload(
+        backend: &WgpuBackend,
+        pipes: &DitPipelines,
+        workspace: &Workspace<WgpuBackend>,
+        vtext: &[f32],
+        atext: &[f32],
+        freqs: &HostFreqs,
+    ) -> Result<Self, WgpuError> {
+        let act = pipes.block.act_dtype;
+        let ones = |dim: usize| -> Result<WsBuf, WgpuError> {
+            let words = bf16_ones_words(dim);
+            let b = workspace.alloc(words.len() as u64)?;
+            backend.write_buffer(b.id(), 0, &words)?;
+            Ok(b)
+        };
+        Ok(Self {
+            vtext: ws_upload(backend, workspace, vtext, act)?,
+            atext: ws_upload(backend, workspace, atext, act)?,
+            video_self: ws_upload(backend, workspace, &freqs.video_self, act)?,
+            audio_self: ws_upload(backend, workspace, &freqs.audio_self, act)?,
+            video_cross: ws_upload(backend, workspace, &freqs.video_cross, act)?,
+            audio_cross: ws_upload(backend, workspace, &freqs.audio_cross, act)?,
+            ones_v: ones(dit::DIM)?,
+            ones_a: ones(dit::AUDIO_DIM)?,
+        })
+    }
+}
+
 fn stream_mod_from<'wsp>(scope: &BatchScope<'wsp, WgpuBackend>, b: &[WsBuf]) -> StreamMod<'wsp> {
     let i: Vec<_> = b
         .iter()
@@ -2061,6 +2133,11 @@ pub struct DitModel {
     /// On-disk quant kind per matmul site (probed from block 0; uniform across
     /// blocks). Q8_0 for the baseline file; mixed Q4_K/Q6_K for the Q4_K_M variant.
     quant: BlockQuantKinds,
+    /// Output-stage `scale_shift_table` rows (`[2*DIM]` / `[2*AUDIO_DIM]`),
+    /// host-cached at register like the block tables: constant across steps, so
+    /// reading them back per forward would stall the queue twice per step.
+    sst_out_v: Vec<f32>,
+    sst_out_a: Vec<f32>,
 }
 
 impl DitModel {
@@ -2081,12 +2158,17 @@ impl DitModel {
             blocks.push(h);
         }
         let quant = BlockQuantKinds::probe(residency);
+        let sst_out_v = read_weight_bf16(backend, residency, io.sst_out_v, 2 * dit::DIM).await?;
+        let sst_out_a =
+            read_weight_bf16(backend, residency, io.sst_out_a, 2 * dit::AUDIO_DIM).await?;
         Ok(Self {
             timestep,
             blocks,
             tables,
             io,
             quant,
+            sst_out_v,
+            sst_out_a,
         })
     }
 
@@ -2094,6 +2176,10 @@ impl DitModel {
     /// block (streams kept on GPU), apply the output stage. Returns the velocity
     /// predictions `(video [Tv,128], audio [Ta,128])` host f32. `sigma` is the
     /// scalar timestep (uniform); `freqs` the rope tables for the latent grid.
+    ///
+    /// Single-shot convenience over [`Self::forward_prepared`] (uploads the
+    /// step-invariant inputs itself). A denoise LOOP should build one
+    /// [`DitLoopInputs`] and call `forward_prepared` per step instead.
     #[allow(clippy::too_many_arguments)]
     pub async fn forward<S: WeightSource>(
         &self,
@@ -2108,6 +2194,29 @@ impl DitModel {
         atext: &[f32],
         sigma: f32,
         freqs: &HostFreqs,
+    ) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
+        let inputs = DitLoopInputs::upload(backend, pipes, workspace, vtext, atext, freqs)?;
+        self.forward_prepared(
+            backend, pipes, residency, workspace, s, latent_v, latent_a, &inputs, sigma,
+        )
+        .await
+    }
+
+    /// [`Self::forward`] with the step-invariant inputs (caption KV, rope freqs,
+    /// ones gains) already resident in `inputs`; only the latents (which change
+    /// every step) are uploaded here.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_prepared<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipes: &DitPipelines,
+        residency: &WeightResidency<S>,
+        workspace: &Workspace<WgpuBackend>,
+        s: Streams,
+        latent_v: &[f32],
+        latent_a: &[f32],
+        inputs: &DitLoopInputs,
+        sigma: f32,
     ) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
         let vd = dit::DIM;
         let ad = dit::AUDIO_DIM;
@@ -2129,21 +2238,20 @@ impl DitModel {
         )
         .await?;
 
-        // Persistent buffers: latents, text, freqs, ones (in the block act dtype).
+        // Per-step buffers: only the latents change between steps; text, freqs
+        // and ones bind the request-lifetime `inputs` buffers.
         let act = pipes.block.act_dtype;
         let ab = act_bytes(act);
         let latv = ws_upload(backend, workspace, latent_v, act)?;
         let lata = ws_upload(backend, workspace, latent_a, act)?;
-        let vtext_b = ws_upload(backend, workspace, vtext, act)?;
-        let atext_b = ws_upload(backend, workspace, atext, act)?;
-        let vsf = ws_upload(backend, workspace, &freqs.video_self, act)?;
-        let asf = ws_upload(backend, workspace, &freqs.audio_self, act)?;
-        let vcf = ws_upload(backend, workspace, &freqs.video_cross, act)?;
-        let acf = ws_upload(backend, workspace, &freqs.audio_cross, act)?;
-        let ones_v_b = workspace.alloc(bf16_ones_words(vd).len() as u64)?;
-        backend.write_buffer(ones_v_b.id(), 0, &bf16_ones_words(vd))?;
-        let ones_a_b = workspace.alloc(bf16_ones_words(ad).len() as u64)?;
-        backend.write_buffer(ones_a_b.id(), 0, &bf16_ones_words(ad))?;
+        let vtext_b = &inputs.vtext;
+        let atext_b = &inputs.atext;
+        let vsf = &inputs.video_self;
+        let asf = &inputs.audio_self;
+        let vcf = &inputs.video_cross;
+        let acf = &inputs.audio_cross;
+        let ones_v_b = &inputs.ones_v;
+        let ones_a_b = &inputs.ones_a;
 
         // Patchify both streams into the persistent residual buffers.
         let io = &self.io;
@@ -2265,9 +2373,10 @@ impl DitModel {
             ax_b = ax_out;
         }
 
-        // Output stage: per-stream scale/shift = sst_out_row + embedded_timestep.
-        let sst_v = read_weight_bf16(backend, residency, io.sst_out_v, 2 * vd).await?;
-        let sst_a = read_weight_bf16(backend, residency, io.sst_out_a, 2 * ad).await?;
+        // Output stage: per-stream scale/shift = sst_out_row + embedded_timestep
+        // (sst rows host-cached at register; constant across steps).
+        let sst_v = &self.sst_out_v;
+        let sst_a = &self.sst_out_a;
         let add_emb = |row: &[f32], emb: &[f32]| -> Vec<f32> {
             row.iter().zip(emb).map(|(a, b)| a + b).collect()
         };

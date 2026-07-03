@@ -385,11 +385,15 @@ async fn video_e2e_safetensors() {
     .await
     .expect("WanModel::load");
 
-    // Safetensors path compiles the DiT matmuls against bf16. A misnamed rename
-    // map / wrong probe would silently fall to some other dtype.
+    // The FastWan variant transcodes bf16 block matmuls to Q8_0 at load. A
+    // misnamed rename map / wrong probe would silently fall to some other dtype.
     let dit_w = model.dit_matmul_weight();
-    eprintln!("[safetensors] DiT matmul weight dtype: {dit_w:?} (expected Bf16)");
-    assert_eq!(dit_w, WeightDtype::Bf16, "safetensors DiT matmul dtype");
+    eprintln!("[safetensors] DiT matmul weight dtype: {dit_w:?} (expected Quant(Q8_0))");
+    assert_eq!(
+        dit_w,
+        WeightDtype::Quant(thinfer_core::quant::QuantKind::Q8_0),
+        "safetensors DiT matmul dtype"
+    );
 
     // Temporal self-attention window (latent frames) for perf/quality A/B. Set
     // THINFER_E2E_ATTN_WINDOW=W to restrict self-attention to +-W latent frames;

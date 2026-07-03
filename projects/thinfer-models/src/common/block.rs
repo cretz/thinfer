@@ -182,10 +182,13 @@ impl BlockMatmuls {
             // tn=2 (not DEFAULT tn=1) so AdaLN output can land in packed-bf16
             // storage when `WgslConfig.act_dtype = Bf16`. Output cols are
             // 6*ADALN_EMBED_DIM = 1536 (even) so pairing is clean. M=1 keeps
-            // register blocking pointless, so bm/tm stay at DEFAULT. AdaLN
-            // weight stays bf16 even in the quant-DiT case.
+            // register blocking pointless, so bm/tm stay at DEFAULT. A Quant
+            // adaln weight (Hunyuan mod linears) goes through the dequant-once
+            // path same as `square`: the matmul reads the dense bf16/f16
+            // N-major workspace (b_nmajor), never the quant stream directly.
             adaln: MatMulF32::new(MatMulConfig {
                 tn: 2,
+                b_nmajor: matches!(cfgs.matmul_adaln.weight_dtype, WeightDtype::Quant(_)),
                 ..MatMulConfig::DEFAULT
             }),
             // Bf16 square (b_nmajor=false): module weights are dense bf16
@@ -203,6 +206,24 @@ impl BlockMatmuls {
 pub struct DequantStep {
     pub pipeline: WgpuPipeline,
     pub scheme: thinfer_core::quant::QuantKind,
+}
+
+/// A matmul site's B operand pre-dequanted ONCE outside the dispatch (a tiled
+/// caller dequants each block weight into persistent workspace buffers and
+/// every activation tile reuses them). Without it, `dispatch_matmul_site*`
+/// re-runs the identical weight dequant inside every call - at video dims
+/// that is once per activation tile, ~32x redundant per block.
+#[derive(Clone, Copy)]
+pub enum PreparedWeight {
+    /// DP4A site: the `dequant_i8` triple (i8 image `[N,K]`, per-32-block
+    /// scale, per-32-block qsum).
+    I8 {
+        i8: BufRef,
+        scale: BufRef,
+        qsum: BufRef,
+    },
+    /// Coopmat / dense-fallback site: the dequanted f16 `[N,K]` n-major image.
+    F16(BufRef),
 }
 
 /// A cooperative-matrix (tensor-core) matmul site. `Some` only for an opt-in
@@ -243,6 +264,11 @@ pub struct BlockPipelines {
     pub dequant_proj: Option<DequantStep>,
     pub dequant_ffn_up: Option<DequantStep>,
     pub dequant_ffn_down: Option<DequantStep>,
+    /// AdaLN/modulation-site dequant. `Some` iff `matmul_adaln.weight_dtype` is
+    /// Quant (Hunyuan mod linears). The site never gets an i8/coopmat pair:
+    /// M=1, and modulation outputs gate the residual stream, so only the
+    /// weight storage quantizes (dequant-once -> dense matmul).
+    pub dequant_adaln: Option<DequantStep>,
     /// DP4A int8 path: per-Quant-site `(dequant_i8 pipeline + scheme,
     /// matmul_i8 pipeline)`. `Some` iff the backend exposes
     /// `WgslLanguageFeatures::Packed4x8IntegerDotProduct` AND the site's
@@ -580,7 +606,8 @@ impl BlockPipelines {
         let proj_wgsl = matmuls.proj.wgsl(&proj_mm_cfg);
         let ffn_up_wgsl = matmuls.ffn_up.wgsl(&ffn_up_mm_cfg);
         let ffn_down_wgsl = matmuls.ffn_down.wgsl(&ffn_down_mm_cfg);
-        let adaln_wgsl = matmuls.adaln.wgsl(&cfgs.matmul_adaln);
+        let adaln_mm_cfg = matmul_cfg_for(cfgs.matmul_adaln);
+        let adaln_wgsl = matmuls.adaln.wgsl(&adaln_mm_cfg);
         // Module-level dense linears: force a bf16 weight regardless of the
         // block's quant choice (the patch/embedder/proj_out weights stay bf16).
         let module_cfg = WgslConfig {
@@ -610,6 +637,11 @@ impl BlockPipelines {
         let dequant_ffn_up = build_dq("dequant_ffn_up", cfgs.matmul_ffn_up.weight_dtype).await?;
         let dequant_ffn_down =
             build_dq("dequant_ffn_down", cfgs.matmul_ffn_down.weight_dtype).await?;
+        // AdaLN/modulation site: dequant-once dense only (no i8/coopmat pair).
+        // M=1 and the outputs gate/shift the whole residual stream, so the
+        // activation math stays at full act dtype; only the weight storage is
+        // Quant (Hunyuan mod linears).
+        let dequant_adaln = build_dq("dequant_adaln", cfgs.matmul_adaln.weight_dtype).await?;
         // DP4A int8 path. Gated on the WGSL packed_4x8_integer_dot_product
         // language feature (queried on the wgpu Instance). When present we
         // build a per-site (dequant_i8, matmul_i8) pair for each Quant
@@ -944,6 +976,7 @@ impl BlockPipelines {
             dequant_proj,
             dequant_ffn_up,
             dequant_ffn_down,
+            dequant_adaln,
             dequant_i8_qkv,
             dequant_i8_qkv_self,
             dequant_i8_proj,
@@ -1605,6 +1638,7 @@ impl Block {
                 k_proj,
                 None,
                 None,
+                None,
                 taps.proj_wo_b_i8_head,
                 taps.proj_wo_b_scale_head,
                 None,
@@ -2014,6 +2048,7 @@ impl Block {
                 rows,
                 n_qkv,
                 dim,
+                None,
                 taps.qkv_attn_in_data_head,
                 taps.qkv_attn_in_params_head,
                 taps.qkv_b_i8_head,
@@ -2177,6 +2212,7 @@ impl Block {
                     rows,
                     dim,
                     k_proj,
+                    None,
                     None,
                     None,
                     taps.proj_wo_b_i8_head,
@@ -2417,6 +2453,47 @@ impl Block {
     /// the bf16 residual. Otherwise fall through to [`Self::dispatch_matmul_site`]
     /// (dense / dequant-once / DP4A). Keeps coopmat isolated to its opt-in
     /// callers (Wan `lin`) without touching the shared dispatch signature.
+    /// Dequant a DP4A site's Quant weight into the persistent `(i8, scale,
+    /// qsum)` triple a [`PreparedWeight::I8`] hands back to the site dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_weight_i8<'wsp>(
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        dq: &DequantStep,
+        b_weight: BatchBuf<'wsp>,
+        dst_i8: BatchBuf<'wsp>,
+        dst_scale: BatchBuf<'wsp>,
+        dst_qsum: BatchBuf<'wsp>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), WgpuError> {
+        let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+        scope.dequant_i8(
+            &dq.pipeline,
+            dq.scheme,
+            b_weight,
+            dst_i8,
+            dst_scale,
+            dst_qsum,
+            dq_dims,
+            n,
+            k,
+        )
+    }
+
+    /// Dequant a coopmat/dense-fallback site's Quant weight into the persistent
+    /// f16 `[N,K]` n-major image a [`PreparedWeight::F16`] hands back.
+    pub(crate) fn prepare_weight_f16<'wsp>(
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        dq: &DequantStep,
+        b_weight: BatchBuf<'wsp>,
+        dst: BatchBuf<'wsp>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), WgpuError> {
+        let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+        scope.dequant(&dq.pipeline, dq.scheme, b_weight, dst, dq_dims, n, k)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_matmul_site_coopmat<'wsp>(
         scope: &BatchScope<'wsp, WgpuBackend>,
@@ -2425,6 +2502,7 @@ impl Block {
         b_weight: BatchBuf<'wsp>,
         out_scratch: BatchBuf<'wsp>,
         dims: BatchBuf<'wsp>,
+        prepared: Option<PreparedWeight>,
         coopmat: Option<&CoopmatStep>,
         matmul_i8: Option<&WgpuPipeline>,
         dequant_i8: Option<&DequantStep>,
@@ -2445,18 +2523,25 @@ impl Block {
             && a.scale.is_none()
             && m >= cm.cfg.wm()
         {
-            // (1) dequant Quant weight -> f16 [N,K] nmajor.
-            let b_f16 = scope.alloc(pipelines.act_bytes(n * k))?;
-            let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
-            scope.dequant(
-                &cm.dequant_f16.pipeline,
-                cm.dequant_f16.scheme,
-                b_weight,
-                b_f16,
-                dq_dims,
-                n,
-                k,
-            )?;
+            // (1) dequant Quant weight -> f16 [N,K] nmajor (or reuse the
+            // caller's per-block prepared image).
+            let b_f16 = match prepared {
+                Some(PreparedWeight::F16(b)) => scope.import_copy(b),
+                _ => {
+                    let b_f16 = scope.alloc(pipelines.act_bytes(n * k))?;
+                    let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+                    scope.dequant(
+                        &cm.dequant_f16.pipeline,
+                        cm.dequant_f16.scheme,
+                        b_weight,
+                        b_f16,
+                        dq_dims,
+                        n,
+                        k,
+                    )?;
+                    b_f16
+                }
+            };
             // (2) cast the bf16 A-side to f16.
             let a_f16 = scope.alloc(pipelines.act_bytes(m * k))?;
             let to_f16 = pipelines
@@ -2475,7 +2560,7 @@ impl Block {
             scope.dispatch_op::<F16ToBf16>(to_bf16, &[mm_out], out_scratch)?;
             return Ok(());
         }
-        Self::dispatch_matmul_site(
+        Self::dispatch_matmul_site_diag(
             scope,
             pipelines,
             a,
@@ -2490,6 +2575,14 @@ impl Block {
             m,
             n,
             k,
+            prepared,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -2532,6 +2625,7 @@ impl Block {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -2551,6 +2645,7 @@ impl Block {
         m: u32,
         n: u32,
         k: u32,
+        prepared: Option<PreparedWeight>,
         diag_a_i8_head: Option<BufRef>,
         diag_a_params_head: Option<BufRef>,
         diag_b_i8_head: Option<BufRef>,
@@ -2563,25 +2658,25 @@ impl Block {
         if let (Some(mm_i8), Some(dq_i8), Some(aq)) =
             (matmul_i8, dequant_i8, pipelines.act_quant.as_ref())
         {
-            // Dequant the quant weight into (i8, scale, qsum). `qsum[n, t] =
-            // Σ_{k in block} qb[n, k]` carries the asymmetric correction-term
-            // factor consumed by matmul_i8 to subtract the activation zero-
-            // point bias from the DP4A main path.
-            let b_i8 = scope.alloc(n as u64 * k as u64)?;
-            let b_sc = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
-            let b_qs = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
-            let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
-            scope.dequant_i8(
-                &dq_i8.pipeline,
-                dq_i8.scheme,
-                b_weight,
-                b_i8,
-                b_sc,
-                b_qs,
-                dq_dims,
-                n,
-                k,
-            )?;
+            // Dequant the quant weight into (i8, scale, qsum) - or reuse the
+            // caller's per-block prepared triple. `qsum[n, t] = Σ_{k in block}
+            // qb[n, k]` carries the asymmetric correction-term factor consumed
+            // by matmul_i8 to subtract the activation zero-point bias from the
+            // DP4A main path.
+            let (b_i8, b_sc, b_qs) = match prepared {
+                Some(PreparedWeight::I8 { i8, scale, qsum }) => (
+                    scope.import_copy(i8),
+                    scope.import_copy(scale),
+                    scope.import_copy(qsum),
+                ),
+                _ => {
+                    let b_i8 = scope.alloc(n as u64 * k as u64)?;
+                    let b_sc = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
+                    let b_qs = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
+                    Self::prepare_weight_i8(scope, dq_i8, b_weight, b_i8, b_sc, b_qs, n, k)?;
+                    (b_i8, b_sc, b_qs)
+                }
+            };
             if let Some(dst) = diag_b_i8_head {
                 let dst_b = scope.import_copy(dst);
                 let n = dst.len.min(b_i8.len());
@@ -2740,14 +2835,16 @@ impl Block {
             a.scale.is_none(),
             "paired A-side requires the DP4A or mixed-bf16 matmul path; dispatch_matmul_site fell through"
         );
-        let b_dense = match dequant_dense {
-            Some(dq) => {
+        let b_dense = match (prepared, dequant_dense) {
+            // Per-block prepared f16 image (same [N,K] n-major f16 bytes the
+            // inline dequant would produce).
+            (Some(PreparedWeight::F16(b)), _) => scope.import_copy(b),
+            (_, Some(dq)) => {
                 let dense = scope.alloc(n as u64 * k as u64 * 2)?;
-                let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
-                scope.dequant(&dq.pipeline, dq.scheme, b_weight, dense, dq_dims, n, k)?;
+                Self::prepare_weight_f16(scope, dq, b_weight, dense, n, k)?;
                 dense
             }
-            None => b_weight,
+            (_, None) => b_weight,
         };
         scope.matmul(
             matmul_pipeline,
@@ -2780,6 +2877,17 @@ impl Block {
         let pre = scope.alloc(full_bytes)?;
         let dims_g = scope.u32x4_uniform(b, four_dim, ad, 0)?;
         let aw = scope.import_copy(w.weight);
+        // Quant adaln weight: dequant once into the dense N-major workspace the
+        // adaln matmul was compiled against (b_nmajor; see BlockMatmuls::for_cfgs).
+        // Never feed the quant stream to the dense pipeline directly.
+        let aw = match pipelines.dequant_adaln.as_ref() {
+            Some(dq) => {
+                let dense = scope.alloc(four_dim as u64 * ad as u64 * 2)?;
+                Self::prepare_weight_f16(scope, dq, aw, dense, four_dim, ad)?;
+                dense
+            }
+            None => aw,
+        };
         scope.matmul(
             &pipelines.matmul_adaln,
             &pipelines.matmuls.adaln,

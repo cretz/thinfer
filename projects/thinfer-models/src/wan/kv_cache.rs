@@ -189,8 +189,11 @@ impl Seg {
 #[derive(Clone, Debug)]
 pub struct ChunkPlan {
     /// Committed (host) token segments the chunk attends to, in order, EXCLUDING
-    /// the current chunk. Upload these to GPU once per chunk; concat the freshly
-    /// computed chunk K/V (the tail) after them.
+    /// the current chunk. Uploaded per layer per forward straight into the GPU
+    /// window buffers (holding all layers' windows resident across a chunk's
+    /// forwards would need `2 * num_layers * prefix_bytes` VRAM, over the whole
+    /// card at release geometry); the freshly computed chunk K/V (the tail)
+    /// concatenates after them.
     pub prefix: Vec<Seg>,
     /// Tail slot for this chunk's K/V in the committed buffer
     /// (`[local_start_index, local_end_index)`). [`KvWindowCache::commit_chunk`]

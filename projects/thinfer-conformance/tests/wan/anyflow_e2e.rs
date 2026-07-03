@@ -181,8 +181,11 @@ async fn anyflow_e2e() {
     // full attention); combine with `THINFER_WAN_WINDOW_FROM_STEP` for the
     // hybrid step-windowing eyeball.
     let attn_window = Some(env_u32("THINFER_E2E_ATTN_WINDOW", 0)).filter(|w| *w > 0);
+    // Prompt override for quality eyeballs (drift-prone / multi-subject
+    // probes); the default PROMPT stays the parity baseline.
+    let prompt = std::env::var("THINFER_E2E_PROMPT").unwrap_or_else(|_| PROMPT.to_string());
     let params = GenerationParams {
-        prompt: PROMPT.to_string(),
+        prompt,
         height: height as u32,
         width: width as u32,
         num_frames,

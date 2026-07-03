@@ -45,15 +45,42 @@ use crate::wan::dit_block::{
     WanDitBlock, WanDitBlockBufs, WanDitBlockHandles, WanDitBlockShape, WanDitBlockTaps,
     WanDitConfig, WanDitPipelines, WanMod, config,
 };
-use crate::wan::kv_cache::{ChunkPlan, KvStore, Seg};
+use crate::wan::kv_cache::{ChunkPlan, KvStore};
 
 /// Per-layer clean-pass K/V commit sinks for [`WanDit::forward_ar`]: when `Some`,
 /// the chunk's roped-k (`.0`) and v (`.1`) bytes are read back per layer (one
 /// `Vec<u8>` per DiT layer) so the cache tail can be committed. `None` on the 4
 /// denoise steps (read-only window).
 type ChunkKvCommit<'a> = Option<(&'a mut Vec<Vec<u8>>, &'a mut Vec<Vec<u8>>)>;
+
 use crate::wan::patchify::{self, PatchGrid};
 use crate::wan::rope3d::WanRope3d;
+
+/// Per-request host cache of each block's cross-attention text K/V:
+/// `(norm_k(to_k(text) + b_k), to_v(text) + b_v)` raw act bytes, one pair
+/// per DiT layer, each `[text_seq, inner]`. The umT5 text states are constant
+/// for the whole request, so the first forward that runs a layer computes the
+/// pair in-scope (the block's weights are already resident) and reads it back;
+/// every later forward replays the exact bytes, skipping the two `[text_seq,
+/// dim] @ [inner, dim]T` projections + k-norm per layer. The byte round-trip
+/// keeps the SDPA inputs bit-identical. Used by [`WanDit::forward_ar`] (one
+/// cache per unique prompt) and by the tiled denoise step loop via
+/// [`WanDit::forward_cached`] (one cache per DiT weight set - the K/V depend
+/// on the block weights, so MoE experts must not share one). Sizing:
+/// `num_layers * 2 * text_seq * inner * act_bytes` host RAM (~189 MB at 30
+/// layers, 512 x 3072 f16; ~420 MB at 40 layers, 512 x 5120); dropped with
+/// the request.
+pub struct WanCrossKvCache {
+    layers: Vec<Option<(Vec<u8>, Vec<u8>)>>,
+}
+
+impl WanCrossKvCache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: vec![None; num_layers],
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Residency handles (file -> handles loader is the step-5 glue)
@@ -225,6 +252,34 @@ impl WanDit {
             scratch,
             inputs,
             WanDitTaps::default(),
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::forward`], threading the per-request cross-attention K/V
+    /// cache through the tiled block loop: the first forward fills it, every
+    /// later forward replays the request-constant bytes (bit-identical; see
+    /// [`WanCrossKvCache`]). Pass one cache per DiT weight set for the whole
+    /// step loop. The untiled tier ignores it (single-scope path unchanged).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_cached<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipelines: &WanDitPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        inputs: &WanDitInputs<'_>,
+        cross_kv: &mut WanCrossKvCache,
+    ) -> Result<WanDitOutput, WanDitError<S::Error>> {
+        self.forward_with_taps(
+            backend,
+            pipelines,
+            residency,
+            scratch,
+            inputs,
+            WanDitTaps::default(),
+            Some(cross_kv),
         )
         .await
     }
@@ -238,6 +293,7 @@ impl WanDit {
         scratch: &Workspace<WgpuBackend>,
         inputs: &WanDitInputs<'_>,
         mut taps: WanDitTaps<'_>,
+        mut cross_kv: Option<&mut WanCrossKvCache>,
     ) -> Result<WanDitOutput, WanDitError<S::Error>> {
         let bp = &pipelines.block;
         let s = self.shape;
@@ -359,7 +415,12 @@ impl WanDit {
             rows.div_ceil(dit_tile_rows()).max(1)
         };
         let tile = if n_tiles > 1 {
-            Some(TileBufs::alloc(scratch, bp, rows, text_seq, inner)?)
+            let tb = TileBufs::alloc(scratch, bp, rows, text_seq, inner)?;
+            // Per-block prepared site weights (dequant once per block; every
+            // tile reuses them). Shapes are block-invariant, so the buffers
+            // are allocated once here and refilled inside the block loop.
+            let ptw = super::dit_block::PreparedTileWeights::alloc(scratch, bp, &self.block.shape)?;
+            Some((tb, ptw))
         } else {
             None
         };
@@ -423,13 +484,15 @@ impl WanDit {
                         None => Ok(()),
                     }
                 };
-                if let Some(tb) = tile.as_ref() {
+                if let Some((tb, ptw)) = tile.as_ref() {
                     // Tiled path owns its own (serial) submits; overlap weight
                     // streaming for the next block(s) with the whole movement.
                     let block_bufs = views.bufs();
                     let sst = views.scale_shift_table();
+                    let ckv_slot = cross_kv.as_deref_mut().map(|c| &mut c.layers[idx]);
                     let compute = self
                         .forward_block_tiled(
+                            backend,
                             pipelines,
                             scratch,
                             &block_bufs,
@@ -440,8 +503,10 @@ impl WanDit {
                             x_cur.as_act_ref(),
                             nxt.as_act_ref(),
                             tb,
+                            ptw,
                             n_tiles,
                             inputs.attn_window.unwrap_or(0),
+                            ckv_slot,
                         )
                         .instrument(tracing::debug_span!(target: PHASE, "wan.tiled", idx));
                     let (c_res, n_res, p_res) =
@@ -587,6 +652,10 @@ impl WanDit {
     /// `commit` is `Some`, the chunk's roped-k / v are read back per layer into it
     /// (the clean recache pass writes these to the cache tail).
     ///
+    /// `cross_kv` caches the per-layer cross-attention text K/V across this
+    /// request's forwards (see [`WanCrossKvCache`]); pass the same cache for
+    /// every forward that shares the prompt.
+    ///
     /// `self.shape` must be the per-CHUNK shape (`n_tok == chunk frames * pph *
     /// ppw`). Serial block residency (acquire -> compute -> next); the AR perf
     /// path (prefetch overlap / activation tiling) is a follow-up, the e2e gate
@@ -601,6 +670,7 @@ impl WanDit {
         inputs: &WanDitInputs<'_>,
         store: &dyn KvStore,
         plan: &ChunkPlan,
+        cross_kv: &mut WanCrossKvCache,
         mut commit: ChunkKvCommit<'_>,
         mut block_res_diag: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<WanDitOutput, WanDitError<S::Error>> {
@@ -692,20 +762,42 @@ impl WanDit {
                 .await?;
             let block_bufs = views.bufs();
 
-            // Gather + upload this layer's committed window prefix (K already
-            // roped, V raw). Empty for the first chunk.
-            let prefix_k = scratch.alloc(bp.act_bytes(prefix_rows * inner).max(16))?;
-            let prefix_v = scratch.alloc(bp.act_bytes(prefix_rows * inner).max(16))?;
-            if prefix_rows > 0 {
-                let kg = gather_segs(store.k(idx), &plan.prefix, token_bytes);
-                let vg = gather_segs(store.v(idx), &plan.prefix, token_bytes);
-                backend.write_buffer(prefix_k.id, 0, &kg)?;
-                backend.write_buffer(prefix_v.id, 0, &vg)?;
-            }
-
             let nxt = ResStream::alloc(scratch, bp, rows, inner)?;
             let window_k = scratch.alloc(bp.act_bytes(window_rows * inner))?;
             let window_v = scratch.alloc(bp.act_bytes(window_rows * inner))?;
+            // Upload this layer's committed window prefix (K already roped, V
+            // raw) straight into the window buffers, one write per committed
+            // segment (no host gather, no GPU staging copy); the chunk's fresh
+            // K/V land after it in-scope. Empty for the first chunk.
+            let mut dst = 0u64;
+            for seg in &plan.prefix {
+                backend.write_buffer(
+                    window_k.id,
+                    dst,
+                    &store.k(idx)[seg.byte_range(token_bytes)],
+                )?;
+                backend.write_buffer(
+                    window_v.id,
+                    dst,
+                    &store.v(idx)[seg.byte_range(token_bytes)],
+                )?;
+                dst += (seg.len * token_bytes) as u64;
+            }
+
+            // Cross-attention text K/V: replay the request-constant bytes when
+            // cached, else compute in-scope and read back after the submit.
+            let ckv_bytes = bp.act_bytes(text_seq * inner);
+            let cross_k = scratch.alloc(ckv_bytes)?;
+            let cross_v = scratch.alloc(ckv_bytes)?;
+            let ckv_cached = match &cross_kv.layers[idx] {
+                Some((kb, vb)) => {
+                    backend.write_buffer(cross_k.id, 0, kb)?;
+                    backend.write_buffer(cross_v.id, 0, vb)?;
+                    true
+                }
+                None => false,
+            };
+
             let roped_k = scratch.alloc(bp.act_bytes(rows * inner))?;
             let v_out = scratch.alloc(bp.act_bytes(rows * inner))?;
             {
@@ -713,14 +805,25 @@ impl WanDit {
                 let tproj_h = scope.import_copy(tproj.as_buf_ref());
                 let m = self.build_mod(&scope, bp, views.scale_shift_table(), tproj_h, inner)?;
                 let x1 = scratch.alloc(bp.act_bytes(rows * inner))?;
+                let cross_k_h = scope.import_copy(cross_k.as_buf_ref());
+                let cross_v_h = scope.import_copy(cross_v.as_buf_ref());
+                if !ckv_cached {
+                    self.block.cross_kv(
+                        &scope,
+                        pipelines,
+                        scope.import_copy(text.as_act_ref()),
+                        &block_bufs.cross_attn,
+                        cross_k_h,
+                        cross_v_h,
+                        text_seq,
+                    )?;
+                }
                 self.block.self_attn_ar(
                     &scope,
                     pipelines,
                     scope.import_copy(x_cur.as_act_ref()),
                     scope.import_copy(freqs.as_buf_ref()),
                     &m,
-                    scope.import_copy(prefix_k.as_buf_ref()),
-                    scope.import_copy(prefix_v.as_buf_ref()),
                     prefix_rows,
                     scope.import_copy(window_k.as_buf_ref()),
                     scope.import_copy(window_v.as_buf_ref()),
@@ -742,8 +845,15 @@ impl WanDit {
                     &WanDitBlockTaps::default(),
                     rows,
                     text_seq,
+                    Some((cross_k_h, cross_v_h)),
                 )?;
                 scope.submit_void().await?;
+            }
+            if !ckv_cached {
+                cross_kv.layers[idx] = Some((
+                    backend.read_buffer(cross_k.id, 0, ckv_bytes).await?,
+                    backend.read_buffer(cross_v.id, 0, ckv_bytes).await?,
+                ));
             }
             // Clean-pass commit: read back the chunk's roped-k / v for this layer.
             if let Some((k_sink, v_sink)) = commit.as_mut() {
@@ -818,9 +928,15 @@ impl WanDit {
     /// its own so the pool recycles tile transients between submits; the only
     /// resolution-growing residents are `qx`/`kx`/`v`/`sa` (the cost of an
     /// exact global attention). Numerically identical to [`WanDitBlock::forward`].
+    ///
+    /// `ckv_slot` is this block's [`WanCrossKvCache`] entry: a hit replays the
+    /// cached ck/cv bytes (skipping the two text projections + k-norm), a miss
+    /// computes them and reads the bytes back after the drain. `None` disables
+    /// caching (single-forward diag paths).
     #[allow(clippy::too_many_arguments)]
     async fn forward_block_tiled(
         &self,
+        backend: &WgpuBackend,
         pipelines: &WanDitPipelines,
         scratch: &Workspace<WgpuBackend>,
         bufs: &WanDitBlockBufs,
@@ -831,8 +947,10 @@ impl WanDit {
         x_in: BufRef,
         y_out: BufRef,
         tb: &TileBufs,
+        ptw: &super::dit_block::PreparedTileWeights,
         n_tiles: u32,
         window: u32,
+        ckv_slot: Option<&mut Option<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<(), WgpuError> {
         let bp = &pipelines.block;
         let inner = self.cfg.inner() as u32;
@@ -845,28 +963,45 @@ impl WanDit {
         let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG);
         let t0 = diag.then(trace::Instant::now);
 
-        // Modulation vectors for this block, persisted across the tile scopes.
-        self.fill_mod(bp, scratch, sst, tproj, inner, &tb.m).await?;
-        let t_mod = t0.as_ref().map(|t| t.elapsed().as_secs_f64() * 1e3);
-
-        // Cross-attention K/V projected once (shared by every query tile).
-        {
-            let scope = scratch.batch();
-            let text_h = scope.import_copy(text);
-            let ck = scope.import_copy(tb.ck.as_buf_ref());
-            let cv = scope.import_copy(tb.cv.as_buf_ref());
-            self.block.cross_kv(
-                &scope,
-                pipelines,
-                text_h,
-                &bufs.cross_attn,
-                ck,
-                cv,
-                text_seq,
-            )?;
-            scope.submit_void().await?;
+        // Setup - one scope, submitted WITHOUT a CPU await: the six modulation
+        // vectors, the cross-attn K/V (replayed from the cache when hit), and
+        // this block's site weights dequanted into the persistent prepared
+        // buffers (all shared by every tile in passes A and B). Queue order
+        // already sequences these writes after the previous block's tile reads
+        // and before this block's, so the two hard submit-await syncs the
+        // setup used to pay per block (each serialized behind the prior
+        // block's pass-B drain) are gone; the fence seeds the pass-A pipeline.
+        let ckv_replay = matches!(ckv_slot.as_deref(), Some(Some(_)));
+        if let Some(Some((kb, vb))) = ckv_slot.as_deref() {
+            // Byte replay of the request-constant text K/V (bit-identical to
+            // recomputing it). queue.write_buffer lands in queue order: after
+            // the prior block's submitted reads, before this block's.
+            let (ck, cv) = (tb.ck.as_buf_ref(), tb.cv.as_buf_ref());
+            backend.write_buffer(ck.id, ck.offset, kb)?;
+            backend.write_buffer(cv.id, cv.offset, vb)?;
         }
-        let t_ckv = t0.as_ref().map(|t| t.elapsed().as_secs_f64() * 1e3);
+        let setup_fut = {
+            let scope = scratch.batch();
+            self.fill_mod(&scope, bp, sst, tproj, inner, &tb.m)?;
+            if !ckv_replay {
+                let text_h = scope.import_copy(text);
+                let ck = scope.import_copy(tb.ck.as_buf_ref());
+                let cv = scope.import_copy(tb.cv.as_buf_ref());
+                self.block.cross_kv(
+                    &scope,
+                    pipelines,
+                    text_h,
+                    &bufs.cross_attn,
+                    ck,
+                    cv,
+                    text_seq,
+                )?;
+            }
+            self.block
+                .fill_prepared_weights(&scope, pipelines, bufs, ptw)?;
+            scope.submit_deferred()
+        };
+        let t_setup = t0.as_ref().map(|t| t.elapsed().as_secs_f64() * 1e3);
 
         // Pass A: per-tile q/k/v projection + RoPE into the full qx/kx/v.
         // Depth-2 submit pipeline: tile t is submitted before tile t-1's
@@ -876,8 +1011,9 @@ impl WanDit {
         // (32760 rows = 32 tiles, ~67 fences per block) that idle was the
         // dominant per-block cost, bigger than the tile compute itself.
         // Depth 2 keeps at most two tiles' transients out of the pool, which
-        // the DiT workspace reserve accounts for.
-        let mut pending_tile = None;
+        // the DiT workspace reserve accounts for. The setup fence rides the
+        // same pipeline (awaited when tile 0's submit lands).
+        let mut pending_tile = Some(setup_fut);
         let (mut enc_a, mut await_a) = (0.0f64, 0.0f64);
         for t in 0..n_tiles {
             let te = diag.then(trace::Instant::now);
@@ -900,6 +1036,7 @@ impl WanDit {
                 v,
                 tr,
                 &bufs.self_attn,
+                ptw,
             )?;
             let fut = scope.submit_deferred();
             if let Some(t) = te {
@@ -913,16 +1050,11 @@ impl WanDit {
                 await_a += t.elapsed().as_secs_f64() * 1e3;
             }
         }
-        if let Some(last) = pending_tile {
-            let ta = diag.then(trace::Instant::now);
-            last.await?;
-            if let Some(t) = ta {
-                await_a += t.elapsed().as_secs_f64() * 1e3;
-            }
-        }
-
-        // Barrier: global self-attention over the whole sequence.
-        {
+        // Barrier: global self-attention over the whole sequence. Submitted
+        // before the leftover pass-A fence is awaited (queue order already
+        // sequences it after every pass-A tile), so the GPU queue never runs
+        // dry between the passes; its fence seeds the pass-B pipeline.
+        let sdpa_fut = {
             let scope = scratch.batch();
             let qx = scope.import_copy(tb.qx.as_buf_ref());
             let kx = scope.import_copy(tb.kx.as_buf_ref());
@@ -933,13 +1065,20 @@ impl WanDit {
             let period = (self.shape.grid.pph * self.shape.grid.ppw) as u32;
             self.block
                 .self_sdpa(&scope, pipelines, qx, kx, v, sa, rows, period, window)?;
-            scope.submit_void().await?;
+            scope.submit_deferred()
+        };
+        if let Some(last) = pending_tile {
+            let ta = diag.then(trace::Instant::now);
+            last.await?;
+            if let Some(t) = ta {
+                await_a += t.elapsed().as_secs_f64() * 1e3;
+            }
         }
         let t_sdpa = t0.as_ref().map(|t| t.elapsed().as_secs_f64() * 1e3);
 
         // Pass B: per-tile o-proj + gated residual + cross-attn + FFN -> y_out.
-        // Same depth-2 submit pipeline as pass A.
-        let mut pending_tile = None;
+        // Same depth-2 submit pipeline as pass A, seeded with the SDPA fence.
+        let mut pending_tile = Some(sdpa_fut);
         let (mut enc_b, mut await_b) = (0.0f64, 0.0f64);
         for t in 0..n_tiles {
             let te = diag.then(trace::Instant::now);
@@ -952,7 +1091,7 @@ impl WanDit {
             let ck = scope.import_copy(tb.ck.as_buf_ref());
             let cv = scope.import_copy(tb.cv.as_buf_ref());
             self.block.post_attn_tile(
-                &scope, pipelines, x_slice, sa_slice, &m, ck, cv, y_slice, tr, text_seq, bufs,
+                &scope, pipelines, x_slice, sa_slice, &m, ck, cv, y_slice, tr, text_seq, bufs, ptw,
             )?;
             let fut = scope.submit_deferred();
             if let Some(t) = te {
@@ -973,15 +1112,28 @@ impl WanDit {
                 await_b += t.elapsed().as_secs_f64() * 1e3;
             }
         }
-        if let (Some(m), Some(ckv), Some(sdpa), Some(t)) = (t_mod, t_ckv, t_sdpa, t0.as_ref()) {
+        // Cache miss: persist the just-computed ck/cv bytes for the later
+        // steps' replay. All fences are drained, so the readback is clean and
+        // adds no extra sync (first-forward-only cost).
+        if let Some(slot) = ckv_slot
+            && slot.is_none()
+        {
+            let (ck, cv) = (tb.ck.as_buf_ref(), tb.cv.as_buf_ref());
+            let n = bp.act_bytes(text_seq * inner);
+            *slot = Some((
+                backend.read_buffer(ck.id, ck.offset, n).await?,
+                backend.read_buffer(cv.id, cv.offset, n).await?,
+            ));
+        }
+        if let (Some(setup), Some(sdpa), Some(t)) = (t_setup, t_sdpa, t0.as_ref()) {
             let total = t.elapsed().as_secs_f64() * 1e3;
             tracing::debug!(
                 target: "thinfer::diag",
-                mod_ms = m,
-                cross_kv_ms = ckv - m,
+                setup_enc_ms = setup,
+                ckv_replay,
                 pass_a_enc_ms = enc_a,
                 pass_a_await_ms = await_a,
-                sdpa_ms = t_sdpa.unwrap_or(0.0) - ckv - enc_a - await_a,
+                sdpa_ms = sdpa - setup - enc_a - await_a,
                 pass_b_enc_ms = enc_b,
                 pass_b_await_ms = await_b,
                 total_ms = total,
@@ -992,21 +1144,21 @@ impl WanDit {
         Ok(())
     }
 
-    /// Build the six modulation vectors for one block into the persistent
+    /// Encode the six modulation vectors for one block into the persistent
     /// `[inner]` buffers `m` (so the tile scopes can broadcast them). Same
-    /// `scale_shift_table[k] + timestep_proj[k]` sum as [`Self::build_mod`].
-    async fn fill_mod(
+    /// `scale_shift_table[k] + timestep_proj[k]` sum as [`Self::build_mod`];
+    /// dispatched into the caller's (setup) scope.
+    fn fill_mod(
         &self,
+        scope: &BatchScope<'_, WgpuBackend>,
         bp: &BlockPipelines,
-        scratch: &Workspace<WgpuBackend>,
         sst: BufRef,
         tproj: BufRef,
         inner: u32,
         m: &[WsBuf<WgpuBackend>; 6],
     ) -> Result<(), WgpuError> {
-        let scope = scratch.batch();
         let tproj_h = scope.import_copy(tproj);
-        let built = self.build_mod(&scope, bp, sst, tproj_h, inner)?;
+        let built = self.build_mod(scope, bp, sst, tproj_h, inner)?;
         let srcs = [
             built.shift_msa,
             built.scale_msa,
@@ -1020,7 +1172,7 @@ impl WanDit {
             let dst = scope.import_copy(m[i].as_buf_ref());
             scope.copy_buffer_to_buffer(src, 0, dst, 0, row_b)?;
         }
-        scope.submit_void().await
+        Ok(())
     }
 
     /// Build the six modulation vectors `scale_shift_table[k] +
@@ -1266,18 +1418,6 @@ fn mk_mod<'wsp>(
 // ---------------------------------------------------------------------------
 // Readback helpers
 // ---------------------------------------------------------------------------
-
-/// Gather non-contiguous committed window segments from a per-layer host K/V
-/// buffer into one contiguous `prefix_tokens * token_bytes` byte run (the order
-/// the GPU window expects). `token_bytes` is one token's K (or V) row width.
-fn gather_segs(buf: &[u8], segs: &[Seg], token_bytes: usize) -> Vec<u8> {
-    let total: usize = segs.iter().map(|s| s.len).sum();
-    let mut out = Vec::with_capacity(total * token_bytes);
-    for seg in segs {
-        out.extend_from_slice(&buf[seg.byte_range(token_bytes)]);
-    }
-    out
-}
 
 /// Read a GPU buffer of `n` activation elements into `sink` as f32.
 pub(crate) async fn read_into_f32(

@@ -1431,6 +1431,21 @@ const VAE_SUBMIT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 // with unit weights -> bit-identical to the untiled path. Sizes are in LATENT
 // pixels (output is 8x).
 
+/// Floor: an 8-latent (64px) decode tile fits any usable device. Shared by the
+/// tile sizer and the decode OOM-retry (a tile already at the floor cannot
+/// shrink further, so the error propagates).
+const VAE_DEC_TILE_MIN: u32 = 8;
+/// Fraction of the workspace budget the INITIAL decode tile is sized to (LTX
+/// precedent): the peak model tracks the measured points closely but does not
+/// model pool size-class fragmentation / staging exactly, so seeding AT the
+/// budget edge OOMs on the first native-res tile (measured: 832x480x81f under
+/// a 6 GiB budget picked tile 26 whose real peak overran by ~5%). The margin
+/// lands the common case on the first try; the strict-budget re-seed corrects
+/// any remaining error without a device OOM.
+const VAE_SEED_SAFETY: f64 = 0.82;
+/// Budget step-down per OOM re-seed (balanced shrink, not an axis halve).
+const VAE_OOM_SHRINK: f64 = 0.7;
+
 /// Largest square latent tile (and its overlap) whose decode working set fits
 /// `workspace_budget` (the VRAM budget already net of the resident VAE weights
 /// and staging; see the decode call site). The live set has two parts, both
@@ -1444,12 +1459,22 @@ const VAE_SUBMIT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 /// `area`-scaling shrinks with the tile; `FIXED` (the temporal buffers carried
 /// across the up_blocks) does NOT -- it is a floor tiling cannot pass, so
 /// there is a min budget below which even `TILE_MIN` will not fit. Calibrated
-/// from four measured f16 points (tile 11 & 22 at tout 1 & 4): tout=1 has ~no
-/// fixed term and ~2.4 MiB/area; tout=4 adds ~553 MiB fixed and ~6.0 MiB/area.
-/// The old area-only model (one constant) undercounted small tiles and the
-/// tout=4 groups, overrunning a thin budget at 540P+. Recalibrate these if the
-/// decoder graph changes.
-fn vae_tile_dims(workspace_budget: u64, act_size: u64, max_tout: u32) -> (u32, u32) {
+/// from four measured f16 points on the FastWan2.2-TI2V-5B decoder
+/// (`decoder_base_dim` 256; tile 11 & 22 at tout 1 & 4): tout=1 has ~no fixed
+/// term and ~2.4 MiB/area; tout=4 adds ~553 MiB fixed and ~6.0 MiB/area. Every
+/// term of the live set (activations, feat_cache, DupUp saves) is linear in
+/// the per-stage channel counts, which are all `decoder_base_dim * mult` with
+/// the same mult vector across variants, so other configs scale the calibrated
+/// bytes by `decoder_base_dim / 256` (Wan2.1 at base 96 -> 0.375x, matching an
+/// analytic walk of its stage shapes). The old area-only model (one constant)
+/// undercounted small tiles and the tout=4 groups, overrunning a thin budget
+/// at 540P+. Recalibrate these if the decoder graph changes.
+fn vae_tile_dims(
+    workspace_budget: u64,
+    act_size: u64,
+    max_tout: u32,
+    cfg: &WanVaeConfig,
+) -> (u32, u32) {
     /// Fixed (tile-independent) workspace bytes at f16 per output frame beyond
     /// the first: the temporal buffers the up_blocks carry across frames.
     const FIXED_PER_EXTRA_T_F16: u64 = 193_000_000;
@@ -1457,15 +1482,20 @@ fn vae_tile_dims(workspace_budget: u64, act_size: u64, max_tout: u32) -> (u32, u
     const AREA_BASE_F16: u64 = 1_260_000;
     /// Additional workspace bytes per latent-px^2 at f16, per output frame.
     const AREA_PER_T_F16: u64 = 1_270_000;
+    /// `decoder_base_dim` the constants were measured on (FastWan2.2-TI2V-5B).
+    const CAL_BASE_DIM: u64 = 256;
     /// Upper cap so a huge budget doesn't pick a TDR-prone megatile.
     const TILE_MAX: u32 = 96;
-    /// Floor: an 8-latent (64px) tile fits any usable device.
-    const TILE_MIN: u32 = 8;
 
-    let fixed = FIXED_PER_EXTRA_T_F16 * u64::from(max_tout.saturating_sub(1)) * act_size / 2;
-    let per_area = ((AREA_BASE_F16 + AREA_PER_T_F16 * u64::from(max_tout)) * act_size / 2).max(1);
+    // Channel scale vs the calibration decoder (see doc comment).
+    let base = cfg.decoder_base_dim as u64;
+    let fixed = FIXED_PER_EXTRA_T_F16 * u64::from(max_tout.saturating_sub(1)) * act_size / 2 * base
+        / CAL_BASE_DIM;
+    let per_area = ((AREA_BASE_F16 + AREA_PER_T_F16 * u64::from(max_tout)) * act_size / 2 * base
+        / CAL_BASE_DIM)
+        .max(1);
     let area = workspace_budget.saturating_sub(fixed) / per_area;
-    let tile = ((area as f64).sqrt() as u32).clamp(TILE_MIN, TILE_MAX);
+    let tile = ((area as f64).sqrt() as u32).clamp(VAE_DEC_TILE_MIN, TILE_MAX);
     // Overlap ~1/4 of the tile (>=4 latent / 32px) for a smooth feather seam.
     let overlap = (tile / 4).max(4);
     (tile, overlap)
@@ -3119,79 +3149,134 @@ impl WanVaeDecoder {
         };
         let reserve = self.weight_footprint + VAE_STAGING_RESERVE;
         let workspace_budget = eff_budget.saturating_sub(reserve);
-        let (tile, overlap) = vae_tile_dims(workspace_budget, self.pipelines.act_size, max_tout);
+        // Seed the tile below the workspace budget (VAE_SEED_SAFETY) and step
+        // it down on OOM (LTX precedent): the peak model does not capture pool
+        // fragmentation exactly, so the margin lands the common case on the
+        // first try and the strict-budget retry converges any residual error
+        // WITHOUT a device OOM.
+        let mut seed_budget = (workspace_budget as f64 * VAE_SEED_SAFETY) as u64;
+        let (mut tile, mut overlap) =
+            vae_tile_dims(seed_budget, self.pipelines.act_size, max_tout, cfg);
         // Hold everything-but-weights free so the arbiter caps weight residency
         // at the footprint (all VAE weights stay resident, no per-tile
         // re-streaming) while the tile workspace + staging cannot push the true
         // peak past the budget. The DiT step loop uses the same mechanism.
         if budget != u64::MAX {
             residency.set_transient_reserve(eff_budget.saturating_sub(self.weight_footprint));
+            // Hard ceiling: an over-budget tile alloc fails AT the budget with
+            // `BudgetExceeded` (retryable, device untouched) instead of
+            // overshooting into a real device OOM.
+            workspace.set_strict_budget(true);
         }
 
-        // Overlapping latent tiles per axis; a single full tile at parity res.
-        let tiles_h = plan_tiles(h_in as u32, tile, overlap);
-        let tiles_w = plan_tiles(w_in as u32, tile, overlap);
-        if std::env::var_os("THINFER_VAE_MEM").is_some() {
-            eprintln!(
-                "[vae_mem] budget={}MiB weights={}MiB reserve={}MiB ws_budget={}MiB act_size={} tile={} overlap={} grid={}x{} (h_in={} w_in={} f={})",
-                budget / (1024 * 1024),
-                self.weight_footprint / (1024 * 1024),
-                reserve / (1024 * 1024),
-                workspace_budget / (1024 * 1024),
-                self.pipelines.act_size,
-                tile,
-                overlap,
-                tiles_h.len(),
-                tiles_w.len(),
-                h_in,
-                w_in,
-                f,
-            );
-        }
-        let single = tiles_h.len() == 1 && tiles_w.len() == 1;
-        for &(r0, hext) in &tiles_h {
-            let weights_h = feather_1d(
-                hext,
-                overlap,
-                spat as u32,
-                r0 > 0,
-                (r0 + hext) < h_in as u32,
-            );
-            for &(c0, wext) in &tiles_w {
-                let weights_w = feather_1d(
-                    wext,
+        'attempt: loop {
+            // Overlapping latent tiles per axis; a single full tile at parity
+            // res (bit-identical to the untiled path).
+            let tiles_h = plan_tiles(h_in as u32, tile, overlap);
+            let tiles_w = plan_tiles(w_in as u32, tile, overlap);
+            if std::env::var_os("THINFER_VAE_MEM").is_some() {
+                eprintln!(
+                    "[vae_mem] budget={}MiB weights={}MiB reserve={}MiB ws_budget={}MiB seed={}MiB act_size={} tile={} overlap={} grid={}x{} (h_in={} w_in={} f={})",
+                    budget / (1024 * 1024),
+                    self.weight_footprint / (1024 * 1024),
+                    reserve / (1024 * 1024),
+                    workspace_budget / (1024 * 1024),
+                    seed_budget / (1024 * 1024),
+                    self.pipelines.act_size,
+                    tile,
                     overlap,
-                    spat as u32,
-                    c0 > 0,
-                    (c0 + wext) < w_in as u32,
-                );
-                // Taps (parity bisection) only apply to the single full tile.
-                let tile_taps = if single { taps.as_deref_mut() } else { None };
-                decode_tile::<S>(
-                    backend,
-                    workspace,
-                    &self.pipelines,
-                    cfg,
-                    &bufs,
-                    latents,
-                    f,
+                    tiles_h.len(),
+                    tiles_w.len(),
                     h_in,
                     w_in,
-                    (r0, c0, hext, wext),
-                    &weights_h,
-                    &weights_w,
-                    t_total,
-                    &mut video,
-                    &mut wsum,
-                    tile_taps,
-                )
-                .await?;
-                // Return this tile's idle buffers to the pool before the next
-                // tile grows it, so the live set stays bounded to one tile.
-                if !single {
-                    workspace.drain_pool();
+                    f,
+                );
+            }
+            let single = tiles_h.len() == 1 && tiles_w.len() == 1;
+            for &(r0, hext) in &tiles_h {
+                let weights_h = feather_1d(
+                    hext,
+                    overlap,
+                    spat as u32,
+                    r0 > 0,
+                    (r0 + hext) < h_in as u32,
+                );
+                for &(c0, wext) in &tiles_w {
+                    let weights_w = feather_1d(
+                        wext,
+                        overlap,
+                        spat as u32,
+                        c0 > 0,
+                        (c0 + wext) < w_in as u32,
+                    );
+                    // Taps (parity bisection) only apply to the single full tile.
+                    let tile_taps = if single { taps.as_deref_mut() } else { None };
+                    match decode_tile::<S>(
+                        backend,
+                        workspace,
+                        &self.pipelines,
+                        cfg,
+                        &bufs,
+                        latents,
+                        f,
+                        h_in,
+                        w_in,
+                        (r0, c0, hext, wext),
+                        &weights_h,
+                        &weights_w,
+                        t_total,
+                        &mut video,
+                        &mut wsum,
+                        tile_taps,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(WanVaeDecodeError::Forward(WanVaeError::Wgpu(
+                            WgpuError::Allocate { .. } | WgpuError::BudgetExceeded { .. },
+                        ))) if tile > VAE_DEC_TILE_MIN => {
+                            // Per-tile workspace didn't fit. OOM hits at alloc
+                            // (pre-submit), so the failed tile left nothing
+                            // live -- drain the pool and re-seed from a smaller
+                            // budget, stepping down until the plan strictly
+                            // shrinks. Restart the whole grid: the accumulators
+                            // hold partial feather sums from the old plan.
+                            workspace.drain_pool();
+                            let prev = (tile, overlap);
+                            loop {
+                                seed_budget = ((seed_budget as f64 * VAE_OOM_SHRINK) as u64).max(1);
+                                let (nt, no) = vae_tile_dims(
+                                    seed_budget,
+                                    self.pipelines.act_size,
+                                    max_tout,
+                                    cfg,
+                                );
+                                tile = nt;
+                                overlap = no;
+                                if (tile, overlap) != prev || tile == VAE_DEC_TILE_MIN {
+                                    break;
+                                }
+                            }
+                            tracing::warn!(
+                                target: thinfer_core::trace::DIAG,
+                                from_tile = prev.0, to_tile = tile,
+                                seed_mb = seed_budget / (1024 * 1024),
+                                "wan vae decode OOM; re-seeding smaller",
+                            );
+                            video.fill(0.0);
+                            wsum.fill(0.0);
+                            continue 'attempt;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // Return this tile's idle buffers to the pool before the
+                    // next tile grows it, keeping the live set to one tile.
+                    if !single {
+                        workspace.drain_pool();
+                    }
                 }
             }
+            break;
         }
 
         // Normalize the feather blend (wsum is unit everywhere for a single

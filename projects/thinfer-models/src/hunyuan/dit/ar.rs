@@ -468,27 +468,48 @@ impl HunyuanArDit {
                 {
                     let scope = ws.batch();
                     let sv = scope.import_copy(silu_vec_ws.as_buf_ref());
-                    let tmodp = linear(
-                        &scope,
-                        bp,
-                        sv,
-                        &cur_b.txt_mod,
-                        1,
-                        6 * dim,
-                        dim,
-                        Site::Module,
-                    )?;
+                    let tmodp = linear(&scope, bp, sv, &cur_b.txt_mod, 1, 6 * dim, dim, Site::Mod)?;
                     let tsig = |k| mod_sig(&scope, bp, tmodp, k, dim);
                     let (sh1, sc1, g1) = (tsig(0)?, tsig(1)?, tsig(2)?);
                     let (sh2, sc2, g2) = (tsig(3)?, tsig(4)?, tsig(5)?);
                     let x = scope.import_copy(cur.as_buf_ref());
                     let tm = norm_modulate(&scope, bp, x, sc1, sh1, s, dim)?;
                     let tm_a = qkv_a_side(&scope, bp, tm, s, dim)?;
-                    let tq = linear_a(&scope, bp, tm_a, &cur_b.txt_q, s, dim, dim, Site::QkvSelf)?;
+                    let tq = linear_a(
+                        &scope,
+                        bp,
+                        tm_a,
+                        &cur_b.txt_q,
+                        s,
+                        dim,
+                        dim,
+                        Site::QkvSelf,
+                        None,
+                    )?;
                     let tq = qk_norm_rope(&scope, bp, tq, cur_b.txt_qn, None, s, heads, hd)?;
-                    let tk = linear_a(&scope, bp, tm_a, &cur_b.txt_k, s, dim, dim, Site::QkvSelf)?;
+                    let tk = linear_a(
+                        &scope,
+                        bp,
+                        tm_a,
+                        &cur_b.txt_k,
+                        s,
+                        dim,
+                        dim,
+                        Site::QkvSelf,
+                        None,
+                    )?;
                     let tk = qk_norm_rope(&scope, bp, tk, cur_b.txt_kn, None, s, heads, hd)?;
-                    let tv = linear_a(&scope, bp, tm_a, &cur_b.txt_v, s, dim, dim, Site::QkvSelf)?;
+                    let tv = linear_a(
+                        &scope,
+                        bp,
+                        tm_a,
+                        &cur_b.txt_v,
+                        s,
+                        dim,
+                        dim,
+                        Site::QkvSelf,
+                        None,
+                    )?;
                     k_ws = persist(&scope, ws, tk, (s * dim) as usize, asz)?;
                     v_ws = persist(&scope, ws, tv, (s * dim) as usize, asz)?;
                     let sa = attention(&scope, bp, tq, tk, tv, s, 0, 1, 0, heads, hd)?;
@@ -504,6 +525,8 @@ impl HunyuanArDit {
                         s,
                         dim,
                         mlp_h,
+                        None,
+                        None,
                     )?;
                     let x2 = gate_residual(&scope, bp, x1, g2, tmlp, s, dim)?;
                     let d = scope.import_copy(nxt.as_buf_ref());
@@ -693,16 +716,7 @@ impl HunyuanArDit {
                 {
                     let scope = ws.batch();
                     let sv = scope.import_copy(silu_vec_ws.as_buf_ref());
-                    let imodp = linear(
-                        &scope,
-                        bp,
-                        sv,
-                        &cur_b.img_mod,
-                        1,
-                        6 * dim,
-                        dim,
-                        Site::Module,
-                    )?;
+                    let imodp = linear(&scope, bp, sv, &cur_b.img_mod, 1, 6 * dim, dim, Site::Mod)?;
                     let isig = |k| mod_sig(&scope, bp, imodp, k, dim);
                     let (sh1, sc1, g1) = (isig(0)?, isig(1)?, isig(2)?);
                     let (sh2, sc2, g2) = (isig(3)?, isig(4)?, isig(5)?);
@@ -719,6 +733,7 @@ impl HunyuanArDit {
                         dim,
                         dim,
                         Site::QkvSelf,
+                        None,
                     )?;
                     let iq = qk_norm_rope(&scope, bp, iq, cur_b.img_qn, Some(fq), rows, heads, hd)?;
                     let fq2 = scope.import_copy(freqs_up.as_buf_ref());
@@ -731,6 +746,7 @@ impl HunyuanArDit {
                         dim,
                         dim,
                         Site::QkvSelf,
+                        None,
                     )?;
                     let ik =
                         qk_norm_rope(&scope, bp, ik, cur_b.img_kn, Some(fq2), rows, heads, hd)?;
@@ -743,6 +759,7 @@ impl HunyuanArDit {
                         dim,
                         dim,
                         Site::QkvSelf,
+                        None,
                     )?;
 
                     // kv = [prefix (host-written) ; chunk]: append chunk K/V.
@@ -810,6 +827,8 @@ impl HunyuanArDit {
                         rows,
                         dim,
                         mlp_h,
+                        None,
+                        None,
                     )?;
                     let x2 = gate_residual(&scope, bp, x1, g2, imlp, rows, dim)?;
                     let d = scope.import_copy(nxt.as_buf_ref());

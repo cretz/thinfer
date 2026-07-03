@@ -42,11 +42,12 @@ use thinfer_core::ops::{
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::weight::WeightSource;
-use thinfer_core::workspace::{BatchBuf, BatchScope};
+use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace, WsBuf};
 
 use crate::common::block::{
-    ActBuf, Block, BlockPipelines, alloc_act, alloc_matmul_out_buf, copy_tap, op_add, op_rmsnorm,
-    op_sdpa, op_sdpa_f16, op_sdpa_f16_win, quant_for_sdpa,
+    ActBuf, Block, BlockPipelines, DequantStep, PreparedWeight, alloc_act, alloc_matmul_out_buf,
+    copy_tap, op_add, op_rmsnorm, op_sdpa, op_sdpa_f16, op_sdpa_f16_win, quant_for_sdpa,
+    quantize_act_paired,
 };
 
 /// Query rows per FFN chunk. The FFN is position-wise, so it is processed in
@@ -582,16 +583,17 @@ fn lin<'wsp>(
     rows: u32,
     n: u32,
     k: u32,
+    prepared: Option<PreparedWeight>,
     coopmat: Option<&crate::common::block::CoopmatStep>,
     i8: Option<&WgpuPipeline>,
-    dq_i8: Option<&crate::common::block::DequantStep>,
-    dq: Option<&crate::common::block::DequantStep>,
+    dq_i8: Option<&DequantStep>,
+    dq: Option<&DequantStep>,
     pipe: &WgpuPipeline,
     inst: &MatMulF32,
 ) -> Result<(), WgpuError> {
     let dims = scope.u32x4_uniform(rows, n, k, 0)?;
     Block::dispatch_matmul_site_coopmat(
-        scope, bp, input, w, out, dims, coopmat, i8, dq_i8, dq, pipe, inst, rows, n, k,
+        scope, bp, input, w, out, dims, prepared, coopmat, i8, dq_i8, dq, pipe, inst, rows, n, k,
     )
 }
 
@@ -612,6 +614,106 @@ enum QkvSite {
     SelfAttn,
     CrossQ,
     Cross,
+}
+
+/// One DP4A site's persistent dequant triple (see [`PreparedTileWeights`]).
+struct PreparedI8 {
+    i8: WsBuf<WgpuBackend>,
+    scale: WsBuf<WgpuBackend>,
+    qsum: WsBuf<WgpuBackend>,
+}
+
+impl PreparedI8 {
+    fn alloc(scratch: &Workspace<WgpuBackend>, n: u64, k: u64) -> Result<Self, WgpuError> {
+        Ok(Self {
+            i8: scratch.alloc(n * k)?,
+            scale: scratch.alloc(n * (k / 32) * 4)?,
+            qsum: scratch.alloc(n * (k / 32) * 4)?,
+        })
+    }
+
+    fn weight(&self) -> PreparedWeight {
+        PreparedWeight::I8 {
+            i8: self.i8.as_buf_ref(),
+            scale: self.scale.as_buf_ref(),
+            qsum: self.qsum.as_buf_ref(),
+        }
+    }
+}
+
+/// Per-block prepared matmul-site weights for the tiled path. Allocated once
+/// per forward (site shapes are constant across blocks), re-dequanted once per
+/// block by [`WanDitBlock::fill_prepared_weights`], and consumed by every
+/// activation tile - without this the site dispatch re-runs the identical
+/// weight dequant per tile (~32x redundant at video dims), and the depth-2
+/// tile pipeline holds TWO tiles' weight scratch in flight, so the hoist also
+/// lowers the peak transient footprint. Sites whose pipelines take the raw
+/// weight directly (dense bf16) stay `None` and keep the inline path.
+pub(crate) struct PreparedTileWeights {
+    /// DP4A i8 triples: self-attn q/k/v + cross-attn q (all `[inner, dim]`,
+    /// shared qkv_self site) and ffn_up (`[dff, dim]`).
+    q: Option<PreparedI8>,
+    k: Option<PreparedI8>,
+    v: Option<PreparedI8>,
+    cross_q: Option<PreparedI8>,
+    ffn_up: Option<PreparedI8>,
+    /// f16 `[N,K]` n-major images for the coopmat / dense-f16 sites: the
+    /// self/cross attention out-projections (`[inner, inner]`, proj site) and
+    /// ffn_down (`[dim, dff]`).
+    o_self: Option<WsBuf<WgpuBackend>>,
+    o_cross: Option<WsBuf<WgpuBackend>>,
+    ffn_down: Option<WsBuf<WgpuBackend>>,
+}
+
+impl PreparedTileWeights {
+    /// Allocate the persistent buffers for every site the block's compiled
+    /// pipelines will actually prep (mirrors the site-dispatch arm order: a
+    /// DP4A site preps i8, else a coopmat/dense-dequant site preps f16, else
+    /// the raw weight is read directly and nothing is prepped).
+    pub(crate) fn alloc(
+        scratch: &Workspace<WgpuBackend>,
+        bp: &BlockPipelines,
+        shape: &WanDitBlockShape,
+    ) -> Result<Self, WgpuError> {
+        let inner = shape.inner as u64;
+        let dim = shape.dim as u64;
+        let dff = shape.ffn_dim as u64;
+        let i8_site = |mm: &Option<WgpuPipeline>, dq: &Option<DequantStep>| {
+            mm.is_some() && dq.is_some() && bp.act_quant.is_some()
+        };
+        let qkv_i8 = i8_site(&bp.matmul_i8_qkv_self, &bp.dequant_i8_qkv_self);
+        let ffn_up_i8 = i8_site(&bp.matmul_i8_ffn_up, &bp.dequant_i8_ffn_up);
+        // f16 prep only when the site would dequant inline (coopmat step or
+        // dense-fallback dequant) and the i8 arm won't shadow it.
+        let proj_f16 = (bp.coopmat_proj.is_some() || bp.dequant_proj.is_some())
+            && !i8_site(&bp.matmul_i8_proj, &bp.dequant_i8_proj);
+        let ffn_down_f16 = (bp.coopmat_ffn_down.is_some() || bp.dequant_ffn_down.is_some())
+            && !i8_site(&bp.matmul_i8_ffn_down, &bp.dequant_i8_ffn_down);
+        let i8_buf = |on: bool, n: u64, k: u64| -> Result<Option<PreparedI8>, WgpuError> {
+            on.then(|| PreparedI8::alloc(scratch, n, k)).transpose()
+        };
+        let f16_buf = |on: bool, n: u64, k: u64| -> Result<Option<WsBuf<WgpuBackend>>, WgpuError> {
+            on.then(|| scratch.alloc(n * k * 2)).transpose()
+        };
+        Ok(Self {
+            q: i8_buf(qkv_i8, inner, dim)?,
+            k: i8_buf(qkv_i8, inner, dim)?,
+            v: i8_buf(qkv_i8, inner, dim)?,
+            cross_q: i8_buf(qkv_i8, inner, dim)?,
+            ffn_up: i8_buf(ffn_up_i8, dff, dim)?,
+            o_self: f16_buf(proj_f16, inner, inner)?,
+            o_cross: f16_buf(proj_f16, inner, inner)?,
+            ffn_down: f16_buf(ffn_down_f16, dim, dff)?,
+        })
+    }
+
+    fn i8w(slot: &Option<PreparedI8>) -> Option<PreparedWeight> {
+        slot.as_ref().map(PreparedI8::weight)
+    }
+
+    fn f16w(slot: &Option<WsBuf<WgpuBackend>>) -> Option<PreparedWeight> {
+        slot.as_ref().map(|b| PreparedWeight::F16(b.as_buf_ref()))
+    }
 }
 
 pub struct WanDitBlock {
@@ -699,6 +801,7 @@ impl WanDitBlock {
             rows,
             scale,
             QkvSite::SelfAttn,
+            None,
             taps.self_q.as_ref(),
             taps.self_k.as_ref(),
             taps.self_v.as_ref(),
@@ -716,7 +819,7 @@ impl WanDitBlock {
 
         // ============== 2. cross-attention + 3. FFN (shared tail) ==============
         self.cross_ffn(
-            scope, pipelines, x1, text, m, y_out, bufs, taps, rows, trows,
+            scope, pipelines, x1, text, m, y_out, bufs, taps, rows, trows, None,
         )
     }
 
@@ -726,6 +829,8 @@ impl WanDitBlock {
     /// [`Self::forward`] so the AR path ([`Self::self_attn_ar`] + this) reuses the
     /// exact same op sequence (FastWan stays numerically byte-identical: the ops
     /// and their order are verbatim, only the self-attention differs in AR).
+    /// `precomputed_kv` optionally replays a cached [`Self::cross_kv`] output
+    /// (the AR text K/V are request-constant); `None` projects from `text`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cross_ffn<'wsp>(
         &self,
@@ -739,6 +844,7 @@ impl WanDitBlock {
         taps: &WanDitBlockTaps,
         rows: u32,
         trows: u32,
+        precomputed_kv: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>)>,
     ) -> Result<(), WgpuError> {
         let s = &self.shape;
         let bp = &pipelines.block;
@@ -780,6 +886,7 @@ impl WanDitBlock {
             trows,
             scale,
             QkvSite::Cross,
+            precomputed_kv,
             None,
             None,
             None,
@@ -848,6 +955,7 @@ impl WanDitBlock {
                 dff,
                 inner,
                 None,
+                None,
                 bp.matmul_i8_ffn_up.as_ref(),
                 bp.dequant_i8_ffn_up.as_ref(),
                 bp.dequant_ffn_up.as_ref(),
@@ -876,6 +984,7 @@ impl WanDitBlock {
                 rc,
                 dim,
                 dff,
+                None,
                 bp.coopmat_ffn_down.as_ref(),
                 bp.matmul_i8_ffn_down.as_ref(),
                 bp.dequant_i8_ffn_down.as_ref(),
@@ -907,11 +1016,12 @@ impl WanDitBlock {
     /// post-self-attn residual `x1_out` and exports the chunk's roped-k / v
     /// (`roped_k_out` / `v_out`) so the clean pass can commit them to the cache.
     ///
-    /// `prefix_k` / `prefix_v` are the `prefix_rows` committed window tokens
-    /// uploaded from the host store (K already roped, V raw); `window_k` /
-    /// `window_v` are `window_rows = prefix_rows + chunk_rows` scratch buffers the
-    /// driver pre-allocates. When `prefix_rows == 0` (first chunk) the window is
-    /// just the chunk itself.
+    /// `window_k` / `window_v` are `window_rows = prefix_rows + chunk_rows`
+    /// scratch buffers the driver pre-allocates, with the first `prefix_rows`
+    /// token rows ALREADY holding the committed window prefix uploaded from the
+    /// host store (K already roped, V raw); this dispatch appends the chunk's
+    /// freshly computed K/V after them. When `prefix_rows == 0` (first chunk)
+    /// the window is just the chunk itself.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn self_attn_ar<'wsp>(
         &self,
@@ -920,8 +1030,6 @@ impl WanDitBlock {
         x_in: BatchBuf<'wsp>,
         chunk_freqs: BatchBuf<'wsp>,
         m: &WanMod<'wsp>,
-        prefix_k: BatchBuf<'wsp>,
-        prefix_v: BatchBuf<'wsp>,
         prefix_rows: u32,
         window_k: BatchBuf<'wsp>,
         window_v: BatchBuf<'wsp>,
@@ -967,6 +1075,7 @@ impl WanDitBlock {
             chunk_rows,
             inner,
             QkvSite::SelfAttn,
+            None,
         )?;
         let k = self.biased_proj(
             scope,
@@ -977,6 +1086,7 @@ impl WanDitBlock {
             chunk_rows,
             inner,
             QkvSite::SelfAttn,
+            None,
         )?;
         let vv = self.biased_proj(
             scope,
@@ -987,6 +1097,7 @@ impl WanDitBlock {
             chunk_rows,
             inner,
             QkvSite::SelfAttn,
+            None,
         )?;
         let qn = alloc_act(scope, bp, chunk_rows, inner)?;
         let nq = scope.import_copy(w.norm_q);
@@ -1009,15 +1120,13 @@ impl WanDitBlock {
         )?;
         scope.copy_buffer_to_buffer(vv.data, 0, v_out, 0, bp.act_bytes(chunk_rows * inner))?;
 
-        // Assemble the attended window K/V = [prefix ++ this chunk]. With no
-        // prefix (first chunk) window == chunk, so the SDPA is bidirectional over
-        // the chunk (matches the upstream block-causal mask within one chunk).
+        // Complete the attended window K/V = [prefix ++ this chunk]: the prefix
+        // rows were uploaded into the window buffers by the driver, append the
+        // chunk after them. With no prefix (first chunk) window == chunk, so the
+        // SDPA is bidirectional over the chunk (matches the upstream block-causal
+        // mask within one chunk).
         let prefix_bytes = bp.act_bytes(prefix_rows * inner);
         let chunk_bytes = bp.act_bytes(chunk_rows * inner);
-        if prefix_rows > 0 {
-            scope.copy_buffer_to_buffer(prefix_k, 0, window_k, 0, prefix_bytes)?;
-            scope.copy_buffer_to_buffer(prefix_v, 0, window_v, 0, prefix_bytes)?;
-        }
         scope.copy_buffer_to_buffer(roped_k_out, 0, window_k, prefix_bytes, chunk_bytes)?;
         scope.copy_buffer_to_buffer(v_out, 0, window_v, prefix_bytes, chunk_bytes)?;
 
@@ -1045,7 +1154,7 @@ impl WanDitBlock {
         )?;
 
         // output projection + bias, then the gated residual into x1_out.
-        let sa_proj = self.attn_out_proj(scope, bp, sa, w, chunk_rows, inner)?;
+        let sa_proj = self.attn_out_proj(scope, bp, sa, w, chunk_rows, inner, None)?;
         op_gate_residual(
             scope,
             bp,
@@ -1091,6 +1200,7 @@ impl WanDitBlock {
         v: BatchBuf<'wsp>,
         tr: u32,
         w: &WanAttnBufs,
+        ptw: &PreparedTileWeights,
     ) -> Result<(), WgpuError> {
         let s = &self.shape;
         let bp = &pipelines.block;
@@ -1106,9 +1216,48 @@ impl WanDitBlock {
         op_modulate(scope, bp, n1, m.scale_msa, m.shift_msa, n1m, tr, dim)?;
 
         // q/k/v projections + bias, qk-norm (RMSNorm across the full inner dim).
-        let q = self.biased_proj(scope, bp, n1m, w.q_w, w.q_b, tr, inner, QkvSite::SelfAttn)?;
-        let k = self.biased_proj(scope, bp, n1m, w.k_w, w.k_b, tr, inner, QkvSite::SelfAttn)?;
-        let vv = self.biased_proj(scope, bp, n1m, w.v_w, w.v_b, tr, inner, QkvSite::SelfAttn)?;
+        // On the DP4A path the shared A-side is quantized ONCE for the three
+        // projections (mirrors hunyuan's `qkv_a_side`; bit-identical to the
+        // per-site transcode). `ptw.q` is Some exactly when the qkv-self site
+        // runs the i8 arm, so it doubles as the gate.
+        let n1m_qkv = if ptw.q.is_some() {
+            quantize_act_paired(scope, bp, n1m.data, tr, dim)?
+        } else {
+            n1m
+        };
+        let q = self.biased_proj(
+            scope,
+            bp,
+            n1m_qkv,
+            w.q_w,
+            w.q_b,
+            tr,
+            inner,
+            QkvSite::SelfAttn,
+            PreparedTileWeights::i8w(&ptw.q),
+        )?;
+        let k = self.biased_proj(
+            scope,
+            bp,
+            n1m_qkv,
+            w.k_w,
+            w.k_b,
+            tr,
+            inner,
+            QkvSite::SelfAttn,
+            PreparedTileWeights::i8w(&ptw.k),
+        )?;
+        let vv = self.biased_proj(
+            scope,
+            bp,
+            n1m_qkv,
+            w.v_w,
+            w.v_b,
+            tr,
+            inner,
+            QkvSite::SelfAttn,
+            PreparedTileWeights::i8w(&ptw.v),
+        )?;
         let qn = alloc_act(scope, bp, tr, inner)?;
         let nq = scope.import_copy(w.norm_q);
         op_rmsnorm(scope, bp, q, nq, qn, tr, inner, eps)?;
@@ -1142,11 +1291,136 @@ impl WanDitBlock {
         let inner = s.inner as u32;
         let eps = s.norm_eps;
         let text = ActBuf::dense(text);
-        let k = self.biased_proj(scope, bp, text, w.k_w, w.k_b, trows, inner, QkvSite::Cross)?;
-        let vv = self.biased_proj(scope, bp, text, w.v_w, w.v_b, trows, inner, QkvSite::Cross)?;
+        let k = self.biased_proj(
+            scope,
+            bp,
+            text,
+            w.k_w,
+            w.k_b,
+            trows,
+            inner,
+            QkvSite::Cross,
+            None,
+        )?;
+        let vv = self.biased_proj(
+            scope,
+            bp,
+            text,
+            w.v_w,
+            w.v_b,
+            trows,
+            inner,
+            QkvSite::Cross,
+            None,
+        )?;
         let nk = scope.import_copy(w.norm_k);
         op_rmsnorm(scope, bp, k, nk, ActBuf::dense(ck), trows, inner, eps)?;
         scope.copy_buffer_to_buffer(vv.data, 0, cv, 0, bp.act_bytes(trows * inner))?;
+        Ok(())
+    }
+
+    /// Re-dequant this block's site weights into the persistent
+    /// [`PreparedTileWeights`] buffers - dispatched into the caller's scope
+    /// once per block (alongside the cross-K/V projection), consumed by every
+    /// activation tile in passes A and B.
+    pub(crate) fn fill_prepared_weights<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        bufs: &WanDitBlockBufs,
+        ptw: &PreparedTileWeights,
+    ) -> Result<(), WgpuError> {
+        let bp = &pipelines.block;
+        let s = &self.shape;
+        let (inner, dim, dff) = (s.inner as u32, s.dim as u32, s.ffn_dim as u32);
+        let i8_fill = |dst: &Option<PreparedI8>,
+                       dq: Option<&DequantStep>,
+                       w: BufRef,
+                       n: u32,
+                       k: u32|
+         -> Result<(), WgpuError> {
+            if let (Some(d), Some(dq)) = (dst, dq) {
+                Block::prepare_weight_i8(
+                    scope,
+                    dq,
+                    scope.import_copy(w),
+                    scope.import_copy(d.i8.as_buf_ref()),
+                    scope.import_copy(d.scale.as_buf_ref()),
+                    scope.import_copy(d.qsum.as_buf_ref()),
+                    n,
+                    k,
+                )?;
+            }
+            Ok(())
+        };
+        i8_fill(
+            &ptw.q,
+            bp.dequant_i8_qkv_self.as_ref(),
+            bufs.self_attn.q_w,
+            inner,
+            dim,
+        )?;
+        i8_fill(
+            &ptw.k,
+            bp.dequant_i8_qkv_self.as_ref(),
+            bufs.self_attn.k_w,
+            inner,
+            dim,
+        )?;
+        i8_fill(
+            &ptw.v,
+            bp.dequant_i8_qkv_self.as_ref(),
+            bufs.self_attn.v_w,
+            inner,
+            dim,
+        )?;
+        i8_fill(
+            &ptw.cross_q,
+            bp.dequant_i8_qkv_self.as_ref(),
+            bufs.cross_attn.q_w,
+            inner,
+            dim,
+        )?;
+        i8_fill(
+            &ptw.ffn_up,
+            bp.dequant_i8_ffn_up.as_ref(),
+            bufs.ffn_up_w,
+            dff,
+            dim,
+        )?;
+        // f16 sites: the coopmat step's dequant when present, else the site's
+        // dense-fallback dequant (same [N,K] n-major f16 bytes either way).
+        let f16_fill = |dst: &Option<WsBuf<WgpuBackend>>,
+                        dq: Option<&DequantStep>,
+                        w: BufRef,
+                        n: u32,
+                        k: u32|
+         -> Result<(), WgpuError> {
+            if let (Some(d), Some(dq)) = (dst, dq) {
+                Block::prepare_weight_f16(
+                    scope,
+                    dq,
+                    scope.import_copy(w),
+                    scope.import_copy(d.as_buf_ref()),
+                    n,
+                    k,
+                )?;
+            }
+            Ok(())
+        };
+        let proj_dq = bp
+            .coopmat_proj
+            .as_ref()
+            .map(|c| &c.dequant_f16)
+            .or(bp.dequant_proj.as_ref());
+        let ffn_down_dq = bp
+            .coopmat_ffn_down
+            .as_ref()
+            .map(|c| &c.dequant_f16)
+            .or(bp.dequant_ffn_down.as_ref());
+        f16_fill(&ptw.o_self, proj_dq, bufs.self_attn.o_w, inner, inner)?;
+        f16_fill(&ptw.o_cross, proj_dq, bufs.cross_attn.o_w, inner, inner)?;
+        f16_fill(&ptw.ffn_down, ffn_down_dq, bufs.ffn_down_w, dim, dff)?;
         Ok(())
     }
 
@@ -1167,6 +1441,7 @@ impl WanDitBlock {
         tr: u32,
         trows: u32,
         bufs: &WanDitBlockBufs,
+        ptw: &PreparedTileWeights,
     ) -> Result<(), WgpuError> {
         let s = &self.shape;
         let bp = &pipelines.block;
@@ -1180,8 +1455,15 @@ impl WanDitBlock {
         let x_in = ActBuf::dense(x_in);
 
         // self-attn output projection + bias, then gated residual.
-        let sa_proj =
-            self.attn_out_proj(scope, bp, ActBuf::dense(sa), &bufs.self_attn, tr, inner)?;
+        let sa_proj = self.attn_out_proj(
+            scope,
+            bp,
+            ActBuf::dense(sa),
+            &bufs.self_attn,
+            tr,
+            inner,
+            PreparedTileWeights::f16w(&ptw.o_self),
+        )?;
         let x1 = alloc_act(scope, bp, tr, dim)?;
         op_gate_residual(scope, bp, x_in, m.gate_msa, sa_proj, x1, tr, dim)?;
 
@@ -1205,6 +1487,7 @@ impl WanDitBlock {
             tr,
             inner,
             QkvSite::CrossQ,
+            PreparedTileWeights::i8w(&ptw.cross_q),
         )?;
         let cq = alloc_act(scope, bp, tr, inner)?;
         let ncq = scope.import_copy(bufs.cross_attn.norm_q);
@@ -1228,7 +1511,15 @@ impl WanDitBlock {
             scale,
             0,
         )?;
-        let ca_proj = self.attn_out_proj(scope, bp, ca, &bufs.cross_attn, tr, inner)?;
+        let ca_proj = self.attn_out_proj(
+            scope,
+            bp,
+            ca,
+            &bufs.cross_attn,
+            tr,
+            inner,
+            PreparedTileWeights::f16w(&ptw.o_cross),
+        )?;
         // cross-attn residual: no gate.
         let x2 = alloc_act(scope, bp, tr, dim)?;
         op_add(scope, bp, x1, ca_proj, x2)?;
@@ -1249,6 +1540,7 @@ impl WanDitBlock {
             tr,
             dff,
             inner,
+            PreparedTileWeights::i8w(&ptw.ffn_up),
             None,
             bp.matmul_i8_ffn_up.as_ref(),
             bp.dequant_i8_ffn_up.as_ref(),
@@ -1272,6 +1564,7 @@ impl WanDitBlock {
             tr,
             dim,
             dff,
+            PreparedTileWeights::f16w(&ptw.ffn_down),
             bp.coopmat_ffn_down.as_ref(),
             bp.matmul_i8_ffn_down.as_ref(),
             bp.dequant_i8_ffn_down.as_ref(),
@@ -1377,6 +1670,7 @@ impl WanDitBlock {
     /// `out = bias + proj(x)` through the attention output matmul site. Shared
     /// by the self/cross output projections in the tiled path (the dense tail
     /// of [`Self::attention`], factored so pass B can reuse it).
+    #[allow(clippy::too_many_arguments)]
     fn attn_out_proj<'wsp>(
         &self,
         scope: &BatchScope<'wsp, WgpuBackend>,
@@ -1385,6 +1679,7 @@ impl WanDitBlock {
         w: &WanAttnBufs,
         rows: u32,
         inner: u32,
+        prepared: Option<PreparedWeight>,
     ) -> Result<ActBuf<'wsp>, WgpuError> {
         let proj = alloc_matmul_out_buf(scope, bp, rows * inner)?;
         let ow = scope.import_copy(w.o_w);
@@ -1397,6 +1692,7 @@ impl WanDitBlock {
             rows,
             inner,
             inner,
+            prepared,
             bp.coopmat_proj.as_ref(),
             bp.matmul_i8_proj.as_ref(),
             bp.dequant_i8_proj.as_ref(),
@@ -1413,7 +1709,10 @@ impl WanDitBlock {
     /// Shared self/cross attention. `q_src` provides the queries `[q_rows,
     /// inner]`; `kv_src` provides keys/values `[kv_rows, inner]` (== `q_src` for
     /// self-attention). `freqs` is `Some` only for self-attention (RoPE3D); cross
-    /// attention runs no positional rotation and no mask.
+    /// attention runs no positional rotation and no mask. `precomputed_kv`, when
+    /// `Some`, supplies the already-projected `(norm_k(k), v)` pair (the
+    /// [`Self::cross_kv`] output, replayed byte-identically across AR forwards)
+    /// and the K/V projections + k-norm are skipped.
     #[allow(clippy::too_many_arguments)]
     fn attention<'wsp>(
         &self,
@@ -1427,6 +1726,7 @@ impl WanDitBlock {
         kv_rows: u32,
         scale: f32,
         site: QkvSite,
+        precomputed_kv: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>)>,
         tap_q: Option<&BufRef>,
         tap_k: Option<&BufRef>,
         tap_v: Option<&BufRef>,
@@ -1446,19 +1746,35 @@ impl WanDitBlock {
             QkvSite::Cross => QkvSite::CrossQ,
             s => s,
         };
-        let q = self.biased_proj(scope, bp, q_src, w.q_w, w.q_b, q_rows, inner, q_site)?;
-        let k = self.biased_proj(scope, bp, kv_src, w.k_w, w.k_b, kv_rows, inner, site)?;
-        let v = self.biased_proj(scope, bp, kv_src, w.v_w, w.v_b, kv_rows, inner, site)?;
+        let q = self.biased_proj(scope, bp, q_src, w.q_w, w.q_b, q_rows, inner, q_site, None)?;
         copy_tap(scope, q.data, tap_q, bp.act_bytes(q_rows * inner))?;
-        copy_tap(scope, k.data, tap_k, bp.act_bytes(kv_rows * inner))?;
-        copy_tap(scope, v.data, tap_v, bp.act_bytes(kv_rows * inner))?;
-
         let qn = alloc_act(scope, bp, q_rows, inner)?;
         let nq = scope.import_copy(w.norm_q);
         op_rmsnorm(scope, bp, q, nq, qn, q_rows, inner, eps)?;
-        let kn = alloc_act(scope, bp, kv_rows, inner)?;
-        let nk = scope.import_copy(w.norm_k);
-        op_rmsnorm(scope, bp, k, nk, kn, kv_rows, inner, eps)?;
+
+        let (kn, v) = match precomputed_kv {
+            Some((pk, pv)) => {
+                // The k tap reads the pre-norm k, which never materializes on
+                // the precomputed path; taps and replay are mutually exclusive.
+                debug_assert!(
+                    tap_k.is_none() && tap_v.is_none(),
+                    "k/v taps require in-place K/V projection"
+                );
+                (ActBuf::dense(pk), ActBuf::dense(pv))
+            }
+            None => {
+                let k =
+                    self.biased_proj(scope, bp, kv_src, w.k_w, w.k_b, kv_rows, inner, site, None)?;
+                let v =
+                    self.biased_proj(scope, bp, kv_src, w.v_w, w.v_b, kv_rows, inner, site, None)?;
+                copy_tap(scope, k.data, tap_k, bp.act_bytes(kv_rows * inner))?;
+                copy_tap(scope, v.data, tap_v, bp.act_bytes(kv_rows * inner))?;
+                let kn = alloc_act(scope, bp, kv_rows, inner)?;
+                let nk = scope.import_copy(w.norm_k);
+                op_rmsnorm(scope, bp, k, nk, kn, kv_rows, inner, eps)?;
+                (kn, v)
+            }
+        };
 
         // RoPE3D (interleaved-pair) on q/k, self-attention only.
         let is_self = freqs.is_some();
@@ -1498,11 +1814,12 @@ impl WanDitBlock {
         copy_tap(scope, sa.data, tap_sa, bp.act_bytes(q_rows * inner))?;
 
         // output projection + bias
-        self.attn_out_proj(scope, bp, sa, w, q_rows, inner)
+        self.attn_out_proj(scope, bp, sa, w, q_rows, inner, None)
     }
 
     /// `out = x @ wᵀ + bias` through the qkv matmul site (`site` selects the
     /// self- vs cross-attention pipeline; see [`QkvSite`]).
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn biased_proj<'wsp>(
         &self,
@@ -1514,6 +1831,7 @@ impl WanDitBlock {
         rows: u32,
         n: u32,
         site: QkvSite,
+        prepared: Option<PreparedWeight>,
     ) -> Result<ActBuf<'wsp>, WgpuError> {
         let dim = self.shape.dim as u32;
         let out = alloc_matmul_out_buf(scope, bp, rows * n)?;
@@ -1541,7 +1859,7 @@ impl WanDitBlock {
             ),
         };
         lin(
-            scope, bp, x, wv, out, rows, n, dim, coopmat, mm_i8, dq_i8, dq, pipe, inst,
+            scope, bp, x, wv, out, rows, n, dim, prepared, coopmat, mm_i8, dq_i8, dq, pipe, inst,
         )?;
         let bv = scope.import_copy(b);
         let biased = alloc_act(scope, bp, rows, n)?;

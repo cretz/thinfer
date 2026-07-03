@@ -29,7 +29,8 @@ use thinfer_core::workspace::Workspace;
 
 use crate::common::block::{BlockWgslConfigs, CoopmatSites, DenseActSites};
 use crate::wan::dit::{
-    LoadedWanDitHandles, WanDit, WanDitError, WanDitInputs, WanDitShape, WanDitTaps, read_into_f32,
+    LoadedWanDitHandles, WanCrossKvCache, WanDit, WanDitError, WanDitInputs, WanDitShape,
+    WanDitTaps, read_into_f32,
 };
 use crate::wan::dit_block::{WanDitBlockTaps, WanDitConfig, WanDitPipelines, config as dit_config};
 use crate::wan::kv_cache::{KvCacheConfig, KvWindowCache, RamKvStore};
@@ -393,16 +394,31 @@ pub struct WanVariant {
 }
 
 impl WanVariant {
-    /// FastWan2.2-TI2V-5B / LongLive-2.0-5B: single expert, bf16 safetensors,
-    /// the TI2V high-compression VAE.
+    /// FastWan2.2-TI2V-5B: single expert, bf16 safetensors -> Q8_0 block
+    /// transcode at load, the TI2V high-compression VAE. At video dims the bf16
+    /// working set (~9.8GB) re-streams every step against the VRAM budget and
+    /// the DiT runs ~3.5x slower than its GPU compute; Q8_0 halves the stream
+    /// and fits (near-)resident. Q8_0 is the big-DiT quality baseline; gated by
+    /// the video_e2e parity bands.
     pub fn fastwan_ti2v_5b() -> Self {
         Self {
             dit: WanDitConfig::fastwan_ti2v_5b(),
             vae: WanVaeConfig::fastwan_ti2v_5b(),
             moe: false,
-            block_transcode: None,
+            block_transcode: Some(thinfer_core::quant::QuantKind::Q8_0),
             act_pref: None,
             tiny_vae_normed_latents: false,
+        }
+    }
+
+    /// LongLive-2.0-5B: FastWan geometry + VAE, but the source bf16 encoding
+    /// (no block transcode) until the AR path gets its own Q8 parity gate --
+    /// its KV-cache commit reads block outputs that the longlive_parity bands
+    /// pin against bf16 today.
+    pub fn longlive_2_0_5b() -> Self {
+        Self {
+            block_transcode: None,
+            ..Self::fastwan_ti2v_5b()
         }
     }
 
@@ -1006,7 +1022,9 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         if let Some(p) = progress {
             p(ProgressEvent::TextEncode);
         }
-        let mut text_by_prompt: HashMap<&str, Arc<Vec<f32>>> = HashMap::new();
+        // Each unique prompt gets an id; the per-prompt cross-attention K/V
+        // cache (filled lazily inside `forward_ar`) is keyed by it.
+        let mut text_by_prompt: HashMap<&str, (usize, Arc<Vec<f32>>)> = HashMap::new();
         for prompt in &chunk_prompt {
             if text_by_prompt.contains_key(prompt.as_str()) {
                 continue;
@@ -1034,13 +1052,25 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 )
                 .await?;
             let padded = pad_text(&qout.hidden, qout.seq, dit_config::TEXT_DIM, TEXT_SEQ);
-            text_by_prompt.insert(prompt.as_str(), Arc::new(padded));
+            let id = text_by_prompt.len();
+            text_by_prompt.insert(prompt.as_str(), (id, Arc::new(padded)));
         }
         // Per-chunk text handles (cheap Arc clones; one encoded tensor per unique
-        // prompt, shared across the chunks that use it).
+        // prompt, shared across the chunks that use it) + the prompt id each
+        // chunk resolves to.
         let chunk_text: Vec<Arc<Vec<f32>>> = chunk_prompt
             .iter()
-            .map(|p| Arc::clone(&text_by_prompt[p.as_str()]))
+            .map(|p| Arc::clone(&text_by_prompt[p.as_str()].1))
+            .collect();
+        let chunk_prompt_id: Vec<usize> = chunk_prompt
+            .iter()
+            .map(|p| text_by_prompt[p.as_str()].0)
+            .collect();
+        // One cross-attention K/V cache per unique prompt: the text K/V each
+        // block projects is constant across every forward that shares the
+        // prompt, so `forward_ar` computes it once and replays the bytes.
+        let mut cross_kv: Vec<WanCrossKvCache> = (0..text_by_prompt.len())
+            .map(|_| WanCrossKvCache::new(self.cfg.num_layers))
             .collect();
         self.residency.evict_all_and_free(&*self.backend);
         workspace.drain_pool();
@@ -1095,6 +1125,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             }
             let plan = cache.begin_chunk(&mut store, current_start, chunk_frames);
             let text = chunk_text[chunk].as_slice();
+            let chunk_cross_kv = &mut cross_kv[chunk_prompt_id[chunk]];
 
             let mut latents = slice_chunk(&full_noise, c, f_lat, f0, chunk_frames, hw);
 
@@ -1134,6 +1165,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         &inputs,
                         &store,
                         &plan,
+                        chunk_cross_kv,
                         None,
                         bd,
                     )
@@ -1173,6 +1205,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 &clean_inputs,
                 &store,
                 &plan,
+                chunk_cross_kv,
                 Some((&mut k_commit, &mut v_commit)),
                 None,
             )
@@ -1345,7 +1378,11 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let bpe = self.dit.block.act_bytes(1);
         let attn_phase = rows * 6 * dim * bpe;
         // x2 on the tile term: the tiled block loop keeps a depth-2 submit
-        // pipeline (two tiles' transients in flight at once).
+        // pipeline (two tiles' transients in flight at once). The deferred
+        // per-block setup / SDPA scopes ride the same envelope: each is in
+        // flight with at most ONE tile scope, and their transients (a few
+        // `[text_seq, dim]` cross-K/V intermediates; the SDPA writes into
+        // persistent TileBufs) are well under a tile's, so no extra term.
         let ffn_phase = rows * 2 * dim * bpe + 2 * (tile * 2 * dff * bpe);
         let dit_workspace = attn_phase.max(ffn_phase) + 4 * dim * dff * bpe;
         self.residency.set_transient_reserve(
@@ -1373,6 +1410,10 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let low = WanDit::assemble(low_handles, shape(), self.cfg);
             let sampler = Wan22DistillSampler::new(&Wan22DistillConfig::wan22_t2v_a14b());
             let n_steps = sampler.num_steps();
+            // One cross-attn K/V cache PER EXPERT: the text K/V depend on the
+            // block to_k/to_v weights, which differ between the experts.
+            let mut ckv_high = WanCrossKvCache::new(self.cfg.num_layers);
+            let mut ckv_low = WanCrossKvCache::new(self.cfg.num_layers);
             for i in 0..n_steps {
                 let _step = trace::scope!("step", i = i).entered();
                 if cancel.is_some_and(|c| c()) {
@@ -1395,10 +1436,10 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                             + dit_workspace,
                     );
                 }
-                let dit = if sampler.is_high_noise(i) {
-                    &high
+                let (dit, ckv) = if sampler.is_high_noise(i) {
+                    (&high, &mut ckv_high)
                 } else {
-                    &low
+                    (&low, &mut ckv_low)
                 };
                 let inputs = WanDitInputs {
                     image: &sample,
@@ -1410,12 +1451,13 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     attn_window: step_attn_window(params.attn_window, i, 0),
                 };
                 let out = dit
-                    .forward(
+                    .forward_cached(
                         &self.backend,
                         &self.dit,
                         &self.residency,
                         &*workspace,
                         &inputs,
+                        ckv,
                     )
                     .await?;
                 sample = sampler.step(i, &out.image, &sample);
@@ -1432,6 +1474,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let dit = WanDit::assemble(self.dit_handles.clone(), shape(), self.cfg);
             let steps = params.steps.unwrap_or(ANYFLOW_DEFAULT_STEPS).max(1) as usize;
             let sampler = AnyFlowSampler::new(steps);
+            let mut ckv = WanCrossKvCache::new(self.cfg.num_layers);
             for i in 0..steps {
                 let _step = trace::scope!("step", i = i).entered();
                 if cancel.is_some_and(|c| c()) {
@@ -1469,6 +1512,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                             &*workspace,
                             &inputs,
                             taps,
+                            Some(&mut ckv),
                         )
                         .await?;
                     if let Some(d) = step_diag.as_deref_mut() {
@@ -1486,12 +1530,13 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     }
                     out.image
                 } else {
-                    dit.forward(
+                    dit.forward_cached(
                         &self.backend,
                         &self.dit,
                         &self.residency,
                         &*workspace,
                         &inputs,
+                        &mut ckv,
                     )
                     .await?
                     .image
@@ -1504,6 +1549,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         }
 
         let dit = WanDit::assemble(self.dit_handles.clone(), shape(), self.cfg);
+        let mut ckv = WanCrossKvCache::new(self.cfg.num_layers);
         match params.sampler {
             // --- DMD: one DiT forward per fixed timestep, renoise between. The
             // step-diag taps live here (the parity/bisection path is DMD-only). ---
@@ -1552,6 +1598,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                                     &*workspace,
                                     &inputs,
                                     taps,
+                                    Some(&mut ckv),
                                 )
                                 .await?;
                             (
@@ -1564,12 +1611,13 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                             )
                         } else {
                             let out = dit
-                                .forward(
+                                .forward_cached(
                                     &self.backend,
                                     &self.dit,
                                     &self.residency,
                                     &*workspace,
                                     &inputs,
+                                    &mut ckv,
                                 )
                                 .await?;
                             (
@@ -1629,12 +1677,13 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         attn_window: params.attn_window,
                     };
                     let out = dit
-                        .forward(
+                        .forward_cached(
                             &self.backend,
                             &self.dit,
                             &self.residency,
                             &*workspace,
                             &inputs,
+                            &mut ckv,
                         )
                         .await?;
                     sample = unipc.step(&out.image, &sample);
@@ -1797,6 +1846,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 &*workspace,
                 &inputs,
                 taps,
+                None,
             )
             .await?;
         // Renoise this step (the sampler returns plain x0 on the final step, and

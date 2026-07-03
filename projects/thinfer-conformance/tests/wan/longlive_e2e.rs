@@ -137,11 +137,13 @@ async fn longlive_e2e_ar() {
         vram_bytes: budget_gb << 30,
     };
     let residency = WeightResidency::new(source, budget);
-    let model = WanModel::load(
+    let model = WanModel::load_variant(
         Arc::clone(&backend),
         residency,
         tokenizer,
         VaeChoice::Full,
+        thinfer_models::wan::pipeline::WanVariant::longlive_2_0_5b(),
+        None,
         std::env::var_os("THINFER_WAN_I8_FFN").is_some(),
     )
     .await

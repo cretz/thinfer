@@ -28,8 +28,8 @@ use thinfer_core::weight::{WeightId, WeightSource};
 use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace, WsBuf};
 
 use crate::common::block::{
-    ActBuf, Block, BlockPipelines, BlockWgslConfigs, CoopmatStep, DequantStep, op_rope,
-    op_sdpa_f16_win, quantize_act_paired,
+    ActBuf, Block, BlockPipelines, BlockWgslConfigs, CoopmatStep, DequantStep, PreparedWeight,
+    op_rope, op_sdpa_f16_win, quantize_act_paired,
 };
 use crate::common::loader::{
     LoadError, register_linear, register_linear_flatten, register_linear_transcode,
@@ -181,7 +181,8 @@ fn reg_lin<S: WeightSource>(res: &WeightResidency<S>, w: &LinW) -> Result<LinH, 
 
 /// Linear whose weight transcodes to `q8` (`Some` on the i8 DP4A path) so the
 /// matmul site can read it as Q8_0; `None` keeps the dense bf16 load. Bias stays
-/// passthrough bf16. Used for the self-attn q/k/v + ffn-up (`fc1`) weights, whose
+/// passthrough bf16. Used for the self-attn q/k/v + ffn-up (`fc1`) weights (i8
+/// DP4A sites) and the img_mod/txt_mod linears (dequant-once adaln site), whose
 /// matmul sites pin `Quant` weight_dtype under i8.
 fn reg_lin_q8<S: WeightSource>(
     res: &WeightResidency<S>,
@@ -222,8 +223,14 @@ impl DitH {
         for i in 0..cfg::DOUBLE_BLOCKS {
             let w = BlockW::new(i);
             blocks.push(BlockH {
-                img_mod: reg_lin(res, &w.img_mod)?,
-                txt_mod: reg_lin(res, &w.txt_mod)?,
+                // Mod linears: Q8_0 weight-only under i8, matching the Quant
+                // adaln site in `hunyuan_block_cfgs` (dequant-once dense path;
+                // no i8 acts). None keeps them dense bf16 (parity / --no-i8).
+                // Mod linears stay dense bf16 while the adaln Q8 path is
+                // disabled (see the cfgs note in `hunyuan_block_cfgs`); the
+                // registration and pipeline MUST flip together.
+                img_mod: reg_lin_q8(res, &w.img_mod, None)?,
+                txt_mod: reg_lin_q8(res, &w.txt_mod, None)?,
                 img_q: reg_lin_q8(res, &w.img_q, q8)?,
                 img_k: reg_lin_q8(res, &w.img_k, q8)?,
                 img_v: reg_lin_q8(res, &w.img_v, q8)?,
@@ -350,6 +357,13 @@ fn hunyuan_block_cfgs(act: ActDtype, i8: bool, coopmat: bool) -> BlockWgslConfig
     if i8 {
         cfgs.matmul_qkv_self.weight_dtype = q8;
         cfgs.matmul_ffn_up.weight_dtype = q8;
+        // Modulation linears (img_mod/txt_mod) as Q8_0 weight-only via the
+        // adaln site: DISABLED 2026-07-03 pending a fix -- dit_parity (taps
+        // path) device-panics in wgpu with the adaln dequant wiring while the
+        // tapless t2v_e2e passes. Re-enable by restoring
+        // `cfgs.matmul_adaln.weight_dtype = q8;` here AND flipping
+        // `MOD_LINEARS_Q8` in `DitH::register`; gate with dit_parity
+        // (default + THINFER_DIT_TILE_ROWS=8) before shipping.
     }
     // ffn_down is the #1 DiT matmul (measured) and outlier-bound (gelu product), so
     // it is NOT i8-eligible -- but coopmat (tensor cores) only casts the A-side to
@@ -373,14 +387,17 @@ fn hunyuan_block_cfgs(act: ActDtype, i8: bool, coopmat: bool) -> BlockWgslConfig
 /// per-site pipeline group so [`Block::dispatch_matmul_site`] picks the right
 /// (dense / dequant-once / i8 DP4A) path. The separate q/k/v projections share
 /// the `QkvSelf` site (normed A-side, i8-eligible in 4b); the two MLP linears
-/// use `FfnUp`/`FfnDown`; attention output uses `Proj`. Module-level dense
-/// linears (img_in, time, modulation, final) stay bf16 via `Module`.
+/// use `FfnUp`/`FfnDown`; attention output uses `Proj`. The per-block
+/// modulation linears (img_mod/txt_mod) use `Mod` (the adaln site: Q8_0
+/// weight + dequant-once dense matmul under i8, dense bf16 otherwise).
+/// Module-level dense linears (img_in, time, final) stay bf16 via `Module`.
 #[derive(Clone, Copy)]
 enum Site {
     QkvSelf,
     Proj,
     FfnUp,
     FfnDown,
+    Mod,
     Module,
 }
 
@@ -427,6 +444,18 @@ fn site_pipes(bp: &BlockPipelines, site: Site) -> SitePipes<'_> {
             &bp.matmul_ffn_down,
             &bp.matmuls.ffn_down,
         ),
+        // Modulation linears: dequant-once dense only (dequant_adaln is Some
+        // iff the i8 config pinned the adaln weight Q8_0). Deliberately no
+        // i8/coopmat entries: the mod outputs gate the whole residual stream
+        // and M=1, so only the weight storage quantizes.
+        Site::Mod => (
+            None,
+            None,
+            None,
+            bp.dequant_adaln.as_ref(),
+            &bp.matmul_adaln,
+            &bp.matmuls.adaln,
+        ),
         // Module-level dense bf16 linears: no quant/i8/coopmat routing.
         Site::Module => (
             None,
@@ -457,12 +486,14 @@ fn linear<'w>(
     k: u32,
     site: Site,
 ) -> Result<BatchBuf<'w>, WgpuError> {
-    linear_a(scope, bp, ActBuf::dense(x), w, rows, n, k, site)
+    linear_a(scope, bp, ActBuf::dense(x), w, rows, n, k, site, None)
 }
 
 /// As [`linear`] but takes the A-side as an [`ActBuf`], so a pre-quantized
 /// paired i8 A-side (see [`quantize_act_paired`]) can be shared across the
-/// separate q/k/v projections instead of each one re-running `act_quant`.
+/// separate q/k/v projections instead of each one re-running `act_quant`, and
+/// an optional per-block [`PreparedWeight`] (see [`HunyuanPreparedWeights`])
+/// so the tiled path skips the per-tile weight dequant inside the dispatch.
 #[allow(clippy::too_many_arguments)]
 fn linear_a<'w>(
     scope: &BatchScope<'w, WgpuBackend>,
@@ -473,13 +504,14 @@ fn linear_a<'w>(
     n: u32,
     k: u32,
     site: Site,
+    prepared: Option<PreparedWeight>,
 ) -> Result<BatchBuf<'w>, WgpuError> {
     let pre = scope.alloc(bp.act_bytes(rows * n))?;
     let dims = scope.u32x4_uniform(rows, n, k, 0)?;
     let wv = scope.import_copy(w.weight);
     let (cm, mi8, dqi8, dqd, mmpl, mmop) = site_pipes(bp, site);
     Block::dispatch_matmul_site_coopmat(
-        scope, bp, a, wv, pre, dims, cm, mi8, dqi8, dqd, mmpl, mmop, rows, n, k,
+        scope, bp, a, wv, pre, dims, prepared, cm, mi8, dqi8, dqd, mmpl, mmop, rows, n, k,
     )?;
     let out = scope.alloc(bp.act_bytes(rows * n))?;
     let u = scope.u32x4_uniform(n, 0, 0, 0)?;
@@ -648,7 +680,8 @@ fn attention<'w>(
     Ok(out)
 }
 
-/// gelu-tanh MLP `fc1 -> gelu -> fc2`.
+/// gelu-tanh MLP `fc1 -> gelu -> fc2`. `p1`/`p2` are the optional per-block
+/// prepared fc1/fc2 weights (tiled img pass; `None` keeps the inline dequant).
 #[allow(clippy::too_many_arguments)]
 fn mlp<'w>(
     scope: &BatchScope<'w, WgpuBackend>,
@@ -659,11 +692,33 @@ fn mlp<'w>(
     rows: u32,
     dim: u32,
     hidden: u32,
+    p1: Option<PreparedWeight>,
+    p2: Option<PreparedWeight>,
 ) -> Result<BatchBuf<'w>, WgpuError> {
-    let up = linear(scope, bp, x, fc1, rows, hidden, dim, Site::FfnUp)?;
+    let up = linear_a(
+        scope,
+        bp,
+        ActBuf::dense(x),
+        fc1,
+        rows,
+        hidden,
+        dim,
+        Site::FfnUp,
+        p1,
+    )?;
     let g = scope.alloc(bp.act_bytes(rows * hidden))?;
     scope.dispatch_op::<GeluF32>(&bp.gelu, &[up], g)?;
-    linear(scope, bp, g, fc2, rows, dim, hidden, Site::FfnDown)
+    linear_a(
+        scope,
+        bp,
+        ActBuf::dense(g),
+        fc2,
+        rows,
+        dim,
+        hidden,
+        Site::FfnDown,
+        p2,
+    )
 }
 
 /// Slice modulation signal `k` ([dim]) out of a `[1, 6*dim]` buffer.
@@ -818,6 +873,191 @@ impl HunyuanTileBufs {
             imod: a(6 * dim)?,
             tmod: a(6 * dim)?,
         })
+    }
+}
+
+/// One DP4A site's persistent dequant triple (see [`HunyuanPreparedWeights`]).
+struct PreparedI8Bufs {
+    i8: WsBuf<WgpuBackend>,
+    scale: WsBuf<WgpuBackend>,
+    qsum: WsBuf<WgpuBackend>,
+}
+
+impl PreparedI8Bufs {
+    fn alloc(ws: &Workspace<WgpuBackend>, n: u64, k: u64) -> Result<Self, WgpuError> {
+        Ok(Self {
+            i8: ws.alloc(n * k)?,
+            scale: ws.alloc(n * (k / 32) * 4)?,
+            qsum: ws.alloc(n * (k / 32) * 4)?,
+        })
+    }
+
+    fn weight(&self) -> PreparedWeight {
+        PreparedWeight::I8 {
+            i8: self.i8.as_buf_ref(),
+            scale: self.scale.as_buf_ref(),
+            qsum: self.qsum.as_buf_ref(),
+        }
+    }
+}
+
+/// Per-block prepared weights for the img-side matmul sites the tiled path
+/// dispatches once per activation tile (q/k/v in pass A; proj/fc1/fc2 in pass
+/// B). Allocated once per forward (site shapes are block-invariant), refilled
+/// once per block by [`Self::fill`], consumed by every img tile - without this
+/// the site dispatch re-runs the identical weight dequant per tile (~32x
+/// redundant at 480p). The txt-side sites dispatch once per block and keep the
+/// inline path; sites whose pipelines read the raw bf16 weight directly prep
+/// nothing (mirrors the Wan `PreparedTileWeights` gating). Bit-identical: same
+/// dequant kernels, same weight bytes, run once instead of per tile.
+struct HunyuanPreparedWeights {
+    /// DP4A i8 triples: img q/k/v (`[dim, dim]`, qkv_self site) and img ffn-up
+    /// (`[mlp_h, dim]`).
+    img_q: Option<PreparedI8Bufs>,
+    img_k: Option<PreparedI8Bufs>,
+    img_v: Option<PreparedI8Bufs>,
+    img_fc1: Option<PreparedI8Bufs>,
+    /// f16 `[N,K]` n-major images for the coopmat / dense-f16 sites: img
+    /// attn-out projection (`[dim, dim]`) and img ffn-down (`[dim, mlp_h]`).
+    img_proj: Option<WsBuf<WgpuBackend>>,
+    img_fc2: Option<WsBuf<WgpuBackend>>,
+}
+
+impl HunyuanPreparedWeights {
+    /// Allocate the persistent buffers for every site the compiled pipelines
+    /// will actually prep (a DP4A site preps i8, else a coopmat/dense-dequant
+    /// site preps f16, else the raw weight is read directly).
+    fn alloc(
+        ws: &Workspace<WgpuBackend>,
+        bp: &BlockPipelines,
+        dim: u64,
+        mlp_h: u64,
+    ) -> Result<Self, WgpuError> {
+        let i8_site = |mm: &Option<WgpuPipeline>, dq: &Option<DequantStep>| {
+            mm.is_some() && dq.is_some() && bp.act_quant.is_some()
+        };
+        let qkv_i8 = i8_site(&bp.matmul_i8_qkv_self, &bp.dequant_i8_qkv_self);
+        let fc1_i8 = i8_site(&bp.matmul_i8_ffn_up, &bp.dequant_i8_ffn_up);
+        let proj_f16 = (bp.coopmat_proj.is_some() || bp.dequant_proj.is_some())
+            && !i8_site(&bp.matmul_i8_proj, &bp.dequant_i8_proj);
+        let fc2_f16 = (bp.coopmat_ffn_down.is_some() || bp.dequant_ffn_down.is_some())
+            && !i8_site(&bp.matmul_i8_ffn_down, &bp.dequant_i8_ffn_down);
+        let i8_buf = |on: bool, n: u64, k: u64| -> Result<Option<PreparedI8Bufs>, WgpuError> {
+            on.then(|| PreparedI8Bufs::alloc(ws, n, k)).transpose()
+        };
+        let f16_buf = |on: bool, n: u64, k: u64| -> Result<Option<WsBuf<WgpuBackend>>, WgpuError> {
+            on.then(|| ws.alloc(n * k * 2)).transpose()
+        };
+        Ok(Self {
+            img_q: i8_buf(qkv_i8, dim, dim)?,
+            img_k: i8_buf(qkv_i8, dim, dim)?,
+            img_v: i8_buf(qkv_i8, dim, dim)?,
+            img_fc1: i8_buf(fc1_i8, mlp_h, dim)?,
+            img_proj: f16_buf(proj_f16, dim, dim)?,
+            img_fc2: f16_buf(fc2_f16, dim, mlp_h)?,
+        })
+    }
+
+    /// Re-dequant this block's img-side site weights into the persistent
+    /// buffers - dispatched once per block (alongside the modulation linears),
+    /// consumed by every img tile in passes A and B.
+    fn fill<'w>(
+        &self,
+        scope: &BatchScope<'w, WgpuBackend>,
+        bp: &BlockPipelines,
+        b: &BlockBufs,
+        dim: u32,
+        mlp_h: u32,
+    ) -> Result<(), WgpuError> {
+        let i8_fill = |dst: &Option<PreparedI8Bufs>,
+                       dq: Option<&DequantStep>,
+                       w: BufRef,
+                       n: u32,
+                       k: u32|
+         -> Result<(), WgpuError> {
+            if let (Some(d), Some(dq)) = (dst, dq) {
+                Block::prepare_weight_i8(
+                    scope,
+                    dq,
+                    scope.import_copy(w),
+                    scope.import_copy(d.i8.as_buf_ref()),
+                    scope.import_copy(d.scale.as_buf_ref()),
+                    scope.import_copy(d.qsum.as_buf_ref()),
+                    n,
+                    k,
+                )?;
+            }
+            Ok(())
+        };
+        i8_fill(
+            &self.img_q,
+            bp.dequant_i8_qkv_self.as_ref(),
+            b.img_q.weight,
+            dim,
+            dim,
+        )?;
+        i8_fill(
+            &self.img_k,
+            bp.dequant_i8_qkv_self.as_ref(),
+            b.img_k.weight,
+            dim,
+            dim,
+        )?;
+        i8_fill(
+            &self.img_v,
+            bp.dequant_i8_qkv_self.as_ref(),
+            b.img_v.weight,
+            dim,
+            dim,
+        )?;
+        i8_fill(
+            &self.img_fc1,
+            bp.dequant_i8_ffn_up.as_ref(),
+            b.img_fc1.weight,
+            mlp_h,
+            dim,
+        )?;
+        // f16 sites: the coopmat step's dequant when present, else the site's
+        // dense-fallback dequant (same [N,K] n-major f16 bytes either way).
+        let f16_fill = |dst: &Option<WsBuf<WgpuBackend>>,
+                        dq: Option<&DequantStep>,
+                        w: BufRef,
+                        n: u32,
+                        k: u32|
+         -> Result<(), WgpuError> {
+            if let (Some(d), Some(dq)) = (dst, dq) {
+                Block::prepare_weight_f16(
+                    scope,
+                    dq,
+                    scope.import_copy(w),
+                    scope.import_copy(d.as_buf_ref()),
+                    n,
+                    k,
+                )?;
+            }
+            Ok(())
+        };
+        let proj_dq = bp
+            .coopmat_proj
+            .as_ref()
+            .map(|c| &c.dequant_f16)
+            .or(bp.dequant_proj.as_ref());
+        let fc2_dq = bp
+            .coopmat_ffn_down
+            .as_ref()
+            .map(|c| &c.dequant_f16)
+            .or(bp.dequant_ffn_down.as_ref());
+        f16_fill(&self.img_proj, proj_dq, b.img_proj.weight, dim, dim)?;
+        f16_fill(&self.img_fc2, fc2_dq, b.img_fc2.weight, dim, mlp_h)?;
+        Ok(())
+    }
+
+    fn i8w(slot: &Option<PreparedI8Bufs>) -> Option<PreparedWeight> {
+        slot.as_ref().map(PreparedI8Bufs::weight)
+    }
+
+    fn f16w(slot: &Option<WsBuf<WgpuBackend>>) -> Option<PreparedWeight> {
+        slot.as_ref().map(|b| PreparedWeight::F16(b.as_buf_ref()))
     }
 }
 
@@ -1062,7 +1302,13 @@ impl HunyuanDit {
             n.div_ceil(dit_tile_rows()).max(1)
         };
         let tile = if n_tiles > 1 {
-            Some(HunyuanTileBufs::alloc(ws, bp, joint, dim)?)
+            // Per-block prepared img-site weights (dequant once per block;
+            // every tile reuses them). Shapes are block-invariant, so the
+            // buffers are allocated once here and refilled inside the loop.
+            Some((
+                HunyuanTileBufs::alloc(ws, bp, joint, dim)?,
+                HunyuanPreparedWeights::alloc(ws, bp, dim as u64, mlp_h as u64)?,
+            ))
         } else {
             None
         };
@@ -1089,7 +1335,7 @@ impl HunyuanDit {
                 &freqs_up,
                 freq_stride,
                 &silu_vec_ws,
-                tile.as_ref(),
+                tile.as_ref().map(|(t, p)| (t, p)),
                 &img_cur,
                 &txt_cur,
                 &img_nxt,
@@ -1211,6 +1457,7 @@ impl HunyuanDit {
         freq_stride: u32,
         silu_vec_ws: &WsBuf<WgpuBackend>,
         tile: &HunyuanTileBufs,
+        ptw: &HunyuanPreparedWeights,
         img_cur: &WsBuf<WgpuBackend>,
         txt_cur: &WsBuf<WgpuBackend>,
         img_nxt: &WsBuf<WgpuBackend>,
@@ -1235,12 +1482,15 @@ impl HunyuanDit {
         // imported `b`'s weight pins + the persistent tile/act buffers).
         let mut ring = InFlight::new(dit_pipeline_depth());
 
-        // 1) Modulation signals for this block, persisted across the tile scopes.
+        // 1) Modulation signals for this block, persisted across the tile
+        //    scopes, plus the once-per-block img-site weight dequants every
+        //    tile below reuses.
         {
             let scope = ws.batch();
+            ptw.fill(&scope, bp, b, dim, mlp_h)?;
             let sv = scope.import_copy(silu_vec_ws.as_buf_ref());
-            let imodp = linear(&scope, bp, sv, &b.img_mod, 1, 6 * dim, dim, Site::Module)?;
-            let tmodp = linear(&scope, bp, sv, &b.txt_mod, 1, 6 * dim, dim, Site::Module)?;
+            let imodp = linear(&scope, bp, sv, &b.img_mod, 1, 6 * dim, dim, Site::Mod)?;
+            let tmodp = linear(&scope, bp, sv, &b.txt_mod, 1, 6 * dim, dim, Site::Mod)?;
             let di = scope.import_copy(tile.imod.as_buf_ref());
             scope.copy_buffer_to_buffer(imodp, 0, di, 0, bp.act_bytes(6 * dim))?;
             let dt = scope.import_copy(tile.tmod.as_buf_ref());
@@ -1257,11 +1507,41 @@ impl HunyuanDit {
             let txt = scope.import_copy(txt_cur.as_buf_ref());
             let tm = norm_modulate(&scope, bp, txt, t_sc1, t_sh1, seqr, dim)?;
             let tm_a = qkv_a_side(&scope, bp, tm, seqr, dim)?;
-            let tq = linear_a(&scope, bp, tm_a, &b.txt_q, seqr, dim, dim, Site::QkvSelf)?;
+            let tq = linear_a(
+                &scope,
+                bp,
+                tm_a,
+                &b.txt_q,
+                seqr,
+                dim,
+                dim,
+                Site::QkvSelf,
+                None,
+            )?;
             let tq = qk_norm_rope(&scope, bp, tq, b.txt_qn, None, seqr, heads, hd)?;
-            let tk = linear_a(&scope, bp, tm_a, &b.txt_k, seqr, dim, dim, Site::QkvSelf)?;
+            let tk = linear_a(
+                &scope,
+                bp,
+                tm_a,
+                &b.txt_k,
+                seqr,
+                dim,
+                dim,
+                Site::QkvSelf,
+                None,
+            )?;
             let tk = qk_norm_rope(&scope, bp, tk, b.txt_kn, None, seqr, heads, hd)?;
-            let tv = linear_a(&scope, bp, tm_a, &b.txt_v, seqr, dim, dim, Site::QkvSelf)?;
+            let tv = linear_a(
+                &scope,
+                bp,
+                tm_a,
+                &b.txt_v,
+                seqr,
+                dim,
+                dim,
+                Site::QkvSelf,
+                None,
+            )?;
             let off = n as u64 * dim_row;
             let len = seqr as u64 * dim_row;
             for (src, base) in [(tq, &tile.jq), (tk, &tile.jk), (tv, &tile.jv)] {
@@ -1282,12 +1562,15 @@ impl HunyuanDit {
             let im = norm_modulate(&scope, bp, img_t, i_sc1, i_sh1, tr, dim)?;
             let im_a = qkv_a_side(&scope, bp, im, tr, dim)?;
             let fq = scope.import_copy(row_slice(freqs_up.as_buf_ref(), r0, tr, freq_row));
-            let iq = linear_a(&scope, bp, im_a, &b.img_q, tr, dim, dim, Site::QkvSelf)?;
+            let pq = HunyuanPreparedWeights::i8w(&ptw.img_q);
+            let iq = linear_a(&scope, bp, im_a, &b.img_q, tr, dim, dim, Site::QkvSelf, pq)?;
             let iq = qk_norm_rope(&scope, bp, iq, b.img_qn, Some(fq), tr, heads, hd)?;
             let fq2 = scope.import_copy(row_slice(freqs_up.as_buf_ref(), r0, tr, freq_row));
-            let ik = linear_a(&scope, bp, im_a, &b.img_k, tr, dim, dim, Site::QkvSelf)?;
+            let pk = HunyuanPreparedWeights::i8w(&ptw.img_k);
+            let ik = linear_a(&scope, bp, im_a, &b.img_k, tr, dim, dim, Site::QkvSelf, pk)?;
             let ik = qk_norm_rope(&scope, bp, ik, b.img_kn, Some(fq2), tr, heads, hd)?;
-            let iv = linear_a(&scope, bp, im_a, &b.img_v, tr, dim, dim, Site::QkvSelf)?;
+            let pv = HunyuanPreparedWeights::i8w(&ptw.img_v);
+            let iv = linear_a(&scope, bp, im_a, &b.img_v, tr, dim, dim, Site::QkvSelf, pv)?;
             let off = r0 as u64 * dim_row;
             let len = tr as u64 * dim_row;
             for (src, base) in [(iq, &tile.jq), (ik, &tile.jk), (iv, &tile.jv)] {
@@ -1340,10 +1623,25 @@ impl HunyuanDit {
             let (i_g1, i_sh2, i_sc2, i_g2) = (isig(2)?, isig(3)?, isig(4)?, isig(5)?);
             let img_t = scope.import_copy(row_slice(img_cur.as_buf_ref(), r0, tr, dim_row));
             let sa_t = scope.import_copy(row_slice(tile.sa.as_buf_ref(), r0, tr, dim_row));
-            let ip = linear(&scope, bp, sa_t, &b.img_proj, tr, dim, dim, Site::Proj)?;
+            let pp = HunyuanPreparedWeights::f16w(&ptw.img_proj);
+            let ip = linear_a(
+                &scope,
+                bp,
+                ActBuf::dense(sa_t),
+                &b.img_proj,
+                tr,
+                dim,
+                dim,
+                Site::Proj,
+                pp,
+            )?;
             let img = gate_residual(&scope, bp, img_t, i_g1, ip, tr, dim)?;
             let im2 = norm_modulate(&scope, bp, img, i_sc2, i_sh2, tr, dim)?;
-            let imlp = mlp(&scope, bp, im2, &b.img_fc1, &b.img_fc2, tr, dim, mlp_h)?;
+            let p1 = HunyuanPreparedWeights::i8w(&ptw.img_fc1);
+            let p2 = HunyuanPreparedWeights::f16w(&ptw.img_fc2);
+            let imlp = mlp(
+                &scope, bp, im2, &b.img_fc1, &b.img_fc2, tr, dim, mlp_h, p1, p2,
+            )?;
             let img = gate_residual(&scope, bp, img, i_g2, imlp, tr, dim)?;
             let d = scope.import_copy(row_slice(img_nxt.as_buf_ref(), r0, tr, dim_row));
             scope.copy_buffer_to_buffer(img, 0, d, 0, tr as u64 * dim_row)?;
@@ -1361,7 +1659,9 @@ impl HunyuanDit {
             let tp = linear(&scope, bp, sa_t, &b.txt_proj, seqr, dim, dim, Site::Proj)?;
             let txt = gate_residual(&scope, bp, txt, t_g1, tp, seqr, dim)?;
             let tm2 = norm_modulate(&scope, bp, txt, t_sc2, t_sh2, seqr, dim)?;
-            let tmlp = mlp(&scope, bp, tm2, &b.txt_fc1, &b.txt_fc2, seqr, dim, mlp_h)?;
+            let tmlp = mlp(
+                &scope, bp, tm2, &b.txt_fc1, &b.txt_fc2, seqr, dim, mlp_h, None, None,
+            )?;
             let txt = gate_residual(&scope, bp, txt, t_g2, tmlp, seqr, dim)?;
             let d = scope.import_copy(txt_nxt.as_buf_ref());
             scope.copy_buffer_to_buffer(txt, 0, d, 0, seqr as u64 * dim_row)?;
@@ -1385,7 +1685,7 @@ impl HunyuanDit {
         freqs_up: &WsBuf<WgpuBackend>,
         freq_stride: u32,
         silu_vec_ws: &WsBuf<WgpuBackend>,
-        tile: Option<&HunyuanTileBufs>,
+        tile: Option<(&HunyuanTileBufs, &HunyuanPreparedWeights)>,
         img_cur: &WsBuf<WgpuBackend>,
         txt_cur: &WsBuf<WgpuBackend>,
         img_nxt: &WsBuf<WgpuBackend>,
@@ -1401,7 +1701,7 @@ impl HunyuanDit {
         window: u32,
     ) -> Result<(), WgpuError> {
         match tile {
-            Some(tile) => {
+            Some((tile, ptw)) => {
                 self.block_tiled(
                     ws,
                     b,
@@ -1409,6 +1709,7 @@ impl HunyuanDit {
                     freq_stride,
                     silu_vec_ws,
                     tile,
+                    ptw,
                     img_cur,
                     txt_cur,
                     img_nxt,
@@ -1479,8 +1780,8 @@ impl HunyuanDit {
         let sv = scope.import_copy(silu_vec_ws.as_buf_ref());
 
         // modulation: [1, 6*dim] per stream from silu_vec.
-        let imodp = linear(&scope, bp, sv, &b.img_mod, 1, 6 * dim, dim, Site::Module)?;
-        let tmodp = linear(&scope, bp, sv, &b.txt_mod, 1, 6 * dim, dim, Site::Module)?;
+        let imodp = linear(&scope, bp, sv, &b.img_mod, 1, 6 * dim, dim, Site::Mod)?;
+        let tmodp = linear(&scope, bp, sv, &b.txt_mod, 1, 6 * dim, dim, Site::Mod)?;
         let isig = |k| mod_sig(&scope, bp, imodp, k, dim);
         let tsig = |k| mod_sig(&scope, bp, tmodp, k, dim);
         let (i_sh1, i_sc1, i_g1) = (isig(0)?, isig(1)?, isig(2)?);
@@ -1497,17 +1798,47 @@ impl HunyuanDit {
         let im_a = qkv_a_side(&scope, bp, im, n, dim)?;
         let tm_a = qkv_a_side(&scope, bp, tm, seqr, dim)?;
         let fq = scope.import_copy(freqs_up.as_buf_ref());
-        let iq = linear_a(&scope, bp, im_a, &b.img_q, n, dim, dim, Site::QkvSelf)?;
+        let iq = linear_a(&scope, bp, im_a, &b.img_q, n, dim, dim, Site::QkvSelf, None)?;
         let iq = qk_norm_rope(&scope, bp, iq, b.img_qn, Some(fq), n, heads, hd)?;
         let fq2 = scope.import_copy(freqs_up.as_buf_ref());
-        let ik = linear_a(&scope, bp, im_a, &b.img_k, n, dim, dim, Site::QkvSelf)?;
+        let ik = linear_a(&scope, bp, im_a, &b.img_k, n, dim, dim, Site::QkvSelf, None)?;
         let ik = qk_norm_rope(&scope, bp, ik, b.img_kn, Some(fq2), n, heads, hd)?;
-        let iv = linear_a(&scope, bp, im_a, &b.img_v, n, dim, dim, Site::QkvSelf)?;
-        let tq = linear_a(&scope, bp, tm_a, &b.txt_q, seqr, dim, dim, Site::QkvSelf)?;
+        let iv = linear_a(&scope, bp, im_a, &b.img_v, n, dim, dim, Site::QkvSelf, None)?;
+        let tq = linear_a(
+            &scope,
+            bp,
+            tm_a,
+            &b.txt_q,
+            seqr,
+            dim,
+            dim,
+            Site::QkvSelf,
+            None,
+        )?;
         let tq = qk_norm_rope(&scope, bp, tq, b.txt_qn, None, seqr, heads, hd)?;
-        let tk = linear_a(&scope, bp, tm_a, &b.txt_k, seqr, dim, dim, Site::QkvSelf)?;
+        let tk = linear_a(
+            &scope,
+            bp,
+            tm_a,
+            &b.txt_k,
+            seqr,
+            dim,
+            dim,
+            Site::QkvSelf,
+            None,
+        )?;
         let tk = qk_norm_rope(&scope, bp, tk, b.txt_kn, None, seqr, heads, hd)?;
-        let tv = linear_a(&scope, bp, tm_a, &b.txt_v, seqr, dim, dim, Site::QkvSelf)?;
+        let tv = linear_a(
+            &scope,
+            bp,
+            tm_a,
+            &b.txt_v,
+            seqr,
+            dim,
+            dim,
+            Site::QkvSelf,
+            None,
+        )?;
 
         // joint concat [img ; txt] for q/k/v.
         let img_bytes = (n * dim) as u64 * asz;
@@ -1534,10 +1865,14 @@ impl HunyuanDit {
 
         // --- MLP sublayer ---
         let im2 = norm_modulate(&scope, bp, img, i_sc2, i_sh2, n, dim)?;
-        let imlp = mlp(&scope, bp, im2, &b.img_fc1, &b.img_fc2, n, dim, mlp_h)?;
+        let imlp = mlp(
+            &scope, bp, im2, &b.img_fc1, &b.img_fc2, n, dim, mlp_h, None, None,
+        )?;
         let img = gate_residual(&scope, bp, img, i_g2, imlp, n, dim)?;
         let tm2 = norm_modulate(&scope, bp, txt, t_sc2, t_sh2, seqr, dim)?;
-        let tmlp = mlp(&scope, bp, tm2, &b.txt_fc1, &b.txt_fc2, seqr, dim, mlp_h)?;
+        let tmlp = mlp(
+            &scope, bp, tm2, &b.txt_fc1, &b.txt_fc2, seqr, dim, mlp_h, None, None,
+        )?;
         let txt = gate_residual(&scope, bp, txt, t_g2, tmlp, seqr, dim)?;
 
         let di = scope.import_copy(img_nxt.as_buf_ref());

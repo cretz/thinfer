@@ -123,10 +123,100 @@ SERVE REDEPLOYED 2026-07-03 (2nd time): hybrid default + job-lifecycle log
 lines (id/dims/seed/elapsed at info, NO prompt -- lost-tab seed recovery;
 the engine's diag generate-start stays muted in serve).
 
+LANDED 2026-07-03 PM (uncommitted, user directive: pick the fastest-at-quality
+model and drive it down; user vetoed FastWan as primary = quality too low at
+5B, so AnyFlow stays the target; FastWan wins banked anyway):
+- **FastWan 5B Q8_0 block transcode** (was bf16: ~9.8GB re-streamed per step at
+  480p = 3.5x streaming-bound vs its ~13s/step GPU compute; 81f 480p full-VAE
+  decode also OOMs at 6GB -> tiny VAE is the product path there). Parity gate
+  GREEN at 256 (vae_rgb slope 0.9426 vs 0.94 floor, same band edge as the bf16
+  baseline). LongLive split to its own `WanVariant::longlive_2_0_5b()` (keeps
+  bf16; its parity bands pin bf16 today).
+- **Per-block weight-prep hoist for the tiled Wan path** (`PreparedTileWeights`):
+  dispatch_matmul_site re-dequanted each block weight PER ACTIVATION TILE
+  (32x redundant at 81f: dequant_i8_qkv_self/ffn_up + dequant_f16_proj/
+  ffn_down = ~40s GPU of the 873s hybrid denoise, and the depth-2 tile
+  pipeline held two tiles' weight scratch in flight). Now dequanted once per
+  block into per-forward persistent buffers, filled alongside cross-K/V.
+  Plus act-quant-once for the shared q/k/v A-side (hunyuan qkv_a_side
+  pattern). GATED: forced-tiling (THINFER_DIT_TILE_ROWS=64) PNG BYTE-EXACT vs
+  pre-change baselines, fastwan(i8) + anyflow(coopmat/f16) legs, twice
+  (hoist, then +act-quant-once). MEASURED at 81f hybrid: blocks 872->845.5s
+  (pass_b 220->202s, pass_a 70->61s, fill overhead +2s). SDPA now 553s = 65%
+  of blocks; the ceiling verdict stands (CL/QR/WG A/Bs triangulate
+  issue-bound ALU; packed-f16 math is unsafe for QK products - do not
+  reopen). anyflow_e2e gained THINFER_E2E_PROMPT for quality eyeballs.
+- **Cold-start note: worklog NEXT item 4 is ALREADY DONE** - residency's
+  `prep_op` GPU-transcodes Bf16->Q8_0 whole-tensor at stream-in
+  (`WeightPrep::Q8_0FromBf16`, visible as q8_0_from_bf16 in the rollup);
+  no CPU cold transcode remains on the anyflow path.
+- Phase-split fact (81f hybrid telemetry + per-pipeline gpu_ms): SDPA 541s
+  (62%, at kernel ceiling), pass-B 220s (coopmat_ffn_down 73s + coopmat_proj
+  50s + i8_ffn_up 33s + dequants 40s), pass-A ~70s. i8 DP4A runs 11-12
+  TFLOPS-eff; coopmat 5-5.5 (see dead-end below: that IS its ceiling).
+  NB the rollup's sdpa_sg line under-reports (~13s total = impossible);
+  trust the W3-vs-full e2e delta (~2.6-2.8 TFLOPS-eff) for SDPA.
+
+**HYBRID EYEBALL DONE 2026-07-03 (agent-eyeballed, 81f 832x480 2-step, same
+seed/prompt A/B, drift-prone tracking-shot prompt): hybrid W=3 holds
+composition/scene (no W3-all-style cuts) but shows SLOW ATTRIBUTE DRIFT over
+5s (hat band appears, sunglasses appear, polka-dot scale grows, dog morphs
+breed, pavement dissolves to sand). FULL ATTENTION same seed: identity SOLID
+across all 81 frames. The drift is the WINDOW's, not the model's. NB the
+pixel-MAD drift metric called them equal (0.124 vs 0.120) -- it is blind to
+semantic attribute drift; eyeball remains the deciding gate. Tier map stands:
+hybrid ~14 min = stable-scene/soft-identity, full ~17 min = solid identity.
+Frames: scratch/anyflow_81f_eyeball{,_full}_png.**
+
+LANDED 2026-07-03 sprint (uncommitted, agents + gates; all clippy-clean):
+- **AnyFlow/Wan tiled**: deferred per-block setup (fill_mod+cross_kv+prepared
+  fill in ONE submit_deferred scope, SDPA fence chains into pass B: 3 hard
+  syncs/block removed, upper bound ~10s at 81f; the double-buffered
+  overlap variant was analyzed and DROPPED: submit-interleave hazard +
+  ~466MB reserve growth). **Tiled cross-attn K/V step-cache**
+  (WanCrossKvCache reused; per-expert caches on MoE; byte replay after step
+  0). Both scheduling/replay-only.
+- **Hunyuan Q8 mod linears: WIRED BUT DISABLED (gate red, then re-greened
+  dense)**: with the adaln Q8 wiring ON, dit_parity (default AND tiled) dies
+  in a wgpu device panic (wgpu_core.rs:2253 binding/validation, not a band
+  miss) while the tapless t2v_e2e passes -> suspect the taps/diag path or
+  the adaln dequant binding. The plumbing (Site::Mod, dequant_adaln,
+  reg_lin_q8) is committed but the two flip points are OFF (cfgs note in
+  hunyuan_block_cfgs + registration in DitH::register; they MUST flip
+  together). All hunyuan gates GREEN with it off. Fix + re-enable = next HY
+  session's first item; the prize below stands:
+  (worklog attack item 2): img_mod/txt_mod
+  -> Q8_0 dequant-once at the adaln site (new Site::Mod; NO i8 acts, weight
+  rounding only; ON under the default i8 config, THINFER_HY_I8=0 bisects).
+  T2V forward streams 2.37GiB less; AR chunk forwards 1.19GiB less (~10% of
+  the 13.5GB stream; ~30GiB less PCIe per 77f run). bf16 lightx2v takes the
+  GPU stream-in transcode; F32 minWM stays CPU (known follow-up).
+- **Wan full-VAE OOM fix**: temporal streaming already existed (diffusers
+  feat_cache form, exact); the bug was the spatial tile sizer seeding at
+  100% of budget with no margin/retry. Now: 0.82 seed safety + strict
+  budget + balanced re-seed on OOM (LTX pattern) + config-aware calibration
+  (Wan2.1 was over-reserving ~2.7x -> bigger tiles on the 169s path).
+  THINFER_VAE_MEM=1 telemetry.
+- **LTX** (audit agent): act-quant-once (-40% act_quant, -2112 disp/run),
+  step-invariant uploads hoisted out of the denoise loop (~45MB/step PCIe),
+  sst_out host-cached (2 blocking readbacks/step gone). Confirmed NO
+  per-tile weight re-prep bug in LTX; cross-attn K/V legitimately per-step
+  (sigma-modulated). Remaining LTX levers (NOT taken, need gates/sign-off):
+  dense matmul_qkv sites = 54.9s of ~105s DiT GPU; prompt-encode phase 61s
+  of 178s wall (streaming-bound, per-layer prefetch already optimal); VAE
+  OOM-retile heuristic.
+- **Wan2.2 MoE audit** (no code): LoRA fold = lazy per-tensor, compute-once
+  cache, NOT repeated across steps (verified vs step1-step2 delta = 62.5s
+  cold fold per expert); fold cache = ~15GB RAM per expert UNACCOUNTED
+  (~30GB both, held to request end). Designed-not-implemented: CPU-side
+  fold-warm of the low expert during high steps (~60s off step 3) +
+  fold-cache clear at the expert switch (frees ~15GB mid-request).
+
 NEXT (in order):
-1. USER EYEBALL: re-run the drifting prompt with attn-window=3 (now hybrid)
-   -- does the scene hold at ~14 min? Then the 4-step full-attention
-   cats/dog composition A/B (decides the quality tier).
+1. USER: pick the anyflow default story given the eyeball verdict above
+   (hybrid default is quality-honest for scenes without a tracked subject;
+   full attention is the identity tier). Then the 4-step full-attention
+   cats/dog composition A/B (decides the quality-ceiling tier).
 2. If the anyflow hybrid eyeball is good, run the same A/B for Wan2.2's
    default W=3 (its all-steps window has the same horizon mechanism).
 3. Artifact-retention TTL option (delete-on-fetch cost a clip to a closed
@@ -303,6 +393,15 @@ exactly what a few-step causal HY15 checkpoint would need.
 
 ## Lessons / dead-ends (do not retry)
 
+- **Coopmat shared-memory staging is a DEAD END (measured 2026-07-03):** a
+  multi-subgroup staged GEMM (ns 2x2..4x2, bk 16-64, llama.cpp shape) ran
+  3.2-5.0 TFLOPS vs the direct kernel's 6.3-7.2 at the production site shapes;
+  coopLoad from workgroup memory is strictly slower than L2-served global
+  coopLoad on naga 29 + NVIDIA. Register-tile sweeps are flat (1x1 ~= 2x2 ~=
+  4x4) -> the direct kernel is coopLoad-issue-bound, not reuse-bound; ~6-7
+  TFLOPS is naga-coopmat's practical ceiling on this card (i8 DP4A does 11-12).
+  Code reverted; only this note remains.
+
 - **Weight transcode must catch every float source encoding.**
   `register_linear_transcode`'s Q8 arm matched Bf16 ONLY; F32/F16 fell through
   to a DENSE registration while the site's quant pipeline read Q8 -> garbage
@@ -365,9 +464,18 @@ exactly what a few-step causal HY15 checkpoint would need.
 - **LTX-2.3 distilled + Sulphur-2** (22B joint AV) -- shipped, `ltx-plan.md`.
 - **FastWan2.2-TI2V-5B** -- parity GREEN; UniPC default. PENDING user eyeball
   of a UniPC clip vs the KingNish Space.
-- **LongLive-2.0-5B** (AR long/multi-shot) -- shipped. OPEN: AR perf wins
-  (upload window prefix once/chunk; cache cross-attn text K/V) -- re-measure
-  WARM at 576 first.
+- **LongLive-2.0-5B** (AR long/multi-shot) -- shipped. AR perf LANDED
+  2026-07-03 (uncommitted): per-request cross-attn text K/V cache
+  (`WanCrossKvCache`, byte-replay = bit-identical) + prefix segments written
+  directly into the window buffers (kills ~39GB/chunk host gather + GPU-GPU
+  copies; upload-once-per-chunk is INFEASIBLE: all-layer prefix K/V = 7.8GB >
+  card). Gates: longlive_e2e + multishot GREEN at THINFER_LL_BUDGET_GB=6 (the
+  8GB default OOMs on the 8GB card with today's desktop VRAM overhead).
+  **DISCOVERED: longlive_parity vel_c0s0 FAILS PRE-EXISTING at HEAD
+  (slope 0.9214 vs band 0.030, byte-identical with and without today's
+  changes, so today's work is exonerated). The gate is stale vs weeks of
+  kernel changes (f16 subgroup SDPA etc.); root-cause = bug-first item for
+  the next LongLive session.** OPEN: re-measure WARM at 576.
 - **Face-swap** -- shipped; NEXT = quality (XSeg + GFPGAN), `faceswap-plan.md`.
 - **Ideogram-4**, **Z-Image**, **Qwen-Image(-Edit)-Rapid** -- shipped.
 - **Wan2.2-T2V-A14B** -- shipped; attn-window default W=3 (long clips).

@@ -569,7 +569,7 @@ impl LocalExecutor {
                 &plan.shots,
                 vae,
                 true,
-                WanVariant::fastwan_ti2v_5b(),
+                WanVariant::longlive_2_0_5b(),
                 &progress,
                 &cancel,
             )
