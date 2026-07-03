@@ -4,31 +4,262 @@ Forward-looking only. Git history is the changelog, the code is the record.
 Engine-wide design: `plan-details.md`. Per-model plans are separate files (see
 Status). Scratch is ephemeral; nothing here depends on a scratch file.
 
-## NOW: causal TI2V (`hunyuan-video-1.5-ti2v`, see `hy15-causal-plan.md`)
+## NOW: AnyFlow perf (user directive 2026-07-02: "drive down perf here")
 
-Model is SHIPPED + serve-deployed: minWM WorldPlay `HY15/TI2V/dmd`, 4-step
-chunked-AR 8B HY1.5. Image OPTIONAL (with = I2V; without = TEXT-ONLY, validated
-sharp/coherent at 480p -- this is the fast-T2V play). Health gate green both
-modes. Naming follow-up: consider a `-distilled` suffix in the id (user, low).
+AnyFlow-Wan2.1-T2V-14B is PORTED + VALIDATED + SERVE-DEPLOYED (details in the
+track section below). 2-step quality at 480p is GORGEOUS on simple prompts.
+The problem is WALL TIME. **User's full serve run, 832x480x81f 2-step, seed
+4450053076214346960 (`scratch/browser-run/{log.txt,video.mp4}`): encode 7.5s,
+step 1 = 635.5s, step 2 = 609.8s, VAE 169s, total 1424s.**
+
+**ROOT-CAUSED 2026-07-02 (phase telemetry in `forward_block_tiled`, diag
+`tiled block phases` event): the 81f block is ~13.2s wall = SDPA 9.0s +
+pass-B (FFN+cross) 2.7s + pass-A 1.0s + streaming ~0.9s (overlapped).
+`sdpa_sg` at s=32760 full attention is ~22 TFLOP/block and runs at ~2.6
+TFLOPS-eff: INSTRUCTION-bound (per-key subgroupShuffleXor reduce chain +
+scalar softmax per Q row), NOT DRAM-bound (WG 128->256 halved K/V traffic,
+gained only 5%) and NOT streaming-bound (all four old suspects were minor).
+The user's "10s at 0% GPU" was Task Manager's 3D graph missing the compute
+queue.**
+
+LANDED (uncommitted, all clippy-clean; sdpa_sg conformance 13/13 GREEN):
+- Cross-attn Q -> i8 site (`QkvSite::CrossQ` shares the self-attn i8
+  pipelines; normed A-side). Was dense-pipeline, ~2.5s/block at 81f (~35% of
+  33f DiT GPU). K/V from un-normed text stay dense (unchanged).
+- sdpa_sg WG 128->256 (`SG_WG`, web-safe at the default 256 limit).
+- Depth-2 submit pipeline in the tiled block loop (pass A/B tiles submit
+  ahead one; transient reserve accounts 2 tiles). Neutral at 81f (SDPA
+  dominates) but strictly better; keep.
+- Web UI: attn-window row now visible for anyflow (blank = full attention).
+- Per-block phase telemetry (diag-gated) in `forward_block_tiled`. Needs
+  `RUST_LOG=info,thinfer::diag=debug` (THINFER_TRACE alone filters to info).
+Result: 81f block 15.9s -> ~12.8s (~16% e2e). W=3 attn-window opt-in cuts
+SDPA ~3x more (projected ~7.3s/block, ~750s total) -- USER EYEBALL gate
+(multi-subject risk, HY second-cat lesson).
+
+LANDED 2026-07-03 (uncommitted, clippy-clean):
+- **Tiny VAE (taew2_1) for AnyFlow, VALIDATED**: new manifest role
+  `TINY_VAE_WAN21` (`lightx2v/Autoencoders taew2_1.safetensors`, z16 patch-1,
+  same `decoder.{1..22}` keys as lighttaew2_2 -- the shared taehv decoder
+  needed ZERO graph changes); per-model tiny-role pick
+  (`VideoModelId::wan_tiny_vae_role`) in executor + request; web UI vae
+  dropdown un-pinned for anyflow. **CRITICAL latent-space fact: taew2_1
+  consumes the DiT's NORMALIZED latents as-is (TAESD convention); only the
+  lightx2v `lighttae*` retrains take the full-VAE `z*std+mean` denorm
+  (upstream gates on "lighttae" in the filename -- lightx2v pipeline.py).**
+  `WanVariant.tiny_vae_normed_latents` carries this; wrong transform =
+  washed-gray output (tiny-vs-full frame MAD 0.19 pre-fix -> 0.016 post-fix
+  at same latent). Env-gated e2e arm: `THINFER_E2E_TINY_VAE=1 anyflow_e2e`.
+  Decode 0.2s vs full 4.0s at 256x256x9f; kills the 169s VAE at 81f.
+- **Web bug fixed: anyflow request payload never sent `attnWindow`** (row was
+  visible but the spec omitted it -> W=3 silently ran full attention). Also
+  sends the vae choice now. NEEDS SERVE REBUILD+REDEPLOY before the user A/B.
+- `THINFER_SDPA_SG_CL` env override (models/common block compile) for the
+  CL=4 A/B; NOT bit-exact across CL (reduce order), gate like a kernel change.
+
+**DEAD END 2026-07-03: i8 SDPA for wan full attention -- measured ~10x
+SLOWER, do not enable.** At 832x480x33f (s=13,320) `sdpa_i8` = 16.6s/block
+vs ~1.5s f16 sdpa_sg (O(s^2)-scaled from the 9.0s/81f baseline). The kernel
+is thread-per-Q-row scalar unpack+fma (no dot4I8Packed, no subgroup co-op
+over D); a DP4A rewrite of the QK dot fixes <=40% of per-key work (the
+softmax-V accumulate can't dot4) and SDPA here is instruction-bound, so i8's
+halved K/V bytes buy nothing. Only an sdpa_sg-shaped subgroup i8 kernel
+could compete, and its only edge over f16 would be bandwidth we don't need.
+The wiring stays (off by default): `THINFER_WAN_I8_SDPA=1` env opt-in in
+wan/pipeline.rs; sdpa_i8 kernel gained Q-row chunking (`row0`) + dense
+f16/bf16 out modes, conformance 7/7 GREEN incl chunk-bit-exactness;
+`op_sdpa_impl` i8 branch now gates on paired inputs (dense callers fall
+through). Parity note: i8 latent was statistically EQUIVALENT to the f16
+baseline on FastWan video_e2e (pre-VAE slope 0.9866 vs 0.9835 baseline);
+only the chaotic vae_rgb band missed (0.9275 vs 0.94 floor; baseline itself
+passes by 0.0025). Numbers in scratch/{video_e2e_i8,video_e2e_base}.log.
+
+**SDPA kernel-tuning verdicts (2026-07-03, all at 832x480x81f, s=32760,
+vs the 9.0s/block CL=8/QR=1/WG256 baseline): the kernel is AT this card's
+practical full-attention ceiling. Do not re-try:**
+- CL=4 (2 shuffle hops, BR=64): sdpa 10.3s mean over 80 blocks = ~14%
+  SLOWER (more per-lane serial D work loses to the saved hop).
+- QR=2 (Q-register blocking, landed as `THINFER_SDPA_SG_QR`, default 1):
+  sdpa ~9.4s = neutral-to-4%-slower; the doubled q/o register set
+  (occupancy) ate the amortized K/V tile loads. Codegen + tests stay
+  (bit-exact vs QR=1; sdpa_sg conformance 16/16 GREEN incl
+  `sdpa_sg_qr2_bitexact_vs_qr1`); knob may help other adapters.
+- i8 SDPA: see DEAD END above (~10x slower).
+Remaining full-attention perf comes from changing the WORK, not the
+kernel: attn-window W=3 (opt-in, ~3x SDPA) and the steps dial.
+
+DONE 2026-07-03: **post-change 81f e2e GREEN** (832x480x81f 2-step, CL=4 +
+tiny VAE, 1183s test: denoise 1169s incl cold transcode, tiny-VAE decode
+6.6s (!) vs 169s full, latent std 1.058, video std 0.61, motion MAD 0.24,
+frames GORGEOUS -- red-car clip eyeballed at product dims,
+`scratch/anyflow_81f_cl4_png/`). At the deployed CL=8 kernel this implies
+~1010s denoise -> **~1070s total for 5s 480p with vae=tiny (was 1424s)**.
+
+SERVE REDEPLOYED 2026-07-03 (tiny-VAE + attnWindow/vae web fix live).
+**USER EYEBALL 2026-07-03, 832x480x81f 2-step W=3 vae=tiny (browser, seed
+10096709036188377068): PERF CONFIRMED -- encode 7.4s, steps 312.5s/299.7s,
+tiny VAE 10.7s, total 632s (~10.5 min; was 1424s). QUALITY FAILED: scene +
+wardrobe change every ~1-2s == the W=3 window horizon (21 latent frames,
++-3 visible ~= +-0.75s; frames beyond it share no attention path). Plain
+all-steps W=3 on AnyFlow = DEAD for temporal identity.** Same mechanism as
+the HY second-cat, expressed as drift.
+
+**HYBRID STEP-WINDOWING PROVEN + SHIPPED 2026-07-03 (anyflow default).**
+Engine A/B at 832x480x81f 2-step, same seed/prompt vs the full-attn red-car
+reference: drift (MAD-vs-frame0 at frame 80) = 0.120 full / 0.216 W3-all /
+**0.124 hybrid (step 0 full, W=3 from step 1)** -- hybrid RESTORES
+full-attention temporal consistency; frame-80 eyeball scene-stable. Denoise
+873s hybrid vs ~1030s full (CL8-normalized) vs 608s W3-all. Shipped as the
+AnyFlow arm's default (`step_attn_window(.., default_from=1)` in
+pipeline.rs): a user attn-window on anyflow now means "full step 0, then
+windowed". Wan2.2 keeps its shipped all-steps W=3 (default_from 0) until
+its own eyeball. `THINFER_WAN_WINDOW_FROM_STEP` env overrides both; e2e
+takes `THINFER_E2E_ATTN_WINDOW`. No new user flag -> CLI/web parity holds
+by construction. PNG evidence: `scratch/anyflow_81f_{cl4,w3all,hybrid}_png`.
+**User tier map (5s 480p, tiny VAE): ~10.5 min W3-all (BROKEN quality),
+~14 min hybrid W=3, ~17.5 min full attention.**
+
+SERVE REDEPLOYED 2026-07-03 (2nd time): hybrid default + job-lifecycle log
+lines (id/dims/seed/elapsed at info, NO prompt -- lost-tab seed recovery;
+the engine's diag generate-start stays muted in serve).
+
+NEXT (in order):
+1. USER EYEBALL: re-run the drifting prompt with attn-window=3 (now hybrid)
+   -- does the scene hold at ~14 min? Then the 4-step full-attention
+   cats/dog composition A/B (decides the quality tier).
+2. If the anyflow hybrid eyeball is good, run the same A/B for Wan2.2's
+   default W=3 (its all-steps window has the same horizon mechanism).
+3. Artifact-retention TTL option (delete-on-fetch cost a clip to a closed
+   tab 2026-07-03): offered to user, no decision yet.
+4. GPU bf16->Q8 transcode prep kernel exists already (`Q8_0FromBf16`); NB
+   measured: umT5 + cold transcode + first-block prep = ~12 min wall in
+   the e2e harness (serve first-touch overlap is much cheaper, ~26s
+   step-1-vs-2 delta) -- localize only if cold-start matters.
+5. Consider default vae=tiny for anyflow in web UI (CLI already defaults
+   Tiny) -- 81f tiny eyeball GREEN engine-side (red-car frames + user clip
+   decode); full stays the parity path.
+
+**Pin-plan lesson (3 device losses 2026-07-02, reverted): do NOT pin a
+weight slice when the working set >> VRAM budget.** Pinning starves the
+same-size recycle scan -> arbiter reclaim during in-flight compute ->
+deferred-destroy zombies -> physical VRAM overshoots the accounted budget ->
+device lost (at 4.2G/3.2G/2.1G pins alike, 8GB card). The fully-streamed
+steady state (same-size recycle, zero frees) is the stable regime. Z-Image
+keeps its pin plan (whole DiT fits). See the NO-pin comment in
+`wan/pipeline.rs::denoise_with`.
+
+**Quality note (2-step, hard prompt):** rendering superb, COMPOSITION wrong:
+two cats, pianist cat has human hands + sneakered feet, dog limbs smear in
+motion (`scratch/browser-run/video.mp4`). Decisive A/B queued: SAME seed +
+prompt at 4 steps -- if composition heals, steps is the user's quality dial
+(already exposed); if not, it's the model's multi-subject ceiling. Rides the
+post-deploy user browser run.
+
+## HY15 TI2V: PARKED (user decision made 2026-07-02)
+
+User picked ANCHOR SYNTHESIS for the TI2V fast-T2V path: text request ->
+in-engine t2i makes frame 0 (Z-Image turbo; derive image prompt from the
+motion prompt, rewriter machinery is the natural place) -> run the model in
+its trained I2V regime. RENAME the model id honestly (it is I2V, optionally
+fronted by t2i -- user: "don't call it ti2v"). Prereq: one I2V 77f pixel
+validation (latent trend says mild decelerating drift, needs eyeball).
+Do AFTER the AnyFlow perf push. TI2V perf items (Q8 mod linears, prefix
+pinning) fold into the same engine work above. Drift root-cause record is in
+the section below; do not reopen it.
+
+## AnyFlow-Wan2.1-T2V-14B: SHIPPED reference (ported 2026-07-02)
+
+Any-step flow-map distill; steps USER-CONFIGURABLE (CLI+serve+web, done).
+LOW-RAM pyref policy honored (component pyref; block-streaming full-DiT pyref
+is a follow-up).
+FACTS ESTABLISHED (from third-party/AnyFlow + diffusers main
+transformer_anyflow.py + HF configs, all verified):
+- Arch = stock Wan2.1-14B (= `WanDitConfig::wan22_14b()` exactly; Wan2.1 VAE,
+  umT5-xxl, diffusers tensor names -> NO rename layer needed). 1099 tensors.
+- ONLY delta: `condition_embedder.delta_embedder.linear_{1,2}` (a second
+  TimestepEmbedding fed sincos(r)); rt_emb = 0.75*temb(t) + 0.25*delta(r)
+  (gate_value=0.25 config const, deltatime_type="r"); timestep_proj =
+  time_proj(silu(rt_emb)); rt_emb also feeds final-layer modulation. Blend =
+  BcastMul x2 + add (rows=1).
+- Scheduler: linspace(1,0,steps+1), sigma-shift 5 (same formula as ours),
+  x -= (sigma_t - sigma_r)*v == our standard Euler; ONLY new input: r =
+  next sigma*1000 passed to the DiT per forward. guidance 1 (no CFG). Demo:
+  480x832x81f, 4 steps, fps 16, seed via torch Generator.
+- Weights: transformer/ 3 bf16 shards IN HF CACHE (27GB). umT5+VAE reuse
+  the existing FastWan bundle roles (Wan2.1 VAE in/out=16).
+- License NSCLv1 (noncommercial) - user informed 2026-07-02.
+IMPLEMENTED (2026-07-02, all compiling clean, uncommitted): WanDitConfig
+`delta_embedder` flag + `anyflow_t2v_14b()`; ConditionEmbedder optional
+delta MLP + gated blend (GATE_VALUE 0.25, `gated_blend` via BcastMul/Add);
+WanDitInputs.r_timestep (None on all legacy paths); AnyFlowSampler
+(scheduler.rs, unit-tested incl 2-step grid [1000, 833.3]); pipeline AnyFlow
+arm gated on cfg.delta_embedder (steps from params.steps, taps for parity);
+WanVariant::anyflow_t2v_14b (Q8_0 block_transcode, bf16 acts, Wan2.1 VAE);
+manifest roles DIT_ANYFLOW_1..3 + variant "anyflow-t2v-14b"; VideoModelId::
+AnyflowT2v14b + executor arm + defaults (832x480, 16fps, wan22 cell cap);
+web UI entry (steps visible, uncapped; vae pinned full). `--steps` already
+existed CLI+wire (UniPC's), now feeds AnyFlow too. Conformance:
+`tests/wan/anyflow_e2e.rs` (embedder parity vs
+`gen_anyflow_embedder_ref.py` fp32 pyref -- low-RAM: reads only
+condition_embedder tensors -- + engine health at 256x256x9f 2-step + PNGs).
+VALIDATED 2026-07-02: `anyflow_e2e` GREEN (embedder parity slope 1.0008
+rel_rmse 2.3e-4 vs fp32 pyref; 256x256x9f 2-step health 70s incl transcode).
+832x480x33f 2-step eyeball: GORGEOUS (sharp coherent prompt-faithful car
+clip; denoise 375s incl cold bf16->Q8 transcode, VAE 67s;
+`scratch/anyflow_480p_png/`). One maiden-run bug found+fixed engine-wide:
+dtype probe read the SOURCE encoding while registration transcoded blocks ->
+Q8/bf16 pipeline mismatch -> NaN; `load_variant` now derives dit_w from
+`variant.block_transcode` first. Serve REDEPLOYED with AnyFlow (steps field
+live in web UI). FastWan video_e2e full-parity regression GREEN 2026-07-02
+("parity OK vs pyref", all bands) -- legacy Wan models proven untouched.
+Follow-ups: block-streaming full-DiT pyref; 81f long-clip quality verdict
+(user run in flight at /clear time).
+
+## HY15 TI2V drift: ROOT-CAUSED + CLOSED (2026-07-02, reference record)
+
+Controls at 832x480 (all same seed/prompt, 45f/3-chunk latent-trend harness,
+`THINFER_E2E_SKIP_DECODE=1 THINFER_AR_DIAG=1`):
+- text-only shipping: latent std/chunk 1.256 -> 1.413 -> 1.580 (+12%/chunk)
+- text-only PURE BF16: 1.259 -> 1.417 -> 1.592 (IDENTICAL -> quant innocent;
+  f16 SDPA also exonerated by kernel read: all-f32 accumulators)
+- I2V (frame-0 anchor): 1.145 -> 1.259 -> 1.335 (+10%, +6%, DECELERATING ->
+  anchor damps; commit-KV telemetry: cache K flat, cache V inflates at deep
+  blocks, block53 v_std +13% by chunk 2)
+Mechanism: unanchored text-only AR rollout at product dims (OOD mode for the
+i2v-trained dmd ckpt; 33 txt tokens vs 6240 img tokens/chunk can't anchor).
+448x256 is clean (img:txt ratio 3.5x smaller). **Recache-T mitigation DEAD
+(2026-07-02): `THINFER_HY_RECACHE_T` (env, plumbed in ar.rs) at 250 gives
+1.479/1.653, at 15 gives 1.441/1.620 -- BOTH WORSE than baseline 1.413/1.580.
+Upstream's stabilization knob amplifies, never damps, this drift.** No engine
+bug: quant/f16-SDPA/faithfulness all exonerated. Remaining product options
+(USER DECIDES at wrap-up): (a) ship with guidance (text-only good to ~45f at
+480p, I2V for longer), (b) validate I2V 77f pixels (trend says mild) and make
+I2V the long-clip recommendation, (c) anchor-synthesis chain (image model
+makes frame 0 -> I2V) as a new feature.
+Drift metric harness: `scratch/drift_stats.py` (pixels) + in-log per-chunk
+latent/commit-KV stats. Perf note: img-only acquire measured ~2.5x on chunk
+denoise (23min/5chunks@480p). OOM guard: 6GB VRAM budget OOMs at chunk-5 KV
+alloc at 77f/480p; 5GB works.
 
 **>>> BUG FIRST (before perf): progressive AR drift.** User's 77f (5-chunk)
 browser run: chunk 1 GORGEOUS (dancing dog, better than the old T2V eyeballs),
-then saturation/contrast blows up chunk-over-chunk into chaos by chunks 4-5.
-2-chunk runs only hint at it (chunk 2 slightly punchier). Mechanism: the AR
-loop feeds each chunk's outputs back through the KV cache, so per-chunk
-numerical error COMPOUNDS (the T2V has no feedback loop). **BISECTED: pure
-bf16 (`THINFER_HY_I8=0 THINFER_NO_COOPMAT=1`) at 448x256x77f (5 chunks) is
-CLEAN through the last frame (`scratch/drift_bf16_png/`), so the amplifier is
-QUANTIZATION NOISE (i8 DP4A qkv/ffn_up + Q8-coopmat proj/ffn_down + f16 SDPA)
-recycling through the cache -- NOT a structural AR bug.** Fix directions, in
-preference order: (1) find WHICH quant site dominates (bisect i8-only vs
-coopmat-only vs f16-sdpa-only at 5 chunks) and disable just that site for this
-model; (2) recache-forward-only at full precision (the cache entries are what
-compound; denoise forwards can stay quant) -- likely the cheapest good fix;
-(3) all-bf16 for this model (works but slower + more streaming). Caveat: the
-bf16-clean run was tiny-dims; confirm the chosen fix at 832x480x77f. Also
-check upstream `stabilization_level > 1` (their knob for this drift class).
-Repro frames from the user's mp4: `scratch/crazy_frames/`.
+then saturation/contrast blows up chunk-over-chunk into chaos by chunks 4-5
+(`scratch/crazy_frames/`). **The quant-noise theory is DEAD: the SHIPPING
+config (i8+coopmat+f16 SDPA) at 448x256x77f T2V-probe is CLEAN and
+statistically identical to the pure-bf16 run (contrast 0.13->0.23, clip
+1.5%->14% in BOTH; `scratch/drift_ship_png/` vs `drift_bf16_png/`,
+`scratch/drift_stats.py` is the metric). The earlier bisect lacked a positive
+control; everything is clean at tiny dims.** Drift is REGIME-dependent:
+resolution/KV-length (tokens/frame 390 -> 1560, s_k to ~32k rows where f16
+SDPA + bf16 KV cache errors have 4x the accumulation length) and/or
+content/prompt. IN FLIGHT: shipping-config repro at 832x480x77f T2V-probe
+(duck prompt). If it reproduces -> bisect AT PRODUCT DIMS (i8-only vs
+coopmat-only vs no-fast-sdpa). If clean -> content/prompt-dependent; add a
+prompt override to the health test and retry with a motion-heavy prompt.
+Mild clip%/contrast growth (to ~14% by chunk 5) exists even in pure bf16 and
+is visually harmless; the discriminator is growth RATE (crazy frames hit 62%
+clip). Upstream `stabilization_level` is 1 in every minWM config (= recache
+t=0, what we do); >1 is a mitigation lever, not a faithfulness gap.
 
 **It is currently WEIGHT-STREAMING BOUND, not compute bound: ~11min for 29f
 (2 chunks) at 480p. Each of the `chunks*(4+1)` AR forwards re-streams all 54
@@ -36,9 +267,9 @@ blocks (~13.5GB mixed Q8/bf16) for only 6,240 rows of compute; the T2V's single
 32,760-row forwards hide the same stream, chunk forwards can't. Attack in this
 order:**
 
-1. **Skip the txt-side weights in chunk forwards.** `forward_chunk` acquires
-   whole blocks but uses ONLY the img-side (img_mod/q/k/v/proj/fc1/fc2 + norms);
-   txt weights are needed once (txt pass). ~2x per-forward traffic for free.
+1. **DONE (uncommitted): skip txt-side weights in chunk forwards**
+   (`acquire_img_block` in ar.rs; numerics-neutral). Perf A/B rides the
+   in-flight 480p run vs the old 694s/2-chunk measurement.
 2. **Q8 the modulation linears.** img_mod/txt_mod are `[12288, 2048]` = ~2.7B
    of the 8.3B params, currently dense bf16 (Module site). Dequant-once or
    direct-quant path cuts ~2.7GB/forward more.

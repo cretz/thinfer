@@ -319,13 +319,15 @@ impl VideoRequest {
                 .collect();
         }
         let mut files: Vec<FileRef> = self.model.variant().files().map(|(_, f)| *f).collect();
-        // `TinyFt` (Hunyuan-only) degrades to Wan's tiny decoder here.
+        // `TinyFt` (Hunyuan-only) degrades to Wan's tiny decoder here. The role
+        // is per-model: the tiny decoder must match the variant's VAE latent
+        // space (taew2_1 for the z16 AnyFlow, lighttaew2_2 for the z48 line).
         if matches!(self.vae, VaeChoice::Tiny | VaeChoice::TinyFt) {
             files.push(
                 *self
                     .model
                     .manifest()
-                    .get(thinfer_models::wan::manifest::role::TINY_VAE)
+                    .get(self.model.wan_tiny_vae_role())
                     .ok_or("manifest missing tiny VAE role")?,
             );
         }

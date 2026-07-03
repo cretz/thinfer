@@ -36,6 +36,11 @@ const REPO_WAN22_LORA: &str = "lightx2v/Wan2.2-Distill-Loras";
 /// `Wan2.1_VAE.safetensors`, but in ORIGINAL-Wan naming (`decoder.middle.*`,
 /// `decoder.conv1`), which the engine's diffusers-named VAE loader can't read.
 const REPO_WAN22_DIFFUSERS: &str = "Wan-AI/Wan2.2-T2V-A14B-Diffusers";
+/// nvidia AnyFlow-Wan2.1-T2V-14B: any-step flow-map distill, Diffusers layout
+/// (3 bf16 DiT shards). umT5 + tokenizer reuse the FastVideo bundle; the VAE is
+/// the Wan2.1 one (diffusers naming, from the Wan2.2-A14B diffusers repo).
+/// License: NVIDIA NSCLv1 (noncommercial).
+const REPO_ANYFLOW: &str = "nvidia/AnyFlow-Wan2.1-T2V-14B-Diffusers";
 
 pub mod role {
     /// DMD-distilled Wan2.2-TI2V-5B DiT (`WanTransformer3DModel`), single file.
@@ -63,8 +68,19 @@ pub mod role {
     pub const LORA_HIGH_NOISE: &str = "lora/wan22_high";
     pub const LORA_LOW_NOISE: &str = "lora/wan22_low";
     pub const SCHEDULER_CONFIG: &str = "scheduler/config";
-    /// LightTAE (`lighttaew2_2`) opt-in tiny decoder, single file.
+    /// LightTAE (`lighttaew2_2`) opt-in tiny decoder, single file. Pairs with
+    /// the Wan2.2 z48 VAE (FastWan/LongLive).
     pub const TINY_VAE: &str = "vae/tiny";
+    /// TAEHV `taew2_1` (madebyollin, mirrored in the lightx2v autoencoder
+    /// repo) opt-in tiny decoder for the Wan2.1 z16 VAE (AnyFlow). Same
+    /// decoder graph + `decoder.{1..22}` keys as `lighttaew2_2`; only z_dim
+    /// (16) and patch (1 -> 8x spatial, no pixel shuffle) differ, both
+    /// carried by the variant's `WanVaeConfig`.
+    pub const TINY_VAE_WAN21: &str = "vae/tiny-wan21";
+    /// AnyFlow-Wan2.1-T2V-14B DiT, 3 bf16 safetensors shards.
+    pub const DIT_ANYFLOW_1: &str = "dit/anyflow1";
+    pub const DIT_ANYFLOW_2: &str = "dit/anyflow2";
+    pub const DIT_ANYFLOW_3: &str = "dit/anyflow3";
 }
 
 /// One loadable variant: the file set `WanModel::load` needs. Mirrors
@@ -117,6 +133,18 @@ const WAN22_TAIL_ROLES: &[&str] = &[
     role::VAE_WAN21,
 ];
 
+/// AnyFlow: 3 DiT shards lead (ShardedSafetensorsSource order: DiT first),
+/// then the umT5 shards + the Wan2.1 VAE.
+const ANYFLOW_WEIGHT_ROLES: &[&str] = &[
+    role::DIT_ANYFLOW_1,
+    role::DIT_ANYFLOW_2,
+    role::DIT_ANYFLOW_3,
+    role::TEXT_ENCODER_SHARD_1,
+    role::TEXT_ENCODER_SHARD_2,
+    role::TEXT_ENCODER_SHARD_3,
+    role::VAE_WAN21,
+];
+
 pub static VARIANTS: &[VariantFiles] = &[
     VariantFiles {
         id: "fastwan-ti2v-5b",
@@ -133,6 +161,16 @@ pub static VARIANTS: &[VariantFiles] = &[
         weight_roles: LONGLIVE_WEIGHT_ROLES,
         aux_roles: AUX_ROLES,
         dit_pt_role: Some(role::LONGLIVE_DIT),
+        gguf_high_role: None,
+        gguf_low_role: None,
+        lora_high_role: None,
+        lora_low_role: None,
+    },
+    VariantFiles {
+        id: "anyflow-t2v-14b",
+        weight_roles: ANYFLOW_WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_pt_role: None,
         gguf_high_role: None,
         gguf_low_role: None,
         lora_high_role: None,
@@ -205,6 +243,27 @@ pub static MANIFEST: ModelManifest = ModelManifest {
             FileRef::new(REPO_LONGLIVE, "model_bf16.pt"),
         ),
         (
+            role::DIT_ANYFLOW_1,
+            FileRef::new(
+                REPO_ANYFLOW,
+                "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+            ),
+        ),
+        (
+            role::DIT_ANYFLOW_2,
+            FileRef::new(
+                REPO_ANYFLOW,
+                "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+            ),
+        ),
+        (
+            role::DIT_ANYFLOW_3,
+            FileRef::new(
+                REPO_ANYFLOW,
+                "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+            ),
+        ),
+        (
             role::TEXT_ENCODER_INDEX,
             FileRef::new(REPO_DIFFUSERS, "text_encoder/model.safetensors.index.json"),
         ),
@@ -256,6 +315,10 @@ pub static MANIFEST: ModelManifest = ModelManifest {
         (
             role::TINY_VAE,
             FileRef::new(REPO_LIGHTX2V_AE, "lighttaew2_2.safetensors"),
+        ),
+        (
+            role::TINY_VAE_WAN21,
+            FileRef::new(REPO_LIGHTX2V_AE, "taew2_1.safetensors"),
         ),
         // --- Wan2.2-T2V-A14B (MoE) ---
         (

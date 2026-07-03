@@ -95,7 +95,7 @@ impl QwenImageDitPipelines {
             let sdpa_wgsl = format!(
                 "{}{}",
                 backend.subgroup_enable_directive(),
-                thinfer_core::ops::sdpa::build_f16_sg_wgsl(cl),
+                thinfer_core::ops::sdpa::build_f16_sg_wgsl(cl, 1),
             );
             let sdpa = backend
                 .create_pipeline(
@@ -642,6 +642,7 @@ fn block_attn<'wsp>(
                 u,
                 sa_f16.data,
                 fast.cl,
+                1,
                 1,
                 joint,
                 heads,

@@ -408,6 +408,7 @@ async fn video_e2e_safetensors() {
         // Parity gate: the DMD reference schedule (step-diag taps are DMD-only).
         sampler: VideoSampler::Dmd,
         attn_window,
+        steps: None,
     };
 
     // Step-0 stage telemetry (magnitudes only; no reference). Localizes a

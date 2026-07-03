@@ -195,13 +195,16 @@ async fn i2v_e2e_health() {
     // all; a scene prompt replaces the motion prompt so there is something to
     // depict.
     let t2v_probe = std::env::var("THINFER_I2V_T2V_PROBE").is_ok_and(|v| v != "0");
-    let prompt = if t2v_probe {
+    // `THINFER_E2E_PROMPT` overrides (drift is content-dependent; a motion-heavy
+    // prompt stresses the AR cache harder than the static probe scenes).
+    let prompt_env = std::env::var("THINFER_E2E_PROMPT").ok();
+    let prompt = prompt_env.as_deref().unwrap_or(if t2v_probe {
         "A single bright yellow rubber duck floats on calm deep-blue water, \
          gentle ripples spreading outward, soft daylight, realistic style, \
          static camera."
     } else {
         PROMPT
-    };
+    });
 
     // --- text encode (real engine encoder, same template/crop as the app) ---
     let t0 = Instant::now();
@@ -362,6 +365,14 @@ async fn i2v_e2e_health() {
         t0.elapsed().as_secs_f32()
     );
     assert!(lat_std > 0.05, "denoised latent degenerate (std {lat_std})");
+
+    // `THINFER_E2E_SKIP_DECODE=1`: drift-bisect mode. The latent-domain
+    // per-chunk stats (`THINFER_AR_DIAG=1`) carry the drift verdict; skipping
+    // the full-VAE decode cuts ~15-20 min per run at product dims.
+    if std::env::var("THINFER_E2E_SKIP_DECODE").is_ok_and(|v| v != "0") {
+        eprintln!("skipping VAE decode (THINFER_E2E_SKIP_DECODE)");
+        return;
+    }
 
     // --- VAE decode + health checks ---
     let t0 = Instant::now();

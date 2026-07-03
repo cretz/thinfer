@@ -242,9 +242,92 @@ impl Wan22DistillSampler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AnyFlow any-step flow-map sampler (nvidia AnyFlow-Wan2.1)
+// ---------------------------------------------------------------------------
+
+/// AnyFlow flow-map Euler sampler (`FlowMapDiscreteScheduler` +
+/// `WanAnyFlowPipeline`): the USER picks the step count (the whole point of the
+/// any-step distill); sigmas are `linspace(1, 0, steps+1)` through the same
+/// flow shift as [`Wan22DistillSampler`] (shift 5 from `scheduler_config.json`,
+/// `shifted(0) = 0` so shifting the closed grid matches upstream's
+/// shift-then-append-zero). Each forward gets BOTH the current timestep and the
+/// TARGET timestep `r = timestep(i+1)`: the model predicts the average velocity
+/// over `[r, t]` and the step is exact displacement `x -= (sigma_i -
+/// sigma_{i+1}) * v`. CFG-free (guidance 1).
+pub struct AnyFlowSampler {
+    /// Shifted sigmas over the closed grid, length `steps + 1` (last = 0).
+    sigmas: Vec<f32>,
+    num_train_timesteps: f32,
+}
+
+impl AnyFlowSampler {
+    pub const SHIFT: f32 = 5.0;
+    pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
+
+    pub fn new(steps: usize) -> Self {
+        assert!(steps >= 1, "AnyFlow needs at least one step");
+        let shift = Self::SHIFT;
+        let sigmas = (0..=steps)
+            .map(|i| {
+                let s = 1.0 - i as f32 / steps as f32;
+                shift * s / (1.0 + (shift - 1.0) * s)
+            })
+            .collect();
+        Self {
+            sigmas,
+            num_train_timesteps: Self::NUM_TRAIN_TIMESTEPS,
+        }
+    }
+
+    pub fn num_steps(&self) -> usize {
+        self.sigmas.len() - 1
+    }
+
+    /// Model timestep `t` fed to the DiT at step `i`.
+    pub fn timestep(&self, i: usize) -> f32 {
+        self.sigmas[i] * self.num_train_timesteps
+    }
+
+    /// Flow-map TARGET timestep `r` fed to the DiT at step `i` (the next grid
+    /// point; 0 on the last step).
+    pub fn r_timestep(&self, i: usize) -> f32 {
+        self.sigmas[i + 1] * self.num_train_timesteps
+    }
+
+    /// Flow-map Euler step: `x_{i+1} = x_i - (sigma_i - sigma_{i+1}) * velocity`.
+    pub fn step(&self, i: usize, velocity: &[f32], sample: &[f32]) -> Vec<f32> {
+        assert_eq!(
+            velocity.len(),
+            sample.len(),
+            "velocity/sample length mismatch"
+        );
+        let d = self.sigmas[i] - self.sigmas[i + 1];
+        sample
+            .iter()
+            .zip(velocity)
+            .map(|(&x, &v)| x - d * v)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anyflow_two_step_schedule() {
+        let s = AnyFlowSampler::new(2);
+        assert_eq!(s.num_steps(), 2);
+        // sigma grid [1, .5, 0] shifted (shift 5): [1, .8333, 0].
+        assert!((s.timestep(0) - 1000.0).abs() < 0.1);
+        assert!((s.timestep(1) - 833.3333).abs() < 0.1);
+        assert!((s.r_timestep(0) - 833.3333).abs() < 0.1);
+        assert!(s.r_timestep(1).abs() < 1e-6);
+        // One full-displacement step from x=1 with v=1: x -= (1-.8333)*1.
+        let out = s.step(0, &[1.0], &[1.0]);
+        assert!((out[0] - (1.0 - (1.0 - 0.833_333_3))).abs() < 1e-5);
+    }
 
     #[test]
     fn wan22_distill_shifted_schedule() {

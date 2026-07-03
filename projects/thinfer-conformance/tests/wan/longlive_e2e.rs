@@ -156,6 +156,7 @@ async fn longlive_e2e_ar() {
         // AR path drives its own UniPC; this field is ignored here.
         sampler: VideoSampler::default(),
         attn_window: None,
+        steps: None,
     };
     let progress = |_ev: thinfer_models::wan::pipeline::ProgressEvent| {};
     let video = model

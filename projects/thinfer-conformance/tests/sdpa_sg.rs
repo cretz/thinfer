@@ -64,6 +64,7 @@ fn cpu_ref(
 #[allow(clippy::too_many_arguments)]
 async fn try_run(
     cl: u32,
+    r: u32,
     b: u32,
     h_q: u32,
     h_kv: u32,
@@ -142,7 +143,7 @@ async fn try_run(
     let pipeline = backend
         .create_pipeline(
             "sdpa_sg_conf",
-            &build_f16_sg_wgsl(cl),
+            &build_f16_sg_wgsl(cl, r),
             "main",
             <SdpaF32 as SdpaOp>::layout(),
         )
@@ -162,7 +163,7 @@ async fn try_run(
             &mut enc,
             &pipeline,
             &bindings,
-            f16_sg_workgroups(cl, b, s_q, h_q),
+            f16_sg_workgroups(cl, r, b, s_q, h_q),
         )
         .expect("dispatch");
     backend.submit(enc).await.expect("submit");
@@ -197,6 +198,7 @@ async fn try_run(
 #[allow(clippy::too_many_arguments)]
 async fn try_run_windowed(
     cl: u32,
+    r: u32,
     s_q: u32,
     s_k: u32,
     d: u32,
@@ -279,7 +281,7 @@ async fn try_run_windowed(
     let pipeline = backend
         .create_pipeline(
             "sdpa_sg_win_conf",
-            &build_f16_sg_windowed_wgsl(cl),
+            &build_f16_sg_windowed_wgsl(cl, r),
             "main",
             <SdpaF32 as SdpaOp>::layout(),
         )
@@ -299,7 +301,7 @@ async fn try_run_windowed(
             &mut enc,
             &pipeline,
             &bindings,
-            f16_sg_workgroups(cl, b, s_q, h_q),
+            f16_sg_workgroups(cl, r, b, s_q, h_q),
         )
         .expect("dispatch");
     backend.submit(enc).await.expect("submit");
@@ -339,6 +341,7 @@ fn sdpa_chunk_rows_f16(s_k: u32) -> u32 {
 #[allow(clippy::too_many_arguments)]
 async fn try_run_windowed_chunked(
     cl: u32,
+    r: u32,
     s_q: u32,
     s_k: u32,
     d: u32,
@@ -403,7 +406,7 @@ async fn try_run_windowed_chunked(
     let pipeline = backend
         .create_pipeline(
             "sdpa_sg_win_chunked_conf",
-            &build_f16_sg_windowed_wgsl(cl),
+            &build_f16_sg_windowed_wgsl(cl, r),
             "main",
             <SdpaF32 as SdpaOp>::layout(),
         )
@@ -451,7 +454,7 @@ async fn try_run_windowed_chunked(
                 &mut enc,
                 &pipeline,
                 &bindings,
-                f16_sg_workgroups(cl, b, rows, h_q),
+                f16_sg_workgroups(cl, r, b, rows, h_q),
             )
             .expect("dispatch");
         backend.submit(enc).await.expect("submit");
@@ -501,22 +504,71 @@ fn assert_dense_close(got: &[f32], exp: &[f32], rel_tol: f32, abs_tol: f32, labe
 #[test]
 fn sdpa_sg_wgsl_sanity() {
     for cl in [4u32, 8] {
-        let src = build_f16_sg_wgsl(cl);
-        assert!(src.contains("enable f16"));
-        // Build sites prepend the web-only `enable subgroups;` directive.
-        assert!(!src.contains("enable subgroups"));
-        assert!(src.contains(&format!("const CL: u32 = {cl}u")));
-        // Cluster dot-reduce; present in any form of this kernel.
-        assert!(src.contains("subgroupShuffleXor"));
-        // The dense kernel has no window machinery.
-        assert!(!src.contains("u.window"));
-        let win = build_f16_sg_windowed_wgsl(cl);
-        assert!(win.contains("period: u32, window: u32, row_off: u32, txt_start: u32"));
-        assert!(win.contains("u.window"));
-        assert!(win.contains("u.txt_start"));
-        assert!(win.contains("subgroupShuffleXor"));
+        for r in [1u32, 2, 4] {
+            let src = build_f16_sg_wgsl(cl, r);
+            assert!(src.contains("enable f16"));
+            // Build sites prepend the web-only `enable subgroups;` directive.
+            assert!(!src.contains("enable subgroups"));
+            assert!(src.contains(&format!("const CL: u32 = {cl}u")));
+            assert!(src.contains(&format!("const R: u32 = {r}u")));
+            // Cluster dot-reduce; present in any form of this kernel.
+            assert!(src.contains("subgroupShuffleXor"));
+            // The dense kernel has no window machinery.
+            assert!(!src.contains("u.window"));
+            let win = build_f16_sg_windowed_wgsl(cl, r);
+            assert!(win.contains("period: u32, window: u32, row_off: u32, txt_start: u32"));
+            assert!(win.contains("u.window"));
+            assert!(win.contains("u.txt_start"));
+            assert!(win.contains("subgroupShuffleXor"));
+        }
     }
     assert_eq!(<SdpaF32 as SdpaOp>::layout().len(), 6);
+}
+
+#[test]
+fn sdpa_sg_qr2() {
+    // Q-register blocking (R=2 rows per lane cluster) vs reference; 96 rows
+    // exercises a ragged final cluster row (96 % BR(64) != 0).
+    let Some((got, exp)) =
+        pollster::block_on(try_run(8, 2, 1, 1, 1, 96, 64, 128, true, 0x5D9A_9002))
+    else {
+        return;
+    };
+    assert_dense_close(&got, &exp, 6e-2, 3e-3, "sdpa_sg_qr2");
+}
+
+#[test]
+fn sdpa_sg_qr2_bitexact_vs_qr1() {
+    // R only re-associates WORK, not math: each row's f32 accumulation order
+    // is identical, so R=2 must be BIT-IDENTICAL to R=1.
+    let seed = 0x5D9A_B17E;
+    let Some((r1, _)) = pollster::block_on(try_run(8, 1, 1, 2, 1, 96, 64, 128, true, seed)) else {
+        return;
+    };
+    let Some((r2, _)) = pollster::block_on(try_run(8, 2, 1, 2, 1, 96, 64, 128, true, seed)) else {
+        return;
+    };
+    assert_eq!(r1, r2, "R=2 output differs from R=1");
+}
+
+#[test]
+fn sdpa_sg_windowed_qr2() {
+    // Windowed twin at R=2 (joint text branch live: txt_start < s_q).
+    let Some((got, exp)) = pollster::block_on(try_run_windowed(
+        8,
+        2,
+        96,
+        96,
+        128,
+        16,
+        1,
+        0,
+        64,
+        0x5D9A_70A1,
+    )) else {
+        return;
+    };
+    assert_dense_close(&got, &exp, 6e-2, 3e-3, "sdpa_sg_windowed_qr2");
 }
 
 #[test]
@@ -525,9 +577,18 @@ fn sdpa_sg_windowed() {
     // 3 frames (or 2 at the ends). Two BC=32 tiles span the kept range; the
     // tile-skip + per-key fold must reproduce the masked reference. Pure video
     // (txt_start == s_k): the joint branches stay dead.
-    let Some((got, exp)) =
-        pollster::block_on(try_run_windowed(8, 96, 96, 128, 16, 1, 0, 96, 0x5D9A_3F00))
-    else {
+    let Some((got, exp)) = pollster::block_on(try_run_windowed(
+        8,
+        1,
+        96,
+        96,
+        128,
+        16,
+        1,
+        0,
+        96,
+        0x5D9A_3F00,
+    )) else {
         return;
     };
     assert_dense_close(&got, &exp, 1e-2, 2e-3, "sdpa_sg_windowed");
@@ -538,9 +599,18 @@ fn sdpa_sg_windowed_chunked() {
     // Chunked-Q path: this dispatch covers global rows [32, 64) (row_off=32),
     // so query frames are (32 + sq)/16. Validates the global-frame recovery the
     // chunked f16 SDPA relies on. window=0 -> strictly intra-frame attention.
-    let Some((got, exp)) =
-        pollster::block_on(try_run_windowed(8, 32, 96, 128, 16, 0, 32, 96, 0x5D9A_44C0))
-    else {
+    let Some((got, exp)) = pollster::block_on(try_run_windowed(
+        8,
+        1,
+        32,
+        96,
+        128,
+        16,
+        0,
+        32,
+        96,
+        0x5D9A_44C0,
+    )) else {
         return;
     };
     assert_dense_close(&got, &exp, 1e-2, 2e-3, "sdpa_sg_windowed_chunked");
@@ -553,9 +623,18 @@ fn sdpa_sg_windowed_joint() {
     // window AND all 32 text keys; the 32 text queries (rows 64..96) attend
     // everything. Exercises the always-in-window text tiles + the full-attention
     // text workgroups against the joint-masked reference.
-    let Some((got, exp)) =
-        pollster::block_on(try_run_windowed(8, 96, 96, 128, 16, 1, 0, 64, 0x5D9A_70A1))
-    else {
+    let Some((got, exp)) = pollster::block_on(try_run_windowed(
+        8,
+        1,
+        96,
+        96,
+        128,
+        16,
+        1,
+        0,
+        64,
+        0x5D9A_70A1,
+    )) else {
         return;
     };
     assert_dense_close(&got, &exp, 1e-2, 2e-3, "sdpa_sg_windowed_joint");
@@ -567,9 +646,18 @@ fn sdpa_sg_windowed_joint_unaligned() {
     // + 16 text tokens -> s_k=64. The straddling tile [32,64) holds image keys
     // 32..47 (frame 2) and text keys 48..63; the per-key in-window fold must keep
     // the text keys and window the image keys correctly.
-    let Some((got, exp)) =
-        pollster::block_on(try_run_windowed(8, 64, 64, 128, 16, 1, 0, 48, 0x5D9A_88B2))
-    else {
+    let Some((got, exp)) = pollster::block_on(try_run_windowed(
+        8,
+        1,
+        64,
+        64,
+        128,
+        16,
+        1,
+        0,
+        48,
+        0x5D9A_88B2,
+    )) else {
         return;
     };
     assert_dense_close(&got, &exp, 1e-2, 2e-3, "sdpa_sg_windowed_joint_unaligned");
@@ -581,9 +669,18 @@ fn sdpa_sg_windowed_joint_chunked() {
     // 48) over a 4-image-frame (txt_start=64) + 32-text sequence. Rows 48..63 are
     // image queries (frame 3, window=1), rows 64..79 are text queries (full); a
     // single workgroup may straddle the boundary and must fall back to full.
-    let Some((got, exp)) =
-        pollster::block_on(try_run_windowed(8, 32, 96, 128, 16, 1, 48, 64, 0x5D9A_99C3))
-    else {
+    let Some((got, exp)) = pollster::block_on(try_run_windowed(
+        8,
+        1,
+        32,
+        96,
+        128,
+        16,
+        1,
+        48,
+        64,
+        0x5D9A_99C3,
+    )) else {
         return;
     };
     assert_dense_close(&got, &exp, 1e-2, 2e-3, "sdpa_sg_windowed_joint_chunked");
@@ -603,6 +700,7 @@ fn sdpa_sg_windowed_joint_realshape_chunked() {
     // the full joint windowed reference within the f16 tolerance.
     let Some((got, exp, n_chunks)) = pollster::block_on(try_run_windowed_chunked(
         8,
+        1,
         5053,
         5053,
         128,
@@ -636,6 +734,7 @@ fn sdpa_sg_windowed_joint_realshape_chunked_w1() {
     // relative to the chunk boundary. Fresh data draw via a different seed.
     let Some((got, exp, n_chunks)) = pollster::block_on(try_run_windowed_chunked(
         8,
+        1,
         5063,
         5063,
         128,
@@ -662,7 +761,8 @@ fn sdpa_sg_windowed_joint_realshape_chunked_w1() {
 #[test]
 fn sdpa_sg_small_no_mask() {
     // B=1, H=1, S_q=S_k=64 (two BC=32 tiles), D=128 (full n_l).
-    let Some((got, exp)) = pollster::block_on(try_run(8, 1, 1, 1, 64, 64, 128, false, 0x5D9A_51D0))
+    let Some((got, exp)) =
+        pollster::block_on(try_run(8, 1, 1, 1, 1, 64, 64, 128, false, 0x5D9A_51D0))
     else {
         return;
     };
@@ -671,7 +771,8 @@ fn sdpa_sg_small_no_mask() {
 
 #[test]
 fn sdpa_sg_with_mask() {
-    let Some((got, exp)) = pollster::block_on(try_run(8, 1, 1, 1, 64, 64, 128, true, 0x5D9A_BEEF))
+    let Some((got, exp)) =
+        pollster::block_on(try_run(8, 1, 1, 1, 1, 64, 64, 128, true, 0x5D9A_BEEF))
     else {
         return;
     };
@@ -681,7 +782,8 @@ fn sdpa_sg_with_mask() {
 #[test]
 fn sdpa_sg_gqa() {
     // H_q=2, H_kv=1 -> both heads share K/V.
-    let Some((got, exp)) = pollster::block_on(try_run(8, 1, 2, 1, 64, 64, 128, false, 0x5D9A_ABCD))
+    let Some((got, exp)) =
+        pollster::block_on(try_run(8, 1, 1, 2, 1, 64, 64, 128, false, 0x5D9A_ABCD))
     else {
         return;
     };
@@ -692,7 +794,8 @@ fn sdpa_sg_gqa() {
 fn sdpa_sg_tails() {
     // S_q=33 (row-tail: 15 invalid rows in the last BR=16 group), S_k=40
     // (key-tail: 24 folded keys in tile 2), D=64 (partial n_l guards).
-    let Some((got, exp)) = pollster::block_on(try_run(8, 1, 1, 1, 33, 40, 64, true, 0x5D9A_7A11))
+    let Some((got, exp)) =
+        pollster::block_on(try_run(8, 1, 1, 1, 1, 33, 40, 64, true, 0x5D9A_7A11))
     else {
         return;
     };
@@ -702,7 +805,8 @@ fn sdpa_sg_tails() {
 #[test]
 fn sdpa_sg_cl4() {
     // CL=4 codegen (web/mobile shape): 8 score regs, 2 xor hops, n_l=8.
-    let Some((got, exp)) = pollster::block_on(try_run(4, 1, 1, 1, 64, 64, 128, true, 0x5D9A_C14A))
+    let Some((got, exp)) =
+        pollster::block_on(try_run(4, 1, 1, 1, 1, 64, 64, 128, true, 0x5D9A_C14A))
     else {
         return;
     };

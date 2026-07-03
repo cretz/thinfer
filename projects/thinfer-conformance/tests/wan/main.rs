@@ -4,6 +4,7 @@
 //! Opt-in via the `wan-e2e` feature; run manually, never under default
 //! `cargo test`.
 
+mod anyflow_e2e;
 mod longlive_e2e;
 mod longlive_load;
 mod longlive_multishot_e2e;

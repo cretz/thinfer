@@ -527,8 +527,8 @@ fn main(
 // relies on the same behavior. On the web (Tint) backend the directive IS
 // required, so the model layer prepends `backend.subgroup_enable_directive()`
 // to this source at the build site.
-pub fn build_f16_sg_wgsl(cl: u32) -> String {
-    build_f16_sg(cl, false)
+pub fn build_f16_sg_wgsl(cl: u32, r: u32) -> String {
+    build_f16_sg(cl, r, false)
 }
 
 /// Temporal sliding-window variant of [`build_f16_sg_wgsl`]. Each query attends
@@ -544,47 +544,133 @@ pub fn build_f16_sg_wgsl(cl: u32) -> String {
 /// sequence (only the Q range is ever chunked), so `key_global` indexes globally.
 /// This CHANGES the attention output (it is a different operation, not an
 /// approximation of full attention); gate it behind the run-time flag.
-pub fn build_f16_sg_windowed_wgsl(cl: u32) -> String {
-    build_f16_sg(cl, true)
+pub fn build_f16_sg_windowed_wgsl(cl: u32, r: u32) -> String {
+    build_f16_sg(cl, r, true)
 }
 
-fn build_f16_sg(cl: u32, windowed: bool) -> String {
+/// Threads per workgroup for the subgroup sdpa. 256 (the WebGPU default
+/// invocations-per-workgroup limit) rather than 128: BR = WG/CL query rows
+/// share each streamed K/V tile, and at video sequence lengths the kernel is
+/// DRAM-bound on K/V re-streaming (each workgroup reads the full K/V for its
+/// head), so doubling BR halves the dominant traffic. Measured 2026-07-02 at
+/// 832x480x81f (s = 32760): SDPA was ~9.0s of a 13.2s DiT block at WG=128.
+pub const SG_WG: u32 = 256;
+
+fn build_f16_sg(cl: u32, r: u32, windowed: bool) -> String {
     assert!(cl == 4 || cl == 8, "sdpa_sg: CL must be 4 or 8, got {cl}");
-    let br = 128 / cl; // WG=128 lanes / CL lanes-per-row
+    assert!(
+        matches!(r, 1 | 2 | 4),
+        "sdpa_sg: R (Q rows per lane cluster) must be 1/2/4, got {r}"
+    );
+    let br = SG_WG / cl * r; // Q rows per workgroup
     let max_nl = 32 / cl; // MAX_DV4=32 vec4 (D=128) split across CL lanes
+    // Q-register blocking: each CL-lane cluster owns R consecutive Q rows.
+    // Per key the K/V shared-tile loads + f16->f32 converts happen ONCE per
+    // cluster (in kw*/vw* registers) and are reused by all R rows; the dot
+    // FMAs, shuffle reduce, and softmax state stay per-row, so each row's
+    // f32 accumulation order is IDENTICAL across R values (bit-exact vs R=1).
+    // Cost: R x (q + o) vec4 register sets; R=2 at D=128/CL=8 is ~24 live
+    // vec4s per lane.
     let decls = |kw: &str| -> String {
-        (0..max_nl)
-            .map(|i| format!("    var {kw}{i} = vec4<f32>();\n"))
+        (0..r)
+            .flat_map(|rr| {
+                (0..max_nl).map(move |i| format!("    var {kw}{rr}_{i} = vec4<f32>();\n"))
+            })
             .collect()
     };
     let q_decls = decls("q");
     let o_decls = decls("o");
-    let mut q_loads = String::from("    q0 = vec4<f32>(q[q_off + l_off]);\n");
-    let mut dot = String::from("            var part = dot(q0, vec4<f32>(k_tile[tb]));\n");
-    let mut o_upd = String::from("            o0 = o0 * alpha + p_j * vec4<f32>(v_tile[tb]);\n");
-    let mut out_w = String::from("        out[q_off + l_off] = vec4<f16>(o0 * inv_l);\n");
+    // Per-row scalar state + Q loads.
+    let mut row_state = String::new();
+    let mut q_loads = String::new();
+    for rr in 0..r {
+        row_state.push_str(&format!(
+            "    let sq{rr} = row0 + {rr}u;\n    let valid{rr} = sq{rr} < u.s_q;\n    let sq_c{rr} = min(sq{rr}, u.s_q - 1u);\n    let q_off{rr} = (((bb * u.s_q + sq_c{rr}) * u.h_q + hq) * u.d) >> 2u;\n    let mask_row{rr} = select(bb * u.s_q + sq_c{rr}, (bb * u.h_q + hq) * u.s_q + sq_c{rr}, u.has_mask == 2u);\n    let mask_w_base{rr} = (mask_row{rr} * u.s_k) >> 1u;\n"
+        ));
+        q_loads.push_str(&format!("    q{rr}_0 = vec4<f32>(q[q_off{rr} + l_off]);\n"));
+        for i in 1..max_nl {
+            q_loads.push_str(&format!(
+                "    if (n_l > {i}u) {{ q{rr}_{i} = vec4<f32>(q[q_off{rr} + l_off + {i}u]); }}\n"
+            ));
+        }
+    }
+    // K tile -> registers, once per cluster per key.
+    let mut k_loads = String::from("            let kw0 = vec4<f32>(k_tile[tb]);\n");
+    let mut v_loads = String::from("            let vw0 = vec4<f32>(v_tile[tb]);\n");
     for i in 1..max_nl {
-        q_loads.push_str(&format!(
-            "    if (n_l > {i}u) {{ q{i} = vec4<f32>(q[q_off + l_off + {i}u]); }}\n"
+        k_loads.push_str(&format!(
+            "            var kw{i} = vec4<f32>();\n            if (n_l > {i}u) {{ kw{i} = vec4<f32>(k_tile[tb + {i}u]); }}\n"
         ));
-        dot.push_str(&format!(
-            "            if (n_l > {i}u) {{ part = part + dot(q{i}, vec4<f32>(k_tile[tb + {i}u])); }}\n"
-        ));
-        o_upd.push_str(&format!(
-            "            if (n_l > {i}u) {{ o{i} = o{i} * alpha + p_j * vec4<f32>(v_tile[tb + {i}u]); }}\n"
-        ));
-        out_w.push_str(&format!(
-            "        if (n_l > {i}u) {{ out[q_off + l_off + {i}u] = vec4<f16>(o{i} * inv_l); }}\n"
+        v_loads.push_str(&format!(
+            "            var vw{i} = vec4<f32>();\n            if (n_l > {i}u) {{ vw{i} = vec4<f32>(v_tile[tb + {i}u]); }}\n"
         ));
     }
-    // Cluster reduce: xor hops 1, 2, .., CL/2 so every lane ends with the full dot.
-    let mut hops = String::new();
-    let mut off = 1u32;
-    while off < cl {
-        hops.push_str(&format!(
-            "            part = part + subgroupShuffleXor(part, {off}u);\n"
+    // Per-row dot + cluster shuffle reduce (xor hops 1, 2, .., CL/2 so every
+    // lane ends with the full dot).
+    let mut dot = String::new();
+    for rr in 0..r {
+        dot.push_str(&format!("            var part{rr} = dot(q{rr}_0, kw0);\n"));
+        for i in 1..max_nl {
+            dot.push_str(&format!(
+                "            if (n_l > {i}u) {{ part{rr} = part{rr} + dot(q{rr}_{i}, kw{i}); }}\n"
+            ));
+        }
+        let mut off = 1u32;
+        while off < cl {
+            dot.push_str(&format!(
+                "            part{rr} = part{rr} + subgroupShuffleXor(part{rr}, {off}u);\n"
+            ));
+            off <<= 1;
+        }
+    }
+    // Per-row softmax step + O update (V registers shared across rows).
+    let mut softmax_o = String::new();
+    for rr in 0..r {
+        softmax_o.push_str(&format!(
+            "            var bias{rr}: f32 = 0.0;\n            if (u.has_mask != 0u) {{\n                let mw: vec2<f32> = vec2<f32>(mask[mask_w_base{rr} + (key_global >> 1u)]);\n                bias{rr} = select(mw.x, mw.y, (key_global & 1u) == 1u);\n            }}\n"
         ));
-        off <<= 1;
+        if windowed {
+            softmax_o.push_str(&format!(
+                "            let is_txt_q{rr} = (u.row_off + sq_c{rr}) >= u.txt_start;\n            let in_win{rr} = is_txt_q{rr} || is_txt_k || ((max(fq{rr}, fk) - min(fq{rr}, fk)) <= u.window);\n            let s_j{rr} = select(NEG_MAX, part{rr} * u.scale + bias{rr}, key_global < u.s_k && in_win{rr});\n"
+            ));
+        } else {
+            softmax_o.push_str(&format!(
+                "            let s_j{rr} = select(NEG_MAX, part{rr} * u.scale + bias{rr}, key_global < u.s_k);\n"
+            ));
+        }
+        softmax_o.push_str(&format!(
+            "            let m_new{rr} = max(m{rr}, s_j{rr});\n            let alpha{rr} = exp(m{rr} - m_new{rr});\n            let p_j{rr}   = exp(s_j{rr} - m_new{rr});\n"
+        ));
+        softmax_o.push_str(&format!(
+            "            o{rr}_0 = o{rr}_0 * alpha{rr} + p_j{rr} * vw0;\n"
+        ));
+        for i in 1..max_nl {
+            softmax_o.push_str(&format!(
+                "            if (n_l > {i}u) {{ o{rr}_{i} = o{rr}_{i} * alpha{rr} + p_j{rr} * vw{i}; }}\n"
+            ));
+        }
+        softmax_o.push_str(&format!(
+            "            l{rr} = l{rr} * alpha{rr} + p_j{rr};\n            m{rr} = m_new{rr};\n"
+        ));
+    }
+    // Per-row output writes.
+    let mut out_w = String::new();
+    for rr in 0..r {
+        out_w.push_str(&format!(
+            "    if (valid{rr}) {{\n        let inv_l{rr} = select(0.0, 1.0 / l{rr}, l{rr} > 0.0);\n        out[q_off{rr} + l_off] = vec4<f16>(o{rr}_0 * inv_l{rr});\n"
+        ));
+        for i in 1..max_nl {
+            out_w.push_str(&format!(
+                "        if (n_l > {i}u) {{ out[q_off{rr} + l_off + {i}u] = vec4<f16>(o{rr}_{i} * inv_l{rr}); }}\n"
+            ));
+        }
+        out_w.push_str("    }\n");
+    }
+    let mut m_l_decls = String::new();
+    for rr in 0..r {
+        m_l_decls.push_str(&format!(
+            "    var m{rr}: f32 = NEG_MAX;\n    var l{rr}: f32 = 0.0;\n"
+        ));
     }
 
     let u_window = if windowed {
@@ -616,52 +702,56 @@ struct U {{
 "#,
     );
     s.push_str(&format!(
-        "const BR: u32 = {br}u;      // Q rows per workgroup (WG/CL)\nconst BC: u32 = 32u;      // keys per shared tile\nconst WG: u32 = 128u;\nconst CL: u32 = {cl}u;       // lanes per Q row (D split)\nconst MAX_DV4: u32 = 32u; // vec4s per row at D=128\nconst NEG_MAX: f32 = -3.402823e38;\n"
+        "const BR: u32 = {br}u;      // Q rows per workgroup (WG/CL*R)\nconst BC: u32 = 32u;      // keys per shared tile\nconst WG: u32 = {SG_WG}u;\nconst CL: u32 = {cl}u;       // lanes per Q row (D split)\nconst R: u32 = {r}u;       // Q rows per lane cluster\nconst MAX_DV4: u32 = 32u; // vec4s per row at D=128\nconst NEG_MAX: f32 = -3.402823e38;\n"
     ));
-    s.push_str(
+    s.push_str(&format!(
         r#"
 var<workgroup> k_tile: array<vec4<f16>, 1024>; // BC * MAX_DV4
 var<workgroup> v_tile: array<vec4<f16>, 1024>;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size({SG_WG})
 fn main(
     @builtin(workgroup_id) wgid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
-) {
+) {{"#
+    ));
+    s.push_str(
+        r#"
     let t    = lid.x;
-    let row  = t / CL;
     let lane = t % CL;
-    let sq    = wgid.x * BR + row;
+    let row0 = wgid.x * BR + (t / CL) * R; // first Q row of this lane cluster
     let hq    = wgid.y;
     let bb    = wgid.z;
-    let valid = sq < u.s_q;
-    let sq_c  = min(sq, u.s_q - 1u);
 
     let hkv     = (hq * u.h_kv) / u.h_q;
     let d_v4    = u.d >> 2u;
     let n_l     = d_v4 / CL; // vec4s per lane
-    let q_off   = (((bb * u.s_q + sq_c) * u.h_q + hq) * u.d) >> 2u;
     let kv_b0   = ((bb * u.s_k * u.h_kv + hkv) * u.d) >> 2u;
     let kv_step = (u.h_kv * u.d) >> 2u;
-    // has_mask==2: per-head mask [B, Hq, Sq, Sk]; else shared [B, Sq, Sk].
-    let mask_row = select(bb * u.s_q + sq_c, (bb * u.h_q + hq) * u.s_q + sq_c, u.has_mask == 2u);
-    let mask_w_base = (mask_row * u.s_k) >> 1u;
     let l_off   = lane * n_l;
-
+    // Per-row state (has_mask==2: per-head mask [B, Hq, Sq, Sk]; else
+    // shared [B, Sq, Sk]).
 "#,
     );
+    s.push_str(&row_state);
+    s.push('\n');
     if windowed {
-        // Global query frame (frame-major layout); row_off shifts the chunk.
-        s.push_str("    let fq = (u.row_off + sq_c) / u.period;\n\n");
+        // Global query frame per row (frame-major layout); row_off shifts the
+        // chunk.
+        for rr in 0..r {
+            s.push_str(&format!(
+                "    let fq{rr} = (u.row_off + sq_c{rr}) / u.period;\n"
+            ));
+        }
+        s.push('\n');
     }
     s.push_str(&q_decls);
     s.push_str(&q_loads);
     s.push('\n');
     s.push_str(&o_decls);
+    s.push_str(&m_l_decls);
     s.push_str(
-        r#"    var m: f32 = NEG_MAX;
-    var l: f32 = 0.0;
-
+        r#"
     let v4_per_tile = BC * d_v4;
 "#,
     );
@@ -727,62 +817,37 @@ fn main(
 
 "#,
     );
+    // K/V tile -> registers once per cluster per key; then per-row dot +
+    // shuffle reduce + softmax step + O update. Out-of-window / tail keys
+    // score -FLT_MAX -> p_j = 0 (exact fold). In the windowed variant text
+    // keys and text queries bypass the frame window (joint attention: image
+    // queries attend all text; text queries attend everything); pure-video
+    // callers (`txt_start == s_k`) reduce to the plain `|fq - fk| <= window`
+    // test.
+    s.push_str(&k_loads);
     s.push_str(&dot);
-    s.push_str(&hops);
-    s.push_str(
-        r#"
-            var bias: f32 = 0.0;
-            if (u.has_mask != 0u) {
-                let mw: vec2<f32> = vec2<f32>(mask[mask_w_base + (key_global >> 1u)]);
-                bias = select(mw.x, mw.y, (key_global & 1u) == 1u);
-            }
-"#,
-    );
     if windowed {
-        // Out-of-window (and tail) keys score -FLT_MAX -> p_j = 0: exact fold.
-        // Text keys and text queries bypass the frame window (joint attention:
-        // image queries attend all text; text queries attend everything). For
-        // pure-video callers (`txt_start == s_k`) both `is_txt_*` are always
-        // false, leaving the original `|fq - fk| <= window` test.
         s.push_str(
             r#"            let is_txt_k = key_global >= u.txt_start;
-            let is_txt_q = (u.row_off + sq_c) >= u.txt_start;
             let fk = key_global / u.period;
-            let in_win = is_txt_q || is_txt_k || ((max(fq, fk) - min(fq, fk)) <= u.window);
-            let s_j = select(NEG_MAX, part * u.scale + bias, key_global < u.s_k && in_win);
-"#,
-        );
-    } else {
-        s.push_str(
-            r#"            // Tail keys score -FLT_MAX -> p_j = 0, alpha = 1: no-op fold.
-            let s_j = select(NEG_MAX, part * u.scale + bias, key_global < u.s_k);
 "#,
         );
     }
+    s.push_str(&v_loads);
+    s.push_str(&softmax_o);
     s.push_str(
-        r#"            let m_new = max(m, s_j);
-            let alpha = exp(m - m_new);
-            let p_j   = exp(s_j - m_new);
-"#,
-    );
-    s.push_str(&o_upd);
-    s.push_str(
-        r#"            l = l * alpha + p_j;
-            m = m_new;
-        }
+        r#"        }
         workgroupBarrier();
     }
 
-    if (valid) {
-        // Guard an all-masked query (l == 0): write 0 rather than 1/0 = inf/NaN.
-        // A NaN propagating into the residual stream can surface as a device loss.
-        // When l > 0 (the normal case: every query has >= 1 in-window key) this is
-        // bit-identically 1.0 / l.
-        let inv_l = select(0.0, 1.0 / l, l > 0.0);
+    // Guard an all-masked query (l == 0): write 0 rather than 1/0 = inf/NaN.
+    // A NaN propagating into the residual stream can surface as a device loss.
+    // When l > 0 (the normal case: every query has >= 1 in-window key) inv_l
+    // is bit-identically 1.0 / l.
 "#,
     );
     s.push_str(&out_w);
-    s.push_str("    }\n}\n");
+    s.push_str("}\n");
     s
 }
 
@@ -846,19 +911,22 @@ pub fn sg_layout() -> &'static [BindingLayout] {
     LAYOUT
 }
 
-/// Workgroup grid for the CL-parameterized subgroup sdpa: BR = WG/CL Q rows
-/// per workgroup, so the grid is [ceil(S_q/BR), H_q, B]. `cl` must match the
-/// value passed to [`build_f16_sg_wgsl`] for the bound pipeline.
-pub fn f16_sg_workgroups(cl: u32, b: u32, s_q: u32, h_q: u32) -> [u32; 3] {
-    [s_q.div_ceil(128 / cl), h_q, b]
+/// Workgroup grid for the CL/R-parameterized subgroup sdpa: BR = WG/CL*R Q
+/// rows per workgroup, so the grid is [ceil(S_q/BR), H_q, B]. `cl` and `r`
+/// must match the values passed to [`build_f16_sg_wgsl`] for the bound
+/// pipeline.
+pub fn f16_sg_workgroups(cl: u32, r: u32, b: u32, s_q: u32, h_q: u32) -> [u32; 3] {
+    [s_q.div_ceil(SG_WG / cl * r), h_q, b]
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_sdpa_f16_sg<B: Backend>(
     backend: &B,
     encoder: &mut B::CommandEncoder,
     pipeline: &B::Pipeline,
     bufs: &SdpaBufs<'_>,
     cl: u32,
+    r: u32,
     b: u32,
     s_q: u32,
     h_q: u32,
@@ -875,7 +943,7 @@ pub(crate) fn dispatch_sdpa_f16_sg<B: Backend>(
         encoder,
         pipeline,
         &bindings,
-        f16_sg_workgroups(cl, b, s_q, h_q),
+        f16_sg_workgroups(cl, r, b, s_q, h_q),
     )
 }
 

@@ -38,6 +38,10 @@ pub struct ConditionEmbedderBufs {
     pub time_proj: LinearBiasBufs,
     pub text_linear_1: LinearBiasBufs,
     pub text_linear_2: LinearBiasBufs,
+    /// AnyFlow `delta_embedder` (second `TimestepEmbedding` fed `sincos(r)`,
+    /// the flow-map target timestep). `None` for the plain Wan models.
+    pub delta_linear_1: Option<LinearBiasBufs>,
+    pub delta_linear_2: Option<LinearBiasBufs>,
 }
 
 /// Output destinations the driver owns (imported from cross-submit `WsBuf`s).
@@ -50,6 +54,11 @@ pub struct ConditionEmbedderOut<'wsp> {
     /// `[text_seq, inner]`.
     pub text: BatchBuf<'wsp>,
 }
+
+/// AnyFlow `delta_emb_gate` (repo `transformer/config.json` `gate_value`): the
+/// blend weight of the delta (target-timestep) embedding. A non-persistent
+/// buffer upstream, so it is a config constant, not a checkpoint tensor.
+pub const GATE_VALUE: f32 = 0.25;
 
 pub struct ConditionEmbedder {
     pub freq_dim: usize,
@@ -80,8 +89,11 @@ impl ConditionEmbedder {
         out
     }
 
-    /// `t` is the scalar diffusion timestep. `text` is the umT5 states
-    /// `[text_seq, text_dim]`.
+    /// `t` is the scalar diffusion timestep. `r` is the AnyFlow flow-map
+    /// TARGET timestep (`Some` iff `bufs.delta_linear_*` are loaded): `temb`
+    /// becomes the gated blend `(1-g)*time_mlp(t) + g*delta_mlp(r)` with
+    /// `g = GATE_VALUE`, exactly `AnyFlowDualTimestepTextImageEmbedding`
+    /// (`deltatime_type="r"`). `text` is the umT5 states `[text_seq, text_dim]`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward<'wsp>(
         &self,
@@ -89,6 +101,7 @@ impl ConditionEmbedder {
         pipelines: &BlockPipelines,
         gelu: &WgpuPipeline,
         t: f32,
+        r: Option<f32>,
         text: BatchBuf<'wsp>,
         text_seq: u32,
         out: &ConditionEmbedderOut<'wsp>,
@@ -99,21 +112,34 @@ impl ConditionEmbedder {
         let six = 6 * inner;
 
         // --- time path: sincos -> Linear -> SiLU -> Linear = temb [1, inner] ---
-        let emb_bytes = crate::common::seq::act_upload_bytes(pipelines.act_dtype, &self.sincos(t));
-        let emb = scope.write_uniform(&emb_bytes)?;
-        let h1 = self.linear_bias(scope, pipelines, emb, &bufs.time_linear_1, 1, freq, inner)?;
-        let h1a = scope.alloc(pipelines.act_bytes(inner))?;
-        scope.dispatch_op::<SiluF32>(&pipelines.silu, &[h1], h1a)?;
-        self.linear_bias_into(
-            scope,
-            pipelines,
-            h1a,
-            &bufs.time_linear_2,
-            1,
-            inner,
-            inner,
-            out.temb,
-        )?;
+        // With a delta embedder the two MLP outputs land in scope buffers and
+        // blend into `out.temb`; without, the time MLP writes `out.temb` direct.
+        let time_mlp = |w1: &LinearBiasBufs,
+                        w2: &LinearBiasBufs,
+                        ts: f32,
+                        dst: BatchBuf<'wsp>|
+         -> Result<(), WgpuError> {
+            let emb_bytes =
+                crate::common::seq::act_upload_bytes(pipelines.act_dtype, &self.sincos(ts));
+            let emb = scope.write_uniform(&emb_bytes)?;
+            let h1 = self.linear_bias(scope, pipelines, emb, w1, 1, freq, inner)?;
+            let h1a = scope.alloc(pipelines.act_bytes(inner))?;
+            scope.dispatch_op::<SiluF32>(&pipelines.silu, &[h1], h1a)?;
+            self.linear_bias_into(scope, pipelines, h1a, w2, 1, inner, inner, dst)
+        };
+        match (&bufs.delta_linear_1, &bufs.delta_linear_2, r) {
+            (Some(d1), Some(d2), Some(r)) => {
+                let temb_t = scope.alloc(pipelines.act_bytes(inner))?;
+                time_mlp(&bufs.time_linear_1, &bufs.time_linear_2, t, temb_t)?;
+                let delta = scope.alloc(pipelines.act_bytes(inner))?;
+                time_mlp(d1, d2, r, delta)?;
+                self.gated_blend(scope, pipelines, temb_t, delta, out.temb)?;
+            }
+            (None, None, None) => {
+                time_mlp(&bufs.time_linear_1, &bufs.time_linear_2, t, out.temb)?;
+            }
+            _ => unreachable!("delta embedder weights and r timestep must agree"),
+        }
 
         // --- timestep_proj = Linear(SiLU(temb), 6*inner) [1, 6*inner] ---
         let ta = scope.alloc(pipelines.act_bytes(inner))?;
@@ -153,6 +179,53 @@ impl ConditionEmbedder {
             out.text,
         )?;
         Ok(())
+    }
+
+    /// `out = (1-g)*a + g*b` elementwise over `[1, inner]` rows (AnyFlow
+    /// `delta_emb_gate` blend): two `BcastMul` by constant vectors + a
+    /// vector add (b_scaled is a `[inner]` vector at rows=1).
+    fn gated_blend<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &BlockPipelines,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+    ) -> Result<(), WgpuError> {
+        let inner = self.inner as u32;
+        let g = GATE_VALUE;
+        let upload_const = |v: f32| -> Result<BatchBuf<'wsp>, WgpuError> {
+            let bytes =
+                crate::common::seq::act_upload_bytes(pipelines.act_dtype, &vec![v; self.inner]);
+            scope.write_uniform(&bytes)
+        };
+        let u = bcast_add_uniform(scope, inner)?;
+        let a_s = scope.alloc(pipelines.act_bytes(inner))?;
+        scope.bcast_add::<thinfer_core::ops::BcastMulF32>(
+            &pipelines.bcast_mul,
+            a,
+            upload_const(1.0 - g)?,
+            u,
+            a_s,
+            inner,
+        )?;
+        let b_s = scope.alloc(pipelines.act_bytes(inner))?;
+        scope.bcast_add::<thinfer_core::ops::BcastMulF32>(
+            &pipelines.bcast_mul,
+            b,
+            upload_const(g)?,
+            u,
+            b_s,
+            inner,
+        )?;
+        scope.bcast_add::<thinfer_core::ops::BcastAddF32>(
+            &pipelines.bcast_add,
+            a_s,
+            b_s,
+            u,
+            out,
+            inner,
+        )
     }
 
     /// `out = x @ wᵀ + b`, allocating the result in the scope pool.
@@ -222,6 +295,9 @@ pub struct ConditionEmbedderHandles {
     pub time_proj: LinearBiasHandles,
     pub text_linear_1: LinearBiasHandles,
     pub text_linear_2: LinearBiasHandles,
+    /// AnyFlow `delta_embedder.linear_{1,2}` (absent on plain Wan models).
+    pub delta_linear_1: Option<LinearBiasHandles>,
+    pub delta_linear_2: Option<LinearBiasHandles>,
 }
 
 pub struct ConditionEmbedderViews<'a> {
@@ -230,6 +306,8 @@ pub struct ConditionEmbedderViews<'a> {
     time_proj: LinearBiasViews<'a>,
     text_linear_1: LinearBiasViews<'a>,
     text_linear_2: LinearBiasViews<'a>,
+    delta_linear_1: Option<LinearBiasViews<'a>>,
+    delta_linear_2: Option<LinearBiasViews<'a>>,
 }
 
 impl ConditionEmbedderHandles {
@@ -244,6 +322,14 @@ impl ConditionEmbedderHandles {
             time_proj: self.time_proj.acquire(residency, backend).await?,
             text_linear_1: self.text_linear_1.acquire(residency, backend).await?,
             text_linear_2: self.text_linear_2.acquire(residency, backend).await?,
+            delta_linear_1: match &self.delta_linear_1 {
+                Some(h) => Some(h.acquire(residency, backend).await?),
+                None => None,
+            },
+            delta_linear_2: match &self.delta_linear_2 {
+                Some(h) => Some(h.acquire(residency, backend).await?),
+                None => None,
+            },
         })
     }
 }
@@ -256,6 +342,8 @@ impl ConditionEmbedderViews<'_> {
             time_proj: self.time_proj.bufs(),
             text_linear_1: self.text_linear_1.bufs(),
             text_linear_2: self.text_linear_2.bufs(),
+            delta_linear_1: self.delta_linear_1.as_ref().map(|v| v.bufs()),
+            delta_linear_2: self.delta_linear_2.as_ref().map(|v| v.bufs()),
         }
     }
 }

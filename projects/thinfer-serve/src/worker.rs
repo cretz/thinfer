@@ -79,6 +79,12 @@ async fn worker_loop(store: Arc<JobStore>, backend_cfg: BackendConfig, download_
 
 async fn process(executor: &LocalExecutor, job: &Arc<JobHandle>, download_as_needed: bool) {
     job.push(JobEvent::Started);
+    // Durable job record (structural fields ONLY -- prompts are never logged).
+    // The engine's own generate-start line rides the muted `thinfer::diag`
+    // target, so without this line a lost client (closed tab + delete-on-fetch
+    // artifact) has no way to recover the run's seed.
+    tracing::info!(id = %job.id, "job started");
+    let t0 = std::time::Instant::now();
 
     let files = match job.request.required_files() {
         Ok(f) => f,
@@ -110,12 +116,24 @@ async fn process(executor: &LocalExecutor, job: &Arc<JobHandle>, download_as_nee
         // it as Cancelled, not a failure. Any other error is a real failure.
         Err(message) => {
             return if job.is_cancel_requested() {
+                tracing::info!(id = %job.id, "job cancelled");
                 job.push(JobEvent::Cancelled)
             } else {
+                tracing::warn!(id = %job.id, %message, "job failed");
                 job.push(JobEvent::Error { message })
             };
         }
     };
+    tracing::info!(
+        id = %job.id,
+        width = summary.width,
+        height = summary.height,
+        frames = summary.frames,
+        fps = summary.fps,
+        seed = summary.seed,
+        elapsed_s = t0.elapsed().as_secs(),
+        "job done"
+    );
 
     // Encrypt the artifact at rest when the client supplied a public key, so the
     // on-disk copy is unreadable by the server and only the client can decrypt.

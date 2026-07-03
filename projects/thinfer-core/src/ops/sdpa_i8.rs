@@ -28,11 +28,24 @@
 //! Mask binding is `vec2<f16>`. I8 acts require SHADER_F16 anyway; matching
 //! F16_PACKED's mask dtype avoids carrying a parallel fp32 mask.
 //!
-//! Workgroup grid: `[ceil(S_q/64), H_q, B]`. Each thread owns one Q row in
-//! registers.
+//! Workgroup grid: `[ceil(rows/64), H_q, B]` where `rows` is this dispatch's
+//! Q-row count (`u.row0 + rows <= u.s_q`); each thread owns one Q row in
+//! registers. Chunking the query range across several dispatches is bit-exact
+//! (each row is independent and all offsets derive from the GLOBAL row index
+//! `u.row0 + local`), which keeps long-clip dispatches under the ~2s Windows
+//! GPU watchdog. All buffers stay bound whole.
+//!
+//! Output form (`u.out_mode`):
+//! - 0: paired i8 + per-(row, D/32) params, as described above.
+//! - 1: dense packed f16 (`vec2<f16>` per u32) at the f16 act layout.
+//! - 2: dense packed bf16 (2 x u16 per u32) at the bf16 act layout.
+//!
+//! The dense modes skip the output quantize entirely: consumers whose next
+//! matmul is NOT a paired-A site (Wan's Q8 proj) read the normalized O
+//! directly, with no dequant round-trip.
 
-use crate::act_i8_prelude;
 use crate::backend::{Backend, BindingKind, BindingLayout, BufRef};
+use crate::{act_bf16_prelude, act_i8_prelude};
 
 const LAYOUT: &[BindingLayout] = &[
     BindingLayout {
@@ -75,6 +88,7 @@ pub fn build_wgsl() -> String {
     let mut s = String::new();
     s.push_str("enable f16;\n");
     s.push_str(act_i8_prelude!());
+    s.push_str(act_bf16_prelude!());
     s.push_str(BODY);
     s
 }
@@ -83,6 +97,7 @@ const BODY: &str = r#"
 struct U {
     b: u32, h_q: u32, h_kv: u32, s_q: u32,
     s_k: u32, d: u32, scale: f32, has_mask: u32,
+    row0: u32, out_mode: u32, pad0: u32, pad1: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       q:    array<u32>;
@@ -115,7 +130,7 @@ fn main(
     let qt = wgid.x;
     let hq = wgid.y;
     let bb = wgid.z;
-    let sq = qt * BR + t;
+    let sq = u.row0 + qt * BR + t;
     let valid = sq < u.s_q;
 
     let hkv = (hq * u.h_kv) / u.h_q;
@@ -258,6 +273,23 @@ fn main(
         workgroupBarrier();
     }
 
+    if (valid && u.out_mode != 0u) {
+        // Dense output: normalized O packed 2 elems/u32 at the act layout
+        // (mode 1 = f16, mode 2 = bf16). Element base == the paired data
+        // layout's element index; dense packs 2 per word instead of 4.
+        let inv_l = 1.0 / l;
+        let ow = (((bb * u.s_q + sq) * u.h_q + hq) * u.d) >> 1u;
+        for (var w = 0u; w < (u.d >> 1u); w = w + 1u) {
+            let lo = o_local[2u * w] * inv_l;
+            let hi = o_local[2u * w + 1u] * inv_l;
+            if (u.out_mode == 1u) {
+                o[ow + w] = pack2x16float(vec2<f32>(lo, hi));
+            } else {
+                o[ow + w] = pack_bf16x2(lo, hi);
+            }
+        }
+        return;
+    }
     if (valid) {
         let inv_l = 1.0 / l;
         let out_scale_row = q_scale_row;     // same shape as q scale
@@ -306,13 +338,16 @@ pub struct SdpaI8Bufs<'a> {
     pub uniform: &'a BufRef,
 }
 
+/// `rows` is this dispatch's Q-row count (the chunk size, == `s_q` for a
+/// whole-tensor call); the uniform's `row0` carries the chunk's global row
+/// offset. All buffers stay bound whole.
 pub fn dispatch_sdpa_i8<B: Backend>(
     backend: &B,
     encoder: &mut B::CommandEncoder,
     pipeline: &B::Pipeline,
     bufs: &SdpaI8Bufs<'_>,
     b: u32,
-    s_q: u32,
+    rows: u32,
     h_q: u32,
     d: u32,
 ) -> Result<(), B::Error> {
@@ -329,5 +364,5 @@ pub fn dispatch_sdpa_i8<B: Backend>(
         bufs.out.binding(4),
         bufs.uniform.binding(5),
     ];
-    backend.dispatch(encoder, pipeline, &bindings, [s_q.div_ceil(64), h_q, b])
+    backend.dispatch(encoder, pipeline, &bindings, [rows.div_ceil(64), h_q, b])
 }

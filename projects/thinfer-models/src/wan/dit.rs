@@ -103,6 +103,10 @@ pub struct WanDitInputs<'a> {
     pub image: &'a [f32],
     /// umT5 text states `[text_seq, text_dim]` row-major f32.
     pub text: &'a [f32],
+    /// AnyFlow flow-map TARGET timestep (`r`, the sigma this forward's
+    /// velocity integrates to). `Some` iff the config's `delta_embedder` is
+    /// set; `None` on the plain Wan models.
+    pub r_timestep: Option<f32>,
     /// Scalar diffusion timestep, uniform over the whole clip (the distilled
     /// T2V line is plain flow-matching, not per-frame Diffusion Forcing).
     pub timestep: f32,
@@ -294,6 +298,7 @@ impl WanDit {
                 bp,
                 &pipelines.gelu,
                 inputs.timestep,
+                inputs.r_timestep,
                 scope.import_copy(text_in.as_buf_ref()),
                 text_seq,
                 &out,
@@ -651,6 +656,7 @@ impl WanDit {
                 bp,
                 &pipelines.gelu,
                 inputs.timestep,
+                inputs.r_timestep,
                 scope.import_copy(text_in.as_buf_ref()),
                 text_seq,
                 &out,
@@ -834,8 +840,14 @@ impl WanDit {
         let text_seq = self.shape.text_seq as u32;
         let hd = config::HEAD_DIM as u32;
 
+        // Diag-gated per-phase wall clocks: encode (CPU dispatch building) vs
+        // await (fence waits) per pass, to localize non-GPU block time.
+        let diag = tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG);
+        let t0 = diag.then(trace::Instant::now);
+
         // Modulation vectors for this block, persisted across the tile scopes.
         self.fill_mod(bp, scratch, sst, tproj, inner, &tb.m).await?;
+        let t_mod = t0.as_ref().map(|t| t.elapsed().as_secs_f64() * 1e3);
 
         // Cross-attention K/V projected once (shared by every query tile).
         {
@@ -854,9 +866,21 @@ impl WanDit {
             )?;
             scope.submit_void().await?;
         }
+        let t_ckv = t0.as_ref().map(|t| t.elapsed().as_secs_f64() * 1e3);
 
         // Pass A: per-tile q/k/v projection + RoPE into the full qx/kx/v.
+        // Depth-2 submit pipeline: tile t is submitted before tile t-1's
+        // completion is awaited, so the CPU encodes/submits the next tile
+        // while the GPU runs the current one. The serial submit-and-wait it
+        // replaces left the GPU idle between every tile - at video dims
+        // (32760 rows = 32 tiles, ~67 fences per block) that idle was the
+        // dominant per-block cost, bigger than the tile compute itself.
+        // Depth 2 keeps at most two tiles' transients out of the pool, which
+        // the DiT workspace reserve accounts for.
+        let mut pending_tile = None;
+        let (mut enc_a, mut await_a) = (0.0f64, 0.0f64);
         for t in 0..n_tiles {
+            let te = diag.then(trace::Instant::now);
             let (r0, tr) = tile_range(rows, n_tiles, t);
             let scope = scratch.batch();
             let m = mk_mod(&scope, &tb.m);
@@ -877,7 +901,24 @@ impl WanDit {
                 tr,
                 &bufs.self_attn,
             )?;
-            scope.submit_void().await?;
+            let fut = scope.submit_deferred();
+            if let Some(t) = te {
+                enc_a += t.elapsed().as_secs_f64() * 1e3;
+            }
+            let ta = diag.then(trace::Instant::now);
+            if let Some(prev) = pending_tile.replace(fut) {
+                prev.await?;
+            }
+            if let Some(t) = ta {
+                await_a += t.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+        if let Some(last) = pending_tile {
+            let ta = diag.then(trace::Instant::now);
+            last.await?;
+            if let Some(t) = ta {
+                await_a += t.elapsed().as_secs_f64() * 1e3;
+            }
         }
 
         // Barrier: global self-attention over the whole sequence.
@@ -894,9 +935,14 @@ impl WanDit {
                 .self_sdpa(&scope, pipelines, qx, kx, v, sa, rows, period, window)?;
             scope.submit_void().await?;
         }
+        let t_sdpa = t0.as_ref().map(|t| t.elapsed().as_secs_f64() * 1e3);
 
         // Pass B: per-tile o-proj + gated residual + cross-attn + FFN -> y_out.
+        // Same depth-2 submit pipeline as pass A.
+        let mut pending_tile = None;
+        let (mut enc_b, mut await_b) = (0.0f64, 0.0f64);
         for t in 0..n_tiles {
+            let te = diag.then(trace::Instant::now);
             let (r0, tr) = tile_range(rows, n_tiles, t);
             let scope = scratch.batch();
             let m = mk_mod(&scope, &tb.m);
@@ -908,7 +954,40 @@ impl WanDit {
             self.block.post_attn_tile(
                 &scope, pipelines, x_slice, sa_slice, &m, ck, cv, y_slice, tr, text_seq, bufs,
             )?;
-            scope.submit_void().await?;
+            let fut = scope.submit_deferred();
+            if let Some(t) = te {
+                enc_b += t.elapsed().as_secs_f64() * 1e3;
+            }
+            let ta = diag.then(trace::Instant::now);
+            if let Some(prev) = pending_tile.replace(fut) {
+                prev.await?;
+            }
+            if let Some(t) = ta {
+                await_b += t.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+        if let Some(last) = pending_tile {
+            let ta = diag.then(trace::Instant::now);
+            last.await?;
+            if let Some(t) = ta {
+                await_b += t.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+        if let (Some(m), Some(ckv), Some(sdpa), Some(t)) = (t_mod, t_ckv, t_sdpa, t0.as_ref()) {
+            let total = t.elapsed().as_secs_f64() * 1e3;
+            tracing::debug!(
+                target: "thinfer::diag",
+                mod_ms = m,
+                cross_kv_ms = ckv - m,
+                pass_a_enc_ms = enc_a,
+                pass_a_await_ms = await_a,
+                sdpa_ms = t_sdpa.unwrap_or(0.0) - ckv - enc_a - await_a,
+                pass_b_enc_ms = enc_b,
+                pass_b_await_ms = await_b,
+                total_ms = total,
+                other_ms = total - sdpa - enc_b - await_b,
+                "tiled block phases"
+            );
         }
         Ok(())
     }

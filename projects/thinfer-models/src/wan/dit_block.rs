@@ -46,7 +46,7 @@ use thinfer_core::workspace::{BatchBuf, BatchScope};
 
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, alloc_act, alloc_matmul_out_buf, copy_tap, op_add, op_rmsnorm,
-    op_sdpa, op_sdpa_f16, op_sdpa_f16_win,
+    op_sdpa, op_sdpa_f16, op_sdpa_f16_win, quant_for_sdpa,
 };
 
 /// Query rows per FFN chunk. The FFN is position-wise, so it is processed in
@@ -105,6 +105,10 @@ pub struct WanDitConfig {
     /// high-compression VAE, 16 for the Wan2.1 VAE.
     pub in_channels: usize,
     pub out_channels: usize,
+    /// AnyFlow dual-timestep conditioning: the checkpoint carries
+    /// `condition_embedder.delta_embedder.*` and every forward takes the
+    /// flow-map target timestep `r` alongside `t`.
+    pub delta_embedder: bool,
 }
 
 impl WanDitConfig {
@@ -119,6 +123,7 @@ impl WanDitConfig {
             num_layers: 30,
             in_channels: 48,
             out_channels: 48,
+            delta_embedder: false,
         }
     }
 
@@ -144,6 +149,20 @@ impl WanDitConfig {
             num_layers: 40,
             in_channels: 16,
             out_channels: 16,
+            delta_embedder: false,
+        }
+    }
+
+    /// nvidia/AnyFlow-Wan2.1-T2V-14B: flow-map any-step distill of the stock
+    /// Wan2.1-14B backbone. Audited against the repo `transformer/config.json`
+    /// (`AnyFlowTransformer3DModel`): dim 5120 (40 x 128), num_layers 40,
+    /// ffn_dim 13824, in/out 16 -- structurally `wan22_14b`. The AnyFlow delta
+    /// (`delta_embedder` + gated blend, `gate_value` 0.25) lives in the
+    /// condition embedder, not the blocks.
+    pub fn anyflow_t2v_14b() -> Self {
+        Self {
+            delta_embedder: true,
+            ..Self::wan22_14b()
         }
     }
 
@@ -581,11 +600,17 @@ fn lin<'wsp>(
 // ---------------------------------------------------------------------------
 
 /// Which QKV projection site a [`WanDitBlock::biased_proj`] call belongs to.
-/// They are separate matmul pipelines so self-attn can run the DP4A i8 weight
-/// while cross-attn (un-normed text K/V) stays dense; identical when i8 is off.
+/// They are separate matmul pipelines so the normed A-sides can run the DP4A
+/// i8 weight while the un-normed umT5 text K/V stays dense; identical when i8
+/// is off. Cross-attention splits per input: the Q projection reads the
+/// norm2-affine residual (i8-safe, same property as self-attn qkv) and shares
+/// the self-attn site pipelines; only the text-side K/V is `Cross` (dense).
+/// At video dims the cross-Q is a full `[rows, inner]` matmul per block, so
+/// leaving it on the dense pipeline cost ~35% of the DiT step GPU time.
 #[derive(Clone, Copy)]
 enum QkvSite {
     SelfAttn,
+    CrossQ,
     Cross,
 }
 
@@ -1179,7 +1204,7 @@ impl WanDitBlock {
             bufs.cross_attn.q_b,
             tr,
             inner,
-            QkvSite::Cross,
+            QkvSite::CrossQ,
         )?;
         let cq = alloc_act(scope, bp, tr, inner)?;
         let ncq = scope.import_copy(bufs.cross_attn.norm_q);
@@ -1294,10 +1319,37 @@ impl WanDitBlock {
     ) -> Result<(), WgpuError> {
         let s = &self.shape;
         let bp = &pipelines.block;
+        let inner = s.inner as u32;
         let nh = s.n_heads as u32;
         let hd = s.head_dim as u32;
         let scale = s.sdpa_scale();
         let no_mask = scope.alloc(16)?;
+        // i8 attention opt-in (full attention only; the i8 kernel has no
+        // windowed twin): quantize the roped q/k and raw v once (normed/roped,
+        // f16-safe -- the fast_sdpa contract) and run sdpa_i8 with dense-bf16
+        // output straight into `sa`. The proj site downstream is untouched.
+        if bp.i8_sdpa() && window == 0 {
+            let qq = quant_for_sdpa(scope, bp, ActBuf::dense(qx), rows, inner)?;
+            let kq = quant_for_sdpa(scope, bp, ActBuf::dense(kx), rows, inner)?;
+            let vq = quant_for_sdpa(scope, bp, ActBuf::dense(v), rows, inner)?;
+            return op_sdpa(
+                scope,
+                bp,
+                qq,
+                kq,
+                vq,
+                no_mask,
+                ActBuf::dense(sa),
+                1,
+                rows,
+                rows,
+                nh,
+                nh,
+                hd,
+                scale,
+                0,
+            );
+        }
         op_sdpa_f16_win(
             scope,
             bp,
@@ -1390,7 +1442,11 @@ impl WanDitBlock {
         // q = norm_q(to_q(q_src) + b_q); k = norm_k(to_k(kv_src) + b_k);
         // v = to_v(kv_src) + b_v. qk-norm is RMSNorm over the FULL inner dim
         // (`rms_norm_across_heads`), applied before the head split.
-        let q = self.biased_proj(scope, bp, q_src, w.q_w, w.q_b, q_rows, inner, site)?;
+        let q_site = match site {
+            QkvSite::Cross => QkvSite::CrossQ,
+            s => s,
+        };
+        let q = self.biased_proj(scope, bp, q_src, w.q_w, w.q_b, q_rows, inner, q_site)?;
         let k = self.biased_proj(scope, bp, kv_src, w.k_w, w.k_b, kv_rows, inner, site)?;
         let v = self.biased_proj(scope, bp, kv_src, w.v_w, w.v_b, kv_rows, inner, site)?;
         copy_tap(scope, q.data, tap_q, bp.act_bytes(q_rows * inner))?;
@@ -1405,6 +1461,7 @@ impl WanDitBlock {
         op_rmsnorm(scope, bp, k, nk, kn, kv_rows, inner, eps)?;
 
         // RoPE3D (interleaved-pair) on q/k, self-attention only.
+        let is_self = freqs.is_some();
         let (qx, kx) = match freqs {
             Some(f) => {
                 let qr = alloc_act(scope, bp, q_rows, inner)?;
@@ -1422,8 +1479,21 @@ impl WanDitBlock {
         // binds the mask storage slot but never reads it (read gated on
         // has_mask != 0), so a tiny dummy storage buffer suffices.
         let no_mask = scope.alloc(16)?;
+        // i8 attention opt-in: self-attention only (normed/roped q/k;
+        // cross-attn K/V from un-normed text stay dense). Same wiring as the
+        // tiled path's `self_sdpa` so small and large grids run one numeric
+        // path.
+        let (qs, ks, vs) = if is_self && bp.i8_sdpa() {
+            (
+                quant_for_sdpa(scope, bp, qx, q_rows, inner)?,
+                quant_for_sdpa(scope, bp, kx, kv_rows, inner)?,
+                quant_for_sdpa(scope, bp, v, kv_rows, inner)?,
+            )
+        } else {
+            (qx, kx, v)
+        };
         op_sdpa(
-            scope, bp, qx, kx, v, no_mask, sa, 1, q_rows, kv_rows, nh, nh, hd, scale, 0,
+            scope, bp, qs, ks, vs, no_mask, sa, 1, q_rows, kv_rows, nh, nh, hd, scale, 0,
         )?;
         copy_tap(scope, sa.data, tap_sa, bp.act_bytes(q_rows * inner))?;
 
@@ -1451,7 +1521,9 @@ impl WanDitBlock {
         // Self-attn qkv may be i8 (normed A-side); cross-attn qkv stays dense
         // (un-normed umT5 text K/V), or runs coopmat when opted in.
         let (coopmat, mm_i8, dq_i8, dq, pipe, inst) = match site {
-            QkvSite::SelfAttn => (
+            // CrossQ shares the self-attn pipelines: same weight encoding,
+            // same [inner, dim] shape, same normed A-side.
+            QkvSite::SelfAttn | QkvSite::CrossQ => (
                 None,
                 bp.matmul_i8_qkv_self.as_ref(),
                 bp.dequant_i8_qkv_self.as_ref(),

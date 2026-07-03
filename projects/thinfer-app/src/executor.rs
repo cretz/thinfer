@@ -507,7 +507,8 @@ impl LocalExecutor {
         // `vae` here is the Wan-mapped choice (`req.vae.into()`), so a Hunyuan-only
         // `TinyFt` request has already collapsed to `Tiny` -- this load covers it.
         if vae == VaeChoice::Tiny {
-            weight_openers.push(open_mmap(&resolve_role(manifest, wanmf::role::TINY_VAE)?).await?);
+            weight_openers
+                .push(open_mmap(&resolve_role(manifest, req.model.wan_tiny_vae_role())?).await?);
         }
 
         let tokenizer =
@@ -548,6 +549,9 @@ impl LocalExecutor {
             // tiled path only); an explicit 0 flows through as full attention.
             // Single source for both CLI and serve so they cannot drift.
             attn_window: req.attn_window.or_else(|| req.model.default_attn_window()),
+            // AnyFlow any-step: the user's --steps drives the flow-map schedule.
+            // The fixed distill samplers ignore it.
+            steps: Some(req.steps),
         };
 
         let video = if req.model.is_ar() {
@@ -612,6 +616,14 @@ impl LocalExecutor {
             let source = WanSource::open(weight_openers, None)
                 .await
                 .map_err(|e| format!("parse weight files: {e:?}"))?;
+            let wan_variant = if matches!(req.model, VideoModelId::AnyflowT2v14b) {
+                // All-safetensors like FastWan (3 DiT shards lead the opener
+                // list); the variant flips the 14B geometry + delta embedder +
+                // Q8 block transcode + the any-step denoise.
+                WanVariant::anyflow_t2v_14b()
+            } else {
+                WanVariant::fastwan_ti2v_5b()
+            };
             self.run_wan(
                 source,
                 req,
@@ -620,7 +632,7 @@ impl LocalExecutor {
                 &plan.shots,
                 vae,
                 false,
-                WanVariant::fastwan_ti2v_5b(),
+                wan_variant,
                 &progress,
                 &cancel,
             )

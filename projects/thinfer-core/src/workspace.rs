@@ -1068,6 +1068,8 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    /// `rows` is the dispatch's Q-row count (chunk size); the uniform carries
+    /// the chunk's global `row0`. Buffers are bound whole.
     #[allow(clippy::too_many_arguments)]
     pub fn sdpa_i8(
         &self,
@@ -1079,7 +1081,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         out: BatchBuf<'wsp>,
         uniform: BatchBuf<'wsp>,
         b: u32,
-        s_q: u32,
+        rows: u32,
         h_q: u32,
         d: u32,
     ) -> Result<(), B::Error> {
@@ -1103,14 +1105,15 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &bufs,
             b,
-            s_q,
+            rows,
             h_q,
             d,
         )
     }
 
-    /// CL-parameterized subgroup sdpa. `cl` must match the value the bound
-    /// `pipeline` was built with (it sets BR = WG/CL for the workgroup grid).
+    /// CL/R-parameterized subgroup sdpa. `cl` and `r` must match the values
+    /// the bound `pipeline` was built with (they set BR = WG/CL*R for the
+    /// workgroup grid).
     #[allow(clippy::too_many_arguments)]
     pub fn sdpa_sg(
         &self,
@@ -1122,6 +1125,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         uniform: BatchBuf<'wsp>,
         out: BatchBuf<'wsp>,
         cl: u32,
+        r: u32,
         b: u32,
         s_q: u32,
         h_q: u32,
@@ -1146,6 +1150,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &bufs,
             cl,
+            r,
             b,
             s_q,
             h_q,

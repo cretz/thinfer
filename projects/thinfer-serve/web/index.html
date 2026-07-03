@@ -139,7 +139,7 @@
              full attention. Only affects the long-clip activation-tiled path. -->
         <div id="attn-window-row" hidden>
           <label for="attn-window">Attention window (frames)</label>
-          <input id="attn-window" type="number" min="0" title="Latent-frame radius. Blank = model default (Wan 3, Hunyuan full). 0 = full attention." />
+          <input id="attn-window" type="number" min="0" title="Latent-frame radius. Blank = model default (Wan2.2 3, AnyFlow/Hunyuan full). 0 = full attention. On AnyFlow the first denoise step always runs full attention (anchors the scene); the window speeds up the later steps." />
         </div>
 
         <label for="seed">Seed</label>

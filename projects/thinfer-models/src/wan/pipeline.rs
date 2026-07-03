@@ -35,7 +35,9 @@ use crate::wan::dit_block::{WanDitBlockTaps, WanDitConfig, WanDitPipelines, conf
 use crate::wan::kv_cache::{KvCacheConfig, KvWindowCache, RamKvStore};
 use crate::wan::loader::{WanI8Sites, register_wan_dit_handles};
 use crate::wan::manifest::RECIPE;
-use crate::wan::scheduler::{DmdConfig, DmdSampler, Wan22DistillConfig, Wan22DistillSampler};
+use crate::wan::scheduler::{
+    AnyFlowSampler, DmdConfig, DmdSampler, Wan22DistillConfig, Wan22DistillSampler,
+};
 use crate::wan::umt5::{
     Umt5BlockOpsHost, Umt5Encoder, Umt5ForwardError, Umt5Handles, Umt5Pipelines, Umt5Taps,
     register_umt5_handles,
@@ -109,6 +111,35 @@ pub struct GenerationParams {
     /// temporal links); `None` runs full self-attention. Honored only on the
     /// activation-tiled path (long clips); short clips run full attention.
     pub attn_window: Option<u32>,
+    /// Inference step count, USER-set (AnyFlow any-step path only; the fixed
+    /// distill schedules ignore it). `None` = the model's default.
+    pub steps: Option<u32>,
+}
+
+/// AnyFlow default step count (the upstream demo's `num_inference_steps`).
+pub const ANYFLOW_DEFAULT_STEPS: u32 = 4;
+
+/// Per-step attention-window gate: hybrid step-windowing. Full attention on
+/// denoise steps `< from`, the requested window from step `from` on.
+/// Rationale: temporal identity and composition are committed in the early
+/// high-sigma steps, and plain all-steps W=3 at 81f drifts the scene every
+/// window-length (browser eyeball 2026-07-03: wardrobe/scene changes ~every
+/// 1-2s -- the +-3-latent-frame horizon; engine A/B at 832x480x81f 2-step,
+/// same seed/prompt: first-vs-frame0 drift curve 0.120 full / 0.216 W3-all /
+/// 0.124 hybrid -- step-0-full RESTORES full-attention temporal consistency
+/// at ~60% of the windowed step's cost saved). `default_from` is the arm's
+/// shipped behavior (AnyFlow: 1; Wan2.2 keeps its eyeballed all-steps 0);
+/// `THINFER_WAN_WINDOW_FROM_STEP` overrides for experiments.
+fn step_attn_window(requested: Option<u32>, step: usize, default_from: usize) -> Option<u32> {
+    static FROM_STEP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let from = FROM_STEP
+        .get_or_init(|| {
+            std::env::var("THINFER_WAN_WINDOW_FROM_STEP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(default_from);
+    if step < from { None } else { requested }
 }
 
 /// One shot of a multi-shot LongLive AR generation: a prompt that holds for
@@ -342,12 +373,23 @@ pub struct WanVariant {
     /// Two-expert MoE: register `high.`/`low.` handle sets + run the step-distill
     /// denoise with the per-step expert switch.
     pub moe: bool,
+    /// Block-matmul weight transcode at load. `Some(Q8_0)` for the AnyFlow
+    /// 14B (bf16 shards would stream 28GB/step; Q8_0 is the big-DiT quality+
+    /// perf baseline). `None` = keep the source encoding (bf16 dense, or the
+    /// GGUF's own quant).
+    pub block_transcode: Option<thinfer_core::quant::QuantKind>,
     /// Forced block activation dtype (overrides the f16-probe). The 14B residual
     /// stream has large-outlier channels that exceed f16's 65504 ceiling over its
     /// 40 layers (f16 saturates -> flat), so it runs bf16 acts (f32 exponent range,
     /// matches the pyref dtype). The 5B (3072 dim) fits f16. `None` = probe (F16
     /// when supported).
     pub act_pref: Option<ActDtype>,
+    /// The variant's tiny decoder consumes the DiT's NORMALIZED latents as-is
+    /// (madebyollin taew2_1 for the Wan2.1 z16 line): the tiny decode skips
+    /// the `z*std+mean` denorm the full VAE applies. False for the lightx2v
+    /// `lighttae*` retrains (lighttaew2_2), which are trained on denormalized
+    /// latents (upstream gates this on "lighttae" in the checkpoint name).
+    pub tiny_vae_normed_latents: bool,
 }
 
 impl WanVariant {
@@ -358,7 +400,24 @@ impl WanVariant {
             dit: WanDitConfig::fastwan_ti2v_5b(),
             vae: WanVaeConfig::fastwan_ti2v_5b(),
             moe: false,
+            block_transcode: None,
             act_pref: None,
+            tiny_vae_normed_latents: false,
+        }
+    }
+
+    /// nvidia/AnyFlow-Wan2.1-T2V-14B: single 14B expert (bf16 safetensors ->
+    /// Q8_0 block transcode at load), the Wan2.1 VAE, the any-step flow-map
+    /// denoise (user step count). Bf16 acts (14B residual overflows f16, same
+    /// as the A14B experts).
+    pub fn anyflow_t2v_14b() -> Self {
+        Self {
+            dit: WanDitConfig::anyflow_t2v_14b(),
+            vae: WanVaeConfig::wan2_1(),
+            moe: false,
+            block_transcode: Some(thinfer_core::quant::QuantKind::Q8_0),
+            act_pref: Some(ActDtype::Bf16),
+            tiny_vae_normed_latents: true,
         }
     }
 
@@ -370,7 +429,10 @@ impl WanVariant {
             dit: WanDitConfig::wan22_14b(),
             vae: WanVaeConfig::wan2_1(),
             moe: true,
+            block_transcode: None,
             act_pref: Some(ActDtype::Bf16),
+            // No tiny path today; taew2_1 (normed) would be the one if added.
+            tiny_vae_normed_latents: true,
         }
     }
 }
@@ -467,7 +529,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let low = register_wan_dit_handles(&residency, &cfg, "low.", None, i8_sites)?;
             (high, Some(low))
         } else {
-            let h = register_wan_dit_handles(&residency, &cfg, "", None, i8_sites)?;
+            let h =
+                register_wan_dit_handles(&residency, &cfg, "", variant.block_transcode, i8_sites)?;
             (h, None)
         };
         let dit_probe_prefix = if variant.moe { "high." } else { "" };
@@ -503,10 +566,17 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // pipeline set for every matmul site (patch, condition embedder, all 30
         // blocks, proj_out), so the dtype must be uniform; the ComfyUI GGUF
         // quantizes those big linears uniformly (norms/biases stay F32).
-        let dit_w = probe_weight(
-            &residency,
-            &format!("{dit_probe_prefix}blocks.0.attn1.to_q.weight"),
-        );
+        // The probe reads the SOURCE encoding; a load-time block transcode
+        // (AnyFlow: bf16 shards -> Q8_0) supersedes it -- pipeline dtype and
+        // registered buffer encoding MUST agree or every block matmul reads
+        // garbage (latent NaN, maiden-run bug 2026-07-02).
+        let dit_w = variant
+            .block_transcode
+            .map(WeightDtype::Quant)
+            .unwrap_or(probe_weight(
+                &residency,
+                &format!("{dit_probe_prefix}blocks.0.attn1.to_q.weight"),
+            ));
         let umt5_w = probe_weight(&residency, "encoder.block.0.layer.0.SelfAttention.q.weight");
         // `act_override` (the fp32 diagnostic) wins; else the variant's forced
         // dtype (14B -> Bf16, its residual overflows f16); else probe (F16 when
@@ -547,6 +617,18 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         } else {
             DenseActSites::default()
         };
+        // i8 self-attention opt-in (`THINFER_WAN_I8_SDPA=1`): quantize the
+        // normed/roped q/k/v to paired i8 and run `sdpa_i8` for the DiT
+        // self-attention (cross-attn stays dense). Needs SHADER_F16 (the
+        // kernel's f16-scaled pairs); on the bf16-act 14B it additionally
+        // rides the fast_sdpa casts, which need subgroups. Perf lever for
+        // the instruction-bound full-attention SDPA at long clips.
+        let i8_sdpa = std::env::var_os("THINFER_WAN_I8_SDPA").is_some_and(|v| v != "0")
+            && backend.supports_shader_f16()
+            && (act == ActDtype::F16 || backend.supports_subgroups());
+        if i8_sdpa {
+            tracing::info!("Wan DiT i8 self-attention opt-in enabled");
+        }
         let dit = WanDitPipelines::compile(
             &backend,
             &block_cfgs(
@@ -561,6 +643,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 // 14B, whose residual forces bf16) uses it; the F16-act FastWan
                 // already runs the native f16 subgroup SDPA.
                 true,
+                i8_sdpa,
             ),
         )
         .await?;
@@ -568,17 +651,28 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             &backend,
             // umT5 keeps bf16 SDPA: its residual is raw (un-normed) and the f16
             // path is only validated for normed DiT Q/K/V.
-            &block_cfgs(umt5_w, umt5_act, SiteOverride::default(), false),
+            &block_cfgs(umt5_w, umt5_act, SiteOverride::default(), false, false),
         )
         .await?;
         let vae_pipelines = WanVaePipelines::compile(&backend).await?;
         let vae_tiny = match vae_tiny_handles {
             None => None,
-            Some(handles) => Some(WanVaeTinyDecoder {
-                pipelines: WanVaeTinyPipelines::compile(&backend).await?,
-                handles,
-                cfg: (&vae_cfg).into(),
-            }),
+            Some(handles) => {
+                // taew2_1-family decoders consume the DiT's NORMALIZED latents
+                // directly (TAESD convention); only the lightx2v `lighttae*`
+                // retrains want the full VAE's `z*std+mean` denorm. Identity
+                // mean/std skips it.
+                let mut cfg: crate::wan::vae_tiny::TaehvConfig = (&vae_cfg).into();
+                if variant.tiny_vae_normed_latents {
+                    cfg.latents_mean = vec![0.0; cfg.z_dim];
+                    cfg.latents_std = vec![1.0; cfg.z_dim];
+                }
+                Some(WanVaeTinyDecoder {
+                    pipelines: WanVaeTinyPipelines::compile(&backend).await?,
+                    handles,
+                    cfg,
+                })
+            }
         };
 
         tracing::info!(
@@ -1018,6 +1112,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     image: &latents,
                     text,
                     timestep: unipc.timestep(step),
+                    r_timestep: None,
                     // AR self-attention uses its own windowed KV cache, not the
                     // dense self-SDPA window.
                     attn_window: None,
@@ -1067,6 +1162,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 image: &latents,
                 text,
                 timestep: 0.0,
+                r_timestep: None,
                 attn_window: None,
             };
             dit.forward_ar(
@@ -1248,11 +1344,24 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let tile = (super::dit_block::FFN_TILE_ROWS as u64).min(rows.max(1));
         let bpe = self.dit.block.act_bytes(1);
         let attn_phase = rows * 6 * dim * bpe;
-        let ffn_phase = rows * 2 * dim * bpe + tile * 2 * dff * bpe;
+        // x2 on the tile term: the tiled block loop keeps a depth-2 submit
+        // pipeline (two tiles' transients in flight at once).
+        let ffn_phase = rows * 2 * dim * bpe + 2 * (tile * 2 * dff * bpe);
         let dit_workspace = attn_phase.max(ffn_phase) + 4 * dim * dff * bpe;
         self.residency.set_transient_reserve(
             PREFETCH_STAGING_DEPTH * self.residency.vram_staging_reserve_bytes() + dit_workspace,
         );
+
+        // NO pin plan here, deliberately (tried + reverted 2026-07-02): with a
+        // 14B working set ~3x the VRAM budget, any pinned slice starves the
+        // same-size recycle scan, so streaming acquires fall into the arbiter
+        // reclaim chain while multi-second block compute is in flight. Freed
+        // buffers are deferred-destroyed (alive until the queue drains), so
+        // physical VRAM overshoots the accounted budget and the device is
+        // lost. Three device losses at three pin sizes (4.2G/3.2G/2.1G on the
+        // 8GB card); the fully-streamed steady state (same-size recycle, no
+        // frees) is what this loop is stable on. Z-Image keeps its pin plan:
+        // its whole DiT fits in budget, so its tail never churns.
 
         // --- Wan2.2-A14B MoE step-distill path (two experts). 4-step flow-Euler,
         // CFG-free; the high-noise expert runs the early steps, the low-noise
@@ -1276,8 +1385,15 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     });
                 }
                 if i > 0 && sampler.is_high_noise(i - 1) && !sampler.is_high_noise(i) {
+                    // The evict clears the transient reserve with the rest of
+                    // the phase state; the low expert runs the same loop, so
+                    // it comes straight back.
                     self.residency.evict_all_and_free(&*self.backend);
                     workspace.drain_pool();
+                    self.residency.set_transient_reserve(
+                        PREFETCH_STAGING_DEPTH * self.residency.vram_staging_reserve_bytes()
+                            + dit_workspace,
+                    );
                 }
                 let dit = if sampler.is_high_noise(i) {
                     &high
@@ -1288,7 +1404,10 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     image: &sample,
                     text: &text,
                     timestep: sampler.timestep(i),
-                    attn_window: params.attn_window,
+                    r_timestep: None,
+                    // Wan2.2 keeps its shipped all-steps window (default_from 0)
+                    // until its own hybrid eyeball.
+                    attn_window: step_attn_window(params.attn_window, i, 0),
                 };
                 let out = dit
                     .forward(
@@ -1300,6 +1419,84 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     )
                     .await?;
                 sample = sampler.step(i, &out.image, &sample);
+            }
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+            return Ok((sample, f_lat, h_lat, w_lat));
+        }
+
+        // --- AnyFlow any-step flow-map path (`delta_embedder` configs): the
+        // user picks the step count; every forward takes (t, r = next t) and
+        // the update is the exact flow-map displacement. CFG-free, no renoise. ---
+        if self.cfg.delta_embedder {
+            let dit = WanDit::assemble(self.dit_handles.clone(), shape(), self.cfg);
+            let steps = params.steps.unwrap_or(ANYFLOW_DEFAULT_STEPS).max(1) as usize;
+            let sampler = AnyFlowSampler::new(steps);
+            for i in 0..steps {
+                let _step = trace::scope!("step", i = i).entered();
+                if cancel.is_some_and(|c| c()) {
+                    return Err(GenerateError::Cancelled);
+                }
+                if let Some(p) = progress {
+                    p(ProgressEvent::Step {
+                        i: i as u32 + 1,
+                        n: steps as u32,
+                    });
+                }
+                let inputs = WanDitInputs {
+                    image: &sample,
+                    text: &text,
+                    timestep: sampler.timestep(i),
+                    r_timestep: Some(sampler.r_timestep(i)),
+                    // AnyFlow default: step 0 runs FULL attention, the window
+                    // applies from step 1 (hybrid schedule; A/B-proven above).
+                    attn_window: step_attn_window(params.attn_window, i, 1),
+                };
+                // Diag taps (the anyflow embedder-parity test): temb here is the
+                // BLENDED rt_emb, the only AnyFlow-specific math in the forward.
+                let velocity = if step_diag.is_some() {
+                    let (mut temb, mut timestep_proj) = (Vec::new(), Vec::new());
+                    let taps = WanDitTaps {
+                        temb: Some(&mut temb),
+                        timestep_proj: Some(&mut timestep_proj),
+                        ..Default::default()
+                    };
+                    let out = dit
+                        .forward_with_taps(
+                            &self.backend,
+                            &self.dit,
+                            &self.residency,
+                            &*workspace,
+                            &inputs,
+                            taps,
+                        )
+                        .await?;
+                    if let Some(d) = step_diag.as_deref_mut() {
+                        d.push(WanStepDiag {
+                            timestep: sampler.timestep(i),
+                            sigma: sampler.timestep(i) / AnyFlowSampler::NUM_TRAIN_TIMESTEPS,
+                            velocity: out.image.clone(),
+                            post: Vec::new(),
+                            per_block: Vec::new(),
+                            temb,
+                            timestep_proj,
+                            final_norm: Vec::new(),
+                            proj_out: Vec::new(),
+                        });
+                    }
+                    out.image
+                } else {
+                    dit.forward(
+                        &self.backend,
+                        &self.dit,
+                        &self.residency,
+                        &*workspace,
+                        &inputs,
+                    )
+                    .await?
+                    .image
+                };
+                sample = sampler.step(i, &velocity, &sample);
             }
             self.residency.evict_all_and_free(&*self.backend);
             workspace.drain_pool();
@@ -1329,6 +1526,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         image: &sample,
                         text: &text,
                         timestep: t,
+                        r_timestep: None,
                         attn_window: params.attn_window,
                     };
                     // Diag path captures per-block + final-stage taps via forward_with_taps;
@@ -1427,6 +1625,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         image: &sample,
                         text: &text,
                         timestep: unipc.timestep(i),
+                        r_timestep: None,
                         attn_window: params.attn_window,
                     };
                     let out = dit
@@ -1529,6 +1728,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             image: &sample,
             text: &text,
             timestep: t,
+            r_timestep: None,
             // Parity/bisection diagnostic: always full attention.
             attn_window: None,
         };
@@ -1699,6 +1899,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             image: latent,
             text: &text,
             timestep: sampler.timestep(step_index),
+            r_timestep: None,
             attn_window: None,
         };
         let out = dit
@@ -1789,6 +1990,7 @@ fn block_cfgs(
     act: ActDtype,
     ovr: SiteOverride,
     fast_sdpa: bool,
+    i8_sdpa: bool,
 ) -> BlockWgslConfigs {
     let ops = WgslConfig {
         bf16_quant_writes: RECIPE.bf16_quant_writes,
@@ -1818,7 +2020,7 @@ fn block_cfgs(
         matmul_ffn_down: mm,
         matmul_adaln: ops,
         ops,
-        i8_sdpa: false,
+        i8_sdpa,
         dense_acts: ovr.dense_acts,
         // Coopmat (tensor-core) on the outlier-bound bf16 sites i8 can't take:
         // proj (attn-out) + ffn_down (gelu product). Only on the bf16 14B path

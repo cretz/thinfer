@@ -27,7 +27,7 @@ const log = (line) => {
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid"],
-  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
+  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
 };
 // LTX-2.3 is a joint audio-video model with its own grid (/64 dims, 8k+1 frames).
 // Its video VAE decode tiles to the VRAM budget, so larger dims are allowed (more
@@ -46,6 +46,12 @@ const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.sta
 // duration field, but on the 8GB card the 14B self-attention is O(rows^2), so
 // longer = slower (the default 33f ~2.1s is the longest length validated e2e).
 const isWan22Model = (model) => model === "wan2.2-t2v-a14b";
+// AnyFlow-Wan2.1-T2V-14B: any-step flow-map distill on the Wan2.1-14B backbone.
+// Same 14B/Wan2.1-VAE surface as Wan2.2-A14B (832x480 default, full VAE only,
+// /16 grid) EXCEPT the step count is the model's headline feature: the user
+// picks it (2 = the fast play, more steps = steady quality gains), so the Steps
+// row stays visible with no upper cap.
+const isAnyflowModel = (model) => model === "anyflow-t2v-14b";
 // HunyuanVideo 1.5 T2V: its own pipeline (Qwen2.5-VL encoder, dual-stream MMDiT,
 // causal-conv VAE). Fixed lightx2v 4-step flow-match schedule (the steps/sampler
 // knobs do not apply) and its own VAE (no tiny path), so those rows are hidden.
@@ -167,6 +173,7 @@ const MODEL_STEPS = {
 const VIDEO_DURATION = {
   "fastwan-ti2v-5b": 5,
   "wan2.2-t2v-a14b": 2.1,
+  "anyflow-t2v-14b": 2.1,
   "longlive-2.0-5b": 5,
   "ltx-2.3-distilled": 2,
   "ltx-2.3-distilled-q4": 2,
@@ -323,7 +330,10 @@ function applyModel() {
   // a misleading "Tiny VAE" default those models ignore. Hunyuan 1.5 HAS both (a
   // TAEHV tiny default + the conv3d full VAE), so it keeps the dropdown.
   const isWan22 = kind === "video" && isWan22Model(model);
+  const isAnyflow = kind === "video" && isAnyflowModel(model);
   const isHunyuan = kind === "video" && isHunyuanModel(model);
+  // AnyFlow keeps the dropdown: tiny = taew2_1 (Wan2.1 z16), full = the real
+  // Wan2.1 VAE (parity path).
   $("vae-row").hidden = isLtxVideo || isWan22;
   // The Hunyuan-tuned tiny VAE is a Hunyuan-only checkpoint; only offer it there.
   // If a non-Hunyuan model is selected while it was chosen, fall back to tiny.
@@ -334,12 +344,18 @@ function applyModel() {
   // fixed lightx2v 4-step flow-match schedule; all ignore the steps/sampler knobs,
   // so hide the field for them.
   $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan;
-  // Temporal attention window is a video-DiT perf knob: Wan2.2-14B long clips and
-  // Hunyuan 1.5 (joint windowed attention -- image queries see ±W latent frames +
-  // all text). 0 = full attention. Wan ships an eyeballed W=3 default; Hunyuan
-  // defaults to FULL attention (blank field): W=3 broke multi-subject coherence
-  // (second-cat spawn at latent frame ~14, 2026-07-01 eyeball), so it is opt-in.
-  $("attn-window-row").hidden = !isWan22 && !(isHunyuan && !i2v);
+  // AnyFlow is ANY-step: lift the FastWan 1..=8 cap for it (default 4; 2 is the
+  // fast play; quality keeps improving with more).
+  if (isAnyflow) {
+    $("steps").max = "";
+  }
+  // Temporal attention window is a video-DiT perf knob: Wan2.2-14B long clips,
+  // AnyFlow-14B (same Wan backbone), and Hunyuan 1.5 (joint windowed attention --
+  // image queries see ±W latent frames + all text). 0 = full attention. Wan ships
+  // an eyeballed W=3 default; Hunyuan and AnyFlow default to FULL attention
+  // (blank field): W=3 broke multi-subject coherence on Hunyuan (second-cat spawn
+  // at latent frame ~14, 2026-07-01 eyeball), so it is opt-in pending eyeballs.
+  $("attn-window-row").hidden = !isWan22 && !isAnyflow && !(isHunyuan && !i2v);
   $("attn-window").value = isWan22 ? "3" : "";
   // Prompt rewrite (Hunyuan only): the model needs detailed captions, so the
   // "Enhance prompt" toggle is on by default and shown only for Hunyuan. The
@@ -489,6 +505,23 @@ async function buildSpec() {
       vae: "full",
       // Temporal self-attention window radius in latent frames; blank = full
       // attention. Only the long-clip activation-tiled path honors it.
+      attnWindow: intOrNull($("attn-window").value),
+      seed,
+    };
+  }
+  // AnyFlow: any-step flow-map schedule -- steps is the primary knob. VAE is
+  // the user's choice (tiny = taew2_1 fast decode, full = parity Wan2.1 VAE);
+  // attn-window is the opt-in perf lever (blank = full attention).
+  if (isAnyflowModel(model)) {
+    return {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      vae: $("vae").value,
+      steps: intOrNull($("steps").value),
       attnWindow: intOrNull($("attn-window").value),
       seed,
     };

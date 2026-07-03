@@ -291,8 +291,13 @@ pub struct BlockPipelines {
     /// && head_dim <= 128`, else falls back to `sdpa`.
     pub sdpa_sg: Option<WgpuPipeline>,
     /// Lane-cluster width (CL) baked into the `sdpa_sg` kernel: 8 when the
-    /// adapter's subgroup min size >= 8, else 4. Sets BR = WG/CL at dispatch.
+    /// adapter's subgroup min size >= 8, else 4. With `sdpa_sg_qr` it sets
+    /// BR = WG/CL*R at dispatch.
     pub sdpa_sg_cl: u32,
+    /// Q rows per lane cluster (R) baked into the `sdpa_sg` kernels
+    /// (Q-register blocking; bit-exact vs R=1). Default 1;
+    /// `THINFER_SDPA_SG_QR` overrides for perf A/B.
+    pub sdpa_sg_qr: u32,
     /// Temporal sliding-window twin of `sdpa_sg` (`build_f16_sg_windowed_wgsl`).
     /// Built alongside `sdpa_sg` whenever the subgroup f16 SDPA is. Dispatched
     /// in place of `sdpa_sg` only when a run sets `attn_window > 0` (video DiT
@@ -494,10 +499,10 @@ impl BlockWgslConfigs {
             );
         }
         if self.i8_sdpa {
-            assert_eq!(
-                a,
-                ActDtype::F16,
-                "BlockWgslConfigs: i8_sdpa requires F16 ops (sdpa_i8 reads/writes f16-scaled pairs)"
+            assert!(
+                a == ActDtype::F16 || (a == ActDtype::Bf16 && self.fast_sdpa),
+                "BlockWgslConfigs: i8_sdpa requires F16 ops, or Bf16 ops with fast_sdpa \
+                 (the mixed-precision casts feed act_quant and the dense-bf16 output mode)"
             );
         }
         if self.large_d_sdpa {
@@ -649,7 +654,27 @@ impl BlockPipelines {
         // (sg_min=32) -> CL=8 (unchanged); web/mobile, where the browser reports
         // the spec floor of 4, -> CL=4. (sg_min >= 4 guards pathological adapters
         // that expose subgroups but report a sub-spec floor.)
-        let sdpa_sg_cl = if sg_min >= 8 { 8u32 } else { 4u32 };
+        // `THINFER_SDPA_SG_CL` (native perf A/B) overrides within [4, sg_min]:
+        // smaller CL = fewer shuffle-reduce hops per key but more rows in
+        // flight per workgroup. NOT bit-exact across CL values (the per-key
+        // dot's f32 reduce order changes); any default change gates on the
+        // e2e parity bands like a kernel change.
+        let cl_default = if sg_min >= 8 { 8u32 } else { 4u32 };
+        let sdpa_sg_cl = std::env::var("THINFER_SDPA_SG_CL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|c| c.is_power_of_two() && *c >= 4 && *c <= sg_min.max(4))
+            .unwrap_or(cl_default);
+        // Q-register blocking: R Q rows per CL-lane cluster, amortizing the
+        // per-key K/V shared-tile loads + f16->f32 converts across R rows.
+        // BIT-EXACT vs R=1 (each row's f32 accumulation order is unchanged);
+        // costs R x the q/o register set, so occupancy decides the win.
+        // `THINFER_SDPA_SG_QR` A/B override; default 1 until measured.
+        let sdpa_sg_qr = std::env::var("THINFER_SDPA_SG_QR")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|r| matches!(r, 1 | 2 | 4))
+            .unwrap_or(1);
         let use_sdpa_sg =
             cfg.act_dtype == ActDtype::F16 && backend.supports_subgroups() && sg_min >= 4;
         let build_sdpa_sg = use_sdpa_sg || fast_mixed;
@@ -659,6 +684,7 @@ impl BlockPipelines {
             sdpa_use_subgroup = use_sdpa_sg,
             fast_mixed_sdpa = fast_mixed,
             sdpa_sg_cl = sdpa_sg_cl,
+            sdpa_sg_qr = sdpa_sg_qr,
             matmul_i8_tile = i8_cfg.tile,
             matmul_i8_use_subgroup = i8_cfg.use_subgroup,
             shader_f16 = backend.supports_shader_f16(),
@@ -976,12 +1002,13 @@ impl BlockPipelines {
                 .await?,
             sdpa_sg: if build_sdpa_sg {
                 // Subgroup-using shader: prepend `enable subgroups;` on the web
-                // (Tint) backend; native (naga) returns "". CL is baked into the
-                // kernel here and must match `sdpa_sg_cl` at dispatch.
+                // (Tint) backend; native (naga) returns "". CL/R are baked into
+                // the kernel here and must match `sdpa_sg_cl`/`sdpa_sg_qr` at
+                // dispatch.
                 let sdpa_sg_wgsl = format!(
                     "{}{}",
                     backend.subgroup_enable_directive(),
-                    thinfer_core::ops::sdpa::build_f16_sg_wgsl(sdpa_sg_cl),
+                    thinfer_core::ops::sdpa::build_f16_sg_wgsl(sdpa_sg_cl, sdpa_sg_qr),
                 );
                 Some(
                     backend
@@ -1003,7 +1030,7 @@ impl BlockPipelines {
                 let win_wgsl = format!(
                     "{}{}",
                     backend.subgroup_enable_directive(),
-                    thinfer_core::ops::sdpa::build_f16_sg_windowed_wgsl(sdpa_sg_cl),
+                    thinfer_core::ops::sdpa::build_f16_sg_windowed_wgsl(sdpa_sg_cl, sdpa_sg_qr),
                 );
                 Some(
                     backend
@@ -1019,6 +1046,7 @@ impl BlockPipelines {
                 None
             },
             sdpa_sg_cl,
+            sdpa_sg_qr,
             sdpa_large_d: if cfgs.large_d_sdpa {
                 Some(
                     backend
@@ -2949,9 +2977,11 @@ fn alloc_act_sdpa_io<'wsp>(
     })
 }
 
-/// Quantize a dense F16 act into a fused paired sdpa_i8 I/O slot via
-/// `act_quant`. Only called when `pipelines.i8_sdpa()`.
-fn quant_for_sdpa<'wsp>(
+/// Quantize a dense act into a fused paired sdpa_i8 I/O slot via `act_quant`.
+/// Only called when `pipelines.i8_sdpa()`. On a bf16-act block the source is
+/// cast to f16 first (act_quant reads vec2<f16>); valid ONLY for normed/roped
+/// O(1) Q/K/V, the same contract as `fast_sdpa`.
+pub(crate) fn quant_for_sdpa<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     src: ActBuf<'wsp>,
@@ -2964,8 +2994,19 @@ fn quant_for_sdpa<'wsp>(
         .act_quant
         .as_ref()
         .expect("act_quant pipeline must be built when sdpa_i8 is");
+    let src_f16 = if pipelines.act_dtype == ActDtype::Bf16 {
+        let f16 = scope.alloc(pipelines.act_bytes(rows * dim))?;
+        let to_f16 = pipelines
+            .cast_to_f16
+            .as_ref()
+            .expect("cast_to_f16 built on the bf16 i8_sdpa path");
+        scope.dispatch_op::<Bf16ToF16>(to_f16, &[src.data], f16)?;
+        f16
+    } else {
+        src.data
+    };
     let u = scope.u32x4_uniform(rows, dim, 0, 0)?;
-    scope.act_quant(aq, src.data, dd, ds, u, rows, dim)?;
+    scope.act_quant(aq, src_f16, dd, ds, u, rows, dim)?;
     Ok(dst)
 }
 
@@ -3286,20 +3327,59 @@ fn op_sdpa_impl<'wsp>(
     window: u32,
     txt_start: u32,
 ) -> Result<(), WgpuError> {
-    // The i8 paired path (opt-in, short-seq sites) dispatches whole, unchunked.
-    if let Some(sdpa_i8) = pipelines.sdpa_i8.as_ref() {
-        let u = sdpa_uniform(scope, b, h_q, h_kv, s_q, s_k, head_dim, scale, has_mask)?;
+    // The i8 paired path (opt-in): taken only when the caller actually
+    // quantized Q/K/V into paired slots (a block may compile sdpa_i8 for its
+    // long self-attention while keeping short cross-attn calls dense). The
+    // output form follows `dst`: paired (feeds a paired-A matmul, z_image
+    // proj) or dense at the act dtype (no output quantize; Wan's Q8 proj).
+    if let Some(sdpa_i8) = pipelines.sdpa_i8.as_ref()
+        && q.scale.is_some()
+    {
         let (qd, qs) = q.paired_unchecked();
         let (kd, ks) = k.paired_unchecked();
         let (vd, vs) = v.paired_unchecked();
-        let (dd, ds) = dst.paired_unchecked();
         let q_fused = scope.fuse_pair(qd, qs);
         let k_fused = scope.fuse_pair(kd, ks);
         let v_fused = scope.fuse_pair(vd, vs);
-        let o_fused = scope.fuse_pair(dd, ds);
-        return scope.sdpa_i8(
-            sdpa_i8, q_fused, k_fused, v_fused, mask, o_fused, u, b, s_q, h_q, head_dim,
-        );
+        let (o_buf, out_mode) = match dst.scale {
+            Some(_) => {
+                let (dd, ds) = dst.paired_unchecked();
+                (scope.fuse_pair(dd, ds), 0u32)
+            }
+            None => (
+                dst.data,
+                match pipelines.act_dtype {
+                    ActDtype::F16 => 1,
+                    ActDtype::Bf16 => 2,
+                    a => unreachable!("sdpa_i8 dense out unsupported at act dtype {a:?}"),
+                },
+            ),
+        };
+        // Q-row chunking under the ~2s Windows GPU watchdog, same scheme as
+        // the f16/dense paths below; each heavy chunk flushes into its own
+        // submit. Bit-exact: every kernel offset derives from the GLOBAL row
+        // index (`u.row0 + local`) and all buffers stay bound whole.
+        let max_rows = if b == 1 && has_mask == 0 {
+            sdpa_chunk_rows_i8(s_k)
+        } else {
+            s_q.max(1)
+        };
+        let chunked = max_rows < s_q;
+        let mut r0 = 0u32;
+        while r0 < s_q {
+            let rows = (s_q - r0).min(max_rows);
+            let u = sdpa_uniform_i8(
+                scope, b, h_q, h_kv, s_q, s_k, head_dim, scale, has_mask, r0, out_mode,
+            )?;
+            scope.sdpa_i8(
+                sdpa_i8, q_fused, k_fused, v_fused, mask, o_buf, u, b, rows, h_q, head_dim,
+            )?;
+            r0 += rows;
+            if chunked {
+                scope.flush()?;
+            }
+        }
+        return Ok(());
     }
 
     // Mixed-precision f16 SDPA (opt-in via fast_sdpa; bf16-act self-attention
@@ -3374,6 +3454,7 @@ fn op_sdpa_impl<'wsp>(
                 u,
                 o_f16,
                 pipelines.sdpa_sg_cl,
+                pipelines.sdpa_sg_qr,
                 b,
                 rows,
                 h_q,
@@ -3459,6 +3540,16 @@ fn sdpa_chunk_rows_f16(s_k: u32) -> u32 {
     (rows / 64 * 64).max(64)
 }
 
+/// Queries-per-dispatch cap for the i8 SDPA. Same 20M QK budget as the f16
+/// subgroup path: measured headroom there is ~10x under the 2s watchdog, so
+/// even if the i8 kernel lands slower per QK pair it stays well clear. Rounds
+/// to the BR=64 workgroup tile.
+fn sdpa_chunk_rows_i8(s_k: u32) -> u32 {
+    const MAX_QK: u64 = 20_000_000;
+    let rows = (MAX_QK / s_k.max(1) as u64) as u32;
+    (rows / 64 * 64).max(64)
+}
+
 /// Dense SDPA variant selection (no i8): large-D (VAE), subgroup-f16 (LTX), or
 /// the `SdpaF32` small-D fallback. Shared by the whole-tensor and chunked paths.
 #[allow(clippy::too_many_arguments)]
@@ -3492,6 +3583,7 @@ fn dispatch_sdpa_dense<'wsp>(
             u,
             out,
             pipelines.sdpa_sg_cl,
+            pipelines.sdpa_sg_qr,
             b,
             s_q,
             h_q,
@@ -3773,6 +3865,38 @@ pub(crate) fn sdpa_uniform_win<'wsp>(
     bytes[36..40].copy_from_slice(&window.to_le_bytes());
     bytes[40..44].copy_from_slice(&row_off.to_le_bytes());
     bytes[44..48].copy_from_slice(&txt_start.to_le_bytes());
+    scope.write_uniform(&bytes)
+}
+
+/// Uniform for the i8 SDPA: the 8 base fields plus `row0` (the global row
+/// index of this dispatch's first query, for Q-row chunking) and `out_mode`
+/// (0 = paired i8 out, 1 = dense packed f16, 2 = dense packed bf16). 48 bytes
+/// (12 u32) keeps the uniform 16-byte aligned.
+#[allow(clippy::too_many_arguments)]
+fn sdpa_uniform_i8<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    b: u32,
+    h_q: u32,
+    h_kv: u32,
+    s_q: u32,
+    s_k: u32,
+    d: u32,
+    scale: f32,
+    has_mask: u32,
+    row0: u32,
+    out_mode: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 48];
+    bytes[0..4].copy_from_slice(&b.to_le_bytes());
+    bytes[4..8].copy_from_slice(&h_q.to_le_bytes());
+    bytes[8..12].copy_from_slice(&h_kv.to_le_bytes());
+    bytes[12..16].copy_from_slice(&s_q.to_le_bytes());
+    bytes[16..20].copy_from_slice(&s_k.to_le_bytes());
+    bytes[20..24].copy_from_slice(&d.to_le_bytes());
+    bytes[24..28].copy_from_slice(&scale.to_le_bytes());
+    bytes[28..32].copy_from_slice(&has_mask.to_le_bytes());
+    bytes[32..36].copy_from_slice(&row0.to_le_bytes());
+    bytes[36..40].copy_from_slice(&out_mode.to_le_bytes());
     scope.write_uniform(&bytes)
 }
 

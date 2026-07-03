@@ -187,6 +187,12 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "longlive-2.0-5b"))]
     #[cfg_attr(feature = "serde", serde(rename = "longlive-2.0-5b"))]
     Longlive205b,
+    /// nvidia AnyFlow-Wan2.1-T2V-14B: any-step flow-map distill (the step
+    /// count is a user option, `--steps`; 2-step is the fast play). T2V only.
+    /// NVIDIA NSCLv1 license (noncommercial).
+    #[cfg_attr(feature = "cli", value(name = "anyflow-t2v-14b"))]
+    #[cfg_attr(feature = "serde", serde(rename = "anyflow-t2v-14b"))]
+    AnyflowT2v14b,
     /// LTX-2.3 distilled-1.1: a 22B joint audio-video DiT (two-stage distilled).
     /// Its own pipeline (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder);
     /// ignores the FastWan sampler/vae/shot knobs. Output MP4 carries an AAC
@@ -387,8 +393,12 @@ impl VideoModelId {
             // 832x480: HunyuanVideo 1.5's native 480p T2V regime (the res the
             // lightx2v 4-step distill was trained for). 16:9, /16-divisible.
             (832, 480)
-        } else if matches!(self, VideoModelId::Wan22T2vA14b) {
-            // 832x480: the lightx2v 480p distill regime, the industry-norm res for
+        } else if matches!(
+            self,
+            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
+        ) {
+            // 832x480: the lightx2v 480p distill regime (and AnyFlow's demo/
+            // trained res), the industry-norm res for
             // this model. The old <=512x288 default existed only to dodge a
             // device-loss that was MISDIAGNOSED as a >4096-cell shader fault; the
             // real cause is the 2s Windows GPU watchdog (TDR) tripping on a single
@@ -416,6 +426,19 @@ impl VideoModelId {
         }
     }
 
+    /// The Wan-manifest tiny-decoder role a `VaeChoice::Tiny` request pulls for
+    /// this model: the tiny decoder must pair with the variant's FULL VAE
+    /// latent space (`lighttaew2_2` for the Wan2.2 z48 line, `taew2_1` for the
+    /// Wan2.1 z16 AnyFlow). Wan models only; others resolve their VAE roles
+    /// through their own manifests.
+    pub fn wan_tiny_vae_role(self) -> &'static str {
+        use thinfer_models::wan::manifest::role;
+        match self {
+            VideoModelId::AnyflowT2v14b => role::TINY_VAE_WAN21,
+            _ => role::TINY_VAE,
+        }
+    }
+
     /// Whether this model's default denoise path is the two-stage upscale-refine
     /// (stage 1 half-res -> 2x latent upscale -> 3-step refine). True for LTX: on
     /// the 8GB target card, single-stage at the in-distribution widescreen res
@@ -440,7 +463,11 @@ impl VideoModelId {
     /// Model-preferred playback fps: default for fps and the `--duration`
     /// divisor. The Wan TI2V line is authored at 24; Wan2.2-A14B at 16 (upstream).
     pub fn fps(self) -> u32 {
-        if matches!(self, VideoModelId::Wan22T2vA14b) || self.is_hunyuan() {
+        if matches!(
+            self,
+            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
+        ) || self.is_hunyuan()
+        {
             16
         } else {
             24
@@ -533,7 +560,12 @@ impl VideoModelId {
     fn max_latent_cells(self) -> Option<u32> {
         if self.is_ltx() {
             Some(Self::LTX_MAX_LATENT_CELLS)
-        } else if matches!(self, VideoModelId::Wan22T2vA14b) {
+        } else if matches!(
+            self,
+            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
+        ) {
+            // AnyFlow shares the 14B geometry + Wan2.1 VAE grid, so the same
+            // activation envelope applies.
             Some(Self::WAN22_MAX_LATENT_CELLS)
         } else {
             None
@@ -639,6 +671,7 @@ impl std::fmt::Display for VideoModelId {
         f.write_str(match self {
             VideoModelId::FastwanTi2v5b => "fastwan-ti2v-5b",
             VideoModelId::Longlive205b => "longlive-2.0-5b",
+            VideoModelId::AnyflowT2v14b => "anyflow-t2v-14b",
             VideoModelId::Ltx23Distilled => "ltx-2.3-distilled",
             VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
             VideoModelId::Sulphur2 => "sulphur-2",

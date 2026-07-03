@@ -85,6 +85,10 @@ struct ConditionEmbedderNames {
     time_proj: LinearNames,
     text_linear_1: LinearNames,
     text_linear_2: LinearNames,
+    /// AnyFlow second TimestepEmbedding (registered only when the config's
+    /// `delta_embedder` is set; plain Wan checkpoints don't carry it).
+    delta_linear_1: LinearNames,
+    delta_linear_2: LinearNames,
 }
 
 impl ConditionEmbedderNames {
@@ -113,6 +117,14 @@ impl ConditionEmbedderNames {
             text_linear_2: lin(
                 "condition_embedder.text_embedder.linear_2.weight",
                 "condition_embedder.text_embedder.linear_2.bias",
+            ),
+            delta_linear_1: lin(
+                "condition_embedder.delta_embedder.linear_1.weight",
+                "condition_embedder.delta_embedder.linear_1.bias",
+            ),
+            delta_linear_2: lin(
+                "condition_embedder.delta_embedder.linear_2.weight",
+                "condition_embedder.delta_embedder.linear_2.bias",
             ),
         }
     }
@@ -227,7 +239,11 @@ pub fn register_wan_dit_handles<S: WeightSource>(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LoadedWanDitHandles {
         patch: register_conv_as_linear_bias(residency, &mw.patch_weight, &mw.patch_bias)?,
-        condition: register_condition_embedder(residency, &ConditionEmbedderNames::new(prefix))?,
+        condition: register_condition_embedder(
+            residency,
+            &ConditionEmbedderNames::new(prefix),
+            cfg.delta_embedder,
+        )?,
         blocks,
         scale_shift_table: register_passthrough(residency, &mw.scale_shift_table)?,
         proj_out: register_linear_bias(residency, &mw.proj_out_weight, &mw.proj_out_bias)?,
@@ -280,6 +296,7 @@ fn register_attn<S: WeightSource>(
 fn register_condition_embedder<S: WeightSource>(
     residency: &WeightResidency<S>,
     w: &ConditionEmbedderNames,
+    delta: bool,
 ) -> Result<ConditionEmbedderHandles, LoadError> {
     let lb = |l: &LinearNames| register_linear_bias(residency, &l.weight, &l.bias);
     Ok(ConditionEmbedderHandles {
@@ -288,6 +305,8 @@ fn register_condition_embedder<S: WeightSource>(
         time_proj: lb(&w.time_proj)?,
         text_linear_1: lb(&w.text_linear_1)?,
         text_linear_2: lb(&w.text_linear_2)?,
+        delta_linear_1: delta.then(|| lb(&w.delta_linear_1)).transpose()?,
+        delta_linear_2: delta.then(|| lb(&w.delta_linear_2)).transpose()?,
     })
 }
 

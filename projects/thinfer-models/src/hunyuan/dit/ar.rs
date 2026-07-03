@@ -71,6 +71,41 @@ struct VisBufs {
     ln4: LinBufs,
 }
 
+/// Img-side subset of a block's weights: everything `forward_chunk` reads.
+/// Chunk forwards acquire ONLY these (the txt-side weights are needed once,
+/// in the txt pass), halving the per-forward streamed bytes.
+struct ImgBlockBufs {
+    img_mod: LinBufs,
+    img_q: LinBufs,
+    img_k: LinBufs,
+    img_v: LinBufs,
+    img_qn: BufRef,
+    img_kn: BufRef,
+    img_proj: LinBufs,
+    img_fc1: LinBufs,
+    img_fc2: LinBufs,
+}
+
+/// Pin + acquire only the img-side weights of a block (chunk forwards).
+async fn acquire_img_block<'r, S: WeightSource>(
+    h: &BlockH,
+    res: &'r WeightResidency<S>,
+    backend: &WgpuBackend,
+    pins: &mut Vec<GpuView<'r>>,
+) -> Result<ImgBlockBufs, ResidencyError<S::Error, WgpuError>> {
+    Ok(ImgBlockBufs {
+        img_mod: acq_lin(res, backend, h.img_mod, pins).await?,
+        img_q: acq_lin(res, backend, h.img_q, pins).await?,
+        img_k: acq_lin(res, backend, h.img_k, pins).await?,
+        img_v: acq_lin(res, backend, h.img_v, pins).await?,
+        img_qn: acq_one(res, backend, h.img_qn, pins).await?,
+        img_kn: acq_one(res, backend, h.img_kn, pins).await?,
+        img_proj: acq_lin(res, backend, h.img_proj, pins).await?,
+        img_fc1: acq_lin(res, backend, h.img_fc1, pins).await?,
+        img_fc2: acq_lin(res, backend, h.img_fc2, pins).await?,
+    })
+}
+
 /// LN params registered passthrough (weight [dim] must NOT go through the
 /// linear transpose path).
 fn reg_ln<S: WeightSource>(res: &WeightResidency<S>, w: &LinW) -> Result<LinH, LoadError> {
@@ -120,12 +155,33 @@ fn ar_diag() -> bool {
     *V.get_or_init(|| std::env::var("THINFER_AR_DIAG").is_ok_and(|v| v != "0"))
 }
 
+/// Recache-forward modulation timestep (upstream `stabilization_level - 1`,
+/// raw 0..1000 label units). Default 0 = upstream level 1 (what every minWM
+/// config ships). `THINFER_HY_RECACHE_T` overrides for drift experiments: a
+/// higher value tells the model the committed context is slightly noisy,
+/// damping the sharpen-recache-sharpen feedback that drives AR drift.
+fn recache_timestep() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("THINFER_HY_RECACHE_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(arcfg::RECACHE_TIMESTEP)
+    })
+}
+
 /// Decode raw bf16 act bytes to f32 (diag only).
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
         .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
         .collect()
+}
+
+fn stat_std(x: &[f32]) -> f64 {
+    let n = x.len().max(1) as f64;
+    let mean = x.iter().map(|v| *v as f64).sum::<f64>() / n;
+    (x.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt()
 }
 
 fn diag_stats(label: &str, x: &[f32]) {
@@ -624,7 +680,7 @@ impl HunyuanArDit {
         let mut cur = img_ws;
         let mut cur_pins: Vec<GpuView> = Vec::new();
         let mut cur_b =
-            acquire_block(&self.handles.blocks[0], residency, backend, &mut cur_pins).await?;
+            acquire_img_block(&self.handles.blocks[0], residency, backend, &mut cur_pins).await?;
         // Committed chunk K/V per block (raw act bytes), appended after the loop
         // (avoids aliasing `cache` between compute and prefetch).
         let mut committed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -776,7 +832,7 @@ impl HunyuanArDit {
             let prefetch = async {
                 let b = if bi + 1 < nblocks {
                     Some(
-                        acquire_block(
+                        acquire_img_block(
                             &self.handles.blocks[bi + 1],
                             residency,
                             backend,
@@ -810,6 +866,20 @@ impl HunyuanArDit {
         }
 
         if commit {
+            if ar_diag() {
+                // Committed-KV drift probe: per-chunk cache growth stats at the
+                // first/middle/last block (an inflating block shows chunk-over-
+                // chunk K/V std growth here before it is visible in pixels).
+                for bi in [0usize, nblocks / 2, nblocks - 1] {
+                    let k = bf16_to_f32(&committed[bi].0);
+                    let v = bf16_to_f32(&committed[bi].1);
+                    let kstd = stat_std(&k);
+                    let vstd = stat_std(&v);
+                    eprintln!(
+                        "[ar diag] commit t0={start_t} block {bi}: k_std={kstd:.4} v_std={vstd:.4}"
+                    );
+                }
+            }
             for (bi, (kb, vb)) in committed.into_iter().enumerate() {
                 cache[bi].k.extend_from_slice(&kb);
                 cache[bi].v.extend_from_slice(&vb);
@@ -1022,12 +1092,27 @@ impl HunyuanArDit {
                 start_t,
                 gh,
                 gw,
-                arcfg::RECACHE_TIMESTEP,
+                recache_timestep(),
                 &mut cache,
                 true,
                 &kv_ping,
             )
             .await?;
+            if ar_diag() {
+                // Latent-domain drift probe: per-chunk stats of the committed
+                // region (compounding shows as chunk-over-chunk growth without
+                // waiting for a VAE decode).
+                let hw = gh * gw;
+                let mut chunk_lat = Vec::with_capacity(rows as usize * lat);
+                for c in 0..lat {
+                    for r in 0..rows as usize {
+                        chunk_lat.push(x[c * thw + start_t * hw + r]);
+                    }
+                }
+                let amax = chunk_lat.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                diag_stats(&format!("chunk {chunk} denoised latent"), &chunk_lat);
+                eprintln!("[ar diag] chunk {chunk} denoised latent absmax={amax:.4}");
+            }
         }
         Ok(x)
     }
