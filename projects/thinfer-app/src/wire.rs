@@ -84,6 +84,27 @@ pub struct ImageSpec {
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
     pub disable_coopmat: Option<bool>,
+    /// User adapters (vault LoRAs) to fold into the DiT for this generation, in
+    /// fold order. Each `id` is a `vault list` entry for THIS model. Empty/absent
+    /// = the plain base model. Only models that support adapters accept a
+    /// non-empty list; requires `password`.
+    #[serde(default)]
+    pub lora: Vec<LoraSpec>,
+    /// Vault password, required when `lora` is non-empty. Transient: used to
+    /// decrypt the adapters for this request only, never stored or logged.
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// One adapter reference in a generate request: a vault entry id + optional blend
+/// weight (defaults to 1.0).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LoraSpec {
+    pub id: String,
+    #[serde(default)]
+    pub weight: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +143,21 @@ pub struct VideoSpec {
     /// image-edit path.
     #[serde(default)]
     pub input_image: Option<String>,
+    /// Base64-encoded source FACE image bytes (PNG/JPEG). DreamID-V only
+    /// (required there): the face to swap into the target video. The server
+    /// decodes it to a temp file under the job dir.
+    #[serde(default)]
+    pub source_image: Option<String>,
+    /// Base64-encoded target VIDEO bytes (mp4). DreamID-V only (required there):
+    /// the clip to swap a face into. Held RAM-first; a large upload spills to an
+    /// encrypted on-disk blob under a per-request ephemeral key (never plaintext
+    /// on disk). Rejected by every other model.
+    #[serde(default)]
+    pub input_video: Option<String>,
+    /// DreamID-V image-CFG guidance scale on the source-face reference. Omitted =
+    /// the model default (4.0). Ignored by the other (CFG-free) video models.
+    #[serde(default)]
+    pub guide_scale: Option<f32>,
     /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
     /// baseline) or `q4` (Q4_K_M, ~2.8x faster encode, lower precision). Applies
     /// to all LTX/Sulphur models; ignored by Wan.
@@ -160,10 +196,23 @@ pub struct VideoSpec {
 pub struct FaceSwapSpec {
     pub model: Option<SwapModel>,
     /// Local path to the input video (the server reads it directly; localhost
-    /// deployments only).
-    pub input_video: String,
-    /// Local path to the source face image.
-    pub source_image: String,
+    /// deployments only). Mutually exclusive with `input_video_b64`.
+    #[serde(default)]
+    pub input_video: Option<String>,
+    /// Local path to the source face image. Mutually exclusive with
+    /// `source_image_b64`.
+    #[serde(default)]
+    pub source_image: Option<String>,
+    /// Base64-encoded input VIDEO bytes (mp4), for browser uploads. Held
+    /// RAM-first; a large upload spills to an encrypted on-disk blob under a
+    /// per-request ephemeral key (never plaintext on disk). Takes precedence over
+    /// `input_video` when both are set.
+    #[serde(default)]
+    pub input_video_b64: Option<String>,
+    /// Base64-encoded source FACE image bytes (PNG/JPEG), for browser uploads.
+    /// Takes precedence over `source_image` when both are set.
+    #[serde(default)]
+    pub source_image_b64: Option<String>,
     /// Base64 SPKI RSA-OAEP public key for result encryption (see [`ImageSpec`]).
     #[serde(default)]
     pub public_key: Option<String>,

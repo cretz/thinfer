@@ -166,6 +166,47 @@ pub(crate) fn register_linear_transcode<S: WeightSource>(
     })
 }
 
+/// Register a raw multi-dim float parameter the model reads DIRECTLY (not via a
+/// matmul), so it keeps the on-disk row order with NO transpose. F16/F32 narrow
+/// to bf16 on upload (residency `read_for_gpu`). Use for params like krea's
+/// `last.modulation.lin` (an F16 `[2, dim]` scale/shift pair sliced into rows):
+/// `register_passthrough` rejects F16, and `register_linear` would apply the
+/// `Linear2D` transpose that scrambles a raw-read layout.
+pub(crate) fn register_raw_param<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    id: &WeightId,
+) -> Result<WeightHandle, LoadError> {
+    let entry = residency
+        .source()
+        .catalog()
+        .get(id)
+        .ok_or_else(|| LoadError::UnknownWeight(id.clone()))?;
+    let encoding = entry.encoding.ok_or_else(|| LoadError::Undecodable {
+        id: id.clone(),
+        encoding: None,
+        label: entry.encoding_label.clone(),
+    })?;
+    if !matches!(
+        encoding,
+        StorageEncoding::Bf16 | StorageEncoding::F16 | StorageEncoding::F32
+    ) {
+        return Err(LoadError::Undecodable {
+            id: id.clone(),
+            encoding: Some(encoding),
+            label: entry.encoding_label.clone(),
+        });
+    }
+    let meta = WeightMeta {
+        id: id.clone(),
+        shape: entry.shape.clone(),
+        encoding,
+        on_disk_bytes: entry.size,
+        transpose: TransposePolicy::None,
+        transcode: None,
+    };
+    Ok(residency.register(meta))
+}
+
 /// Register a conv kernel whose spatial dims are all 1 (a 1x1x1 conv) as a
 /// dense linear. The on-disk weight `[out, in, 1, 1, 1]` is row-major identical
 /// to `[out, in]`, so we flatten the shape to 2D and ride the `Linear2D`

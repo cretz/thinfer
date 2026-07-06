@@ -383,6 +383,7 @@ pub struct BlockPipelines {
     pub coopmat_proj: Option<CoopmatStep>,
     pub coopmat_ffn_down: Option<CoopmatStep>,
     pub coopmat_qkv: Option<CoopmatStep>,
+    pub coopmat_ffn_up: Option<CoopmatStep>,
     /// On-GPU activation storage dtype for buffers compiled against this set
     /// of pipelines. Drives byte sizing of every transient alloc through the
     /// DiT block forward pass.
@@ -459,6 +460,10 @@ pub struct CoopmatSites {
     pub proj: bool,
     pub ffn_down: bool,
     pub qkv: bool,
+    /// FFN up/gate (SwiGLU input side). Off for the i8 image/video paths (that
+    /// site takes DP4A on its normed A-side); ON only where i8 is unavailable
+    /// (bf16-residual DiTs like Krea whose f16-only i8 path diverges).
+    pub ffn_up: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -867,6 +872,12 @@ impl BlockPipelines {
         .await?;
         let coopmat_qkv =
             build_coopmat("qkv", cfgs.matmul_qkv.weight_dtype, cfgs.coopmat_acts.qkv).await?;
+        let coopmat_ffn_up = build_coopmat(
+            "ffn_up",
+            cfgs.matmul_ffn_up.weight_dtype,
+            cfgs.coopmat_acts.ffn_up,
+        )
+        .await?;
         // act_quant serves two consumers: the matmul-site dense->paired
         // transcode on every i8 site, and the post-rope q/k/v quantize
         // when i8 attention is enabled.
@@ -1219,6 +1230,7 @@ impl BlockPipelines {
             coopmat_proj,
             coopmat_ffn_down,
             coopmat_qkv,
+            coopmat_ffn_up,
             act_dtype: cfg.act_dtype,
         })
     }

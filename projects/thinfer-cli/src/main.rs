@@ -23,6 +23,11 @@ enum Top {
         #[command(subcommand)]
         cmd: Box<cmd::generate::GenerateCmd>,
     },
+    /// Manage the encrypted adapter (LoRA) vault.
+    Vault {
+        #[command(subcommand)]
+        cmd: cmd::vault::VaultCmd,
+    },
 }
 
 fn main() -> ExitCode {
@@ -76,6 +81,13 @@ fn main() -> ExitCode {
         match cli.cmd {
             Top::Model { cmd: sub } => cmd::model::run(sub).await,
             Top::Generate { cmd: sub } => cmd::generate::run(*sub).await,
+            Top::Vault { cmd: sub } => match cmd::vault::run(sub).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(1)
+                }
+            },
         }
     });
     if let Some(h) = rollup_handle {

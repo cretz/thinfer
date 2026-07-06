@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::SwapModel;
-use thinfer_app::request::FaceSwapRequest;
+use thinfer_app::request::{FaceImage, FaceSwapRequest, VideoInput};
 use thinfer_app::{JobRequest, parse_budget};
 
 #[derive(Args)]
@@ -40,10 +40,16 @@ pub async fn run_faceswap(args: GenerateFaceSwap) -> Result<(), String> {
     let ram = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
     let vram = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
 
+    // The target video rides RAM-first (the request holds the mp4 bytes; a serve
+    // upload may instead be an encrypted spill). The CLI reads the local file.
+    let video_bytes = std::fs::read(&args.input_video)
+        .map_err(|e| format!("read {}: {e}", args.input_video.display()))?;
+    let source_bytes = std::fs::read(&args.source_image)
+        .map_err(|e| format!("read {}: {e}", args.source_image.display()))?;
     let req = FaceSwapRequest {
         model: args.model,
-        input_video: args.input_video,
-        source_image: args.source_image,
+        input_video: VideoInput::Ram(video_bytes),
+        source_image: FaceImage(source_bytes),
         output: args.output,
         budget: ResidencyBudget {
             ram_bytes: ram,

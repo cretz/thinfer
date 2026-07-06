@@ -21,6 +21,8 @@ pub mod remote;
 pub mod request;
 #[cfg(feature = "rewrite")]
 pub mod rewrite;
+#[cfg(feature = "vault")]
+pub mod vault;
 #[cfg(feature = "serde")]
 pub mod wire;
 

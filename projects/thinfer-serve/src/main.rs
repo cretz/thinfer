@@ -16,6 +16,7 @@ mod api;
 mod config;
 mod crypto;
 mod job;
+mod vault;
 mod web;
 mod worker;
 
@@ -170,11 +171,14 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
         "thinfer-serve starting",
     );
 
+    let vault_dir = config.resolved_vault_dir();
+    tracing::info!(vault_dir = %vault_dir.display(), "adapter vault");
     let web = web::router(config.web_dir.as_deref());
     let state = AppState {
         store,
         config: Arc::new(config.clone()),
         coopmat_supported,
+        vault: Arc::new(thinfer_app::vault::Vault::new(vault_dir)),
     };
     let app = api::router(state).merge(web);
 

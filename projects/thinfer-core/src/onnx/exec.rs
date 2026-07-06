@@ -155,6 +155,9 @@ struct Pipelines {
     maxpool: WgpuPipeline,
     zero_upsample: WgpuPipeline,
     concat2: WgpuPipeline,
+    slice: WgpuPipeline,
+    global_avg_pool: WgpuPipeline,
+    reduce_sum: WgpuPipeline,
 }
 
 impl Pipelines {
@@ -201,6 +204,9 @@ impl Pipelines {
             maxpool: p("onnx_maxpool", kernels::MAXPOOL, 1).await?,
             zero_upsample: p("onnx_zero_upsample", kernels::ZERO_UPSAMPLE, 1).await?,
             concat2: p("onnx_concat2", kernels::CONCAT2, 2).await?,
+            slice: p("onnx_slice", kernels::SLICE, 1).await?,
+            global_avg_pool: p("onnx_global_avg_pool", kernels::GLOBAL_AVG_POOL, 1).await?,
+            reduce_sum: p("onnx_reduce_sum", kernels::REDUCE_SUM, 1).await?,
         })
     }
 }
@@ -892,20 +898,34 @@ impl OnnxModel {
                 )?;
                 acts.insert(out_name.clone(), out);
             }
-            "Relu" | "Sigmoid" | "Tanh" | "LeakyRelu" => {
+            "Relu" | "Sigmoid" | "Tanh" | "LeakyRelu" | "Sqrt" | "HardSigmoid" | "Clip" => {
                 let x = self.value_buf(acts, &node.inputs[0])?;
-                let kind = match op {
-                    "Relu" => 0u32,
-                    "Sigmoid" => 1,
-                    "Tanh" => 2,
-                    _ => 3,
+                // kind, alpha, beta per UNARY kernel's switch.
+                let (kind, alpha, beta) = match op {
+                    "Relu" => (0u32, 0.0, 0.0),
+                    "Sigmoid" => (1, 0.0, 0.0),
+                    "Tanh" => (2, 0.0, 0.0),
+                    "LeakyRelu" => (3, node.attr_f("alpha", 0.01), 0.0),
+                    "Sqrt" => (5, 0.0, 0.0),
+                    "HardSigmoid" => (6, node.attr_f("alpha", 0.2), node.attr_f("beta", 0.5)),
+                    // Clip: min/max come from optional scalar const inputs.
+                    _ => {
+                        let clip_bound = |i: usize, default: f32| -> f32 {
+                            node.inputs
+                                .get(i)
+                                .filter(|s| !s.is_empty())
+                                .and_then(|n| self.plan.consts.get(n))
+                                .map(|d| d.to_f32()[0])
+                                .unwrap_or(default)
+                        };
+                        (7, clip_bound(1, -3.4e38), clip_bound(2, 3.4e38))
+                    }
                 };
-                let alpha = node.attr_f("alpha", 0.01);
                 let u = Uni::default()
                     .u32(total)
                     .u32(kind)
                     .f32(alpha)
-                    .u32(0)
+                    .f32(beta)
                     .finish();
                 let uni = self.write_uniform(u, keepalive)?;
                 let out = self.alloc_out(&out_shape, keepalive)?;
@@ -1105,44 +1125,11 @@ impl OnnxModel {
                     let a = node.attr_i("axis", 0);
                     (if a < 0 { a + out_shape.len() as i64 } else { a }) as usize
                 };
-                if node.inputs.len() == 2 {
-                    // Batch-safe 2-input concat kernel (the U-Net skip joins).
-                    let a = self.value_buf(acts, &node.inputs[0])?;
-                    let b = self.value_buf(acts, &node.inputs[1])?;
-                    let ad = pad4(in_shape(0)?);
-                    let bd = pad4(in_shape(1)?);
-                    let od = pad4(&out_shape);
-                    // `axis` is over the (possibly <4D) logical shape; pad4 right-
-                    // aligns to 4D, so shift the axis index to match.
-                    let off = 4 - out_shape.len();
-                    let a_axis = ad[axis + off];
-                    let mut u = Uni::default()
-                        .u32(total)
-                        .u32((axis + off) as u32)
-                        .u32(a_axis)
-                        .u32(0);
-                    for v in od.iter().chain(ad.iter()).chain(bd.iter()) {
-                        u = u.u32(*v);
-                    }
-                    let uni = self.write_uniform(u.finish(), keepalive)?;
-                    let out = self.alloc_out(&out_shape, keepalive)?;
-                    self.backend.dispatch(
-                        encoder,
-                        &self.pipelines.concat2,
-                        &[a.binding(0), b.binding(1), out.binding(2), uni.binding(3)],
-                        wg,
-                    )?;
-                    acts.insert(out_name.clone(), out);
-                } else {
-                    // Contiguous fallback (N inputs): valid only when the axes
-                    // before `axis` are unit (e.g. batch 1, channel concat).
-                    let outer: i64 = out_shape[..axis].iter().product::<i64>().max(1);
-                    if outer != 1 {
-                        return Err(OnnxError::Unsupported(format!(
-                            "Concat of {} inputs at axis={axis} with non-unit outer dims {out_shape:?}",
-                            node.inputs.len()
-                        )));
-                    }
+                let outer: i64 = out_shape[..axis].iter().product::<i64>().max(1);
+                if node.inputs.len() > 2 && outer == 1 {
+                    // Contiguous fast path (N inputs, unit outer dims): the concat
+                    // axis is the outermost non-unit one, so each input is a
+                    // contiguous run - a plain buffer copy.
                     let out = self.alloc_out(&out_shape, keepalive)?;
                     let mut off_elems: u64 = 0;
                     for inp in &node.inputs {
@@ -1159,10 +1146,243 @@ impl OnnxModel {
                         off_elems += n;
                     }
                     acts.insert(out_name.clone(), out);
+                } else {
+                    // General case: fold the inputs left with the batch-safe
+                    // 2-input concat kernel (handles any axis / non-unit outer).
+                    let mut acc = self.value_buf(acts, &node.inputs[0])?;
+                    let mut acc_shape = in_shape(0)?.to_vec();
+                    for (i, inp) in node.inputs.iter().enumerate().skip(1) {
+                        let b = self.value_buf(acts, inp)?;
+                        let b_shape = in_shape(i)?.to_vec();
+                        let mut step_shape = acc_shape.clone();
+                        step_shape[axis] += b_shape[axis];
+                        let out = if i == node.inputs.len() - 1 {
+                            self.alloc_out(&out_shape, keepalive)?
+                        } else {
+                            self.alloc_out(&step_shape, keepalive)?
+                        };
+                        self.dispatch_concat2(
+                            &acc,
+                            &acc_shape,
+                            &b,
+                            &b_shape,
+                            axis,
+                            &step_shape,
+                            &out,
+                            encoder,
+                            keepalive,
+                        )?;
+                        acc = out;
+                        acc_shape = step_shape;
+                    }
+                    acts.insert(out_name.clone(), acc);
                 }
+            }
+            // Batched MatMul with a batch dim of 1 (RTMPose SimCC/GAU head):
+            // collapse A's leading dims into M and reuse the GEMM kernel, which
+            // reads B as a contiguous `[K, N]` block (valid since B's leading
+            // dims are all 1 here). No transpose, no bias.
+            "MatMul" => {
+                let a = self.value_buf(acts, &node.inputs[0])?;
+                let b = self.value_buf(acts, &node.inputs[1])?;
+                let a_sh = in_shape(0)?.to_vec();
+                let b_sh = in_shape(1)?.to_vec();
+                let k = *a_sh.last().unwrap() as u32;
+                let n = *b_sh.last().unwrap() as u32;
+                let m = (numel(&a_sh) / k.max(1) as u64) as u32;
+                let bias = self.zero_bias(n as usize, keepalive)?;
+                let u = Uni::default()
+                    .u32(m)
+                    .u32(n)
+                    .u32(k)
+                    .u32(0)
+                    .u32(0)
+                    .u32(0)
+                    .u32(0)
+                    .u32(0)
+                    .finish();
+                let uni = self.write_uniform(u, keepalive)?;
+                let out = self.alloc_out(&out_shape, keepalive)?;
+                self.backend.dispatch(
+                    encoder,
+                    &self.pipelines.gemm,
+                    &[
+                        a.binding(0),
+                        b.binding(1),
+                        bias.binding(2),
+                        out.binding(3),
+                        uni.binding(4),
+                    ],
+                    crate::ops::linear_workgroups(m * n, 64),
+                )?;
+                acts.insert(out_name.clone(), out);
+            }
+            "Slice" => {
+                let x = self.value_buf(acts, &node.inputs[0])?;
+                let xs = in_shape(0)?.to_vec();
+                let (start, step) = slice_starts_steps(node, &self.plan, &xs)?;
+                let out = self.alloc_out(&out_shape, keepalive)?;
+                self.dispatch_slice(&x, &out, &xs, &out_shape, start, step, encoder, keepalive)?;
+                acts.insert(out_name.clone(), out);
+            }
+            // Split along `axis`: each output is a contiguous sub-block, emitted
+            // via the slice kernel (start = running offset on that axis).
+            "Split" => {
+                let x = self.value_buf(acts, &node.inputs[0])?;
+                let xs = in_shape(0)?.to_vec();
+                let rank = xs.len() as i64;
+                let axis = {
+                    let a = node.attr_i("axis", 0);
+                    (if a < 0 { a + rank } else { a }) as usize
+                };
+                let off = 4 - xs.len();
+                let mut cursor = 0i64;
+                for out_val in &node.outputs {
+                    let osh = self.plan.shape_of(out_val)?.to_vec();
+                    let mut start = [0u32; 4];
+                    start[off + axis] = cursor as u32;
+                    let out = self.alloc_out(&osh, keepalive)?;
+                    self.dispatch_slice(&x, &out, &xs, &osh, start, [1u32; 4], encoder, keepalive)?;
+                    acts.insert(out_val.clone(), out);
+                    cursor += osh[axis];
+                }
+            }
+            "GlobalAveragePool" => {
+                let x = self.value_buf(acts, &node.inputs[0])?;
+                let xs = in_shape(0)?.to_vec();
+                let nc = (xs[0] * xs[1]) as u32;
+                let hw = (xs[2] * xs[3]) as u32;
+                let u = Uni::default().u32(nc).u32(hw).u32(0).u32(0).finish();
+                let uni = self.write_uniform(u, keepalive)?;
+                let out = self.alloc_out(&out_shape, keepalive)?;
+                self.backend.dispatch(
+                    encoder,
+                    &self.pipelines.global_avg_pool,
+                    &[x.binding(0), out.binding(1), uni.binding(2)],
+                    crate::ops::linear_workgroups(nc, 64),
+                )?;
+                acts.insert(out_name.clone(), out);
+            }
+            "ReduceSum" => {
+                let x = self.value_buf(acts, &node.inputs[0])?;
+                let xs = in_shape(0)?.to_vec();
+                let rank = xs.len() as i64;
+                let axes: Vec<i64> = node
+                    .attr_ints("axes")
+                    .map(|a| a.to_vec())
+                    .or_else(|| {
+                        node.inputs
+                            .get(1)
+                            .filter(|s| !s.is_empty())
+                            .and_then(|n| self.plan.consts.get(n))
+                            .map(|d| d.as_i64().to_vec())
+                    })
+                    .ok_or_else(|| OnnxError::Unsupported("ReduceSum without axes".into()))?;
+                if axes.len() != 1 {
+                    return Err(OnnxError::Unsupported(
+                        "ReduceSum over multiple axes".into(),
+                    ));
+                }
+                let ax = {
+                    let a = axes[0];
+                    (if a < 0 { a + rank } else { a }) as usize
+                };
+                let alen = xs[ax] as u32;
+                let astride: u32 = xs[ax + 1..].iter().product::<i64>() as u32;
+                let u = Uni::default()
+                    .u32(total)
+                    .u32(alen)
+                    .u32(astride)
+                    .u32(0)
+                    .finish();
+                let uni = self.write_uniform(u, keepalive)?;
+                let out = self.alloc_out(&out_shape, keepalive)?;
+                self.backend.dispatch(
+                    encoder,
+                    &self.pipelines.reduce_sum,
+                    &[x.binding(0), out.binding(1), uni.binding(2)],
+                    wg,
+                )?;
+                acts.insert(out_name.clone(), out);
             }
             other => return Err(OnnxError::Unsupported(format!("compute op '{other}'"))),
         }
+        Ok(())
+    }
+
+    /// Dispatch the strided-slice kernel: gather `out[oc] = x[start + oc*step]`
+    /// per padded-4D axis. Shared by ONNX Slice and Split.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_slice(
+        &self,
+        x: &Rc<GpuBuf>,
+        out: &Rc<GpuBuf>,
+        xs: &[i64],
+        os: &[i64],
+        start: [u32; 4],
+        step: [u32; 4],
+        encoder: &mut crate::backend::CommandEncoderState,
+        keepalive: &mut Vec<Rc<GpuBuf>>,
+    ) -> Result<(), OnnxError> {
+        let id = pad4(xs);
+        let od = pad4(os);
+        let total = numel(os) as u32;
+        let mut u = Uni::default().u32(total).u32(0).u32(0).u32(0);
+        for v in id
+            .iter()
+            .chain(od.iter())
+            .chain(start.iter())
+            .chain(step.iter())
+        {
+            u = u.u32(*v);
+        }
+        let uni = self.write_uniform(u.finish(), keepalive)?;
+        self.backend.dispatch(
+            encoder,
+            &self.pipelines.slice,
+            &[x.binding(0), out.binding(1), uni.binding(2)],
+            crate::ops::linear_workgroups(total, 64),
+        )?;
+        Ok(())
+    }
+
+    /// Dispatch the batch-safe 2-input concat kernel joining `a`/`b` along
+    /// `axis` into `out` (shape `os`). Shared by the 2-input and N-way paths.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_concat2(
+        &self,
+        a: &Rc<GpuBuf>,
+        a_shape: &[i64],
+        b: &Rc<GpuBuf>,
+        b_shape: &[i64],
+        axis: usize,
+        os: &[i64],
+        out: &Rc<GpuBuf>,
+        encoder: &mut crate::backend::CommandEncoderState,
+        keepalive: &mut Vec<Rc<GpuBuf>>,
+    ) -> Result<(), OnnxError> {
+        let ad = pad4(a_shape);
+        let bd = pad4(b_shape);
+        let od = pad4(os);
+        // pad4 right-aligns to 4D; shift `axis` (over the logical shape) to match.
+        let off = 4 - os.len();
+        let a_axis = ad[axis + off];
+        let total = numel(os) as u32;
+        let mut u = Uni::default()
+            .u32(total)
+            .u32((axis + off) as u32)
+            .u32(a_axis)
+            .u32(0);
+        for v in od.iter().chain(ad.iter()).chain(bd.iter()) {
+            u = u.u32(*v);
+        }
+        let uni = self.write_uniform(u.finish(), keepalive)?;
+        self.backend.dispatch(
+            encoder,
+            &self.pipelines.concat2,
+            &[a.binding(0), b.binding(1), out.binding(2), uni.binding(3)],
+            crate::ops::linear_workgroups(total, 64),
+        )?;
         Ok(())
     }
 
@@ -1200,6 +1420,50 @@ fn ct_tiled_eligible(node: &crate::onnx::proto::Node) -> bool {
             .unwrap_or(true)
 }
 
+/// Per-axis (start, step) padded to 4D for a Slice node, read from its const
+/// starts/ends/axes/steps inputs. Only positive steps are supported (all the
+/// slices in these models are forward strides).
+fn slice_starts_steps(
+    node: &crate::onnx::proto::Node,
+    plan: &Plan,
+    xs: &[i64],
+) -> Result<([u32; 4], [u32; 4]), OnnxError> {
+    let cint = |i: usize| -> Vec<i64> {
+        plan.consts
+            .get(&node.inputs[i])
+            .map(|d| d.as_i64().to_vec())
+            .unwrap_or_default()
+    };
+    let starts = cint(1);
+    let rank = xs.len() as i64;
+    let axes: Vec<i64> = match node.inputs.get(3).filter(|s| !s.is_empty()) {
+        Some(_) => cint(3)
+            .iter()
+            .map(|&a| if a < 0 { a + rank } else { a })
+            .collect(),
+        None => (0..starts.len() as i64).collect(),
+    };
+    let steps: Vec<i64> = match node.inputs.get(4).filter(|s| !s.is_empty()) {
+        Some(_) => cint(4),
+        None => vec![1; starts.len()],
+    };
+    let off = 4 - xs.len();
+    let mut start = [0u32; 4];
+    let mut step = [1u32; 4];
+    for (k, &ax) in axes.iter().enumerate() {
+        if steps[k] <= 0 {
+            return Err(OnnxError::Unsupported(
+                "Slice with non-positive step".into(),
+            ));
+        }
+        let dim = xs[ax as usize];
+        let norm = |v: i64| if v < 0 { v + dim } else { v };
+        start[off + ax as usize] = norm(starts[k]).clamp(0, dim) as u32;
+        step[off + ax as usize] = steps[k] as u32;
+    }
+    Ok((start, step))
+}
+
 /// Indices of a node's inputs that are real data operands (not shape/param
 /// inputs consumed at plan time). Used to decide which constants to upload.
 fn data_operands<'a>(op: &str, inputs: &'a [String]) -> Vec<&'a str> {
@@ -1212,8 +1476,10 @@ fn data_operands<'a>(op: &str, inputs: &'a [String]) -> Vec<&'a str> {
             .collect()
     };
     match op {
-        // x + shape/param input(s) -> only the data tensor.
-        "Resize" | "Expand" => take(1),
+        // x + shape/param input(s) -> only the data tensor. (Slice starts/ends/
+        // axes/steps, Split sizes, ReduceSum axes, Clip min/max are const params
+        // read at plan/dispatch time, never uploaded as buffers.)
+        "Resize" | "Expand" | "Slice" | "Split" | "ReduceSum" | "Clip" => take(1),
         // All inputs are data operands.
         _ => inputs
             .iter()

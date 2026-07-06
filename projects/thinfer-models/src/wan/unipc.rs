@@ -38,6 +38,20 @@ impl UniPcConfig {
         }
     }
 
+    /// DreamID-V-Wan-1.3B-Faster (`wan_swapface.py::generate`): the upstream
+    /// `FlowUniPCMultistepScheduler(shift=1)` re-shifted by `set_timesteps(steps,
+    /// shift=5.0)`, `num_train_timesteps=1000`, CFG on the image ref only. The
+    /// Faster variant ships 16 steps; `steps` is passed through so the health
+    /// gate can run a 2-step smoke.
+    pub fn dreamid_v(steps: u32) -> Self {
+        Self {
+            sampling_steps: steps.max(1) as usize,
+            shift: 5.0,
+            num_train_timesteps: 1000.0,
+            sigma_min: 0.001,
+        }
+    }
+
     /// FastWan2.2-TI2V-5B served sampler. Matches the public HF Spaces that load
     /// `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers`:
     /// `UniPCMultistepScheduler.from_config(..., flow_shift=8.0)`, CFG-free.

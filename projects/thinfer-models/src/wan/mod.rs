@@ -7,6 +7,7 @@
 pub mod condition_embedder;
 pub mod dit;
 pub mod dit_block;
+pub mod dreamidv;
 pub mod kv_cache;
 pub mod loader;
 pub mod manifest;

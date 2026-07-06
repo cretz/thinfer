@@ -41,6 +41,14 @@ const REPO_WAN22_DIFFUSERS: &str = "Wan-AI/Wan2.2-T2V-A14B-Diffusers";
 /// the Wan2.1 one (diffusers naming, from the Wan2.2-A14B diffusers repo).
 /// License: NVIDIA NSCLv1 (noncommercial).
 const REPO_ANYFLOW: &str = "nvidia/AnyFlow-Wan2.1-T2V-14B-Diffusers";
+/// DreamID-V-Wan-1.3B-Faster: the diffusion video face-swap DiT (`dreamidv_faster
+/// .pth`, 827 fp32 tensors, repo root), read directly via `PytorchSource` (no
+/// offline convert). The baked "chang face" umT5 context is a fixed model constant
+/// the HF weights repo does not ship, so it rides in-tree (see
+/// `wan::dreamidv::baked_context`), not as a download. The Wan2.1 VAE reuses the
+/// Wan2.2-A14B diffusers `Wan2.1_VAE` (`VAE_WAN21`). License Apache-2.0. No umT5
+/// encoder / tokenizer (baked context).
+const REPO_DREAMIDV: &str = "XuGuo699/DreamID-V";
 
 pub mod role {
     /// DMD-distilled Wan2.2-TI2V-5B DiT (`WanTransformer3DModel`), single file.
@@ -81,6 +89,14 @@ pub mod role {
     pub const DIT_ANYFLOW_1: &str = "dit/anyflow1";
     pub const DIT_ANYFLOW_2: &str = "dit/anyflow2";
     pub const DIT_ANYFLOW_3: &str = "dit/anyflow3";
+    /// DreamID-V-Wan-1.3B-Faster DiT (`dreamidv_faster.pth`, read directly via
+    /// `PytorchSource`). The baked umT5 context is an in-tree constant, not a role.
+    pub const DIT_DREAMIDV: &str = "dit/dreamidv";
+    /// DWPose live face-mask preprocessor ONNX nets (DreamID-V live path):
+    /// `yolox_l` person detector + `dw-ll_ucoco_384` RTMPose whole-body
+    /// keypoints. Both at the DreamID-V HF repo root; download-as-needed.
+    pub const YOLOX_ONNX: &str = "dwpose/yolox";
+    pub const DWPOSE_ONNX: &str = "dwpose/pose";
 }
 
 /// One loadable variant: the file set `WanModel::load` needs. Mirrors
@@ -145,6 +161,14 @@ const ANYFLOW_WEIGHT_ROLES: &[&str] = &[
     role::VAE_WAN21,
 ];
 
+/// DreamID-V safetensors side: just the Wan2.1 VAE (`VAE_WAN21`). The DiT is the
+/// `.pth` in `dit_pt_role` (read via `PytorchSource`, like LongLive). No umT5, no
+/// tokenizer. The baked context + the two DWPose ONNX nets ride `aux_roles` so
+/// the whole download set is the variant's `files()` (no special-casing at the
+/// request layer).
+const DREAMIDV_WEIGHT_ROLES: &[&str] = &[role::VAE_WAN21];
+const DREAMIDV_AUX_ROLES: &[&str] = &[role::YOLOX_ONNX, role::DWPOSE_ONNX];
+
 pub static VARIANTS: &[VariantFiles] = &[
     VariantFiles {
         id: "fastwan-ti2v-5b",
@@ -185,6 +209,18 @@ pub static VARIANTS: &[VariantFiles] = &[
         gguf_low_role: Some(role::DIT_LOW_NOISE),
         lora_high_role: Some(role::LORA_HIGH_NOISE),
         lora_low_role: Some(role::LORA_LOW_NOISE),
+    },
+    VariantFiles {
+        id: "dreamid-v",
+        // The Wan2.1 VAE + baked context + DWPose ONNX download (weight/aux roles);
+        // the DiT `.pth` rides `dit_pt_role` (read via `PytorchSource`).
+        weight_roles: DREAMIDV_WEIGHT_ROLES,
+        aux_roles: DREAMIDV_AUX_ROLES,
+        dit_pt_role: Some(role::DIT_DREAMIDV),
+        gguf_high_role: None,
+        gguf_low_role: None,
+        lora_high_role: None,
+        lora_low_role: None,
     },
 ];
 
@@ -355,6 +391,20 @@ pub static MANIFEST: ModelManifest = ModelManifest {
                 REPO_WAN22_LORA,
                 "wan2.2_t2v_A14b_low_noise_lora_rank64_lightx2v_4step_1217.safetensors",
             ),
+        ),
+        // --- DreamID-V-Wan-1.3B-Faster (DiT `.pth` read directly; baked context
+        //     is an in-tree constant, not a download) ---
+        (
+            role::DIT_DREAMIDV,
+            FileRef::new(REPO_DREAMIDV, "dreamidv_faster.pth"),
+        ),
+        (
+            role::YOLOX_ONNX,
+            FileRef::new(REPO_DREAMIDV, "yolox_l.onnx"),
+        ),
+        (
+            role::DWPOSE_ONNX,
+            FileRef::new(REPO_DREAMIDV, "dw-ll_ucoco_384.onnx"),
         ),
     ],
 };

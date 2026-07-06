@@ -1,0 +1,6 @@
+# Local thinfer-serve config. HTTPS with a self-signed cert generated at startup
+# so the browser gets a secure context over the LAN (needed for WebCrypto result
+# encryption AND to keep the adapter-vault password off plaintext HTTP). SANs
+# auto-include localhost, 127.0.0.1, and the primary LAN IP; add others (e.g. a
+# Tailscale IP) to tls_sans. Clients accept a one-time cert warning.
+tls_self_signed = true

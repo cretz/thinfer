@@ -247,6 +247,19 @@ pub fn register_wan_dit_handles<S: WeightSource>(
         blocks,
         scale_shift_table: register_passthrough(residency, &mw.scale_shift_table)?,
         proj_out: register_linear_bias(residency, &mw.proj_out_weight, &mw.proj_out_bias)?,
+        // DreamID-V ref_conv (source-face patchify). Named literally (no diffusers
+        // equivalent -> passes through the rename layer unchanged). Same conv-as-
+        // linear fold as patch_embedding.
+        ref_conv: cfg
+            .ref_conv
+            .then(|| {
+                register_conv_as_linear_bias(
+                    residency,
+                    &WeightId(format!("{prefix}ref_conv.weight")),
+                    &WeightId(format!("{prefix}ref_conv.bias")),
+                )
+            })
+            .transpose()?,
     })
 }
 

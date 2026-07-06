@@ -8,7 +8,8 @@ use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::{
     IMAGE_DEFAULT_HEIGHT, IMAGE_DEFAULT_STEPS, IMAGE_DEFAULT_WIDTH, ImageModelId,
 };
-use thinfer_app::request::{ImageFormat, ImageRequest};
+use thinfer_app::request::{ImageFormat, ImageRequest, LoraRef, Secret};
+use thinfer_app::vault::{self, Vault};
 use thinfer_app::wire::{ImageSpec, JobSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 
@@ -53,6 +54,16 @@ pub struct GenerateImage {
     /// forces the bf16 reference path). No effect on Z-Image.
     #[arg(long)]
     pub no_i8_matmul: bool,
+    /// Fold a stored adapter into the DiT, as `NAME_OR_ID[:WEIGHT]` (repeatable,
+    /// applied in order). Resolved against the vault for `--model`; needs the
+    /// vault password (hidden prompt, or `THINFER_VAULT_PASSWORD`). Local runs
+    /// only (not `--remote`); only models that support adapters accept it.
+    #[arg(long = "lora", value_name = "NAME[:WEIGHT]")]
+    pub lora: Vec<String>,
+    /// Vault directory for `--lora`. Defaults to the shared location
+    /// (`THINFER_VAULT_DIR`, else `<hf-cache>/vault`).
+    #[arg(long)]
+    pub vault_dir: Option<PathBuf>,
     /// Skip the TTY consent prompt and download missing weight files.
     #[arg(long, default_value_t = false)]
     pub download_as_needed: bool,
@@ -73,6 +84,12 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         if args.input_image.is_some() {
             return Err("--input-image (image edit) is not supported over --remote yet".into());
         }
+        if !args.lora.is_empty() {
+            return Err(
+                "--lora (adapters) is not supported over --remote; run locally or use the web UI"
+                    .into(),
+            );
+        }
         let spec = JobSpec::Image(ImageSpec {
             model: Some(args.model),
             prompt: args.prompt,
@@ -87,11 +104,22 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
             disable_coopmat: None,
+            // Adapters over --remote are guarded above.
+            lora: Vec::new(),
+            password: None,
         });
         return super::run_remote(&args.remote, spec, args.output).await;
     }
     let ram = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
     let vram = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
+
+    // Resolve any --lora names/ids against the vault (needs the password).
+    let (lora, vault_password) = if args.lora.is_empty() {
+        (Vec::new(), None)
+    } else {
+        let (refs, password) = resolve_loras(args.model, args.vault_dir.as_deref(), &args.lora)?;
+        (refs, Some(password))
+    };
 
     let req = ImageRequest {
         model: args.model,
@@ -102,6 +130,9 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         seed: args.seed,
         i8_matmul: !args.no_i8_matmul,
         input_image: args.input_image,
+        lora,
+        vault_password,
+        vault_dir: vault::resolve_dir(args.vault_dir.as_deref()),
         budget: ResidencyBudget {
             ram_bytes: ram,
             vram_bytes: vram,
@@ -119,4 +150,53 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         vram,
     )
     .await
+}
+
+/// Parse a `--lora` value: `NAME_OR_ID` optionally suffixed with `:WEIGHT`. The
+/// suffix is only a weight if it parses as a float (ids/names never contain a
+/// trailing `:float`), so a bare name is unambiguous.
+fn parse_lora_arg(s: &str) -> (&str, Option<f32>) {
+    if let Some((key, w)) = s.rsplit_once(':')
+        && let Ok(weight) = w.parse::<f32>()
+    {
+        return (key, Some(weight));
+    }
+    (s, None)
+}
+
+/// Resolve `--lora` values to vault entry ids by matching each against the
+/// model's stored adapters (by id or decrypted name). Reads the vault password
+/// (prompt / env). The weight is the explicit `:WEIGHT`, else the adapter's
+/// stored suggestion, else 1.0.
+fn resolve_loras(
+    model: ImageModelId,
+    vault_dir: Option<&std::path::Path>,
+    specs: &[String],
+) -> Result<(Vec<LoraRef>, Secret), String> {
+    let password = crate::cmd::vault::read_password(false)?;
+    let vault = Vault::new(vault::resolve_dir(vault_dir));
+    let entries = vault
+        .list(password.expose(), &model.to_string())
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (key, weight) = parse_lora_arg(spec);
+        let entry = entries
+            .iter()
+            .find(|e| e.id == key || e.name == key)
+            .ok_or_else(|| {
+                format!(
+                    "no adapter '{key}' for {model} in the vault \
+                     (see `thinfer vault list --model {model}`)"
+                )
+            })?;
+        let weight = weight
+            .or_else(|| entry.extra.get("weight").and_then(|w| w.parse().ok()))
+            .unwrap_or(1.0);
+        out.push(LoraRef {
+            id: entry.id.clone(),
+            weight,
+        });
+    }
+    Ok((out, password))
 }

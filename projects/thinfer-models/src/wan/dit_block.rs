@@ -110,6 +110,13 @@ pub struct WanDitConfig {
     /// `condition_embedder.delta_embedder.*` and every forward takes the
     /// flow-map target timestep `r` alongside `t`.
     pub delta_embedder: bool,
+    /// DreamID-V face-swap conditioning: the checkpoint carries a `ref_conv`
+    /// (`Conv2d(out_channels -> inner, k=stride=patch_hw)`) that patchifies the
+    /// source-face latent into PREFIX tokens prepended to the sequence (grid
+    /// `F -> F+1`, stripped before the head). `false` on every plain Wan model,
+    /// so their forward is unchanged. Implies `in_channels` carries the extra
+    /// conditioning latents concatenated on the channel axis.
+    pub ref_conv: bool,
 }
 
 impl WanDitConfig {
@@ -125,6 +132,27 @@ impl WanDitConfig {
             in_channels: 48,
             out_channels: 48,
             delta_embedder: false,
+            ref_conv: false,
+        }
+    }
+
+    /// DreamID-V-Wan-1.3B-Faster: the stock Wan2.1-1.3B T2V backbone (num_heads
+    /// 12 * head_dim 128 -> dim 1536; ffn_dim 8960; num_layers 30; Wan2.1 VAE
+    /// z_dim 16) modified for diffusion video face swap. Two deltas vs stock:
+    /// `in_channels 48` (the patch-embed sees noise[16] concatenated with the
+    /// target-video[16] and face-mask[16] conditioning latents on the channel
+    /// axis) and `ref_conv true` (a Conv2d that patchifies the source-face
+    /// latent into prefix tokens). `out_channels` stays 16 (the denoised video
+    /// latent). Audited against `dreamidv_wan_faster/configs/wan_swapface.py`.
+    pub fn dreamid_v() -> Self {
+        Self {
+            num_heads: 12,
+            ffn_dim: 8960,
+            num_layers: 30,
+            in_channels: 48,
+            out_channels: 16,
+            delta_embedder: false,
+            ref_conv: true,
         }
     }
 
@@ -151,6 +179,7 @@ impl WanDitConfig {
             in_channels: 16,
             out_channels: 16,
             delta_embedder: false,
+            ref_conv: false,
         }
     }
 

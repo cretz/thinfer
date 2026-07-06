@@ -39,17 +39,31 @@ utoipa = { version = "5", optional = true }
 serde_json = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
 futures-util = { version = "0.3", optional = true }
+# User-driven encrypted adapter (LoRA) vault (`vault` module): Argon2id KDF +
+# AES-256-GCM, both native-only. Gated so a bare thinfer-app stays dep-clean;
+# both `cli` and `serve` turn it on for CLI/web parity.
+argon2 = { version = "0.5", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+rand = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = []
 # clap `ValueEnum` derives on the canonical id enums, so thinfer-cli reuses the
 # app enums as its `--model` etc. value types (one name per concept).
-cli = ["dep:clap", "rewrite"]
+cli = ["dep:clap", "rewrite", "vault"]
 # serde derives on the canonical id enums (kebab-case ids matching the CLI).
 serde = ["dep:serde"]
 # serde + utoipa `ToSchema`, so thinfer-serve reuses the id enums as its OpenAPI
 # schema (single source for the variant lists).
-serve = ["serde", "dep:utoipa", "rewrite"]
+serve = ["serde", "dep:utoipa", "rewrite", "vault"]
+# The encrypted adapter vault (`vault` module + LoRA request plumbing). Native
+# crypto + reqwest download; shared by CLI and serve so the capability is at
+# parity across every interface.
+vault = ["serde", "dep:serde_json", "dep:reqwest", "dep:argon2", "dep:aes-gcm", "dep:base64", "dep:rand"]
 # Optional HunyuanVideo 1.5 prompt rewriting: runs the cached Qwen3-VL-8B GGUF
 # on-device (native wgpu, `thinfer_models::qwen3_lm`), no HTTP/Python sidecar.
 # Just gates the `rewrite` module + the Phase-0 call; no extra deps. Enabled by

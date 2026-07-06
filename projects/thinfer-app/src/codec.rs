@@ -4,7 +4,6 @@
 //! WebCodecs instead). Per-frame progress goes through a [`ProgressSink`];
 //! descriptive lines go through [`ProgressSink::note`] with their original text.
 
-use std::io::BufReader;
 use std::path::Path;
 
 use thinfer_models::faceswap::FaceSwapper;
@@ -20,6 +19,16 @@ const BITS_PER_PIXEL: f64 = 0.2;
 /// Decode a PNG/JPEG source image into an RGB [`Image`].
 pub fn load_image(path: &Path) -> Result<Image, String> {
     let dynimg = image::open(path).map_err(|e| format!("decode {}: {e}", path.display()))?;
+    let rgb = dynimg.to_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    Ok(Image::from_rgb8(w, h, rgb.as_raw()))
+}
+
+/// Decode PNG/JPEG source-image container bytes (held in RAM) into an RGB
+/// [`Image`]. The RAM-first counterpart of [`load_image`] (face-swap / DreamID-V
+/// source face; the bytes never touch disk).
+pub fn load_image_bytes(bytes: &[u8]) -> Result<Image, String> {
+    let dynimg = image::load_from_memory(bytes).map_err(|e| format!("decode source image: {e}"))?;
     let rgb = dynimg.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
     Ok(Image::from_rgb8(w, h, rgb.as_raw()))
@@ -432,6 +441,95 @@ fn patch_chunk_offsets(buf: &mut [u8], shift: u64) -> bool {
     true
 }
 
+/// The byte offset where a box's payload starts (past its size+type header),
+/// accounting for a 64-bit `largesize`. `abs` is the box's absolute start.
+fn box_payload_start(data: &[u8], abs: usize) -> usize {
+    match u32::from_be_bytes(data[abs..abs + 4].try_into().unwrap()) {
+        1 => abs + 16, // 64-bit largesize
+        _ => abs + 8,
+    }
+}
+
+/// Iterate the child boxes in `data[start..end)`, yielding `(abs_start, kind,
+/// abs_end)` for each. Handles 32/64-bit sizes and size-0-to-end. Stops on any
+/// malformed length (returns what parsed so far).
+fn child_boxes(data: &[u8], mut p: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+    let mut out = Vec::new();
+    while p + 8 <= end {
+        let size = u32::from_be_bytes(data[p..p + 4].try_into().unwrap());
+        let kind: [u8; 4] = data[p + 4..p + 8].try_into().unwrap();
+        let len = match size {
+            0 => end - p,
+            1 => match data.get(p + 8..p + 16) {
+                Some(b) => u64::from_be_bytes(b.try_into().unwrap()) as usize,
+                None => break,
+            },
+            n => n as usize,
+        };
+        if len < 8 || p + len > end {
+            break;
+        }
+        out.push((kind, p, p + len));
+        p += len;
+    }
+    out
+}
+
+/// Whether a `trak` box (`data[start..end)`) is an AUDIO track: its
+/// `mdia/hdlr` handler_type is `soun`.
+fn trak_is_audio(data: &[u8], start: usize, end: usize) -> bool {
+    let Some((_, ms, me)) = child_boxes(data, box_payload_start(data, start), end)
+        .into_iter()
+        .find(|(k, ..)| k == b"mdia")
+    else {
+        return false;
+    };
+    let Some((_, hs, _)) = child_boxes(data, box_payload_start(data, ms), me)
+        .into_iter()
+        .find(|(k, ..)| k == b"hdlr")
+    else {
+        return false;
+    };
+    // hdlr payload: version+flags (4), pre_defined (4), handler_type (4).
+    let ht = box_payload_start(data, hs) + 8;
+    data.get(ht..ht + 4) == Some(b"soun".as_slice())
+}
+
+/// Neutralize every AUDIO trak inside `moov` so the strict `mp4` demuxer never
+/// parses an audio sample-entry box it rejects (some AAC muxings), even though we
+/// only need the H.264 video track. Each audio `trak` box type is rewritten IN
+/// PLACE to `free` (an ignorable box): the moov length is unchanged, so `mdat`
+/// stays put and the video `stco` chunk offsets (absolute into the file) remain
+/// valid regardless of faststart. Returns the input untouched (borrowed) when
+/// there is no audio trak or on any parse surprise (the caller then surfaces the
+/// actionable hint if the read still fails).
+fn strip_audio_traks(input: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    let Some(boxes) = top_level_boxes(input) else {
+        return Cow::Borrowed(input);
+    };
+    let Some(moov) = boxes.iter().find(|b| &b.kind == b"moov") else {
+        return Cow::Borrowed(input);
+    };
+    let audio: Vec<usize> = child_boxes(
+        input,
+        box_payload_start(input, moov.start),
+        moov.start + moov.len,
+    )
+    .into_iter()
+    .filter(|(k, s, e)| k == b"trak" && trak_is_audio(input, *s, *e))
+    .map(|(_, s, _)| s)
+    .collect();
+    if audio.is_empty() {
+        return Cow::Borrowed(input);
+    }
+    let mut out = input.to_vec();
+    for s in audio {
+        out[s + 4..s + 8].copy_from_slice(b"free");
+    }
+    Cow::Owned(out)
+}
+
 // --- Annex B <-> AVCC --------------------------------------------------------
 
 /// Convert one Annex B access unit to AVCC (4-byte length-prefixed NALs),
@@ -517,6 +615,115 @@ fn avcc_to_annexb(avcc: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+// --- RAM mp4 decode (DreamID-V target video) ---------------------------------
+
+/// Decode EVERY video frame of an in-RAM mp4 into RGB [`Image`]s (RAM-first: no
+/// disk touch). Returns `(frames, fps)`. Reuses the openh264 decoder + mp4
+/// demux; any audio track is ignored (DreamID-V re-encodes a silent clip). Used
+/// by the DreamID-V face-swap path, which needs the whole clip in RAM to VAE-
+/// encode it (unlike the frame-streaming HyperSwap path).
+pub fn decode_mp4_frames(input: &[u8]) -> Result<(Vec<Image>, u32), String> {
+    use std::io::Cursor;
+
+    use mp4::{Mp4Reader, TrackType};
+    use openh264::OpenH264API;
+    use openh264::decoder::{Decoder, DecoderConfig, Flush};
+
+    // The `mp4` demuxer parses the whole moov (incl. the audio track) strictly, so
+    // an unusual audio sample-entry box (some AAC muxings) would fail the whole read
+    // even though we only need the H.264 video track. Neutralize the audio trak(s)
+    // first (in-place `free` rewrite, moov length preserved). If a read still fails,
+    // surface an actionable hint rather than the raw box error.
+    let demuxed = strip_audio_traks(input);
+    let demuxed = demuxed.as_ref();
+    let size = demuxed.len() as u64;
+    let mut mp4 = Mp4Reader::read_header(Cursor::new(demuxed), size).map_err(|e| {
+        format!(
+            "could not parse the uploaded video container ({e}). Some audio-track \
+             encodings are not yet supported; re-export the clip as H.264 + AAC-LC \
+             (or strip its audio) and retry."
+        )
+    })?;
+
+    let (track_id, sps, pps, fps) = {
+        let track = mp4
+            .tracks()
+            .iter()
+            .find(|(_, t)| matches!(t.track_type(), Ok(TrackType::Video)))
+            .ok_or("no video track in input")?
+            .1;
+        let sps = track
+            .sequence_parameter_set()
+            .map_err(|e| format!("missing SPS: {e}"))?
+            .to_vec();
+        let pps = track
+            .picture_parameter_set()
+            .map_err(|e| format!("missing PPS: {e}"))?
+            .to_vec();
+        let fr = track.frame_rate();
+        let fps = if fr.is_finite() && fr > 0.0 {
+            fr.round() as u32
+        } else {
+            24
+        };
+        (track.track_id(), sps, pps, fps.max(1))
+    };
+    let count = mp4
+        .tracks()
+        .get(&track_id)
+        .map(|t| t.sample_count())
+        .unwrap_or(0);
+
+    let mut prefix = Vec::new();
+    for nal in [&sps, &pps] {
+        prefix.extend_from_slice(&[0, 0, 0, 1]);
+        prefix.extend_from_slice(nal);
+    }
+    let mut decoder = Decoder::with_api_config(
+        OpenH264API::from_source(),
+        DecoderConfig::new().flush_after_decode(Flush::NoFlush),
+    )
+    .map_err(|e| format!("openh264 decoder init: {e}"))?;
+
+    let mut frames = Vec::with_capacity(count as usize);
+    let mut rgb: Vec<u8> = Vec::new();
+    for sid in 1..=count {
+        let Some(sample) = mp4
+            .read_sample(track_id, sid)
+            .map_err(|e| format!("read sample {sid}: {e}"))?
+        else {
+            continue;
+        };
+        let mut au = prefix.clone();
+        avcc_to_annexb(&sample.bytes, &mut au);
+        if let Some(yuv) = decoder
+            .decode(&au)
+            .map_err(|e| format!("decode sample {sid}: {e}"))?
+        {
+            frames.push(yuv_to_image(&yuv, &mut rgb));
+        }
+    }
+    for yuv in decoder
+        .flush_remaining()
+        .map_err(|e| format!("decode flush: {e}"))?
+    {
+        frames.push(yuv_to_image(&yuv, &mut rgb));
+    }
+    if frames.is_empty() {
+        return Err("input video has no decodable frames".into());
+    }
+    Ok((frames, fps))
+}
+
+/// Convert a decoded YUV frame to an RGB [`Image`], reusing `rgb` as scratch.
+fn yuv_to_image(yuv: &openh264::decoder::DecodedYUV<'_>, rgb: &mut Vec<u8>) -> Image {
+    use openh264::formats::YUVSource;
+    let (w, h) = yuv.dimensions();
+    rgb.resize(w * h * 3, 0);
+    yuv.write_rgb8(rgb);
+    Image::from_rgb8(w, h, rgb)
+}
+
 // --- Face-swap streaming (mp4 demux -> per-frame swap -> mp4 mux) -------------
 
 /// Decode the input, swap each frame, and encode the output one frame at a time
@@ -526,18 +733,35 @@ fn avcc_to_annexb(avcc: &[u8], out: &mut Vec<u8>) {
 pub async fn swap_video_streaming(
     swapper: &FaceSwapper,
     embedding: &[f32],
-    input: &Path,
+    input: &[u8],
     output: &Path,
     sink: &dyn ProgressSink,
 ) -> Result<(usize, usize, u32, usize), String> {
+    use std::io::Cursor;
+
     use mp4::{Mp4Reader, TrackType};
     use openh264::OpenH264API;
     use openh264::decoder::{Decoder, DecoderConfig, Flush};
 
-    let file = std::fs::File::open(input).map_err(|e| format!("open {}: {e}", input.display()))?;
-    let size = file.metadata().map_err(|e| e.to_string())?.len();
-    let mut mp4 = Mp4Reader::read_header(BufReader::new(file), size)
-        .map_err(|e| format!("mp4 parse: {e}"))?;
+    // RAM-first: the uploaded mp4 rides in memory (decrypted from an encrypted
+    // spill upstream if it was large), so demux over a Cursor -- no plaintext
+    // video ever hits disk here.
+    //
+    // The `mp4` demuxer parses the whole moov (incl. the audio track) strictly, so
+    // an unusual audio sample-entry box (some AAC muxings) would fail the whole read
+    // even though we only need the H.264 video track. Neutralize the audio trak(s)
+    // first (in-place `free` rewrite, moov length preserved). If a read still fails,
+    // surface an actionable hint rather than the raw box error.
+    let demuxed = strip_audio_traks(input);
+    let demuxed = demuxed.as_ref();
+    let size = demuxed.len() as u64;
+    let mut mp4 = Mp4Reader::read_header(Cursor::new(demuxed), size).map_err(|e| {
+        format!(
+            "could not parse the uploaded video container ({e}). Some audio-track \
+             encodings are not yet supported; re-export the clip as H.264 + AAC-LC \
+             (or strip its audio) and retry."
+        )
+    })?;
 
     let (track_id, sps, pps, fps) = {
         let track = mp4
@@ -894,5 +1118,52 @@ mod tests {
         input.extend_from_slice(&moov);
         input.extend_from_slice(&mdat);
         assert_eq!(faststart(input.clone()), input);
+    }
+
+    /// Build a `trak` box with the given `mdia/hdlr` handler_type.
+    fn trak(handler: &[u8; 4]) -> Vec<u8> {
+        // hdlr payload: version+flags (4) + pre_defined (4) + handler_type (4) + 0.
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(handler);
+        bx(b"trak", &bx(b"mdia", &bx(b"hdlr", &hdlr)))
+    }
+
+    #[test]
+    fn strip_audio_rewrites_only_the_soun_trak_to_free() {
+        let ftyp = bx(b"ftyp", b"isom");
+        let vtrak = trak(b"vide");
+        let atrak = trak(b"soun");
+        let moov = bx(b"moov", &[vtrak.clone(), atrak.clone()].concat());
+        let mdat = bx(b"mdat", &[0xAAu8; 16]);
+        let mut input = Vec::new();
+        for b in [&ftyp, &moov, &mdat] {
+            input.extend_from_slice(b);
+        }
+
+        let out = strip_audio_traks(&input);
+        // Same length (in-place rewrite), mdat untouched.
+        assert_eq!(out.len(), input.len(), "length must be preserved");
+        assert_eq!(&out[input.len() - mdat.len()..], mdat.as_slice());
+        // The audio trak header is now `free`; exactly one `trak` remains (video).
+        let n_trak = out.windows(4).filter(|w| *w == b"trak").count();
+        let n_free = out.windows(4).filter(|w| *w == b"free").count();
+        assert_eq!(n_trak, 1, "only the video trak should remain a trak");
+        assert_eq!(n_free, 1, "the audio trak became a free box");
+        // The `soun` handler bytes still sit inside the now-ignored free box.
+        assert!(out.windows(4).any(|w| w == b"vide"));
+    }
+
+    #[test]
+    fn strip_audio_is_a_noop_without_audio() {
+        let ftyp = bx(b"ftyp", b"isom");
+        let moov = bx(b"moov", &trak(b"vide"));
+        let mut input = Vec::new();
+        input.extend_from_slice(&ftyp);
+        input.extend_from_slice(&moov);
+        // Borrowed (no copy) when there's nothing to strip.
+        assert!(matches!(
+            strip_audio_traks(&input),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

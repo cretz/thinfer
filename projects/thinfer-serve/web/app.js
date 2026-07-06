@@ -14,6 +14,14 @@ const $ = (id) => document.getElementById(id);
 const setStatus = (text) => {
   $("status").textContent = text;
 };
+// Toggle the `hidden` attribute on a control AND its `<label for=id>` together
+// (for the bare label|input grid rows that are not wrapped in a row div).
+const setLabeledHidden = (id, hidden) => {
+  const el = $(id);
+  if (el) el.hidden = hidden;
+  const lab = document.querySelector(`label[for="${id}"]`);
+  if (lab) lab.hidden = hidden;
+};
 // Set when a generation starts; log lines are then prefixed with elapsed-from-
 // start, mirroring the CLI's stamped stderr sink (`[  12.3s] ...`, width-6 like
 // the CLI's `{:6.1}`). Null before/after a run, so pre-gen warnings are unstamped.
@@ -26,8 +34,11 @@ const log = (line) => {
 };
 
 const MODELS = {
-  image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid"],
-  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4"],
+  image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"],
+  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4", "dreamid-v"],
+  // HyperSwap ONNX face-swap: a source face pasted into every frame of a video.
+  // Its own JobSpec (FaceSwapSpec); no prompt / size / steps.
+  "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c"],
 };
 // LTX-2.3 is a joint audio-video model with its own grid (/64 dims, 8k+1 frames).
 // Its video VAE decode tiles to the VRAM budget, so larger dims are allowed (more
@@ -58,6 +69,11 @@ const isAnyflowModel = (model) => model === "anyflow-t2v-14b";
 // /16 grid, industry-norm 832x480 / 81f @ 16fps default.
 const isHunyuanModel = (model) => model.startsWith("hunyuan-video-1.5");
 const isHunyuanI2vModel = (model) => model === "hunyuan-video-1.5-ti2v";
+// DreamID-V: a diffusion VIDEO face-swap. Not a text-prompt model -- it consumes
+// a target video + a source face image (the context is baked). Runs on the Wan
+// backbone but through its own pipeline (no sampler/vae/steps-cap knobs); its own
+// image-CFG guidance-scale field applies. 832x480 default.
+const isDreamidModel = (model) => model === "dreamid-v";
 // Multi-shot video: only LongLive treats each prompt line as a separate shot.
 // Every other video model is single-prompt (the whole box is one prompt).
 const isMultiShotModel = (model) => model === "longlive-2.0-5b";
@@ -65,6 +81,11 @@ const isMultiShotModel = (model) => model === "longlive-2.0-5b";
 // REQUIRE an uploaded input image (mirrors the server's QwenImageEdit kind).
 const EDIT_MODELS = new Set(["qwen-image-edit-rapid"]);
 const isEditModel = (model) => EDIT_MODELS.has(model);
+// Image models that accept request-time user adapters (the encrypted LoRA
+// vault), mirroring the server's `ImageModelId::supports_adapters`. Adapters are
+// per-model, so the UI only lists/uses adapters stored for the selected model.
+const ADAPTER_MODELS = new Set(["krea-2-turbo"]);
+const supportsAdapters = (kind, model) => kind === "image" && ADAPTER_MODELS.has(model);
 // Size presets per kind. First entry is the default. Hand-typed dims are still
 // allowed and flip the dropdown to "Custom". Dim rules differ by kind: image
 // (Z-Image VAE) needs /16, video (Wan2.2 16x16x4 VAE + patch 2) needs /32 --
@@ -140,8 +161,13 @@ function sizeSpec(kind, model) {
   if (kind === "video" && isLtxModel(model)) return { presets: LTX_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isWan22Model(model)) return { presets: WAN22_PRESETS, step: 16, min: 16 };
   if (kind === "video" && isHunyuanModel(model)) return { presets: HUNYUAN_PRESETS, step: 16, min: 16 };
-  const step = DIM_STEP[kind];
-  return { presets: PRESETS[kind], step, min: step };
+  // DreamID-V: the /16 Wan2.1-VAE grid led by its 832x480 default (the target
+  // clip is downsampled toward this area).
+  if (kind === "video" && isDreamidModel(model)) return { presets: HUNYUAN_PRESETS, step: 16, min: 16 };
+  // Face-swap has no size (output matches the input video); fall back to the
+  // video presets so populateSize has data, but the row is hidden in applyModel.
+  const step = DIM_STEP[kind] ?? DIM_STEP.video;
+  return { presets: PRESETS[kind] ?? PRESETS.video, step, min: step };
 }
 
 // Steps input config per kind. Image (Z-Image Turbo) defaults to 8, unbounded
@@ -159,6 +185,8 @@ const MODEL_STEPS = {
   "ideogram4-q8": 4,
   "qwen-image-rapid": 4,
   "qwen-image-edit-rapid": 4,
+  "krea-2-turbo": 8,
+  "dreamid-v": 16,
 };
 // Default clip length (seconds) shown in the duration PLACEHOLDER per video
 // model, mirroring the server's default_frames so a blank field advertises the
@@ -295,7 +323,8 @@ function applyKind() {
     }),
   );
   // Steps range is kind-specific (see STEPS); applyModel sets the per-model value.
-  const st = STEPS[kind];
+  // Face-swap has no steps, so fall back to the video range (the row is hidden).
+  const st = STEPS[kind] ?? STEPS.video;
   $("steps").min = st.min;
   $("steps").max = st.max;
   applyModel();
@@ -314,6 +343,26 @@ function applyModel() {
   const i2v = kind === "video" && isHunyuanI2vModel(model);
   $("input-image-row").hidden = !edit && !i2v;
   $("input-image").required = edit;
+  // DreamID-V (video kind) and the face-swap kind both consume a source FACE
+  // image + a target VIDEO instead of a text prompt; reveal those uploaders and
+  // drop the prompt / size / steps / seed rows that do not apply.
+  const dreamid = kind === "video" && isDreamidModel(model);
+  const faceSwap = kind === "face-swap";
+  const usesFaceInputs = dreamid || faceSwap;
+  $("source-image-row").hidden = !usesFaceInputs;
+  $("source-image").required = usesFaceInputs;
+  $("input-video-row").hidden = !usesFaceInputs;
+  $("input-video").required = usesFaceInputs;
+  setLabeledHidden("prompt", usesFaceInputs);
+  $("prompt").required = !usesFaceInputs;
+  $("guide-scale-row").hidden = !dreamid; // DreamID-V image-CFG guidance scale
+  // Face-swap output tracks the input clip: no size / seed. DreamID-V keeps size
+  // (it drives the target resolution) but has no free-form duration.
+  setLabeledHidden("preset", faceSwap);
+  setLabeledHidden("width", faceSwap);
+  setLabeledHidden("height", faceSwap);
+  setLabeledHidden("seed", faceSwap);
+  setLabeledHidden("duration", faceSwap || dreamid);
   // Audio toggle + upscale toggle are LTX-only (Wan models are silent and have
   // no two-stage upscale path).
   const isLtxVideo = kind === "video" && isLtxModel(model);
@@ -334,7 +383,7 @@ function applyModel() {
   const isHunyuan = kind === "video" && isHunyuanModel(model);
   // AnyFlow keeps the dropdown: tiny = taew2_1 (Wan2.1 z16), full = the real
   // Wan2.1 VAE (parity path).
-  $("vae-row").hidden = isLtxVideo || isWan22;
+  $("vae-row").hidden = isLtxVideo || isWan22 || dreamid || faceSwap;
   // The Hunyuan-tuned tiny VAE is a Hunyuan-only checkpoint; only offer it there.
   // If a non-Hunyuan model is selected while it was chosen, fall back to tiny.
   $("vae-opt-tiny-ft").hidden = !isHunyuan;
@@ -343,7 +392,7 @@ function applyModel() {
   // upscaling), Wan2.2-A14B a fixed 4-step LightX2V distill, and Hunyuan 1.5 a
   // fixed lightx2v 4-step flow-match schedule; all ignore the steps/sampler knobs,
   // so hide the field for them.
-  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan;
+  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan || faceSwap;
   // AnyFlow is ANY-step: lift the FastWan 1..=8 cap for it (default 4; 2 is the
   // fast play; quality keeps improving with more).
   if (isAnyflow) {
@@ -364,6 +413,15 @@ function applyModel() {
   // an image is attached), so the toggle stays visible.
   $("rewrite-row").hidden = !isHunyuan;
   $("rewrite-quality-row").hidden = !isHunyuan;
+  // Adapter (LoRA) vault: only image models that support adapters. Clear any
+  // rendered list on a model switch so a stale other-model list can't linger
+  // (adapters are per-model, so a fresh List is required after switching).
+  const adapters = supportsAdapters(kind, model);
+  $("adapters-section").hidden = !adapters;
+  if (adapters) {
+    $("adapters-list").replaceChildren();
+    $("adapters-status").textContent = "";
+  }
   populateSize(kind, model);
   // Steps default is per-model (mirrors the server): the 4-step distilled image
   // models start at 4, everything else at the kind default. LTX ignores steps
@@ -418,6 +476,133 @@ async function refreshCapabilities() {
 }
 refreshCapabilities();
 
+// --- adapter (LoRA) vault -----------------------------------------------------
+// All three ops POST JSON to same-origin serve endpoints (through authHeaders,
+// like the job calls) carrying the vault password. The server holds no key; the
+// password unlocks the model's adapters for this call only.
+function renderAdapters(adapters) {
+  const box = $("adapters-list");
+  box.replaceChildren();
+  if (!adapters.length) {
+    box.textContent = "No adapters stored for this model yet.";
+    return;
+  }
+  for (const a of adapters) {
+    const row = document.createElement("div");
+    row.className = "adapter-item";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "adapter-pick";
+    cb.dataset.id = a.id;
+    cb.id = `adapter-${a.id}`;
+    const label = document.createElement("label");
+    label.htmlFor = cb.id;
+    label.textContent = `${a.name} (${(a.size / (1024 * 1024)).toFixed(1)} MB)`;
+    const weight = document.createElement("input");
+    weight.type = "text";
+    weight.inputMode = "decimal";
+    weight.className = "adapter-weight";
+    weight.dataset.id = a.id;
+    weight.value = a.extra?.weight ?? "1.0";
+    weight.size = 4;
+    weight.title = "Blend weight for this adapter";
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.textContent = "✕";
+    rm.title = "Remove from the vault";
+    rm.addEventListener("click", () => void removeAdapter(a.id, a.name));
+    row.append(cb, label, weight, rm);
+    box.append(row);
+  }
+}
+
+// The vault password from the adapters section (kept in memory only).
+const vaultPassword = () => $("vault-password").value;
+
+async function vaultFetch(path, body) {
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(await errorText(resp));
+  return resp;
+}
+
+async function listAdapters() {
+  const password = vaultPassword();
+  if (!password) {
+    $("adapters-status").textContent = "Enter the adapter password first.";
+    return;
+  }
+  $("adapters-status").textContent = "Loading…";
+  try {
+    const resp = await vaultFetch("vault/adapters/list", { model: $("model").value, password });
+    const { adapters } = await resp.json();
+    renderAdapters(adapters);
+    $("adapters-status").textContent = `${adapters.length} adapter(s).`;
+  } catch (e) {
+    $("adapters-status").textContent = `Failed: ${e.message ?? e}`;
+  }
+}
+
+async function addAdapter() {
+  const password = vaultPassword();
+  const url = $("adapter-url").value.trim();
+  if (!password) {
+    $("adapters-status").textContent = "Enter the adapter password first.";
+    return;
+  }
+  if (!url) {
+    $("adapters-status").textContent = "Enter a download URL.";
+    return;
+  }
+  const body = { model: $("model").value, url, password };
+  const token = $("adapter-token").value.trim();
+  if (token) body.token = token;
+  const name = $("adapter-name").value.trim();
+  if (name) body.name = name;
+  const weight = floatOrNull($("adapter-weight").value);
+  if (weight !== null) body.weight = weight;
+
+  const btn = $("adapter-add-btn");
+  btn.disabled = true;
+  $("adapters-status").textContent = "Downloading + encrypting…";
+  try {
+    const resp = await vaultFetch("vault/adapters/add", body);
+    const info = await resp.json();
+    $("adapter-url").value = "";
+    $("adapter-token").value = "";
+    $("adapter-name").value = "";
+    $("adapter-weight").value = "";
+    $("adapters-status").textContent = `Added "${info.name}".`;
+    await listAdapters();
+  } catch (e) {
+    $("adapters-status").textContent = `Add failed: ${e.message ?? e}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function removeAdapter(id, name) {
+  const password = vaultPassword();
+  if (!password) {
+    $("adapters-status").textContent = "Enter the adapter password first.";
+    return;
+  }
+  if (!globalThis.confirm(`Remove "${name}" from the vault? This cannot be undone.`)) return;
+  try {
+    await vaultFetch("vault/adapters/remove", { model: $("model").value, id, password });
+    $("adapters-status").textContent = `Removed "${name}".`;
+    await listAdapters();
+  } catch (e) {
+    $("adapters-status").textContent = `Remove failed: ${e.message ?? e}`;
+  }
+}
+
+$("adapters-refresh").addEventListener("click", () => void listAdapters());
+$("adapter-add-btn").addEventListener("click", () => void addAdapter());
+
 // --- spec building ------------------------------------------------------------
 const intOrNull = (v) => {
   const s = String(v).trim();
@@ -438,6 +623,20 @@ async function buildSpec() {
   const width = intOrNull($("width").value);
   const height = intOrNull($("height").value);
   const model = $("model").value;
+  // HyperSwap face-swap: source FACE image + target VIDEO, uploaded as base64
+  // (the server holds the video RAM-first / encrypted-spill). No prompt/size.
+  if (kind === "face-swap") {
+    const face = $("source-image").files[0];
+    const vid = $("input-video").files[0];
+    if (!face) throw new Error("choose a source face image");
+    if (!vid) throw new Error("choose a target video (mp4)");
+    return {
+      kind: "faceSwap",
+      model,
+      sourceImageB64: await fileToBase64(face),
+      inputVideoB64: await fileToBase64(vid),
+    };
+  }
   if (kind === "image") {
     const spec = {
       kind: "image",
@@ -455,7 +654,44 @@ async function buildSpec() {
       if (!file) throw new Error(`${model} requires a reference image; choose one first`);
       spec.inputImage = await fileToBase64(file);
     }
+    // Fold any checked vault adapters into the DiT (per-adapter weight). The
+    // password rides only when at least one adapter is selected.
+    if (supportsAdapters("image", model)) {
+      const picks = [...document.querySelectorAll(".adapter-pick")].filter((cb) => cb.checked);
+      if (picks.length) {
+        const password = vaultPassword();
+        if (!password) throw new Error("enter the adapter password to use adapters");
+        spec.lora = picks.map((cb) => {
+          const w = document.querySelector(`.adapter-weight[data-id="${cb.dataset.id}"]`);
+          const weight = floatOrNull(w?.value);
+          return weight === null ? { id: cb.dataset.id } : { id: cb.dataset.id, weight };
+        });
+        spec.password = password;
+      }
+    }
     return spec;
+  }
+  // DreamID-V diffusion video face-swap: source FACE image + target VIDEO (no
+  // prompt; the context is baked). Width/height drive the target resolution; the
+  // image-CFG guidance scale tunes identity transfer. The video is uploaded as
+  // base64 and handled RAM-first / encrypted-spill server-side.
+  if (isDreamidModel(model)) {
+    const face = $("source-image").files[0];
+    const vid = $("input-video").files[0];
+    if (!face) throw new Error("dreamid-v needs a source face image");
+    if (!vid) throw new Error("dreamid-v needs a target video (mp4)");
+    return {
+      kind: "video",
+      model,
+      prompts: [],
+      width,
+      height,
+      steps: intOrNull($("steps").value),
+      guideScale: floatOrNull($("guide-scale").value),
+      sourceImage: await fileToBase64(face),
+      inputVideo: await fileToBase64(vid),
+      seed,
+    };
   }
   // Multi-shot (LongLive only): each non-empty line of the prompt box is one
   // shot. Every other video model is single-prompt, so send the whole box

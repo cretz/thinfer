@@ -5,6 +5,7 @@
 //! (`thinfer_core::onnx`); geometry is host-side (`image`).
 
 pub mod detect;
+pub mod dwpose;
 pub mod image;
 
 use std::collections::HashMap;

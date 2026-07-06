@@ -230,9 +230,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "#;
 
 /// Elementwise unary activation. `kind`: 0 relu, 1 sigmoid, 2 tanh, 3 leakyrelu
-/// (alpha), 4 identity-clip[0,1]. Bindings: 0=x, 1=out, 2=uniform.
+/// (alpha), 4 identity-clip[0,1], 5 sqrt, 6 hardsigmoid (clip(alpha*x+beta,0,1)),
+/// 7 clip (clamp to [alpha, beta]). Bindings: 0=x, 1=out, 2=uniform.
 pub const UNARY: &str = r#"
-struct U { total: u32, kind: u32, alpha: f32, _p: u32 };
+struct U { total: u32, kind: u32, alpha: f32, beta: f32 };
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> u: U;
@@ -247,9 +248,77 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     case 1u: { r = 1.0 / (1.0 + exp(-v)); }
     case 2u: { r = tanh(v); }
     case 3u: { r = select(u.alpha * v, v, v > 0.0); }
-    default: { r = clamp(v, 0.0, 1.0); }
+    case 4u: { r = clamp(v, 0.0, 1.0); }
+    case 5u: { r = sqrt(v); }
+    case 6u: { r = clamp(u.alpha * v + u.beta, 0.0, 1.0); }
+    default: { r = clamp(v, u.alpha, u.beta); }
   }
   out[i] = r;
+}
+"#;
+
+/// Strided slice / gather over up-to-4D NCHW. Output coord `oc` maps to input
+/// coord `start[k] + oc[k]*step[k]`. Also serves ONNX Split (one dispatch per
+/// output block). Bindings: 0=x, 1=out, 2=uniform.
+pub const SLICE: &str = r#"
+struct U { total: u32, _p0: u32, _p1: u32, _p2: u32, id: vec4<u32>, od: vec4<u32>, start: vec4<u32>, step: vec4<u32> };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  let oc3 = i % u.od.w;
+  let oc2 = (i / u.od.w) % u.od.z;
+  let oc1 = (i / (u.od.w * u.od.z)) % u.od.y;
+  let oc0 = i / (u.od.w * u.od.z * u.od.y);
+  let ic0 = u.start.x + oc0 * u.step.x;
+  let ic1 = u.start.y + oc1 * u.step.y;
+  let ic2 = u.start.z + oc2 * u.step.z;
+  let ic3 = u.start.w + oc3 * u.step.w;
+  out[i] = x[((ic0 * u.id.y + ic1) * u.id.z + ic2) * u.id.w + ic3];
+}
+"#;
+
+/// GlobalAveragePool (NCHW): mean over H*W -> `[N, C, 1, 1]`. One thread per
+/// (n, c) output. Bindings: 0=x, 1=out, 2=uniform.
+pub const GLOBAL_AVG_POOL: &str = r#"
+struct U { nc: u32, hw: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.nc) { return; }
+  let base = i * u.hw;
+  var s: f32 = 0.0;
+  for (var j: u32 = 0u; j < u.hw; j = j + 1u) { s = s + x[base + j]; }
+  out[i] = s / f32(u.hw);
+}
+"#;
+
+/// ReduceSum over a single axis (keepdims), on an up-to-4D tensor. `axis` is the
+/// reduced axis; `astride`/`alen` are that axis's stride and length; the output
+/// has that axis collapsed to 1. One thread per output element. Bindings: 0=x,
+/// 1=out, 2=uniform.
+pub const REDUCE_SUM: &str = r#"
+struct U { total: u32, alen: u32, astride: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  // Base input index: split the output linear index around the (collapsed) axis.
+  let inner = i % u.astride;
+  let outer = i / u.astride;
+  let base = outer * u.alen * u.astride + inner;
+  var s: f32 = 0.0;
+  for (var j: u32 = 0u; j < u.alen; j = j + 1u) { s = s + x[base + j * u.astride]; }
+  out[i] = s;
 }
 "#;
 

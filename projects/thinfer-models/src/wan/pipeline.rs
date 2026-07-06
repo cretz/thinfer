@@ -451,6 +451,28 @@ impl WanVariant {
             tiny_vae_normed_latents: true,
         }
     }
+
+    /// DreamID-V-Wan-1.3B-Faster: the stock Wan2.1-1.3B backbone with the face-swap
+    /// deltas (48-ch patch input + `ref_conv` prefix), the Wan2.1 z16 VAE, source
+    /// bf16 encoding (no block transcode -- parity first). Single expert. Its
+    /// pipeline is [`crate::wan::dreamidv`], not `WanModel::generate` (no umT5,
+    /// baked context, image-CFG denoise); this variant carries the geometry the
+    /// DiT loader + residency sizing need.
+    pub fn dreamid_v() -> Self {
+        Self {
+            dit: WanDitConfig::dreamid_v(),
+            vae: WanVaeConfig::wan2_1(),
+            moe: false,
+            // bf16 base; the DP4A-safe normed sites (self-attn qkv + ffn_up) take
+            // Q8_0 + i8 matmul via `WanI8Sites` in the pipeline load (the two
+            // biggest dense-bf16 matmuls otherwise), proj/ffn_down stay bf16 +
+            // coopmat. No full block transcode (parity path is bf16 + the same i8
+            // sites the main Wan path uses by default).
+            block_transcode: None,
+            act_pref: None,
+            tiny_vae_normed_latents: true,
+        }
+    }
 }
 
 impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
@@ -1141,6 +1163,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 }
                 let inputs = WanDitInputs {
                     image: &latents,
+                    img_ref: None,
                     text,
                     timestep: unipc.timestep(step),
                     r_timestep: None,
@@ -1192,6 +1215,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let mut v_commit: Vec<Vec<u8>> = vec![Vec::new(); num_layers];
             let clean_inputs = WanDitInputs {
                 image: &latents,
+                img_ref: None,
                 text,
                 timestep: 0.0,
                 r_timestep: None,
@@ -1443,6 +1467,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 };
                 let inputs = WanDitInputs {
                     image: &sample,
+                    img_ref: None,
                     text: &text,
                     timestep: sampler.timestep(i),
                     r_timestep: None,
@@ -1488,6 +1513,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 }
                 let inputs = WanDitInputs {
                     image: &sample,
+                    img_ref: None,
                     text: &text,
                     timestep: sampler.timestep(i),
                     r_timestep: Some(sampler.r_timestep(i)),
@@ -1570,6 +1596,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     let t = sampler.timestep(i);
                     let inputs = WanDitInputs {
                         image: &sample,
+                        img_ref: None,
                         text: &text,
                         timestep: t,
                         r_timestep: None,
@@ -1671,6 +1698,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     }
                     let inputs = WanDitInputs {
                         image: &sample,
+                        img_ref: None,
                         text: &text,
                         timestep: unipc.timestep(i),
                         r_timestep: None,
@@ -1775,6 +1803,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let t = sampler.timestep(step_index);
         let inputs = WanDitInputs {
             image: &sample,
+            img_ref: None,
             text: &text,
             timestep: t,
             r_timestep: None,
@@ -1947,6 +1976,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
         let inputs = WanDitInputs {
             image: latent,
+            img_ref: None,
             text: &text,
             timestep: sampler.timestep(step_index),
             r_timestep: None,
@@ -2021,21 +2051,21 @@ fn probe_weight<S: WeightSource>(residency: &WeightResidency<S>, id: &str) -> We
 /// [`WanI8Sites`] transcode so each matmul's pipeline encoding matches its
 /// registered weight.
 #[derive(Clone, Copy, Default)]
-struct SiteOverride {
+pub(crate) struct SiteOverride {
     /// Self-attention QKV (`matmul_qkv_self`). Cross-attention QKV
     /// (`matmul_qkv`) is never overridden: its K/V project from un-normed umT5
     /// text and overflow f16 under i8 acts, so it stays dense at `weight_dtype`.
-    qkv_self: Option<WeightDtype>,
-    ffn_up: Option<WeightDtype>,
+    pub(crate) qkv_self: Option<WeightDtype>,
+    pub(crate) ffn_up: Option<WeightDtype>,
     /// Sites that must use the dense (dequant-once -> bf16 matmul) path instead of
     /// i8 DP4A even when their weight is Quant. On a Q8 DiT (Wan2.2 GGUF, every
     /// site Quant) the cross-attn qkv, proj, and ffn_down acts are un-normed /
     /// outlier-heavy: i8 act_quant's f16 scale overflows -> inf. FastWan keeps
     /// these bf16 so the issue never arises; here we force the dense path.
-    dense_acts: DenseActSites,
+    pub(crate) dense_acts: DenseActSites,
 }
 
-fn block_cfgs(
+pub(crate) fn block_cfgs(
     weight_dtype: WeightDtype,
     act: ActDtype,
     ovr: SiteOverride,
@@ -2088,6 +2118,10 @@ fn block_cfgs(
                 // ms/disp), so it's the prize, but needs a CLAMPED bf16->f16
                 // cast on the A-side + quality validation before it can ship.
                 qkv: false,
+                // ffn_up takes DP4A i8 on its normed A-side (bf16 14B path), so
+                // coopmat is off here; the Krea bf16-residual DiT is the only
+                // user of coopmat ffn_up.
+                ffn_up: false,
             }
         } else {
             CoopmatSites::default()

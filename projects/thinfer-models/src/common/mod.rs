@@ -12,6 +12,7 @@ pub mod autoencoder_kl;
 pub mod block;
 pub mod embedders;
 pub mod loader;
+pub mod lora;
 pub mod rope_embedder;
 pub mod seq;
 pub mod vae_taehv;

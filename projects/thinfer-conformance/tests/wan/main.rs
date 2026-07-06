@@ -5,6 +5,7 @@
 //! `cargo test`.
 
 mod anyflow_e2e;
+mod dreamidv_e2e;
 mod longlive_e2e;
 mod longlive_load;
 mod longlive_multishot_e2e;

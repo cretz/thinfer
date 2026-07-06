@@ -268,6 +268,51 @@ pub fn longlive_dit_renames(num_layers: usize) -> HashMap<WeightId, WeightId> {
 }
 
 // ---------------------------------------------------------------------------
+// DreamID-V-Wan-1.3B-Faster source (DiT safetensors + Wan2.1 VAE)
+// ---------------------------------------------------------------------------
+//
+// The DreamID-V DiT ships as a single fp32 `.pth` (827 tensors, ORIGINAL-Wan
+// names, no wrapper prefix) read directly via `PytorchSource`. We rename those
+// names to the canonical diffusers ids the DiT loader asks for (reusing
+// `dit_gguf_renames`, no prefix), and `patch_embedding.*` + `ref_conv.*` ride
+// the passthrough (already literal ids). That renamed DiT is unioned over the
+// Wan2.1 VAE safetensors (diffusers naming). No umT5 (the "chang face" text
+// context is baked), no tokenizer. Mirrors [`open_longlive_source`] but there is
+// no `generator.model.` prefix and the tail is VAE-only.
+
+/// DiT side: the DreamID-V `.pth` re-presented under canonical names.
+type DreamIdvDitSide<O> = RenamedSource<PytorchSource<O>>;
+/// The one weight source a DreamID-V model loads from: renamed DiT over the
+/// Wan2.1 VAE safetensors tail.
+pub type DreamIdvSource<O> = UnionSource<DreamIdvDitSide<O>, SafetensorsSide<O>>;
+
+#[derive(Debug)]
+pub enum DreamIdvOpenError<E: core::fmt::Debug> {
+    Pt(pytorch::PtError),
+    Safetensors(safetensors::SourceError<E>),
+}
+
+/// Build a [`DreamIdvSource`]: `dit_opener` is the `dreamidv_faster.pth`
+/// (original-Wan names); `vae_openers` the Wan2.1 VAE safetensors shard(s)
+/// (diffusers naming). `num_layers` is the DiT block count (30).
+pub async fn open_dreamidv_source<O: FileOpener>(
+    dit_opener: O,
+    vae_openers: Vec<O>,
+    num_layers: usize,
+) -> Result<DreamIdvSource<O>, DreamIdvOpenError<O::Error>> {
+    let dit = PytorchSource::open(dit_opener)
+        .await
+        .map_err(DreamIdvOpenError::Pt)?;
+    let vae = ShardedSafetensorsSource::open(vae_openers)
+        .await
+        .map_err(DreamIdvOpenError::Safetensors)?;
+    Ok(UnionSource::new(
+        RenamedSource::with_passthrough(dit, dit_gguf_renames(num_layers)),
+        vae,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // GGUF -> canonical rename maps
 // ---------------------------------------------------------------------------
 //

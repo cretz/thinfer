@@ -98,6 +98,10 @@ pub struct LoadedWanDitHandles {
     pub scale_shift_table: thinfer_core::residency::WeightHandle,
     /// `proj_out` `[out_ch*p_t*p_h*p_w, inner]` (transposed) + bias.
     pub proj_out: LinearBiasHandles,
+    /// DreamID-V only (`cfg.ref_conv`): `ref_conv` Conv2d `[inner, out_ch, p_h,
+    /// p_w]` folded to a linear `[inner, out_ch*p_h*p_w]` + bias. Patchifies the
+    /// source-face latent into prefix tokens. `None` on every plain Wan model.
+    pub ref_conv: Option<LinearBiasHandles>,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +132,11 @@ impl WanDitShape {
 pub struct WanDitInputs<'a> {
     /// Latent `[C, F, H, W]` row-major f32.
     pub image: &'a [f32],
+    /// DreamID-V source-face latent `[out_channels, 1, h, w]` row-major f32 (the
+    /// single-frame reference the `ref_conv` patchifies into prefix tokens).
+    /// `Some` on every DreamID-V forward (`cfg.ref_conv`), the negative pass
+    /// feeding a zeros latent; `None` on every plain Wan model.
+    pub img_ref: Option<&'a [f32]>,
     /// umT5 text states `[text_seq, text_dim]` row-major f32.
     pub text: &'a [f32],
     /// AnyFlow flow-map TARGET timestep (`r`, the sigma this forward's
@@ -226,7 +235,20 @@ pub struct WanDit {
 
 impl WanDit {
     pub fn assemble(handles: LoadedWanDitHandles, shape: WanDitShape, cfg: WanDitConfig) -> Self {
-        let block = WanDitBlock::new(WanDitBlockShape::new(&cfg, shape.n_tok, shape.text_seq));
+        // DreamID-V (`cfg.ref_conv`) prepends `ref_rows = pph * ppw` source-face
+        // tokens to the sequence, so the block runs over the full (ref ++ video)
+        // row count. `ref_rows == 0` on every plain Wan model, leaving the block
+        // shape (and thus its forward) bit-identical.
+        let ref_rows = if cfg.ref_conv {
+            shape.grid.pph * shape.grid.ppw
+        } else {
+            0
+        };
+        let block = WanDitBlock::new(WanDitBlockShape::new(
+            &cfg,
+            shape.n_tok + ref_rows,
+            shape.text_seq,
+        ));
         Self {
             shape,
             cfg,
@@ -298,11 +320,25 @@ impl WanDit {
         let bp = &pipelines.block;
         let s = self.shape;
         let inner = self.cfg.inner() as u32;
-        let rows = s.n_tok as u32;
         let ppf = s.grid.ppf;
         let text_seq = s.text_seq as u32;
+        // DreamID-V prefix geometry: `ref_rows` source-face tokens ride in front
+        // of the `n_tok` video patch tokens, and RoPE runs over the grown grid
+        // `(ppf + 1, pph, ppw)` (ref = frame 0, video = frames 1..ppf). Both are
+        // zero / identity on every plain Wan model, so `rows == n_tok` and the
+        // whole forward stays bit-identical there.
+        let n_tok = s.n_tok as u32;
+        let ref_rows = if self.cfg.ref_conv {
+            (s.grid.pph * s.grid.ppw) as u32
+        } else {
+            0
+        };
+        let rows = n_tok + ref_rows;
+        let ppf_full = ppf + if self.cfg.ref_conv { 1 } else { 0 };
 
-        // --- 1. patchify image + front-door linear -> x [n_tok, inner] ---
+        // --- 1. patchify image + front-door linear -> x [rows, inner] ---
+        // The video patch-embed output lands AFTER the ref prefix (offset 0 when
+        // no ref); the ref_conv prefix tokens are written to rows `0..ref_rows`.
         let patch_in = s.grid.patch_in() as u32;
         let tokens = patchify::patchify(inputs.image, &s.grid);
         let tok_bytes = act_upload_bytes(bp.act_dtype, &tokens);
@@ -317,10 +353,38 @@ impl WanDit {
                 bp,
                 scope.import_copy(tok_buf.as_buf_ref()),
                 &views.bufs(),
-                rows,
+                n_tok,
                 patch_in,
                 inner,
-                scope.import_copy(x.as_act_ref()),
+                scope.import_copy(act_slice(x.as_act_ref(), ref_rows, n_tok, inner, bp)),
+            )?;
+            scope.submit_void().await?;
+        }
+        // DreamID-V: patchify the single-frame source-face latent spatially and
+        // project it through `ref_conv` (a 2x2 conv folded to a linear over
+        // `out_channels * p_h * p_w`), writing the prefix tokens to rows
+        // `0..ref_rows`. `ref_conv` is `None` on every plain Wan model.
+        if let Some(ref_conv) = &self.handles.ref_conv {
+            let img_ref = inputs
+                .img_ref
+                .expect("DreamID-V forward requires img_ref when ref_conv is set");
+            let ref_grid = PatchGrid::new(self.cfg.out_channels, 1, s.grid.h, s.grid.w);
+            let ref_tokens = patchify::patchify(img_ref, &ref_grid);
+            let ref_in = ref_grid.patch_in() as u32;
+            let ref_bytes = act_upload_bytes(bp.act_dtype, &ref_tokens);
+            let ref_buf = scratch.alloc(ref_bytes.len() as u64)?;
+            backend.write_buffer(ref_buf.id, 0, &ref_bytes)?;
+            let views = ref_conv.acquire(residency, backend).await?;
+            let scope = scratch.batch();
+            self.linear_bias(
+                &scope,
+                bp,
+                scope.import_copy(ref_buf.as_buf_ref()),
+                &views.bufs(),
+                ref_rows,
+                ref_in,
+                inner,
+                scope.import_copy(act_slice(x.as_act_ref(), 0, ref_rows, inner, bp)),
             )?;
             scope.submit_void().await?;
         }
@@ -391,8 +455,10 @@ impl WanDit {
         // Pack to the act dtype: the F16/Bf16 rope kernels read freqs in the act
         // dtype (packed), not f32. (Mirrors z_image; the f32-only `lookup_bytes`
         // would feed f16 kernels reinterpreted garbage -> inf -> NaN softmax.)
-        let freqs_bytes =
-            freqs_upload_bytes(bp.act_dtype, &self.rope.lookup(ppf, s.grid.pph, s.grid.ppw));
+        let freqs_bytes = freqs_upload_bytes(
+            bp.act_dtype,
+            &self.rope.lookup(ppf_full, s.grid.pph, s.grid.ppw),
+        );
         let freqs = scratch.alloc(freqs_bytes.len() as u64)?;
         backend.write_buffer(freqs.id, 0, &freqs_bytes)?;
 
@@ -409,7 +475,11 @@ impl WanDit {
         // Below the threshold (the e2e gate's tiny grids), n_tiles == 1 keeps
         // the original single-scope path bit-identical. Diag taps force the
         // untiled path (intra-block taps are single-scope only).
-        let n_tiles = if taps.block0.is_some() {
+        // DreamID-V runs untiled: the activation-tiled path derives its geometry
+        // (rows, self-attn period) from `self.shape.n_tok`, which excludes the
+        // ref prefix. Parity first; the prefix-aware tiled path is a perf
+        // follow-up. Plain Wan models are unaffected (`ref_conv` is false).
+        let n_tiles = if taps.block0.is_some() || self.cfg.ref_conv {
             1
         } else {
             rows.div_ceil(dit_tile_rows()).max(1)
@@ -563,13 +633,18 @@ impl WanDit {
             }
         }
 
-        // --- 6. final norm + modulation + proj_out ---
+        // --- 6. strip the ref prefix, then final norm + modulation + proj_out ---
+        // The head runs on the VIDEO rows only: DreamID-V slices off the `ref_rows`
+        // source-face prefix (`x[ref_rows..]`); on plain Wan models `ref_rows == 0`
+        // and `head_rows == rows`, so `x_head` is the whole stream (bit-identical).
+        let head_rows = n_tok;
+        let x_head = act_slice(x_cur.as_act_ref(), ref_rows, head_rows, inner, bp);
         let proj_w = self.cfg.out_channels * config::PATCH_T * config::PATCH_H * config::PATCH_W;
-        let proj_out = ResStream::alloc(scratch, bp, rows, proj_w as u32)?;
+        let proj_out = ResStream::alloc(scratch, bp, head_rows, proj_w as u32)?;
         // Persist the post-modulation activation when a tap wants it (readback
         // after submit; scope-local buffers do not survive the submit).
         let final_norm_ws = match taps.final_norm {
-            Some(_) => Some(scratch.alloc(bp.act_bytes(rows * inner))?),
+            Some(_) => Some(scratch.alloc(bp.act_bytes(head_rows * inner))?),
             None => None,
         };
         {
@@ -584,24 +659,36 @@ impl WanDit {
             let shift = self.mod_signal(&scope, bp, sst.buf(), 0, temb_h, inner)?;
             let scale = self.mod_signal(&scope, bp, sst.buf(), 1, temb_h, inner)?;
             // norm_out (FP32 LayerNorm, no affine).
-            let x_h = ActBuf::dense(scope.import_copy(x_cur.as_act_ref()));
-            let normed = alloc_act(&scope, bp, rows, inner)?;
-            let ln_u = scope.u32x4_uniform(rows, inner, config::EPS.to_bits(), 0)?;
-            scope.layernorm::<LayerNormF32>(&bp.layernorm, x_h.data, ln_u, normed.data, rows)?;
+            let x_h = ActBuf::dense(scope.import_copy(x_head));
+            let normed = alloc_act(&scope, bp, head_rows, inner)?;
+            let ln_u = scope.u32x4_uniform(head_rows, inner, config::EPS.to_bits(), 0)?;
+            scope.layernorm::<LayerNormF32>(
+                &bp.layernorm,
+                x_h.data,
+                ln_u,
+                normed.data,
+                head_rows,
+            )?;
             // out = normed * (1 + scale) + shift.
-            let modded = alloc_act(&scope, bp, rows, inner)?;
-            self.modulate(&scope, bp, normed, scale, shift, modded, rows, inner)?;
+            let modded = alloc_act(&scope, bp, head_rows, inner)?;
+            self.modulate(&scope, bp, normed, scale, shift, modded, head_rows, inner)?;
             if let Some(fnw) = &final_norm_ws {
                 let dst = scope.import_copy(fnw.as_buf_ref());
-                scope.copy_buffer_to_buffer(modded.data, 0, dst, 0, bp.act_bytes(rows * inner))?;
+                scope.copy_buffer_to_buffer(
+                    modded.data,
+                    0,
+                    dst,
+                    0,
+                    bp.act_bytes(head_rows * inner),
+                )?;
             }
-            // proj_out: [rows, inner] @ [proj_w, inner]ᵀ + bias.
+            // proj_out: [head_rows, inner] @ [proj_w, inner]ᵀ + bias.
             self.linear_bias(
                 &scope,
                 bp,
                 modded.data,
                 &pv.bufs(),
-                rows,
+                head_rows,
                 inner,
                 proj_w as u32,
                 scope.import_copy(proj_out.as_act_ref()),
@@ -612,7 +699,7 @@ impl WanDit {
             read_into_f32(
                 backend,
                 &fnw.as_buf_ref(),
-                (rows * inner) as usize,
+                (head_rows * inner) as usize,
                 bp.act_dtype,
                 sink,
             )
@@ -621,7 +708,7 @@ impl WanDit {
         read_tap(
             backend,
             &proj_out.as_act_ref(),
-            (rows * proj_w as u32) as usize,
+            (head_rows * proj_w as u32) as usize,
             bp.act_dtype,
             &mut taps.proj_out,
         )
@@ -632,7 +719,7 @@ impl WanDit {
         read_into_f32(
             backend,
             &proj_out.as_act_ref(),
-            (rows * proj_w as u32) as usize,
+            (head_rows * proj_w as u32) as usize,
             bp.act_dtype,
             &mut tokens_out,
         )

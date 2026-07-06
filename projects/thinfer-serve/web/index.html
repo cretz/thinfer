@@ -25,6 +25,7 @@
         <select id="kind">
           <option value="image" selected>Image</option>
           <option value="video">Video</option>
+          <option value="face-swap">Face swap</option>
         </select>
 
         <label for="model">Model</label>
@@ -40,6 +41,60 @@
           <input id="input-image" type="file" accept="image/png,image/jpeg" />
         </div>
 
+        <!-- DreamID-V (diffusion video face-swap) + the HyperSwap face-swap flow.
+             app.js reveals these for those models and requires both then: the
+             source FACE image and the TARGET video to swap it into. The video is
+             uploaded as base64 and handled RAM-first server-side (encrypted spill
+             for large clips); neither ever lands on the server as plaintext past
+             the ephemeral job dir. -->
+        <div id="source-image-row" hidden>
+          <label for="source-image">Source face</label>
+          <input id="source-image" type="file" accept="image/png,image/jpeg" />
+        </div>
+        <div id="input-video-row" hidden>
+          <label for="input-video">Target video</label>
+          <input id="input-video" type="file" accept="video/mp4" />
+        </div>
+
+        <!-- Adapter (LoRA) vault: one self-contained collapsible section (spans
+             the full form width, own internal layout) so it stays out of the
+             label/input grid. app.js reveals it only for image models that
+             support adapters (e.g. krea-2-turbo). Adapters belong to a model and
+             are encrypted at rest; the password unlocks them for listing / adding
+             / use, rides each request only, and is kept in this tab's memory. -->
+        <details id="adapters-section" hidden>
+          <summary>Adapters (LoRA)</summary>
+          <div class="adapters-body">
+            <label for="vault-password">Password</label>
+            <input id="vault-password" type="password" placeholder="unlocks your adapter vault" autocomplete="off" />
+
+            <div class="adapters-actions">
+              <button id="adapters-refresh" type="button">List adapters</button>
+              <span id="adapters-status"></span>
+            </div>
+
+            <!-- Checkbox + per-adapter weight per stored adapter (filled by
+                 app.js from POST /vault/adapters/list). Checked adapters are
+                 folded into the DiT for this generation, in listed order. -->
+            <div id="adapters-list"></div>
+
+            <details id="adapters-add">
+              <summary>Add adapter by URL</summary>
+              <div class="adapters-add-body">
+                <label for="adapter-url">URL</label>
+                <input id="adapter-url" type="url" placeholder="https://civitai.com/api/download/models/…" />
+                <label for="adapter-token">Token</label>
+                <input id="adapter-token" type="password" placeholder="Civitai token, if the file needs one" autocomplete="off" />
+                <label for="adapter-name">Name</label>
+                <input id="adapter-name" type="text" placeholder="(defaults to the download filename)" />
+                <label for="adapter-weight">Default weight</label>
+                <input id="adapter-weight" type="text" inputmode="decimal" placeholder="1.0" />
+                <button id="adapter-add-btn" type="button">Add to vault</button>
+              </div>
+            </details>
+          </div>
+        </details>
+
         <label for="preset">Size</label>
         <select id="preset"></select>
 
@@ -53,6 +108,13 @@
         <div id="steps-row">
           <label for="steps">Steps</label>
           <input id="steps" type="number" value="8" min="1" />
+        </div>
+
+        <!-- DreamID-V only (app.js reveals it): image-CFG guidance scale on the
+             source-face reference. Higher = stronger identity transfer. -->
+        <div id="guide-scale-row" hidden>
+          <label for="guide-scale">Guidance (face)</label>
+          <input id="guide-scale" type="number" value="4" min="0" step="0.5" />
         </div>
 
         <label for="duration" class="video-only">Duration (s)</label>

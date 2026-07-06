@@ -94,6 +94,88 @@ impl VideoFormat {
     pub const KNOWN: &'static str = "mp4";
 }
 
+/// A secret string (a vault password) that never appears in logs. `Debug`
+/// redacts it, so a `{:?}` on any request that carries one -- serve access logs,
+/// a panic dump -- cannot leak it (stricter than the prompt handling, which
+/// relies on callers not printing the struct). The plaintext is reachable only
+/// via [`Secret::expose`], used at the single crypto call site.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// A vault adapter to fold into the DiT for one generation: the entry id (from
+/// `vault list`) and its blend weight (ComfyUI `LoraLoaderModelOnly` strength).
+#[derive(Clone, Debug)]
+pub struct LoraRef {
+    pub id: String,
+    pub weight: f32,
+}
+
+/// An uploaded target video (DreamID-V / face-swap). RAM-FIRST: the mp4 bytes
+/// ride in memory and decode straight from RAM. A large upload instead spills to
+/// an on-disk blob AES-256-GCM sealed under a per-request EPHEMERAL key held only
+/// in RAM (see `vault::ephemeral_seal`), decrypted back to RAM on read for
+/// decode. The raw plaintext video NEVER lands on disk, and the bytes are never
+/// logged (`Debug` shows only the size / a redaction).
+#[derive(Clone)]
+pub enum VideoInput {
+    /// The mp4 container bytes, held in RAM.
+    Ram(Vec<u8>),
+    /// A spilled upload: ciphertext at `path`, sealed under `key` (RAM only)
+    /// with base64 `nonce`. The whole blob is read + decrypted to RAM at decode
+    /// time (GCM is not seekable; "decrypt-on-read" = one transient decrypt).
+    Encrypted {
+        path: PathBuf,
+        /// The ephemeral AES-256-GCM key. RAM only; dropped with the request.
+        key: [u8; 32],
+        /// Base64 GCM nonce.
+        nonce: String,
+    },
+}
+
+impl std::fmt::Debug for VideoInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the bytes or the key (no-media-logging): size / path only.
+        match self {
+            VideoInput::Ram(b) => write!(f, "VideoInput::Ram({} bytes)", b.len()),
+            VideoInput::Encrypted { path, .. } => {
+                write!(
+                    f,
+                    "VideoInput::Encrypted({}, <key redacted>)",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+/// A source FACE image (PNG/JPEG container bytes) held in RAM (DreamID-V /
+/// face-swap). Small enough to always ride in memory (unlike the large target
+/// video), so it never lands on disk. Bytes are never logged (`Debug` shows only
+/// the size), matching the target video's no-media-logging discipline.
+#[derive(Clone)]
+pub struct FaceImage(pub Vec<u8>);
+
+impl std::fmt::Debug for FaceImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FaceImage({} bytes)", self.0.len())
+    }
+}
+
 /// Generate an image from a prompt (Z-Image t2i).
 #[derive(Clone, Debug)]
 pub struct ImageRequest {
@@ -111,6 +193,17 @@ pub struct ImageRequest {
     /// Reference image for the image-EDIT path (Qwen-Image-Edit). REQUIRED for
     /// the `QwenImageEdit` kind; rejected for the t2i kinds (Z-Image, Ideogram).
     pub input_image: Option<PathBuf>,
+    /// User adapters to fold into the DiT for this generation, in fold order
+    /// (each id is a vault entry for THIS model). Empty = the plain base model.
+    /// Only models where [`ImageModelId::supports_adapters`] is true accept a
+    /// non-empty list.
+    pub lora: Vec<LoraRef>,
+    /// The vault password, required when `lora` is non-empty. Re-derives the key
+    /// for this request only; never persisted, never logged (see [`Secret`]).
+    pub vault_password: Option<Secret>,
+    /// Where the encrypted adapter vault lives (shared by CLI + serve). Only read
+    /// when `lora` is non-empty.
+    pub vault_dir: PathBuf,
     pub budget: ResidencyBudget,
     pub output: PathBuf,
     pub format: ImageFormat,
@@ -127,7 +220,8 @@ impl ImageRequest {
             // VAE, mmproj/LoRA, tokenizer), not via the Z-Image variant registry.
             crate::model::ImageKind::Ideogram4
             | crate::model::ImageKind::QwenImageEdit
-            | crate::model::ImageKind::QwenImage => {
+            | crate::model::ImageKind::QwenImage
+            | crate::model::ImageKind::Krea2 => {
                 let m = self.model.manifest();
                 self.model
                     .required_roles()
@@ -157,6 +251,14 @@ impl ImageRequest {
                 }
             }
         }
+        if !self.lora.is_empty() {
+            if !self.model.supports_adapters() {
+                return Err(format!("{} does not support adapters", self.model));
+            }
+            if self.vault_password.is_none() {
+                return Err("a vault password is required to use adapters".into());
+            }
+        }
         Ok(())
     }
 }
@@ -178,6 +280,19 @@ pub struct VideoRequest {
     pub seed: Option<u64>,
     /// img2vid conditioning (not yet wired; rejected in [`Self::resolve`]).
     pub input_image: Option<PathBuf>,
+    /// DreamID-V only: the source FACE image (PNG/JPEG) to swap into the target
+    /// video. Required for DreamID-V, rejected by every other model. Small, so it
+    /// rides in RAM ([`FaceImage`]) and never touches disk; the large target
+    /// video takes the RAM/encrypted `input_video` path.
+    pub source_image: Option<FaceImage>,
+    /// DreamID-V only: the target VIDEO (the clip to swap a face into), held
+    /// RAM-first (encrypted spill for large uploads; see [`VideoInput`]).
+    /// Required for DreamID-V, `None` for every other model.
+    pub input_video: Option<VideoInput>,
+    /// DreamID-V image-CFG guidance scale on the source-face reference. `None` ->
+    /// the model default ([`VideoModelId::default_guide_scale`]). Ignored by the
+    /// other (CFG-free) video models.
+    pub guide_scale: Option<f32>,
     /// FastWan denoise sampler (ignored on the AR path).
     pub sampler: VideoSampler,
     /// UniPC denoise step count (1..=`VIDEO_MAX_STEPS`); DMD ignores it.
@@ -235,6 +350,12 @@ pub struct VideoPlan {
 
 impl VideoRequest {
     pub fn required_files(&self) -> Result<Vec<FileRef>, String> {
+        // DreamID-V's whole fetch set is its variant `files()`: the DiT `.pth`
+        // (dit_pt_role), the Wan2.1 VAE (weight_roles), and the baked context +
+        // the two DWPose ONNX nets (aux_roles). No special-casing needed.
+        if self.model.is_dreamidv() {
+            return Ok(self.model.variant().files().map(|(_, f)| *f).collect());
+        }
         // LTX sources by role (joint-AV: encoder + tokenizer + connector + DiT +
         // both VAEs + upscaler), not via the Wan variant registry.
         if self.model.is_ltx() {
@@ -353,6 +474,12 @@ impl VideoRequest {
     /// Validate dims + resolve fps and the shot plan. Fails fast on every user
     /// error so a server can 400 at submit.
     pub fn resolve(&self) -> Result<VideoPlan, String> {
+        // DreamID-V is a video face-swap, not a t2v: it consumes a target video +
+        // a source face image (no prompt), on the Wan /16 grid. Its own resolve
+        // validates those inputs and skips the prompt/sampler/shot machinery.
+        if self.model.is_dreamidv() {
+            return self.resolve_dreamidv();
+        }
         // First-frame image conditioning exists only on the causal Hunyuan TI2V
         // model, where it is OPTIONAL: with an image the run is I2V; without it
         // the model runs text-only (the upstream `mask_type="t2v"` shape --
@@ -421,6 +548,34 @@ impl VideoRequest {
             shots,
             fps,
             warnings,
+        })
+    }
+
+    /// DreamID-V plan resolution: validate the /16 dims + require BOTH a source
+    /// face image and a target video (no prompt). `frames` is the requested
+    /// target on the 4k+1 grid (default 81); the executor clamps it to the actual
+    /// decoded length of the target clip. Single-clip, no shots.
+    fn resolve_dreamidv(&self) -> Result<VideoPlan, String> {
+        validate_dim("height", self.height)?;
+        validate_dim("width", self.width)?;
+        if self.source_image.is_none() {
+            return Err(format!("{} requires a source face image", self.model));
+        }
+        if self.input_video.is_none() {
+            return Err(format!("{} requires a target video", self.model));
+        }
+        let frames = match self.frames.first() {
+            Some(&f) => {
+                self.model.validate_frames(f)?;
+                f
+            }
+            None => self.model.default_frames(),
+        };
+        Ok(VideoPlan {
+            frames,
+            shots: Vec::new(),
+            fps: self.fps.unwrap_or_else(|| self.model.fps()),
+            warnings: Vec::new(),
         })
     }
 
@@ -498,12 +653,14 @@ impl VideoRequest {
     }
 }
 
-/// Swap a face from a source image into every frame of an input video.
+/// Swap a face from a source image into every frame of an input video. The
+/// target video is RAM-first (encrypted spill for large uploads; see
+/// [`VideoInput`]); the small source image rides in RAM ([`FaceImage`]).
 #[derive(Clone, Debug)]
 pub struct FaceSwapRequest {
     pub model: SwapModel,
-    pub input_video: PathBuf,
-    pub source_image: PathBuf,
+    pub input_video: VideoInput,
+    pub source_image: FaceImage,
     pub output: PathBuf,
     pub budget: ResidencyBudget,
 }
@@ -759,6 +916,9 @@ mod tests {
             fps: None,
             seed: None,
             input_image: None,
+            source_image: None,
+            input_video: None,
+            guide_scale: None,
             sampler: VideoSampler::UniPc,
             steps: 8,
             attn_window: None,
@@ -830,6 +990,9 @@ mod tests {
             fps: None,
             seed: None,
             input_image: None,
+            source_image: None,
+            input_video: None,
+            guide_scale: None,
             sampler: VideoSampler::UniPc,
             steps: 4,
             attn_window: None,

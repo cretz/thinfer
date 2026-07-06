@@ -131,6 +131,55 @@ fn resolve_target(target: &[i64], input: &[i64], allow_zero: bool) -> Result<Vec
     Ok(out)
 }
 
+/// (starts, ends, axes, steps) of a Slice, one entry per sliced axis.
+type SliceParams = (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>);
+
+/// Resolve ONNX Slice params from the const inputs. Axes/steps are optional;
+/// default axes = 0..len(starts), steps = 1.
+fn slice_params(
+    node: &Node,
+    vals: &HashMap<String, Val>,
+    x: &[i64],
+) -> Result<SliceParams, PlanError> {
+    let cint = |i: usize| -> Result<Vec<i64>, PlanError> {
+        get(vals, &node.inputs[i])?
+            .data
+            .as_ref()
+            .ok_or_else(|| PlanError::Unsupported("Slice with non-const params".into()))
+            .map(|d| d.as_i64().to_vec())
+    };
+    let starts = cint(1)?;
+    let ends = cint(2)?;
+    let rank = x.len() as i64;
+    let axes: Vec<i64> = match node.inputs.get(3).filter(|s| !s.is_empty()) {
+        Some(_) => cint(3)?
+            .iter()
+            .map(|&a| if a < 0 { a + rank } else { a })
+            .collect(),
+        None => (0..starts.len() as i64).collect(),
+    };
+    let steps: Vec<i64> = match node.inputs.get(4).filter(|s| !s.is_empty()) {
+        Some(_) => cint(4)?,
+        None => vec![1; starts.len()],
+    };
+    Ok((starts, ends, axes, steps))
+}
+
+/// Clamp a Slice (start, end) for one axis of length `dim` to valid bounds,
+/// honoring ONNX's negative-index and INT_MAX/INT_MIN conventions.
+fn clamp_slice(start: i64, end: i64, dim: i64, step: i64) -> (i64, i64) {
+    let norm = |v: i64| if v < 0 { v + dim } else { v };
+    if step > 0 {
+        let s = norm(start).clamp(0, dim);
+        let e = norm(end).clamp(0, dim);
+        (s, e)
+    } else {
+        let s = norm(start).clamp(0, dim - 1);
+        let e = norm(end).clamp(-1, dim - 1);
+        (s, e)
+    }
+}
+
 /// The per-value working state during the analysis pass.
 struct Val {
     shape: Vec<i64>,
@@ -482,9 +531,10 @@ fn try_fold(node: &Node, vals: &mut HashMap<String, Val>) -> Result<Option<()>, 
             set_const(vals, &node.outputs[0], vec![len], TensorData::I64(out));
             Ok(Some(()))
         }
-        "Cast" => {
-            // Constant cast: keep i64 as i64 (shape math). The only casts in
-            // these graphs that fold are int<->int on shape values.
+        "Cast" | "Identity" => {
+            // Constant Cast/Identity: propagate the value (a Cast on a shape
+            // vector keeps i64; an Identity on a scalar const - e.g. a Clip eps -
+            // must fold so it never becomes a runtime buffer view).
             let v = get(vals, &node.inputs[0])?;
             let (shape, data) = (v.shape.clone(), v.data.clone().unwrap());
             set_const(vals, &node.outputs[0], shape, data);
@@ -609,6 +659,7 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
         | "LeakyRelu"
         | "PRelu"
         | "Sigmoid"
+        | "HardSigmoid"
         | "Tanh"
         | "Softplus"
         | "Elu"
@@ -619,6 +670,91 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
         | "Neg" => {
             let x = in_shape(0)?;
             set_shape(vals, &node.outputs[0], x);
+        }
+        "GlobalAveragePool" => {
+            let x = in_shape(0)?;
+            let out = vec![x[0], x[1], 1, 1];
+            set_shape(vals, &node.outputs[0], out);
+        }
+        "ReduceSum" | "ReduceMean" => {
+            let x = in_shape(0)?;
+            let rank = x.len() as i64;
+            let keepdims = node.attr_i("keepdims", 1) != 0;
+            // axes: attribute (opset<13) or second input (opset>=13); default all.
+            let axes: Vec<i64> = node
+                .attr_ints("axes")
+                .map(|a| a.to_vec())
+                .or_else(|| {
+                    node.inputs
+                        .get(1)
+                        .filter(|s| !s.is_empty())
+                        .and_then(|n| vals.get(n))
+                        .and_then(|v| v.data.as_ref())
+                        .map(|d| d.as_i64().to_vec())
+                })
+                .unwrap_or_else(|| (0..rank).collect());
+            let axset: std::collections::HashSet<i64> = axes
+                .iter()
+                .map(|&a| if a < 0 { a + rank } else { a })
+                .collect();
+            let mut out = Vec::new();
+            for (i, &d) in x.iter().enumerate() {
+                if axset.contains(&(i as i64)) {
+                    if keepdims {
+                        out.push(1);
+                    }
+                } else {
+                    out.push(d);
+                }
+            }
+            set_shape(vals, &node.outputs[0], out);
+        }
+        "Slice" => {
+            let x = in_shape(0)?;
+            let (starts, ends, axes, steps) = slice_params(node, vals, &x)?;
+            let mut out = x.clone();
+            for (k, &ax) in axes.iter().enumerate() {
+                let ax = ax as usize;
+                let dim = x[ax];
+                let (s, e) = clamp_slice(starts[k], ends[k], dim, steps[k]);
+                let step = steps[k];
+                out[ax] = if step > 0 {
+                    ((e - s + step - 1) / step).max(0)
+                } else {
+                    ((s - e - step - 1) / (-step)).max(0)
+                };
+            }
+            set_shape(vals, &node.outputs[0], out);
+        }
+        "Split" => {
+            let x = in_shape(0)?;
+            let rank = x.len() as i64;
+            let axis = {
+                let a = node.attr_i("axis", 0);
+                (if a < 0 { a + rank } else { a }) as usize
+            };
+            // split sizes: attribute (opset<13) or second input (opset>=13);
+            // else even split across the outputs.
+            let sizes: Vec<i64> = node
+                .attr_ints("split")
+                .map(|s| s.to_vec())
+                .or_else(|| {
+                    node.inputs
+                        .get(1)
+                        .filter(|s| !s.is_empty())
+                        .and_then(|n| vals.get(n))
+                        .and_then(|v| v.data.as_ref())
+                        .map(|d| d.as_i64().to_vec())
+                })
+                .unwrap_or_else(|| {
+                    let each = x[axis] / node.outputs.len() as i64;
+                    vec![each; node.outputs.len()]
+                });
+            for (o, &sz) in node.outputs.iter().zip(&sizes) {
+                let mut sh = x.clone();
+                sh[axis] = sz;
+                set_shape(vals, o, sh);
+            }
         }
         "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Max" | "Min" => {
             let a = in_shape(0)?;
@@ -687,3 +823,4 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
     }
     Ok(())
 }
+

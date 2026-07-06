@@ -6,10 +6,8 @@ use std::path::PathBuf;
 
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
-use thinfer_app::model::{
-    EncoderQuant, RewriteQuality, VIDEO_DEFAULT_STEPS, VaeChoice, VideoModelId, VideoSampler,
-};
-use thinfer_app::request::{VideoFormat, VideoRequest};
+use thinfer_app::model::{EncoderQuant, RewriteQuality, VaeChoice, VideoModelId, VideoSampler};
+use thinfer_app::request::{FaceImage, VideoFormat, VideoInput, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 
@@ -25,9 +23,21 @@ pub struct GenerateVideo {
     #[arg(long, default_value_t = VideoModelId::DEFAULT, value_enum)]
     pub model: VideoModelId,
     /// Text prompt. Repeat `--prompt` for a multi-shot video (LongLive only):
-    /// each prompt is one shot, with a scene cut between shots.
-    #[arg(long, required = true)]
+    /// each prompt is one shot, with a scene cut between shots. Not used by
+    /// `dreamid-v` (the context is baked; pass `--input-video` + `--source-image`
+    /// instead). Required for every other video model.
+    #[arg(long)]
     pub prompt: Vec<String>,
+    /// DreamID-V only: the target VIDEO (mp4) to swap a face into.
+    #[arg(long)]
+    pub input_video: Option<PathBuf>,
+    /// DreamID-V only: the source FACE image (PNG/JPEG) to swap in.
+    #[arg(long)]
+    pub source_image: Option<PathBuf>,
+    /// DreamID-V only: image-CFG guidance scale on the source-face reference
+    /// (default 4.0). Ignored by the other (CFG-free) video models.
+    #[arg(long)]
+    pub guide_scale: Option<f32>,
     /// Output video file (e.g. `out.mp4`).
     #[arg(long)]
     pub output: PathBuf,
@@ -63,9 +73,10 @@ pub struct GenerateVideo {
     /// `dmd` (fixed 3-step byte-parity path). Ignored on the AR (LongLive) path.
     #[arg(long, value_enum, default_value_t = VideoSampler::default())]
     pub sampler: VideoSampler,
-    /// UniPC denoise steps (1..=8). Ignored when `--sampler dmd`.
-    #[arg(long, default_value_t = VIDEO_DEFAULT_STEPS)]
-    pub steps: u32,
+    /// UniPC denoise steps (1..=8; dreamid-v defaults to 16). Ignored when
+    /// `--sampler dmd`. Unset -> the model default.
+    #[arg(long)]
+    pub steps: Option<u32>,
     /// Temporal self-attention window radius in LATENT frames (Wan2.2 14B). Each
     /// query attends only to keys within `±N` latent frames, breaking the
     /// O(frames^2) self-attention cost on long clips at the price of long-range
@@ -126,6 +137,21 @@ pub struct GenerateVideo {
     pub remote: super::RemoteArgs,
 }
 
+/// Read a file and base64-encode it for a remote job spec, or `None` when the
+/// path is absent.
+fn base64_of(path: Option<&std::path::Path>) -> Result<Option<String>, String> {
+    use base64::Engine;
+    match path {
+        Some(p) => {
+            let bytes = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            Ok(Some(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
 pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     let format = resolve_output_format(
         args.output_format,
@@ -148,18 +174,13 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             fps: args.fps,
             seed: args.seed,
             sampler: Some(args.sampler),
-            steps: Some(args.steps),
+            steps: args.steps,
             attn_window: args.attn_window,
             vae: Some(args.vae),
-            input_image: match &args.input_image {
-                Some(p) => {
-                    use base64::Engine;
-                    let bytes =
-                        std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
-                    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
-                }
-                None => None,
-            },
+            input_image: base64_of(args.input_image.as_deref())?,
+            source_image: base64_of(args.source_image.as_deref())?,
+            input_video: base64_of(args.input_video.as_deref())?,
+            guide_scale: args.guide_scale,
             encoder: Some(args.encoder),
             i8_matmul: Some(!args.no_i8_matmul),
             audio: Some(!args.no_audio),
@@ -187,8 +208,21 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         fps: args.fps,
         seed: args.seed,
         input_image: args.input_image,
+        source_image: match &args.source_image {
+            Some(p) => Some(FaceImage(
+                std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,
+            )),
+            None => None,
+        },
+        input_video: match &args.input_video {
+            Some(p) => Some(VideoInput::Ram(
+                std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,
+            )),
+            None => None,
+        },
+        guide_scale: args.guide_scale,
         sampler: args.sampler,
-        steps: args.steps,
+        steps: args.steps.unwrap_or(args.model.default_steps()),
         attn_window: args.attn_window,
         vae: args.vae,
         encoder: args.encoder,

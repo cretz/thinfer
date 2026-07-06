@@ -45,6 +45,10 @@ pub struct ServeConfig {
     pub workers: usize,
     /// Where job outputs are written (one subdir per job id).
     pub artifact_dir: PathBuf,
+    /// Where the encrypted adapter (LoRA) vault lives. Unset = the shared default
+    /// (`THINFER_VAULT_DIR` env, else `<hf-cache>/vault`) so an adapter added via
+    /// the CLI on this box is usable from the web UI. Set it to pin a location.
+    pub vault_dir: Option<PathBuf>,
     /// Artifact retention in seconds (informational sweep target in v1).
     pub retention_secs: u64,
     /// Download missing weight files automatically (no interactive consent on a
@@ -69,6 +73,7 @@ impl Default for ServeConfig {
             web_dir: None,
             workers: 1,
             artifact_dir: PathBuf::from("thinfer-artifacts"),
+            vault_dir: None,
             retention_secs: 24 * 60 * 60,
             download_as_needed: true,
             power_preference: "high".into(),
@@ -102,6 +107,11 @@ impl ServeConfig {
             // Coopmat (tensor-core) path stays ON when the GPU supports it.
             disable_coopmat: false,
         }
+    }
+
+    /// The resolved vault directory (config override, else the shared default).
+    pub fn resolved_vault_dir(&self) -> PathBuf {
+        thinfer_app::vault::resolve_dir(self.vault_dir.as_deref())
     }
 
     pub fn budget(&self) -> Result<ResidencyBudget, String> {

@@ -16,7 +16,10 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use thinfer_app::JobRequest;
 use thinfer_app::model::{ImageModelId, SwapModel, VaeChoice, VideoModelId};
-use thinfer_app::request::{FaceSwapRequest, ImageFormat, ImageRequest, VideoFormat, VideoRequest};
+use thinfer_app::request::{
+    FaceImage, FaceSwapRequest, ImageFormat, ImageRequest, LoraRef, Secret, VideoFormat,
+    VideoInput, VideoRequest,
+};
 use thinfer_app::wire::{CreateResponse, JobSpec, JobStateKind, JobStatus};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -31,6 +34,10 @@ pub struct AppState {
     /// path. Probed once at startup; surfaced via `GET /capabilities` so the web
     /// UI can grey the coopmat toggle on hardware that can't accelerate.
     pub coopmat_supported: bool,
+    /// The encrypted adapter (LoRA) vault, rooted at the configured dir. Shared
+    /// with the CLI (same on-disk vault); every op re-derives the key from the
+    /// request password.
+    pub vault: Arc<thinfer_app::vault::Vault>,
 }
 
 /// `GET /capabilities` body: static server/GPU capabilities the UI adapts to.
@@ -44,6 +51,37 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
     Json(CapabilitiesResponse {
         coopmat: state.coopmat_supported,
     })
+}
+
+/// Above this size an uploaded video spills to an encrypted on-disk blob under a
+/// per-request ephemeral key (AES-256-GCM) rather than staying in RAM; below it,
+/// the mp4 bytes ride in the request in memory. 512 MiB (typical clips are a few
+/// hundred MB, well under the ~28GB RAM budget). Either way the raw plaintext
+/// video never lands on disk.
+const VIDEO_SPILL_THRESHOLD: usize = 512 << 20;
+
+/// Base64-decode a required upload field, tagging errors with the field name.
+fn b64_decode(field: &str, b64: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("{field} is not valid base64: {e}"))
+}
+
+/// Turn decoded video bytes into a [`VideoInput`]: held in RAM under the spill
+/// threshold, else sealed to `<dir>/input_video.enc` under a fresh ephemeral key
+/// (held in the returned value, RAM only). The raw plaintext never touches disk.
+fn video_input(bytes: Vec<u8>, dir: &std::path::Path) -> Result<VideoInput, String> {
+    if bytes.len() > VIDEO_SPILL_THRESHOLD {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let (key, nonce, ct) = thinfer_app::vault::ephemeral_seal(&bytes);
+        drop(bytes); // wipe the plaintext copy; only ciphertext + the RAM key remain
+        let path = dir.join("input_video.enc");
+        std::fs::write(&path, &ct).map_err(|e| format!("write {}: {e}", path.display()))?;
+        Ok(VideoInput::Encrypted { path, key, nonce })
+    } else {
+        Ok(VideoInput::Ram(bytes))
+    }
 }
 
 /// Build the executable request for `spec`, placing the artifact under
@@ -94,6 +132,16 @@ fn spec_into_request(
                 seed: s.seed,
                 i8_matmul: s.i8_matmul.unwrap_or(true),
                 input_image,
+                lora: s
+                    .lora
+                    .into_iter()
+                    .map(|l| LoraRef {
+                        id: l.id,
+                        weight: l.weight.unwrap_or(1.0),
+                    })
+                    .collect(),
+                vault_password: s.password.map(Secret::new),
+                vault_dir: config.resolved_vault_dir(),
                 budget,
                 output: dir.join("output.png"),
                 format: ImageFormat::Png,
@@ -111,16 +159,25 @@ fn spec_into_request(
             // `VideoRequest::resolve` enforces required/rejected per model.
             let input_image = match s.input_image {
                 Some(b64) => {
-                    use base64::Engine;
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(b64.as_bytes())
-                        .map_err(|e| format!("input_image is not valid base64: {e}"))?;
+                    let bytes = b64_decode("input_image", &b64)?;
                     make_dir()?;
                     let path = dir.join("input_image");
                     std::fs::write(&path, &bytes)
                         .map_err(|e| format!("write {}: {e}", path.display()))?;
                     Some(path)
                 }
+                None => None,
+            };
+            // DreamID-V source FACE image: small, held in RAM only (never on
+            // disk), matching the target video's RAM-first privacy.
+            let source_image = match s.source_image {
+                Some(b64) => Some(FaceImage(b64_decode("source_image", &b64)?)),
+                None => None,
+            };
+            // DreamID-V target VIDEO: RAM-first, encrypted spill for large uploads
+            // (never plaintext on disk).
+            let input_video = match s.input_video {
+                Some(b64) => Some(video_input(b64_decode("input_video", &b64)?, &dir)?),
                 None => None,
             };
             let req = VideoRequest {
@@ -133,8 +190,11 @@ fn spec_into_request(
                 fps: s.fps,
                 seed: s.seed,
                 input_image,
+                source_image,
+                input_video,
+                guide_scale: s.guide_scale,
                 sampler: s.sampler.unwrap_or_default(),
-                steps: s.steps.unwrap_or(thinfer_app::model::VIDEO_DEFAULT_STEPS),
+                steps: s.steps.unwrap_or(model.default_steps()),
                 attn_window: s.attn_window,
                 vae: s.vae.unwrap_or(VaeChoice::Tiny),
                 encoder: s.encoder.unwrap_or_default(),
@@ -154,10 +214,30 @@ fn spec_into_request(
             Ok((JobRequest::Video(req), out, public_key, disable_coopmat))
         }
         JobSpec::FaceSwap(s) => {
+            // Target video: uploaded bytes (RAM-first / encrypted spill) take
+            // precedence; else a server-side path (localhost deployments) read
+            // into RAM. Exactly one must be present.
+            let input_video = match (s.input_video_b64, s.input_video) {
+                (Some(b64), _) => video_input(b64_decode("input_video_b64", &b64)?, &dir)?,
+                (None, Some(path)) => {
+                    let bytes = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+                    video_input(bytes, &dir)?
+                }
+                (None, None) => return Err("face-swap requires an input video".into()),
+            };
+            // Source face image: uploaded bytes, or a server-side path read into
+            // RAM. Held in RAM only (never written to the job dir).
+            let source_image = match (s.source_image_b64, s.source_image) {
+                (Some(b64), _) => FaceImage(b64_decode("source_image_b64", &b64)?),
+                (None, Some(path)) => {
+                    FaceImage(std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?)
+                }
+                (None, None) => return Err("face-swap requires a source image".into()),
+            };
             let req = FaceSwapRequest {
                 model: s.model.unwrap_or(SwapModel::DEFAULT),
-                input_video: PathBuf::from(s.input_video),
-                source_image: PathBuf::from(s.source_image),
+                input_video,
+                source_image,
                 output: mp4(),
                 budget,
             };
@@ -180,6 +260,9 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}/events", get(events))
         .route("/jobs/{id}/result", get(get_result))
         .route("/jobs/{id}/cancel", post(cancel))
+        .route("/vault/adapters/list", post(crate::vault::list_adapters))
+        .route("/vault/adapters/add", post(crate::vault::add_adapter))
+        .route("/vault/adapters/remove", post(crate::vault::remove_adapter))
         .route("/capabilities", get(capabilities))
         .route("/openapi.json", get(openapi))
         .layer(middleware::from_fn(move |req, next| {
@@ -386,12 +469,22 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         title = "thinfer",
         description = "Async job API for image/video/face-swap generation."
     ),
-    paths(create_job, get_status, events, get_result, cancel),
+    paths(
+        create_job,
+        get_status,
+        events,
+        get_result,
+        cancel,
+        crate::vault::list_adapters,
+        crate::vault::add_adapter,
+        crate::vault::remove_adapter,
+    ),
     components(schemas(
         JobSpec,
         thinfer_app::wire::ImageSpec,
         thinfer_app::wire::VideoSpec,
         thinfer_app::wire::FaceSwapSpec,
+        thinfer_app::wire::LoraSpec,
         CreateResponse,
         JobStatus,
         JobStateKind,
@@ -401,6 +494,11 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         VideoModelId,
         SwapModel,
         VaeChoice,
+        crate::vault::AddAdapterRequest,
+        crate::vault::ListAdaptersRequest,
+        crate::vault::RemoveAdapterRequest,
+        crate::vault::AdaptersResponse,
+        thinfer_app::vault::VaultEntryInfo,
     ))
 )]
 struct ApiDoc;
@@ -416,7 +514,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),

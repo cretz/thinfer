@@ -46,11 +46,13 @@ pub mod relu;
 pub mod replicate_pad1d;
 pub mod rmsnorm;
 pub mod rmsnorm3d;
+pub mod rmsnorm_gemma;
 pub mod rope;
 pub mod scale;
 pub mod scatter_pad_rows;
 pub mod sdpa;
 pub mod sdpa_i8;
+pub mod sigmoid_mul;
 pub mod silu;
 pub mod silu_mul;
 pub mod snake_beta;
@@ -117,6 +119,7 @@ pub use replicate_pad1d::{
 };
 pub(crate) use rmsnorm::dispatch_rmsnorm;
 pub use rmsnorm::{RmsNormBufs, RmsNormF32, RmsNormOp};
+pub use rmsnorm_gemma::RmsNormGemmaF32;
 pub(crate) use rmsnorm3d::dispatch_rmsnorm3d;
 pub use rmsnorm3d::{RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp};
 pub(crate) use rope::dispatch_rope;
@@ -130,6 +133,7 @@ pub use sdpa::{
     build_f16_sg_windowed_wgsl, f16_sg_workgroups,
 };
 pub(crate) use sdpa::{dispatch_sdpa, dispatch_sdpa_f16_sg};
+pub use sigmoid_mul::SigmoidMulF32;
 pub use silu::SiluF32;
 pub use silu_mul::SiluMulF32;
 pub(crate) use snake_beta::dispatch_snake_beta;

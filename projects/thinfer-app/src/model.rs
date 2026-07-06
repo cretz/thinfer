@@ -7,6 +7,7 @@
 use thinfer_core::manifest::ModelManifest;
 use thinfer_models::hunyuan::manifest as hunmf;
 use thinfer_models::ideogram4::manifest as idmf;
+use thinfer_models::krea::manifest as kreamf;
 use thinfer_models::ltx::manifest as ltxmf;
 use thinfer_models::qwen_image::manifest as qimf;
 use thinfer_models::wan::manifest as wanmf;
@@ -77,6 +78,12 @@ pub enum ImageModelId {
     #[cfg_attr(feature = "cli", value(name = "qwen-image-rapid"))]
     #[cfg_attr(feature = "serde", serde(rename = "qwen-image-rapid"))]
     QwenImageRapid,
+    /// Krea 2 Turbo: a 12.9B aesthetic-first, 8-step distilled CFG-free
+    /// single-stream MMDiT (Qwen3-VL-4B encoder + txtfusion; Wan2.1 VAE).
+    /// Text-to-image, no reference image.
+    #[cfg_attr(feature = "cli", value(name = "krea-2-turbo"))]
+    #[cfg_attr(feature = "serde", serde(rename = "krea-2-turbo"))]
+    Krea2Turbo,
 }
 
 /// Which engine pipeline an image id drives. The executor branches on this:
@@ -89,6 +96,8 @@ pub enum ImageKind {
     QwenImageEdit,
     /// Qwen-Image (text->image; same MMDiT, no reference image).
     QwenImage,
+    /// Krea 2 Turbo (text->image; Qwen3-VL encoder + single-stream DiT).
+    Krea2,
 }
 
 impl ImageModelId {
@@ -100,6 +109,7 @@ impl ImageModelId {
             ImageModelId::Ideogram4Q8 => ImageKind::Ideogram4,
             ImageModelId::QwenImageEditRapid => ImageKind::QwenImageEdit,
             ImageModelId::QwenImageRapid => ImageKind::QwenImage,
+            ImageModelId::Krea2Turbo => ImageKind::Krea2,
             _ => ImageKind::ZImage,
         }
     }
@@ -109,7 +119,15 @@ impl ImageModelId {
             ImageKind::ZImage => &zmf::MANIFEST,
             ImageKind::Ideogram4 => &idmf::MANIFEST,
             ImageKind::QwenImageEdit | ImageKind::QwenImage => &qimf::MANIFEST,
+            ImageKind::Krea2 => &kreamf::MANIFEST,
         }
+    }
+
+    /// Whether request-time user adapters (the vault LoRA fold) apply to this
+    /// model. Krea 2 Turbo for now; the fold itself is model-agnostic, so a new
+    /// image DiT opts in here + wires the fold into its executor path.
+    pub fn supports_adapters(self) -> bool {
+        matches!(self.kind(), ImageKind::Krea2)
     }
 
     /// File set from the shared Z-Image variant registry (keyed by `Display`).
@@ -129,6 +147,8 @@ impl ImageModelId {
             ImageModelId::QwenImageEditRapid => qimf::RUNTIME_ROLES_Q8,
             // t2i omits the vision tower (mmproj) + preprocessor.
             ImageModelId::QwenImageRapid => qimf::RUNTIME_ROLES_T2I_Q8,
+            // Krea sources by role (Q8_0 canary DiT + Qwen3-VL encoder + VAE).
+            ImageModelId::Krea2Turbo => kreamf::RUNTIME_ROLES_Q8,
             // Z-Image uses the variant registry, not roles.
             _ => &[],
         }
@@ -155,6 +175,13 @@ impl ImageModelId {
                 height: IMAGE_DEFAULT_HEIGHT,
                 steps: IMAGE_DEFAULT_STEPS,
             },
+            // Krea 2 Turbo: aesthetic-first, authored at 1024; fixed 8-step turbo
+            // schedule (mu=1.15). 512x512 is the sub-2-min fast tier.
+            ImageKind::Krea2 => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 8,
+            },
         }
     }
 }
@@ -168,6 +195,7 @@ impl std::fmt::Display for ImageModelId {
             ImageModelId::Ideogram4Q8 => "ideogram4-q8",
             ImageModelId::QwenImageEditRapid => "qwen-image-edit-rapid",
             ImageModelId::QwenImageRapid => "qwen-image-rapid",
+            ImageModelId::Krea2Turbo => "krea-2-turbo",
         })
     }
 }
@@ -254,6 +282,17 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "hunyuan-video-1.5-ti2v"))]
     #[cfg_attr(feature = "serde", serde(rename = "hunyuan-video-1.5-ti2v"))]
     Hunyuan15I2v,
+    /// DreamID-V-Wan-1.3B-Faster: a diffusion VIDEO FACE-SWAP DiT on the Wan2.1
+    /// backbone (16-step image-CFG, FastWan-speed class). NOT a text-prompt
+    /// model: it consumes a target VIDEO + a source FACE image (the umT5 context
+    /// is baked in). Its own pipeline (`wan::dreamidv`): the target video +
+    /// live-generated DWPose face-mask + source-face image are VAE-encoded, the
+    /// mask conditions a 48-channel DiT input, and a ref-conv prefix injects the
+    /// source face; none of the Wan variant/sampler/prompt machinery applies.
+    /// 832x480, 81f @ 16fps default. Apache-2.0.
+    #[cfg_attr(feature = "cli", value(name = "dreamid-v"))]
+    #[cfg_attr(feature = "serde", serde(rename = "dreamid-v"))]
+    DreamIdV,
 }
 
 impl VideoModelId {
@@ -354,6 +393,15 @@ impl VideoModelId {
         matches!(self, VideoModelId::Hunyuan15I2v)
     }
 
+    /// DreamID-V video face-swap path: its own `wan::dreamidv` pipeline (target
+    /// video + source-face image + live DWPose mask, image-CFG denoise), NOT a
+    /// text-prompt Wan model. It reuses the Wan variant registry only for the
+    /// shared Wan2.1 VAE file; everything else (no prompt, no sampler choice, the
+    /// source-image + video inputs) is dispatched separately.
+    pub fn is_dreamidv(self) -> bool {
+        matches!(self, VideoModelId::DreamIdV)
+    }
+
     /// LTX-2.3 joint audio-video path: its own two-stage pipeline + audio tail,
     /// none of the FastWan/LongLive (Wan-base) machinery applies.
     pub fn is_ltx(self) -> bool {
@@ -389,6 +437,11 @@ impl VideoModelId {
     pub fn video_defaults(self) -> (u32, u32) {
         if self.is_ltx() {
             (1280, 704)
+        } else if self.is_dreamidv() {
+            // 832x480: DreamID-V's default face-swap resolution (the reference
+            // `size = (832, 480)`; the NaResize downsamples the target clip toward
+            // this area). /16 grid (Wan2.1 VAE 8x + patch 2).
+            (832, 480)
         } else if self.is_hunyuan() {
             // 832x480: HunyuanVideo 1.5's native 480p T2V regime (the res the
             // lightx2v 4-step distill was trained for). 16:9, /16-divisible.
@@ -467,11 +520,29 @@ impl VideoModelId {
             self,
             VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
         ) || self.is_hunyuan()
+            || self.is_dreamidv()
         {
             16
         } else {
             24
         }
+    }
+
+    /// Default denoise step count when the caller leaves `--steps` unset. Most
+    /// video models share [`VIDEO_DEFAULT_STEPS`]; DreamID-V's faster distill is
+    /// authored for 16 (`wan::dreamidv::DEFAULT_STEPS`).
+    pub fn default_steps(self) -> u32 {
+        if self.is_dreamidv() {
+            thinfer_models::wan::dreamidv::DEFAULT_STEPS
+        } else {
+            VIDEO_DEFAULT_STEPS
+        }
+    }
+
+    /// DreamID-V image-CFG guidance scale on the source-face reference when the
+    /// caller leaves `--guide-scale` unset (`wan::dreamidv::DEFAULT_GUIDE_SCALE`).
+    pub fn default_guide_scale(self) -> f32 {
+        thinfer_models::wan::dreamidv::DEFAULT_GUIDE_SCALE
     }
 
     /// Default clip length in seconds when neither frames nor duration is
@@ -490,6 +561,10 @@ impl VideoModelId {
             Self::LTX_DEFAULT_FRAMES
         } else if matches!(self, VideoModelId::Wan22T2vA14b) {
             Self::WAN22_DEFAULT_FRAMES
+        } else if self.is_dreamidv() {
+            // 81 frames (4k+1), the DreamID-V reference default clip length. The
+            // executor clamps this to the actual decoded length of the target clip.
+            81
         } else {
             self.snap_frames(Self::DEFAULT_DURATION_SECS * self.fps())
         }
@@ -679,6 +754,7 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
             VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",
             VideoModelId::Hunyuan15I2v => "hunyuan-video-1.5-ti2v",
+            VideoModelId::DreamIdV => "dreamid-v",
         })
     }
 }
