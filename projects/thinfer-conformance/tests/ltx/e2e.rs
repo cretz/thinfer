@@ -317,6 +317,7 @@ async fn t2v_e2e_health() {
             &vtext,
             &atext,
             &freqs_s1,
+            None, // no i2v conditioning
             None,
         )
         .await
@@ -384,6 +385,7 @@ async fn t2v_e2e_health() {
             &vtext,
             &atext,
             &freqs_s2,
+            None, // no i2v conditioning
             None,
         )
         .await
@@ -407,6 +409,7 @@ async fn t2v_e2e_health() {
             &vtext,
             &atext,
             &freqs,
+            None, // no i2v conditioning
             None,
         )
         .await

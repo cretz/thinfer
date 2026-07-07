@@ -154,6 +154,34 @@ fn scrfd_parity() {
     }
 }
 
+/// XSeg occlusion mask parity. Exercises the ops added for XSeg (Pad, Max/Min,
+/// Reciprocal) + the NHWC input path. Looser tol than the pure conv models: the
+/// GlobalAveragePool -> Sqrt -> Reciprocal norm chain compounds fp order.
+#[test]
+fn xseg_parity() {
+    let ran = pollster::block_on(async {
+        let backend = std::sync::Arc::new(WgpuBackend::new().await.expect("wgpu"));
+        run_model(backend, "THINFER_FS_XSEG", "xseg", 3e-2).await
+    });
+    if !ran {
+        eprintln!("xseg_parity skipped");
+    }
+}
+
+/// GFPGAN face-enhancer parity. Exercises the ops added for GFPGAN (Pow,
+/// ConstantOfShape, Tile) + the StyleGAN weight-demod chain. Deep generator, so
+/// a looser tol (the Pow/ReduceSum/Sqrt/Div demod compounds fp over 95 convs).
+#[test]
+fn gfpgan_parity() {
+    let ran = pollster::block_on(async {
+        let backend = std::sync::Arc::new(WgpuBackend::new().await.expect("wgpu"));
+        run_model(backend, "THINFER_FS_GFPGAN", "gfpgan", 5e-2).await
+    });
+    if !ran {
+        eprintln!("gfpgan_parity skipped");
+    }
+}
+
 #[test]
 fn arcface_parity() {
     let ran = pollster::block_on(async {
@@ -163,6 +191,242 @@ fn arcface_parity() {
     if !ran {
         eprintln!("arcface_parity skipped");
     }
+}
+
+/// Elementwise-chain fusion parity: the fused path must match the per-op path to
+/// f32 noise. Arithmetic ops are identical (f32 buffer round-trips are lossless);
+/// the residual ~1e-5 is transcendental functions (exp/sigmoid/tanh) compiling
+/// slightly differently in the fused vs standalone shader - not a broadcast bug
+/// (which would perturb many elements by more). `THINFER_ONNX_NO_FUSION` toggles
+/// fusion off for the reference run. Needs only THINFER_FS_HYPERSWAP.
+#[test]
+fn hyperswap_fusion_parity() {
+    let ran = pollster::block_on(async {
+        let Ok(model_path) = std::env::var("THINFER_FS_HYPERSWAP") else {
+            return false;
+        };
+        let onnx = std::fs::read(&model_path).unwrap();
+        let backend = std::sync::Arc::new(WgpuBackend::new().await.expect("wgpu"));
+
+        // Identify inputs by rank (4D target image, 2D source embedding).
+        let g = thinfer_core::onnx::proto::parse_model(&onnx).unwrap();
+        let ins: Vec<(String, usize)> = g
+            .inputs
+            .iter()
+            .filter(|vi| !g.initializers.iter().any(|t| t.name == vi.name))
+            .map(|vi| (vi.name.clone(), vi.dims.len()))
+            .collect();
+        let tname = ins.iter().find(|(_, r)| *r == 4).unwrap().0.clone();
+        let sname = ins.iter().find(|(_, r)| *r == 2).unwrap().0.clone();
+        let shapes = {
+            let mut m = HashMap::new();
+            m.insert(tname.clone(), vec![1i64, 3, 256, 256]);
+            m.insert(sname.clone(), vec![1i64, 512]);
+            m
+        };
+        let mut feeds = HashMap::new();
+        feeds.insert(
+            tname.clone(),
+            (0..3 * 256 * 256)
+                .map(|i| ((i % 509) as f32 / 509.0) * 2.0 - 1.0)
+                .collect::<Vec<f32>>(),
+        );
+        feeds.insert(sname.clone(), vec![1.0 / (512f32).sqrt(); 512]);
+        let out4 = |o: &HashMap<String, (Vec<i64>, Vec<f32>)>| {
+            o.values()
+                .find(|(sh, _)| sh.len() == 4 && sh[1] == 3)
+                .unwrap()
+                .1
+                .clone()
+        };
+
+        // Reference: fusion off.
+        unsafe { std::env::set_var("THINFER_ONNX_NO_FUSION", "1") };
+        let m_ref = OnnxModel::load(std::sync::Arc::clone(&backend), &onnx, &shapes)
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("THINFER_ONNX_NO_FUSION") };
+        let m_fused = OnnxModel::load(std::sync::Arc::clone(&backend), &onnx, &shapes)
+            .await
+            .unwrap();
+        let o_ref = m_ref.run(&feeds).await.unwrap();
+        let o_fused = m_fused.run(&feeds).await.unwrap();
+
+        let s = compare(&out4(&o_fused), &out4(&o_ref));
+        eprintln!(
+            "[fusion] rel_vs_unfused={:.3e} max_abs={:.3e} nan={}",
+            s.rel, s.max_abs, s.nan
+        );
+        assert_eq!(s.nan, 0, "fused output has NaNs");
+        assert!(s.rel <= 1e-4, "fused output diverged: {:.3e}", s.rel);
+        true
+    });
+    if !ran {
+        eprintln!("hyperswap_fusion_parity skipped (set THINFER_FS_HYPERSWAP)");
+    }
+}
+
+/// Clean full-forward wall time of one HyperSwap forward (synthetic inputs, no
+/// golden). Warms up, then times N forwards single-submit. The A/B harness for
+/// conv-path work. Run: THINFER_FS_HYPERSWAP=<...> cargo test --features
+/// faceswap-e2e --release hyperswap_forward_timing -- --ignored --nocapture.
+#[test]
+#[ignore]
+fn hyperswap_forward_timing() {
+    pollster::block_on(async {
+        let model_path = std::env::var("THINFER_FS_HYPERSWAP").expect("THINFER_FS_HYPERSWAP");
+        let onnx = std::fs::read(&model_path).unwrap();
+        // Time on the discrete GPU (the production device): plain
+        // WgpuBackend::new() defaults to PowerPreference::None -> the iGPU.
+        let cfg = thinfer_core::backend::WgpuConfig {
+            power_preference: thinfer_core::backend::PowerPreference::HighPerformance,
+            ..Default::default()
+        };
+        let backend = std::sync::Arc::new(WgpuBackend::new_with_config(cfg).await.expect("wgpu"));
+        let g = thinfer_core::onnx::proto::parse_model(&onnx).unwrap();
+        let ins: Vec<(String, usize)> = g
+            .inputs
+            .iter()
+            .filter(|vi| !g.initializers.iter().any(|t| t.name == vi.name))
+            .map(|vi| (vi.name.clone(), vi.dims.len()))
+            .collect();
+        let tname = ins.iter().find(|(_, r)| *r == 4).unwrap().0.clone();
+        let sname = ins.iter().find(|(_, r)| *r == 2).unwrap().0.clone();
+        // Batch sweep: does stacking N frames into one forward amortize the
+        // per-dispatch GPU underutilization (sublinear) or is it saturated
+        // (linear)? THINFER_FS_BATCH=1,2,4,8.
+        let batch: i64 = std::env::var("THINFER_FS_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let mut shapes = HashMap::new();
+        shapes.insert(tname.clone(), vec![batch, 3, 256, 256]);
+        shapes.insert(sname.clone(), vec![batch, 512]);
+        let mut feeds = HashMap::new();
+        feeds.insert(
+            tname,
+            (0..batch as usize * 3 * 256 * 256)
+                .map(|i| ((i % 509) as f32 / 509.0) * 2.0 - 1.0)
+                .collect::<Vec<f32>>(),
+        );
+        feeds.insert(sname, vec![1.0 / (512f32).sqrt(); batch as usize * 512]);
+        let m = OnnxModel::load(std::sync::Arc::clone(&backend), &onnx, &shapes)
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            m.run(&feeds).await.unwrap();
+        }
+        let iters = 30;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(m.run(&feeds).await.unwrap());
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "[hyperswap-timing] batch={batch} mean_forward={ms:.2}ms \
+             ({:.2}ms/frame) over {iters} iters",
+            ms / batch as f64
+        );
+    });
+}
+
+/// i8 DP4A conv A/B: load HyperSwap f32 and i8 (THINFER_ONNX_I8_CONV), run both
+/// on the same input, report the output rel error + both timings. Numeric sanity
+/// for the opt-in i8 path (the real gate is a visual eyeball on a face). Run
+/// --ignored --nocapture with THINFER_FS_HYPERSWAP set.
+#[test]
+#[ignore]
+fn hyperswap_i8_ab() {
+    pollster::block_on(async {
+        let model_path = std::env::var("THINFER_FS_HYPERSWAP").expect("THINFER_FS_HYPERSWAP");
+        let onnx = std::fs::read(&model_path).unwrap();
+        let cfg = thinfer_core::backend::WgpuConfig {
+            power_preference: thinfer_core::backend::PowerPreference::HighPerformance,
+            ..Default::default()
+        };
+        let backend = std::sync::Arc::new(WgpuBackend::new_with_config(cfg).await.expect("wgpu"));
+        let g = thinfer_core::onnx::proto::parse_model(&onnx).unwrap();
+        let ins: Vec<(String, usize)> = g
+            .inputs
+            .iter()
+            .filter(|vi| !g.initializers.iter().any(|t| t.name == vi.name))
+            .map(|vi| (vi.name.clone(), vi.dims.len()))
+            .collect();
+        let tname = ins.iter().find(|(_, r)| *r == 4).unwrap().0.clone();
+        let sname = ins.iter().find(|(_, r)| *r == 2).unwrap().0.clone();
+        let mut shapes = HashMap::new();
+        shapes.insert(tname.clone(), vec![1i64, 3, 256, 256]);
+        shapes.insert(sname.clone(), vec![1i64, 512]);
+        let mut feeds = HashMap::new();
+        // A smoothly varying target (closer to a face than white noise).
+        feeds.insert(
+            tname.clone(),
+            (0..3 * 256 * 256)
+                .map(|i| {
+                    let (c, p) = (i / (256 * 256), i % (256 * 256));
+                    let (y, x) = ((p / 256) as f32, (p % 256) as f32);
+                    ((x / 256.0 * 6.0).sin() * (y / 256.0 * 6.0).cos() * 0.5 + 0.1 * c as f32)
+                        .clamp(-1.0, 1.0)
+                })
+                .collect::<Vec<f32>>(),
+        );
+        feeds.insert(sname.clone(), vec![1.0 / (512f32).sqrt(); 512]);
+        let out4 = |o: &HashMap<String, (Vec<i64>, Vec<f32>)>| {
+            o.values()
+                .find(|(sh, _)| sh.len() == 4 && sh[1] == 3)
+                .unwrap()
+                .1
+                .clone()
+        };
+
+        let m_f32 = OnnxModel::load(std::sync::Arc::clone(&backend), &onnx, &shapes)
+            .await
+            .unwrap();
+        let o_f32 = m_f32.run(&feeds).await.unwrap();
+        for _ in 0..3 {
+            m_f32.run(&feeds).await.unwrap();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(m_f32.run(&feeds).await.unwrap());
+        }
+        let t_f32 = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+
+        let m_i8 = OnnxModel::load_i8(std::sync::Arc::clone(&backend), &onnx, &shapes, true)
+            .await
+            .unwrap();
+        let o_i8 = m_i8.run(&feeds).await.unwrap();
+        for _ in 0..3 {
+            m_i8.run(&feeds).await.unwrap();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(m_i8.run(&feeds).await.unwrap());
+        }
+        let t_i8 = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+
+        let (a, b) = (out4(&o_f32), out4(&o_i8));
+        let mut sq_err = 0f64;
+        let mut sq_ref = 0f64;
+        let mut max_abs = 0f32;
+        let mut nan = 0;
+        for (&x, &y) in a.iter().zip(&b) {
+            if !y.is_finite() {
+                nan += 1;
+                continue;
+            }
+            sq_err += ((x - y) as f64).powi(2);
+            sq_ref += (x as f64).powi(2);
+            max_abs = max_abs.max((x - y).abs());
+        }
+        let rel = (sq_err / sq_ref).sqrt();
+        eprintln!(
+            "[i8-ab] rel_rmse={rel:.3e} max_abs={max_abs:.3e} (out in [-1,1]) nan={nan} | \
+             f32={t_f32:.1}ms i8={t_i8:.1}ms speedup={:.2}x",
+            t_f32 / t_i8
+        );
+        assert_eq!(nan, 0, "i8 output has non-finite values");
+    });
 }
 
 /// Batch spike: run HyperSwap with target `[B,3,256,256]` (B copies of the
@@ -239,7 +503,12 @@ fn hyperswap_batch_spike() {
         fb.insert(tname, tiled);
         fb.insert(sname, s_data.clone());
         let outb = mb.run(&fb).await.unwrap();
-        let (osh, od) = outb.values().find(|(sh, _)| sh.len() == 4).unwrap();
+        // HyperSwap has two 4D outputs (the 3-ch image and the 1-ch mask); the
+        // batch check is on the image output.
+        let (osh, od) = outb
+            .values()
+            .find(|(sh, _)| sh.len() == 4 && sh[1] == 3)
+            .unwrap();
         assert_eq!(osh[0], B);
         // Each batch slice equals the golden.
         let mut worst = 0f32;

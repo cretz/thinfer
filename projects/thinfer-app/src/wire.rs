@@ -143,6 +143,11 @@ pub struct VideoSpec {
     /// image-edit path.
     #[serde(default)]
     pub input_image: Option<String>,
+    /// LTX native-I2V frame-0 conditioning strength (`0.0..=1.0`; default 1.0).
+    /// `1.0` locks the encoded input frame through the denoise; lower lets it
+    /// drift. Used only with `input_image` on ltx2-rapid; ignored otherwise.
+    #[serde(default)]
+    pub strength: Option<f32>,
     /// Base64-encoded source FACE image bytes (PNG/JPEG). DreamID-V only
     /// (required there): the face to swap into the target video. The server
     /// decodes it to a temp file under the job dir.
@@ -151,9 +156,14 @@ pub struct VideoSpec {
     /// Base64-encoded target VIDEO bytes (mp4). DreamID-V only (required there):
     /// the clip to swap a face into. Held RAM-first; a large upload spills to an
     /// encrypted on-disk blob under a per-request ephemeral key (never plaintext
-    /// on disk). Rejected by every other model.
+    /// on disk). Rejected by every other model. Prefer `input_video_upload` for
+    /// large clips (this base64-in-JSON field inflates the body ~33%).
     #[serde(default)]
     pub input_video: Option<String>,
+    /// Id of a video previously streamed to `POST /uploads` (DreamID-V). Takes
+    /// precedence over `input_video`; the raw mp4 never rides in the JSON body.
+    #[serde(default)]
+    pub input_video_upload: Option<String>,
     /// DreamID-V image-CFG guidance scale on the source-face reference. Omitted =
     /// the model default (4.0). Ignored by the other (CFG-free) video models.
     #[serde(default)]
@@ -188,6 +198,16 @@ pub struct VideoSpec {
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
     pub disable_coopmat: Option<bool>,
+    /// User adapters (vault LoRAs) to fold into the DiT for this generation, in
+    /// fold order. Each `id` is a `vault list` entry for THIS model. Empty/absent
+    /// = the plain base model. Only models that support adapters (AnyFlow) accept a
+    /// non-empty list; requires `password`.
+    #[serde(default)]
+    pub lora: Vec<LoraSpec>,
+    /// Vault password, required when `lora` is non-empty. Transient: used to
+    /// decrypt the adapters for this request only, never stored or logged.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -206,9 +226,16 @@ pub struct FaceSwapSpec {
     /// Base64-encoded input VIDEO bytes (mp4), for browser uploads. Held
     /// RAM-first; a large upload spills to an encrypted on-disk blob under a
     /// per-request ephemeral key (never plaintext on disk). Takes precedence over
-    /// `input_video` when both are set.
+    /// `input_video` when both are set. Prefer `input_video_upload` for large
+    /// clips: base64-in-JSON inflates the body ~33% and hits the JSON size cap.
     #[serde(default)]
     pub input_video_b64: Option<String>,
+    /// Id of a video previously streamed to `POST /uploads`. The raw mp4 rides
+    /// its own request body (no base64, no JSON size cap); the server holds it
+    /// RAM-first / encrypted-spill under a TTL until this job consumes it. Takes
+    /// precedence over `input_video_b64` and `input_video`.
+    #[serde(default)]
+    pub input_video_upload: Option<String>,
     /// Base64-encoded source FACE image bytes (PNG/JPEG), for browser uploads.
     /// Takes precedence over `source_image` when both are set.
     #[serde(default)]
@@ -220,6 +247,34 @@ pub struct FaceSwapSpec {
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
     pub disable_coopmat: Option<bool>,
+    /// Intersect the paste mask with an XSeg occlusion mask so occluders
+    /// (hands/hair/glasses) crossing the face show the original frame through.
+    /// Adds one ONNX forward per face.
+    #[serde(default)]
+    pub occlusion_mask: Option<bool>,
+    /// Intersect the paste mask with HyperSwap's own confidence mask (free).
+    #[serde(default)]
+    pub hyperswap_mask: Option<bool>,
+    /// Run the GFPGAN face enhancer on each swapped face.
+    #[serde(default)]
+    pub enhance: Option<bool>,
+    /// Detect faces every Nth frame, reusing the previous detection in between.
+    /// 1 = every frame (default). Higher = faster, looser tracking.
+    #[serde(default)]
+    pub detect_stride: Option<u32>,
+    /// Output H.264 bitrate as a multiple of the source video bitrate (default
+    /// 1.15). Falls back to a bits-per-pixel target if the source bitrate is
+    /// unknown.
+    #[serde(default)]
+    pub bitrate_scale: Option<f32>,
+    /// Only swap+output the source window starting at this many seconds (rebased
+    /// to 0). Default: clip start.
+    #[serde(default)]
+    pub start_secs: Option<f32>,
+    /// Only swap+output the source window ending at this many seconds. Default:
+    /// clip end.
+    #[serde(default)]
+    pub end_secs: Option<f32>,
 }
 
 /// The `POST /jobs` response.
@@ -229,6 +284,16 @@ pub struct FaceSwapSpec {
 pub struct CreateResponse {
     pub id: String,
     pub queue_position: usize,
+}
+
+/// The `POST /uploads` response: an opaque id a job spec references via
+/// `input_video_upload`, plus the received byte count.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct UploadResponse {
+    pub id: String,
+    pub size: usize,
 }
 
 /// Coarse job lifecycle state.

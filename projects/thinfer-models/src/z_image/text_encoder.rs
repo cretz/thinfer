@@ -344,7 +344,13 @@ pub(crate) fn register_one<S: WeightSource>(
             (TransposePolicy::None, Some(k))
         }
         (StorageEncoding::Quant(_), _) => (TransposePolicy::None, None),
-        (StorageEncoding::Bf16 | StorageEncoding::F32, None) => (transpose, None),
+        // F16 float source (the ltx2-rapid DiT stores norms/biases/tables/adaln/
+        // caption/patchify/proj_out as F16): treated like F32/Bf16 -- it uploads
+        // bf16 (`gpu_encoding`) and the bf16 matmul/rmsnorm reads it. Transcode of
+        // a float source is only defined for Bf16, so F16 never carries a hint.
+        (StorageEncoding::Bf16 | StorageEncoding::F32 | StorageEncoding::F16, None) => {
+            (transpose, None)
+        }
         _ => {
             return Err(LoadError::Undecodable {
                 id: id.clone(),

@@ -128,10 +128,25 @@ pub fn normalize_cthw(latent: &mut [f32], mean: &[f32], std: &[f32], thw: usize)
 /// `[tokens, IN_CHANNELS]` and are advanced in place. `vtext`/`atext` are the
 /// connector cross-attn KV. Returns the final `(latent_v, latent_a)`.
 ///
-/// No image/video conditioning here (`post_process_latent` is identity for the
-/// all-ones denoise mask), so the X0 estimate is `latent - v*sigma` and the step
-/// recovers the velocity exactly; the explicit X0 round-trip keeps the shape that
-/// future conditioning (blend X0 against a clean latent) will slot into.
+/// Native I2V conditioning for the video stream (`None` = pure t2v). `clean_v` is
+/// the token-major clean latent (encoded frame-0 in the leading tokens) and
+/// `mask_v` is the per-video-token denoise mask (`1.0` free, `1-strength` on the
+/// conditioned tokens); the caller seeds `latent_v` with the same blend. Each
+/// step hard-replaces the conditioned tokens' X0 with the clean latent (the
+/// scalar-sigma forward still sees them, an approximation the eyeball validates;
+/// exact would thread a per-token timestep into adaln). Audio is never
+/// conditioned (rapid is video-only).
+#[derive(Clone, Copy)]
+pub struct I2vCond<'a> {
+    pub clean_v: &'a [f32],
+    pub mask_v: &'a [f32],
+}
+
+/// Run an X0-prediction velocity Euler denoising loop over `sigmas`. With
+/// `cond = None` this is pure t2v: the X0 estimate is `latent - v*sigma` and the
+/// step recovers the velocity exactly. With `Some`, the conditioned video tokens
+/// are held to `cond.clean_v` via the per-step X0 blend (the caller must also
+/// seed `latent_v` with the matching `blend_clean`).
 #[allow(clippy::too_many_arguments)]
 pub async fn denoise_loop<S: WeightSource>(
     backend: &WgpuBackend,
@@ -146,6 +161,7 @@ pub async fn denoise_loop<S: WeightSource>(
     vtext: &[f32],
     atext: &[f32],
     freqs: &HostFreqs,
+    cond: Option<I2vCond<'_>>,
     progress: Option<&dyn Fn(usize)>,
 ) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
     // Step-invariant inputs (caption KV, rope freqs, ones gains) upload ONCE;
@@ -159,7 +175,10 @@ pub async fn denoise_loop<S: WeightSource>(
                 backend, pipes, residency, workspace, s, &latent_v, &latent_a, &inputs, sigma,
             )
             .await?;
-        let x0_v = sampler::to_denoised(&latent_v, &vel_v, sigma);
+        let mut x0_v = sampler::to_denoised(&latent_v, &vel_v, sigma);
+        if let Some(c) = cond {
+            sampler::blend_clean(&mut x0_v, c.clean_v, c.mask_v, dit::IN_CHANNELS);
+        }
         let x0_a = sampler::to_denoised(&latent_a, &vel_a, sigma);
         latent_v = sampler::euler_step(&latent_v, &x0_v, sigma, sigma_next);
         latent_a = sampler::euler_step(&latent_a, &x0_a, sigma, sigma_next);

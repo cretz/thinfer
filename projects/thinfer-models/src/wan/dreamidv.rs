@@ -31,15 +31,15 @@ use std::sync::Arc;
 
 use thinfer_core::backend::WgpuBackend;
 use thinfer_core::ops::{ActDtype, WeightDtype};
-use thinfer_core::trace;
 use thinfer_core::residency::WeightResidency;
+use thinfer_core::trace;
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 
+use crate::common::block::DenseActSites;
 use crate::wan::dit::{WanDit, WanDitError, WanDitInputs, WanDitShape, WanDitTaps};
 use crate::wan::dit_block::{WanDitConfig, WanDitPipelines, config as dit_config};
 use crate::wan::loader::{WanI8Sites, register_wan_dit_handles};
-use crate::common::block::DenseActSites;
 use crate::wan::pipeline::{SiteOverride, WanVariant, block_cfgs, gaussian_noise};
 use crate::wan::unipc::{FlowUniPc, UniPcConfig};
 use crate::wan::vae::{
@@ -212,11 +212,13 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
             register_wan_dit_handles(&residency, &cfg, "", variant.block_transcode, i8_sites)?;
         // Acts F16 when the device supports shader-f16 (the 1536-dim residual fits
         // f16), else F32. F32 `.pth` narrows to bf16 at upload for the dense sites.
-        let act = variant.act_pref.unwrap_or(if backend.supports_shader_f16() {
-            ActDtype::F16
-        } else {
-            ActDtype::F32
-        });
+        let act = variant
+            .act_pref
+            .unwrap_or(if backend.supports_shader_f16() {
+                ActDtype::F16
+            } else {
+                ActDtype::F32
+            });
         let dit_w = variant
             .block_transcode
             .map(WeightDtype::Quant)

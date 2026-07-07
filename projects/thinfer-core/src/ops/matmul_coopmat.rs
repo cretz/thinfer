@@ -11,11 +11,13 @@
 //!   workgroup size is the device subgroup width, baked at build (the caller
 //!   must only use this when subgroup_min == subgroup_max). Each workgroup
 //!   computes a `(tm*T) x (tn*T)` register-tiled output block.
-//! - Ragged M/N need NO operand padding when the device reports
-//!   `cooperativeMatrixRobustBufferAccess` (the RTX 5070 does): out-of-bounds
-//!   `coopLoad` tile reads clamp to 0, and the matmul is row/col independent so
-//!   the in-bounds outputs are unaffected; the staged store is bounds-checked.
-//!   Without robust access, the caller must pad A/B to `T` multiples.
+//! - Ragged M/N: the staged store is bounds-checked, but the `coopLoad`s are
+//!   NOT -- despite the driver reporting `cooperativeMatrixRobustBufferAccess`,
+//!   out-of-bounds coop loads are unreliable on this stack (M < WM device-loses;
+//!   ragged-M fringe loads page-fault when the fringe crosses an unmapped page:
+//!   nvlddmkm GPUID error, device lost). The caller MUST allocate A (and B, if
+//!   its leading dim can be ragged) padded up to whole `WM`/`WN` blocks; fringe
+//!   CONTENTS are don't-care (fringe output rows/cols are never stored).
 //!
 //! Layout: 0=A `[M,K]` f16 row-major, 1=B f16 (`[K,N]` row-major, or `[N,K]`
 //! n-major when `cfg.b_col_major`), 2=Out `[M,N]` (f32 or f16), 3=Dims uniform

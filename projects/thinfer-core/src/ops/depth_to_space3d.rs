@@ -16,6 +16,12 @@ use crate::tensor::{ComputeDtype, F32};
 /// for output `(co, p1, p2, p3)` is `((co*P1 + p1)*P2 + p2)*P3 + p3`. One thread
 /// per output element gathers its single source value (pure copy, no arithmetic).
 ///
+/// `base_cout` supports the residual up-shortcut (`DepthToSpaceUpsample(residual=
+/// True)`): the output channel index is wrapped by `base_cout` before decoding
+/// the source channel, so a shuffle into `base_cout` channels is tiled (torch
+/// `.repeat`) up to `cout = base_cout * repeat`. Set `base_cout == cout` for the
+/// plain (non-residual) shuffle, which makes `co % cout == co` a no-op.
+///
 /// Layout: 0=X, 1=Out, 2=Uniform.
 pub trait DepthToSpace3dOp {
     const KERNEL_ID: &'static str;
@@ -83,6 +89,7 @@ struct U {{
     cin: u32, t_in: u32, h_in: u32, w_in: u32,
     p1: u32, p2: u32, p3: u32, t_drop: u32,
     cout: u32, t_out: u32, h_out: u32, w_out: u32,
+    base_cout: u32, pad0: u32, pad1: u32, pad2: u32,
 }};
 
 {x_decl}
@@ -116,7 +123,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let p3: u32 = wo % u.p3;
     let wi: u32 = wo / u.p3;
 
-    let ci: u32 = ((co * u.p1 + p1) * u.p2 + p2) * u.p3 + p3;
+    // Wrap the output channel into the shuffle group so a `base_cout`-channel
+    // shuffle is tiled up to `cout` (the residual up-shortcut); a no-op when
+    // `base_cout == cout`.
+    let cb: u32 = co % u.base_cout;
+    let ci: u32 = ((cb * u.p1 + p1) * u.p2 + p2) * u.p3 + p3;
     let in_idx: u32 = ((ci * u.t_in + ti) * u.h_in + hi) * u.w_in + wi;
     let v: f32 = load_x(in_idx);
     out[o] = {store_expr};

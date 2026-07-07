@@ -1212,6 +1212,7 @@ const WAN_VAE_CONV2D_TILE: Conv2dConfig = Conv2dConfig {
     bk: 16,
     tm: 8,
     tn: 6,
+    prefetch: false,
 };
 
 /// Every WGSL pipeline the Wan VAE forward dispatches. Shared encoder + decoder.

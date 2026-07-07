@@ -27,18 +27,21 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::weight::{WeightCatalog, WeightId, WeightReader, WeightSource};
 use thinfer_core::workspace::Workspace;
+use thinfer_models::ltx::LtxVariant;
 use thinfer_models::ltx::audio_vae::{
     AudioVaeDecoder, AudioVaePipelines, load_latent_stats as load_audio_latent_stats,
 };
 use thinfer_models::ltx::config;
 use thinfer_models::ltx::connector::{
-    AUDIO, ConnectorPipelines, VIDEO, connector_forward, fe_aggregate,
-    feature_extractor_v2_flatten, register_connector, register_fe,
+    AUDIO, CONN_SEQ, ConnectorPipelines, RAPID_AUDIO, RAPID_VIDEO, VIDEO, connector_forward,
+    fe_aggregate, fe_aggregate_v1, feature_extractor_v1_flatten, feature_extractor_v2_flatten,
+    register_connector, register_fe, register_fe_v1,
 };
-use thinfer_models::ltx::dit::{DitModel, DitPipelines};
+use thinfer_models::ltx::dit::{DitModel, DitPipelines, caption_project, register_caption_proj};
 use thinfer_models::ltx::loader::{UnitOffsetSource, gemma_gguf_renames, gemma_norm_offset_ids};
 use thinfer_models::ltx::lora;
 use thinfer_models::ltx::manifest::role;
+use thinfer_models::ltx::pipeline::I2vCond;
 use thinfer_models::ltx::pipeline::{
     build_dit_freqs, denoise_loop, normalize_cthw, streams_for, un_normalize_cthw,
 };
@@ -50,7 +53,8 @@ use thinfer_models::ltx::text_encoder::{
 };
 use thinfer_models::ltx::upsampler::{LtxUpsampler, LtxUpsamplerPipelines};
 use thinfer_models::ltx::video_vae::{
-    LATENT_CHANNELS, LtxVaeDecoder, LtxVaePipelines, load_latent_stats,
+    LATENT_CHANNELS, LtxVaeConfig, LtxVaeDecoder, LtxVaeEncoder, LtxVaeEncoderConfig,
+    LtxVaePipelines, load_latent_stats,
 };
 use thinfer_models::ltx::vocoder::{Vocoder, VocoderPipelines};
 use thinfer_models::wan::pipeline::WanVideo;
@@ -88,6 +92,10 @@ pub async fn run(
         sink.note(w);
     }
     let manifest = req.model.manifest();
+    // ltx2-rapid (LTX-2 19B merge): 19B conditioning tail + LTX-2 VAEs, single-stage
+    // only (no spatial upscaler ships), video-only for now (its audio VAE is
+    // comfy-prefixed -- a separate follow-up).
+    let rapid = req.model.is_ltx_rapid();
     let frames = plan.frames as usize;
     let height = req.height as usize;
     let width = req.width as usize;
@@ -108,11 +116,37 @@ pub async fn run(
     let vae_path = resolve_role(manifest, role::VIDEO_VAE)?;
     let audio_vae_path = resolve_role(manifest, role::AUDIO_VAE)?;
 
+    // --- Phase 0: optional prompt rewrite (ltx2-rapid only). Like HunyuanVideo
+    //     1.5, the 19B merge is trained on long, structured captions -- a terse
+    //     raw prompt is out-of-distribution and collapses to the model's portrait
+    //     prior. Expand it via the on-device Qwen3-VL rewriter (phase-scoped,
+    //     evicted before the encoder); fall back to the original on any failure.
+    //     The 22B distilled/Sulphur path is unchanged. Prompt text is never logged.
+    let raw_prompt = req.prompts[0].trim();
+    if raw_prompt.is_empty() {
+        return Err("empty prompt produced no tokens".into());
+    }
+    let rewritten = if rapid {
+        crate::rewrite::maybe_rewrite_prompt(
+            req.rewrite,
+            req.rewrite_quality,
+            crate::rewrite::LTX_REWRITE_SYSTEM_PROMPT,
+            raw_prompt,
+            backend,
+            manifest,
+            req.budget.vram_bytes,
+            sink,
+        )
+        .await
+    } else {
+        None
+    };
+    let prompt: &str = rewritten.as_deref().unwrap_or(raw_prompt);
+
     // --- tokenize (Gemma fast tokenizer; matches the pyref add_special_tokens) ---
     let tokenizer = HfTokenizer::from_path(&tok_path)
         .await
         .map_err(|e| format!("load tokenizer {}: {e:?}", tok_path.display()))?;
-    let prompt = req.prompts[0].trim();
     let ids = tokenizer
         .encode(prompt, true)
         .map_err(|e| format!("tokenize: {e:?}"))?;
@@ -191,130 +225,308 @@ pub async fn run(
         out.states
     };
 
-    // The connector pipelines are reused across the FE (connector ST) and the
-    // connector-blocks (DiT GGUF) phases.
-    let conn_pipes = ConnectorPipelines::compile(backend)
-        .await
-        .map_err(|e| format!("compile connector pipelines: {e:?}"))?;
-
-    // === Phase B: FeatureExtractor V2 -> aggregate embeds (host) ===
-    let flat = feature_extractor_v2_flatten(&states, seq);
-    drop(states);
-    let (video_embed, audio_embed) = {
-        let src = open_st(&conn_path).await?;
-        let residency = WeightResidency::new(src, budget);
-        let fe = register_fe(&residency).map_err(|e| format!("register FE: {e:?}"))?;
-        let workspace = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
-        let v = fe_aggregate(
-            backend,
-            &conn_pipes,
-            &residency,
-            &workspace,
-            &flat,
-            seq,
-            fe.video_w,
-            fe.video_b,
-            VIDEO.out_dim,
-        )
-        .await
-        .map_err(|e| format!("fe video: {e:?}"))?;
-        let a = fe_aggregate(
-            backend,
-            &conn_pipes,
-            &residency,
-            &workspace,
-            &flat,
-            seq,
-            fe.audio_w,
-            fe.audio_b,
-            AUDIO.out_dim,
-        )
-        .await
-        .map_err(|e| format!("fe audio: {e:?}"))?;
-        residency.evict_all_and_free(&**backend);
-        (v, a)
+    // Which LTX-2 line: 22B (LTX-2.3 / Sulphur) or the 19B (ltx2-rapid) merge.
+    let variant = if rapid {
+        LtxVariant::ltx2_rapid_19b()
+    } else {
+        LtxVariant::ltx_2_3_22b()
     };
 
-    // === Phases C-F: DiT GGUF resident for connector blocks + both denoise stages ===
-    let opener = open_mmap(&dit_path).await?;
-    let gguf = GgufSource::open(opener)
+    // FeatureExtractor: V1 (19B range-norm, single stream) or V2 (22B per-token RMS).
+    let flat = if rapid {
+        feature_extractor_v1_flatten(&states, seq)
+    } else {
+        feature_extractor_v2_flatten(&states, seq)
+    };
+    drop(states);
+
+    // Connector pipelines: bf16 block matmuls (19B, from safetensors) vs Q8_0 (22B,
+    // from the DiT GGUF).
+    let conn_pipes = if rapid {
+        ConnectorPipelines::compile_rapid(backend).await
+    } else {
+        ConnectorPipelines::compile(backend).await
+    }
+    .map_err(|e| format!("compile connector pipelines: {e:?}"))?;
+
+    // Conditioning tail -> cross-attn caption KV (`vtext`/`atext`) + the resident
+    // DiT (`dit_res`/`dit_model`/`dit_pipes`/`dit_ws`). The 19B and 22B lines differ
+    // in where the connector lives and how the 3840 Gemma channels reach the
+    // cross-attn width, so each builds the KV its own way and converges here.
+    let (vtext, atext, dit_res, dit_pipes, dit_model, dit_ws) = if rapid {
+        // === Phase B (19B): single bias-free FE V1 aggregate + 2-layer ungated
+        // 3840 connector, BOTH from the connector safetensors -> [1024, 3840]. ===
+        let (video_conn, audio_conn) = {
+            let src = open_st(&conn_path).await?;
+            let residency = WeightResidency::new(src, budget);
+            let fe_w = register_fe_v1(&residency).map_err(|e| format!("register FE V1: {e:?}"))?;
+            let video_h = register_connector(&residency, RAPID_VIDEO)
+                .map_err(|e| format!("register video conn: {e:?}"))?;
+            let audio_h = register_connector(&residency, RAPID_AUDIO)
+                .map_err(|e| format!("register audio conn: {e:?}"))?;
+            let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+            // Single shared aggregate (out = Gemma HIDDEN = 3840) fed to both.
+            let agg = fe_aggregate_v1(
+                backend,
+                &conn_pipes,
+                &residency,
+                &ws,
+                &flat,
+                seq,
+                fe_w,
+                config::CAPTION_CHANNELS,
+            )
+            .await
+            .map_err(|e| format!("fe v1 aggregate: {e:?}"))?;
+            let v = connector_forward(
+                backend,
+                &conn_pipes,
+                &residency,
+                &ws,
+                &video_h,
+                RAPID_VIDEO,
+                &agg,
+                seq,
+            )
+            .await
+            .map_err(|e| format!("video connector: {e:?}"))?;
+            let a = connector_forward(
+                backend,
+                &conn_pipes,
+                &residency,
+                &ws,
+                &audio_h,
+                RAPID_AUDIO,
+                &agg,
+                seq,
+            )
+            .await
+            .map_err(|e| format!("audio connector: {e:?}"))?;
+            residency.evict_all_and_free(&**backend);
+            (v, a)
+        };
+        // === Phase C (19B): DiT GGUF resident: caption projection (3840 -> 4096/
+        // 2048) + register the 19B variant. No Sulphur fold (rapid is pre-distilled). ===
+        let opener = open_mmap(&dit_path).await?;
+        let gguf = GgufSource::open(opener)
+            .await
+            .map_err(|e| format!("parse dit gguf: {e:?}"))?;
+        let dit_res = WeightResidency::new(DitSource::Plain(gguf), budget);
+        let dit_pipes = DitPipelines::compile(backend)
+            .await
+            .map_err(|e| format!("compile dit: {e:?}"))?;
+        let cap_h =
+            register_caption_proj(&dit_res).map_err(|e| format!("register caption proj: {e:?}"))?;
+        let dit_model = DitModel::register_variant(backend, &dit_res, config::NUM_LAYERS, variant)
+            .await
+            .map_err(|e| format!("register dit model: {e:?}"))?;
+        let dit_ws = Workspace::new(Arc::clone(backend), Arc::clone(dit_res.arbiter()));
+        let (vtext, atext) = caption_project(
+            backend,
+            &dit_pipes,
+            &dit_res,
+            &dit_ws,
+            &cap_h,
+            &video_conn,
+            &audio_conn,
+            CONN_SEQ,
+        )
         .await
-        .map_err(|e| format!("parse dit gguf: {e:?}"))?;
-    // Sulphur ships the BASE (`dev`) DiT; fold the distill LoRA in so the 8-step
-    // CFG-free distilled sampler converges (see `ltx::lora`). LTX distilled DiTs
-    // are already distilled -> plain passthrough.
-    let dit_src = if req.model.is_sulphur() {
-        // Build the (lora, strength, specs) stack -- the distilled workflow stacks
-        // several distill LoRAs at < 1.0; the default is condsafe alone at 1.0.
-        let mut stack = Vec::new();
-        for (role_name, strength) in req.model.sulphur_distill_stack() {
-            let lora_path = resolve_role(manifest, role_name)?;
-            let lora = open_st(&lora_path).await?;
-            let specs = lora::discover_specs(&gguf, &lora)
-                .await
-                .map_err(|e| format!("discover distill lora {role_name} specs: {e:?}"))?;
+        .map_err(|e| format!("caption projection: {e:?}"))?;
+        (vtext, atext, dit_res, dit_pipes, dit_model, dit_ws)
+    } else {
+        // === Phase B (22B): FeatureExtractor V2 -> per-modality aggregate embeds ===
+        let (video_embed, audio_embed) = {
+            let src = open_st(&conn_path).await?;
+            let residency = WeightResidency::new(src, budget);
+            let fe = register_fe(&residency).map_err(|e| format!("register FE: {e:?}"))?;
+            let workspace = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+            let v = fe_aggregate(
+                backend,
+                &conn_pipes,
+                &residency,
+                &workspace,
+                &flat,
+                seq,
+                fe.video_w,
+                fe.video_b,
+                VIDEO.out_dim,
+            )
+            .await
+            .map_err(|e| format!("fe video: {e:?}"))?;
+            let a = fe_aggregate(
+                backend,
+                &conn_pipes,
+                &residency,
+                &workspace,
+                &flat,
+                seq,
+                fe.audio_w,
+                fe.audio_b,
+                AUDIO.out_dim,
+            )
+            .await
+            .map_err(|e| format!("fe audio: {e:?}"))?;
+            residency.evict_all_and_free(&**backend);
+            (v, a)
+        };
+
+        // === Phases C-F: DiT GGUF resident for connector blocks + denoise ===
+        let opener = open_mmap(&dit_path).await?;
+        let gguf = GgufSource::open(opener)
+            .await
+            .map_err(|e| format!("parse dit gguf: {e:?}"))?;
+        // Sulphur ships the BASE (`dev`) DiT; fold the distill LoRA in so the 8-step
+        // CFG-free distilled sampler converges (see `ltx::lora`). LTX distilled DiTs
+        // are already distilled -> plain passthrough.
+        let dit_src = if req.model.is_sulphur() {
+            let mut stack = Vec::new();
+            for (role_name, strength) in req.model.sulphur_distill_stack() {
+                let lora_path = resolve_role(manifest, role_name)?;
+                let lora = open_st(&lora_path).await?;
+                let specs = lora::discover_specs(&gguf, &lora)
+                    .await
+                    .map_err(|e| format!("discover distill lora {role_name} specs: {e:?}"))?;
+                tracing::info!(
+                    target: thinfer_core::trace::DIAG,
+                    lora = role_name, strength, sites = specs.len(),
+                    "sulphur distill lora in stack",
+                );
+                stack.push((lora, strength, specs));
+            }
+            let folded = lora::LoraFoldSource::new(gguf, stack)
+                .map_err(|e| format!("build distill lora fold: {e}"))?;
             tracing::info!(
                 target: thinfer_core::trace::DIAG,
-                lora = role_name, strength, sites = specs.len(),
-                "sulphur distill lora in stack",
+                sites = folded.fold_count(), "sulphur distill lora folded",
             );
-            stack.push((lora, strength, specs));
-        }
-        let folded = lora::LoraFoldSource::new(gguf, stack)
-            .map_err(|e| format!("build distill lora fold: {e}"))?;
-        tracing::info!(
-            target: thinfer_core::trace::DIAG,
-            sites = folded.fold_count(), "sulphur distill lora folded",
-        );
-        DitSource::Folded(Box::new(folded))
-    } else {
-        DitSource::Plain(gguf)
-    };
-    let dit_res = WeightResidency::new(dit_src, budget);
-    let video_h =
-        register_connector(&dit_res, VIDEO).map_err(|e| format!("register video conn: {e:?}"))?;
-    let audio_h =
-        register_connector(&dit_res, AUDIO).map_err(|e| format!("register audio conn: {e:?}"))?;
-    let dit_pipes = DitPipelines::compile(backend)
-        .await
-        .map_err(|e| format!("compile dit: {e:?}"))?;
-    let dit_model = DitModel::register(backend, &dit_res, config::NUM_LAYERS)
-        .await
-        .map_err(|e| format!("register dit model: {e:?}"))?;
-    let dit_ws = Workspace::new(Arc::clone(backend), Arc::clone(dit_res.arbiter()));
+            DitSource::Folded(Box::new(folded))
+        } else {
+            DitSource::Plain(gguf)
+        };
+        let dit_res = WeightResidency::new(dit_src, budget);
+        let video_h = register_connector(&dit_res, VIDEO)
+            .map_err(|e| format!("register video conn: {e:?}"))?;
+        let audio_h = register_connector(&dit_res, AUDIO)
+            .map_err(|e| format!("register audio conn: {e:?}"))?;
+        let dit_pipes = DitPipelines::compile(backend)
+            .await
+            .map_err(|e| format!("compile dit: {e:?}"))?;
+        let dit_model = DitModel::register(backend, &dit_res, config::NUM_LAYERS)
+            .await
+            .map_err(|e| format!("register dit model: {e:?}"))?;
+        let dit_ws = Workspace::new(Arc::clone(backend), Arc::clone(dit_res.arbiter()));
 
-    // Connector cross-attn KV (all 1024 positions valid; registers fill pads).
-    let vtext = connector_forward(
-        backend,
-        &conn_pipes,
-        &dit_res,
-        &dit_ws,
-        &video_h,
-        VIDEO,
-        &video_embed,
-        seq,
-    )
-    .await
-    .map_err(|e| format!("video connector: {e:?}"))?;
-    let atext = connector_forward(
-        backend,
-        &conn_pipes,
-        &dit_res,
-        &dit_ws,
-        &audio_h,
-        AUDIO,
-        &audio_embed,
-        seq,
-    )
-    .await
-    .map_err(|e| format!("audio connector: {e:?}"))?;
+        // Connector cross-attn KV (all 1024 positions valid; registers fill pads).
+        let vtext = connector_forward(
+            backend,
+            &conn_pipes,
+            &dit_res,
+            &dit_ws,
+            &video_h,
+            VIDEO,
+            &video_embed,
+            seq,
+        )
+        .await
+        .map_err(|e| format!("video connector: {e:?}"))?;
+        let atext = connector_forward(
+            backend,
+            &conn_pipes,
+            &dit_res,
+            &dit_ws,
+            &audio_h,
+            AUDIO,
+            &audio_embed,
+            seq,
+        )
+        .await
+        .map_err(|e| format!("audio connector: {e:?}"))?;
+        (vtext, atext, dit_res, dit_pipes, dit_model, dit_ws)
+    };
+
+    // === Optional Phase F2: native I2V frame-0 latent (ltx2-rapid only) ===
+    // Encode the input image to a clean, normalized frame-0 latent; the denoise
+    // then holds the leading latent-frame to it (the frame-0 anchor that rescues
+    // the merge's weak compositional T2V). Video-only, single-stage. `clean_v` is
+    // token-major with the encoded frame-0 in the leading `H'*W'` tokens; `mask_v`
+    // is 1.0 (free) everywhere except `1-strength` on those frame-0 tokens.
+    let i2v = if let Some(img) = req.input_image.as_ref().filter(|_| rapid) {
+        let rgb = image::load_from_memory(&img.0)
+            .map_err(|e| format!("decode input image: {e}"))?
+            .to_rgb8();
+        sink.note(&format!(
+            "I2V frame-0 {}x{} (strength {:.2})",
+            rgb.width(),
+            rgb.height(),
+            req.strength
+        ));
+        let resized = image::imageops::resize(
+            &rgb,
+            width as u32,
+            height as u32,
+            image::imageops::FilterType::CatmullRom,
+        );
+        // CHW [-1,1], single frame [3, H, W].
+        let mut frame_px = vec![0.0f32; 3 * width * height];
+        for (x, y, px) in resized.enumerate_pixels() {
+            for c in 0..3 {
+                frame_px[c * width * height + y as usize * width + x as usize] =
+                    px.0[c] as f32 / 127.5 - 1.0;
+            }
+        }
+        // Encode -> normalized latent CTHW [128, 1, H/32, W/32].
+        let z = {
+            let src = open_st(&vae_path).await?;
+            let residency = WeightResidency::new(src, budget);
+            let pipes = LtxVaePipelines::compile(backend)
+                .await
+                .map_err(|e| format!("compile vae encoder: {e:?}"))?;
+            let enc = LtxVaeEncoder::new(
+                pipes,
+                &residency,
+                mean.clone(),
+                std.clone(),
+                LtxVaeEncoderConfig::ltx2_rapid(),
+            )
+            .map_err(|e| format!("build vae encoder: {e:?}"))?;
+            let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+            let out = enc
+                .encode(backend, &residency, &ws, &frame_px, 1, height, width)
+                .await
+                .map_err(|e| format!("vae encode: {e:?}"))?;
+            residency.evict_all_and_free(&**backend);
+            out
+        };
+        // z CTHW [128,1,H',W'] -> token-major clean_v [tokens,128] with the
+        // leading latent-frame-0 tokens filled (token t = f*H'*W' + h*W' + w).
+        let ftok = vd_full.height * vd_full.width;
+        let tokens = vd_full.tokens();
+        let c = LATENT_CHANNELS;
+        if z.len() != c * ftok {
+            return Err(format!("i2v latent size {} != {}", z.len(), c * ftok));
+        }
+        let mut clean = vec![0.0f32; c * tokens];
+        for t in 0..ftok {
+            for ch in 0..c {
+                clean[t * c + ch] = z[ch * ftok + t];
+            }
+        }
+        let mut mask = vec![1.0f32; tokens];
+        for m in &mut mask[..ftok] {
+            *m = 1.0 - req.strength;
+        }
+        Some((clean, mask))
+    } else {
+        None
+    };
 
     // Two render paths (upstream `LTX2_DISTILLED` vs `LTX2_TWO_STAGE`): the
     // default single-stage 8-step denoise at the target res, or the opt-in 2x
     // spatial-upscale refine. Two-stage halves stage-1's res, so at low res it
     // goes out of distribution -- hence single-stage is the default; two-stage is
     // for cheaply reaching HIGH res.
-    let (lat_v_final, lat_a_final) = if req.upscale {
+    let (lat_v_final, lat_a_final) = if req.upscale && !rapid {
         let upscaler_path = resolve_role(manifest, role::UPSCALER)?;
         let vd_s1 = VideoLatentDims::from_pixels(frames, height / 2, width / 2);
         let s1_steps = STAGE1_SIGMAS.len() - 1;
@@ -345,6 +557,7 @@ pub async fn run(
             &vtext,
             &atext,
             &freqs_s1,
+            None, // upscale path is t2v only (rapid, the i2v model, is single-stage)
             Some(&prog_s1),
         )
         .await
@@ -419,6 +632,7 @@ pub async fn run(
             &vtext,
             &atext,
             &freqs_s2,
+            None, // upscale path is t2v only
             Some(&prog_s2),
         )
         .await
@@ -428,8 +642,17 @@ pub async fn run(
         let total_steps = (STAGE1_SIGMAS.len() - 1) as u32;
         let s = streams_for(vd_full, ad);
         let freqs = build_dit_freqs(vd_full, ad, fps);
-        let lat_v = sampler::gaussian_noise(vd_full.elems(), sampler::substream_seed(seed, 0));
+        let mut lat_v = sampler::gaussian_noise(vd_full.elems(), sampler::substream_seed(seed, 0));
         let lat_a = sampler::gaussian_noise(ad.elems(), sampler::substream_seed(seed, 1));
+        // I2V: seed the conditioned tokens with the clean frame-0 latent (the
+        // same blend the per-step X0 hard-replace uses), then hold them there.
+        let cond = i2v.as_ref().map(|(clean, mask)| {
+            sampler::blend_clean(&mut lat_v, clean, mask, LATENT_CHANNELS);
+            I2vCond {
+                clean_v: clean.as_slice(),
+                mask_v: mask.as_slice(),
+            }
+        });
         let prog = |step: usize| {
             sink.stage(Stage::Step {
                 i: step as u32 + 1,
@@ -449,6 +672,7 @@ pub async fn run(
             &vtext,
             &atext,
             &freqs,
+            cond,
             Some(&prog),
         )
         .await
@@ -463,15 +687,32 @@ pub async fn run(
     sink.stage(Stage::VaeDecode);
 
     // === Phase G: video VAE decode -> frames ===
+    // The DiT is fully evicted above, so the whole card is free for the decode.
+    // Use the UNCAPPED requested budget (not the 2G DiT-streaming cap): the VAE
+    // tiler sizes tiles from this budget, so the 2G cap forced tiny tiles (seed
+    // OOMed down to 2 latent cells -> hundreds of overlapping tiles, ~320s at
+    // 768x512x49). The cap exists only to leave device slack while the 22.8G DiT
+    // streams per-block; it has no reason to throttle the standalone VAE phase.
+    let vae_budget = ResidencyBudget {
+        vram_bytes: req.budget.vram_bytes,
+        ..budget
+    };
     let cthw_final = sampler::video_tokens_to_cthw(&lat_v_final, vd_full);
     let mut video = {
         let src = open_st(&vae_path).await?;
-        let residency = WeightResidency::new(src, budget);
+        let residency = WeightResidency::new(src, vae_budget);
         let pipes = LtxVaePipelines::compile(backend)
             .await
             .map_err(|e| format!("compile vae: {e:?}"))?;
-        let decoder = LtxVaeDecoder::new(pipes, &residency, mean.clone(), std.clone())
-            .map_err(|e| format!("vae decoder: {e:?}"))?;
+        // The 19B (ltx2-rapid) uses the LTX-2 (non-.3) decoder schedule.
+        let cfg = if rapid {
+            LtxVaeConfig::ltx2_rapid()
+        } else {
+            LtxVaeConfig::distilled()
+        };
+        let decoder =
+            LtxVaeDecoder::new_with_config(pipes, &residency, mean.clone(), std.clone(), cfg)
+                .map_err(|e| format!("vae decoder: {e:?}"))?;
         let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
         let out = decoder
             .decode(
@@ -517,7 +758,8 @@ pub async fn run(
     // saves it. The DiT audio latent is token-major [Ta, IN_CHANNELS]; the 128
     // features are (channel, mel) = c*16 + m. Reshape to the audio VAE's
     // [8, Ta, 16] CTF layout. Audio VAE + vocoder share one residency.
-    let wav = if req.audio {
+    // rapid: video-only (its audio VAE is comfy-prefixed; a follow-up).
+    let wav = if req.audio && !rapid {
         let ta = ad.frames;
         const AC: usize = 8;
         const AM: usize = 16;

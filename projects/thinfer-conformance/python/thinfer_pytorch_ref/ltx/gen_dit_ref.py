@@ -69,7 +69,11 @@ def _bf16(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.bfloat16).float()
 
 
-def build_model(num_layers: int = 1):
+def build_model(num_layers: int = 1, gated: bool = True, cross_adaln: bool = True):
+    """`gated`/`cross_adaln` = True for the 22B LTX-2.3 block, False for the 19B
+    (ltx2-rapid) block (6-way scale_shift_table, no prompt-AdaLN, raw attn2, no
+    per-head gate). caption_projection is left unset (None) either way: the block
+    parity feeds the already-projected 4096/2048 caption KV as `context`."""
     sys.path.insert(0, str(_ltx_src()))
     from ltx_core.model.transformer.model import LTXModel, LTXModelType
     from ltx_core.model.transformer.rope import LTXRopeType
@@ -97,8 +101,8 @@ def build_model(num_layers: int = 1):
         av_ca_timestep_scale_multiplier=1000,
         rope_type=LTXRopeType.SPLIT,
         double_precision_rope=True,
-        apply_gated_attention=True,
-        cross_attention_adaln=True,
+        apply_gated_attention=gated,
+        cross_attention_adaln=cross_adaln,
     ).eval()
     return model
 
@@ -134,29 +138,40 @@ def squeeze_vec(t: torch.Tensor) -> np.ndarray:
 
 
 def stream_mod(block, args, table, prompt_table) -> dict[str, np.ndarray]:
-    """Extract the 16 AdaLN modulation vectors for one stream (see dit.rs
-    `HostStreamMod`). Order/semantics mirror `transformer.py` `get_ada_values`."""
+    """Extract the AdaLN modulation vectors for one stream (see dit.rs
+    `HostStreamMod`). Order/semantics mirror `transformer.py` `get_ada_values`.
+    22B (`prompt_table` set): 6-way table[0:6] = msa/mlp + cross-q table[6:9] +
+    prompt-AdaLN ckv. 19B (`prompt_table is None`): table is [6,dim] (msa+mlp only),
+    attn2 is RAW -> cq/ckv unused by the 19B block; dumped as zeros so the shared
+    engine `HostStreamMod` still loads."""
     B = args.x.shape[0]
     shift_msa, scale_msa, gate_msa = block.get_ada_values(table, B, args.timesteps, slice(0, 3))
     shift_mlp, scale_mlp, gate_mlp = block.get_ada_values(table, B, args.timesteps, slice(3, 6))
-    shift_q, scale_q, gate_q = block.get_ada_values(table, B, args.timesteps, slice(6, 9))
-    shift_kv, scale_kv = (
-        prompt_table[None, None]
-        + args.prompt_timestep.reshape(B, args.prompt_timestep.shape[1], 2, -1)
-    ).unbind(dim=2)
-    return {
+    out = {
         "msa_scale": squeeze_vec(scale_msa),
         "msa_shift": squeeze_vec(shift_msa),
         "msa_gate": squeeze_vec(gate_msa),
-        "cq_scale": squeeze_vec(scale_q),
-        "cq_shift": squeeze_vec(shift_q),
-        "cq_gate": squeeze_vec(gate_q),
-        "ckv_scale": squeeze_vec(scale_kv),
-        "ckv_shift": squeeze_vec(shift_kv),
         "mlp_scale": squeeze_vec(scale_mlp),
         "mlp_shift": squeeze_vec(shift_mlp),
         "mlp_gate": squeeze_vec(gate_mlp),
     }
+    if prompt_table is not None:
+        shift_q, scale_q, gate_q = block.get_ada_values(table, B, args.timesteps, slice(6, 9))
+        shift_kv, scale_kv = (
+            prompt_table[None, None]
+            + args.prompt_timestep.reshape(B, args.prompt_timestep.shape[1], 2, -1)
+        ).unbind(dim=2)
+        out.update(
+            cq_scale=squeeze_vec(scale_q),
+            cq_shift=squeeze_vec(shift_q),
+            cq_gate=squeeze_vec(gate_q),
+            ckv_scale=squeeze_vec(scale_kv),
+            ckv_shift=squeeze_vec(shift_kv),
+        )
+    else:
+        z = np.zeros_like(out["msa_scale"])
+        out.update(cq_scale=z, cq_shift=z, cq_gate=z, ckv_scale=z, ckv_shift=z)
+    return out
 
 
 def av_mod(block, args, av_table) -> dict[str, np.ndarray]:
@@ -182,11 +197,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dit-gguf", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--variant", default="22b", choices=["22b", "19b"], help="22b=LTX-2.3, 19b=ltx2-rapid")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out
 
-    model = build_model(num_layers=1)
+    gated = args.variant == "22b"  # 19b: no gated attn, no cross-adaln / prompt-adaln
+    model = build_model(num_layers=1, gated=gated, cross_adaln=gated)
     load_weights(model, args.dit_gguf)
     block = model.transformer_blocks[0]
 
@@ -219,10 +236,15 @@ def main() -> int:
 
     # modulation vectors (computed from the prepared args; the block-input
     # processor only attaches perturbation flags, leaving timesteps untouched).
-    vmod = stream_mod(block, v_args, block.scale_shift_table, block.prompt_scale_shift_table)
+    vmod = stream_mod(
+        block, v_args, block.scale_shift_table, getattr(block, "prompt_scale_shift_table", None)
+    )
     vmod.update(av_mod(block, v_args, block.scale_shift_table_a2v_ca_video))
     amod = stream_mod(
-        block, a_args, block.audio_scale_shift_table, block.audio_prompt_scale_shift_table
+        block,
+        a_args,
+        block.audio_scale_shift_table,
+        getattr(block, "audio_prompt_scale_shift_table", None),
     )
     amod.update(av_mod(block, a_args, block.scale_shift_table_a2v_ca_audio))
 

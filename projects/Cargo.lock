@@ -3112,6 +3112,7 @@ dependencies = [
  "image",
  "mp4",
  "openh264",
+ "openh264-sys2",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -3201,6 +3202,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

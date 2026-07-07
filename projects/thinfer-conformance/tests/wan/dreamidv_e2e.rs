@@ -312,9 +312,15 @@ async fn dreamidv_dit_parity() {
     // i8 DP4A on the normed matmul sites is the production default; opt out via
     // THINFER_DREAMIDV_NO_I8 for a bf16 A/B.
     let i8_matmul = std::env::var_os("THINFER_DREAMIDV_NO_I8").is_none();
-    let pipeline = DreamIdvPipeline::load(Arc::clone(&backend), residency, &context, ctx_rows, i8_matmul)
-        .await
-        .unwrap_or_else(|e| panic!("DreamIdvPipeline::load: {e:?}"));
+    let pipeline = DreamIdvPipeline::load(
+        Arc::clone(&backend),
+        residency,
+        &context,
+        ctx_rows,
+        i8_matmul,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("DreamIdvPipeline::load: {e:?}"));
 
     // --- the single DiT forward (velocity + per-block residuals) ---
     let (vel, per_block) = pipeline
@@ -430,9 +436,15 @@ async fn dreamidv_vae_parity() {
     // i8 DP4A on the normed matmul sites is the production default; opt out via
     // THINFER_DREAMIDV_NO_I8 for a bf16 A/B.
     let i8_matmul = std::env::var_os("THINFER_DREAMIDV_NO_I8").is_none();
-    let pipeline = DreamIdvPipeline::load(Arc::clone(&backend), residency, &context, ctx_rows, i8_matmul)
-        .await
-        .unwrap_or_else(|e| panic!("DreamIdvPipeline::load: {e:?}"));
+    let pipeline = DreamIdvPipeline::load(
+        Arc::clone(&backend),
+        residency,
+        &context,
+        ctx_rows,
+        i8_matmul,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("DreamIdvPipeline::load: {e:?}"));
 
     let lat = pipeline
         .vae_encode_parity(&pixels, 1, h_in, w_in)
@@ -549,9 +561,15 @@ async fn dreamidv_health() {
     // i8 DP4A on the normed matmul sites is the production default; opt out via
     // THINFER_DREAMIDV_NO_I8 for a bf16 A/B.
     let i8_matmul = std::env::var_os("THINFER_DREAMIDV_NO_I8").is_none();
-    let pipeline = DreamIdvPipeline::load(Arc::clone(&backend), residency, &context, ctx_rows, i8_matmul)
-        .await
-        .unwrap_or_else(|e| panic!("DreamIdvPipeline::load: {e:?}"));
+    let pipeline = DreamIdvPipeline::load(
+        Arc::clone(&backend),
+        residency,
+        &context,
+        ctx_rows,
+        i8_matmul,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("DreamIdvPipeline::load: {e:?}"));
 
     let inputs = DreamIdvInputs {
         video: RgbFrames {

@@ -4,6 +4,8 @@
 //! ensure the request's files are cached first (see [`crate::download`]); `run`
 //! assumes they are present and opens them.
 
+#[cfg(feature = "vault")]
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,6 +17,8 @@ use thinfer_core::format::safetensors::ShardedSafetensorsSource;
 use thinfer_core::format::union::{RenamedSource, UnionSource};
 use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
+#[cfg(feature = "vault")]
+use thinfer_core::weight::WeightId;
 use thinfer_core::weight::WeightSource;
 #[cfg(feature = "vault")]
 use thinfer_models::common::lora as vault_lora;
@@ -51,6 +55,28 @@ use crate::progress::{ProgressSink, Stage};
 use crate::request::{
     FaceSwapRequest, ImageRequest, JobRequest, JobSummary, VideoFormat, VideoInput, VideoRequest,
 };
+
+/// Image-model weight-residency cap for thin (8GB) hardware. serve runs a high
+/// global `vram_budget` (6.5G) so the LTX VAE tiler seeds large tiles; LTX caps
+/// its own DiT residency to 2G internally (see `ltx::LTX_VRAM_BUDGET_CAP`), so
+/// that global budget only feeds its VAE phase. Image DiTs have NO such internal
+/// cap, so the raw 6.5G budget would pin nearly the whole 8GB card as resident
+/// weights and starve the activation workspace, OOMing at larger resolutions.
+/// Cap image residency so bigger images keep several GB of device slack; callers
+/// requesting LESS keep it (the cap only lowers an over-large budget). Revisit
+/// for >8GB cards.
+const IMAGE_VRAM_BUDGET_CAP: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Lower an over-large residency budget to [`IMAGE_VRAM_BUDGET_CAP`] for the
+/// image pipelines (see the constant's rationale).
+fn image_budget(
+    budget: thinfer_core::policy::ResidencyBudget,
+) -> thinfer_core::policy::ResidencyBudget {
+    thinfer_core::policy::ResidencyBudget {
+        vram_bytes: budget.vram_bytes.min(IMAGE_VRAM_BUDGET_CAP),
+        ..budget
+    }
+}
 
 /// Runs jobs on this machine's GPU. Construct once; the backend is reused.
 pub struct LocalExecutor {
@@ -148,7 +174,7 @@ impl LocalExecutor {
             steps: req.steps,
             seed,
         };
-        let residency = WeightResidency::new(source, req.budget);
+        let residency = WeightResidency::new(source, image_budget(req.budget));
         let model = {
             let _s = tracing::info_span!("model_load").entered();
             ZImageModel::load(self.backend.clone(), residency, tokenizer)
@@ -236,7 +262,7 @@ impl LocalExecutor {
 
         let progress = |ev: idpipe::ProgressEvent| sink.stage(map_ideo(ev));
         let params = IdParams::new(token_ids, req.height, req.width, req.steps, seed);
-        let residency = WeightResidency::new(source, req.budget);
+        let residency = WeightResidency::new(source, image_budget(req.budget));
         let pipeline = {
             let _s = tracing::info_span!("model_load").entered();
             Ideogram4Pipeline::load(self.backend.clone(), residency, req.i8_matmul)
@@ -300,15 +326,11 @@ impl LocalExecutor {
         let vae_src = SafetensorsSource::open(vae)
             .await
             .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
-        let source = UnionSource::new(
-            UnionSource::new(UnionSource::new(dit_src, enc_src), mmproj_src),
-            vae_src,
-        );
 
         // --- host-side input prep: decode source, preprocess, tokenize ---
         let rgb = {
-            let dynimg = image::open(input_image)
-                .map_err(|e| format!("decode {}: {e}", input_image.display()))?;
+            let dynimg = image::load_from_memory(&input_image.0)
+                .map_err(|e| format!("decode reference image: {e}"))?;
             dynimg.to_rgb8()
         };
         sink.note(&format!(
@@ -325,14 +347,62 @@ impl LocalExecutor {
             steps = req.steps, seed, tokens = inputs.token_ids.len(),
             image_pad_start = inputs.image_pad_start,
             vit_grid = ?inputs.vit_grid, vae_dims = ?inputs.vae_dims,
-            "qwen-image-edit generate start",
+            adapters = req.lora.len(), "qwen-image-edit generate start",
         );
         sink.note(&format!(
             "Generating {}x{} image, {} steps, seed {} ({})",
             req.width, req.height, req.steps, seed, req.model,
         ));
 
-        let residency = WeightResidency::new(source, req.budget);
+        // Fold any request-time user adapters into the DiT (encrypted vault); the
+        // folded source is a distinct type, so each arm hands its concrete source
+        // to the shared generic finish (mirrors `run_krea`).
+        #[cfg(feature = "vault")]
+        if !req.lora.is_empty() {
+            let renames = thinfer_models::qwen_image::lora::lora_key_renames();
+            let folded = self
+                .fold_adapters(
+                    dit_src,
+                    &req.lora,
+                    req.vault_password.as_ref(),
+                    &req.vault_dir,
+                    &req.model.to_string(),
+                    renames,
+                    sink,
+                )
+                .await?;
+            let source = UnionSource::new(
+                UnionSource::new(UnionSource::new(folded, enc_src), mmproj_src),
+                vae_src,
+            );
+            return self
+                .qwen_image_edit_generate(source, req, &inputs, seed, sink)
+                .await;
+        }
+        #[cfg(not(feature = "vault"))]
+        if !req.lora.is_empty() {
+            return Err("this build has no adapter (vault) support".into());
+        }
+        let source = UnionSource::new(
+            UnionSource::new(UnionSource::new(dit_src, enc_src), mmproj_src),
+            vae_src,
+        );
+        self.qwen_image_edit_generate(source, req, &inputs, seed, sink)
+            .await
+    }
+
+    /// Load the Qwen-Image EDIT pipeline over `source` (plain or adapter-folded
+    /// DiT) and run the CFG-free edit denoise -> PNG. Generic over the source so
+    /// the fold and base paths share one body.
+    async fn qwen_image_edit_generate<S: WeightSource>(
+        &self,
+        source: S,
+        req: &ImageRequest,
+        inputs: &crate::preprocess::EditInputs,
+        seed: u64,
+        sink: &dyn ProgressSink,
+    ) -> Result<JobSummary, String> {
+        let residency = WeightResidency::new(source, image_budget(req.budget));
         let pipeline = {
             let _s = tracing::info_span!("model_load").entered();
             // The edit encoder even-pads the sequence (mask layout wants even
@@ -412,22 +482,62 @@ impl LocalExecutor {
         let vae_src = SafetensorsSource::open(vae)
             .await
             .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
-        let source = UnionSource::new(UnionSource::new(dit_src, enc_src), vae_src);
-
         let token_ids = crate::preprocess::tokenize_t2i(&req.prompt, &tokenizer)?;
-
         let seed = req.seed.unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model, width = req.width, height = req.height,
-            steps = req.steps, seed, tokens = token_ids.len(), "qwen-image generate start",
+            steps = req.steps, seed, tokens = token_ids.len(),
+            adapters = req.lora.len(), "qwen-image generate start",
         );
         sink.note(&format!(
             "Generating {}x{} image, {} steps, seed {} ({})",
             req.width, req.height, req.steps, seed, req.model,
         ));
 
-        let residency = WeightResidency::new(source, req.budget);
+        // Fold any request-time user adapters into the DiT (encrypted vault). The
+        // folded source is a distinct type, so each arm hands its concrete source
+        // to the shared generic finish (mirrors `run_krea`).
+        #[cfg(feature = "vault")]
+        if !req.lora.is_empty() {
+            let renames = thinfer_models::qwen_image::lora::lora_key_renames();
+            let folded = self
+                .fold_adapters(
+                    dit_src,
+                    &req.lora,
+                    req.vault_password.as_ref(),
+                    &req.vault_dir,
+                    &req.model.to_string(),
+                    renames,
+                    sink,
+                )
+                .await?;
+            let source = UnionSource::new(UnionSource::new(folded, enc_src), vae_src);
+            return self
+                .qwen_image_generate(source, req, &token_ids, seed, sink)
+                .await;
+        }
+        #[cfg(not(feature = "vault"))]
+        if !req.lora.is_empty() {
+            return Err("this build has no adapter (vault) support".into());
+        }
+        let source = UnionSource::new(UnionSource::new(dit_src, enc_src), vae_src);
+        self.qwen_image_generate(source, req, &token_ids, seed, sink)
+            .await
+    }
+
+    /// Load the Qwen-Image t2i pipeline over `source` (plain or adapter-folded
+    /// DiT) and run the CFG-free denoise -> PNG. Generic over the source so the
+    /// fold and base paths share one body.
+    async fn qwen_image_generate<S: WeightSource>(
+        &self,
+        source: S,
+        req: &ImageRequest,
+        token_ids: &[u32],
+        seed: u64,
+        sink: &dyn ProgressSink,
+    ) -> Result<JobSummary, String> {
+        let residency = WeightResidency::new(source, image_budget(req.budget));
         let pipeline = {
             let _s = tracing::info_span!("model_load").entered();
             // The encoder even-pads to the next even length; size the rope table
@@ -446,7 +556,7 @@ impl LocalExecutor {
         let progress = |ev: qpipe::ProgressEvent| sink.stage(map_qwen(ev));
         let rgb_out = pipeline
             .generate_rgb(
-                &token_ids,
+                token_ids,
                 req.height,
                 req.width,
                 req.steps,
@@ -520,7 +630,19 @@ impl LocalExecutor {
         // hands its concrete source to the shared generic finish.
         #[cfg(feature = "vault")]
         if !req.lora.is_empty() {
-            let folded = self.krea_fold_adapters(dit_src, req, sink).await?;
+            // Community Krea LoRAs use diffusers names; map onto the sd.cpp GGUF.
+            let renames = thinfer_models::krea::lora::lora_key_renames();
+            let folded = self
+                .fold_adapters(
+                    dit_src,
+                    &req.lora,
+                    req.vault_password.as_ref(),
+                    &req.vault_dir,
+                    &req.model.to_string(),
+                    renames,
+                    sink,
+                )
+                .await?;
             let source = UnionSource::new(UnionSource::new(folded, enc_src), vae_src);
             return self
                 .krea_generate(source, req, &token_ids, seed, sink)
@@ -546,7 +668,7 @@ impl LocalExecutor {
         seed: u64,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
-        let residency = WeightResidency::new(source, req.budget);
+        let residency = WeightResidency::new(source, image_budget(req.budget));
         let pipeline = {
             let _s = tracing::info_span!("model_load").entered();
             let max_seq = token_ids.len() + 2;
@@ -588,33 +710,33 @@ impl LocalExecutor {
         })
     }
 
-    /// Decrypt this request's vault adapters and wrap `base` (the Krea DiT GGUF)
-    /// in the generic LoRA fold. Each adapter's plaintext bytes live only for the
-    /// fold build; the password is re-derived here and never logged. `validate`
-    /// has already guaranteed a password is present.
+    /// Decrypt this request's vault adapters and wrap `base` (the target DiT
+    /// source) in the generic LoRA fold. `renames` maps community adapter keys
+    /// (diffusers naming) onto the base DiT's keys so the fold discovers their
+    /// sites (else 0); each model supplies its own map. Each adapter's plaintext
+    /// bytes live only for the fold build; the password is re-derived here and
+    /// never logged. `validate` has already guaranteed a password is present.
     #[cfg(feature = "vault")]
-    async fn krea_fold_adapters<B: WeightSource>(
+    #[allow(clippy::too_many_arguments)]
+    async fn fold_adapters<B: WeightSource>(
         &self,
         base: B,
-        req: &ImageRequest,
+        lora: &[crate::request::LoraRef],
+        password: Option<&crate::request::Secret>,
+        vault_dir: &Path,
+        model_label: &str,
+        lora_renames: HashMap<WeightId, WeightId>,
         sink: &dyn ProgressSink,
     ) -> Result<
         vault_lora::LoraFoldSource<B, RenamedSource<ShardedSafetensorsSource<BytesOpener>>>,
         String,
     > {
-        let password = req
-            .vault_password
-            .as_ref()
-            .ok_or("a vault password is required to use adapters")?;
-        let vault = crate::vault::Vault::new(&req.vault_dir);
-        let model_id = req.model.to_string();
-        // Community Krea LoRAs use diffusers module names; map them onto the base
-        // DiT's sd.cpp keys so the generic fold discovers their sites (else 0).
-        let lora_renames = thinfer_models::krea::lora::lora_key_renames();
-        let mut stacks = Vec::with_capacity(req.lora.len());
-        for l in &req.lora {
+        let password = password.ok_or("a vault password is required to use adapters")?;
+        let vault = crate::vault::Vault::new(vault_dir);
+        let mut stacks = Vec::with_capacity(lora.len());
+        for l in lora {
             let bytes = vault
-                .open(password.expose(), &model_id, &l.id)
+                .open(password.expose(), model_label, &l.id)
                 .map_err(|e| e.to_string())?;
             let raw = ShardedSafetensorsSource::open(vec![BytesOpener::new(bytes)])
                 .await
@@ -628,16 +750,13 @@ impl LocalExecutor {
         let sites: usize = stacks.iter().map(|(_, _, s)| s.len()).sum();
         if sites == 0 {
             return Err(format!(
-                "adapter(s) folded 0 sites into {} -- the LoRA keys match no {} DiT \
-                 tensor (is this a LoRA for a different model?)",
-                req.model, req.model,
+                "adapter(s) folded 0 sites into {model_label} -- the LoRA keys match no \
+                 {model_label} DiT tensor (is this a LoRA for a different model?)",
             ));
         }
         sink.note(&format!(
-            "Folding {} adapter(s) into {} ({} sites); first-touch quantizes each site",
+            "Folding {} adapter(s) into {model_label} ({sites} sites); first-touch quantizes each site",
             stacks.len(),
-            req.model,
-            sites,
         ));
         vault_lora::LoraFoldSource::new(base, stacks)
             .map_err(|e| format!("build adapter fold: {e}"))
@@ -797,6 +916,44 @@ impl LocalExecutor {
                 &cancel,
             )
             .await?
+        } else if req.model.supports_adapters() && !req.lora.is_empty() {
+            // AnyFlow with request-time vault LoRAs: fold the adapters into its
+            // diffusers-named DiT (the fold only touches DiT matmul sites; umT5 +
+            // VAE pass through). `run_wan` is generic over the source, so the folded
+            // and plain paths share the denoise/decode tail.
+            #[cfg(feature = "vault")]
+            {
+                let sharded = ShardedSafetensorsSource::open(weight_openers)
+                    .await
+                    .map_err(|e| format!("parse weight files: {e:?}"))?;
+                let n = thinfer_models::wan::dit_block::WanDitConfig::anyflow_t2v_14b().num_layers;
+                let folded = self
+                    .fold_adapters(
+                        sharded,
+                        &req.lora,
+                        req.vault_password.as_ref(),
+                        &req.vault_dir,
+                        &req.model.to_string(),
+                        thinfer_models::wan::lora::lora_key_renames(n),
+                        sink,
+                    )
+                    .await?;
+                self.run_wan(
+                    folded,
+                    req,
+                    tokenizer,
+                    &params,
+                    &plan.shots,
+                    vae,
+                    false,
+                    WanVariant::anyflow_t2v_14b(),
+                    &progress,
+                    &cancel,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "vault"))]
+            return Err("this build has no adapter (vault) support".into());
         } else {
             // GGUF deferred: bringup is safetensors-only (the union path in
             // wan::source is retained for a published FastWan GGUF).
@@ -908,19 +1065,44 @@ impl LocalExecutor {
             .map_err(|e| format!("read arcface: {e}"))?;
         let hyperswap = std::fs::read(resolve_file(&req.model.file())?)
             .map_err(|e| format!("read hyperswap: {e}"))?;
+        let xseg = if req.options.occlusion {
+            Some(
+                std::fs::read(resolve_file(&crate::model::XSEG)?)
+                    .map_err(|e| format!("read xseg: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let gfpgan = if req.options.enhance {
+            Some(
+                std::fs::read(resolve_file(&crate::model::GFPGAN)?)
+                    .map_err(|e| format!("read gfpgan: {e}"))?,
+            )
+        } else {
+            None
+        };
 
         let source = codec::load_image_bytes(&req.source_image.0)?;
         sink.note(&format!("Loaded source {}x{}", source.w, source.h));
 
         tracing::info!(
             target: thinfer_core::trace::DIAG, model = %req.model,
+            occlusion = req.options.occlusion, hyperswap_mask = req.options.hyperswap_mask,
+            enhance = req.options.enhance,
             ram_budget = req.budget.ram_bytes, vram_budget = req.budget.vram_bytes, "face-swap start",
         );
-        let swapper = thinfer_models::faceswap::FaceSwapper::load(
+        let swapper = thinfer_models::faceswap::FaceSwapper::load_with(
             self.backend.clone(),
             &scrfd,
             &arcface,
             &hyperswap,
+            thinfer_models::faceswap::SwapOptions {
+                hyperswap_mask: req.options.hyperswap_mask,
+                occlusion: req.options.occlusion,
+                enhance: req.options.enhance,
+            },
+            xseg.as_deref(),
+            gfpgan.as_deref(),
         )
         .await
         .map_err(|e| format!("load models: {e}"))?;
@@ -938,6 +1120,12 @@ impl LocalExecutor {
             &embedding,
             video_bytes.as_ref(),
             &req.output,
+            codec::StreamOptions {
+                detect_stride: req.options.detect_stride.max(1),
+                bitrate_scale: req.options.bitrate_scale,
+                start_secs: req.options.start_secs,
+                end_secs: req.options.end_secs,
+            },
             sink,
         )
         .await?;

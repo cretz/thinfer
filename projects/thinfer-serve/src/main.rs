@@ -16,6 +16,7 @@ mod api;
 mod config;
 mod crypto;
 mod job;
+mod uploads;
 mod vault;
 mod web;
 mod worker;
@@ -173,12 +174,25 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
 
     let vault_dir = config.resolved_vault_dir();
     tracing::info!(vault_dir = %vault_dir.display(), "adapter vault");
+
+    // Streamed-video upload store + its TTL reaper (deletes uploads never
+    // consumed by a job so no encrypted spill lingers indefinitely).
+    let uploads_dir = config.artifact_dir.join("uploads");
+    std::fs::create_dir_all(&uploads_dir)
+        .map_err(|e| format!("create {}: {e}", uploads_dir.display()))?;
+    let uploads = Arc::new(uploads::UploadStore::new(uploads_dir));
+    uploads::spawn_reaper(
+        uploads.clone(),
+        std::time::Duration::from_secs(config.upload_ttl_secs),
+    );
+
     let web = web::router(config.web_dir.as_deref());
     let state = AppState {
         store,
         config: Arc::new(config.clone()),
         coopmat_supported,
         vault: Arc::new(thinfer_app::vault::Vault::new(vault_dir)),
+        uploads,
     };
     let app = api::router(state).merge(web);
 

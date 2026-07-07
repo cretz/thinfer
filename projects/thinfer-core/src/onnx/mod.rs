@@ -8,6 +8,8 @@
 //! inference + fold, `exec` for the BatchScope dispatch.
 
 pub mod exec;
+pub mod fusion;
+pub mod i8conv;
 pub mod kernels;
 pub mod proto;
 pub mod shape;

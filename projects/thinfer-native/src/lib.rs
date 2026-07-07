@@ -68,6 +68,41 @@ impl WeightReader for MmapFile {
         dst.copy_from_slice(&self.mmap[off..end]);
         Ok(())
     }
+
+    /// Real OS readahead. The streaming chunk loop hints `READ_PREFETCH_CHUNKS`
+    /// ahead; starting the page-in now (batched large IOs) means `read_at`'s
+    /// memcpy hits resident pages instead of fault-per-page at disk latency
+    /// (measured: cold Gemma stream read_at ~1GB/s = 12.5s of a 15s encode).
+    /// Best-effort: a failed or ignored hint only costs speed, never bytes.
+    fn will_read(&mut self, offset: u64, len: u64) {
+        let off = offset as usize;
+        let Some(end) = off.checked_add(len as usize) else {
+            return;
+        };
+        if len == 0 || end > self.mmap.len() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let _ = self
+                .mmap
+                .advise_range(memmap2::Advice::WillNeed, off, len as usize);
+        }
+        #[cfg(windows)]
+        // SAFETY: the range is inside the live mapping (bounds-checked above);
+        // PrefetchVirtualMemory only initiates paging, it does not mutate.
+        unsafe {
+            use windows_sys::Win32::System::Memory::{
+                PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let entry = WIN32_MEMORY_RANGE_ENTRY {
+                VirtualAddress: self.mmap.as_ptr().add(off) as *mut core::ffi::c_void,
+                NumberOfBytes: len as usize,
+            };
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+        }
+    }
 }
 
 /// Sequential read-bandwidth bench over the real weight-read paths. Gated on

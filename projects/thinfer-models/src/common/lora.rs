@@ -192,10 +192,18 @@ pub async fn discover_specs<B: WeightSource, L: WeightSource>(
 /// STACK LoRAs at different strengths, so the fold accumulates all of them onto
 /// each base before re-encoding. See the module note.
 pub struct LoraFoldSource<B: WeightSource, L: WeightSource> {
+    catalog: WeightCatalog,
+    /// Everything `compute_fold` needs, behind an `Arc` so the native
+    /// background prefold worker ([`Self::spawn_prefold`]) can share it with
+    /// the engine's lazy `open` path.
+    state: Arc<FoldState<B, L>>,
+}
+
+/// Shared fold state: sources, fold map, and the compute-once byte cache.
+struct FoldState<B: WeightSource, L: WeightSource> {
     base: B,
     loras: Vec<L>,
     strengths: Vec<f32>,
-    catalog: WeightCatalog,
     /// base id -> the `(lora index, spec)` pairs folded into it (a site may be
     /// touched by several stacked LoRAs).
     folds: HashMap<WeightId, Vec<(usize, FoldSpec)>>,
@@ -243,20 +251,24 @@ impl<B: WeightSource, L: WeightSource> LoraFoldSource<B, L> {
             strengths.push(strength);
         }
         Ok(Self {
-            base,
-            loras,
-            strengths,
             catalog,
-            folds,
-            cache: Mutex::new(HashMap::new()),
+            state: Arc::new(FoldState {
+                base,
+                loras,
+                strengths,
+                folds,
+                cache: Mutex::new(HashMap::new()),
+            }),
         })
     }
 
     /// Number of distinct base sites that will be folded.
     pub fn fold_count(&self) -> usize {
-        self.folds.len()
+        self.state.folds.len()
     }
+}
 
+impl<B: WeightSource, L: WeightSource> FoldState<B, L> {
     async fn lora_to_f32(
         &self,
         lora: &L,
@@ -465,19 +477,112 @@ impl<B: WeightSource, L: WeightSource> WeightSource for LoraFoldSource<B, L> {
     }
 
     async fn open(&self, id: &WeightId) -> Result<Self::Reader, Self::Error> {
-        let Some(specs) = self.folds.get(id) else {
-            let r = self.base.open(id).await.map_err(FoldError::Base)?;
+        let Some(specs) = self.state.folds.get(id) else {
+            let r = self.state.base.open(id).await.map_err(FoldError::Base)?;
             return Ok(LoraFoldReader::Base(r));
         };
-        if let Some(bytes) = self.cache.lock().expect("lora cache").get(id).cloned() {
+        if let Some(bytes) = self
+            .state
+            .cache
+            .lock()
+            .expect("lora cache")
+            .get(id)
+            .cloned()
+        {
             return Ok(LoraFoldReader::Folded(VecReader::new(bytes)));
         }
-        let bytes = self.compute_fold(id, specs).await?;
-        self.cache
+        let bytes = self.state.compute_fold(id, specs).await?;
+        self.state
+            .cache
             .lock()
             .expect("lora cache")
             .insert(id.clone(), Arc::clone(&bytes));
         Ok(LoraFoldReader::Folded(VecReader::new(bytes)))
+    }
+}
+
+/// Native background prefold: fold every site on ONE detached worker thread
+/// (ascending block order = the stream order the DiT will request), filling
+/// the same compute-once cache the engine's `open` reads. Byte-identical to
+/// the lazy fold -- the engine either hits the cache or computes the same
+/// bytes (a concurrent duplicate compute of one tensor is benign; last insert
+/// wins with identical bytes). Hides the fold CPU (tens of seconds for a 14B
+/// expert) behind the encoder / earlier denoise steps instead of stalling the
+/// expert's first streaming step. wasm keeps the lazy path (single thread).
+#[cfg(not(target_arch = "wasm32"))]
+impl<B, L> LoraFoldSource<B, L>
+where
+    B: WeightSource + Send + Sync + 'static,
+    L: WeightSource + Send + Sync + 'static,
+{
+    pub fn spawn_prefold(&self) {
+        // Ascending block index (first decimal run in the id), then name: the
+        // order residency will stream, so the cache stays just-ahead of the
+        // engine's cursor.
+        let block_num = |s: &str| -> u64 {
+            s.chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(u64::MAX)
+        };
+        let mut ids: Vec<WeightId> = self.state.folds.keys().cloned().collect();
+        ids.sort_by(|a, b| (block_num(&a.0), &a.0).cmp(&(block_num(&b.0), &b.0)));
+        let state = Arc::clone(&self.state);
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let mut folded_bytes = 0u64;
+            for id in ids {
+                if state.cache.lock().expect("lora cache").contains_key(&id) {
+                    continue;
+                }
+                let Some(specs) = state.folds.get(&id) else {
+                    continue;
+                };
+                match block_on_ready(state.compute_fold(&id, specs)) {
+                    Ok(bytes) => {
+                        folded_bytes += bytes.len() as u64;
+                        state.cache.lock().expect("lora cache").insert(id, bytes);
+                    }
+                    Err(e) => {
+                        // The engine's own open will hit the same error and
+                        // surface it with context; the worker just stops.
+                        tracing::debug!(
+                            target: "thinfer::diag",
+                            id = %id.0,
+                            err = ?e,
+                            "prefold worker stopped"
+                        );
+                        return;
+                    }
+                }
+            }
+            // Info: the fold cache is host RAM held for the model's lifetime
+            // (it rides OUTSIDE the residency ram budget); surface the size.
+            tracing::info!(
+                target: "thinfer::diag",
+                cache_mb = (folded_bytes as f64) / 1.0e6,
+                elapsed_s = t0.elapsed().as_secs_f64(),
+                "prefold complete"
+            );
+        });
+    }
+}
+
+/// Poll a fold future to completion on the current thread. The fold's awaits
+/// are mmap `read_at`s that resolve on first poll on native; if a reader ever
+/// pends, spin-yield (this runs on a dedicated worker thread, never the
+/// engine thread).
+#[cfg(not(target_arch = "wasm32"))]
+fn block_on_ready<F: core::future::Future>(fut: F) -> F::Output {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => return v,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
     }
 }
 

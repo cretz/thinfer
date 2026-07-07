@@ -49,6 +49,28 @@ const REPO_SULPHUR: &str = "vantagewithai/Sulphur-2-Base-GGUF";
 /// dev DiT). The LoRA is folded into the dev DiT at load (see `ltx::lora`).
 const REPO_SULPHUR_SRC: &str = "SulphurAI/Sulphur-2-base";
 
+/// ltx2-rapid: an LTX-2 19B community merge (Phr00t v62; distilled + native I2V),
+/// GGUF-converted by 3ndetz. Same `ltxv` DiT topology as LTX-2.3 (48 layers) but
+/// the 19B conditioning line: FeatureExtractor V1 + in-transformer caption
+/// projection, 2-layer/30-head/3840 ungated connector, 6-way block modulation, no
+/// gated attention, no prompt-AdaLN. See `ltx2-rapid-plan.md`. Merge, so no
+/// upstream pyref: validated component-wise + against ComfyUI on the same GGUF.
+const REPO_RAPID_DIT: &str = "3ndetz/LTX2-Rapid-Merges-GGUF";
+/// 19B embeddings connector (+ FE V1 aggregate embed) and both VAEs (bf16
+/// safetensors, comfy-converted). The connector file holds the 2-layer video +
+/// audio connectors, their learnable registers, and `text_embedding_projection.
+/// aggregate_embed` (the single FE V1 embed). The DiT GGUF holds the caption
+/// projections. VAEs are the LTX-2 (non-.3) video + audio autoencoders.
+const REPO_RAPID_CONN_VAE: &str = "Kijai/LTXV2_comfy";
+/// Prompt-rewriter LM (shared with HunyuanVideo 1.5, keyed by the same rewriter
+/// roles): the 19B merge is trained on long, structured captions, so a terse
+/// prompt is out-of-distribution and collapses to the model's portrait prior. The
+/// optional on-device Qwen3-VL rewriter expands it. Files are model-agnostic
+/// (same public repos Hunyuan uses); opt-in, fetched only when rewriting is on.
+const REPO_REWRITER_GGUF_4B: &str = "unsloth/Qwen3-VL-4B-Instruct-GGUF";
+const REPO_REWRITER_GGUF_8B: &str = "unsloth/Qwen3-VL-8B-Instruct-GGUF";
+const REPO_REWRITER_TOKENIZER: &str = "Qwen/Qwen3-VL-8B-Instruct";
+
 pub mod role {
     /// DiT GGUF, Q8_0 (quality+perf baseline + parity canary). 22.8G.
     pub const DIT_GGUF_Q8_0: &str = "dit/gguf-q8_0";
@@ -56,6 +78,10 @@ pub mod role {
     pub const DIT_GGUF_Q4_K_M: &str = "dit/gguf-q4_k_m";
     /// DiT GGUF, Q2_K (footprint-floor experiment only). 7.94G.
     pub const DIT_GGUF_Q2_K: &str = "dit/gguf-q2_k";
+    /// DiT GGUF, Q5_K_M (ltx2-rapid default; mixed Q5_K/Q6_K per tensor). 14.2G.
+    pub const DIT_GGUF_Q5_K_M: &str = "dit/gguf-q5_k_m";
+    /// DiT GGUF, F16 (ltx2-rapid quality canary). 37.8G.
+    pub const DIT_GGUF_F16: &str = "dit/gguf-f16";
     /// Gemma-3-12B-it text encoder, pure Q8_0 (uniform per-site). ~12.5G.
     pub const ENCODER_GGUF: &str = "encoder/gemma-gguf";
     /// Gemma-3-12B-it text encoder, Q4_K_M (~7.3G; Q4_K + Q6_K mix per tensor).
@@ -259,9 +285,110 @@ pub static SULPHUR_MANIFEST: ModelManifest = ModelManifest {
     ],
 };
 
+/// ltx2-rapid joint audio-video roles (single-stage; no spatial upscaler). Q5_K_M
+/// DiT default. Connector + VAEs come from the LTX-2 19B (Kijai) files; encoder +
+/// tokenizer reuse the shared Gemma-3-12B.
+pub const RUNTIME_ROLES_RAPID: &[&str] = &[
+    role::ENCODER_GGUF,
+    role::TOKENIZER,
+    role::CONNECTOR,
+    role::DIT_GGUF_Q5_K_M,
+    role::VIDEO_VAE,
+    role::AUDIO_VAE,
+];
+
+/// ltx2-rapid manifest. DiT GGUF (Q5_K_M default / Q4_K_M compare / F16 canary)
+/// from the merge repo; connector + both VAEs from the LTX-2 19B comfy files;
+/// encoder + tokenizer shared with LTX-2.3. No upscaler (single-stage path).
+pub static LTX2_RAPID_MANIFEST: ModelManifest = ModelManifest {
+    id: "ltx2-rapid",
+    files: &[
+        (
+            role::DIT_GGUF_Q5_K_M,
+            FileRef::new(
+                REPO_RAPID_DIT,
+                "nsfw/ltx2-phr00tmerge-nsfw-v62/ltx2-phr00tmerge-nsfw-v62-Q5_K_M.gguf",
+            ),
+        ),
+        (
+            role::DIT_GGUF_Q4_K_M,
+            FileRef::new(
+                REPO_RAPID_DIT,
+                "nsfw/ltx2-phr00tmerge-nsfw-v62/ltx2-phr00tmerge-nsfw-v62-Q4_K_M.gguf",
+            ),
+        ),
+        (
+            role::DIT_GGUF_F16,
+            FileRef::new(
+                REPO_RAPID_DIT,
+                "nsfw/ltx2-phr00tmerge-nsfw-v62/ltx2-phr00tmerge-nsfw-v62-F16.gguf",
+            ),
+        ),
+        (
+            role::ENCODER_GGUF,
+            FileRef::new(REPO_GEMMA, "gemma-3-12b-it-Q8_0.gguf"),
+        ),
+        (
+            role::ENCODER_GGUF_Q4,
+            FileRef::new(REPO_GEMMA, "gemma-3-12b-it-Q4_K_M.gguf"),
+        ),
+        (
+            role::CONNECTOR,
+            FileRef::new(
+                REPO_RAPID_CONN_VAE,
+                "text_encoders/ltx-2-19b-embeddings_connector_distill_bf16.safetensors",
+            ),
+        ),
+        (
+            role::VIDEO_VAE,
+            FileRef::new(REPO_RAPID_CONN_VAE, "VAE/LTX2_video_vae_bf16.safetensors"),
+        ),
+        (
+            role::AUDIO_VAE,
+            FileRef::new(REPO_RAPID_CONN_VAE, "VAE/LTX2_audio_vae_bf16.safetensors"),
+        ),
+        (
+            role::TOKENIZER,
+            FileRef::new(REPO_TOKENIZER, "tokenizer.json"),
+        ),
+        // Opt-in prompt-rewriter files (keyed by the shared Hunyuan rewriter
+        // roles). Fetched only when rewriting is enabled (see request.rs).
+        (
+            crate::hunyuan::manifest::role::REWRITER_GGUF_4B_Q5_K_M,
+            FileRef::new(REPO_REWRITER_GGUF_4B, "Qwen3-VL-4B-Instruct-Q5_K_M.gguf"),
+        ),
+        (
+            crate::hunyuan::manifest::role::REWRITER_GGUF_8B_Q5_K_M,
+            FileRef::new(REPO_REWRITER_GGUF_8B, "Qwen3-VL-8B-Instruct-Q5_K_M.gguf"),
+        ),
+        (
+            crate::hunyuan::manifest::role::REWRITER_TOKENIZER,
+            FileRef::new(REPO_REWRITER_TOKENIZER, "tokenizer.json"),
+        ),
+    ],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rapid_roles_resolve() {
+        for r in RUNTIME_ROLES_RAPID {
+            assert!(LTX2_RAPID_MANIFEST.get(r).is_some(), "missing role {r}");
+        }
+        // DiT from the merge repo; connector/VAE from the 19B comfy repo.
+        assert_eq!(
+            LTX2_RAPID_MANIFEST.get(role::DIT_GGUF_Q5_K_M).unwrap().repo,
+            REPO_RAPID_DIT
+        );
+        assert_eq!(
+            LTX2_RAPID_MANIFEST.get(role::CONNECTOR).unwrap().repo,
+            REPO_RAPID_CONN_VAE
+        );
+        // Single-stage: no upscaler role.
+        assert!(!RUNTIME_ROLES_RAPID.contains(&role::UPSCALER));
+    }
 
     #[test]
     fn roles_resolve() {

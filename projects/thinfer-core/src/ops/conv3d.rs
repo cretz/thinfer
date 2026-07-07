@@ -408,6 +408,19 @@ fn main(
                         let cwi: u32 = u32(clamp(wi, 0, i32(u.w_in) - 1));
                         v = load_x(x_base + ci * thw_in + cti * hw_in
                             + chi * u.w_in + cwi);
+                    }} else if (u.pad_mode == 2u) {{
+                        // Reflect padding (PyTorch F.pad mode='reflect'): mirror
+                        // across the border WITHOUT repeating it (i=-1 -> 1,
+                        // i=N -> N-2). In-bounds indices are returned unchanged, so
+                        // an unpadded axis (e.g. pre-padded time, pad=0) is a no-op.
+                        let nt: i32 = i32(u.t_in);
+                        let nh: i32 = i32(u.h_in);
+                        let nw: i32 = i32(u.w_in);
+                        let rti: u32 = u32(select(select(ti, 2 * nt - 2 - ti, ti >= nt), -ti, ti < 0));
+                        let rhi: u32 = u32(select(select(hi, 2 * nh - 2 - hi, hi >= nh), -hi, hi < 0));
+                        let rwi: u32 = u32(select(select(wi, 2 * nw - 2 - wi, wi >= nw), -wi, wi < 0));
+                        v = load_x(x_base + ci * thw_in + rti * hw_in
+                            + rhi * u.w_in + rwi);
                     }} else if (ti >= 0 && ti < i32(u.t_in) && hi >= 0 && hi < i32(u.h_in)
                         && wi >= 0 && wi < i32(u.w_in)) {{
                         v = load_x(x_base + ci * thw_in + u32(ti) * hw_in

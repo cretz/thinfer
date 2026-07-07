@@ -175,6 +175,27 @@ pub fn euler_step(latent: &[f32], denoised: &[f32], sigma: f32, sigma_next: f32)
         .collect()
 }
 
+/// I2V conditioning blend (per token): `x = x*mask + clean*(1-mask)`. `x` and
+/// `clean` are token-major `[tokens, c]`; `mask` is per-token `[tokens]` (channel
+/// -shared). Used both to seed the noised latent (`x = noise`) and to hard-
+/// replace the X0 estimate each denoise step (`x = x0`) so the conditioned tokens
+/// (mask -> 0) hold the clean latent while the rest (mask -> 1) denoise freely.
+/// This is the `GaussianNoiser`/`post_process_latent` `lerp(clean, x, mask)`.
+pub fn blend_clean(x: &mut [f32], clean: &[f32], mask: &[f32], c: usize) {
+    assert_eq!(x.len(), clean.len(), "blend length mismatch");
+    assert_eq!(x.len(), mask.len() * c, "blend mask/channel mismatch");
+    for (t, &m) in mask.iter().enumerate() {
+        if m >= 1.0 {
+            continue; // free token: unchanged.
+        }
+        let inv = 1.0 - m;
+        for ch in 0..c {
+            let i = t * c + ch;
+            x[i] = x[i] * m + clean[i] * inv;
+        }
+    }
+}
+
 /// Convert the DiT's token-major video latent `[tokens, C]` (token `t = f*H*W +
 /// h*W + w`, channel-last) to the channel-first CTHW `[C, F, H, W]` the video
 /// VAE and latent upsampler consume. `C = IN_CHANNELS`.
@@ -294,6 +315,18 @@ mod tests {
         // spot-check: token 1 channel 3 lands at [3*thw + 1] with value 1*1000+3.
         assert_eq!(cthw[3 * thw + 1], (1000 + 3) as f32);
         assert_eq!(video_cthw_to_tokens(&cthw, d), tm);
+    }
+
+    #[test]
+    fn blend_clean_locks_conditioned_tokens() {
+        let c = 2;
+        // 3 tokens: token 0 locked (mask 0), token 1 free (mask 1), token 2 half.
+        let clean = vec![10.0, 20.0, /*t1*/ 0.0, 0.0, /*t2*/ 4.0, 8.0];
+        let mask = vec![0.0, 1.0, 0.5];
+        let mut x = vec![1.0, 2.0, 3.0, 4.0, 6.0, 10.0];
+        blend_clean(&mut x, &clean, &mask, c);
+        // token 0 -> clean; token 1 -> unchanged; token 2 -> midpoint.
+        assert_eq!(x, vec![10.0, 20.0, 3.0, 4.0, 5.0, 9.0]);
     }
 
     #[test]

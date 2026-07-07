@@ -163,16 +163,18 @@ impl std::fmt::Debug for VideoInput {
     }
 }
 
-/// A source FACE image (PNG/JPEG container bytes) held in RAM (DreamID-V /
-/// face-swap). Small enough to always ride in memory (unlike the large target
-/// video), so it never lands on disk. Bytes are never logged (`Debug` shows only
-/// the size), matching the target video's no-media-logging discipline.
+/// Image container bytes (PNG/JPEG) held in RAM: a source face (DreamID-V /
+/// face-swap), an edit reference (Qwen-Image-Edit), or an i2v first frame
+/// (Hunyuan). Small enough to always ride in memory (unlike the large target
+/// video), so a decrypted image NEVER lands on disk. Bytes are never logged
+/// (`Debug` shows only the size), matching the video's no-media-logging
+/// discipline. Decode with `image::load_from_memory`.
 #[derive(Clone)]
-pub struct FaceImage(pub Vec<u8>);
+pub struct ImageBytes(pub Vec<u8>);
 
-impl std::fmt::Debug for FaceImage {
+impl std::fmt::Debug for ImageBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FaceImage({} bytes)", self.0.len())
+        write!(f, "ImageBytes({} bytes)", self.0.len())
     }
 }
 
@@ -192,7 +194,8 @@ pub struct ImageRequest {
     pub i8_matmul: bool,
     /// Reference image for the image-EDIT path (Qwen-Image-Edit). REQUIRED for
     /// the `QwenImageEdit` kind; rejected for the t2i kinds (Z-Image, Ideogram).
-    pub input_image: Option<PathBuf>,
+    /// Held in RAM ([`ImageBytes`]); a decrypted image never touches disk.
+    pub input_image: Option<ImageBytes>,
     /// User adapters to fold into the DiT for this generation, in fold order
     /// (each id is a vault entry for THIS model). Empty = the plain base model.
     /// Only models where [`ImageModelId::supports_adapters`] is true accept a
@@ -278,13 +281,19 @@ pub struct VideoRequest {
     /// `None` -> the model's preferred fps.
     pub fps: Option<u32>,
     pub seed: Option<u64>,
-    /// img2vid conditioning (not yet wired; rejected in [`Self::resolve`]).
-    pub input_image: Option<PathBuf>,
+    /// Hunyuan i2v / ltx2-rapid i2v first-frame conditioning image. Held in RAM
+    /// ([`ImageBytes`]); a decrypted image never touches disk.
+    pub input_image: Option<ImageBytes>,
+    /// LTX native-I2V frame-0 conditioning strength (`0.0..=1.0`; default 1.0).
+    /// `1.0` fully locks the encoded input frame through the denoise (the frame-0
+    /// anchor); lower values let it drift toward the model's own frame-0. Only
+    /// used when `input_image` is set on an LTX i2v model; ignored otherwise.
+    pub strength: f32,
     /// DreamID-V only: the source FACE image (PNG/JPEG) to swap into the target
     /// video. Required for DreamID-V, rejected by every other model. Small, so it
-    /// rides in RAM ([`FaceImage`]) and never touches disk; the large target
+    /// rides in RAM ([`ImageBytes`]) and never touches disk; the large target
     /// video takes the RAM/encrypted `input_video` path.
-    pub source_image: Option<FaceImage>,
+    pub source_image: Option<ImageBytes>,
     /// DreamID-V only: the target VIDEO (the clip to swap a face into), held
     /// RAM-first (encrypted spill for large uploads; see [`VideoInput`]).
     /// Required for DreamID-V, `None` for every other model.
@@ -330,6 +339,17 @@ pub struct VideoRequest {
     /// `Fast` = the ~2.5GB Qwen3-VL-4B (default, budget-honest), `Full` = the
     /// ~5.85GB Qwen3-VL-8B. Ignored when `rewrite` is false or by other models.
     pub rewrite_quality: RewriteQuality,
+    /// User adapters (vault LoRAs) to fold into the DiT for this generation, in
+    /// fold order (each id is a vault entry for THIS model). Empty = the plain
+    /// base model. Only models where [`VideoModelId::supports_adapters`] is true
+    /// accept a non-empty list.
+    pub lora: Vec<LoraRef>,
+    /// The vault password, required when `lora` is non-empty. Re-derives the key
+    /// for this request only; never persisted, never logged (see [`Secret`]).
+    pub vault_password: Option<Secret>,
+    /// Where the encrypted adapter vault lives (shared by CLI + serve). Only read
+    /// when `lora` is non-empty.
+    pub vault_dir: PathBuf,
     pub budget: ResidencyBudget,
     pub output: PathBuf,
     pub format: VideoFormat,
@@ -386,6 +406,19 @@ impl VideoRequest {
                         m.get(role).copied().ok_or_else(|| {
                             format!("Sulphur manifest missing distill role {role}")
                         })?,
+                    );
+                }
+            }
+            // ltx2-rapid optional prompt rewriter (the 19B merge needs long
+            // captions, like Hunyuan): fetch the selected rewriter GGUF +
+            // tokenizer only when rewriting is enabled (opt-in footprint).
+            if self.rewrite && self.model.is_ltx_rapid() {
+                use thinfer_models::hunyuan::manifest::role as hyrole;
+                for r in [self.rewrite_quality.gguf_role(), hyrole::REWRITER_TOKENIZER] {
+                    files.push(
+                        m.get(r)
+                            .copied()
+                            .ok_or_else(|| format!("LTX manifest missing rewriter role {r}"))?,
                     );
                 }
             }
@@ -485,14 +518,22 @@ impl VideoRequest {
         // the model runs text-only (the upstream `mask_type="t2v"` shape --
         // probe-validated to produce coherent prompt-following video despite the
         // i2v-trained checkpoint). Every other model rejects it.
-        if !self.model.is_hunyuan_i2v() && self.input_image.is_some() {
+        if !(self.model.is_hunyuan_i2v() || self.model.is_ltx_i2v()) && self.input_image.is_some() {
             return Err(format!(
-                "--input-image is only supported by hunyuan-video-1.5-ti2v (got {})",
+                "--input-image is only supported by hunyuan-video-1.5-ti2v and ltx2-rapid (got {})",
                 self.model
             ));
         }
         if self.prompts.is_empty() {
             return Err("at least one prompt is required".into());
+        }
+        if !self.lora.is_empty() {
+            if !self.model.supports_adapters() {
+                return Err(format!("{} does not support adapters", self.model));
+            }
+            if self.vault_password.is_none() {
+                return Err("a vault password is required to use adapters".into());
+            }
         }
         let fps = self.fps.unwrap_or_else(|| self.model.fps());
         if fps == 0 {
@@ -600,6 +641,12 @@ impl VideoRequest {
                 self.model
             ));
         }
+        if self.input_image.is_some() && !(0.0..=1.0).contains(&self.strength) {
+            return Err(format!(
+                "--strength must be in 0.0..=1.0 (got {})",
+                self.strength
+            ));
+        }
         if self.frames.len() > 1 || self.durations.len() > 1 {
             return Err(format!("{} takes a single --frames/--duration", self.model));
         }
@@ -653,25 +700,78 @@ impl VideoRequest {
     }
 }
 
+/// Compositing/quality knobs for a face-swap run. All default off so the
+/// baseline (feather-only paste) is unchanged; each changes the visual output,
+/// so it is user-opt-in.
+#[derive(Clone, Copy, Debug)]
+pub struct FaceSwapOptions {
+    /// Intersect the paste mask with HyperSwap's own confidence mask (free).
+    pub hyperswap_mask: bool,
+    /// Intersect with an XSeg occlusion mask so occluders (hands/hair/glasses)
+    /// show the original frame through. Pulls in the XSeg model + one ONNX
+    /// forward per face.
+    pub occlusion: bool,
+    /// Run the GFPGAN face enhancer on the swapped face (restores GAN detail).
+    /// Pulls in the GFPGAN model + one ONNX forward per face.
+    pub enhance: bool,
+    /// Run SCRFD detection every Nth frame, reusing the previous frame's faces in
+    /// between (the per-frame HyperSwap still runs). 1 = detect every frame
+    /// (default). >1 trades a little tracking accuracy on fast head motion for
+    /// speed. 0 is treated as 1.
+    pub detect_stride: u32,
+    /// Output H.264 bitrate as a multiple of the source video bitrate. Default
+    /// 1.15 (matches the input's size/quality with a small cushion for the second
+    /// encode). Falls back to a bits-per-pixel target if the source bitrate is
+    /// unknown.
+    pub bitrate_scale: f32,
+    /// Optional swap+output window in seconds of the source clip: only frames in
+    /// [start, end) are swapped and written (rebased to t=0). `None` = clip
+    /// start/end.
+    pub start_secs: Option<f32>,
+    pub end_secs: Option<f32>,
+}
+
+impl Default for FaceSwapOptions {
+    fn default() -> Self {
+        Self {
+            hyperswap_mask: false,
+            occlusion: false,
+            enhance: false,
+            detect_stride: 1,
+            bitrate_scale: 1.15,
+            start_secs: None,
+            end_secs: None,
+        }
+    }
+}
+
 /// Swap a face from a source image into every frame of an input video. The
 /// target video is RAM-first (encrypted spill for large uploads; see
-/// [`VideoInput`]); the small source image rides in RAM ([`FaceImage`]).
+/// [`VideoInput`]); the small source image rides in RAM ([`ImageBytes`]).
 #[derive(Clone, Debug)]
 pub struct FaceSwapRequest {
     pub model: SwapModel,
     pub input_video: VideoInput,
-    pub source_image: FaceImage,
+    pub source_image: ImageBytes,
     pub output: PathBuf,
     pub budget: ResidencyBudget,
+    pub options: FaceSwapOptions,
 }
 
 impl FaceSwapRequest {
     pub fn required_files(&self) -> Vec<FileRef> {
-        vec![
+        let mut files = vec![
             crate::model::SCRFD,
             crate::model::ARCFACE,
             self.model.file(),
-        ]
+        ];
+        if self.options.occlusion {
+            files.push(crate::model::XSEG);
+        }
+        if self.options.enhance {
+            files.push(crate::model::GFPGAN);
+        }
+        files
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -683,6 +783,25 @@ impl FaceSwapRequest {
             .unwrap_or(false);
         if !ok {
             return Err("--output must be a .mp4 file".into());
+        }
+        let o = &self.options;
+        if o.bitrate_scale <= 0.0 || !o.bitrate_scale.is_finite() {
+            return Err("--bitrate-scale must be a positive number".into());
+        }
+        if let Some(s) = o.start_secs
+            && (s < 0.0 || !s.is_finite())
+        {
+            return Err("--start must be a non-negative number of seconds".into());
+        }
+        if let Some(e) = o.end_secs
+            && (e < 0.0 || !e.is_finite())
+        {
+            return Err("--end must be a non-negative number of seconds".into());
+        }
+        if let (Some(s), Some(e)) = (o.start_secs, o.end_secs)
+            && e <= s
+        {
+            return Err("--end must be greater than --start".into());
         }
         Ok(())
     }
@@ -916,6 +1035,7 @@ mod tests {
             fps: None,
             seed: None,
             input_image: None,
+            strength: 1.0,
             source_image: None,
             input_video: None,
             guide_scale: None,
@@ -929,6 +1049,9 @@ mod tests {
             upscale: true,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
+            lora: vec![],
+            vault_password: None,
+            vault_dir: std::path::PathBuf::new(),
             budget: ResidencyBudget {
                 ram_bytes: 5 << 30,
                 vram_bytes: 5 << 30,
@@ -990,6 +1113,7 @@ mod tests {
             fps: None,
             seed: None,
             input_image: None,
+            strength: 1.0,
             source_image: None,
             input_video: None,
             guide_scale: None,
@@ -1003,6 +1127,9 @@ mod tests {
             upscale: false,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
+            lora: vec![],
+            vault_password: None,
+            vault_dir: std::path::PathBuf::new(),
             budget: ResidencyBudget {
                 ram_bytes: 5 << 30,
                 vram_bytes: 5 << 30,

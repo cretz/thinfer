@@ -825,6 +825,7 @@ const CONV_TILE_WIDE: Conv2dConfig = Conv2dConfig {
     bk: 32,
     tm: 4,
     tn: 8,
+    prefetch: false,
 };
 /// Small-N conv tile: conv_out (cout=3). The default bm=64 tile would idle
 /// 15/16 of each workgroup's rows.
@@ -834,6 +835,7 @@ const CONV_TILE_SMALL_N: Conv2dConfig = Conv2dConfig {
     bk: 32,
     tm: 1,
     tn: 2,
+    prefetch: false,
 };
 
 /// WGSL pipelines needed by the KL-VAE decoder forward. Built once at runtime

@@ -51,6 +51,16 @@ pub struct ServeConfig {
     pub vault_dir: Option<PathBuf>,
     /// Artifact retention in seconds (informational sweep target in v1).
     pub retention_secs: u64,
+    /// Max bytes accepted on `POST /jobs` (the JSON spec, which still carries the
+    /// small base64 source/reference image). Large videos go through `/uploads`
+    /// instead, so this stays modest. Default 32 MiB.
+    pub max_json_bytes: usize,
+    /// Max bytes accepted on `POST /uploads` (a single raw video body). Default
+    /// 2 GiB.
+    pub max_upload_bytes: usize,
+    /// How long an uploaded (but not yet consumed) video is retained before the
+    /// reaper deletes it (and any encrypted spill). Default 1800s (30 min).
+    pub upload_ttl_secs: u64,
     /// Download missing weight files automatically (no interactive consent on a
     /// server). When false, a job whose files are missing fails fast.
     pub download_as_needed: bool,
@@ -75,6 +85,9 @@ impl Default for ServeConfig {
             artifact_dir: PathBuf::from("thinfer-artifacts"),
             vault_dir: None,
             retention_secs: 24 * 60 * 60,
+            max_json_bytes: 32 << 20,
+            max_upload_bytes: 2 << 30,
+            upload_ttl_secs: 30 * 60,
             download_as_needed: true,
             power_preference: "high".into(),
             ram_budget: "5G".into(),

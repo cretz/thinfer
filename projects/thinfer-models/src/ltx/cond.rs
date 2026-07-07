@@ -26,6 +26,7 @@ use thinfer_core::residency::{TransposePolicy, WeightHandle, WeightResidency};
 use thinfer_core::weight::{WeightId, WeightSource};
 use thinfer_core::workspace::{BatchScope, Workspace};
 
+use super::LtxVariant;
 use super::config as dit;
 use super::dit::{BlockHandles, DitError, DitPipelines, HostStreamMod};
 use crate::common::block::{ActBuf, alloc_act, alloc_matmul_out_buf};
@@ -58,8 +59,9 @@ pub struct AdalnHandles {
 pub struct TimestepHandles {
     pub video: AdalnHandles,
     pub audio: AdalnHandles,
-    pub prompt_video: AdalnHandles,
-    pub prompt_audio: AdalnHandles,
+    /// Prompt-AdaLN (continuous-sigma text-KV modulation). `None` on 19B.
+    pub prompt_video: Option<AdalnHandles>,
+    pub prompt_audio: Option<AdalnHandles>,
     pub av_video_ss: AdalnHandles,
     pub av_audio_ss: AdalnHandles,
     pub av_a2v_gate: AdalnHandles,
@@ -85,12 +87,20 @@ fn register_adaln<S: WeightSource>(
 
 pub fn register_timestep<S: WeightSource>(
     residency: &WeightResidency<S>,
+    variant: LtxVariant,
 ) -> Result<TimestepHandles, LoadError> {
+    let prompt = |p: &str| -> Result<Option<AdalnHandles>, LoadError> {
+        Ok(if variant.prompt_adaln {
+            Some(register_adaln(residency, p)?)
+        } else {
+            None
+        })
+    };
     Ok(TimestepHandles {
         video: register_adaln(residency, "adaln_single")?,
         audio: register_adaln(residency, "audio_adaln_single")?,
-        prompt_video: register_adaln(residency, "prompt_adaln_single")?,
-        prompt_audio: register_adaln(residency, "audio_prompt_adaln_single")?,
+        prompt_video: prompt("prompt_adaln_single")?,
+        prompt_audio: prompt("audio_prompt_adaln_single")?,
         av_video_ss: register_adaln(residency, "av_ca_video_scale_shift_adaln_single")?,
         av_audio_ss: register_adaln(residency, "av_ca_audio_scale_shift_adaln_single")?,
         av_a2v_gate: register_adaln(residency, "av_ca_a2v_gate_adaln_single")?,
@@ -214,8 +224,11 @@ pub struct SharedTimestep {
     pub a_emb: Vec<f32>,     // [AUDIO_DIM]
 }
 
-/// Compute the 8 adaln modules for `(sigma_video, sigma_audio)` (av-cross gate
-/// reads the cross stream's sigma). One GPU submit (rows=1), read back to host.
+/// Compute the adaln modules for `(sigma_video, sigma_audio)` (av-cross gate reads
+/// the cross stream's sigma). One GPU submit (rows=1), read back to host. 22B runs
+/// 8 modules (9-way main + 2-way prompt + av); 19B runs 6 (6-way main + av, no
+/// prompt), selected by `variant`.
+#[allow(clippy::too_many_arguments)]
 pub async fn compute_shared_timestep<S: WeightSource>(
     backend: &WgpuBackend,
     pipes: &DitPipelines,
@@ -224,9 +237,11 @@ pub async fn compute_shared_timestep<S: WeightSource>(
     th: &TimestepHandles,
     sigma_video: f32,
     sigma_audio: f32,
+    variant: LtxVariant,
 ) -> Result<SharedTimestep, DitError<S::Error>> {
     let vd = dit::DIM as u32;
     let ad = dit::AUDIO_DIM as u32;
+    let nmod = variant.n_block_mod as u32;
     let mul = dit::TIMESTEP_SCALE_MULTIPLIER;
     // The adaln matmuls run on the shared block pipelines, so their buffers must
     // use the block act dtype (f32 parity path, or f16 when the perf path is on).
@@ -260,8 +275,16 @@ pub async fn compute_shared_timestep<S: WeightSource>(
     }
     let v = acq!(&th.video);
     let a = acq!(&th.audio);
-    let pv = acq!(&th.prompt_video);
-    let pa = acq!(&th.prompt_audio);
+    let pv = if let Some(m) = th.prompt_video {
+        Some(acq!(&m))
+    } else {
+        None
+    };
+    let pa = if let Some(m) = th.prompt_audio {
+        Some(acq!(&m))
+    } else {
+        None
+    };
     let avs = acq!(&th.av_video_ss);
     let aas = acq!(&th.av_audio_ss);
     let a2vg = acq!(&th.av_a2v_gate);
@@ -284,12 +307,12 @@ pub async fn compute_shared_timestep<S: WeightSource>(
 
     // Output buffers (workspace allocs) for readback (block act dtype).
     let mk = |n: u32| -> Result<_, WgpuError> { workspace.alloc(n as u64 * ab) };
-    let v_main_b = mk(9 * vd)?;
+    let v_main_b = mk(nmod * vd)?;
     let v_prompt_b = mk(2 * vd)?;
     let v_av_ss_b = mk(4 * vd)?;
     let v_av_gate_b = mk(vd)?;
     let v_emb_b = mk(vd)?;
-    let a_main_b = mk(9 * ad)?;
+    let a_main_b = mk(nmod * ad)?;
     let a_prompt_b = mk(2 * ad)?;
     let a_av_ss_b = mk(4 * ad)?;
     let a_av_gate_b = mk(ad)?;
@@ -306,22 +329,26 @@ pub async fn compute_shared_timestep<S: WeightSource>(
             }};
         }
 
-        let (v_emb, v_ts) = adaln_forward(&scope, pipes, sv_h, &bufs(&v), vd, 9 * vd)?;
-        copy!(v_ts, &v_main_b, 9 * vd);
+        let (v_emb, v_ts) = adaln_forward(&scope, pipes, sv_h, &bufs(&v), vd, nmod * vd)?;
+        copy!(v_ts, &v_main_b, nmod * vd);
         copy!(v_emb, &v_emb_b, vd);
-        let (_, vp_ts) = adaln_forward(&scope, pipes, sv_h, &bufs(&pv), vd, 2 * vd)?;
-        copy!(vp_ts, &v_prompt_b, 2 * vd);
+        if let Some(pv) = &pv {
+            let (_, vp_ts) = adaln_forward(&scope, pipes, sv_h, &bufs(pv), vd, 2 * vd)?;
+            copy!(vp_ts, &v_prompt_b, 2 * vd);
+        }
         let (_, vss_ts) = adaln_forward(&scope, pipes, sv_h, &bufs(&avs), vd, 4 * vd)?;
         copy!(vss_ts, &v_av_ss_b, 4 * vd);
         // video av gate reads the AUDIO sigma sinusoid.
         let (_, vg_ts) = adaln_forward(&scope, pipes, sa_h, &bufs(&a2vg), vd, vd)?;
         copy!(vg_ts, &v_av_gate_b, vd);
 
-        let (a_emb, a_ts) = adaln_forward(&scope, pipes, sa_h, &bufs(&a), ad, 9 * ad)?;
-        copy!(a_ts, &a_main_b, 9 * ad);
+        let (a_emb, a_ts) = adaln_forward(&scope, pipes, sa_h, &bufs(&a), ad, nmod * ad)?;
+        copy!(a_ts, &a_main_b, nmod * ad);
         copy!(a_emb, &a_emb_b, ad);
-        let (_, ap_ts) = adaln_forward(&scope, pipes, sa_h, &bufs(&pa), ad, 2 * ad)?;
-        copy!(ap_ts, &a_prompt_b, 2 * ad);
+        if let Some(pa) = &pa {
+            let (_, ap_ts) = adaln_forward(&scope, pipes, sa_h, &bufs(pa), ad, 2 * ad)?;
+            copy!(ap_ts, &a_prompt_b, 2 * ad);
+        }
         let (_, ass_ts) = adaln_forward(&scope, pipes, sa_h, &bufs(&aas), ad, 4 * ad)?;
         copy!(ass_ts, &a_av_ss_b, 4 * ad);
         // audio av gate reads the VIDEO sigma sinusoid.
@@ -331,14 +358,24 @@ pub async fn compute_shared_timestep<S: WeightSource>(
         scope.submit_void().await?;
     }
 
+    let prompt_v = if variant.prompt_adaln {
+        read_ws(backend, &v_prompt_b, (2 * vd) as usize, act).await?
+    } else {
+        Vec::new()
+    };
+    let prompt_a = if variant.prompt_adaln {
+        read_ws(backend, &a_prompt_b, (2 * ad) as usize, act).await?
+    } else {
+        Vec::new()
+    };
     Ok(SharedTimestep {
-        v_main: read_ws(backend, &v_main_b, 9 * vd as usize, act).await?,
-        v_prompt: read_ws(backend, &v_prompt_b, 2 * vd as usize, act).await?,
+        v_main: read_ws(backend, &v_main_b, (nmod * vd) as usize, act).await?,
+        v_prompt: prompt_v,
         v_av_ss: read_ws(backend, &v_av_ss_b, 4 * vd as usize, act).await?,
         v_av_gate: read_ws(backend, &v_av_gate_b, vd as usize, act).await?,
         v_emb: read_ws(backend, &v_emb_b, vd as usize, act).await?,
-        a_main: read_ws(backend, &a_main_b, 9 * ad as usize, act).await?,
-        a_prompt: read_ws(backend, &a_prompt_b, 2 * ad as usize, act).await?,
+        a_main: read_ws(backend, &a_main_b, (nmod * ad) as usize, act).await?,
+        a_prompt: prompt_a,
         a_av_ss: read_ws(backend, &a_av_ss_b, 4 * ad as usize, act).await?,
         a_av_gate: read_ws(backend, &a_av_gate_b, ad as usize, act).await?,
         a_emb: read_ws(backend, &a_emb_b, ad as usize, act).await?,
@@ -379,6 +416,7 @@ pub async fn read_block_tables<S: WeightSource>(
     backend: &WgpuBackend,
     residency: &WeightResidency<S>,
     handles: &BlockHandles,
+    variant: LtxVariant,
 ) -> Result<BlockTables, DitError<S::Error>> {
     let t = &handles.tables;
     let rd = |h: WeightHandle, n: usize| async move {
@@ -394,11 +432,21 @@ pub async fn read_block_tables<S: WeightSource>(
     };
     let d = dit::DIM;
     let ad = dit::AUDIO_DIM;
+    let nmod = variant.n_block_mod;
+    // Prompt tables exist only on 22B (`prompt_scale_shift` handles are None on 19B).
+    let prompt = match t.prompt_scale_shift {
+        Some(h) => rd(h, 2 * d).await?,
+        None => Vec::new(),
+    };
+    let audio_prompt = match t.audio_prompt_scale_shift {
+        Some(h) => rd(h, 2 * ad).await?,
+        None => Vec::new(),
+    };
     Ok(BlockTables {
-        scale_shift: rd(t.scale_shift, 9 * d).await?,
-        audio_scale_shift: rd(t.audio_scale_shift, 9 * ad).await?,
-        prompt: rd(t.prompt_scale_shift, 2 * d).await?,
-        audio_prompt: rd(t.audio_prompt_scale_shift, 2 * ad).await?,
+        scale_shift: rd(t.scale_shift, nmod * d).await?,
+        audio_scale_shift: rd(t.audio_scale_shift, nmod * ad).await?,
+        prompt,
+        audio_prompt,
         a2v_ca_video: rd(t.a2v_ca_video, 5 * d).await?,
         a2v_ca_audio: rd(t.a2v_ca_audio, 5 * ad).await?,
     })
@@ -412,6 +460,7 @@ fn row_add(table: &[f32], ts: &[f32], p: usize, d: usize) -> Vec<f32> {
     tb.iter().zip(tv).map(|(a, b)| a + b).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_stream(
     main: &[f32],
     prompt_ts: &[f32],
@@ -421,8 +470,25 @@ fn assemble_stream(
     prompt_table: &[f32],
     av_table: &[f32],
     d: usize,
+    cross_adaln: bool,
 ) -> HostStreamMod {
     // get_ada_values order per slice: row p -> (shift @0, scale @1, gate @2).
+    // 22B: msa(0,1,2) mlp(3,4,5) cross-q(6,7,8) + prompt cross-kv(0,1). 19B: only
+    // msa + mlp (6-way table); cross-attn is raw so cq/ckv are unused -> zeros
+    // (block_forward never reads them on the 19B path, but the upload path walks
+    // all 16 vectors, so keep them d-sized rather than empty).
+    let (cq_shift, cq_scale, cq_gate, ckv_shift, ckv_scale) = if cross_adaln {
+        (
+            row_add(table, main, 6, d),
+            row_add(table, main, 7, d),
+            row_add(table, main, 8, d),
+            row_add(prompt_table, prompt_ts, 0, d),
+            row_add(prompt_table, prompt_ts, 1, d),
+        )
+    } else {
+        let z = || vec![0.0f32; d];
+        (z(), z(), z(), z(), z())
+    };
     HostStreamMod {
         msa_shift: row_add(table, main, 0, d),
         msa_scale: row_add(table, main, 1, d),
@@ -430,12 +496,11 @@ fn assemble_stream(
         mlp_shift: row_add(table, main, 3, d),
         mlp_scale: row_add(table, main, 4, d),
         mlp_gate: row_add(table, main, 5, d),
-        cq_shift: row_add(table, main, 6, d),
-        cq_scale: row_add(table, main, 7, d),
-        cq_gate: row_add(table, main, 8, d),
-        // prompt: row0 -> shift_kv, row1 -> scale_kv.
-        ckv_shift: row_add(prompt_table, prompt_ts, 0, d),
-        ckv_scale: row_add(prompt_table, prompt_ts, 1, d),
+        cq_shift,
+        cq_scale,
+        cq_gate,
+        ckv_shift,
+        ckv_scale,
         // av_ca scale/shift: rows 0,1 = a2v (scale,shift); 2,3 = v2a (scale,shift).
         a2v_scale: row_add(av_table, av_ss, 0, d),
         a2v_shift: row_add(av_table, av_ss, 1, d),
@@ -455,9 +520,11 @@ fn assemble_stream(
 pub fn assemble_block_mod(
     shared: &SharedTimestep,
     tables: &BlockTables,
+    variant: LtxVariant,
 ) -> (HostStreamMod, HostStreamMod) {
     let d = dit::DIM;
     let ad = dit::AUDIO_DIM;
+    let ca = variant.cross_adaln;
     let vmod = assemble_stream(
         &shared.v_main,
         &shared.v_prompt,
@@ -467,6 +534,7 @@ pub fn assemble_block_mod(
         &tables.prompt,
         &tables.a2v_ca_video,
         d,
+        ca,
     );
     let amod = assemble_stream(
         &shared.a_main,
@@ -477,6 +545,7 @@ pub fn assemble_block_mod(
         &tables.audio_prompt,
         &tables.a2v_ca_audio,
         ad,
+        ca,
     );
     (vmod, amod)
 }

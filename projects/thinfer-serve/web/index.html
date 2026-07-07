@@ -41,6 +41,13 @@
           <input id="input-image" type="file" accept="image/png,image/jpeg" />
         </div>
 
+        <!-- ltx2-rapid native I2V: frame-0 conditioning strength (only shown with
+             an input image on rapid). 1 = lock the input frame, lower = drift. -->
+        <div id="strength-row" hidden>
+          <label for="strength">Frame-0 strength</label>
+          <input id="strength" type="number" min="0" max="1" step="0.05" value="1" />
+        </div>
+
         <!-- DreamID-V (diffusion video face-swap) + the HyperSwap face-swap flow.
              app.js reveals these for those models and requires both then: the
              source FACE image and the TARGET video to swap it into. The video is
@@ -54,6 +61,44 @@
         <div id="input-video-row" hidden>
           <label for="input-video">Target video</label>
           <input id="input-video" type="file" accept="video/mp4" />
+        </div>
+        <!-- Face-swap compositing options (HyperSwap path only). Both change the
+             visual output, so they are opt-in; app.js reveals these rows only for
+             the face-swap kind. -->
+        <div id="occlusion-mask-row" hidden
+          title="Let hands/hair/glasses crossing the face show through instead of swapped pixels (adds one pass per face)">
+          <label for="occlusion-mask">Occlusion mask (XSeg)</label>
+          <input id="occlusion-mask" type="checkbox" />
+        </div>
+        <div id="hyperswap-mask-row" hidden
+          title="Tighten the blend to the region HyperSwap actually synthesized (free)">
+          <label for="hyperswap-mask">HyperSwap mask</label>
+          <input id="hyperswap-mask" type="checkbox" checked />
+        </div>
+        <div id="enhance-row" hidden
+          title="Run the GFPGAN face enhancer on each swapped face (restores skin/eye/teeth detail; adds a pass per face)">
+          <label for="enhance">Enhance (GFPGAN)</label>
+          <input id="enhance" type="checkbox" />
+        </div>
+        <div id="detect-stride-row" hidden
+          title="Detect faces every Nth frame, reusing the last detection in between. 1 = every frame. Higher is faster but tracks fast head motion less tightly.">
+          <label for="detect-stride">Detect every N frames</label>
+          <input id="detect-stride" type="number" min="1" step="1" value="1" />
+        </div>
+        <div id="bitrate-scale-row" hidden
+          title="Output bitrate as a multiple of the source video's bitrate. 1.15 matches the input's size/quality with a small cushion; higher is larger/cleaner, lower is smaller/softer.">
+          <label for="bitrate-scale">Bitrate x source</label>
+          <input id="bitrate-scale" type="number" min="0.1" step="0.05" value="1.15" />
+        </div>
+        <div id="trim-start-row" hidden
+          title="Only swap and output the source starting at this many seconds (rebased to 0). Blank = clip start.">
+          <label for="trim-start">Start (s)</label>
+          <input id="trim-start" type="number" min="0" step="0.1" placeholder="(clip start)" />
+        </div>
+        <div id="trim-end-row" hidden
+          title="Only swap and output the source up to this many seconds. Blank = clip end.">
+          <label for="trim-end">End (s)</label>
+          <input id="trim-end" type="number" min="0" step="0.1" placeholder="(clip end)" />
         </div>
 
         <!-- Adapter (LoRA) vault: one self-contained collapsible section (spans

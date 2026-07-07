@@ -32,6 +32,23 @@ pub const VIDEO_DEFAULT_STEPS: u32 = 4;
 /// Upper bound on the UniPC step slider (the Spaces cap at 8).
 pub const VIDEO_MAX_STEPS: u32 = 8;
 
+/// The kebab wire ids of every model (image or video) that accepts vault
+/// adapters. The vault add/list/remove surfaces are model-agnostic (keyed by the
+/// string), so they take a plain model string and validate it against this set
+/// instead of a typed enum. Keep in sync with the typed
+/// `ImageModelId::supports_adapters` / `VideoModelId::supports_adapters` predicates.
+pub const ADAPTER_MODEL_IDS: [&str; 4] = [
+    "krea-2-turbo",
+    "qwen-image-rapid",
+    "qwen-image-edit-rapid",
+    "anyflow-t2v-14b",
+];
+
+/// Whether `id` names an adapter-supporting model (see [`ADAPTER_MODEL_IDS`]).
+pub fn is_adapter_model(id: &str) -> bool {
+    ADAPTER_MODEL_IDS.contains(&id)
+}
+
 /// Resolved per-model image defaults (the registry accessor `thinfer-serve` and
 /// the CLI both read).
 #[derive(Clone, Copy, Debug)]
@@ -51,7 +68,7 @@ pub enum ImageModelId {
     #[cfg_attr(feature = "serde", serde(rename = "zimage-turbo-q8"))]
     ZImageTurboQ8,
     /// Z-Image-Turbo, Q4_K_M DiT matmul weights; halves DiT VRAM/bandwidth vs
-    /// Q8_0 at production quality. The default.
+    /// Q8_0 at production quality.
     #[cfg_attr(feature = "cli", value(name = "zimage-turbo-q4"))]
     #[cfg_attr(feature = "serde", serde(rename = "zimage-turbo-q4"))]
     ZImageTurboQ4,
@@ -101,7 +118,7 @@ pub enum ImageKind {
 }
 
 impl ImageModelId {
-    pub const DEFAULT: ImageModelId = ImageModelId::ZImageTurboQ4;
+    pub const DEFAULT: ImageModelId = ImageModelId::QwenImageRapid;
 
     /// Which engine pipeline this id drives.
     pub fn kind(self) -> ImageKind {
@@ -124,10 +141,13 @@ impl ImageModelId {
     }
 
     /// Whether request-time user adapters (the vault LoRA fold) apply to this
-    /// model. Krea 2 Turbo for now; the fold itself is model-agnostic, so a new
-    /// image DiT opts in here + wires the fold into its executor path.
+    /// model. The fold itself is model-agnostic, so a new image DiT opts in here +
+    /// wires the fold into its executor path (with its diffusers->base rename map).
     pub fn supports_adapters(self) -> bool {
-        matches!(self.kind(), ImageKind::Krea2)
+        matches!(
+            self.kind(),
+            ImageKind::Krea2 | ImageKind::QwenImage | ImageKind::QwenImageEdit
+        )
     }
 
     /// File set from the shared Z-Image variant registry (keyed by `Display`).
@@ -255,6 +275,15 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "sulphur-2-q4"))]
     #[cfg_attr(feature = "serde", serde(rename = "sulphur-2-q4"))]
     Sulphur2Q4,
+    /// ltx2-rapid: an LTX-2 19B community merge (distilled + native I2V). Same
+    /// dual-stream AV DiT backbone as LTX-2.3, but the 19B conditioning line
+    /// (FeatureExtractor V1 + in-transformer caption projection, 2-layer ungated
+    /// 3840 connector, 6-way block modulation, no gated attention / prompt-AdaLN)
+    /// and its own LTX-2 (non-.3) VAEs. Q5_K_M DiT (no Q8 exists). SINGLE-STAGE
+    /// only (no spatial upscaler ships), so it renders directly at the target res.
+    #[cfg_attr(feature = "cli", value(name = "ltx2-rapid"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ltx2-rapid"))]
+    Ltx2Rapid,
     /// Wan2.2-T2V-A14B (MoE): two 14B experts (high/low noise) + the LightX2V
     /// 4-step distill LoRA, GGUF Q5_K_M, on the Wan backbone. CFG-free distill
     /// denoise (high expert steps 0-1, low expert 2-3); Wan2.1 VAE. The state-of-
@@ -302,6 +331,7 @@ impl VideoModelId {
         match self {
             VideoModelId::Ltx23Distilled | VideoModelId::Ltx23DistilledQ4 => &ltxmf::MANIFEST,
             VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4 => &ltxmf::SULPHUR_MANIFEST,
+            VideoModelId::Ltx2Rapid => &ltxmf::LTX2_RAPID_MANIFEST,
             VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v => &hunmf::MANIFEST,
             _ => &wanmf::MANIFEST,
         }
@@ -315,6 +345,7 @@ impl VideoModelId {
                 ltxmf::role::DIT_GGUF_Q4_K_M
             }
             VideoModelId::Ltx23Distilled | VideoModelId::Sulphur2 => ltxmf::role::DIT_GGUF_Q8_0,
+            VideoModelId::Ltx2Rapid => ltxmf::role::DIT_GGUF_Q5_K_M,
             other => panic!("ltx_dit_role on non-LTX model {other}"),
         }
     }
@@ -359,6 +390,7 @@ impl VideoModelId {
     pub fn ltx_runtime_roles(self) -> &'static [&'static str] {
         match self {
             VideoModelId::Ltx23DistilledQ4 | VideoModelId::Sulphur2Q4 => ltxmf::RUNTIME_ROLES_AV_Q4,
+            VideoModelId::Ltx2Rapid => ltxmf::RUNTIME_ROLES_RAPID,
             _ => ltxmf::RUNTIME_ROLES_AV_Q8,
         }
     }
@@ -411,7 +443,25 @@ impl VideoModelId {
                 | VideoModelId::Ltx23DistilledQ4
                 | VideoModelId::Sulphur2
                 | VideoModelId::Sulphur2Q4
+                | VideoModelId::Ltx2Rapid
         )
+    }
+
+    /// ltx2-rapid (LTX-2 19B merge): the 19B conditioning line (FE V1 + caption
+    /// projection + 2-layer ungated 3840 connector, no gated attn / prompt-AdaLN)
+    /// and the LTX-2 VAEs. Selects the 19B branch in the LTX executor + the
+    /// single-stage-only denoise (no spatial upscaler ships for this merge).
+    pub fn is_ltx_rapid(self) -> bool {
+        matches!(self, VideoModelId::Ltx2Rapid)
+    }
+
+    /// LTX native I2V (first-frame anchor): only ltx2-rapid. The merge is a
+    /// "distilled + native I2V" checkpoint, so encoding an input image to a clean
+    /// frame-0 latent and holding it through the denoise rescues its weak
+    /// compositional T2V. `input_image` is OPTIONAL (present -> I2V, absent ->
+    /// T2V); the other LTX models reject it (no encoder path, two-stage grid).
+    pub fn is_ltx_i2v(self) -> bool {
+        self.is_ltx_rapid()
     }
 
     /// Sulphur-2 variants: the published GGUF is the BASE (`dev`) checkpoint, so
@@ -435,7 +485,13 @@ impl VideoModelId {
     /// VAE decode tiles (spatial + temporal) to the residency budget. All callers
     /// resolve unset `--width/--height` through this.
     pub fn video_defaults(self) -> (u32, u32) {
-        if self.is_ltx() {
+        if self.is_ltx_rapid() {
+            // The res the v62 merge's ComfyUI workflow runs (EmptyLTXVLatentVideo
+            // 768x512), i.e. in-distribution. Single-stage (no upscaler), so it
+            // renders directly here; cost scales with token count, so keep clips
+            // short on the 8GB card (~90s/step at 81f). /64-divisible.
+            (768, 512)
+        } else if self.is_ltx() {
             (1280, 704)
         } else if self.is_dreamidv() {
             // 832x480: DreamID-V's default face-swap resolution (the reference
@@ -498,7 +554,8 @@ impl VideoModelId {
     /// OOMs, and low-res single-stage is out of distribution, so two-stage is the
     /// only good regime. Surfaces that leave `upscale` unset default to this.
     pub fn two_stage_default(self) -> bool {
-        self.is_ltx()
+        // ltx2-rapid ships no spatial upscaler -> single-stage only.
+        self.is_ltx() && !self.is_ltx_rapid()
     }
 
     /// Minimum LTX pixel dim. 256 (the "fastest" tier, stage 1 at 128) is the
@@ -532,10 +589,15 @@ impl VideoModelId {
     /// video models share [`VIDEO_DEFAULT_STEPS`]; DreamID-V's faster distill is
     /// authored for 16 (`wan::dreamidv::DEFAULT_STEPS`).
     pub fn default_steps(self) -> u32 {
-        if self.is_dreamidv() {
-            thinfer_models::wan::dreamidv::DEFAULT_STEPS
-        } else {
-            VIDEO_DEFAULT_STEPS
+        match self {
+            _ if self.is_dreamidv() => thinfer_models::wan::dreamidv::DEFAULT_STEPS,
+            // AnyFlow is an any-step flow map: an eyeball sweep at 832x480 showed 2
+            // steps holds 4-step quality (the flow map jumps in one displacement per
+            // step). Each step re-streams the whole 15GB DiT (it does not fit the 8GB
+            // card), so halving steps ~halves wall time -- 2 is the quality-neutral
+            // fast default. More steps stay available via `--steps`.
+            VideoModelId::AnyflowT2v14b => 2,
+            _ => VIDEO_DEFAULT_STEPS,
         }
     }
 
@@ -543,6 +605,15 @@ impl VideoModelId {
     /// caller leaves `--guide-scale` unset (`wan::dreamidv::DEFAULT_GUIDE_SCALE`).
     pub fn default_guide_scale(self) -> f32 {
         thinfer_models::wan::dreamidv::DEFAULT_GUIDE_SCALE
+    }
+
+    /// Whether request-time user adapters (the vault LoRA fold) apply to this
+    /// video model. Only AnyFlow: it is the sole video DiT stored as diffusers-named
+    /// safetensors (the `wan::lora` rename map targets those ids), and the ecosystem
+    /// base-Wan2.1 LoRAs fold onto it. The GGUF/MoE/LTX/causal paths are not wired
+    /// (different names, or the distill LoRA already occupies the fold).
+    pub fn supports_adapters(self) -> bool {
+        matches!(self, VideoModelId::AnyflowT2v14b)
     }
 
     /// Default clip length in seconds when neither frames nor duration is
@@ -751,6 +822,7 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
             VideoModelId::Sulphur2 => "sulphur-2",
             VideoModelId::Sulphur2Q4 => "sulphur-2-q4",
+            VideoModelId::Ltx2Rapid => "ltx2-rapid",
             VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
             VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",
             VideoModelId::Hunyuan15I2v => "hunyuan-video-1.5-ti2v",
@@ -953,3 +1025,9 @@ pub const SCRFD: thinfer_core::manifest::FileRef =
     thinfer_core::manifest::FileRef::new("deepghs/insightface", "buffalo_s/det_500m.onnx");
 pub const ARCFACE: thinfer_core::manifest::FileRef =
     thinfer_core::manifest::FileRef::new("facefusion/models-3.0.0", "arcface_w600k_r50.onnx");
+/// XSeg occlusion mask, pulled in only when `--occlusion-mask` is set.
+pub const XSEG: thinfer_core::manifest::FileRef =
+    thinfer_core::manifest::FileRef::new("facefusion/models-3.1.0", "xseg_1.onnx");
+/// GFPGAN 1.4 face enhancer, pulled in only when `--enhance` is set.
+pub const GFPGAN: thinfer_core::manifest::FileRef =
+    thinfer_core::manifest::FileRef::new("facefusion/models-3.0.0", "gfpgan_1.4.onnx");

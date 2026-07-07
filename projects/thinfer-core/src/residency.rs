@@ -76,6 +76,24 @@ const READ_PREFETCH_CHUNKS: u64 = 4;
 /// (`join!` of next-acquire + prefetch), so a small cap covers steady state.
 const SCRATCH_POOL_CAP: usize = 4;
 
+/// Single-wake cooperative yield: returns `Pending` once (waking itself
+/// immediately) so a `join!` sibling gets polled, then completes. Executor-
+/// and platform-agnostic (no timer, no thread), safe on the single-threaded
+/// wasm executor. Used by the streaming chunk loop so a CPU-bound upload leg
+/// cannot monopolize the engine thread against a compute leg.
+fn yield_now() -> impl core::future::Future<Output = ()> {
+    let mut yielded = false;
+    core::future::poll_fn(move |cx| {
+        if yielded {
+            core::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    })
+}
+
 /// Target VRAM staging footprint for the banded f32 narrow+transpose prep
 /// (`NarrowTransposeF32`). The source is staged one row-band at a time so the
 /// transient f32 buffer (2x the bf16 weight) never spikes the whole tensor
@@ -645,13 +663,20 @@ impl<S: WeightSource> WeightResidency<S> {
         // Hold the in-flight transient envelope (concurrent upload staging + the
         // forward's workspace) free alongside this weight so the streamed weight
         // set caps below budget and the transients never push the true peak past
-        // it (a hard ceiling at any value, not a soft target). Floored by this
-        // weight's own staging so a single load is safe even with no envelope
-        // configured; reclaiming for staging only after the weight is allocated
-        // would let the peak overshoot by one staging buffer.
+        // it (a hard ceiling at any value, not a soft target). Transients that
+        // are ALREADY live (idle pool buffers the forward will reuse, staging in
+        // flight) count against the envelope: reserving the full envelope on top
+        // of them double-counts, and at a full budget that re-runs the reclaim
+        // chain on every admission, draining the idle workspace pool the reserve
+        // exists to protect (alloc/free ping-pong, deferred-destroy churn).
+        // Floored by this weight's own staging so a single load is safe even
+        // with no envelope configured; reclaiming for staging only after the
+        // weight is allocated would let the peak overshoot by one staging
+        // buffer.
         let reserve = self
             .transient_reserve
             .load(Ordering::Relaxed)
+            .saturating_sub(mem.vram_non_weights_current())
             .max(Self::vram_staging_bytes(&meta, prep));
         let id = match recycled {
             Some(id) => {
@@ -1275,6 +1300,28 @@ impl<S: WeightSource> WeightResidency<S> {
                 write_acc += t.elapsed();
             }
             off += n_write as u64;
+            // Cooperative yield between chunks: on a single-threaded executor
+            // a `join!`ed prefetch leg would otherwise run this whole loop
+            // (mmap memcpy + write_buffer memcpy per chunk) without ever
+            // returning control to the compute leg, starving the GPU of
+            // submits while the CPU streams weights. One yield per 16MiB
+            // chunk bounds the monopolization.
+            if off < padded_len {
+                yield_now().await;
+            }
+        }
+        // The chunk writes above are staged: `queue.write_buffer` defers the
+        // actual DMA to the head of the NEXT `queue.submit`, so bytes staged
+        // after a block's last compute submit would stall the next block's
+        // first submit instead of copying during idle queue time. An empty
+        // flush makes the copies execute now, overlapped with in-flight
+        // compute. Skip it for small weights: each flush is a real (if cheap)
+        // submit, and sub-chunk weights don't move the needle.
+        if total >= UPLOAD_CHUNK_BYTES {
+            let enc = backend.create_command_encoder();
+            backend
+                .flush_encoder(enc)
+                .map_err(ResidencyError::Backend)?;
         }
         {
             let mut pool = self.scratch_pool.lock().unwrap();
@@ -1402,7 +1449,7 @@ impl<S: WeightSource> WeightResidency<S> {
         // is still mid-forward); they'll be reclaimed on the next phase
         // boundary. Allocated_bytes drops accordingly so the eviction
         // predicate frees up budget immediately.
-        for (_, r) in g.rings.iter_mut() {
+        for r in g.rings.values_mut() {
             for slot in r.slots.iter_mut() {
                 if slot.pin_count == 0 {
                     if let Some(id) = slot.id.take() {

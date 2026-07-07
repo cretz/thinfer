@@ -54,8 +54,13 @@ pub const LATENT_CHANNELS: usize = 128;
 pub const PATCH_SIZE: usize = 4;
 /// Output RGB channels.
 pub const OUT_CHANNELS: usize = 3;
-/// `conv_out` packed channels (`out_channels * patch_size^2 = 3*16`).
+/// Packed RGB patch channels (`out_channels * patch_size^2 = 3*16 = 48`): the
+/// decoder `conv_out` output width AND the encoder `conv_in` input width (the
+/// host `patchify` / `unpatchify` boundary).
 pub const CONV_OUT_CHANNELS: usize = OUT_CHANNELS * PATCH_SIZE * PATCH_SIZE;
+/// Encoder `conv_out` width: 128 latent means + 1 uniform log-variance
+/// (`latent_log_var=uniform`); encode takes the first [`LATENT_CHANNELS`] means.
+pub const ENC_CONV_OUT_CHANNELS: usize = LATENT_CHANNELS + 1;
 /// Spatial / temporal compression (latent cell -> pixels / frames).
 pub const SPATIAL_SCALE: usize = 32;
 pub const TEMPORAL_SCALE: usize = 8;
@@ -67,12 +72,15 @@ enum UpBlockKind {
     ResX { n_layers: usize, channels: usize },
     /// `compress_*` = `DepthToSpaceUpsample`: a k3 conv `in -> conv_out_c` then a
     /// `(p1,p2,p3)` depth-to-space shuffle, dropping the leading frame when
-    /// `p1 == 2`. Output channels = `in / multiplier`.
+    /// `p1 == 2`. Output channels = `in / multiplier`. `residual` adds the
+    /// input's own shuffle-and-tile up-shortcut (`compress_all` w/ `residual:
+    /// True`; LTX-2 rapid VAE, off for the shipped distilled schedule).
     Upsample {
         conv_out_c: usize,
         out_c: usize,
         p: [usize; 3],
         t_drop: usize,
+        residual: bool,
     },
 }
 
@@ -81,6 +89,10 @@ pub struct LtxVaeConfig {
     up_blocks: Vec<UpBlockKind>,
     /// `conv_in` output channels (= base_channels * 8).
     mid_channels: usize,
+    /// Conv spatial-border `pad_mode` (`decoder_spatial_padding_mode`): 0=zeros
+    /// (distilled, explicit in its config), 2=reflect (LTX-2 rapid, the decoder
+    /// configurator default when the config omits `spatial_padding_mode`).
+    spatial_pad_mode: u32,
 }
 
 impl LtxVaeConfig {
@@ -122,6 +134,8 @@ impl LtxVaeConfig {
                         out_c,
                         p,
                         t_drop: if p[0] == 2 { 1 } else { 0 },
+                        // Distilled decoder_blocks carry no `residual` key.
+                        residual: false,
                     };
                     feature = out_c;
                     blk
@@ -133,6 +147,63 @@ impl LtxVaeConfig {
         Self {
             up_blocks,
             mid_channels: LATENT_CHANNELS * 8,
+            // Distilled config sets `spatial_padding_mode=zeros`.
+            spatial_pad_mode: 0,
+        }
+    }
+
+    /// The LTX-2 (non-.3) VAE decoder used by ltx2-rapid (verified on disk from
+    /// `Kijai/LTXV2_comfy/VAE/LTX2_video_vae_bf16.safetensors`). Same `conv_in`
+    /// 128->1024, patch_size 4, and 32x spatial / 8x temporal scale as distilled,
+    /// but a different (symmetric) block schedule: 4 uniform `res_x` (5 layers) with
+    /// 3 `compress_all` (`[2,2,2]`, mult 2) between them -> feature 1024,512,256,128.
+    /// Reconstructed from the tensor shapes: up_blocks conv `(4096,1024)`,
+    /// `(2048,512)`, `(1024,256)`; res_blocks 5 per stage.
+    pub fn ltx2_rapid() -> Self {
+        let decoder_blocks: [(&str, usize); 7] = [
+            ("res_x", 5),
+            ("compress_all", 2),
+            ("res_x", 5),
+            ("compress_all", 2),
+            ("res_x", 5),
+            ("compress_all", 2),
+            ("res_x", 5),
+        ];
+        let mut feature = LATENT_CHANNELS * 8; // 1024
+        let mut up_blocks = Vec::with_capacity(decoder_blocks.len());
+        for (name, param) in decoder_blocks.iter().rev() {
+            let block = match *name {
+                "res_x" => UpBlockKind::ResX {
+                    n_layers: *param,
+                    channels: feature,
+                },
+                "compress_all" => {
+                    let p = [2usize, 2, 2];
+                    let prod = p[0] * p[1] * p[2];
+                    let multiplier = *param;
+                    let conv_out_c = prod * feature / multiplier;
+                    let out_c = feature / multiplier;
+                    let blk = UpBlockKind::Upsample {
+                        conv_out_c,
+                        out_c,
+                        p,
+                        t_drop: 1,
+                        // LTX-2 rapid `compress_all` sets `residual: True`.
+                        residual: true,
+                    };
+                    feature = out_c;
+                    blk
+                }
+                other => panic!("unknown decoder block: {other}"),
+            };
+            up_blocks.push(block);
+        }
+        Self {
+            up_blocks,
+            mid_channels: LATENT_CHANNELS * 8,
+            // The rapid config omits `spatial_padding_mode`; the decoder
+            // configurator defaults it to reflect (encoder defaults to zeros).
+            spatial_pad_mode: 2,
         }
     }
 
@@ -407,10 +478,11 @@ fn conv3d_uniform_bytes(
     w_out: u32,
     ker: (u32, u32, u32),
     pad: (u32, u32, u32),
+    pad_mode: u32,
 ) -> [u8; 80] {
     let fields: [u32; 20] = [
         1, cin, cout, t_in, h_in, w_in, t_out, h_out, w_out, ker.0, ker.1, ker.2, pad.0, pad.1,
-        pad.2, 1, 1, 1, 0, 0,
+        pad.2, 1, 1, 1, pad_mode, 0,
     ];
     let mut bytes = [0u8; 80];
     for (i, v) in fields.iter().enumerate() {
@@ -462,11 +534,13 @@ fn depth_to_space_uniform_bytes(
     t_out: u32,
     h_out: u32,
     w_out: u32,
-) -> [u8; 48] {
-    let fields: [u32; 12] = [
-        cin, t_in, h_in, w_in, p[0], p[1], p[2], t_drop, cout, t_out, h_out, w_out,
+    base_cout: u32,
+) -> [u8; 64] {
+    let fields: [u32; 16] = [
+        cin, t_in, h_in, w_in, p[0], p[1], p[2], t_drop, cout, t_out, h_out, w_out, base_cout, 0,
+        0, 0,
     ];
-    let mut bytes = [0u8; 48];
+    let mut bytes = [0u8; 64];
     for (i, v) in fields.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -476,6 +550,15 @@ fn depth_to_space_uniform_bytes(
 // ============================================================================
 // Op wrappers (all run inside one BatchScope)
 // ============================================================================
+
+/// Temporal padding for a k3 conv (both pad time by 2 -> conv restores T).
+/// `Symmetric` (`causal=False`, decoder) pads one frame each side; `Causal`
+/// (`causal=True`, encoder) front-pads two frames (repeat frame 0), no rear pad.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimePad {
+    Symmetric,
+    Causal,
+}
 
 /// Symmetric replicate temporal pad by 1 (`causal=False`): `[C,T,H,W]` ->
 /// `[C,T+2,H,W]` = `[x0, x0..x_{T-1}, x_{T-1}]`, via two `concat_time` passes.
@@ -510,8 +593,39 @@ fn replicate_pad_time<'w>(
     Ok(padded)
 }
 
-/// k3 conv with `causal=False` padding: replicate-pad time (+1 each side), zeros
-/// pad H/W (+1 each side), stride 1. `[in.c, T, H, W]` -> `[cout, T, H, W]`.
+/// Causal temporal pad by 2 (`causal=True`): `[C,T,H,W]` -> `[C,T+2,H,W]` =
+/// `[x0, x0, x0..x_{T-1}]` (repeat frame 0 twice up front, no rear pad), via two
+/// `concat_time` passes. This is the encoder's `CausalConv3d` front-pad; the conv
+/// (pad_t=0, stride 1) then restores T.
+fn causal_pad_time<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &LtxVaePipelines,
+    x: thinfer_core::workspace::BatchBuf<'w>,
+    s: Shape,
+) -> Result<thinfer_core::workspace::BatchBuf<'w>, WgpuError> {
+    // tmp [C,2,H,W] = [x0, x0].
+    let tmp_shape = Shape { t: 2, ..s };
+    let tmp = scope.alloc(tmp_shape.bytes(pl.act_size()))?;
+    let u1 = scope.write_uniform(&concat_time_uniform_bytes(
+        s.c, s.h, s.w, s.t, s.t, 0, 1, 0, 1,
+    ))?;
+    scope.concat_time::<ConcatTimeF32>(&pl.concat_time, x, x, u1, tmp, tmp_shape.elems())?;
+    // padded [C,T+2,H,W] = [x0, x0, x0..x_{T-1}].
+    let pad_shape = Shape { t: s.t + 2, ..s };
+    let padded = scope.alloc(pad_shape.bytes(pl.act_size()))?;
+    let u2 = scope.write_uniform(&concat_time_uniform_bytes(
+        s.c, s.h, s.w, 2, s.t, 0, 2, 0, s.t,
+    ))?;
+    scope.concat_time::<ConcatTimeF32>(&pl.concat_time, tmp, x, u2, padded, pad_shape.elems())?;
+    Ok(padded)
+}
+
+/// k3 conv, stride 1, with time pre-padded by 2 (mode-dependent: `Symmetric` =
+/// decoder `causal=False` replicate; `Causal` = encoder `causal=True` front-pad)
+/// so the conv restores T. The conv then pads H/W (+1 each side) with `pad_mode`
+/// (0=zeros for the distilled VAE + every encoder conv, 2=reflect for the LTX-2
+/// rapid decoder). `pad_mode` only affects the spatial border (conv pad_t=0).
+/// `[in.c, T, H, W]` -> `[cout, T, H, W]`.
 fn conv3d_k3<'w>(
     scope: &BatchScope<'w, WgpuBackend>,
     pl: &LtxVaePipelines,
@@ -519,8 +633,13 @@ fn conv3d_k3<'w>(
     s: Shape,
     w: &ConvBufs,
     cout: u32,
+    pad_mode: u32,
+    time_pad: TimePad,
 ) -> Result<(thinfer_core::workspace::BatchBuf<'w>, Shape), WgpuError> {
-    let padded = replicate_pad_time(scope, pl, x, s)?;
+    let padded = match time_pad {
+        TimePad::Symmetric => replicate_pad_time(scope, pl, x, s)?,
+        TimePad::Causal => causal_pad_time(scope, pl, x, s)?,
+    };
     let out_shape = Shape { c: cout, ..s };
     let out = scope.alloc(out_shape.bytes(pl.act_size()))?;
     let u = scope.write_uniform(&conv3d_uniform_bytes(
@@ -534,6 +653,7 @@ fn conv3d_k3<'w>(
         s.w,
         (3, 3, 3),
         (0, 1, 1),
+        pad_mode,
     ))?;
     let wb = scope.import_copy(w.weight);
     let bb = scope.import_copy(w.bias);
@@ -587,8 +707,38 @@ fn add<'w>(
     Ok(out)
 }
 
-/// `DepthToSpaceUpsample` (residual=False): k3 conv `in -> conv_out_c`, then a
-/// `(p1,p2,p3)` depth-to-space shuffle (+ leading-frame drop when p1==2).
+/// One channel-preserving `res_x` resnet layer (`ResnetBlock3D`, in==out):
+/// `x + conv2(silu(norm2(conv1(silu(norm1(x))))))`. Shared by the decoder
+/// `up_blocks` and the encoder `down_blocks` (they are the same module); the
+/// only difference is the conv temporal padding (`Symmetric` decode / `Causal`
+/// encode). `cout == s.c`.
+#[allow(clippy::too_many_arguments)]
+fn resnet_layer<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &LtxVaePipelines,
+    x: thinfer_core::workspace::BatchBuf<'w>,
+    s: Shape,
+    conv1: &ConvBufs,
+    conv2: &ConvBufs,
+    pad_mode: u32,
+    time_pad: TimePad,
+) -> Result<thinfer_core::workspace::BatchBuf<'w>, WgpuError> {
+    let cout = s.c;
+    let n1 = pixel_norm(scope, pl, x, s)?;
+    let a1 = silu(scope, pl, n1, s)?;
+    let (c1, _) = conv3d_k3(scope, pl, a1, s, conv1, cout, pad_mode, time_pad)?;
+    let n2 = pixel_norm(scope, pl, c1, s)?;
+    let a2 = silu(scope, pl, n2, s)?;
+    let (c2, _) = conv3d_k3(scope, pl, a2, s, conv2, cout, pad_mode, time_pad)?;
+    add(scope, pl, x, c2, s)
+}
+
+/// Depth-to-space shuffle of `x` into `out_c` channels: a `(p1,p2,p3)` pixel
+/// shuffle (`b (c p1 p2 p3) t h w -> b c (t p1)(h p2)(w p3)`, + leading-frame
+/// drop when p1==2). `base_c` is the pre-tile channel count (`s.c / prod(p)`):
+/// pass `base_c == out_c` for the plain shuffle (`residual=False` conv path), or
+/// `base_c = s.c / prod` with `out_c = base_c * repeat` to tile the shuffle up
+/// for the residual up-shortcut (`x_in` in `DepthToSpaceUpsample(residual=True)`).
 #[allow(clippy::too_many_arguments)]
 fn depth_to_space<'w>(
     scope: &BatchScope<'w, WgpuBackend>,
@@ -598,6 +748,7 @@ fn depth_to_space<'w>(
     p: [u32; 3],
     t_drop: u32,
     out_c: u32,
+    base_c: u32,
 ) -> Result<(thinfer_core::workspace::BatchBuf<'w>, Shape), WgpuError> {
     let out_shape = Shape {
         c: out_c,
@@ -617,6 +768,7 @@ fn depth_to_space<'w>(
         out_shape.t,
         out_shape.h,
         out_shape.w,
+        base_c,
     ))?;
     scope.depth_to_space3d::<DepthToSpace3dF32>(
         &pl.depth_to_space,
@@ -716,7 +868,24 @@ impl LtxVaeDecoder {
         latents_mean: Vec<f32>,
         latents_std: Vec<f32>,
     ) -> Result<Self, LoadError> {
-        let cfg = LtxVaeConfig::distilled();
+        Self::new_with_config(
+            pipelines,
+            residency,
+            latents_mean,
+            latents_std,
+            LtxVaeConfig::distilled(),
+        )
+    }
+
+    /// [`Self::new`] with an explicit decoder config (ltx2-rapid uses
+    /// [`LtxVaeConfig::ltx2_rapid`]; the shipped 22B path uses `distilled`).
+    pub fn new_with_config<S: WeightSource>(
+        pipelines: LtxVaePipelines,
+        residency: &WeightResidency<S>,
+        latents_mean: Vec<f32>,
+        latents_std: Vec<f32>,
+        cfg: LtxVaeConfig,
+    ) -> Result<Self, LoadError> {
         let weights = DecoderW::new(&cfg);
         let handles = DecoderH::register(residency, &weights)?;
         assert_eq!(latents_mean.len(), LATENT_CHANNELS);
@@ -1022,6 +1191,7 @@ impl LtxVaeDecoder {
         {
             let scope = workspace.batch();
             let pl = &self.pipelines;
+            let pad_mode = self.cfg.spatial_pad_mode;
             let mut x = scope.import_copy(in_buf.as_buf_ref());
             let mut s = Shape {
                 c: LATENT_CHANNELS as u32,
@@ -1038,6 +1208,8 @@ impl LtxVaeDecoder {
                 s,
                 &bufs.conv_in,
                 self.cfg.mid_channels as u32,
+                pad_mode,
+                TimePad::Symmetric,
             )?;
             x = cx;
             s = cs;
@@ -1050,19 +1222,20 @@ impl LtxVaeDecoder {
             for (i, blk) in self.cfg.up_blocks.iter().enumerate() {
                 match blk {
                     UpBlockKind::ResX { n_layers, channels } => {
-                        let cout = *channels as u32;
-                        debug_assert_eq!(s.c, cout, "res_x preserves channels");
+                        debug_assert_eq!(s.c, *channels as u32, "res_x preserves channels");
                         for j in 0..*n_layers {
                             let conv1 = &bufs.up_blocks[i][2 * j];
                             let conv2 = &bufs.up_blocks[i][2 * j + 1];
-                            // norm1 -> silu -> conv1 -> norm2 -> silu -> conv2 + residual.
-                            let n1 = pixel_norm(&scope, pl, x, s)?;
-                            let a1 = silu(&scope, pl, n1, s)?;
-                            let (c1, _) = conv3d_k3(&scope, pl, a1, s, conv1, cout)?;
-                            let n2 = pixel_norm(&scope, pl, c1, s)?;
-                            let a2 = silu(&scope, pl, n2, s)?;
-                            let (c2, _) = conv3d_k3(&scope, pl, a2, s, conv2, cout)?;
-                            x = add(&scope, pl, x, c2, s)?;
+                            x = resnet_layer(
+                                &scope,
+                                pl,
+                                x,
+                                s,
+                                conv1,
+                                conv2,
+                                pad_mode,
+                                TimePad::Symmetric,
+                            )?;
                         }
                     }
                     UpBlockKind::Upsample {
@@ -1070,14 +1243,43 @@ impl LtxVaeDecoder {
                         out_c,
                         p,
                         t_drop,
-                        ..
+                        residual,
                     } => {
                         let conv = &bufs.up_blocks[i][0];
-                        let (cx, cs) = conv3d_k3(&scope, pl, x, s, conv, *conv_out_c as u32)?;
                         let pp = [p[0] as u32, p[1] as u32, p[2] as u32];
-                        let (dx, ds) =
-                            depth_to_space(&scope, pl, cx, cs, pp, *t_drop as u32, *out_c as u32)?;
-                        x = dx;
+                        let td = *t_drop as u32;
+                        // Main path: k3 conv `in -> conv_out_c` then shuffle to out_c.
+                        let (cx, cs) = conv3d_k3(
+                            &scope,
+                            pl,
+                            x,
+                            s,
+                            conv,
+                            *conv_out_c as u32,
+                            pad_mode,
+                            TimePad::Symmetric,
+                        )?;
+                        let (dx, ds) = depth_to_space(
+                            &scope,
+                            pl,
+                            cx,
+                            cs,
+                            pp,
+                            td,
+                            *out_c as u32,
+                            *out_c as u32,
+                        )?;
+                        // Residual up-shortcut: shuffle the block INPUT into
+                        // `s.c / prod` channels and tile it up to out_c, then add.
+                        x = if *residual {
+                            let prod = pp[0] * pp[1] * pp[2];
+                            let base_c = s.c / prod;
+                            let (rx, _) =
+                                depth_to_space(&scope, pl, x, s, pp, td, *out_c as u32, base_c)?;
+                            add(&scope, pl, dx, rx, ds)?
+                        } else {
+                            dx
+                        };
                         s = ds;
                     }
                 }
@@ -1089,7 +1291,16 @@ impl LtxVaeDecoder {
             // norm_out -> silu -> conv_out (k3, 1024-stage-out -> 48).
             let n = pixel_norm(&scope, pl, x, s)?;
             let a = silu(&scope, pl, n, s)?;
-            let (co, cos) = conv3d_k3(&scope, pl, a, s, &bufs.conv_out, CONV_OUT_CHANNELS as u32)?;
+            let (co, cos) = conv3d_k3(
+                &scope,
+                pl,
+                a,
+                s,
+                &bufs.conv_out,
+                CONV_OUT_CHANNELS as u32,
+                pad_mode,
+                TimePad::Symmetric,
+            )?;
             conv_out_shape = cos;
             conv_out_persist = persist(&scope, workspace, co, cos, act_size)?;
 
@@ -1255,6 +1466,639 @@ fn unpatchify_4x4(packed: &[f32], s: Shape) -> Vec<f32> {
                 }
             }
         }
+    }
+    out
+}
+
+// ============================================================================
+// Encoder (image/video -> latent), for native I2V frame-0 conditioning.
+//
+// Mirror of the upstream `VideoEncoder` (video_vae.py). The conv/norm/silu run
+// on the GPU (reusing the decoder pipelines); the `SpaceToDepthDownsample`
+// space-to-depth + grouped-mean skip and the initial `patchify` run host-side
+// between per-block scopes (encode runs ONCE per generation, so bounded host
+// rearranges cost nothing and add no kernels -- same pattern as the Hunyuan VAE
+// encoder). Every conv is `causal=True` (front-pad time by 2) with ZEROS spatial
+// padding (the encoder default; the config omits `spatial_padding_mode`).
+// ============================================================================
+
+/// One encoder `down_block` (config order).
+#[derive(Clone, Debug)]
+enum EncBlock {
+    /// `res_x` = `UNetMidBlock3D`: `n_layers` channel-preserving resnets.
+    ResX { n_layers: usize, channels: usize },
+    /// `compress_*_res` = `SpaceToDepthDownsample`: a k3 conv `in_c ->
+    /// conv_out_c` then a `stride` space-to-depth (-> `out_c`), plus a grouped-
+    /// mean space-to-depth skip of the block input. `stride` selects the
+    /// compressed dims (space / time / all).
+    Compress {
+        in_c: usize,
+        out_c: usize,
+        /// Conv output channels (`out_c / prod(stride)`); space-to-depth then
+        /// re-expands by `prod(stride)` back to `out_c`.
+        conv_out_c: usize,
+        /// Skip group size (`in_c * prod(stride) / out_c`): the space-to-depth of
+        /// the input has `in_c * prod` channels, mean-pooled in contiguous groups.
+        group_size: usize,
+        stride: [usize; 3],
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct LtxVaeEncoderConfig {
+    blocks: Vec<EncBlock>,
+    /// Final feature width feeding `conv_out` (2048 for rapid).
+    feature_out: usize,
+}
+
+impl LtxVaeEncoderConfig {
+    /// The LTX-2 rapid encoder, verified from the on-disk `encoder_blocks`:
+    /// res_x(4), compress_space_res, res_x(6), compress_time_res, res_x(6),
+    /// compress_all_res, res_x(2), compress_all_res, res_x(2). Every
+    /// `compress_*_res` doubles channels (multiplier 2); features run
+    /// 128 -> 256 -> 512 -> 1024 -> 2048. Net 32x spatial / 8x temporal.
+    pub fn ltx2_rapid() -> Self {
+        // (name, multiplier-or-num_layers).
+        let schedule: [(&str, usize); 9] = [
+            ("res_x", 4),
+            ("compress_space", 2),
+            ("res_x", 6),
+            ("compress_time", 2),
+            ("res_x", 6),
+            ("compress_all", 2),
+            ("res_x", 2),
+            ("compress_all", 2),
+            ("res_x", 2),
+        ];
+        let mut feature = LATENT_CHANNELS; // conv_in output = 128.
+        let mut blocks = Vec::with_capacity(schedule.len());
+        for (name, param) in schedule {
+            match name {
+                "res_x" => blocks.push(EncBlock::ResX {
+                    n_layers: param,
+                    channels: feature,
+                }),
+                "compress_space" | "compress_time" | "compress_all" => {
+                    let stride = match name {
+                        "compress_space" => [1usize, 2, 2],
+                        "compress_time" => [2, 1, 1],
+                        _ => [2, 2, 2],
+                    };
+                    let prod = stride[0] * stride[1] * stride[2];
+                    let in_c = feature;
+                    let out_c = in_c * param; // multiplier.
+                    blocks.push(EncBlock::Compress {
+                        in_c,
+                        out_c,
+                        conv_out_c: out_c / prod,
+                        group_size: in_c * prod / out_c,
+                        stride,
+                    });
+                    feature = out_c;
+                }
+                other => panic!("unknown encoder block: {other}"),
+            }
+        }
+        Self {
+            blocks,
+            feature_out: feature,
+        }
+    }
+}
+
+/// All encoder conv weight ids, in forward order (mirrors [`DecoderW`]).
+struct EncoderW {
+    conv_in: ConvW,
+    /// `down_blocks[i]`: res_x = `2*n_layers` convs (conv1,conv2 flat); compress
+    /// = 1 conv (`down_blocks.{i}.conv.conv`).
+    down_blocks: Vec<Vec<ConvW>>,
+    conv_out: ConvW,
+}
+
+impl EncoderW {
+    fn new(cfg: &LtxVaeEncoderConfig) -> Self {
+        let mut down_blocks = Vec::with_capacity(cfg.blocks.len());
+        for (i, blk) in cfg.blocks.iter().enumerate() {
+            let mut convs = Vec::new();
+            match blk {
+                EncBlock::ResX { n_layers, .. } => {
+                    for j in 0..*n_layers {
+                        let p = format!("encoder.down_blocks.{i}.res_blocks.{j}");
+                        convs.push(conv_w(&format!("{p}.conv1.conv")));
+                        convs.push(conv_w(&format!("{p}.conv2.conv")));
+                    }
+                }
+                EncBlock::Compress { .. } => {
+                    convs.push(conv_w(&format!("encoder.down_blocks.{i}.conv.conv")));
+                }
+            }
+            down_blocks.push(convs);
+        }
+        Self {
+            conv_in: conv_w("encoder.conv_in.conv"),
+            down_blocks,
+            conv_out: conv_w("encoder.conv_out.conv"),
+        }
+    }
+}
+
+struct EncoderH {
+    conv_in: ConvH,
+    down_blocks: Vec<Vec<ConvH>>,
+    conv_out: ConvH,
+}
+
+impl EncoderH {
+    fn register<S: WeightSource>(
+        res: &WeightResidency<S>,
+        w: &EncoderW,
+    ) -> Result<Self, LoadError> {
+        let mut down_blocks = Vec::with_capacity(w.down_blocks.len());
+        for convs in &w.down_blocks {
+            let mut hs = Vec::with_capacity(convs.len());
+            for c in convs {
+                hs.push(reg_conv(res, c)?);
+            }
+            down_blocks.push(hs);
+        }
+        Ok(Self {
+            conv_in: reg_conv(res, &w.conv_in)?,
+            down_blocks,
+            conv_out: reg_conv(res, &w.conv_out)?,
+        })
+    }
+}
+
+/// Prepend a duplicate of frame 0 (`SpaceToDepthDownsample`'s temporal-stride
+/// front-pad, distinct from the conv's causal pad): `[C,T,H,W] -> [C,T+1,H,W]` =
+/// `[x0, x0..x_{T-1}]`.
+fn dup_first_frame<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &LtxVaePipelines,
+    x: thinfer_core::workspace::BatchBuf<'w>,
+    s: Shape,
+) -> Result<(thinfer_core::workspace::BatchBuf<'w>, Shape), WgpuError> {
+    let out_shape = Shape { t: s.t + 1, ..s };
+    let out = scope.alloc(out_shape.bytes(pl.act_size()))?;
+    let u = scope.write_uniform(&concat_time_uniform_bytes(
+        s.c, s.h, s.w, s.t, s.t, 0, 1, 0, s.t,
+    ))?;
+    scope.concat_time::<ConcatTimeF32>(&pl.concat_time, x, x, u, out, out_shape.elems())?;
+    Ok((out, out_shape))
+}
+
+pub struct LtxVaeEncoder {
+    pipelines: LtxVaePipelines,
+    cfg: LtxVaeEncoderConfig,
+    handles: EncoderH,
+    /// Baked per-channel latent normalization (`per_channel_statistics`); encode
+    /// applies `(mean - mean-of-means) / std-of-means` (inverse of the decoder
+    /// un-normalize), so the output shares the DiT's normalized latent space.
+    latents_mean: Vec<f32>,
+    latents_std: Vec<f32>,
+}
+
+impl LtxVaeEncoder {
+    pub fn new<S: WeightSource>(
+        pipelines: LtxVaePipelines,
+        residency: &WeightResidency<S>,
+        latents_mean: Vec<f32>,
+        latents_std: Vec<f32>,
+        cfg: LtxVaeEncoderConfig,
+    ) -> Result<Self, LoadError> {
+        assert_eq!(latents_mean.len(), LATENT_CHANNELS);
+        assert_eq!(latents_std.len(), LATENT_CHANNELS);
+        let handles = EncoderH::register(residency, &EncoderW::new(&cfg))?;
+        Ok(Self {
+            pipelines,
+            cfg,
+            handles,
+            latents_mean,
+            latents_std,
+        })
+    }
+
+    /// Encode a NORMALIZED-`[-1,1]` video `[3, t, hp, wp]` (row-major CTHW;
+    /// `t == 1 + 8*k`, `hp`/`wp` multiples of 32) into the normalized latent
+    /// `[128, 1 + (t-1)/8, hp/32, wp/32]` f32 (distribution mean, per-channel
+    /// normalized). Single frame (`t == 1`) is the I2V frame-0 case.
+    pub async fn encode<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &Workspace<WgpuBackend>,
+        frame: &[f32],
+        t: usize,
+        hp: usize,
+        wp: usize,
+    ) -> Result<Vec<f32>, LtxVaeError<S::Error>> {
+        self.encode_with_taps(backend, residency, workspace, frame, t, hp, wp, None)
+            .await
+    }
+
+    /// [`Self::encode`] with an optional per-`down_block` output sink (parity
+    /// bisection): each `Some` sink is filled with one host `[C,T,H,W]` vector
+    /// per encoder block, in forward order.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn encode_with_taps<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &Workspace<WgpuBackend>,
+        frame: &[f32],
+        t: usize,
+        hp: usize,
+        wp: usize,
+        mut block_taps: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Vec<f32>, LtxVaeError<S::Error>> {
+        assert_eq!(frame.len(), OUT_CHANNELS * t * hp * wp, "frame [3,t,hp,wp]");
+        assert!(
+            hp.is_multiple_of(SPATIAL_SCALE) && wp.is_multiple_of(SPATIAL_SCALE),
+            "hp/wp must be multiples of {SPATIAL_SCALE}"
+        );
+        assert!((t - 1).is_multiple_of(TEMPORAL_SCALE), "t must be 1 + 8*k");
+        if let Some(taps) = block_taps.as_deref_mut() {
+            taps.clear();
+        }
+
+        // Host patchify: [3, t, hp, wp] -> [48, t, hp/4, wp/4].
+        let (mut host, mut s) = patchify_4x4(frame, t, hp, wp);
+
+        for (bi, blk) in self.cfg.blocks.iter().enumerate() {
+            match blk {
+                EncBlock::ResX { n_layers, channels } => {
+                    host = self
+                        .run_res_x(backend, residency, workspace, bi, *n_layers, &mut s, &host)
+                        .await?;
+                    debug_assert_eq!(s.c as usize, *channels, "res_x channel width");
+                }
+                EncBlock::Compress {
+                    in_c,
+                    out_c,
+                    conv_out_c,
+                    group_size,
+                    stride,
+                } => {
+                    host = self
+                        .run_compress(
+                            backend,
+                            residency,
+                            workspace,
+                            bi,
+                            *in_c,
+                            *out_c,
+                            *conv_out_c,
+                            *group_size,
+                            *stride,
+                            &mut s,
+                            &host,
+                        )
+                        .await?;
+                }
+            }
+            if let Some(taps) = block_taps.as_deref_mut() {
+                taps.push(host.clone());
+            }
+        }
+
+        // norm_out (pixel_norm) -> silu -> conv_out (feature -> 129).
+        let raw = self
+            .run_conv_out(backend, residency, workspace, &mut s, &host)
+            .await?;
+
+        // Means = first 128 channels (channel-major, so contiguous); normalize.
+        let plane = (s.t * s.h * s.w) as usize;
+        let mut z = raw[..LATENT_CHANNELS * plane].to_vec();
+        for c in 0..LATENT_CHANNELS {
+            let (mean, std) = (self.latents_mean[c], self.latents_std[c]);
+            for v in &mut z[c * plane..(c + 1) * plane] {
+                *v = (*v - mean) / std;
+            }
+        }
+        Ok(z)
+    }
+
+    /// A `res_x` block: `n_layers` resnets in one scope (conv_in prepended for
+    /// block 0). Host in -> host out; `s` updated (conv_in changes 48 -> 128).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_res_x<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &Workspace<WgpuBackend>,
+        bi: usize,
+        n_layers: usize,
+        s: &mut Shape,
+        host: &[f32],
+    ) -> Result<Vec<f32>, LtxVaeError<S::Error>> {
+        use thinfer_core::backend::Backend;
+        let pl = &self.pipelines;
+        let act = pl.act;
+        let act_size = pl.act_size();
+        let mut pins: Vec<GpuView> = Vec::new();
+        let conv_in = if bi == 0 {
+            Some(acquire_conv(residency, backend, self.handles.conv_in, &mut pins).await?)
+        } else {
+            None
+        };
+        let mut convs = Vec::with_capacity(2 * n_layers);
+        for h in &self.handles.down_blocks[bi] {
+            convs.push(acquire_conv(residency, backend, *h, &mut pins).await?);
+        }
+
+        let up = crate::common::seq::act_upload_bytes(act, host);
+        let x_up = workspace.alloc(up.len() as u64)?;
+        backend.write_buffer(x_up.id(), 0, &up)?;
+
+        let (out_ws, out_s);
+        {
+            let scope = workspace.batch();
+            let mut x = scope.import_copy(x_up.as_buf_ref());
+            let mut cur = *s;
+            if let Some(ci) = &conv_in {
+                let (y, ns) = conv3d_k3(
+                    &scope,
+                    pl,
+                    x,
+                    cur,
+                    ci,
+                    LATENT_CHANNELS as u32,
+                    0,
+                    TimePad::Causal,
+                )?;
+                x = y;
+                cur = ns;
+            }
+            for j in 0..n_layers {
+                x = resnet_layer(
+                    &scope,
+                    pl,
+                    x,
+                    cur,
+                    &convs[2 * j],
+                    &convs[2 * j + 1],
+                    0,
+                    TimePad::Causal,
+                )?;
+            }
+            out_s = cur;
+            out_ws = persist(&scope, workspace, x, cur, act_size)?;
+            scope.submit_void().await?;
+        }
+        *s = out_s;
+        Ok(read_acts(backend, &out_ws.as_buf_ref(), out_s.elems() as usize, act).await?)
+    }
+
+    /// A `compress_*_res` block. GPU: optional temporal frame-0 dup, then the k3
+    /// causal conv. Host: space-to-depth of both the conv output (-> `out_c`) and
+    /// the (dup'd) block input, grouped-mean the latter for the skip, and add.
+    /// `s` updated to the compressed shape.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_compress<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &Workspace<WgpuBackend>,
+        bi: usize,
+        in_c: usize,
+        out_c: usize,
+        conv_out_c: usize,
+        group_size: usize,
+        stride: [usize; 3],
+        s: &mut Shape,
+        host: &[f32],
+    ) -> Result<Vec<f32>, LtxVaeError<S::Error>> {
+        use thinfer_core::backend::Backend;
+        let pl = &self.pipelines;
+        let act = pl.act;
+        let act_size = pl.act_size();
+        let temporal = stride[0] == 2;
+
+        let mut pins: Vec<GpuView> = Vec::new();
+        let conv = acquire_conv(
+            residency,
+            backend,
+            self.handles.down_blocks[bi][0],
+            &mut pins,
+        )
+        .await?;
+
+        let up = crate::common::seq::act_upload_bytes(act, host);
+        let x_up = workspace.alloc(up.len() as u64)?;
+        backend.write_buffer(x_up.id(), 0, &up)?;
+
+        // Skip source = the (dup'd) block input; conv output = the main path.
+        let (skip_ws, skip_s, conv_ws, conv_s);
+        {
+            let scope = workspace.batch();
+            let mut x = scope.import_copy(x_up.as_buf_ref());
+            let mut xs = *s;
+            if temporal {
+                let (y, ns) = dup_first_frame(&scope, pl, x, xs)?;
+                x = y;
+                xs = ns;
+            }
+            skip_ws = persist(&scope, workspace, x, xs, act_size)?;
+            skip_s = xs;
+            let (cx, cs) = conv3d_k3(
+                &scope,
+                pl,
+                x,
+                xs,
+                &conv,
+                conv_out_c as u32,
+                0,
+                TimePad::Causal,
+            )?;
+            conv_ws = persist(&scope, workspace, cx, cs, act_size)?;
+            conv_s = cs;
+            scope.submit_void().await?;
+        }
+        let skip_host =
+            read_acts(backend, &skip_ws.as_buf_ref(), skip_s.elems() as usize, act).await?;
+        let conv_host =
+            read_acts(backend, &conv_ws.as_buf_ref(), conv_s.elems() as usize, act).await?;
+        drop(pins);
+
+        // Main: space-to-depth conv output (conv_out_c * prod = out_c channels).
+        let main = space_to_depth3d(
+            &conv_host,
+            conv_out_c,
+            conv_s.t as usize,
+            conv_s.h as usize,
+            conv_s.w as usize,
+            stride,
+        );
+        // Skip: space-to-depth input (in_c * prod channels), grouped-mean -> out_c.
+        let sd_skip = space_to_depth3d(
+            &skip_host,
+            in_c,
+            skip_s.t as usize,
+            skip_s.h as usize,
+            skip_s.w as usize,
+            stride,
+        );
+        let out_t = skip_s.t as usize / stride[0];
+        let out_h = skip_s.h as usize / stride[1];
+        let out_w = skip_s.w as usize / stride[2];
+        let plane = out_t * out_h * out_w;
+        let skip = group_mean_plane(&sd_skip, out_c, group_size, plane);
+        debug_assert_eq!(main.len(), out_c * plane, "compress main channel math");
+
+        let mut out = main;
+        for (a, b) in out.iter_mut().zip(skip.iter()) {
+            *a += b;
+        }
+        *s = Shape {
+            c: out_c as u32,
+            t: out_t as u32,
+            h: out_h as u32,
+            w: out_w as u32,
+        };
+        Ok(out)
+    }
+
+    /// Final `pixel_norm -> silu -> conv_out` (feature -> 129). Returns the raw
+    /// `[129, T', H', W']` host output; `s` updated to `c = 129`.
+    async fn run_conv_out<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &Workspace<WgpuBackend>,
+        s: &mut Shape,
+        host: &[f32],
+    ) -> Result<Vec<f32>, LtxVaeError<S::Error>> {
+        use thinfer_core::backend::Backend;
+        let pl = &self.pipelines;
+        let act = pl.act;
+        let act_size = pl.act_size();
+        debug_assert_eq!(s.c as usize, self.cfg.feature_out, "conv_out input width");
+
+        let mut pins: Vec<GpuView> = Vec::new();
+        let conv_out = acquire_conv(residency, backend, self.handles.conv_out, &mut pins).await?;
+
+        let up = crate::common::seq::act_upload_bytes(act, host);
+        let x_up = workspace.alloc(up.len() as u64)?;
+        backend.write_buffer(x_up.id(), 0, &up)?;
+
+        let (out_ws, out_s);
+        {
+            let scope = workspace.batch();
+            let x = scope.import_copy(x_up.as_buf_ref());
+            let n = pixel_norm(&scope, pl, x, *s)?;
+            let a = silu(&scope, pl, n, *s)?;
+            let (co, cos) = conv3d_k3(
+                &scope,
+                pl,
+                a,
+                *s,
+                &conv_out,
+                ENC_CONV_OUT_CHANNELS as u32,
+                0,
+                TimePad::Causal,
+            )?;
+            out_s = cos;
+            out_ws = persist(&scope, workspace, co, cos, act_size)?;
+            scope.submit_void().await?;
+        }
+        *s = out_s;
+        Ok(read_acts(backend, &out_ws.as_buf_ref(), out_s.elems() as usize, act).await?)
+    }
+}
+
+/// Host `patchify` (patch 4, inverse of [`unpatchify_4x4`]): `[3, t, hp, wp]` ->
+/// `[48, t, hp/4, wp/4]`. einops `c (h q)(w r) -> (c r q) h w`, q,r = 4: pixel
+/// `(c, hp=h*4+q, wp=w*4+r)` -> packed channel `(c*4 + r)*4 + q` at `(h, w)`.
+fn patchify_4x4(frame: &[f32], t: usize, hp: usize, wp: usize) -> (Vec<f32>, Shape) {
+    let (ho, wo) = (hp / PATCH_SIZE, wp / PATCH_SIZE);
+    let mut out = vec![0.0f32; CONV_OUT_CHANNELS * t * ho * wo];
+    let in_thw = t * hp * wp;
+    let out_thw = t * ho * wo;
+    for c in 0..OUT_CHANNELS {
+        for r in 0..PATCH_SIZE {
+            for q in 0..PATCH_SIZE {
+                let cp = (c * PATCH_SIZE + r) * PATCH_SIZE + q;
+                for tt in 0..t {
+                    for h in 0..ho {
+                        for w in 0..wo {
+                            let src = c * in_thw
+                                + (tt * hp + h * PATCH_SIZE + q) * wp
+                                + w * PATCH_SIZE
+                                + r;
+                            let dst = cp * out_thw + (tt * ho + h) * wo + w;
+                            out[dst] = frame[src];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (
+        out,
+        Shape {
+            c: CONV_OUT_CHANNELS as u32,
+            t: t as u32,
+            h: ho as u32,
+            w: wo as u32,
+        },
+    )
+}
+
+/// Host space-to-depth (inverse of the decoder `DepthToSpace3d`): `[c, td, hd,
+/// wd]` -> `[c*p1*p2*p3, td/p1, hd/p2, wd/p3]`. einops `c (d p1)(h p2)(w p3) ->
+/// (c p1 p2 p3) d h w`: element `(c, d*p1+i1, h*p2+i2, w*p3+i3)` -> channel
+/// `((c*p1+i1)*p2+i2)*p3+i3` at `(d, h, w)`.
+fn space_to_depth3d(
+    x: &[f32],
+    c: usize,
+    td: usize,
+    hd: usize,
+    wd: usize,
+    p: [usize; 3],
+) -> Vec<f32> {
+    let (p1, p2, p3) = (p[0], p[1], p[2]);
+    let (to, ho, wo) = (td / p1, hd / p2, wd / p3);
+    let out_thw = to * ho * wo;
+    let mut out = vec![0.0f32; c * p1 * p2 * p3 * out_thw];
+    for ci in 0..c {
+        for d in 0..to {
+            for i1 in 0..p1 {
+                for h in 0..ho {
+                    for i2 in 0..p2 {
+                        for w in 0..wo {
+                            for i3 in 0..p3 {
+                                let src = ci * td * hd * wd
+                                    + (d * p1 + i1) * hd * wd
+                                    + (h * p2 + i2) * wd
+                                    + (w * p3 + i3);
+                                let oc = ((ci * p1 + i1) * p2 + i2) * p3 + i3;
+                                out[oc * out_thw + (d * ho + h) * wo + w] = x[src];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Contiguous grouped channel mean: `view(out_c, group, plane).mean(dim=1)`
+/// (out channel `o` averages input channels `[o*group, (o+1)*group)`).
+fn group_mean_plane(x: &[f32], out_c: usize, group: usize, plane: usize) -> Vec<f32> {
+    assert_eq!(x.len(), out_c * group * plane, "group_mean size");
+    let mut out = vec![0.0f32; out_c * plane];
+    let inv = 1.0 / group as f32;
+    for o in 0..out_c {
+        for g in 0..group {
+            let base = (o * group + g) * plane;
+            for p in 0..plane {
+                out[o * plane + p] += x[base + p];
+            }
+        }
+    }
+    for v in &mut out {
+        *v *= inv;
     }
     out
 }

@@ -22,6 +22,7 @@ use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::policy::ResidencyBudget;
 use thinfer_core::residency::WeightResidency;
 use thinfer_core::workspace::Workspace;
+use thinfer_models::ltx::LtxVariant;
 use thinfer_models::ltx::config as dit;
 use thinfer_models::ltx::dit::{
     DitPipelines, HostFreqs, HostStreamMod, Streams, build_split_freqs, forward_block_dumped,
@@ -105,12 +106,25 @@ async fn dit_parity() {
             vram_bytes: 5 << 30,
         },
     );
-    let handles = register_block(&residency, 0).expect("register block 0");
+    let handles =
+        register_block(&residency, 0, LtxVariant::ltx_2_3_22b()).expect("register block 0");
     let workspace = Workspace::new(Arc::clone(&backend), Arc::clone(residency.arbiter()));
 
     let (vx_out, ax_out) = forward_block_dumped(
-        &backend, &pipelines, &residency, &workspace, &handles, s, &vx, &ax, &vtext, &atext, &vmod,
-        &amod, &freqs,
+        &backend,
+        &pipelines,
+        &residency,
+        &workspace,
+        &handles,
+        s,
+        &vx,
+        &ax,
+        &vtext,
+        &atext,
+        &vmod,
+        &amod,
+        &freqs,
+        LtxVariant::ltx_2_3_22b(),
     )
     .await
     .expect("dit block forward");
@@ -134,6 +148,117 @@ async fn dit_parity() {
     assert!(
         failures.is_empty(),
         "ltx dit parity (slope 1+-{SLOPE_TOL}, rel {REL_TOL}):\n{}",
+        failures.join("\n")
+    );
+}
+
+/// ltx2-rapid (19B) one-block DiT parity: the engine `forward_block_dumped` with
+/// `LtxVariant::ltx2_rapid_19b()` (Q5_K/Q6_K matmuls) vs the upstream 19B
+/// `BasicAVTransformerBlock` (`gen_dit_ref.py --variant 19b`, same Q5_K_M GGUF).
+/// The 19B block = 6-way scale_shift_table, RAW attn2 (no cross-adaln / prompt-adaln),
+/// no per-head gate -- the variant-gated cross-attn path the 22B parity does NOT
+/// cover. Confirms our 19B DiT matches the reference block-for-block: combined with
+/// `connector_parity` (caption KV bit-verified), it splits "engine DiT bug" from
+/// "the merge genuinely conditions weakly" (the fox-in-grass eyeball).
+#[tokio::test(flavor = "current_thread")]
+async fn rapid_dit_parity() {
+    let _trace = thinfer_core::trace::init_from_env();
+
+    let dit_fr = manifest::LTX2_RAPID_MANIFEST
+        .get(role::DIT_GGUF_Q5_K_M)
+        .expect("rapid dit role");
+    let Some(dit_path) = cache::resolve(dit_fr) else {
+        eprintln!("skipped[ltx rapid_dit_parity]: rapid DiT GGUF not in HF cache");
+        return;
+    };
+
+    let tmp = ensure_pyref_rapid(&dit_path);
+    let meta = std::fs::read_to_string(tmp.join("meta.txt")).expect("meta.txt");
+    let m: Vec<usize> = meta
+        .split_whitespace()
+        .map(|s| s.parse().expect("meta int"))
+        .collect();
+    let s = Streams {
+        video_tokens: m[0],
+        audio_tokens: m[1],
+        video_text: m[2],
+        audio_text: m[3],
+    };
+
+    let vx = read_f32(&tmp.join("vx_in.bin"));
+    let ax = read_f32(&tmp.join("ax_in.bin"));
+    let vtext = read_f32(&tmp.join("vtext.bin"));
+    let atext = read_f32(&tmp.join("atext.bin"));
+    let v_pos = read_f32(&tmp.join("v_pos.bin"));
+    let a_pos = read_f32(&tmp.join("a_pos.bin"));
+    let vmod = load_mod(&tmp, "vmod");
+    let amod = load_mod(&tmp, "amod");
+    let freqs = build_freqs(s, &v_pos, &a_pos);
+
+    let backend = Arc::new(
+        WgpuBackend::new_with_config(WgpuConfig {
+            power_preference: match std::env::var("THINFER_POWER_PREF").as_deref() {
+                Ok("low" | "lowpower" | "integrated") => PowerPreference::LowPower,
+                Ok("none") => PowerPreference::None,
+                _ => PowerPreference::HighPerformance,
+            },
+            timestamps: std::env::var("THINFER_TRACE").is_ok(),
+            disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
+        })
+        .await
+        .expect("wgpu adapter unavailable for tests"),
+    );
+
+    let pipelines = DitPipelines::compile(&backend)
+        .await
+        .expect("compile dit pipelines");
+    let opener = MmapFileOpener::new(&dit_path)
+        .await
+        .unwrap_or_else(|e| panic!("open {}: {e}", dit_path.display()));
+    let src = GgufSource::open(opener).await.expect("parse dit gguf");
+    let residency = WeightResidency::new(
+        src,
+        ResidencyBudget {
+            ram_bytes: 16 << 30,
+            vram_bytes: 5 << 30,
+        },
+    );
+    let variant = LtxVariant::ltx2_rapid_19b();
+    let handles = register_block(&residency, 0, variant).expect("register block 0");
+    let workspace = Workspace::new(Arc::clone(&backend), Arc::clone(residency.arbiter()));
+
+    let (vx_out, ax_out) = forward_block_dumped(
+        &backend, &pipelines, &residency, &workspace, &handles, s, &vx, &ax, &vtext, &atext, &vmod,
+        &amod, &freqs, variant,
+    )
+    .await
+    .expect("rapid dit block forward");
+
+    let vx_exp = read_f32(&tmp.join("vx_out.bin"));
+    let ax_exp = read_f32(&tmp.join("ax_out.bin"));
+    assert_eq!(vx_out.len(), vx_exp.len(), "vx_out size");
+    assert_eq!(ax_out.len(), ax_exp.len(), "ax_out size");
+
+    // SLOPE is the structural gate (a dropped-conditioning / wrong-wiring bug moves
+    // slope off 1 or explodes rel). Measured slope 0.9999 (video) / 0.9994 (audio),
+    // bias ~2e-5. REL is looser than the 22B Q8_0 gate (0.5%): the 19B DiT matmuls
+    // are Q5_K/Q6_K (much coarser quant), so a full block accumulates ~0.6% scatter
+    // vs the reference (measured 0.63% video / 0.54% audio). 1.2% = ~2x headroom.
+    const REL_TOL_RAPID: f64 = 0.012;
+    eprintln!("---- ltx rapid dit parity (19B) ----");
+    let mut failures = Vec::new();
+    for (label, exp, got) in [("video", &vx_exp, &vx_out), ("audio", &ax_exp, &ax_out)] {
+        let (slope, rel) = report(label, exp, got);
+        if !slope.is_finite() || (slope - 1.0).abs() > SLOPE_TOL {
+            failures.push(format!("{label} slope off: {slope:.6}"));
+        }
+        if rel > REL_TOL_RAPID {
+            failures.push(format!("{label} rel={:.3}% > {REL_TOL_RAPID}", rel * 100.0));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "ltx rapid dit parity (slope 1+-{SLOPE_TOL}, rel {REL_TOL_RAPID}):\n{}",
         failures.join("\n")
     );
 }
@@ -373,8 +498,9 @@ async fn modulation_parity() {
             vram_bytes: 5 << 30,
         },
     );
-    let th = register_timestep(&residency).expect("register timestep");
-    let block0 = register_block(&residency, 0).expect("register block 0");
+    let variant = LtxVariant::ltx_2_3_22b();
+    let th = register_timestep(&residency, variant).expect("register timestep");
+    let block0 = register_block(&residency, 0, variant).expect("register block 0");
     let workspace = Workspace::new(Arc::clone(&backend), Arc::clone(residency.arbiter()));
 
     let shared = compute_shared_timestep(
@@ -385,13 +511,14 @@ async fn modulation_parity() {
         &th,
         PYREF_SIGMA,
         PYREF_SIGMA,
+        variant,
     )
     .await
     .expect("compute shared timestep");
-    let tables = read_block_tables(&backend, &residency, &block0)
+    let tables = read_block_tables(&backend, &residency, &block0, variant)
         .await
         .expect("read block tables");
-    let (vmod, amod) = assemble_block_mod(&shared, &tables);
+    let (vmod, amod) = assemble_block_mod(&shared, &tables, variant);
 
     let exp_v = load_mod(&tmp, "vmod");
     let exp_a = load_mod(&tmp, "amod");
@@ -463,13 +590,34 @@ fn ensure_pyref(dit_path: &Path) -> PathBuf {
         for ent in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
             let _ = std::fs::remove_file(ent.path());
         }
-        run_python_ref(dit_path, &tmp);
+        run_python_ref(dit_path, &tmp, "22b");
         std::fs::write(&marker, "ok").expect("write marker");
     }
     tmp
 }
 
-fn run_python_ref(dit: &Path, out_dir: &Path) {
+/// Run (or reuse) the 19B (ltx2-rapid) 1-block pyref dumps; separate tmp dir from
+/// the 22B set so the two caches don't collide.
+fn ensure_pyref_rapid(dit_path: &Path) -> PathBuf {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ltx_rapid_dit_parity");
+    std::fs::create_dir_all(&tmp).expect("tmpdir");
+    let marker = tmp.join("done.txt");
+    if tmp.join("vx_out.bin").exists() && marker.exists() {
+        eprintln!(
+            "ltx rapid dit-parity: reusing cached pyref dumps ({})",
+            tmp.display()
+        );
+    } else {
+        for ent in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+            let _ = std::fs::remove_file(ent.path());
+        }
+        run_python_ref(dit_path, &tmp, "19b");
+        std::fs::write(&marker, "ok").expect("write marker");
+    }
+    tmp
+}
+
+fn run_python_ref(dit: &Path, out_dir: &Path, variant: &str) {
     let py_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python");
     let status = Command::new("uv")
         .args([
@@ -483,6 +631,8 @@ fn run_python_ref(dit: &Path, out_dir: &Path) {
             "thinfer_pytorch_ref.ltx.gen_dit_ref",
             "--dit-gguf",
             dit.to_str().unwrap(),
+            "--variant",
+            variant,
             "--out",
             out_dir.to_str().unwrap(),
         ])

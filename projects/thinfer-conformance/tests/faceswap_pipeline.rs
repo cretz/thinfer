@@ -142,3 +142,102 @@ fn faceswap_pipeline_e2e() {
         }
     });
 }
+
+/// i8 DP4A conv quality eyeball: swap the SAME frame with HyperSwap in f32 and
+/// in i8 (THINFER_ONNX_I8_CONV, scoped to HyperSwap by the loader), write both
+/// swapped frames + a cropped face patch for each, and report the face-region
+/// MAD between them. The detector/embedder stay f32 in both runs, so any
+/// difference is purely the i8 conv. Run --ignored --nocapture; writes into the
+/// dir given by THINFER_FS_OUT.
+#[test]
+#[ignore]
+fn faceswap_i8_eyeball() {
+    let env = |k: &str| std::env::var(k).ok();
+    let (Some(scrfd), Some(arcface), Some(hyperswap), Some(src), Some(dst), Some(outdir)) = (
+        env("THINFER_FS_SCRFD"),
+        env("THINFER_FS_ARCFACE"),
+        env("THINFER_FS_HYPERSWAP"),
+        env("THINFER_FS_SRC"),
+        env("THINFER_FS_DST"),
+        env("THINFER_FS_OUT"),
+    ) else {
+        eprintln!("faceswap_i8_eyeball skipped (needs FS_{{SCRFD,ARCFACE,HYPERSWAP,SRC,DST,OUT}})");
+        return;
+    };
+
+    pollster::block_on(async {
+        let cfg = thinfer_core::backend::WgpuConfig {
+            power_preference: thinfer_core::backend::PowerPreference::HighPerformance,
+            ..Default::default()
+        };
+        let backend = Arc::new(WgpuBackend::new_with_config(cfg).await.expect("wgpu"));
+        let (sb, ab, hb) = (
+            std::fs::read(&scrfd).unwrap(),
+            std::fs::read(&arcface).unwrap(),
+            std::fs::read(&hyperswap).unwrap(),
+        );
+        let src_img = load_png_rgb(Path::new(&src));
+        let dst_img = load_png_rgb(Path::new(&dst));
+
+        // Load both swappers up front so the env toggle only affects the i8 one.
+        let sw_f32 = FaceSwapper::load(Arc::clone(&backend), &sb, &ab, &hb)
+            .await
+            .expect("load f32");
+        unsafe { std::env::set_var("THINFER_ONNX_I8_CONV", "1") };
+        let sw_i8 = FaceSwapper::load(Arc::clone(&backend), &sb, &ab, &hb)
+            .await
+            .expect("load i8");
+        unsafe { std::env::remove_var("THINFER_ONNX_I8_CONV") };
+
+        let emb = sw_f32.source_embedding(&src_img).await.expect("embedding");
+        let faces = sw_f32.detect(&dst_img).await.expect("detect");
+        assert!(!faces.is_empty(), "no face in target");
+        let f0 = &faces[0];
+
+        let out_f32 = sw_f32.swap_frame(&dst_img, &emb).await.expect("swap f32");
+        let out_i8 = sw_i8.swap_frame(&dst_img, &emb).await.expect("swap i8");
+        assert!(
+            out_i8.data.iter().all(|x| x.is_finite()),
+            "i8 swap non-finite"
+        );
+
+        let (bx0, by0) = (f0.bbox[0].max(0.0) as usize, f0.bbox[1].max(0.0) as usize);
+        let (bx1, by1) = (
+            (f0.bbox[2] as usize).min(dst_img.w),
+            (f0.bbox[3] as usize).min(dst_img.h),
+        );
+        let i8_vs_f32 = region_diff(&out_f32, &out_i8, bx0, by0, bx1, by1);
+        let f32_vs_orig = region_diff(&dst_img, &out_f32, bx0, by0, bx1, by1);
+        eprintln!(
+            "[i8-eyeball] face bbox {:?}: f32-vs-i8 MAD={i8_vs_f32:.2}/255 \
+             (swap magnitude f32-vs-orig={f32_vs_orig:.2}) -> i8 perturbs the swap by {:.1}%",
+            f0.bbox,
+            100.0 * i8_vs_f32 / f32_vs_orig.max(1e-3)
+        );
+
+        let d = Path::new(&outdir);
+        std::fs::create_dir_all(d).ok();
+        write_png_rgb(&d.join("swap_f32.png"), &out_f32);
+        write_png_rgb(&d.join("swap_i8.png"), &out_i8);
+        // Cropped face patches (padded) for a zoomed side-by-side.
+        let crop = |img: &Image| -> Image {
+            let pad = ((bx1 - bx0) / 4).max(10);
+            let (cx0, cy0) = (bx0.saturating_sub(pad), by0.saturating_sub(pad));
+            let (cx1, cy1) = ((bx1 + pad).min(img.w), (by1 + pad).min(img.h));
+            let (cw, ch) = (cx1 - cx0, cy1 - cy0);
+            let mut out = Image::new(cw, ch);
+            for y in 0..ch {
+                for x in 0..cw {
+                    for c in 0..3 {
+                        out.data[(y * cw + x) * 3 + c] =
+                            img.data[((cy0 + y) * img.w + cx0 + x) * 3 + c];
+                    }
+                }
+            }
+            out
+        };
+        write_png_rgb(&d.join("face_f32.png"), &crop(&out_f32));
+        write_png_rgb(&d.join("face_i8.png"), &crop(&out_i8));
+        eprintln!("wrote swap_{{f32,i8}}.png + face_{{f32,i8}}.png to {outdir}");
+    });
+}

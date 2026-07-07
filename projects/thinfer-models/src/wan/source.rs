@@ -147,7 +147,7 @@ pub enum Wan22OpenError<E: core::fmt::Debug> {
 
 /// Build one expert: open the GGUF (original-Wan names) + its LoRA, discover the
 /// fold sites, fold (-> Q8_0 block matmuls), rename to canonical, then prefix.
-async fn fold_wan22_expert<O: FileOpener>(
+async fn fold_wan22_expert<O: FileOpener + Send + Sync + 'static>(
     gguf_opener: O,
     lora_opener: O,
     num_layers: usize,
@@ -165,6 +165,13 @@ async fn fold_wan22_expert<O: FileOpener>(
     let n_specs = specs.len();
     let folded = crate::ltx::lora::LoraFoldSource::new(gguf, vec![(lora, 1.0, specs)])
         .map_err(|e| Wan22OpenError::Fold(format!("fold {prefix}: {e}")))?;
+    // Native: fold this expert's sites on a background worker (stream order)
+    // so the expert's first denoise step streams from the cache instead of
+    // folding inline (the fold is tens of seconds of CPU per 14B expert; the
+    // high expert's folds hide behind the umT5 encode, the low expert's
+    // behind the high expert's steps). Byte-identical either way.
+    #[cfg(not(target_arch = "wasm32"))]
+    folded.spawn_prefold();
     tracing::info!(
         target: thinfer_core::trace::DIAG,
         prefix,
@@ -187,8 +194,10 @@ async fn fold_wan22_expert<O: FileOpener>(
 
 /// Build the [`Wan22Source`]. `high_gguf`/`low_gguf` are the two expert GGUFs;
 /// `high_lora`/`low_lora` their matching LightX2V distill LoRAs; `tail_openers`
-/// the safetensors tail (umT5 shards + Wan2.1 VAE, in role order).
-pub async fn open_wan22_source<O: FileOpener>(
+/// the safetensors tail (umT5 shards + Wan2.1 VAE, in role order). `Send +
+/// Sync + 'static` on the opener: the fold prefolds on a background worker
+/// (native; wan22 has no web path -- the MoE fold cache alone is ~30GB RAM).
+pub async fn open_wan22_source<O: FileOpener + Send + Sync + 'static>(
     high_gguf: O,
     high_lora: O,
     low_gguf: O,

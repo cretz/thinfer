@@ -36,6 +36,15 @@ use crate::model::RewriteQuality;
 /// rewrite into the KV cache.
 pub const T2V_REWRITE_SYSTEM_PROMPT: &str = include_str!("../assets/t2v_rewrite_system_prompt.txt");
 
+/// Concise English rewrite system prompt for the LTX models (ltx2-rapid). The
+/// Hunyuan spec above is ~5.8k tokens of Chinese-language rules -- both slow (each
+/// decoded token attends over the whole system prompt) and stylistically wrong for
+/// LTX. This short prompt keeps the KV context small (fast decode) and targets
+/// LTX's English caption distribution: expand a terse prompt while preserving every
+/// subject/action (the failure mode this fixes is a compositional prompt collapsing
+/// to the merge's human-portrait prior).
+pub const LTX_REWRITE_SYSTEM_PROMPT: &str = include_str!("../assets/ltx_rewrite_system_prompt.txt");
+
 /// Qwen3 ChatML end token (`<|im_end|>`), the rewriter EOS.
 const EOS_ID: u32 = 151645;
 
@@ -55,6 +64,7 @@ pub async fn rewrite_prompt(
     manifest: &ModelManifest,
     quality: RewriteQuality,
     vram_budget_bytes: u64,
+    system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
     let cfg = quality.lm_config();
@@ -68,7 +78,7 @@ pub async fn rewrite_prompt(
     // --- Qwen3 ChatML: system = the t2v rewrite prompt, user = the raw prompt,
     //     assistant open (generation prompt). Never log the text. ---
     let chat = format!(
-        "<|im_start|>system\n{T2V_REWRITE_SYSTEM_PROMPT}<|im_end|>\n\
+        "<|im_start|>system\n{system_prompt}<|im_end|>\n\
          <|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
     );
     let prompt_ids = tokenizer
@@ -138,4 +148,66 @@ pub async fn rewrite_prompt(
         return Err("rewrite produced empty text".into());
     }
     Ok(text)
+}
+
+/// Wrap [`rewrite_prompt`] with the soft-fallback + progress-note behavior shared
+/// by every model that rewrites (HunyuanVideo 1.5, ltx2-rapid). Returns
+/// `Some(expanded)` when rewriting is enabled, the feature is compiled in, and the
+/// rewriter succeeds; otherwise `None` and the caller keeps the original prompt.
+/// Rewriting is a quality lift, never load-bearing. Prompt text is never logged.
+pub async fn maybe_rewrite_prompt(
+    enabled: bool,
+    quality: RewriteQuality,
+    system_prompt: &str,
+    prompt: &str,
+    backend: &Arc<WgpuBackend>,
+    manifest: &ModelManifest,
+    vram_budget_bytes: u64,
+    sink: &dyn crate::progress::ProgressSink,
+) -> Option<String> {
+    #[cfg(feature = "rewrite")]
+    {
+        if !enabled {
+            return None;
+        }
+        sink.note("Rewriting prompt");
+        match rewrite_prompt(
+            backend,
+            manifest,
+            quality,
+            vram_budget_bytes,
+            system_prompt,
+            prompt,
+        )
+        .await
+        {
+            Ok(text) => {
+                tracing::info!(target: thinfer_core::trace::DIAG, "prompt rewrite applied");
+                Some(text)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: thinfer_core::trace::DIAG,
+                    error = %e,
+                    "prompt rewrite failed; using original prompt"
+                );
+                sink.note("Prompt rewrite unavailable; using the original prompt");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "rewrite"))]
+    {
+        let _ = (
+            enabled,
+            quality,
+            system_prompt,
+            prompt,
+            backend,
+            manifest,
+            vram_budget_bytes,
+            sink,
+        );
+        None
+    }
 }

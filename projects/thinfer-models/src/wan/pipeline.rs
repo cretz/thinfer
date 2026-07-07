@@ -1486,6 +1486,22 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     )
                     .await?;
                 sample = sampler.step(i, &out.image, &sample);
+                // Sampler-level diag only (velocity in, latent out): the MoE
+                // path has no pyref (no per-block taps needed), but the e2e
+                // health gate asserts the step count and reads the tensors.
+                if let Some(d) = step_diag.as_deref_mut() {
+                    d.push(WanStepDiag {
+                        timestep: sampler.timestep(i),
+                        sigma: sampler.timestep(i) / AnyFlowSampler::NUM_TRAIN_TIMESTEPS,
+                        velocity: out.image.clone(),
+                        post: sample.clone(),
+                        per_block: Vec::new(),
+                        temb: Vec::new(),
+                        timestep_proj: Vec::new(),
+                        final_norm: Vec::new(),
+                        proj_out: Vec::new(),
+                    });
+                }
             }
             self.residency.evict_all_and_free(&*self.backend);
             workspace.drain_pool();

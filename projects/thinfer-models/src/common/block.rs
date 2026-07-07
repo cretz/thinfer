@@ -2535,6 +2535,10 @@ impl Block {
             && a.scale.is_none()
             && m >= cm.cfg.wm()
         {
+            // B `[N,K]` is coop-loaded without bounds checks too; a ragged N
+            // would fringe-read past the weight image. Every current model dim
+            // is a WN multiple -- keep it that way or pad the B image.
+            debug_assert_eq!(n % cm.cfg.wn(), 0, "coopmat B needs N % WN == 0");
             // (1) dequant Quant weight -> f16 [N,K] nmajor (or reuse the
             // caller's per-block prepared image).
             let b_f16 = match prepared {
@@ -2554,8 +2558,15 @@ impl Block {
                     b_f16
                 }
             };
-            // (2) cast the bf16 A-side to f16.
-            let a_f16 = scope.alloc(pipelines.act_bytes(m * k))?;
+            // (2) cast the bf16 A-side to f16. The staging is padded up to a
+            // whole WM row block: at ragged M the last row-block's coopLoads
+            // read the fringe rows, and robust coop access is NOT reliable on
+            // this stack (see the M < WM guard above) -- an unmapped fringe
+            // page faults the device (nvlddmkm GPUID error, device lost;
+            // wan2.2 video tiles were the first shipped non-WM-multiple M).
+            // Fringe values are irrelevant: the store discards fringe rows.
+            let m_pad = m.next_multiple_of(cm.cfg.wm());
+            let a_f16 = scope.alloc(pipelines.act_bytes(m_pad * k))?;
             let to_f16 = pipelines
                 .cast_to_f16
                 .as_ref()

@@ -138,6 +138,7 @@ async fn dit_perf() {
         &vtext,
         &atext,
         &freqs,
+        None, // no i2v conditioning
         None,
     )
     .await
@@ -146,7 +147,8 @@ async fn dit_perf() {
     let t0 = Instant::now();
     let (lat_v, _lat_a) = denoise_loop(
         &backend, &pipelines, &residency, &workspace, &model, s, sigmas, lat_v, lat_a, &vtext,
-        &atext, &freqs, None,
+        &atext, &freqs, None, // no i2v conditioning
+        None,
     )
     .await
     .expect("timed denoise");

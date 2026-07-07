@@ -35,7 +35,7 @@ const log = (line) => {
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"],
-  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4", "dreamid-v"],
+  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4", "ltx2-rapid", "dreamid-v"],
   // HyperSwap ONNX face-swap: a source face pasted into every frame of a video.
   // Its own JobSpec (FaceSwapSpec); no prompt / size / steps.
   "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c"],
@@ -48,7 +48,14 @@ const MODELS = {
 // distribution and output is incoherent. LTX also exposes an Audio toggle.
 // Sulphur-2 is an LTX-2.3 DiT finetune: byte-identical architecture, same grid +
 // audio path, so it shares the whole LTX UI surface.
-const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.startsWith("sulphur-2");
+// ltx2-rapid (LTX-2 19B merge) shares the LTX grid + audio/VAE surface but is
+// single-stage (no upscaler) and video-only for now; it matches neither existing
+// prefix, so list it explicitly.
+const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.startsWith("sulphur-2") || model === "ltx2-rapid";
+// ltx2-rapid is single-stage + video-only, and (post conditioning + VAE fixes) is
+// in-distribution at its own low res, so it takes its own preset list + toggle
+// defaults instead of the 22B two-stage LTX ones.
+const isLtxRapid = (model) => model === "ltx2-rapid";
 // Wan2.2-T2V-A14B (MoE 14B): a heavier Wan-family tier with its own surface. It
 // runs a fixed 4-step LightX2V distill schedule (the steps/sampler knobs do not
 // apply) and only the full Wan2.1 VAE (no tiny-VAE path), so the Steps + Quality
@@ -84,8 +91,29 @@ const isEditModel = (model) => EDIT_MODELS.has(model);
 // Image models that accept request-time user adapters (the encrypted LoRA
 // vault), mirroring the server's `ImageModelId::supports_adapters`. Adapters are
 // per-model, so the UI only lists/uses adapters stored for the selected model.
-const ADAPTER_MODELS = new Set(["krea-2-turbo"]);
-const supportsAdapters = (kind, model) => kind === "image" && ADAPTER_MODELS.has(model);
+const ADAPTER_MODELS = new Set(["krea-2-turbo", "qwen-image-rapid", "qwen-image-edit-rapid"]);
+// AnyFlow is the one video model that folds vault LoRAs (diffusers-named Wan DiT;
+// the base-Wan2.1 LoRA ecosystem transfers). Mirrors the server's
+// `ImageModelId::supports_adapters` + `VideoModelId::supports_adapters`.
+const supportsAdapters = (kind, model) =>
+  (kind === "image" && ADAPTER_MODELS.has(model)) ||
+  (kind === "video" && model === "anyflow-t2v-14b");
+// Fold any checked vault adapters into `spec` (mutated in place) plus the vault
+// password. Shared by the image and AnyFlow-video spec builders; a no-op when the
+// model takes no adapters or none are checked.
+function attachAdapters(spec, kind, model) {
+  if (!supportsAdapters(kind, model)) return;
+  const picks = [...document.querySelectorAll(".adapter-pick")].filter((cb) => cb.checked);
+  if (!picks.length) return;
+  const password = vaultPassword();
+  if (!password) throw new Error("enter the adapter password to use adapters");
+  spec.lora = picks.map((cb) => {
+    const w = document.querySelector(`.adapter-weight[data-id="${cb.dataset.id}"]`);
+    const weight = floatOrNull(w?.value);
+    return weight === null ? { id: cb.dataset.id } : { id: cb.dataset.id, weight };
+  });
+  spec.password = password;
+}
 // Size presets per kind. First entry is the default. Hand-typed dims are still
 // allowed and flip the dropdown to "Custom". Dim rules differ by kind: image
 // (Z-Image VAE) needs /16, video (Wan2.2 16x16x4 VAE + patch 2) needs /32 --
@@ -130,6 +158,16 @@ const LTX_PRESETS = [
   { label: "768x512 landscape (fast, less faithful)", width: 768, height: 512 },
   { label: "512x320 landscape (fastest, off-prompt / OOD)", width: 512, height: 320 },
 ];
+// ltx2-rapid single-stage presets. Default is 768x512 (the v62 workflow's native
+// res); 512x320 is the clean fast floor (in-distribution post the conditioning +
+// VAE fixes). Higher res is single-stage here (no upscaler yet), so it is slower
+// and labeled by cost, not by faithfulness. All /64, min 256.
+const RAPID_PRESETS = [
+  { label: "768x512 landscape (default)", width: 768, height: 512 },
+  { label: "512x320 landscape (fastest, clean)", width: 512, height: 320 },
+  { label: "960x544 landscape (slower)", width: 960, height: 544 },
+  { label: "1280x704 landscape (slowest, near VRAM cap)", width: 1280, height: 704 },
+];
 // Wan2.2-T2V-A14B size ladder (/16 grid, the Wan2.1 VAE 8x + patch 2). The
 // default is 832x480, the industry-norm 480p distill regime. (The earlier
 // low-res default existed only to dodge a device-loss that turned out to be the
@@ -158,6 +196,7 @@ const HUNYUAN_PRESETS = [
 /// defaults with its /64 grid and 256 floor; Wan2.2-A14B uses its /16 ladder led
 /// by 832x480; everything else uses the per-kind presets (min = step).
 function sizeSpec(kind, model) {
+  if (kind === "video" && isLtxRapid(model)) return { presets: RAPID_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isLtxModel(model)) return { presets: LTX_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isWan22Model(model)) return { presets: WAN22_PRESETS, step: 16, min: 16 };
   if (kind === "video" && isHunyuanModel(model)) return { presets: HUNYUAN_PRESETS, step: 16, min: 16 };
@@ -187,6 +226,9 @@ const MODEL_STEPS = {
   "qwen-image-edit-rapid": 4,
   "krea-2-turbo": 8,
   "dreamid-v": 16,
+  // AnyFlow any-step flow map: 2 holds 4-step quality on our sweep and each step
+  // re-streams the 15GB DiT, so 2 is the quality-neutral fast default.
+  "anyflow-t2v-14b": 2,
 };
 // Default clip length (seconds) shown in the duration PLACEHOLDER per video
 // model, mirroring the server's default_frames so a blank field advertises the
@@ -207,6 +249,7 @@ const VIDEO_DURATION = {
   "ltx-2.3-distilled-q4": 2,
   "sulphur-2": 2,
   "sulphur-2-q4": 2,
+  "ltx2-rapid": 3,
   "hunyuan-video-1.5-t2v": 5,
   "hunyuan-video-1.5-ti2v": 5,
 };
@@ -230,6 +273,22 @@ const fileToBase64 = (file) =>
     r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ""));
     r.readAsDataURL(file);
   });
+
+// Stream a video file to POST /uploads as a raw body (no base64, no JSON) and
+// return its opaque id. Keeps the large clip out of the job JSON body -- no
+// ~33% base64 inflation and no JSON size cap -- while the server holds it
+// RAM-first / encrypted-spill under a TTL until the job consumes it.
+async function uploadVideo(file) {
+  setStatus("Uploading video…");
+  const resp = await fetch("uploads", {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/octet-stream" }),
+    body: file,
+  });
+  if (!resp.ok) throw new Error(await errorText(resp));
+  const { id } = await resp.json();
+  return id;
+}
 
 // --- token persistence (this browser only) ------------------------------------
 const TOKEN_KEY = "thinfer_token";
@@ -340,9 +399,12 @@ function applyModel() {
   const edit = kind === "image" && isEditModel(model);
   // The causal Hunyuan TI2V optionally animates a first-frame image: same
   // picker as the image-edit models, but NOT required (no image = text-only).
-  const i2v = kind === "video" && isHunyuanI2vModel(model);
+  const i2v = kind === "video" && (isHunyuanI2vModel(model) || isLtxRapid(model));
   $("input-image-row").hidden = !edit && !i2v;
   $("input-image").required = edit;
+  // Frame-0 strength: ltx2-rapid I2V only (optional image, so always visible for
+  // rapid; server ignores it when no image is sent).
+  $("strength-row").hidden = !(kind === "video" && isLtxRapid(model));
   // DreamID-V (video kind) and the face-swap kind both consume a source FACE
   // image + a target VIDEO instead of a text prompt; reveal those uploaders and
   // drop the prompt / size / steps / seed rows that do not apply.
@@ -353,6 +415,14 @@ function applyModel() {
   $("source-image").required = usesFaceInputs;
   $("input-video-row").hidden = !usesFaceInputs;
   $("input-video").required = usesFaceInputs;
+  // Mask compositing options are HyperSwap-path-only (DreamID-V has its own mask).
+  $("occlusion-mask-row").hidden = !faceSwap;
+  $("hyperswap-mask-row").hidden = !faceSwap;
+  $("enhance-row").hidden = !faceSwap;
+  $("detect-stride-row").hidden = !faceSwap;
+  $("bitrate-scale-row").hidden = !faceSwap;
+  $("trim-start-row").hidden = !faceSwap;
+  $("trim-end-row").hidden = !faceSwap;
   setLabeledHidden("prompt", usesFaceInputs);
   $("prompt").required = !usesFaceInputs;
   $("guide-scale-row").hidden = !dreamid; // DreamID-V image-CFG guidance scale
@@ -366,14 +436,19 @@ function applyModel() {
   // Audio toggle + upscale toggle are LTX-only (Wan models are silent and have
   // no two-stage upscale path).
   const isLtxVideo = kind === "video" && isLtxModel(model);
-  $("audio-row").hidden = !isLtxVideo;
-  $("upscale-row").hidden = !isLtxVideo;
-  // Text-encoder quant (q8/q4) is an LTX-only knob (shared Gemma encoder).
+  const rapid = isLtxRapid(model);
+  // rapid is video-only + single-stage: no audio, no upscaler. The other LTX
+  // models expose both.
+  $("audio-row").hidden = !isLtxVideo || rapid;
+  $("upscale-row").hidden = !isLtxVideo || rapid;
+  // Text-encoder quant (q8/q4) is an LTX knob (shared Gemma encoder); rapid uses
+  // the same encoder, so keep it for rapid too.
   $("encoder-row").hidden = !isLtxVideo;
-  // Two-stage is the in-distribution path for LTX (the widescreen default OOMs
-  // single-stage and low-res single-stage is OOD), so default it on; the user can
-  // still uncheck it for a fast low-res single-stage preview.
-  $("upscale").checked = isLtxVideo;
+  // Two-stage is the in-distribution path for the 22B LTX (the widescreen default
+  // OOMs single-stage and low-res single-stage is OOD), so default it on there;
+  // the user can still uncheck it for a fast low-res single-stage preview. rapid
+  // is force-single-stage in the executor, so keep it off.
+  $("upscale").checked = isLtxVideo && !rapid;
   // The tiny/full VAE choice does not apply to LTX (own full VAE) or to
   // Wan2.2-A14B (full Wan2.1 VAE only, no tiny path), so hide it rather than show
   // a misleading "Tiny VAE" default those models ignore. Hunyuan 1.5 HAS both (a
@@ -406,13 +481,14 @@ function applyModel() {
   // at latent frame ~14, 2026-07-01 eyeball), so it is opt-in pending eyeballs.
   $("attn-window-row").hidden = !isWan22 && !isAnyflow && !(isHunyuan && !i2v);
   $("attn-window").value = isWan22 ? "3" : "";
-  // Prompt rewrite (Hunyuan only): the model needs detailed captions, so the
-  // "Enhance prompt" toggle is on by default and shown only for Hunyuan. The
-  // rewriter-model picker (Fast 4B / Full 8B) rides alongside it.
-  // On TI2V the rewriter applies to text-only runs (skipped server-side when
-  // an image is attached), so the toggle stays visible.
-  $("rewrite-row").hidden = !isHunyuan;
-  $("rewrite-quality-row").hidden = !isHunyuan;
+  // Prompt rewrite (Hunyuan + ltx2-rapid): both are trained on detailed
+  // captions, so the "Enhance prompt" toggle is on by default and shown for
+  // them. The rewriter-model picker (Fast 4B / Full 8B) rides alongside it.
+  // On Hunyuan TI2V the rewriter applies to text-only runs (skipped server-side
+  // when an image is attached), so the toggle stays visible.
+  const canRewrite = isHunyuan || rapid;
+  $("rewrite-row").hidden = !canRewrite;
+  $("rewrite-quality-row").hidden = !canRewrite;
   // Adapter (LoRA) vault: only image models that support adapters. Clear any
   // rendered list on a model switch so a stale other-model list can't linger
   // (adapters are per-model, so a fresh List is required after switching).
@@ -623,8 +699,8 @@ async function buildSpec() {
   const width = intOrNull($("width").value);
   const height = intOrNull($("height").value);
   const model = $("model").value;
-  // HyperSwap face-swap: source FACE image + target VIDEO, uploaded as base64
-  // (the server holds the video RAM-first / encrypted-spill). No prompt/size.
+  // HyperSwap face-swap: source FACE image (small, base64 in the job body) +
+  // target VIDEO (streamed to /uploads, referenced by id). No prompt/size.
   if (kind === "face-swap") {
     const face = $("source-image").files[0];
     const vid = $("input-video").files[0];
@@ -634,7 +710,14 @@ async function buildSpec() {
       kind: "faceSwap",
       model,
       sourceImageB64: await fileToBase64(face),
-      inputVideoB64: await fileToBase64(vid),
+      inputVideoUpload: await uploadVideo(vid),
+      occlusionMask: $("occlusion-mask").checked,
+      hyperswapMask: $("hyperswap-mask").checked,
+      enhance: $("enhance").checked,
+      detectStride: intOrNull($("detect-stride").value) ?? 1,
+      bitrateScale: floatOrNull($("bitrate-scale").value) ?? 1.15,
+      startSecs: floatOrNull($("trim-start").value),
+      endSecs: floatOrNull($("trim-end").value),
     };
   }
   if (kind === "image") {
@@ -654,27 +737,15 @@ async function buildSpec() {
       if (!file) throw new Error(`${model} requires a reference image; choose one first`);
       spec.inputImage = await fileToBase64(file);
     }
-    // Fold any checked vault adapters into the DiT (per-adapter weight). The
-    // password rides only when at least one adapter is selected.
-    if (supportsAdapters("image", model)) {
-      const picks = [...document.querySelectorAll(".adapter-pick")].filter((cb) => cb.checked);
-      if (picks.length) {
-        const password = vaultPassword();
-        if (!password) throw new Error("enter the adapter password to use adapters");
-        spec.lora = picks.map((cb) => {
-          const w = document.querySelector(`.adapter-weight[data-id="${cb.dataset.id}"]`);
-          const weight = floatOrNull(w?.value);
-          return weight === null ? { id: cb.dataset.id } : { id: cb.dataset.id, weight };
-        });
-        spec.password = password;
-      }
-    }
+    // Fold any checked vault adapters into the DiT (per-adapter weight).
+    attachAdapters(spec, "image", model);
     return spec;
   }
   // DreamID-V diffusion video face-swap: source FACE image + target VIDEO (no
   // prompt; the context is baked). Width/height drive the target resolution; the
-  // image-CFG guidance scale tunes identity transfer. The video is uploaded as
-  // base64 and handled RAM-first / encrypted-spill server-side.
+  // image-CFG guidance scale tunes identity transfer. The video streams to
+  // /uploads (referenced by id); the server handles it RAM-first /
+  // encrypted-spill.
   if (isDreamidModel(model)) {
     const face = $("source-image").files[0];
     const vid = $("input-video").files[0];
@@ -689,7 +760,7 @@ async function buildSpec() {
       steps: intOrNull($("steps").value),
       guideScale: floatOrNull($("guide-scale").value),
       sourceImage: await fileToBase64(face),
-      inputVideo: await fileToBase64(vid),
+      inputVideoUpload: await uploadVideo(vid),
       seed,
     };
   }
@@ -713,18 +784,34 @@ async function buildSpec() {
   // steps knobs, so omit them. Blank dims/duration -> the server's LTX defaults
   // (1280x704 two-stage, ~2s with audio).
   if (isLtxModel(model)) {
-    return {
+    const spec = {
       kind: "video",
       model,
       prompts,
       width,
       height,
       durations: duration === null ? null : [duration],
-      audio: $("audio").checked,
-      upscale: $("upscale").checked,
+      // rapid is video-only + single-stage; force both off regardless of any
+      // stale checkbox state.
+      audio: isLtxRapid(model) ? false : $("audio").checked,
+      upscale: isLtxRapid(model) ? false : $("upscale").checked,
       encoder: $("encoder").value,
+      // Prompt rewrite: rapid only (the 22B path ignores it server-side and its
+      // rewriter files are not in the LTX-2.3 fetch set).
+      rewrite: isLtxRapid(model) ? $("rewrite").checked : false,
+      rewriteQuality: $("rewrite-quality").value,
       seed,
     };
+    // rapid native I2V: an optional first-frame image (with = I2V frame-0
+    // anchor, without = t2v) + its conditioning strength.
+    if (isLtxRapid(model)) {
+      const file = $("input-image").files[0];
+      if (file) {
+        spec.inputImage = await fileToBase64(file);
+        spec.strength = floatOrNull($("strength").value) ?? 1.0;
+      }
+    }
+    return spec;
   }
   // Wan2.2-A14B runs a fixed 4-step LightX2V distill (steps/sampler ignored) and
   // only the full Wan2.1 VAE, so omit steps and pin vae=full (sending vae=tiny
@@ -749,7 +836,7 @@ async function buildSpec() {
   // the user's choice (tiny = taew2_1 fast decode, full = parity Wan2.1 VAE);
   // attn-window is the opt-in perf lever (blank = full attention).
   if (isAnyflowModel(model)) {
-    return {
+    const spec = {
       kind: "video",
       model,
       prompts,
@@ -761,6 +848,9 @@ async function buildSpec() {
       attnWindow: intOrNull($("attn-window").value),
       seed,
     };
+    // AnyFlow folds base-Wan2.1 vault LoRAs (per-adapter weight + password).
+    attachAdapters(spec, "video", model);
+    return spec;
   }
   // Causal Hunyuan TI2V: optional first-frame image (with = I2V, without =
   // text-only) + prompt; fixed 4-step chunked AR schedule (steps/sampler/
@@ -943,7 +1033,24 @@ async function showResult(kind, result, privateKey) {
     video.hidden = true;
   } else {
     if (video.src) URL.revokeObjectURL(video.src);
+    // Diagnostics: an inline-playback failure often surfaces NOTHING (0:00 white
+    // frame) rather than a MediaError -- e.g. Safari/WebKit refusing a blob: video
+    // URL. Log the container sniff + the load lifecycle so the failure mode is
+    // visible in the on-page log (the file may still download + play fine).
+    const isMp4 = bytes.length > 12 && String.fromCharCode(...bytes.subarray(4, 8)) === "ftyp";
+    log(
+      `result: ${(bytes.length / 1e6).toFixed(1)}MB, ${mime}, ftyp=${isMp4}; ua=${navigator.userAgent}`,
+    );
+    const CODES = { 1: "ABORTED", 2: "NETWORK", 3: "DECODE", 4: "SRC_NOT_SUPPORTED" };
+    video.onerror = () => {
+      const e = video.error;
+      log(`video error: code ${e?.code ?? "?"} (${CODES[e?.code] ?? "?"})${e?.message ? ` - ${e.message}` : ""}`);
+    };
+    video.onloadedmetadata = () =>
+      log(`video metadata: duration=${video.duration.toFixed(2)}s ${video.videoWidth}x${video.videoHeight}`);
+    video.onstalled = () => log("video stalled (source not delivering data)");
     video.src = url;
+    video.load();
     video.hidden = false;
     img.hidden = true;
   }

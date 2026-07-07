@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path as AxPath, Request, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path as AxPath, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -17,14 +18,15 @@ use axum::routing::{get, post};
 use thinfer_app::JobRequest;
 use thinfer_app::model::{ImageModelId, SwapModel, VaeChoice, VideoModelId};
 use thinfer_app::request::{
-    FaceImage, FaceSwapRequest, ImageFormat, ImageRequest, LoraRef, Secret, VideoFormat,
+    FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, VideoFormat,
     VideoInput, VideoRequest,
 };
-use thinfer_app::wire::{CreateResponse, JobSpec, JobStateKind, JobStatus};
+use thinfer_app::wire::{CreateResponse, JobSpec, JobStateKind, JobStatus, UploadResponse};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::config::ServeConfig;
 use crate::job::{JobStore, SeqEvent};
+use crate::uploads::UploadStore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +40,9 @@ pub struct AppState {
     /// with the CLI (same on-disk vault); every op re-derives the key from the
     /// request password.
     pub vault: Arc<thinfer_app::vault::Vault>,
+    /// Pending streamed video uploads (RAM-first / encrypted-spill), keyed by id
+    /// and reaped by TTL. A job spec references one via `input_video_upload`.
+    pub uploads: Arc<UploadStore>,
 }
 
 /// `GET /capabilities` body: static server/GPU capabilities the UI adapts to.
@@ -53,13 +58,6 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
     })
 }
 
-/// Above this size an uploaded video spills to an encrypted on-disk blob under a
-/// per-request ephemeral key (AES-256-GCM) rather than staying in RAM; below it,
-/// the mp4 bytes ride in the request in memory. 512 MiB (typical clips are a few
-/// hundred MB, well under the ~28GB RAM budget). Either way the raw plaintext
-/// video never lands on disk.
-const VIDEO_SPILL_THRESHOLD: usize = 512 << 20;
-
 /// Base64-decode a required upload field, tagging errors with the field name.
 fn b64_decode(field: &str, b64: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
@@ -71,17 +69,9 @@ fn b64_decode(field: &str, b64: &str) -> Result<Vec<u8>, String> {
 /// Turn decoded video bytes into a [`VideoInput`]: held in RAM under the spill
 /// threshold, else sealed to `<dir>/input_video.enc` under a fresh ephemeral key
 /// (held in the returned value, RAM only). The raw plaintext never touches disk.
+/// Shared with the streaming-upload path ([`crate::uploads`]).
 fn video_input(bytes: Vec<u8>, dir: &std::path::Path) -> Result<VideoInput, String> {
-    if bytes.len() > VIDEO_SPILL_THRESHOLD {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let (key, nonce, ct) = thinfer_app::vault::ephemeral_seal(&bytes);
-        drop(bytes); // wipe the plaintext copy; only ciphertext + the RAM key remain
-        let path = dir.join("input_video.enc");
-        std::fs::write(&path, &ct).map_err(|e| format!("write {}: {e}", path.display()))?;
-        Ok(VideoInput::Encrypted { path, key, nonce })
-    } else {
-        Ok(VideoInput::Ram(bytes))
-    }
+    crate::uploads::seal_video(bytes, dir, crate::uploads::VIDEO_SPILL_THRESHOLD)
 }
 
 /// Build the executable request for `spec`, placing the artifact under
@@ -93,6 +83,7 @@ fn spec_into_request(
     spec: JobSpec,
     id: &str,
     config: &ServeConfig,
+    uploads: &UploadStore,
 ) -> Result<(JobRequest, PathBuf, Option<String>, Option<bool>), String> {
     let budget = config.budget()?;
     let dir = config.artifact_dir.join(id);
@@ -105,22 +96,12 @@ fn spec_into_request(
         JobSpec::Image(s) => {
             let model = s.model.unwrap_or(ImageModelId::DEFAULT);
             let d = model.defaults();
-            // Image-edit reference image: base64-decode and stash under the job
-            // dir so the edit path reads it like a CLI --input-image. The dir
-            // must exist first. `ImageRequest::validate` enforces the
-            // present/required-by-kind rules (400 on mismatch).
+            // Image-edit reference image: base64-decode and hold in RAM
+            // ([`ImageBytes`]); a decrypted image never touches disk.
+            // `ImageRequest::validate` enforces the present/required-by-kind
+            // rules (400 on mismatch).
             let input_image = match s.input_image {
-                Some(b64) => {
-                    use base64::Engine;
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(b64.as_bytes())
-                        .map_err(|e| format!("input_image is not valid base64: {e}"))?;
-                    make_dir()?;
-                    let path = dir.join("input_image");
-                    std::fs::write(&path, &bytes)
-                        .map_err(|e| format!("write {}: {e}", path.display()))?;
-                    Some(path)
-                }
+                Some(b64) => Some(ImageBytes(b64_decode("input_image", &b64)?)),
                 None => None,
             };
             let req = ImageRequest {
@@ -155,30 +136,27 @@ fn spec_into_request(
             let model = s.model.unwrap_or(VideoModelId::DEFAULT);
             let (def_w, def_h) = model.video_defaults();
             // First-frame conditioning image (hunyuan-video-1.5-i2v): decode the
-            // base64 payload to the job dir like the image-edit path;
-            // `VideoRequest::resolve` enforces required/rejected per model.
+            // base64 payload and hold in RAM ([`ImageBytes`]); a decrypted image
+            // never touches disk. `VideoRequest::resolve` enforces
+            // required/rejected per model.
             let input_image = match s.input_image {
-                Some(b64) => {
-                    let bytes = b64_decode("input_image", &b64)?;
-                    make_dir()?;
-                    let path = dir.join("input_image");
-                    std::fs::write(&path, &bytes)
-                        .map_err(|e| format!("write {}: {e}", path.display()))?;
-                    Some(path)
-                }
+                Some(b64) => Some(ImageBytes(b64_decode("input_image", &b64)?)),
                 None => None,
             };
             // DreamID-V source FACE image: small, held in RAM only (never on
             // disk), matching the target video's RAM-first privacy.
             let source_image = match s.source_image {
-                Some(b64) => Some(FaceImage(b64_decode("source_image", &b64)?)),
+                Some(b64) => Some(ImageBytes(b64_decode("source_image", &b64)?)),
                 None => None,
             };
-            // DreamID-V target VIDEO: RAM-first, encrypted spill for large uploads
-            // (never plaintext on disk).
-            let input_video = match s.input_video {
-                Some(b64) => Some(video_input(b64_decode("input_video", &b64)?, &dir)?),
-                None => None,
+            // DreamID-V target VIDEO: a streamed upload id (preferred) is
+            // consumed from the store into the job dir; else a base64 payload is
+            // decoded RAM-first with an encrypted spill for large clips. Either
+            // way, raw plaintext never lands on disk.
+            let input_video = match (s.input_video_upload, s.input_video) {
+                (Some(uid), _) => Some(uploads.consume(&uid, &dir)?),
+                (None, Some(b64)) => Some(video_input(b64_decode("input_video", &b64)?, &dir)?),
+                (None, None) => None,
             };
             let req = VideoRequest {
                 model,
@@ -190,6 +168,7 @@ fn spec_into_request(
                 fps: s.fps,
                 seed: s.seed,
                 input_image,
+                strength: s.strength.unwrap_or(1.0),
                 source_image,
                 input_video,
                 guide_scale: s.guide_scale,
@@ -203,6 +182,16 @@ fn spec_into_request(
                 upscale: s.upscale.unwrap_or(model.two_stage_default()),
                 rewrite: s.rewrite.unwrap_or(true),
                 rewrite_quality: s.rewrite_quality.unwrap_or_default(),
+                lora: s
+                    .lora
+                    .into_iter()
+                    .map(|l| LoraRef {
+                        id: l.id,
+                        weight: l.weight.unwrap_or(1.0),
+                    })
+                    .collect(),
+                vault_password: s.password.map(Secret::new),
+                vault_dir: config.resolved_vault_dir(),
                 budget,
                 // Server emits MP4 only (PNG-frames is a CLI debug format).
                 output: mp4(),
@@ -214,23 +203,25 @@ fn spec_into_request(
             Ok((JobRequest::Video(req), out, public_key, disable_coopmat))
         }
         JobSpec::FaceSwap(s) => {
-            // Target video: uploaded bytes (RAM-first / encrypted spill) take
-            // precedence; else a server-side path (localhost deployments) read
-            // into RAM. Exactly one must be present.
-            let input_video = match (s.input_video_b64, s.input_video) {
-                (Some(b64), _) => video_input(b64_decode("input_video_b64", &b64)?, &dir)?,
-                (None, Some(path)) => {
+            // Target video, in precedence order: a streamed upload id (consumed
+            // from the store into the job dir), then base64-in-JSON bytes
+            // (RAM-first / encrypted spill), then a server-side path (localhost
+            // deployments) read into RAM. Exactly one must be present.
+            let input_video = match (s.input_video_upload, s.input_video_b64, s.input_video) {
+                (Some(uid), _, _) => uploads.consume(&uid, &dir)?,
+                (None, Some(b64), _) => video_input(b64_decode("input_video_b64", &b64)?, &dir)?,
+                (None, None, Some(path)) => {
                     let bytes = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
                     video_input(bytes, &dir)?
                 }
-                (None, None) => return Err("face-swap requires an input video".into()),
+                (None, None, None) => return Err("face-swap requires an input video".into()),
             };
             // Source face image: uploaded bytes, or a server-side path read into
             // RAM. Held in RAM only (never written to the job dir).
             let source_image = match (s.source_image_b64, s.source_image) {
-                (Some(b64), _) => FaceImage(b64_decode("source_image_b64", &b64)?),
+                (Some(b64), _) => ImageBytes(b64_decode("source_image_b64", &b64)?),
                 (None, Some(path)) => {
-                    FaceImage(std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?)
+                    ImageBytes(std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?)
                 }
                 (None, None) => return Err("face-swap requires a source image".into()),
             };
@@ -240,6 +231,15 @@ fn spec_into_request(
                 source_image,
                 output: mp4(),
                 budget,
+                options: thinfer_app::request::FaceSwapOptions {
+                    hyperswap_mask: s.hyperswap_mask.unwrap_or(false),
+                    occlusion: s.occlusion_mask.unwrap_or(false),
+                    enhance: s.enhance.unwrap_or(false),
+                    detect_stride: s.detect_stride.unwrap_or(1),
+                    bitrate_scale: s.bitrate_scale.unwrap_or(1.15),
+                    start_secs: s.start_secs,
+                    end_secs: s.end_secs,
+                },
             };
             req.validate()?;
             make_dir()?;
@@ -254,7 +254,15 @@ fn spec_into_request(
 /// UI is mounted separately so it can load and prompt for the token.
 pub fn router(state: AppState) -> Router {
     let auth = state.config.auth_token.clone();
+    let max_json = state.config.max_json_bytes;
+    let max_upload = state.config.max_upload_bytes;
     Router::new()
+        // Raw video upload: its own large body limit (route-level, so it wins
+        // over the modest router-wide JSON limit below).
+        .route(
+            "/uploads",
+            post(upload_video).layer(DefaultBodyLimit::max(max_upload)),
+        )
         .route("/jobs", post(create_job))
         .route("/jobs/{id}", get(get_status))
         .route("/jobs/{id}/events", get(events))
@@ -265,6 +273,9 @@ pub fn router(state: AppState) -> Router {
         .route("/vault/adapters/remove", post(crate::vault::remove_adapter))
         .route("/capabilities", get(capabilities))
         .route("/openapi.json", get(openapi))
+        // Router-wide cap for the JSON job spec (small base64 image only; big
+        // video takes the /uploads path). `/uploads` overrides this per-route.
+        .layer(DefaultBodyLimit::max(max_json))
         .layer(middleware::from_fn(move |req, next| {
             require_auth(auth.clone(), req, next)
         }))
@@ -314,7 +325,7 @@ async fn create_job(
     }
     let (handle, position) = state
         .store
-        .submit(|id| spec_into_request(spec, id, &state.config))
+        .submit(|id| spec_into_request(spec, id, &state.config, &state.uploads))
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
     Ok((
         StatusCode::ACCEPTED,
@@ -323,6 +334,34 @@ async fn create_job(
             queue_position: position,
         }),
     ))
+}
+
+/// Stream a raw video (mp4) body into the upload store, returning an id a job
+/// spec then references via `input_video_upload`. The body is the raw bytes (no
+/// base64, no JSON) so a large clip does not inflate or hit the JSON size cap;
+/// the store holds it RAM-first or seals it to an encrypted spill. Uploads are
+/// reaped after `upload_ttl_secs` if never consumed by a job.
+#[utoipa::path(
+    post, path = "/uploads",
+    request_body(content = Vec<u8>, description = "Raw mp4 bytes", content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "Stored", body = UploadResponse),
+        (status = 400, description = "Empty body"),
+        (status = 413, description = "Body exceeds max_upload_bytes"),
+    )
+)]
+async fn upload_video(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<UploadResponse>, ApiError> {
+    if body.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty upload body"));
+    }
+    let (id, size) = state
+        .uploads
+        .put(body.to_vec())
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(UploadResponse { id, size }))
 }
 
 /// Job status snapshot (polling fallback for the SSE stream).
@@ -471,6 +510,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     ),
     paths(
         create_job,
+        upload_video,
         get_status,
         events,
         get_result,
@@ -486,6 +526,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         thinfer_app::wire::FaceSwapSpec,
         thinfer_app::wire::LoraSpec,
         CreateResponse,
+        UploadResponse,
         JobStatus,
         JobStateKind,
         thinfer_app::wire::ProgressStage,

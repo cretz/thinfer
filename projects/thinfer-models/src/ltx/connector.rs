@@ -2,7 +2,8 @@
 //! embeddings connector (per modality: video 4096, audio 2048). Consumes the
 //! Gemma encoder's 49 hidden states and produces the DiT cross-attention KV
 //! caption tensors (`video [1024, 4096]`, `audio [1024, 2048]`, all positions
-//! valid; learnable registers fill the right-pad slots).
+//! valid; learnable registers fill the LEFT-pad slots -- real tokens land at the
+//! trailing rows, matching the `padding_side=LEFT` upstream tokenizer).
 //!
 //! Ground truth: `third-party/LTX-2/.../text_encoders/gemma/`
 //! (`feature_extractor.py` V2, `embeddings_connector.py`, `embeddings_processor.py`)
@@ -69,16 +70,29 @@ const FE_EPS: f32 = 1e-6;
 const N_STATES: usize = gemma::N_LAYERS + 1;
 const FE_FLAT: usize = gemma::HIDDEN * N_STATES; // 3840 * 49 = 188160
 
-/// One connector modality (video / audio) geometry.
+/// One connector modality (video / audio) geometry + weight provenance. The 22B
+/// (`VIDEO`/`AUDIO`) blocks are 8-layer gated, from the DiT GGUF (Q8_0); the 19B
+/// (`rapid_video`/`rapid_audio`) blocks are 2-layer ungated, from the connector
+/// SAFETENSORS (bf16), both streams at inner 3840.
 #[derive(Clone, Copy, Debug)]
 pub struct Modality {
-    /// GGUF prefix: `video_embeddings_connector` / `audio_embeddings_connector`.
+    /// Register prefix: `{video,audio}_embeddings_connector` (22B, DiT GGUF) or
+    /// `model.diffusion_model.{video,audio}_embeddings_connector` (19B, ST).
     pub prefix: &'static str,
     pub inner_dim: usize,
     pub n_heads: usize,
     pub head_dim: usize,
     /// Aggregate-embed Linear out width (= inner_dim).
     pub out_dim: usize,
+    /// Number of `transformer_1d_blocks` (22B 8, 19B 2).
+    pub n_layers: usize,
+    /// Per-head sigmoid attention gate (`to_gate_logits`). 22B true, 19B false.
+    pub gated: bool,
+    /// Blocks live in the connector safetensors (19B, bf16) vs the DiT GGUF (22B,
+    /// Q8_0). Selects the register transpose/quant + the block matmul weight dtype.
+    pub from_safetensors: bool,
+    /// RoPE fractional-position divisor (`max_position`).
+    pub max_pos: usize,
 }
 
 pub const VIDEO: Modality = Modality {
@@ -87,6 +101,10 @@ pub const VIDEO: Modality = Modality {
     n_heads: dit::CONNECTOR_N_HEADS,
     head_dim: dit::CONNECTOR_HEAD_DIM,
     out_dim: dit::DIM,
+    n_layers: dit::CONNECTOR_NUM_LAYERS,
+    gated: true,
+    from_safetensors: false,
+    max_pos: dit::CONNECTOR_MAX_POS,
 };
 
 pub const AUDIO: Modality = Modality {
@@ -95,6 +113,37 @@ pub const AUDIO: Modality = Modality {
     n_heads: dit::AUDIO_CONNECTOR_N_HEADS,
     head_dim: dit::AUDIO_CONNECTOR_HEAD_DIM,
     out_dim: dit::AUDIO_DIM,
+    n_layers: dit::CONNECTOR_NUM_LAYERS,
+    gated: true,
+    from_safetensors: false,
+    max_pos: dit::CONNECTOR_MAX_POS,
+};
+
+/// ltx2-rapid (19B) connectors: 2-layer, 30-head, inner 3840, UNGATED, from the
+/// connector safetensors (bf16). Both streams share this geometry; only the
+/// register prefix (and its learnable registers) differ.
+pub const RAPID_VIDEO: Modality = Modality {
+    prefix: "model.diffusion_model.video_embeddings_connector",
+    inner_dim: 3840,
+    n_heads: 30,
+    head_dim: 128,
+    out_dim: 3840,
+    n_layers: 2,
+    gated: false,
+    from_safetensors: true,
+    max_pos: dit::CONNECTOR_MAX_POS,
+};
+
+pub const RAPID_AUDIO: Modality = Modality {
+    prefix: "model.diffusion_model.audio_embeddings_connector",
+    inner_dim: 3840,
+    n_heads: 30,
+    head_dim: 128,
+    out_dim: 3840,
+    n_layers: 2,
+    gated: false,
+    from_safetensors: true,
+    max_pos: dit::CONNECTOR_MAX_POS,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +168,44 @@ pub fn feature_extractor_v2_flatten(states: &[Vec<f32>], seq: usize) -> Vec<f32>
             let base = t * FE_FLAT;
             for (dd, &v) in row.iter().enumerate() {
                 flat[base + dd * l_n + l] = v * inv;
+            }
+        }
+    }
+    flat
+}
+
+/// FeatureExtractor V1 (LTX-2 19B). Range-normalize each of the 49 hidden states
+/// and flatten C-order to `[seq, FE_FLAT]` with `flat[t][d*49 + l]`. Unlike V2's
+/// per-token RMS, V1 reduces mean/min/max over BOTH the token AND hidden axes,
+/// PER LAYER (a single scalar mean/range per layer), then `normed = 8*(x-mean)/
+/// (range+eps)` (`feature_extractor.py` `_norm_and_concat_padded_batch`). Real
+/// tokens only (our states carry no padding, so the mask is all-ones over `seq`).
+/// A single shared stream feeds both the video and audio connectors (`is_av`); no
+/// per-modality sqrt rescale (V2-only). `states[l]` is `[seq, HIDDEN]` row-major.
+pub fn feature_extractor_v1_flatten(states: &[Vec<f32>], seq: usize) -> Vec<f32> {
+    assert_eq!(states.len(), N_STATES, "FE V1 needs all 49 states");
+    let d = gemma::HIDDEN;
+    let l_n = N_STATES;
+    let mut flat = vec![0.0f32; seq * FE_FLAT];
+    for (l, state) in states.iter().enumerate() {
+        assert_eq!(state.len(), seq * d, "state {l} size");
+        // Per-layer mean/min/max over all seq*D values (masked = all real here).
+        let mut sum = 0.0f64;
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &v in state.iter() {
+            sum += v as f64;
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let mean = (sum / (seq * d) as f64) as f32;
+        let range = hi - lo;
+        let inv = 8.0 / (range + FE_EPS);
+        for t in 0..seq {
+            let row = &state[t * d..(t + 1) * d];
+            let base = t * FE_FLAT;
+            for (dd, &v) in row.iter().enumerate() {
+                flat[base + dd * l_n + l] = (v - mean) * inv;
             }
         }
     }
@@ -161,6 +248,20 @@ pub fn register_fe<S: WeightSource>(
     })
 }
 
+/// FE V1 (19B) aggregate-embed handle: a SINGLE bias-free Linear
+/// `[3840*49 -> 3840]` shared by both connectors (`text_embedding_projection.
+/// aggregate_embed.weight`, bf16). No per-modality video/audio split (unlike V2).
+pub fn register_fe_v1<S: WeightSource>(
+    residency: &WeightResidency<S>,
+) -> Result<WeightHandle, LoadError> {
+    register_one(
+        residency,
+        &WeightId("text_embedding_projection.aggregate_embed.weight".into()),
+        TransposePolicy::Linear2D,
+        None,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Connector block weights / handles (from the DiT GGUF)
 // ---------------------------------------------------------------------------
@@ -176,6 +277,7 @@ struct BlockWeightIds {
     o_b: WeightId,
     q_norm: WeightId,
     k_norm: WeightId,
+    /// Present only on the gated (22B) connector.
     gate_w: WeightId,
     gate_b: WeightId,
     ff0_w: WeightId,
@@ -221,8 +323,8 @@ pub struct BlockHandles {
     o_b: WeightHandle,
     q_norm: WeightHandle,
     k_norm: WeightHandle,
-    gate_w: WeightHandle,
-    gate_b: WeightHandle,
+    gate_w: Option<WeightHandle>,
+    gate_b: Option<WeightHandle>,
     ff0_w: WeightHandle,
     ff0_b: WeightHandle,
     ff2_w: WeightHandle,
@@ -236,17 +338,25 @@ pub struct ConnectorHandles {
     registers: WeightHandle,
 }
 
-/// Register one modality's 8 connector blocks + registers from the DiT GGUF.
+/// Register one modality's connector blocks + registers. 22B: 8 gated blocks from
+/// the DiT GGUF (Q8_0 matmuls). 19B: 2 ungated blocks from the connector
+/// safetensors (bf16 matmuls; `from_safetensors` -> no Q8 hint, no gate tensors).
 pub fn register_connector<S: WeightSource>(
     residency: &WeightResidency<S>,
     m: Modality,
 ) -> Result<ConnectorHandles, LoadError> {
-    let q8 = Some(thinfer_core::quant::QuantKind::Q8_0);
-    // Matmul weights are Q8_0 in the GGUF -> registered as-is (transcode moot).
+    // GGUF matmuls are Q8_0 (registered as-is, transcode moot); safetensors
+    // matmuls are bf16 (no hint). `register_one` ignores the hint for an
+    // already-quantized source, so the Q8 hint is harmless when present.
+    let q8 = if m.from_safetensors {
+        None
+    } else {
+        Some(thinfer_core::quant::QuantKind::Q8_0)
+    };
     let lin = |id: &WeightId| register_one(residency, id, TransposePolicy::Linear2D, q8);
     let dense = |id: &WeightId| register_one(residency, id, TransposePolicy::None, None);
-    let mut layers = Vec::with_capacity(dit::CONNECTOR_NUM_LAYERS);
-    for b in (0..dit::CONNECTOR_NUM_LAYERS).map(|i| BlockWeightIds::new(m.prefix, i)) {
+    let mut layers = Vec::with_capacity(m.n_layers);
+    for b in (0..m.n_layers).map(|i| BlockWeightIds::new(m.prefix, i)) {
         layers.push(BlockHandles {
             q_w: lin(&b.q_w)?,
             q_b: dense(&b.q_b)?,
@@ -258,8 +368,12 @@ pub fn register_connector<S: WeightSource>(
             o_b: dense(&b.o_b)?,
             q_norm: dense(&b.q_norm)?,
             k_norm: dense(&b.k_norm)?,
-            gate_w: lin(&b.gate_w)?,
-            gate_b: dense(&b.gate_b)?,
+            gate_w: if m.gated { Some(lin(&b.gate_w)?) } else { None },
+            gate_b: if m.gated {
+                Some(dense(&b.gate_b)?)
+            } else {
+                None
+            },
             ff0_w: lin(&b.ff0_w)?,
             ff0_b: dense(&b.ff0_b)?,
             ff2_w: lin(&b.ff2_w)?,
@@ -274,10 +388,12 @@ pub fn register_connector<S: WeightSource>(
 // Pipelines
 // ---------------------------------------------------------------------------
 
-/// Connector block config: Q8_0 matmuls, F32 acts, bf16 norm/bias weights,
-/// dense acts (no DP4A act-quant; once-per-request and the gated-attn / gelu
-/// A-sides can carry outliers). `head_dim` 128 (video) fits `SdpaF32`.
-fn connector_block_cfgs() -> BlockWgslConfigs {
+/// Connector block config: F32 acts, bf16 norm/bias weights, dense acts (no DP4A
+/// act-quant; once-per-request and the gated-attn / gelu A-sides can carry
+/// outliers). `head_dim` 128 (video) fits `SdpaF32`. `mm_weight` is the block
+/// matmul weight dtype: Q8_0 for the 22B connector (DiT GGUF) or Bf16 for the 19B
+/// connector (safetensors).
+fn connector_block_cfgs(mm_weight: WeightDtype) -> BlockWgslConfigs {
     use thinfer_core::ops::ActDtype;
     let ops = WgslConfig {
         bf16_quant_writes: false,
@@ -285,7 +401,7 @@ fn connector_block_cfgs() -> BlockWgslConfigs {
         weight_dtype: WeightDtype::Bf16,
     };
     let mm = WgslConfig {
-        weight_dtype: WeightDtype::Quant(thinfer_core::quant::QuantKind::Q8_0),
+        weight_dtype: mm_weight,
         ..ops
     };
     BlockWgslConfigs {
@@ -321,8 +437,25 @@ pub struct ConnectorPipelines {
 }
 
 impl ConnectorPipelines {
+    /// 22B connector pipelines (Q8_0 block matmuls).
     pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
-        let cfgs = connector_block_cfgs();
+        Self::compile_with(
+            backend,
+            WeightDtype::Quant(thinfer_core::quant::QuantKind::Q8_0),
+        )
+        .await
+    }
+
+    /// 19B (ltx2-rapid) connector pipelines (bf16 block matmuls, from safetensors).
+    pub async fn compile_rapid(backend: &WgpuBackend) -> Result<Self, WgpuError> {
+        Self::compile_with(backend, WeightDtype::Bf16).await
+    }
+
+    async fn compile_with(
+        backend: &WgpuBackend,
+        mm_weight: WeightDtype,
+    ) -> Result<Self, WgpuError> {
+        let cfgs = connector_block_cfgs(mm_weight);
         let block = BlockPipelines::compile(backend, &cfgs).await?;
         let fe_cfg = WgslConfig {
             weight_dtype: WeightDtype::Bf16,
@@ -376,7 +509,7 @@ impl ConnectorPipelines {
 fn build_connector_freqs(m: Modality, seq: usize) -> Vec<f32> {
     use std::f64::consts::PI;
     let theta = dit::ROPE_THETA;
-    let max_pos = dit::CONNECTOR_MAX_POS as f64;
+    let max_pos = m.max_pos as f64;
     let half = m.inner_dim / 2;
     let pairs = m.head_dim / 2;
     let indices: Vec<f64> = (0..half)
@@ -483,10 +616,65 @@ pub async fn fe_aggregate<S: WeightSource>(
     ))
 }
 
+/// FE V1 aggregate-embed Linear (19B): `out = flat @ W^T` -- NO per-modality
+/// `sqrt(out/D)` rescale (V2-only) and NO bias (`bias=false`). `flat` is the
+/// range-normalized single stream (`feature_extractor_v1_flatten`); the result
+/// `[seq, 3840]` feeds BOTH connectors. `out_dim = 3840` (= `gemma::HIDDEN`).
+pub async fn fe_aggregate_v1<S: WeightSource>(
+    backend: &WgpuBackend,
+    pipelines: &ConnectorPipelines,
+    residency: &WeightResidency<S>,
+    scratch: &Workspace<WgpuBackend>,
+    flat: &[f32],
+    seq: usize,
+    w: WeightHandle,
+    out_dim: usize,
+) -> Result<Vec<f32>, ConnError<S::Error>> {
+    let bp = &pipelines.block;
+    let flat_buf = scratch.alloc(bp.act_bytes((seq * FE_FLAT) as u32))?;
+    backend.write_buffer(flat_buf.id, 0, &seq::act_upload_bytes(bp.act_dtype, flat))?;
+    let out_bytes = bp.act_bytes((seq * out_dim) as u32);
+    let out_buf = scratch.alloc(out_bytes)?;
+
+    let w_view = residency.acquire(w, backend).await?;
+    {
+        let scope = scratch.batch();
+        let x = scope.import_copy(flat_buf.as_buf_ref());
+        let wv = scope.import_copy(w_view.buf());
+        let pre = alloc_matmul_out_buf(&scope, bp, (seq * out_dim) as u32)?;
+        let dims = scope.u32x4_uniform(seq as u32, out_dim as u32, FE_FLAT as u32, 0)?;
+        scope.matmul(
+            &pipelines.fe_matmul,
+            &pipelines.fe_matmul_op,
+            x,
+            wv,
+            dims,
+            pre,
+            seq as u32,
+            out_dim as u32,
+        )?;
+        let out_h = scope.import_copy(out_buf.as_buf_ref());
+        scope.copy_buffer_to_buffer(pre, 0, out_h, 0, out_bytes)?;
+        scope.submit_void().await?;
+    }
+    let bytes = backend.read_buffer(out_buf.id(), 0, out_bytes).await?;
+    Ok(seq::act_readback_to_f32(
+        bp.act_dtype,
+        &bytes,
+        seq * out_dim,
+    ))
+}
+
 /// Frame `[n_real, inner]` aggregate embeds into the `[CONN_SEQ, inner]` connector
-/// input: valid tokens at rows `0..n_real`, then `learnable_registers[row % 128]`
-/// (the registers are tiled with period 128 over the full sequence, replaced where
-/// the binary mask is 0). `registers` is `[128, inner]` row-major host f32.
+/// input, LEFT-padded to match the upstream tokenizer (`LTXVGemmaTokenizer`,
+/// `padding_side=LEFT`): the leading `CONN_SEQ - n_real` rows hold
+/// `learnable_registers[row % 128]` (registers tiled with period 128 over the full
+/// arange, kept where the reference binary mask is 0 = pad) and the real tokens
+/// occupy the TRAILING `n_real` rows in order. The connector applies rope over
+/// absolute positions `arange(CONN_SEQ)`, so the real tokens must sit at the high
+/// positions (`CONN_SEQ - n_real .. CONN_SEQ`) to reproduce the reference
+/// `_replace_padded_with_learnable_registers`. `registers` is `[128, inner]`
+/// row-major host f32.
 fn frame_with_registers(
     embeds: &[f32],
     n_real: usize,
@@ -494,11 +682,12 @@ fn frame_with_registers(
     registers: &[f32],
 ) -> Vec<f32> {
     let mut framed = vec![0.0f32; CONN_SEQ * inner];
-    framed[..n_real * inner].copy_from_slice(&embeds[..n_real * inner]);
-    for row in n_real..CONN_SEQ {
+    let n_reg = CONN_SEQ - n_real;
+    for row in 0..n_reg {
         let reg = (row % dit::CONNECTOR_NUM_LEARNABLE_REGISTERS) * inner;
         framed[row * inner..(row + 1) * inner].copy_from_slice(&registers[reg..reg + inner]);
     }
+    framed[n_reg * inner..].copy_from_slice(&embeds[..n_real * inner]);
     framed
 }
 
@@ -526,8 +715,8 @@ struct ConnBufs {
     o_b: BufRef,
     q_norm: BufRef,
     k_norm: BufRef,
-    gate_w: BufRef,
-    gate_b: BufRef,
+    gate_w: Option<BufRef>,
+    gate_b: Option<BufRef>,
     ff0_w: BufRef,
     ff0_b: BufRef,
     ff2_w: BufRef,
@@ -770,22 +959,29 @@ fn conn_block_forward<'wsp>(
         0,
     )?;
 
-    // per-head gate: attn * 2*sigmoid(to_gate_logits(n1)).
-    let gate_pre = mm(
-        n1,
-        b.gate_w,
-        hq,
-        dimu,
-        bp.dequant_qkv.as_ref(),
-        &bp.matmul_qkv,
-        &bp.matmuls.qkv,
-    )?;
-    let gate = add_bias(gate_pre, b.gate_b, hq)?;
-    let gated = alloc_act(scope, bp, rows, dimu)?;
-    scope.dispatch_op::<GatedHeadMulF32>(&pipelines.gate, &[sa.data, gate], gated.data)?;
+    // per-head gate: attn * 2*sigmoid(to_gate_logits(n1)). 22B only; the 19B
+    // connector is UNGATED (no gate tensors) -> SDPA output goes straight to to_out.
+    let attn_out = match (b.gate_w, b.gate_b) {
+        (Some(gate_w), Some(gate_b)) => {
+            let gate_pre = mm(
+                n1,
+                gate_w,
+                hq,
+                dimu,
+                bp.dequant_qkv.as_ref(),
+                &bp.matmul_qkv,
+                &bp.matmuls.qkv,
+            )?;
+            let gate = add_bias(gate_pre, gate_b, hq)?;
+            let gated = alloc_act(scope, bp, rows, dimu)?;
+            scope.dispatch_op::<GatedHeadMulF32>(&pipelines.gate, &[sa.data, gate], gated.data)?;
+            gated
+        }
+        _ => sa,
+    };
 
     let proj = mm(
-        gated,
+        attn_out,
         b.o_w,
         dimu,
         dimu,
@@ -837,8 +1033,8 @@ struct LayerViews<'a> {
     o_b: GpuView<'a>,
     q_norm: GpuView<'a>,
     k_norm: GpuView<'a>,
-    gate_w: GpuView<'a>,
-    gate_b: GpuView<'a>,
+    gate_w: Option<GpuView<'a>>,
+    gate_b: Option<GpuView<'a>>,
     ff0_w: GpuView<'a>,
     ff0_b: GpuView<'a>,
     ff2_w: GpuView<'a>,
@@ -851,6 +1047,14 @@ impl<'a> LayerViews<'a> {
         residency: &'a WeightResidency<S>,
         backend: &WgpuBackend,
     ) -> Result<Self, ResidencyError<S::Error, WgpuError>> {
+        let opt = |o: Option<WeightHandle>| async move {
+            match o {
+                Some(h) => Ok::<_, ResidencyError<S::Error, WgpuError>>(Some(
+                    residency.acquire(h, backend).await?,
+                )),
+                None => Ok(None),
+            }
+        };
         Ok(Self {
             q_w: residency.acquire(h.q_w, backend).await?,
             q_b: residency.acquire(h.q_b, backend).await?,
@@ -862,8 +1066,8 @@ impl<'a> LayerViews<'a> {
             o_b: residency.acquire(h.o_b, backend).await?,
             q_norm: residency.acquire(h.q_norm, backend).await?,
             k_norm: residency.acquire(h.k_norm, backend).await?,
-            gate_w: residency.acquire(h.gate_w, backend).await?,
-            gate_b: residency.acquire(h.gate_b, backend).await?,
+            gate_w: opt(h.gate_w).await?,
+            gate_b: opt(h.gate_b).await?,
             ff0_w: residency.acquire(h.ff0_w, backend).await?,
             ff0_b: residency.acquire(h.ff0_b, backend).await?,
             ff2_w: residency.acquire(h.ff2_w, backend).await?,
@@ -882,8 +1086,8 @@ impl<'a> LayerViews<'a> {
             o_b: self.o_b.buf(),
             q_norm: self.q_norm.buf(),
             k_norm: self.k_norm.buf(),
-            gate_w: self.gate_w.buf(),
-            gate_b: self.gate_b.buf(),
+            gate_w: self.gate_w.as_ref().map(|v| v.buf()),
+            gate_b: self.gate_b.as_ref().map(|v| v.buf()),
             ff0_w: self.ff0_w.buf(),
             ff0_b: self.ff0_b.buf(),
             ff2_w: self.ff2_w.buf(),
@@ -913,6 +1117,33 @@ mod tests {
     }
 
     #[test]
+    fn fe_v1_range_norm_and_layout() {
+        // 2 tokens. Layer l: first half of D is 0.0, second half is 2*(l+1).
+        // -> per-layer mean=(l+1), range=2(l+1), so 8*(x-mean)/range maps the low
+        // half to -4 and the high half to +4 for EVERY layer.
+        let seq = 2;
+        let d = gemma::HIDDEN;
+        let states: Vec<Vec<f32>> = (0..N_STATES)
+            .map(|l| {
+                let hi = 2.0 * (l + 1) as f32;
+                (0..seq)
+                    .flat_map(|_| (0..d).map(move |dd| if dd < d / 2 { 0.0 } else { hi }))
+                    .collect()
+            })
+            .collect();
+        let flat = super::feature_extractor_v1_flatten(&states, seq);
+        assert_eq!(flat.len(), seq * FE_FLAT);
+        for l in [0usize, 5, N_STATES - 1] {
+            // index = t * FE_FLAT + dd * N_STATES + l, here t=0.
+            // dd=0 (low half) -> -4; dd=D/2 (high half) -> +4.
+            let low = flat[l];
+            let high = flat[(d / 2) * N_STATES + l];
+            assert!((low + 4.0).abs() < 1e-2, "layer {l} low {low}");
+            assert!((high - 4.0).abs() < 1e-2, "layer {l} high {high}");
+        }
+    }
+
+    #[test]
     fn freqs_endpoints() {
         // pos at the middle of max_pos -> frac 0 -> all cos=1, sin=0.
         let mid = dit::CONNECTOR_MAX_POS / 2;
@@ -924,6 +1155,8 @@ mod tests {
 
     #[test]
     fn registers_fill_pads() {
+        // LEFT-pad: registers fill the leading rows (0 -> reg 0, 1 -> reg 1, ...),
+        // the single real token lands in the FINAL row.
         let inner = 4;
         let n_real = 1;
         let embeds = vec![9.0f32; n_real * inner];
@@ -931,8 +1164,11 @@ mod tests {
             .map(|i| i as f32)
             .collect();
         let framed = frame_with_registers(&embeds, n_real, inner, &registers);
-        assert_eq!(&framed[0..inner], &[9.0; 4]);
+        // row 0 -> register 0 -> [0,1,2,3]
+        assert_eq!(&framed[0..inner], &[0.0, 1.0, 2.0, 3.0]);
         // row 1 -> register 1 -> [4,5,6,7]
         assert_eq!(&framed[inner..2 * inner], &[4.0, 5.0, 6.0, 7.0]);
+        // final row -> the real token.
+        assert_eq!(&framed[(CONN_SEQ - 1) * inner..], &[9.0; 4]);
     }
 }

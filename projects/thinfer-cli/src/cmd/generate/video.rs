@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::{EncoderQuant, RewriteQuality, VaeChoice, VideoModelId, VideoSampler};
-use thinfer_app::request::{FaceImage, VideoFormat, VideoInput, VideoRequest};
+use thinfer_app::request::{ImageBytes, VideoFormat, VideoInput, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 
@@ -18,8 +18,8 @@ use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 /// 4k+1 (the causal-VAE temporal grid). For a fast first run, pass `--frames 5`.
 #[derive(Args)]
 pub struct GenerateVideo {
-    /// Model identifier. Defaults to `fastwan-ti2v-5b` (safetensors, the
-    /// e2e-validated path).
+    /// Model identifier. Defaults to `fastwan-ti2v-5b` (a fast 5B DMD distill,
+    /// 960x544, no prompt rewrite; the e2e-validated path).
     #[arg(long, default_value_t = VideoModelId::DEFAULT, value_enum)]
     pub model: VideoModelId,
     /// Text prompt. Repeat `--prompt` for a multi-shot video (LongLive only):
@@ -85,11 +85,16 @@ pub struct GenerateVideo {
     /// tiled long-clip path.
     #[arg(long)]
     pub attn_window: Option<u32>,
-    /// First-frame conditioning image (PNG/JPEG). Optional, and only on
-    /// hunyuan-video-1.5-ti2v: with it the run animates the image (I2V);
-    /// without it the model generates from the prompt alone.
+    /// First-frame conditioning image (PNG/JPEG). Optional, on
+    /// hunyuan-video-1.5-ti2v and ltx2-rapid: with it the run animates the image
+    /// (I2V); without it the model generates from the prompt alone.
     #[arg(long)]
     pub input_image: Option<PathBuf>,
+    /// LTX native-I2V frame-0 conditioning strength (0.0..=1.0, default 1.0):
+    /// 1.0 locks the input frame through the denoise; lower lets it drift toward
+    /// the model's own first frame. Used only with --input-image on ltx2-rapid.
+    #[arg(long, default_value_t = 1.0)]
+    pub strength: f32,
     /// Host RAM budget for the weight residency manager. e.g. `8G`, `512M`.
     #[arg(long)]
     pub ram_budget: Option<String>,
@@ -133,6 +138,16 @@ pub struct GenerateVideo {
     /// with `--no-rewrite` or on non-Hunyuan models.
     #[arg(long, value_enum, default_value_t = RewriteQuality::Fast)]
     pub rewrite_quality: RewriteQuality,
+    /// Fold a stored adapter into the DiT, as `NAME_OR_ID[:WEIGHT]` (repeatable,
+    /// applied in order). Resolved against the vault for `--model`; needs the
+    /// vault password (hidden prompt, or `THINFER_VAULT_PASSWORD`). Local runs
+    /// only (not `--remote`); only AnyFlow accepts adapters today.
+    #[arg(long = "lora", value_name = "NAME[:WEIGHT]")]
+    pub lora: Vec<String>,
+    /// Vault directory for `--lora`. Defaults to the shared location
+    /// (`THINFER_VAULT_DIR`, else `<hf-cache>/vault`).
+    #[arg(long)]
+    pub vault_dir: Option<PathBuf>,
     #[command(flatten)]
     pub remote: super::RemoteArgs,
 }
@@ -164,6 +179,12 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         if format != VideoFormat::Mp4 {
             return Err("--remote only produces MP4 (png-frames is a local debug format)".into());
         }
+        if !args.lora.is_empty() {
+            return Err(
+                "--lora (adapters) is not supported over --remote; run locally or use the web UI"
+                    .into(),
+            );
+        }
         let spec = JobSpec::Video(VideoSpec {
             model: Some(args.model),
             prompts: args.prompt,
@@ -178,8 +199,12 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             attn_window: args.attn_window,
             vae: Some(args.vae),
             input_image: base64_of(args.input_image.as_deref())?,
+            strength: Some(args.strength),
             source_image: base64_of(args.source_image.as_deref())?,
             input_video: base64_of(args.input_video.as_deref())?,
+            // The CLI reads local files inline; the raw-upload endpoint is a
+            // serve-only path, so there is never an upload id here.
+            input_video_upload: None,
             guide_scale: args.guide_scale,
             encoder: Some(args.encoder),
             i8_matmul: Some(!args.no_i8_matmul),
@@ -191,11 +216,23 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
             disable_coopmat: None,
+            // Adapters over --remote are guarded above.
+            lora: Vec::new(),
+            password: None,
         });
         return super::run_remote(&args.remote, spec, args.output).await;
     }
     let ram = parse_budget("--ram-budget", args.ram_budget.as_deref())?;
     let vram = parse_budget("--vram-budget", args.vram_budget.as_deref())?;
+
+    // Resolve any --lora names/ids against the vault (needs the password).
+    let (lora, vault_password) = if args.lora.is_empty() {
+        (Vec::new(), None)
+    } else {
+        let (refs, password) =
+            super::image::resolve_loras(args.model, args.vault_dir.as_deref(), &args.lora)?;
+        (refs, Some(password))
+    };
 
     let (def_w, def_h) = args.model.video_defaults();
     let req = VideoRequest {
@@ -207,9 +244,15 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         durations: args.duration,
         fps: args.fps,
         seed: args.seed,
-        input_image: args.input_image,
+        input_image: match &args.input_image {
+            Some(p) => Some(ImageBytes(
+                std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,
+            )),
+            None => None,
+        },
+        strength: args.strength,
         source_image: match &args.source_image {
-            Some(p) => Some(FaceImage(
+            Some(p) => Some(ImageBytes(
                 std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,
             )),
             None => None,
@@ -234,6 +277,9 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         upscale: args.upscale || args.model.two_stage_default(),
         rewrite: !args.no_rewrite,
         rewrite_quality: args.rewrite_quality,
+        lora,
+        vault_password,
+        vault_dir: thinfer_app::vault::resolve_dir(args.vault_dir.as_deref()),
         budget: ResidencyBudget {
             ram_bytes: ram,
             vram_bytes: vram,

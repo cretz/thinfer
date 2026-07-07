@@ -6,8 +6,8 @@
 
 use std::path::Path;
 
-use thinfer_models::faceswap::FaceSwapper;
 use thinfer_models::faceswap::image::Image;
+use thinfer_models::faceswap::{Face, FaceSwapper};
 use thinfer_models::wan::pipeline::WanVideo;
 use thinfer_models::z_image::pipeline::encode_png;
 
@@ -530,6 +530,102 @@ fn strip_audio_traks(input: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+/// First child box of kind `kind` directly inside the box at `parent_start`
+/// (whose contents end at `parent_end`). Returns `(kind, abs_start, abs_end)`.
+fn find_child(
+    data: &[u8],
+    parent_start: usize,
+    parent_end: usize,
+    kind: &[u8; 4],
+) -> Option<([u8; 4], usize, usize)> {
+    child_boxes(data, box_payload_start(data, parent_start), parent_end)
+        .into_iter()
+        .find(|(k, ..)| k == kind)
+}
+
+/// Some H.264 muxers emit the `avc1` sample entry with a `colr`/`pasp`/`fiel`
+/// box BEFORE the `avcC` config box. The strict `mp4` demuxer reads only the
+/// FIRST child of `avc1` and rejects the track ("avcc not found") if it is not
+/// `avcC`, even though the clip is perfectly decodable H.264. Reorder the `avc1`
+/// child boxes IN PLACE so `avcC` leads: every child keeps its exact bytes and
+/// length and the region is only permuted, so the `avc1` box size and all
+/// downstream chunk offsets (`stco`/`co64`) are unchanged. Returns the input
+/// borrowed when no reorder is needed or on any parse surprise.
+fn reorder_avcc_first(input: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    let Some(boxes) = top_level_boxes(input) else {
+        return Cow::Borrowed(input);
+    };
+    let Some(moov) = boxes.iter().find(|b| &b.kind == b"moov") else {
+        return Cow::Borrowed(input);
+    };
+
+    // Every avc1 child region that needs reordering: (children_start, avc1_end).
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for (k, ts, te) in child_boxes(
+        input,
+        box_payload_start(input, moov.start),
+        moov.start + moov.len,
+    ) {
+        if &k != b"trak" {
+            continue;
+        }
+        // trak -> mdia -> minf -> stbl -> stsd.
+        let Some((_, ms, me)) = find_child(input, ts, te, b"mdia") else {
+            continue;
+        };
+        let Some((_, is, ie)) = find_child(input, ms, me, b"minf") else {
+            continue;
+        };
+        let Some((_, bs, be)) = find_child(input, is, ie, b"stbl") else {
+            continue;
+        };
+        let Some((_, ss, se)) = find_child(input, bs, be, b"stsd") else {
+            continue;
+        };
+        // stsd is a FullBox: skip version+flags (4) + entry_count (4) to reach
+        // the sample-entry boxes; then find the avc1 entry (if any).
+        for (ek, es, ee) in child_boxes(input, box_payload_start(input, ss) + 8, se) {
+            if &ek != b"avc1" {
+                continue;
+            }
+            // avc1's children start after the 78-byte visual sample entry header
+            // (the fields the `mp4` crate reads before the first child box).
+            let children_start = box_payload_start(input, es) + 78;
+            let kids = child_boxes(input, children_start, ee);
+            match kids.iter().position(|(kk, ..)| kk == b"avcC") {
+                Some(0) | None => {} // already first, or no avcC to hoist
+                Some(_) => regions.push((children_start, ee)),
+            }
+        }
+    }
+    if regions.is_empty() {
+        return Cow::Borrowed(input);
+    }
+
+    let mut out = input.to_vec();
+    for (children_start, avc1_end) in regions {
+        let kids = child_boxes(input, children_start, avc1_end);
+        let mut reordered = Vec::with_capacity(avc1_end - children_start);
+        // avcC first, then every other child in its original order.
+        for (k, s, e) in kids.iter().filter(|(k, ..)| k == b"avcC") {
+            let _ = k;
+            reordered.extend_from_slice(&input[*s..*e]);
+        }
+        for (k, s, e) in &kids {
+            if k != b"avcC" {
+                reordered.extend_from_slice(&input[*s..*e]);
+            }
+        }
+        // Only rewrite when the children tile the region exactly (they always do
+        // for well-formed avc1); otherwise leave it for the reader to reject.
+        if reordered.len() == avc1_end - children_start {
+            out[children_start..avc1_end].copy_from_slice(&reordered);
+        }
+    }
+    Cow::Owned(out)
+}
+
 // --- Annex B <-> AVCC --------------------------------------------------------
 
 /// Convert one Annex B access unit to AVCC (4-byte length-prefixed NALs),
@@ -601,11 +697,14 @@ fn nal_units(annexb: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Convert AVCC (4-byte length-prefixed NALs) to Annex B, appending to `out`.
-fn avcc_to_annexb(avcc: &[u8], out: &mut Vec<u8>) {
+fn avcc_to_annexb(avcc: &[u8], length_size: usize, out: &mut Vec<u8>) {
     let mut i = 0;
-    while i + 4 <= avcc.len() {
-        let len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
-        i += 4;
+    while i + length_size <= avcc.len() {
+        let mut len = 0usize;
+        for &b in &avcc[i..i + length_size] {
+            len = (len << 8) | b as usize;
+        }
+        i += length_size;
         if i + len > avcc.len() {
             break;
         }
@@ -613,6 +712,261 @@ fn avcc_to_annexb(avcc: &[u8], out: &mut Vec<u8>) {
         out.extend_from_slice(&avcc[i..i + len]);
         i += len;
     }
+}
+
+/// (all SPS NALs, all PPS NALs, NAL length-prefix width in bytes).
+type ParamSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, usize);
+
+/// Every SPS and PPS NAL from every `avcC` config record in the file, plus the
+/// NAL length-prefix width (bytes). A clip can carry MORE than one parameter set
+/// -- a second `stsd` `avc1` entry written after a mid-recording resolution or
+/// orientation change, or several sets in one record. Slices after the switch
+/// reference the later set, so prepending only the FIRST record's first SPS/PPS
+/// makes openh264 report `dsNoParamSets` (Native error bit 0x10) and lose every
+/// frame past the switch. Collect them all (deduped) so the prefix we prepend to
+/// each access unit always contains the set the slice needs. `None` when no avcC
+/// parsed (the caller falls back to the demuxer's single SPS/PPS).
+fn collect_avcc_param_sets(input: &[u8]) -> Option<ParamSets> {
+    let boxes = top_level_boxes(input)?;
+    let moov = boxes.iter().find(|b| &b.kind == b"moov")?;
+    let mut sps_all: Vec<Vec<u8>> = Vec::new();
+    let mut pps_all: Vec<Vec<u8>> = Vec::new();
+    let mut length_size = 4usize;
+    for (k, ts, te) in child_boxes(
+        input,
+        box_payload_start(input, moov.start),
+        moov.start + moov.len,
+    ) {
+        if &k != b"trak" {
+            continue;
+        }
+        let Some((_, ms, me)) = find_child(input, ts, te, b"mdia") else {
+            continue;
+        };
+        let Some((_, is, ie)) = find_child(input, ms, me, b"minf") else {
+            continue;
+        };
+        let Some((_, bs, be)) = find_child(input, is, ie, b"stbl") else {
+            continue;
+        };
+        let Some((_, ss, se)) = find_child(input, bs, be, b"stsd") else {
+            continue;
+        };
+        for (ek, es, ee) in child_boxes(input, box_payload_start(input, ss) + 8, se) {
+            if &ek != b"avc1" {
+                continue;
+            }
+            // avc1 children start past the 78-byte visual sample entry header.
+            let children_start = box_payload_start(input, es) + 78;
+            let Some((_, cs, ce)) = child_boxes(input, children_start, ee)
+                .into_iter()
+                .find(|(kk, ..)| kk == b"avcC")
+            else {
+                continue;
+            };
+            let rec = &input[box_payload_start(input, cs)..ce];
+            if let Some(ls) = parse_avcc_record(rec, &mut sps_all, &mut pps_all) {
+                length_size = ls;
+            }
+        }
+    }
+    if sps_all.is_empty() && pps_all.is_empty() {
+        return None;
+    }
+    Some((sps_all, pps_all, length_size))
+}
+
+/// Parse one AVCDecoderConfigurationRecord, appending its SPS/PPS NALs (deduped)
+/// and returning the NAL length-prefix width in bytes. Layout: `[0]` version,
+/// `[1..4]` profile/compat/level, `[4]` `xxxxxx|lengthSizeMinusOne(2b)`, `[5]`
+/// `xxx|numSPS(5b)`, then each SPS as `u16 len + bytes`, then `[numPPS: u8]`,
+/// then each PPS as `u16 len + bytes`.
+fn parse_avcc_record(rec: &[u8], sps: &mut Vec<Vec<u8>>, pps: &mut Vec<Vec<u8>>) -> Option<usize> {
+    if rec.len() < 6 {
+        return None;
+    }
+    let length_size = (rec[4] & 0x03) as usize + 1;
+    let push = |dst: &mut Vec<Vec<u8>>, nal: &[u8]| {
+        if !nal.is_empty() && !dst.iter().any(|e| e.as_slice() == nal) {
+            dst.push(nal.to_vec());
+        }
+    };
+    let mut i = 6;
+    for _ in 0..(rec[5] & 0x1F) {
+        if i + 2 > rec.len() {
+            return Some(length_size);
+        }
+        let l = u16::from_be_bytes([rec[i], rec[i + 1]]) as usize;
+        i += 2;
+        if i + l > rec.len() {
+            return Some(length_size);
+        }
+        push(sps, &rec[i..i + l]);
+        i += l;
+    }
+    if i >= rec.len() {
+        return Some(length_size);
+    }
+    let num_pps = rec[i];
+    i += 1;
+    for _ in 0..num_pps {
+        if i + 2 > rec.len() {
+            break;
+        }
+        let l = u16::from_be_bytes([rec[i], rec[i + 1]]) as usize;
+        i += 2;
+        if i + l > rec.len() {
+            break;
+        }
+        push(pps, &rec[i..i + l]);
+        i += l;
+    }
+    Some(length_size)
+}
+
+/// Build the Annex B parameter-set prefix (all SPS then all PPS, each with a
+/// 4-byte start code) prepended to every access unit before decode. Falls back
+/// to the demuxer's single `sps`/`pps` when no multi-set `avcC` could be parsed.
+fn build_param_set_prefix(container: &[u8], sps: &[u8], pps: &[u8]) -> (Vec<u8>, usize) {
+    let (sps_all, pps_all, length_size) = collect_avcc_param_sets(container)
+        .unwrap_or_else(|| (vec![sps.to_vec()], vec![pps.to_vec()], 4));
+    let mut prefix = Vec::new();
+    for nal in sps_all.iter().chain(pps_all.iter()) {
+        prefix.extend_from_slice(&[0, 0, 0, 1]);
+        prefix.extend_from_slice(nal);
+    }
+    (prefix, length_size)
+}
+
+/// Build the H.264 decoder with error concealment enabled. The safe `openh264`
+/// wrapper hardcodes concealment OFF, so a single lost reference (a corrupt or
+/// dropped inter-frame -- common in phone-recorded clips) makes EVERY following
+/// frame fail until the next clean IDR; with IDRs ~2s apart the output collapses
+/// to ~1 distinct frame every couple seconds (and a long enough run trips the
+/// per-sample error guard and aborts the job). `ERROR_CON_SLICE_MV_COPY_CROSS_IDR`
+/// lets the decoder rebuild references (motion-copy concealment, recovering across
+/// IDRs) and keep producing frames. `NoFlush` (drain via `flush_remaining`) is
+/// B-frame safe. Concealment is a no-op on clean streams (error-free frames keep
+/// returning `dsErrorFree`), so it does not change well-formed clips.
+fn make_h264_decoder() -> Result<openh264::decoder::Decoder, String> {
+    use openh264::OpenH264API;
+    use openh264::decoder::{Decoder, DecoderConfig, Flush};
+    let mut decoder = Decoder::with_api_config(
+        OpenH264API::from_source(),
+        DecoderConfig::new().flush_after_decode(Flush::NoFlush),
+    )
+    .map_err(|e| format!("openh264 decoder init: {e}"))?;
+    // SAFETY: raw_api()/set_option are unsafe FFI. We only set the documented
+    // DECODER_OPTION_ERROR_CON_IDC to a valid ERROR_CON_IDC; `idc` outlives the
+    // call and SetOption copies the int out, so the pointer is sound.
+    unsafe {
+        let mut idc: openh264_sys2::ERROR_CON_IDC =
+            openh264_sys2::ERROR_CON_SLICE_MV_COPY_CROSS_IDR;
+        let _ = decoder.raw_api().set_option(
+            openh264_sys2::DECODER_OPTION_ERROR_CON_IDC,
+            std::ptr::addr_of_mut!(idc).cast(),
+        );
+    }
+    Ok(decoder)
+}
+
+/// Feed one Annex B access unit and return the decoded frame, KEEPING concealed
+/// frames. The safe `Decoder::decode` turns any nonzero decode state into an Err
+/// and discards the frame -- but with concealment on, a frame flagged
+/// `dsDataErrorConcealed` (lost reference filled in) is still valid and usable;
+/// discarding it is exactly what froze glitchy/corrupt clips. We call the raw
+/// `decode_frame_no_delay` and read the picture directly, ignoring the state.
+/// `None` means the decoder buffered the AU for reorder (no frame ready yet).
+fn decode_au_concealed(
+    decoder: &mut openh264::decoder::Decoder,
+    au: &[u8],
+    rgb: &mut Vec<u8>,
+) -> Option<Image> {
+    let mut dst = [std::ptr::null_mut::<u8>(); 3];
+    let mut info = openh264_sys2::SBufferInfo::default();
+    // SAFETY: raw FFI. `decode_frame_no_delay` fills `dst` (plane pointers into the
+    // decoder's internal picture, valid until the next decode call) and `info`; we
+    // copy pixels out immediately in `yuv_ptrs_to_rgb`. The returned DECODING_STATE
+    // is intentionally ignored (concealed frames report nonzero but are valid).
+    unsafe {
+        decoder.raw_api().decode_frame_no_delay(
+            au.as_ptr(),
+            au.len() as i32,
+            std::ptr::from_mut(&mut dst).cast(),
+            std::ptr::from_mut(&mut info),
+        );
+    }
+    yuv_ptrs_to_rgb(&dst, &info, rgb)
+}
+
+/// Drain the decoder's reorder buffer after the last AU, keeping concealed frames
+/// (see [`decode_au_concealed`]). Bounded well above any real reorder depth.
+fn flush_all_concealed(decoder: &mut openh264::decoder::Decoder, rgb: &mut Vec<u8>) -> Vec<Image> {
+    let mut out = Vec::new();
+    for _ in 0..64 {
+        let mut dst = [std::ptr::null_mut::<u8>(); 3];
+        let mut info = openh264_sys2::SBufferInfo::default();
+        // SAFETY: as decode_au_concealed; flush_frame emits one buffered picture.
+        unsafe {
+            decoder.raw_api().flush_frame(
+                std::ptr::from_mut(&mut dst).cast(),
+                std::ptr::from_mut(&mut info),
+            );
+        }
+        match yuv_ptrs_to_rgb(&dst, &info, rgb) {
+            Some(img) => out.push(img),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Convert an openh264 I420 picture (plane pointers + `SBufferInfo`) to an RGB
+/// [`Image`]. `None` when no frame is ready (`iBufferStatus != 1`) or a plane is
+/// null. Matches openh264's own limited-range BT.601 YUV->RGB (`write_rgb8`), so
+/// output is identical to the safe path on clean frames.
+fn yuv_ptrs_to_rgb(
+    dst: &[*mut u8; 3],
+    info: &openh264_sys2::SBufferInfo,
+    rgb: &mut Vec<u8>,
+) -> Option<Image> {
+    if info.iBufferStatus != 1 || dst[0].is_null() || dst[1].is_null() || dst[2].is_null() {
+        return None;
+    }
+    // SAFETY: the union holds the system-memory buffer when a frame is ready.
+    let sys = unsafe { info.UsrData.sSystemBuffer };
+    let (w, h) = (sys.iWidth as usize, sys.iHeight as usize);
+    let (ys, cs) = (sys.iStride[0] as usize, sys.iStride[1] as usize);
+    if w == 0 || h == 0 || ys == 0 || cs == 0 {
+        return None;
+    }
+    // SAFETY: with iBufferStatus==1 the planes hold a full I420 picture at these
+    // strides (Y: h rows x ys; U/V: h/2 rows x cs), matching the safe decoder.
+    let (y, u, v) = unsafe {
+        (
+            std::slice::from_raw_parts(dst[0], ys * h),
+            std::slice::from_raw_parts(dst[1], cs * h / 2),
+            std::slice::from_raw_parts(dst[2], cs * h / 2),
+        )
+    };
+    const Y_MUL: f32 = 255.0 / 219.0;
+    const RV_MUL: f32 = 255.0 / 224.0 * 1.402;
+    const GV_MUL: f32 = -255.0 / 224.0 * 1.402 * 0.299 / 0.687;
+    const GU_MUL: f32 = -255.0 / 224.0 * 1.772 * 0.114 / 0.587;
+    const BU_MUL: f32 = 255.0 / 224.0 * 1.772;
+    rgb.resize(w * h * 3, 0);
+    for row in 0..h {
+        for col in 0..w {
+            let t = (row * w + col) * 3;
+            let yv = Y_MUL * (f32::from(y[row * ys + col]) - 16.0);
+            let uu = f32::from(u[(row / 2) * cs + col / 2]) - 128.0;
+            let vv = f32::from(v[(row / 2) * cs + col / 2]) - 128.0;
+            rgb[t] = RV_MUL.mul_add(vv, yv) as u8;
+            rgb[t + 1] = GV_MUL.mul_add(vv, GU_MUL.mul_add(uu, yv)) as u8;
+            rgb[t + 2] = BU_MUL.mul_add(uu, yv) as u8;
+        }
+    }
+    Some(Image::from_rgb8(w, h, rgb))
 }
 
 // --- RAM mp4 decode (DreamID-V target video) ---------------------------------
@@ -626,22 +980,21 @@ pub fn decode_mp4_frames(input: &[u8]) -> Result<(Vec<Image>, u32), String> {
     use std::io::Cursor;
 
     use mp4::{Mp4Reader, TrackType};
-    use openh264::OpenH264API;
-    use openh264::decoder::{Decoder, DecoderConfig, Flush};
 
     // The `mp4` demuxer parses the whole moov (incl. the audio track) strictly, so
     // an unusual audio sample-entry box (some AAC muxings) would fail the whole read
     // even though we only need the H.264 video track. Neutralize the audio trak(s)
     // first (in-place `free` rewrite, moov length preserved). If a read still fails,
     // surface an actionable hint rather than the raw box error.
-    let demuxed = strip_audio_traks(input);
+    let prepared = reorder_avcc_first(input);
+    let demuxed = strip_audio_traks(prepared.as_ref());
     let demuxed = demuxed.as_ref();
     let size = demuxed.len() as u64;
     let mut mp4 = Mp4Reader::read_header(Cursor::new(demuxed), size).map_err(|e| {
         format!(
-            "could not parse the uploaded video container ({e}). Some audio-track \
-             encodings are not yet supported; re-export the clip as H.264 + AAC-LC \
-             (or strip its audio) and retry."
+            "could not parse the MP4 video container ({e}). The file may be malformed \
+             or use an unsupported box layout; re-mux/re-export it as a standard \
+             H.264 MP4 and retry."
         )
     })?;
 
@@ -654,7 +1007,12 @@ pub fn decode_mp4_frames(input: &[u8]) -> Result<(Vec<Image>, u32), String> {
             .1;
         let sps = track
             .sequence_parameter_set()
-            .map_err(|e| format!("missing SPS: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "missing H.264 SPS ({e}); the video track is likely HEVC/H.265 or \
+                     another non-AVC codec, which is not supported -- re-export as H.264"
+                )
+            })?
             .to_vec();
         let pps = track
             .picture_parameter_set()
@@ -674,16 +1032,10 @@ pub fn decode_mp4_frames(input: &[u8]) -> Result<(Vec<Image>, u32), String> {
         .map(|t| t.sample_count())
         .unwrap_or(0);
 
-    let mut prefix = Vec::new();
-    for nal in [&sps, &pps] {
-        prefix.extend_from_slice(&[0, 0, 0, 1]);
-        prefix.extend_from_slice(nal);
-    }
-    let mut decoder = Decoder::with_api_config(
-        OpenH264API::from_source(),
-        DecoderConfig::new().flush_after_decode(Flush::NoFlush),
-    )
-    .map_err(|e| format!("openh264 decoder init: {e}"))?;
+    // Prepend EVERY avcC parameter set (all SPS/PPS across all avc1 entries), not
+    // just the first, so a mid-clip param-set switch does not lose the rest.
+    let (prefix, length_size) = build_param_set_prefix(demuxed, &sps, &pps);
+    let mut decoder = make_h264_decoder()?;
 
     let mut frames = Vec::with_capacity(count as usize);
     let mut rgb: Vec<u8> = Vec::new();
@@ -695,33 +1047,18 @@ pub fn decode_mp4_frames(input: &[u8]) -> Result<(Vec<Image>, u32), String> {
             continue;
         };
         let mut au = prefix.clone();
-        avcc_to_annexb(&sample.bytes, &mut au);
-        if let Some(yuv) = decoder
-            .decode(&au)
-            .map_err(|e| format!("decode sample {sid}: {e}"))?
-        {
-            frames.push(yuv_to_image(&yuv, &mut rgb));
+        avcc_to_annexb(&sample.bytes, length_size, &mut au);
+        // Concealing decode: a lost reference is filled in, not turned into a hard
+        // error, so a glitchy/corrupt clip keeps decoding instead of freezing.
+        if let Some(img) = decode_au_concealed(&mut decoder, &au, &mut rgb) {
+            frames.push(img);
         }
     }
-    for yuv in decoder
-        .flush_remaining()
-        .map_err(|e| format!("decode flush: {e}"))?
-    {
-        frames.push(yuv_to_image(&yuv, &mut rgb));
-    }
+    frames.extend(flush_all_concealed(&mut decoder, &mut rgb));
     if frames.is_empty() {
         return Err("input video has no decodable frames".into());
     }
     Ok((frames, fps))
-}
-
-/// Convert a decoded YUV frame to an RGB [`Image`], reusing `rgb` as scratch.
-fn yuv_to_image(yuv: &openh264::decoder::DecodedYUV<'_>, rgb: &mut Vec<u8>) -> Image {
-    use openh264::formats::YUVSource;
-    let (w, h) = yuv.dimensions();
-    rgb.resize(w * h * 3, 0);
-    yuv.write_rgb8(rgb);
-    Image::from_rgb8(w, h, rgb)
 }
 
 // --- Face-swap streaming (mp4 demux -> per-frame swap -> mp4 mux) -------------
@@ -730,18 +1067,45 @@ fn yuv_to_image(yuv: &openh264::decoder::DecodedYUV<'_>, rgb: &mut Vec<u8>) -> I
 /// so only a few frames are ever in RAM (a 4K clip otherwise materializes
 /// ~30GB). The source AAC audio track is remuxed verbatim. Returns the output
 /// `(width, height, fps, frame_count)`.
+/// Encode + trim knobs for a streaming face-swap.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamOptions {
+    /// Detect faces every Nth frame (>=1), reusing between. See `detect_stride`.
+    pub detect_stride: u32,
+    /// Output H.264 bitrate = source video bitrate * this factor. ~1.15 keeps
+    /// quality (offsets the second encode + a weaker encoder) without the 2x bloat
+    /// of a fixed high target. Falls back to a bits-per-pixel target when the
+    /// source bitrate is unknown.
+    pub bitrate_scale: f32,
+    /// Optional swap+output window, in seconds of the SOURCE clip: only frames in
+    /// [start, end) are swapped and written (rebased to t=0). `None` bounds mean
+    /// clip start / clip end.
+    pub start_secs: Option<f32>,
+    pub end_secs: Option<f32>,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        Self {
+            detect_stride: 1,
+            bitrate_scale: 1.15,
+            start_secs: None,
+            end_secs: None,
+        }
+    }
+}
+
 pub async fn swap_video_streaming(
     swapper: &FaceSwapper,
     embedding: &[f32],
     input: &[u8],
     output: &Path,
+    opts: StreamOptions,
     sink: &dyn ProgressSink,
 ) -> Result<(usize, usize, u32, usize), String> {
     use std::io::Cursor;
 
     use mp4::{Mp4Reader, TrackType};
-    use openh264::OpenH264API;
-    use openh264::decoder::{Decoder, DecoderConfig, Flush};
 
     // RAM-first: the uploaded mp4 rides in memory (decrypted from an encrypted
     // spill upstream if it was large), so demux over a Cursor -- no plaintext
@@ -752,14 +1116,24 @@ pub async fn swap_video_streaming(
     // even though we only need the H.264 video track. Neutralize the audio trak(s)
     // first (in-place `free` rewrite, moov length preserved). If a read still fails,
     // surface an actionable hint rather than the raw box error.
-    let demuxed = strip_audio_traks(input);
-    let demuxed = demuxed.as_ref();
+    //
+    // The bytes are owned here (not borrowed) so the decode thread below can take
+    // them: the pipeline runs demux+decode on one thread and encode on another,
+    // overlapping the ~77ms/frame codec CPU with the GPU swap.
+    //
+    // First reorder the avc1 sample entry so `avcC` leads (some muxers put a
+    // colr/pasp box first, which the strict demuxer rejects). Audio is extracted
+    // from these audio-INTACT bytes for passthrough BEFORE the audio trak is
+    // neutralized for the video demux -- stripping first would drop the audio.
+    let prepared = reorder_avcc_first(input);
+    let audio = extract_audio_from_bytes(prepared.as_ref());
+    let demuxed: Vec<u8> = strip_audio_traks(prepared.as_ref()).into_owned();
     let size = demuxed.len() as u64;
-    let mut mp4 = Mp4Reader::read_header(Cursor::new(demuxed), size).map_err(|e| {
+    let mp4 = Mp4Reader::read_header(Cursor::new(demuxed.as_slice()), size).map_err(|e| {
         format!(
-            "could not parse the uploaded video container ({e}). Some audio-track \
-             encodings are not yet supported; re-export the clip as H.264 + AAC-LC \
-             (or strip its audio) and retry."
+            "could not parse the MP4 video container ({e}). The file may be malformed \
+             or use an unsupported box layout; re-mux/re-export it as a standard \
+             H.264 MP4 and retry."
         )
     })?;
 
@@ -772,7 +1146,12 @@ pub async fn swap_video_streaming(
             .1;
         let sps = track
             .sequence_parameter_set()
-            .map_err(|e| format!("missing SPS: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "missing H.264 SPS ({e}); the video track is likely HEVC/H.265 or \
+                     another non-AVC codec, which is not supported -- re-export as H.264"
+                )
+            })?
             .to_vec();
         let pps = track
             .picture_parameter_set()
@@ -791,8 +1170,45 @@ pub async fn swap_video_streaming(
         .get(&track_id)
         .map(|t| t.sample_count())
         .unwrap_or(0);
+    // Source video bitrate -> scaled encoder target. 0/unknown -> None (the
+    // encoder falls back to its bits-per-pixel target).
+    let src_bitrate = mp4
+        .tracks()
+        .get(&track_id)
+        .map(|t| t.bitrate())
+        .unwrap_or(0);
+    let target_bitrate = (src_bitrate > 0).then(|| {
+        (f64::from(src_bitrate) * f64::from(opts.bitrate_scale.max(0.1))).max(1_000_000.0) as u32
+    });
 
-    let audio = extract_audio(&mut mp4)?;
+    // Trim window -> frame range [start_frame, end_frame). Bounds snap to whole
+    // frames at the source fps; the output is rebased to t=0.
+    let count_usize = count as usize;
+    let to_frame = |s: f32| (s.max(0.0) * fps as f32).round() as usize;
+    let start_frame = opts.start_secs.map(to_frame).unwrap_or(0).min(count_usize);
+    let end_frame = opts
+        .end_secs
+        .map(to_frame)
+        .unwrap_or(count_usize)
+        .clamp(start_frame, count_usize);
+    let out_count = end_frame - start_frame;
+    if out_count == 0 {
+        return Err(format!(
+            "trim window selects no frames (start={:?}s end={:?}s, clip is {} frames @ {fps}fps)",
+            opts.start_secs, opts.end_secs, count
+        ));
+    }
+    // Trim the passthrough audio to the same window (rebased) so it stays in sync.
+    let audio = if opts.start_secs.is_some() || opts.end_secs.is_some() {
+        trim_audio(
+            audio,
+            start_frame as f32 / fps as f32,
+            end_frame as f32 / fps as f32,
+        )
+    } else {
+        audio
+    };
+
     match &audio {
         Some(a) => sink.note(&format!(
             "Audio: {} AAC sample(s), passthrough",
@@ -801,59 +1217,226 @@ pub async fn swap_video_streaming(
         None => sink.note("Audio: video-only output"),
     }
 
-    // Annex B SPS/PPS prefix, prepended to every access unit.
-    let mut prefix = Vec::new();
-    for nal in [&sps, &pps] {
-        prefix.extend_from_slice(&[0, 0, 0, 1]);
-        prefix.extend_from_slice(nal);
+    // Annex B parameter-set prefix, prepended to every access unit. Include EVERY
+    // avcC parameter set (all SPS/PPS across all avc1 entries), not just the first,
+    // so a mid-clip param-set switch (a second stsd entry after a resolution /
+    // orientation change) does not make openh264 lose every frame past the switch.
+    let (prefix, length_size) = build_param_set_prefix(&demuxed, &sps, &pps);
+
+    // --- 3-stage pipeline: (1) demux+decode+YUV->RGB on a thread, (2) detect+
+    // swap on this task (GPU), (3) encode on a thread. Bounded channels keep only
+    // a few frames resident (streaming stays RAM-cheap) while the ~77ms/frame
+    // codec CPU overlaps the GPU swap -> per-frame wall ~= max(gpu, codec)
+    // instead of their serial sum. ---
+    type EncodeResult =
+        Result<(usize, usize, usize, Vec<u8>, Vec<u8>, Vec<(bool, Vec<u8>)>), String>;
+
+    if out_count == count_usize {
+        sink.note(&format!("Streaming {count} frames at {fps} fps"));
+    } else {
+        sink.note(&format!(
+            "Streaming {out_count} of {count} frames (trim {start_frame}..{end_frame}) at {fps} fps"
+        ));
+    }
+    drop(mp4); // release the borrow of `demuxed` so the decode thread can own it.
+
+    // Stage 1: emits owned `Image`s in display order; a decode error is sent as
+    // the final `Err` item and also surfaces via the thread join.
+    let (img_tx, img_rx) = std::sync::mpsc::sync_channel::<Result<Image, String>>(3);
+    let decode_thread = std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut mp4 = Mp4Reader::read_header(Cursor::new(demuxed.as_slice()), size)
+                .map_err(|e| format!("re-parse video for streaming: {e}"))?;
+            // B-frame-safe (NoFlush + flush_remaining) with error concealment on.
+            let mut decoder = make_h264_decoder()?;
+            let mut rgb: Vec<u8> = Vec::new();
+            // Frames must be DECODED in order (H.264 references), but we only need
+            // to EMIT up to `end_frame` display frames -- stop early past the trim
+            // end instead of decoding the whole tail. Front-trim frames are still
+            // decoded (they may be references) and dropped by the consumer.
+            let mut emitted = 0usize;
+            for sid in 1..=count {
+                let Some(sample) = mp4
+                    .read_sample(track_id, sid)
+                    .map_err(|e| format!("read sample {sid}: {e}"))?
+                else {
+                    continue;
+                };
+                let mut au = prefix.clone();
+                avcc_to_annexb(&sample.bytes, length_size, &mut au);
+                // Concealing decode: a lost reference (corrupt/dropped inter-frame
+                // in a phone clip) is filled in instead of turned into a hard error,
+                // so the stream keeps decoding rather than freezing until the next
+                // IDR. `None` = frame buffered for B-frame reorder (not ready yet).
+                let Some(frame) = decode_au_concealed(&mut decoder, &au, &mut rgb) else {
+                    continue;
+                };
+                if img_tx.send(Ok(frame)).is_err() {
+                    return Ok(()); // consumer gone
+                }
+                emitted += 1;
+                if emitted >= end_frame {
+                    return Ok(());
+                }
+            }
+            for frame in flush_all_concealed(&mut decoder, &mut rgb) {
+                if img_tx.send(Ok(frame)).is_err() {
+                    return Ok(());
+                }
+                emitted += 1;
+                if emitted >= end_frame {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = img_tx.send(Err(e));
+        }
+    });
+
+    // Stage 3: encode each swapped frame immediately (one frame resident).
+    let (swap_tx, swap_rx) = std::sync::mpsc::sync_channel::<Image>(3);
+    let encode_thread = std::thread::spawn(move || -> EncodeResult {
+        let mut video_sink = Mp4VideoSink::new(fps, target_bitrate);
+        for frame in swap_rx {
+            video_sink.push(&frame)?;
+        }
+        video_sink.finish()
+    });
+
+    // Stage 2 (this task): detect (on a stride), then swap a WINDOW of frames at
+    // once so the HyperSwap forward batches every frame's crop into one GPU
+    // dispatch (the swapper is badly GPU-underutilized at one crop at a time).
+    // Detection cadence and frame order are unchanged vs the serial loop; only
+    // the swap is grouped. `swap_window` collects up to SWAP_BATCH frames + their
+    // detected faces, batch-swaps them in place, and streams them to the encoder
+    // in display order.
+    let stride = opts.detect_stride.max(1);
+    let mut cached_faces: Vec<Face> = Vec::new();
+    let mut done = 0usize; // frames emitted (drives progress)
+    let mut win_frames: Vec<Image> = Vec::new();
+    let mut win_faces: Vec<Vec<Face>> = Vec::new();
+    let mut pipeline_err: Option<String> = None;
+    let mut aborted = false;
+
+    // Batch-swap the current window and stream it to the encoder. Returns false
+    // if the encoder is gone (caller should stop).
+    async fn flush_window(
+        swapper: &FaceSwapper,
+        embedding: &[f32],
+        frames: &mut Vec<Image>,
+        faces: &mut Vec<Vec<Face>>,
+        swap_tx: &std::sync::mpsc::SyncSender<Image>,
+        done: &mut usize,
+        count: u32,
+        sink: &dyn ProgressSink,
+    ) -> Result<bool, String> {
+        if frames.is_empty() {
+            return Ok(true);
+        }
+        swapper
+            .swap_predetected_multi(frames, faces, embedding)
+            .await
+            .map_err(|e| format!("swap frame: {e}"))?;
+        faces.clear();
+        for f in frames.drain(..) {
+            if swap_tx.send(f).is_err() {
+                return Ok(false); // encoder died; its error surfaces at join
+            }
+            *done += 1;
+            // Progress is emitted every STATUS_EVERY frames (plus the last one) to
+            // keep the SSE stream light on long clips -- not once per frame.
+            const STATUS_EVERY: usize = 50;
+            if done.is_multiple_of(STATUS_EVERY) || *done as u32 == count {
+                sink.stage(Stage::FrameSwapped {
+                    done: *done as u32,
+                    total: count,
+                });
+            }
+        }
+        Ok(true)
     }
 
-    // Disable per-decode auto-flush: with B-frames openh264 reorders internally,
-    // so frames come ready in display order and the tail is drained with
-    // flush_remaining after the last AU (the B-frame-safe pattern).
-    let mut decoder = Decoder::with_api_config(
-        OpenH264API::from_source(),
-        DecoderConfig::new().flush_after_decode(Flush::NoFlush),
-    )
-    .map_err(|e| format!("openh264 decoder init: {e}"))?;
-
-    sink.note(&format!("Streaming {count} frames at {fps} fps"));
-    let mut video_sink = Mp4VideoSink::new(fps);
-    let mut rgb: Vec<u8> = Vec::new();
-    let mut done = 0usize;
-    for sid in 1..=count {
-        let Some(sample) = mp4
-            .read_sample(track_id, sid)
-            .map_err(|e| format!("read sample {sid}: {e}"))?
-        else {
-            continue;
+    for (idx, item) in img_rx.into_iter().enumerate() {
+        let img = match item {
+            Ok(img) => img,
+            Err(e) => {
+                pipeline_err = Some(e);
+                break;
+            }
         };
-        let mut au = prefix.clone();
-        avcc_to_annexb(&sample.bytes, &mut au);
-        if let Some(yuv) = decoder
-            .decode(&au)
-            .map_err(|e| format!("decode sample {sid}: {e}"))?
-        {
-            swap_and_push(swapper, embedding, &yuv, &mut video_sink, &mut rgb).await?;
-            done += 1;
-            sink.stage(Stage::FrameSwapped {
-                done: done as u32,
-                total: count,
-            });
+        if idx < start_frame {
+            continue; // front-trim: decoded for references, not swapped/emitted
+        }
+        if idx >= end_frame {
+            break; // past the trim end (the decode thread stops here too)
+        }
+        if cached_faces.is_empty() || idx.is_multiple_of(stride as usize) {
+            match swapper.detect(&img).await {
+                Ok(f) => cached_faces = f,
+                Err(e) => {
+                    pipeline_err = Some(format!("detect: {e}"));
+                    break;
+                }
+            }
+        }
+        win_frames.push(img);
+        win_faces.push(cached_faces.clone());
+        if win_frames.len() >= thinfer_models::faceswap::SWAP_BATCH {
+            match flush_window(
+                swapper,
+                embedding,
+                &mut win_frames,
+                &mut win_faces,
+                &swap_tx,
+                &mut done,
+                out_count as u32,
+                sink,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    aborted = true;
+                    break;
+                }
+                Err(e) => {
+                    pipeline_err = Some(e);
+                    break;
+                }
+            }
         }
     }
-    for yuv in decoder
-        .flush_remaining()
-        .map_err(|e| format!("decode flush: {e}"))?
+    // Swap the trailing partial window (unless we already hit an error / abort).
+    if pipeline_err.is_none()
+        && !aborted
+        && let Err(e) = flush_window(
+            swapper,
+            embedding,
+            &mut win_frames,
+            &mut win_faces,
+            &swap_tx,
+            &mut done,
+            out_count as u32,
+            sink,
+        )
+        .await
     {
-        swap_and_push(swapper, embedding, &yuv, &mut video_sink, &mut rgb).await?;
-        done += 1;
-        sink.stage(Stage::FrameSwapped {
-            done: done as u32,
-            total: count,
-        });
+        pipeline_err = Some(e);
     }
-    if done == 0 {
+    drop(swap_tx); // close the encoder's input so it can finish
+
+    let encoded = encode_thread
+        .join()
+        .map_err(|_| "encode thread panicked".to_string())?;
+    let _ = decode_thread.join(); // decode errors surface via `img_rx` above
+
+    if let Some(e) = pipeline_err {
+        return Err(e);
+    }
+    let (out_w, out_h, n, enc_sps, enc_pps, samples) = encoded?;
+    if n == 0 {
         return Err("input video has no decodable frames".into());
     }
 
@@ -861,31 +1444,10 @@ pub async fn swap_video_streaming(
         "Encoding MP4 (H.264){}",
         if audio.is_some() { " + audio" } else { "" }
     ));
-    let (out_w, out_h, n, enc_sps, enc_pps, samples) = video_sink.finish()?;
     mux_mp4(
         output, out_w, out_h, fps, &enc_sps, &enc_pps, &samples, audio,
     )?;
     Ok((out_w, out_h, fps, n))
-}
-
-/// Decode one YUV frame to an [`Image`], swap, and feed it to the encoder sink.
-async fn swap_and_push(
-    swapper: &FaceSwapper,
-    embedding: &[f32],
-    yuv: &openh264::decoder::DecodedYUV<'_>,
-    sink: &mut Mp4VideoSink,
-    rgb: &mut Vec<u8>,
-) -> Result<(), String> {
-    use openh264::formats::YUVSource;
-    let (w, h) = yuv.dimensions();
-    rgb.resize(w * h * 3, 0);
-    yuv.write_rgb8(rgb);
-    let img = Image::from_rgb8(w, h, rgb);
-    let swapped = swapper
-        .swap_frame(&img, embedding)
-        .await
-        .map_err(|e| format!("swap frame: {e}"))?;
-    sink.push(&swapped)
 }
 
 /// Read the input's audio track (if any) for verbatim remux. Returns `None`
@@ -957,12 +1519,50 @@ fn extract_audio<R: std::io::Read + std::io::Seek>(
     }))
 }
 
+/// Extract the AAC audio track from a full mp4 in RAM, for passthrough. Call
+/// this on the audio-INTACT bytes (before [`strip_audio_traks`] neutralizes the
+/// audio trak for the strict video demux): stripping first would leave nothing
+/// to pass through. Returns `None` when there is no audio track, the codec is
+/// not passthrough-able AAC, or the container's audio box is one the demuxer
+/// cannot parse (a soft failure -> video-only output, never a hard error).
+fn extract_audio_from_bytes(bytes: &[u8]) -> Option<AudioPassthrough> {
+    use std::io::Cursor;
+    let mut mp4 = mp4::Mp4Reader::read_header(Cursor::new(bytes), bytes.len() as u64).ok()?;
+    extract_audio(&mut mp4).ok().flatten()
+}
+
+/// Trim a passthrough audio track to the window `[start_sec, end_sec)` of the
+/// SOURCE timeline and rebase it to t=0, so it stays in sync with a trimmed
+/// video. Samples are kept by their `start_time` (in the track timescale).
+/// Returns `None` if nothing remains in the window.
+fn trim_audio(
+    audio: Option<AudioPassthrough>,
+    start_sec: f32,
+    end_sec: f32,
+) -> Option<AudioPassthrough> {
+    let mut a = audio?;
+    let ts = f64::from(a.timescale);
+    let start_tick = (f64::from(start_sec) * ts) as u64;
+    let end_tick = (f64::from(end_sec) * ts) as u64;
+    a.samples.retain_mut(|s| {
+        let keep = s.start_time >= start_tick && s.start_time < end_tick;
+        if keep {
+            s.start_time -= start_tick;
+        }
+        keep
+    });
+    (!a.samples.is_empty()).then_some(a)
+}
+
 /// Streaming H.264 encoder sink: each swapped frame is encoded immediately (one
 /// frame in RAM) and accumulated as a compressed AVCC sample. Output resolution
 /// is fixed on the first frame, downscaled to fit openh264's encoder cap
 /// (max 3840 long edge / 2160 short edge), aspect-preserved.
 struct Mp4VideoSink {
     fps: u32,
+    /// Target H.264 bitrate (bps). `None` -> a bits-per-pixel target from the
+    /// output dims (used when the source bitrate could not be read).
+    target_bitrate: Option<u32>,
     enc: Option<openh264::encoder::Encoder>,
     out_w: usize,
     out_h: usize,
@@ -972,9 +1572,10 @@ struct Mp4VideoSink {
 }
 
 impl Mp4VideoSink {
-    fn new(fps: u32) -> Self {
+    fn new(fps: u32, target_bitrate: Option<u32>) -> Self {
         Self {
             fps,
+            target_bitrate,
             enc: None,
             out_w: 0,
             out_h: 0,
@@ -997,8 +1598,12 @@ impl Mp4VideoSink {
                     frame.w, frame.h
                 );
             }
-            let bitrate = ((ow as f64) * (oh as f64) * (self.fps as f64) * BITS_PER_PIXEL)
-                .max(1_000_000.0) as u32;
+            // Prefer the (scaled) source bitrate so the output tracks the input's
+            // size/quality; fall back to a bits-per-pixel target if it is unknown.
+            let bitrate = self.target_bitrate.unwrap_or_else(|| {
+                ((ow as f64) * (oh as f64) * (self.fps as f64) * BITS_PER_PIXEL).max(1_000_000.0)
+                    as u32
+            });
             let cfg = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(bitrate))
                 .skip_frames(false)
@@ -1064,6 +1669,114 @@ mod tests {
         hay.windows(needle.len())
             .position(|w| w == needle)
             .expect("box type present")
+    }
+
+    /// Build an AVCDecoderConfigurationRecord: version/profile/compat/level, then
+    /// `lengthSizeMinusOne`, the SPS list, and the PPS list.
+    fn avcc_record(length_minus_one: u8, sps: &[&[u8]], pps: &[&[u8]]) -> Vec<u8> {
+        let mut r = vec![1, 0x64, 0x00, 0x1f];
+        r.push(0xFC | (length_minus_one & 0x03));
+        r.push(0xE0 | (sps.len() as u8 & 0x1F));
+        for s in sps {
+            r.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            r.extend_from_slice(s);
+        }
+        r.push(pps.len() as u8);
+        for p in pps {
+            r.extend_from_slice(&(p.len() as u16).to_be_bytes());
+            r.extend_from_slice(p);
+        }
+        r
+    }
+
+    #[test]
+    fn parse_avcc_record_reads_all_sets_and_length_size() {
+        let rec = avcc_record(1, &[b"AAA", b"BBB"], &[b"P"]);
+        let (mut sps, mut pps) = (Vec::new(), Vec::new());
+        let ls = parse_avcc_record(&rec, &mut sps, &mut pps).expect("parses");
+        assert_eq!(ls, 2, "lengthSizeMinusOne 1 -> 2-byte prefix");
+        assert_eq!(sps, vec![b"AAA".to_vec(), b"BBB".to_vec()]);
+        assert_eq!(pps, vec![b"P".to_vec()]);
+    }
+
+    #[test]
+    fn avcc_to_annexb_honors_length_size() {
+        // Two NALs with 2-byte length prefixes (not the usual 4).
+        let mut avcc = Vec::new();
+        avcc.extend_from_slice(&3u16.to_be_bytes());
+        avcc.extend_from_slice(b"foo");
+        avcc.extend_from_slice(&2u16.to_be_bytes());
+        avcc.extend_from_slice(b"hi");
+        let mut out = Vec::new();
+        avcc_to_annexb(&avcc, 2, &mut out);
+        assert_eq!(out, [0, 0, 0, 1, b'f', b'o', b'o', 0, 0, 0, 1, b'h', b'i']);
+    }
+
+    // A clip with TWO avc1 sample-description entries (a mid-recording param-set
+    // switch) must contribute BOTH entries' SPS/PPS to the prefix -- prepending
+    // only the first is what made openh264 lose every frame past the switch.
+    #[test]
+    fn collect_gathers_param_sets_from_all_avc1_entries() {
+        let mk_avc1 = |rec: Vec<u8>| {
+            let mut payload = vec![0u8; 78]; // VisualSampleEntry header
+            payload.extend_from_slice(&bx(b"avcC", &rec));
+            bx(b"avc1", &payload)
+        };
+        let avc1_a = mk_avc1(avcc_record(3, &[b"SPS_A"], &[b"PPS_A"]));
+        let avc1_b = mk_avc1(avcc_record(3, &[b"SPS_B"], &[b"PPS_B"]));
+        let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 2]; // version/flags, entry_count=2
+        stsd_payload.extend_from_slice(&avc1_a);
+        stsd_payload.extend_from_slice(&avc1_b);
+        let moov = bx(
+            b"moov",
+            &bx(
+                b"trak",
+                &bx(
+                    b"mdia",
+                    &bx(b"minf", &bx(b"stbl", &bx(b"stsd", &stsd_payload))),
+                ),
+            ),
+        );
+        let mut input = bx(b"ftyp", b"isom");
+        input.extend_from_slice(&moov);
+
+        let (sps, pps, ls) = collect_avcc_param_sets(&input).expect("param sets parsed");
+        assert_eq!(ls, 4);
+        assert_eq!(sps, vec![b"SPS_A".to_vec(), b"SPS_B".to_vec()]);
+        assert_eq!(pps, vec![b"PPS_A".to_vec(), b"PPS_B".to_vec()]);
+    }
+
+    // Encode a handful of distinct frames, mux, then decode: exercises the raw
+    // concealing decode path (decode_au_concealed + flush_all_concealed + YUV->RGB)
+    // on a clean stream. Every frame must round-trip (no drops, correct dims).
+    #[test]
+    fn concealing_decode_roundtrips_a_clean_clip() {
+        let (w, h, n, fps) = (64usize, 48usize, 12usize, 15u32);
+        let mut sink = Mp4VideoSink::new(fps, None);
+        for i in 0..n {
+            let mut rgb = vec![0u8; w * h * 3];
+            for y in 0..h {
+                for x in 0..w {
+                    let t = (y * w + x) * 3;
+                    rgb[t] = if x == (i * 3) % w { 255 } else { 0 }; // moving bar
+                    rgb[t + 1] = ((i * 20) % 256) as u8;
+                    rgb[t + 2] = 128;
+                }
+            }
+            sink.push(&Image::from_rgb8(w, h, &rgb))
+                .expect("encode frame");
+        }
+        let (ow, oh, cnt, sps, pps, samples) = sink.finish().expect("finish encode");
+        assert_eq!(cnt, n);
+        let tmp =
+            std::env::temp_dir().join(format!("thinfer_dec_roundtrip_{}.mp4", std::process::id()));
+        mux_mp4(&tmp, ow, oh, fps, &sps, &pps, &samples, None).expect("mux");
+        let bytes = std::fs::read(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let (frames, got_fps) = decode_mp4_frames(&bytes).expect("decode");
+        assert_eq!(got_fps, fps);
+        assert_eq!(frames.len(), n, "all encoded frames decode back (no drops)");
+        assert_eq!((frames[0].w, frames[0].h), (ow, oh));
     }
 
     // ftyp|mdat|moov (moov last) -> ftyp|moov|mdat, with the single stco chunk
@@ -1165,5 +1878,241 @@ mod tests {
             strip_audio_traks(&input),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// Build a video `trak` whose stbl/stsd holds one `avc1` sample entry with
+    /// the given child boxes (in order) after its 78-byte visual sample header.
+    fn video_trak_with_avc1_children(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut avc1_payload = vec![0u8; 78]; // visual sample entry fields (opaque here)
+        for c in children {
+            avc1_payload.extend_from_slice(c);
+        }
+        let avc1 = bx(b"avc1", &avc1_payload);
+        // stsd is a FullBox: version+flags (4) + entry_count (4) then the entries.
+        let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd_payload.extend_from_slice(&avc1);
+        let hdlr = {
+            let mut h = vec![0u8; 8];
+            h.extend_from_slice(b"vide");
+            bx(b"hdlr", &h)
+        };
+        let mdia = bx(
+            b"mdia",
+            &[hdlr, bx(b"minf", &bx(b"stbl", &bx(b"stsd", &stsd_payload)))].concat(),
+        );
+        bx(b"trak", &mdia)
+    }
+
+    #[test]
+    fn reorder_hoists_avcc_ahead_of_a_leading_colr_box() {
+        // avc1 children as some muxers emit them: colr BEFORE avcC.
+        let colr = bx(b"colr", b"nclx____");
+        let avcc = bx(b"avcC", b"\x01dummy-config");
+        let trak = video_trak_with_avc1_children(&[colr.clone(), avcc.clone()]);
+        let moov = bx(b"moov", &trak);
+        let mut input = bx(b"ftyp", b"isom");
+        input.extend_from_slice(&moov);
+
+        let out = reorder_avcc_first(&input);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)), "should rewrite");
+        let out = out.into_owned();
+        // Length preserved (pure permutation of the avc1 child region).
+        assert_eq!(out.len(), input.len());
+        // avcC now precedes colr; both boxes still present intact. `find`
+        // locates the 4-byte box TYPE, which sits 4 bytes past the box start
+        // (after the size field), so back up to slice the whole box.
+        let avcc_box = find(&out, b"avcC") - 4;
+        let colr_box = find(&out, b"colr") - 4;
+        assert!(avcc_box < colr_box, "avcC must lead its avc1 siblings");
+        assert_eq!(&out[avcc_box..avcc_box + avcc.len()], avcc.as_slice());
+        assert_eq!(&out[colr_box..colr_box + colr.len()], colr.as_slice());
+    }
+
+    #[test]
+    fn reorder_is_a_noop_when_avcc_already_leads() {
+        let avcc = bx(b"avcC", b"\x01cfg");
+        let pasp = bx(b"pasp", b"____");
+        let trak = video_trak_with_avc1_children(&[avcc, pasp]);
+        let moov = bx(b"moov", &trak);
+        let mut input = bx(b"ftyp", b"isom");
+        input.extend_from_slice(&moov);
+        // avcC is already first -> borrowed, no copy.
+        assert!(matches!(
+            reorder_avcc_first(&input),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    // Audio passthrough must survive the reorder+demux path: extract runs on the
+    // audio-INTACT bytes, so a real AAC-LC track round-trips. This guards the
+    // regression where strip_audio_traks ran BEFORE extraction and silently
+    // dropped all audio (video-only output).
+    #[test]
+    fn audio_extracts_from_intact_bytes_but_not_after_stripping() {
+        use mp4::{AacConfig, AudioObjectType, AvcConfig, ChannelConfig, SampleFreqIndex};
+
+        // Mux a 1-frame H.264 + AAC-LC clip via the mp4 writer (avcC is written
+        // first, so this exercises audio, not the reorder path).
+        let config = mp4::Mp4Config {
+            major_brand: str::parse("isom").unwrap(),
+            minor_version: 0,
+            compatible_brands: vec![str::parse("isom").unwrap()],
+            timescale: 1000,
+        };
+        let mut writer =
+            mp4::Mp4Writer::write_start(std::io::Cursor::new(Vec::new()), &config).unwrap();
+        writer
+            .add_track(&mp4::TrackConfig {
+                track_type: mp4::TrackType::Video,
+                timescale: 30,
+                language: "und".to_string(),
+                media_conf: mp4::MediaConfig::AvcConfig(AvcConfig {
+                    width: 16,
+                    height: 16,
+                    seq_param_set: vec![0x67, 0x42, 0x00, 0x0a, 0xf8, 0x41, 0xa2],
+                    pic_param_set: vec![0x68, 0xce, 0x3c, 0x80],
+                }),
+            })
+            .unwrap();
+        writer
+            .add_track(&mp4::TrackConfig {
+                track_type: mp4::TrackType::Audio,
+                timescale: 44100,
+                language: "und".to_string(),
+                media_conf: mp4::MediaConfig::AacConfig(AacConfig {
+                    bitrate: 128000,
+                    profile: AudioObjectType::AacLowComplexity,
+                    freq_index: SampleFreqIndex::Freq44100,
+                    chan_conf: ChannelConfig::Stereo,
+                }),
+            })
+            .unwrap();
+        // One video sample, two audio samples (opaque bytes; the demuxer treats
+        // AAC frames as raw payloads).
+        writer
+            .write_sample(
+                1,
+                &mp4::Mp4Sample {
+                    start_time: 0,
+                    duration: 1,
+                    rendering_offset: 0,
+                    is_sync: true,
+                    bytes: vec![0u8; 4].into(),
+                },
+            )
+            .unwrap();
+        for i in 0..2 {
+            writer
+                .write_sample(
+                    2,
+                    &mp4::Mp4Sample {
+                        start_time: i * 1024,
+                        duration: 1024,
+                        rendering_offset: 0,
+                        is_sync: true,
+                        bytes: vec![i as u8; 6].into(),
+                    },
+                )
+                .unwrap();
+        }
+        writer.write_end().unwrap();
+        let clip = writer.into_writer().into_inner();
+
+        // Intact bytes: audio is recovered (the fixed path).
+        let recovered = extract_audio_from_bytes(&clip).expect("audio should passthrough");
+        assert_eq!(recovered.samples.len(), 2, "both AAC samples pass through");
+        assert_eq!(recovered.samples[1].bytes.as_ref(), &[1u8; 6]);
+
+        // Strip-first bytes: audio is gone (the bug this fix avoids by extracting
+        // before stripping).
+        let stripped = strip_audio_traks(&clip).into_owned();
+        assert!(
+            extract_audio_from_bytes(&stripped).is_none(),
+            "stripping before extraction drops audio (regression guard)"
+        );
+    }
+
+    fn box_offset(data: &[u8], kind: &[u8]) -> usize {
+        // Box TYPE sits 4 bytes past the box start (after the size field).
+        find(data, kind) - 4
+    }
+
+    // A muxed video+audio clip must be faststart (moov before mdat) -- else mobile
+    // browsers show a 0:00 white frame with no MediaError (the file still
+    // downloads + plays in desktop players). Guards faststart across BOTH tracks.
+    #[test]
+    fn mux_with_audio_is_faststart() {
+        use mp4::{AacConfig, AudioObjectType, ChannelConfig, Mp4Sample, SampleFreqIndex};
+
+        let sps = vec![0x67, 0x42, 0x00, 0x0a, 0xf8, 0x41, 0xa2];
+        let pps = vec![0x68, 0xce, 0x3c, 0x80];
+        let samples: Vec<(bool, Vec<u8>)> = (0..8).map(|i| (i == 0, vec![i as u8; 32])).collect();
+        let audio = AudioPassthrough {
+            config: AacConfig {
+                bitrate: 128000,
+                profile: AudioObjectType::AacLowComplexity,
+                freq_index: SampleFreqIndex::Freq44100,
+                chan_conf: ChannelConfig::Stereo,
+            },
+            timescale: 44100,
+            samples: (0..8)
+                .map(|i| Mp4Sample {
+                    start_time: i as u64 * 1024,
+                    duration: 1024,
+                    rendering_offset: 0,
+                    is_sync: true,
+                    bytes: vec![i as u8; 6].into(),
+                })
+                .collect(),
+        };
+
+        let tmp =
+            std::env::temp_dir().join(format!("thinfer_mux_faststart_{}.mp4", std::process::id()));
+        mux_mp4(&tmp, 16, 16, 24, &sps, &pps, &samples, Some(audio)).unwrap();
+        let data = std::fs::read(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        let moov = box_offset(&data, b"moov");
+        let mdat = box_offset(&data, b"mdat");
+        assert!(
+            moov < mdat,
+            "moov (@{moov}) must precede mdat (@{mdat}) for inline playback"
+        );
+    }
+
+    #[test]
+    fn trim_audio_keeps_window_and_rebases() {
+        use mp4::{AacConfig, AudioObjectType, ChannelConfig, Mp4Sample, SampleFreqIndex};
+        // 10 samples of 1024 ticks each at 44100 Hz (~0.0232s apart). Window
+        // [0.05s, 0.15s) -> ticks [2205, 6615) -> keeps samples 3,4,5,6.
+        let mk = |i: u64| Mp4Sample {
+            start_time: i * 1024,
+            duration: 1024,
+            rendering_offset: 0,
+            is_sync: true,
+            bytes: vec![i as u8; 4].into(),
+        };
+        let audio = AudioPassthrough {
+            config: AacConfig {
+                bitrate: 128000,
+                profile: AudioObjectType::AacLowComplexity,
+                freq_index: SampleFreqIndex::Freq44100,
+                chan_conf: ChannelConfig::Stereo,
+            },
+            timescale: 44100,
+            samples: (0..10).map(mk).collect(),
+        };
+        let out = trim_audio(Some(audio), 0.05, 0.15).expect("window is non-empty");
+        assert_eq!(out.samples.len(), 4, "samples 3..=6 fall in the window");
+        // First kept sample (index 3, start 3072) rebases to 3072-2205=867.
+        assert_eq!(out.samples[0].start_time, 3072 - 2205);
+        assert_eq!(out.samples[0].bytes.as_ref(), &[3u8; 4]);
+        // A window past the end yields no audio (None, not an empty track).
+        let audio2 = AudioPassthrough {
+            config: out.config.clone(),
+            timescale: 44100,
+            samples: (0..10).map(mk).collect(),
+        };
+        assert!(trim_audio(Some(audio2), 100.0, 200.0).is_none());
     }
 }

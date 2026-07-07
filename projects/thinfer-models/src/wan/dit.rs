@@ -207,6 +207,16 @@ struct ResStream {
     data: WsBuf<WgpuBackend>,
 }
 
+/// Boxed completion fence carried ACROSS blocks: block N's last pass-B submit,
+/// awaited inside block N+1's pass-A pipeline instead of drained at the end of
+/// block N (`forward_block_tiled`). Eliminates the per-block GPU drain: block
+/// N+1's setup/pass-A submits land while block N's tail executes. The future
+/// owns the submitting scope's workspace guards (and, via the caller's
+/// wrapper, the retiring residual-stream input), so it MUST be awaited --
+/// dropping it un-awaited would release pool buffers the GPU may still read.
+type TailFence<'w> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), WgpuError>> + 'w>>;
+
 impl ResStream {
     fn alloc(
         scratch: &Workspace<WgpuBackend>,
@@ -505,6 +515,9 @@ impl WanDit {
                     .await?,
             )
         };
+        // Cross-block tail fence (tiled path): block N's last pass-B submit,
+        // awaited inside block N+1's pass-A pipeline. See `TailFence`.
+        let mut carried: Option<TailFence<'_>> = None;
         for idx in 0..self.handles.blocks.len() {
             let _bs = trace::scope!(format_args!("block.{idx}")).entered();
             if idx > 0
@@ -577,13 +590,29 @@ impl WanDit {
                             n_tiles,
                             inputs.attn_window.unwrap_or(0),
                             ckv_slot,
+                            carried.take(),
                         )
                         .instrument(tracing::debug_span!(target: PHASE, "wan.tiled", idx));
                     let (c_res, n_res, p_res) =
                         futures::join!(compute, next_acquire, prefetch_after);
-                    c_res?;
+                    let tail = c_res?;
                     p_res?;
                     pending = n_res?;
+                    // Carry this block's tail fence into the next block; the
+                    // retiring input buffer rides inside it (pool reuse only
+                    // after the GPU is done reading it). The host-readback
+                    // per-block taps need the tail complete -> drain inline.
+                    let prev_x = std::mem::replace(&mut x_cur, nxt);
+                    match tail {
+                        Some(t) if taps.per_block.is_none() => {
+                            carried = Some(Box::pin(async move {
+                                let _hold = prev_x;
+                                t.await
+                            }));
+                        }
+                        Some(t) => t.await?,
+                        None => {}
+                    }
                 } else {
                     let scope = scratch.batch();
                     // Build the six modulation vectors: scale_shift_table[k] +
@@ -611,9 +640,14 @@ impl WanDit {
                     s_res?;
                     p_res?;
                     pending = n_res?;
+                    x_cur = nxt;
                 }
             }
-            x_cur = nxt;
+        }
+        // Drain the last block's carried tail before anything reads x_cur on
+        // the host (and so its workspace guards resolve before the head).
+        if let Some(t) = carried.take() {
+            t.await?;
         }
         // Last block's residual, if requested.
         if let Some(sink) = taps.per_block.as_deref_mut() {
@@ -1020,12 +1054,16 @@ impl WanDit {
     /// cached ck/cv bytes (skipping the two text projections + k-norm), a miss
     /// computes them and reads the bytes back after the drain. `None` disables
     /// caching (single-forward diag paths).
+    ///
+    /// Returns block N's last pass-B fence (`Some`) for the caller to carry
+    /// into block N+1 instead of draining here; `None` when the fn had to
+    /// drain internally (first-step cross-KV persist readback).
     #[allow(clippy::too_many_arguments)]
-    async fn forward_block_tiled(
+    async fn forward_block_tiled<'w>(
         &self,
         backend: &WgpuBackend,
         pipelines: &WanDitPipelines,
-        scratch: &Workspace<WgpuBackend>,
+        scratch: &'w Workspace<WgpuBackend>,
         bufs: &WanDitBlockBufs,
         sst: BufRef,
         tproj: BufRef,
@@ -1038,7 +1076,8 @@ impl WanDit {
         n_tiles: u32,
         window: u32,
         ckv_slot: Option<&mut Option<(Vec<u8>, Vec<u8>)>>,
-    ) -> Result<(), WgpuError> {
+        carry: Option<TailFence<'w>>,
+    ) -> Result<Option<TailFence<'w>>, WgpuError> {
         let bp = &pipelines.block;
         let inner = self.cfg.inner() as u32;
         let rows = self.shape.n_tok as u32;
@@ -1099,8 +1138,16 @@ impl WanDit {
         // dominant per-block cost, bigger than the tile compute itself.
         // Depth 2 keeps at most two tiles' transients out of the pool, which
         // the DiT workspace reserve accounts for. The setup fence rides the
-        // same pipeline (awaited when tile 0's submit lands).
-        let mut pending_tile = Some(setup_fut);
+        // same pipeline (awaited when tile 0's submit lands), and the PRIOR
+        // block's carried tail fence rides ahead of it (cross-block depth-2:
+        // this block's setup/pass-A submits landed while that tail executed).
+        let mut pending_tile: Option<TailFence<'w>> = Some(match carry {
+            Some(c) => Box::pin(async move {
+                c.await?;
+                setup_fut.await
+            }),
+            None => Box::pin(setup_fut),
+        });
         let (mut enc_a, mut await_a) = (0.0f64, 0.0f64);
         for t in 0..n_tiles {
             let te = diag.then(trace::Instant::now);
@@ -1125,7 +1172,7 @@ impl WanDit {
                 &bufs.self_attn,
                 ptw,
             )?;
-            let fut = scope.submit_deferred();
+            let fut: TailFence<'w> = Box::pin(scope.submit_deferred());
             if let Some(t) = te {
                 enc_a += t.elapsed().as_secs_f64() * 1e3;
             }
@@ -1165,7 +1212,7 @@ impl WanDit {
 
         // Pass B: per-tile o-proj + gated residual + cross-attn + FFN -> y_out.
         // Same depth-2 submit pipeline as pass A, seeded with the SDPA fence.
-        let mut pending_tile = Some(sdpa_fut);
+        let mut pending_tile: Option<TailFence<'w>> = Some(Box::pin(sdpa_fut));
         let (mut enc_b, mut await_b) = (0.0f64, 0.0f64);
         for t in 0..n_tiles {
             let te = diag.then(trace::Instant::now);
@@ -1180,7 +1227,7 @@ impl WanDit {
             self.block.post_attn_tile(
                 &scope, pipelines, x_slice, sa_slice, &m, ck, cv, y_slice, tr, text_seq, bufs, ptw,
             )?;
-            let fut = scope.submit_deferred();
+            let fut: TailFence<'w> = Box::pin(scope.submit_deferred());
             if let Some(t) = te {
                 enc_b += t.elapsed().as_secs_f64() * 1e3;
             }
@@ -1192,19 +1239,21 @@ impl WanDit {
                 await_b += t.elapsed().as_secs_f64() * 1e3;
             }
         }
-        if let Some(last) = pending_tile {
-            let ta = diag.then(trace::Instant::now);
-            last.await?;
-            if let Some(t) = ta {
-                await_b += t.elapsed().as_secs_f64() * 1e3;
-            }
-        }
         // Cache miss: persist the just-computed ck/cv bytes for the later
-        // steps' replay. All fences are drained, so the readback is clean and
-        // adds no extra sync (first-forward-only cost).
+        // steps' replay. This is the one case that must DRAIN the tail here
+        // (the readback needs the ck/cv writes complete); first-forward-only
+        // cost. Otherwise the tail fence is RETURNED for the caller to carry
+        // into the next block's pass-A pipeline (no per-block GPU drain).
         if let Some(slot) = ckv_slot
             && slot.is_none()
         {
+            if let Some(last) = pending_tile.take() {
+                let ta = diag.then(trace::Instant::now);
+                last.await?;
+                if let Some(t) = ta {
+                    await_b += t.elapsed().as_secs_f64() * 1e3;
+                }
+            }
             let (ck, cv) = (tb.ck.as_buf_ref(), tb.cv.as_buf_ref());
             let n = bp.act_bytes(text_seq * inner);
             *slot = Some((
@@ -1228,7 +1277,7 @@ impl WanDit {
                 "tiled block phases"
             );
         }
-        Ok(())
+        Ok(pending_tile)
     }
 
     /// Encode the six modulation vectors for one block into the persistent

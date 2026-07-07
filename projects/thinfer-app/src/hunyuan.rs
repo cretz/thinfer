@@ -51,61 +51,6 @@ const VAE_SPATIAL: usize = 16;
 const VAE_TEMPORAL: usize = 4;
 const LATENT_CHANNELS: usize = 32;
 
-/// Phase 0 prompt rewrite. Returns `Some(expanded)` when rewriting is enabled,
-/// the feature is compiled in, and the endpoint responds; otherwise `None` (the
-/// caller keeps the original prompt). Surfaces a note to the progress sink and
-/// never logs prompt text.
-async fn maybe_rewrite_prompt(
-    enabled: bool,
-    quality: crate::model::RewriteQuality,
-    prompt: &str,
-    backend: &Arc<WgpuBackend>,
-    manifest: &thinfer_core::manifest::ModelManifest,
-    vram_budget_bytes: u64,
-    sink: &dyn ProgressSink,
-) -> Option<String> {
-    #[cfg(feature = "rewrite")]
-    {
-        if !enabled {
-            return None;
-        }
-        sink.note("Rewriting prompt");
-        match crate::rewrite::rewrite_prompt(backend, manifest, quality, vram_budget_bytes, prompt)
-            .await
-        {
-            Ok(text) => {
-                tracing::info!(
-                    target: thinfer_core::trace::DIAG,
-                    "hunyuan prompt rewrite applied"
-                );
-                Some(text)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: thinfer_core::trace::DIAG,
-                    error = %e,
-                    "hunyuan prompt rewrite failed; using original prompt"
-                );
-                sink.note("Prompt rewrite unavailable; using the original prompt");
-                None
-            }
-        }
-    }
-    #[cfg(not(feature = "rewrite"))]
-    {
-        let _ = (
-            enabled,
-            quality,
-            prompt,
-            backend,
-            manifest,
-            vram_budget_bytes,
-            sink,
-        );
-        None
-    }
-}
-
 /// Run a HunyuanVideo 1.5 T2V generate to completion. `req.model` must be the
 /// Hunyuan id (the caller dispatches on [`crate::model::VideoModelId::is_hunyuan`]).
 pub async fn run(
@@ -148,9 +93,10 @@ pub async fn run(
     // incoherent video. Expand it via the rewrite endpoint; fall back to the
     // original on any failure (rewriting never blocks a run). Prompt text is
     // never logged.
-    let rewritten = maybe_rewrite_prompt(
+    let rewritten = crate::rewrite::maybe_rewrite_prompt(
         req.rewrite,
         req.rewrite_quality,
+        crate::rewrite::T2V_REWRITE_SYSTEM_PROMPT,
         raw_prompt,
         backend,
         manifest,
@@ -484,8 +430,8 @@ pub async fn run_i2v(
     };
     let pixels = match req.input_image.as_ref() {
         Some(input_image) => {
-            let rgb = image::open(input_image)
-                .map_err(|e| format!("decode {}: {e}", input_image.display()))?
+            let rgb = image::load_from_memory(&input_image.0)
+                .map_err(|e| format!("decode first frame: {e}"))?
                 .to_rgb8();
             sink.note(&format!(
                 "Loaded first frame {}x{}",
@@ -531,9 +477,10 @@ pub async fn run_i2v(
     // and would describe a scene that contradicts it (image-aware rewrite is a
     // follow-up).
     let rewritten = if pixels.is_none() {
-        maybe_rewrite_prompt(
+        crate::rewrite::maybe_rewrite_prompt(
             req.rewrite,
             req.rewrite_quality,
+            crate::rewrite::T2V_REWRITE_SYSTEM_PROMPT,
             raw_prompt,
             backend,
             manifest,

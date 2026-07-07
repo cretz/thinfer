@@ -72,7 +72,7 @@ async fn connector_parity() {
     let marker = tmp.join("prompt.txt");
     // Discriminator busts caches from the old degenerate `AutoTokenizer(gguf_file=)`
     // dumps when the pyref switched to the product tokenizer.json.
-    let marker_val = format!("{PROMPT}\ntok=product");
+    let marker_val = format!("{PROMPT}\ntok=product,leftpad");
     let vc_path = tmp.join("video_connected.bin");
     let cached =
         vc_path.exists() && std::fs::read_to_string(&marker).is_ok_and(|p| p == marker_val);

@@ -74,16 +74,88 @@ def _read_safetensors(path: Path) -> tuple[dict, dict[str, torch.Tensor]]:
     return meta, tensors
 
 
+def _dump_fn(out_dir: Path):
+    def dump(name: str, t: torch.Tensor) -> None:
+        arr = t.detach().contiguous().to(torch.float32).numpy().astype("<f4")
+        (out_dir / name).write_bytes(arr.tobytes())
+
+    return dump
+
+
+def encode_main(args) -> int:
+    """Encoder reference (upstream `VideoEncoder`, image/video -> normalized
+    latent), for the native I2V frame-0 path. Builds the encoder from the on-disk
+    config, loads the SAME bf16 `encoder.*` weights, and encodes a fixed-seed
+    video. `--frames/--height/--width` are PIXEL dims here (frames = 1 + 8*k,
+    h/w % 32).
+
+    Dumps: frame.bin [3,F,H,W], mean/std.bin [128], down_NN.bin per down_block,
+    conv_out.bin [129,T',H',W'], latent.bin [128,T',H',W'] (final normalized),
+    meta.txt "F H W n_down T' H' W'".
+    """
+    sys.path.insert(0, _locate_ltx_core())
+    from ltx_core.model.video_vae.model_configurator import VideoEncoderConfigurator
+
+    meta, tensors = _read_safetensors(args.vae)
+    encoder = VideoEncoderConfigurator.from_config(meta).eval().float()
+
+    sd: dict[str, torch.Tensor] = {}
+    for k, v in tensors.items():
+        if k.startswith("encoder."):
+            sd[k[len("encoder.") :]] = v
+        elif k.startswith("per_channel_statistics."):
+            sd[k] = v
+    missing, unexpected = encoder.load_state_dict(sd, strict=False)
+    assert not [m for m in missing if "num_batches" not in m], f"missing params: {missing}"
+    # LTX-2 VAE carries extra per_channel_statistics buffers unused by encode.
+    unexpected = [u for u in unexpected if not u.startswith("per_channel_statistics.")]
+    assert not unexpected, f"unexpected params: {unexpected}"
+
+    fpix, hpix, wpix = args.frames, args.height, args.width
+    assert (fpix - 1) % 8 == 0, "frames must be 1 + 8*k"
+    assert hpix % 32 == 0 and wpix % 32 == 0, "h/w must be multiples of 32"
+    g = torch.Generator().manual_seed(args.seed)
+    video = torch.randn(1, 3, fpix, hpix, wpix, generator=g, dtype=torch.float32)
+
+    down_outs: list[torch.Tensor] = []
+    handles = [db.register_forward_hook(lambda m, i, o: down_outs.append(o.detach())) for db in encoder.down_blocks]
+    conv_out_tap: dict[str, torch.Tensor] = {}
+    handles.append(encoder.conv_out.register_forward_hook(lambda m, i, o: conv_out_tap.__setitem__("v", o.detach())))
+
+    with torch.no_grad():
+        latent = encoder(video)  # [1, 128, T', H', W'] normalized means
+    for h in handles:
+        h.remove()
+
+    dump = _dump_fn(args.out)
+    dump("frame.bin", video[0])
+    dump("mean.bin", encoder.per_channel_statistics.get_buffer("mean-of-means"))
+    dump("std.bin", encoder.per_channel_statistics.get_buffer("std-of-means"))
+    for i, o in enumerate(down_outs):
+        dump(f"down_{i:02d}.bin", o[0])
+    dump("conv_out.bin", conv_out_tap["v"][0])
+    dump("latent.bin", latent[0])
+
+    tlat, hlat, wlat = latent.shape[2], latent.shape[3], latent.shape[4]
+    (args.out / "meta.txt").write_text(f"{fpix} {hpix} {wpix} {len(down_outs)} {tlat} {hlat} {wlat}\n")
+    print(f"ltx vae encode ref: video[3,{fpix},{hpix},{wpix}] -> latent[128,{tlat},{hlat},{wlat}], {len(down_outs)} down_blocks")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--vae", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
-    p.add_argument("--frames", type=int, default=2, help="latent frames f")
-    p.add_argument("--height", type=int, default=4, help="latent height h")
-    p.add_argument("--width", type=int, default=4, help="latent width w")
+    p.add_argument("--frames", type=int, default=2, help="latent frames f (decode) / pixel frames (encode)")
+    p.add_argument("--height", type=int, default=4, help="latent height h (decode) / pixel height (encode)")
+    p.add_argument("--width", type=int, default=4, help="latent width w (decode) / pixel width (encode)")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--encode", action="store_true", help="run the encoder reference instead of the decoder")
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+
+    if args.encode:
+        return encode_main(args)
 
     sys.path.insert(0, _locate_ltx_core())
     from ltx_core.model.video_vae.model_configurator import VideoDecoderConfigurator
@@ -102,6 +174,11 @@ def main() -> int:
     missing, unexpected = decoder.load_state_dict(sd, strict=False)
     # PixelNorm / norm3 / shortcut are weightless or Identity here -> no params.
     assert not [m for m in missing if "num_batches" not in m], f"missing params: {missing}"
+    # The LTX-2 (rapid) VAE checkpoint carries extra per_channel_statistics
+    # buffers (channel, mean-of-stds, mean-of-stds_over_std-of-means) the decoder
+    # module does not register. They are NOT used by decode (un-normalize reads
+    # only mean-of-means / std-of-means), so ignore them; flag any other extra.
+    unexpected = [u for u in unexpected if not u.startswith("per_channel_statistics.")]
     assert not unexpected, f"unexpected params: {unexpected}"
 
     f, h, w = args.frames, args.height, args.width

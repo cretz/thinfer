@@ -12,7 +12,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
-use thinfer_app::model::ImageModelId;
 use thinfer_app::vault::{VaultEntryInfo, VaultError};
 use utoipa::ToSchema;
 
@@ -23,7 +22,9 @@ use crate::api::{ApiError, AppState};
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AddAdapterRequest {
-    pub model: ImageModelId,
+    /// Model id (kebab wire string) these adapters apply to. Image or video;
+    /// validated against [`thinfer_app::model::is_adapter_model`].
+    pub model: String,
     /// Direct download URL (a Civitai model file link, or any safetensors URL).
     pub url: String,
     /// Optional download token (Civitai). Appended as a `token` query param.
@@ -42,7 +43,9 @@ pub struct AddAdapterRequest {
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ListAdaptersRequest {
-    pub model: ImageModelId,
+    /// Model id (kebab wire string) these adapters apply to. Image or video;
+    /// validated against [`thinfer_app::model::is_adapter_model`].
+    pub model: String,
     pub password: String,
 }
 
@@ -50,7 +53,9 @@ pub struct ListAdaptersRequest {
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoveAdapterRequest {
-    pub model: ImageModelId,
+    /// Model id (kebab wire string) these adapters apply to. Image or video;
+    /// validated against [`thinfer_app::model::is_adapter_model`].
+    pub model: String,
     pub id: String,
     pub password: String,
 }
@@ -112,6 +117,12 @@ pub async fn add_adapter(
     State(state): State<AppState>,
     Json(req): Json<AddAdapterRequest>,
 ) -> Result<Json<VaultEntryInfo>, ApiError> {
+    if !thinfer_app::model::is_adapter_model(&req.model) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{} does not support adapters", req.model),
+        ));
+    }
     // Download (async), then validate + encrypt (blocking) off the runtime.
     let (filename, bytes) = thinfer_app::vault::download(&req.url, req.token.as_deref())
         .await

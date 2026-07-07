@@ -20,6 +20,7 @@
 //! Pattern adapted from cubecl (`crates/cubecl-wgpu/src/compute/poll.rs`).
 
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(target_arch = "wasm32"))]

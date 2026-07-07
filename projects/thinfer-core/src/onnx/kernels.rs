@@ -5,10 +5,11 @@
 //! math, one kernel per ONNX op family. Binding convention per kernel:
 //! storage-read inputs at 0.., the read_write output next, the uniform last.
 //!
-//! Perf note: convs are direct (one thread per output element), not the tuned
-//! implicit-GEMM in `ops/conv2d.rs`. The face-swap models are small (256x256,
-//! mostly low channel counts at full spatial), so this is fast enough for v1;
-//! a tiled path is a later optimization if a trace shows conv dominating.
+//! Perf note: `CONV2D`/`CONVT2D` here are the direct (one thread per output
+//! element) fallbacks. The executor routes every plain (group=1, dilation=1)
+//! conv - the HyperSwap/ArcFace bulk - through the tuned implicit-GEMM in
+//! `ops/conv2d.rs` (see `dispatch_node`), so this direct kernel now only serves
+//! grouped/dilated convs (none in the current face-swap models).
 
 // Every elementwise kernel below recovers a linear element index from a 2D
 // workgroup grid (WebGPU caps each grid dim at 65535) via
@@ -251,9 +252,100 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     case 4u: { r = clamp(v, 0.0, 1.0); }
     case 5u: { r = sqrt(v); }
     case 6u: { r = clamp(u.alpha * v + u.beta, 0.0, 1.0); }
+    case 8u: { r = 1.0 / v; }
     default: { r = clamp(v, u.alpha, u.beta); }
   }
   out[i] = r;
+}
+"#;
+
+/// Gather along one axis with (const) integer indices. Flattened as
+/// `out[outer, k, inner] = data[outer, idx[k], inner]`. `idx` is a u32 buffer.
+/// Bindings: 0=data, 1=idx, 2=out, 3=uniform.
+pub const GATHER: &str = r#"
+struct U { total: u32, outer: u32, n_idx: u32, inner: u32, axis_len: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<storage, read> data: array<f32>;
+@group(0) @binding(1) var<storage, read> idx: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  let inner_i = i % u.inner;
+  let t = i / u.inner;
+  let k = t % u.n_idx;
+  let outer_i = t / u.n_idx;
+  let src = (outer_i * u.axis_len + idx[k]) * u.inner + inner_i;
+  out[i] = data[src];
+}
+"#;
+
+/// ConstantOfShape: fill an output of `total` elements with a scalar `val`.
+/// No input operand. Bindings: 0=out, 1=uniform.
+pub const CONST_FILL: &str = r#"
+struct U { total: u32, val: f32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@group(0) @binding(1) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  out[i] = u.val;
+}
+"#;
+
+/// Tile: repeat an up-to-4D input `rep` times per axis. Output coord maps to
+/// input coord by per-axis modulo (`ic = oc % id`). Bindings: 0=x, 1=out, 2=uniform.
+pub const TILE: &str = r#"
+struct U { total: u32, _p0: u32, _p1: u32, _p2: u32, id: vec4<u32>, od: vec4<u32> };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  let oc3 = i % u.od.w;
+  let oc2 = (i / u.od.w) % u.od.z;
+  let oc1 = (i / (u.od.w * u.od.z)) % u.od.y;
+  let oc0 = i / (u.od.w * u.od.z * u.od.y);
+  let ic0 = oc0 % u.id.x;
+  let ic1 = oc1 % u.id.y;
+  let ic2 = oc2 % u.id.z;
+  let ic3 = oc3 % u.id.w;
+  out[i] = x[((ic0 * u.id.y + ic1) * u.id.z + ic2) * u.id.w + ic3];
+}
+"#;
+
+/// Constant-value Pad over up-to-4D NCHW. Output coord `oc` maps to input coord
+/// `oc - begin[k]`; out-of-range coords take `val`. `begin` is the per-axis
+/// leading pad. Bindings: 0=x, 1=out, 2=uniform.
+pub const PAD: &str = r#"
+struct U { total: u32, val: f32, _p0: u32, _p1: u32, id: vec4<u32>, od: vec4<u32>, begin: vec4<u32> };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform> u: U;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+  let i = gid.y * (ng.x * 64u) + gid.x;
+  if (i >= u.total) { return; }
+  let oc3 = i % u.od.w;
+  let oc2 = (i / u.od.w) % u.od.z;
+  let oc1 = (i / (u.od.w * u.od.z)) % u.od.y;
+  let oc0 = i / (u.od.w * u.od.z * u.od.y);
+  // Signed input coord = out coord - leading pad; out-of-range -> constant.
+  let ic0 = i32(oc0) - i32(u.begin.x);
+  let ic1 = i32(oc1) - i32(u.begin.y);
+  let ic2 = i32(oc2) - i32(u.begin.z);
+  let ic3 = i32(oc3) - i32(u.begin.w);
+  if (ic0 < 0 || ic0 >= i32(u.id.x) || ic1 < 0 || ic1 >= i32(u.id.y) ||
+      ic2 < 0 || ic2 >= i32(u.id.z) || ic3 < 0 || ic3 >= i32(u.id.w)) {
+    out[i] = u.val;
+    return;
+  }
+  let src = ((u32(ic0) * u.id.y + u32(ic1)) * u.id.z + u32(ic2)) * u.id.w + u32(ic3);
+  out[i] = x[src];
 }
 "#;
 
@@ -360,6 +452,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     case 0u: { r = av + bv; }
     case 1u: { r = av - bv; }
     case 2u: { r = av * bv; }
+    case 4u: { r = max(av, bv); }
+    case 5u: { r = min(av, bv); }
+    case 6u: {
+      // Pow. WGSL pow() is NaN for a negative base; special-case the integer/half
+      // exponents that appear in norms (x^2 variance, x^0.5) so signed inputs work.
+      if (bv == 2.0) { r = av * av; }
+      else if (bv == 0.5) { r = sqrt(av); }
+      else { r = pow(av, bv); }
+    }
     default: { r = av / bv; }
   }
   out[i] = r;

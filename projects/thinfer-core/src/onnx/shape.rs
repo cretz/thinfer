@@ -638,6 +638,62 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
                 strides[1] * (x[3] - 1) + outpad[1] + dil[1] * (ksh[1] - 1) + 1 - pads[1] - pads[3];
             set_shape(vals, &node.outputs[0], vec![x[0], cout, ho, wo]);
         }
+        "Pad" => {
+            // Constant Pad, up-to-4D. `pads` = [begin_0..begin_r, end_0..end_r]
+            // as an attribute (opset<11) or the 2nd input (opset>=11).
+            let x = in_shape(0)?;
+            let rank = x.len();
+            let pads: Vec<i64> = node
+                .attr_ints("pads")
+                .map(|v| v.to_vec())
+                .or_else(|| {
+                    node.inputs
+                        .get(1)
+                        .filter(|s| !s.is_empty())
+                        .and_then(|n| vals.get(n))
+                        .and_then(|v| v.data.as_ref())
+                        .map(|d| d.as_i64().to_vec())
+                })
+                .ok_or_else(|| PlanError::Unsupported("Pad without static pads".into()))?;
+            let out: Vec<i64> = (0..rank).map(|i| x[i] + pads[i] + pads[i + rank]).collect();
+            set_shape(vals, &node.outputs[0], out);
+        }
+        "Gather" => {
+            // Runtime Gather (data is an activation; indices are const). Output
+            // shape = data[:axis] ++ indices.shape ++ data[axis+1:].
+            let data = in_shape(0)?;
+            let rank = data.len() as i64;
+            let axis = {
+                let a = node.attr_i("axis", 0);
+                (if a < 0 { a + rank } else { a }) as usize
+            };
+            let idx_shape = get(vals, &node.inputs[1])?.shape.clone();
+            let mut out = data[..axis].to_vec();
+            out.extend_from_slice(&idx_shape);
+            out.extend_from_slice(&data[axis + 1..]);
+            set_shape(vals, &node.outputs[0], out);
+        }
+        "ConstantOfShape" => {
+            // Output shape is the (const) 1-D shape tensor's values.
+            let dims = get(vals, &node.inputs[0])?
+                .data
+                .as_ref()
+                .ok_or_else(|| PlanError::Unsupported("ConstantOfShape non-const shape".into()))?
+                .as_i64()
+                .to_vec();
+            set_shape(vals, &node.outputs[0], dims);
+        }
+        "Tile" => {
+            let x = in_shape(0)?;
+            let reps = get(vals, &node.inputs[1])?
+                .data
+                .as_ref()
+                .ok_or_else(|| PlanError::Unsupported("Tile non-const repeats".into()))?
+                .as_i64()
+                .to_vec();
+            let out: Vec<i64> = x.iter().zip(&reps).map(|(&d, &r)| d * r).collect();
+            set_shape(vals, &node.outputs[0], out);
+        }
         "Gemm" => {
             let a = in_shape(0)?;
             let b = in_shape(1)?;
@@ -666,6 +722,7 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
         | "Clip"
         | "Abs"
         | "Sqrt"
+        | "Reciprocal"
         | "Exp"
         | "Neg" => {
             let x = in_shape(0)?;
@@ -823,4 +880,3 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
     }
     Ok(())
 }
-

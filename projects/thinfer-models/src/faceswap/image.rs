@@ -239,18 +239,78 @@ pub fn feathered_mask(w: usize, h: usize, erode_x: f32, erode_y: f32) -> Vec<f32
 /// Paste `crop` back onto `frame` using the forward affine `matrix` (frame->crop)
 /// with a feathered elliptical mask (cv.ts `pasteBack`, no occlusion mask).
 pub fn paste_back(frame: &Image, crop: &Image, matrix: &Affine) -> Image {
-    let (fw, fh) = (frame.w, frame.h);
-    let (cw, ch) = (crop.w, crop.h);
-    let mask = feathered_mask(cw, ch, 15.0, 15.0);
     let mut out = frame.clone();
+    paste_back_into(&mut out, crop, matrix, None);
+    out
+}
+
+/// In-place variant of [`paste_back`]: blends `crop` directly into `out`,
+/// touching only the crop's frame-space bbox (no full-frame clone). Used by the
+/// per-face swap loop so an N-face frame allocates one buffer, not N.
+///
+/// `extra` is an optional crop-space mask (`cw*ch`, values in `[0,1]`) that is
+/// element-wise `min`'d with the feathered ellipse before blending. It carries
+/// the model/occlusion masks (HyperSwap's own confidence, XSeg occluders): where
+/// it drops to 0 the original frame shows through, so hands/hair/glasses crossing
+/// the face are not painted over. `None` reproduces the feather-only paste
+/// bit-for-bit.
+pub fn paste_back_into(out: &mut Image, crop: &Image, matrix: &Affine, extra: Option<&[f32]>) {
+    let (fw, fh) = (out.w, out.h);
+    let (cw, ch) = (crop.w, crop.h);
+    let mut mask = feathered_mask(cw, ch, 15.0, 15.0);
+    if let Some(extra) = extra {
+        debug_assert_eq!(extra.len(), cw * ch, "extra mask must be crop-sized");
+        for (m, &e) in mask.iter_mut().zip(extra) {
+            *m = m.min(e);
+        }
+    }
     let m = *matrix;
-    let nt = n_threads(fh);
-    let rows_per = fh.div_ceil(nt);
+
+    // The crop occupies crop-space [0,cw) x [0,ch); its preimage under the
+    // frame->crop affine is a parallelogram whose vertices are the inverse-
+    // mapped corners. The axis-aligned bbox of those vertices is a superset of
+    // that parallelogram, so restricting the scan to it drops only pixels that
+    // land outside the crop (which the interior test would `continue` on
+    // anyway). Output is bit-identical to a full-frame scan.
+    let inv = invert_affine(&m);
+    let map = |cx: f32, cy: f32| {
+        (
+            inv[0] * cx + inv[1] * cy + inv[2],
+            inv[3] * cx + inv[4] * cy + inv[5],
+        )
+    };
+    let corners = [
+        map(0.0, 0.0),
+        map(cw as f32, 0.0),
+        map(0.0, ch as f32),
+        map(cw as f32, ch as f32),
+    ];
+    let (mut xlo, mut xhi, mut ylo, mut yhi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+    for (fx, fy) in corners {
+        xlo = xlo.min(fx);
+        xhi = xhi.max(fx);
+        ylo = ylo.min(fy);
+        yhi = yhi.max(fy);
+    }
+    // Clamp to the frame; floor/ceil so the box is a superset of the quad.
+    let rx0 = (xlo.floor().max(0.0) as usize).min(fw);
+    let rx1 = ((xhi.ceil() as i64 + 1).max(0) as usize).min(fw);
+    let ry0 = (ylo.floor().max(0.0) as usize).min(fh);
+    let ry1 = ((yhi.ceil() as i64 + 1).max(0) as usize).min(fh);
+    if rx0 >= rx1 || ry0 >= ry1 {
+        return; // crop maps fully outside the frame; nothing to paste.
+    }
+
+    let band = ry1 - ry0;
+    let nt = n_threads(band);
+    let rows_per = band.div_ceil(nt);
     std::thread::scope(|s| {
-        let mut rest = out.data.as_mut_slice();
-        let mut row0 = 0usize;
-        while row0 < fh {
-            let row1 = (row0 + rows_per).min(fh);
+        // Restrict the mutable view to the bbox row band [ry0, ry1).
+        let (_, band_data) = out.data.as_mut_slice().split_at_mut(ry0 * fw * 3);
+        let (mut rest, _) = band_data.split_at_mut(band * fw * 3);
+        let mut row0 = ry0;
+        while row0 < ry1 {
+            let row1 = (row0 + rows_per).min(ry1);
             let (chunk, tail) = rest.split_at_mut((row1 - row0) * fw * 3);
             rest = tail;
             let crop = &*crop;
@@ -258,7 +318,7 @@ pub fn paste_back(frame: &Image, crop: &Image, matrix: &Affine) -> Image {
             s.spawn(move || {
                 for (yy, row) in chunk.chunks_exact_mut(fw * 3).enumerate() {
                     let y = (row0 + yy) as f32;
-                    for x in 0..fw {
+                    for x in rx0..rx1 {
                         let cx = m[0] * x as f32 + m[1] * y + m[2];
                         let cy = m[3] * x as f32 + m[4] * y + m[5];
                         if cx < 0.0 || cx >= (cw - 1) as f32 || cy < 0.0 || cy >= (ch - 1) as f32 {
@@ -289,7 +349,6 @@ pub fn paste_back(frame: &Image, crop: &Image, matrix: &Affine) -> Image {
             row0 = row1;
         }
     });
-    out
 }
 
 #[cfg(test)]
@@ -337,6 +396,138 @@ mod tests {
         let bx = inv[0] * fx + inv[1] * fy + inv[2];
         let by = inv[3] * fx + inv[4] * fy + inv[5];
         assert!((bx - px).abs() < 1e-3 && (by - py).abs() < 1e-3);
+    }
+
+    /// Full-frame reference paste (scans every pixel) for the bbox-restricted
+    /// `paste_back` to match bit-for-bit.
+    fn paste_back_full(frame: &Image, crop: &Image, matrix: &Affine) -> Image {
+        let (fw, fh) = (frame.w, frame.h);
+        let (cw, ch) = (crop.w, crop.h);
+        let mask = feathered_mask(cw, ch, 15.0, 15.0);
+        let mut out = frame.clone();
+        let m = *matrix;
+        for y in 0..fh {
+            for x in 0..fw {
+                let cx = m[0] * x as f32 + m[1] * y as f32 + m[2];
+                let cy = m[3] * x as f32 + m[4] * y as f32 + m[5];
+                if cx < 0.0 || cx >= (cw - 1) as f32 || cy < 0.0 || cy >= (ch - 1) as f32 {
+                    continue;
+                }
+                let x0 = cx.floor() as usize;
+                let y0 = cy.floor() as usize;
+                let fx = cx - x0 as f32;
+                let fy = cy - y0 as f32;
+                let m00 = mask[y0 * cw + x0];
+                let m10 = mask[y0 * cw + x0 + 1];
+                let m01 = mask[(y0 + 1) * cw + x0];
+                let m11 = mask[(y0 + 1) * cw + x0 + 1];
+                let alpha = m00 * (1.0 - fx) * (1.0 - fy)
+                    + m10 * fx * (1.0 - fy)
+                    + m01 * (1.0 - fx) * fy
+                    + m11 * fx * fy;
+                if alpha < 0.001 {
+                    continue;
+                }
+                let cp = crop.sample(cx, cy);
+                let row = &mut out.data[y * fw * 3..];
+                for (c, &v) in cp.iter().enumerate() {
+                    row[x * 3 + c] = row[x * 3 + c] * (1.0 - alpha) + v * alpha;
+                }
+            }
+        }
+        out
+    }
+
+    /// bbox-restricted paste is byte-identical to the full-frame scan across a
+    /// range of transforms (rotation + scale + translation), including a crop
+    /// that partly falls off the frame edge.
+    #[test]
+    fn paste_back_bbox_matches_full() {
+        let (fw, fh, cs) = (200usize, 150usize, 64usize);
+        let mut frame = Image::new(fw, fh);
+        for (i, p) in frame.data.iter_mut().enumerate() {
+            *p = (i % 251) as f32;
+        }
+        let mut crop = Image::new(cs, cs);
+        for (i, p) in crop.data.iter_mut().enumerate() {
+            *p = ((i * 7) % 256) as f32;
+        }
+        // Cases: centered, rotated, off-edge, tiny-scale.
+        let cases: [Affine; 4] = [
+            // frame->crop transforms (scale ~cs/region + translate).
+            [0.6, 0.0, -20.0, 0.0, 0.6, -10.0],
+            {
+                let th: f32 = 0.5;
+                let s = 0.7f32;
+                [
+                    s * th.cos(),
+                    -s * th.sin(),
+                    15.0,
+                    s * th.sin(),
+                    s * th.cos(),
+                    5.0,
+                ]
+            },
+            [0.9, 0.0, -140.0, 0.0, 0.9, -110.0], // maps most of the crop off-edge
+            [0.3, 0.1, 5.0, -0.1, 0.3, 8.0],
+        ];
+        for (i, m) in cases.iter().enumerate() {
+            let got = paste_back(&frame, &crop, m);
+            let exp = paste_back_full(&frame, &crop, m);
+            assert_eq!(got.w, exp.w);
+            let diff = got
+                .data
+                .iter()
+                .zip(&exp.data)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(diff, 0, "case {i}: {diff} pixels differ from full scan");
+        }
+    }
+
+    /// Wall-time of bbox vs full-frame paste at 4K (run with --ignored
+    /// --nocapture). Not a gate; the correctness gate is paste_back_bbox_matches_full.
+    #[test]
+    #[ignore]
+    fn paste_back_4k_timing() {
+        let (fw, fh, cs) = (3840usize, 2024usize, 256usize);
+        let mut frame = Image::new(fw, fh);
+        for (i, p) in frame.data.iter_mut().enumerate() {
+            *p = (i % 251) as f32;
+        }
+        let mut crop = Image::new(cs, cs);
+        for (i, p) in crop.data.iter_mut().enumerate() {
+            *p = ((i * 7) % 256) as f32;
+        }
+        // A realistic face placement: ~340px face, slight rotation, mid-frame.
+        let th: f32 = 0.15;
+        let s = cs as f32 / 340.0;
+        let m: Affine = [
+            s * th.cos(),
+            -s * th.sin(),
+            -s * 1700.0,
+            s * th.sin(),
+            s * th.cos(),
+            -s * 820.0,
+        ];
+        let iters = 100;
+        // Production path: in-place blend into an owned buffer (no clone).
+        let mut buf = frame.clone();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            paste_back_into(&mut buf, &crop, &m, None);
+            std::hint::black_box(&buf);
+        }
+        let inplace_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        // Old path: full-frame scan + clone-return.
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(paste_back_full(&frame, &crop, &m));
+        }
+        let full_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "[paste-bench] 4K in-place={inplace_ms:.2}ms full-scan+clone(1-thread)={full_ms:.2}ms",
+        );
     }
 
     /// Warp by identity reproduces the source (interior pixels, exact-ish).

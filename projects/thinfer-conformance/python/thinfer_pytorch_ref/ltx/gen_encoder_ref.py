@@ -182,9 +182,11 @@ def run_connector(
     """Run one modality's 8-layer gated connector (upstream `Embeddings1DConnector`)
     on the FE V2 aggregate `feat` `[n_real, inner]`. Mirrors engine precision: f32
     compute, bf16-rounded weights AND registers (the engine reads the registers
-    back from their bf16 GPU upload). Frames `feat` valid-front into `[1, S, inner]`;
-    the connector replaces the pad slots with `learnable_registers[s % 128]` and
-    runs full bidirectional attention. Returns `[S, inner]` f32."""
+    back from their bf16 GPU upload). LEFT-pads `feat` into `[1, S, inner]` (valid
+    tokens in the TRAILING rows, matching the `padding_side=LEFT` upstream
+    tokenizer); the connector replaces the leading pad slots with
+    `learnable_registers[s % 128]` and runs full bidirectional attention over
+    absolute rope positions `arange(S)`. Returns `[S, inner]` f32."""
     import sys
 
     here = Path(__file__).resolve()
@@ -224,9 +226,9 @@ def run_connector(
 
     n = feat.shape[0]
     h = torch.zeros(1, seq_len, inner_dim, dtype=torch.float32)
-    h[0, :n] = feat
+    h[0, seq_len - n :] = feat
     add_mask = torch.zeros(1, 1, 1, seq_len, dtype=torch.float32)
-    add_mask[..., n:] = torch.finfo(torch.float32).min
+    add_mask[..., : seq_len - n] = torch.finfo(torch.float32).min
     out, _ = conn(h, additive_attention_mask=add_mask)
     return out[0]
 

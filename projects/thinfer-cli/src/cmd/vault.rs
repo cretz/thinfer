@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use thinfer_app::model::ImageModelId;
 use thinfer_app::request::Secret;
 use thinfer_app::vault::{self, Vault};
 
@@ -28,8 +27,8 @@ pub enum VaultCmd {
 #[derive(Args)]
 pub struct VaultAdd {
     /// The model these adapters apply to (e.g. `krea-2-turbo`).
-    #[arg(long, value_enum)]
-    pub model: ImageModelId,
+    #[arg(long)]
+    pub model: String,
     /// Direct download URL (a Civitai model file link, or any safetensors URL).
     #[arg(long)]
     pub url: String,
@@ -49,16 +48,16 @@ pub struct VaultAdd {
 
 #[derive(Args)]
 pub struct VaultList {
-    #[arg(long, value_enum)]
-    pub model: ImageModelId,
+    #[arg(long)]
+    pub model: String,
     #[arg(long)]
     pub vault_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
 pub struct VaultRemove {
-    #[arg(long, value_enum)]
-    pub model: ImageModelId,
+    #[arg(long)]
+    pub model: String,
     /// Adapter id (from `vault list`).
     #[arg(long)]
     pub id: String,
@@ -99,9 +98,12 @@ pub async fn run(cmd: VaultCmd) -> Result<(), String> {
 }
 
 async fn add(a: VaultAdd) -> Result<(), String> {
+    if !thinfer_app::model::is_adapter_model(&a.model) {
+        return Err(format!("{} does not support adapters", a.model));
+    }
     let password = read_password(true)?;
     let vault = Vault::new(vault::resolve_dir(a.vault_dir.as_deref()));
-    let model = a.model.to_string();
+    let model = a.model.clone();
 
     eprintln!("Downloading {} ...", a.url);
     let (filename, bytes) = vault::download(&a.url, a.token.as_deref())

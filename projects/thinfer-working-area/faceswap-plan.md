@@ -184,7 +184,8 @@ PATH TO "a few minutes" (~3-5x more needed; not yet done):
   has them; HyperSwap path works without).
 - Multi-face: swaps every detected face with the same source (matches intabai).
 - Temporal coherence (detect every Nth frame, smooth landmarks) not done.
-- Audio passthrough from input video not done (video-only output).
+- HE-AAC (SBR/PS) audio passthrough: dropped with a warning (crate can't round-trip
+  its AudioSpecificConfig). AAC-LC/Main/SSR/LTP DO pass through verbatim (item 4 DONE).
 
 ## Pointers
 

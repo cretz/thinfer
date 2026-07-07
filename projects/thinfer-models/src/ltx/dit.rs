@@ -40,10 +40,11 @@ use thinfer_core::residency::{
 use thinfer_core::weight::{WeightId, WeightSource};
 use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 
+use super::LtxVariant;
 use super::config as dit;
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, BlockWgslConfigs, DenseActSites, DequantStep, alloc_act,
-    alloc_matmul_out_buf, op_rmsnorm, op_rope_halfrot, op_sdpa, quantize_act_paired,
+    alloc_matmul_out_buf, op_add, op_rmsnorm, op_rope_halfrot, op_sdpa, quantize_act_paired,
 };
 use crate::common::embedders::bcast_add_uniform;
 use crate::z_image::text_encoder::{LoadError, register_one};
@@ -246,8 +247,10 @@ pub struct AttnHandles {
     o_b: WeightHandle,
     q_norm: WeightHandle,
     k_norm: WeightHandle,
-    gate_w: WeightHandle,
-    gate_b: WeightHandle,
+    /// Per-head sigmoid gate (`to_gate_logits`). `None` on the 19B (ltx2-rapid)
+    /// path (`apply_gated_attention=false`; the tensors do not exist).
+    gate_w: Option<WeightHandle>,
+    gate_b: Option<WeightHandle>,
 }
 
 /// FFN weights for one modality (`ff.net.0.proj` -> gelu-tanh -> `ff.net.2`).
@@ -264,8 +267,9 @@ pub struct FfHandles {
 pub struct TableHandles {
     pub scale_shift: WeightHandle,
     pub audio_scale_shift: WeightHandle,
-    pub prompt_scale_shift: WeightHandle,
-    pub audio_prompt_scale_shift: WeightHandle,
+    /// Prompt-AdaLN tables (`prompt_scale_shift_table`). `None` on 19B.
+    pub prompt_scale_shift: Option<WeightHandle>,
+    pub audio_prompt_scale_shift: Option<WeightHandle>,
     pub a2v_ca_video: WeightHandle,
     pub a2v_ca_audio: WeightHandle,
 }
@@ -287,6 +291,7 @@ fn register_attn<S: WeightSource>(
     residency: &WeightResidency<S>,
     block_prefix: &str,
     attn: &str,
+    gated: bool,
 ) -> Result<AttnHandles, LoadError> {
     let ids = AttnWeightIds::new(block_prefix, attn);
     let q8 = Some(QuantKind::Q8_0);
@@ -303,8 +308,12 @@ fn register_attn<S: WeightSource>(
         o_b: dense(&ids.o_b)?,
         q_norm: dense(&ids.q_norm)?,
         k_norm: dense(&ids.k_norm)?,
-        gate_w: lin(&ids.gate_w)?,
-        gate_b: dense(&ids.gate_b)?,
+        gate_w: if gated { Some(lin(&ids.gate_w)?) } else { None },
+        gate_b: if gated {
+            Some(dense(&ids.gate_b)?)
+        } else {
+            None
+        },
     })
 }
 
@@ -339,9 +348,12 @@ fn register_ff<S: WeightSource>(
 }
 
 /// Register one DiT block's weights from the GGUF (`transformer_blocks.{i}.*`).
+/// `variant` selects gated attention + the prompt-AdaLN tables (22B) vs their
+/// absence (19B / ltx2-rapid).
 pub fn register_block<S: WeightSource>(
     residency: &WeightResidency<S>,
     i: usize,
+    variant: LtxVariant,
 ) -> Result<BlockHandles, LoadError> {
     let p = format!("transformer_blocks.{i}");
     let dense = |s: &str| {
@@ -352,20 +364,28 @@ pub fn register_block<S: WeightSource>(
             None,
         )
     };
+    let g = variant.gated_attn;
+    let prompt = |s: &str| -> Result<Option<WeightHandle>, LoadError> {
+        Ok(if variant.prompt_adaln {
+            Some(dense(s)?)
+        } else {
+            None
+        })
+    };
     Ok(BlockHandles {
-        attn1: register_attn(residency, &p, "attn1")?,
-        attn2: register_attn(residency, &p, "attn2")?,
-        audio_attn1: register_attn(residency, &p, "audio_attn1")?,
-        audio_attn2: register_attn(residency, &p, "audio_attn2")?,
-        a2v: register_attn(residency, &p, "audio_to_video_attn")?,
-        v2a: register_attn(residency, &p, "video_to_audio_attn")?,
+        attn1: register_attn(residency, &p, "attn1", g)?,
+        attn2: register_attn(residency, &p, "attn2", g)?,
+        audio_attn1: register_attn(residency, &p, "audio_attn1", g)?,
+        audio_attn2: register_attn(residency, &p, "audio_attn2", g)?,
+        a2v: register_attn(residency, &p, "audio_to_video_attn", g)?,
+        v2a: register_attn(residency, &p, "video_to_audio_attn", g)?,
         ff: register_ff(residency, &p, "ff")?,
         audio_ff: register_ff(residency, &p, "audio_ff")?,
         tables: TableHandles {
             scale_shift: dense("scale_shift_table")?,
             audio_scale_shift: dense("audio_scale_shift_table")?,
-            prompt_scale_shift: dense("prompt_scale_shift_table")?,
-            audio_prompt_scale_shift: dense("audio_prompt_scale_shift_table")?,
+            prompt_scale_shift: prompt("prompt_scale_shift_table")?,
+            audio_prompt_scale_shift: prompt("audio_prompt_scale_shift_table")?,
             a2v_ca_video: dense("scale_shift_table_a2v_ca_video")?,
             a2v_ca_audio: dense("scale_shift_table_a2v_ca_audio")?,
         },
@@ -415,6 +435,201 @@ pub fn register_io<S: WeightSource>(
         proj_out_a_w: lin("audio_proj_out.weight")?,
         proj_out_a_b: den("audio_proj_out.bias")?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Caption projection (19B / ltx2-rapid only): in-transformer PixArtAlpha text
+// projection mapping the connector output (3840) to the per-stream cross-attn KV
+// width (video 4096, audio 2048). The 22B does this inside the FE V2 aggregate
+// embeds instead, so these tensors exist only in the 19B DiT GGUF (F16).
+// ---------------------------------------------------------------------------
+
+/// One PixArtAlpha projection (`linear_1 -> gelu-tanh -> linear_2`) weight set.
+#[derive(Clone, Copy, Debug)]
+struct CaptionProjModality {
+    l1_w: WeightHandle,
+    l1_b: WeightHandle,
+    l2_w: WeightHandle,
+    l2_b: WeightHandle,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CaptionProjHandles {
+    video: CaptionProjModality,
+    audio: CaptionProjModality,
+}
+
+fn register_caption_proj_modality<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    prefix: &str,
+) -> Result<CaptionProjModality, LoadError> {
+    let lin = |s: &str| {
+        register_one(
+            residency,
+            &WeightId(format!("{prefix}.{s}")),
+            TransposePolicy::Linear2D,
+            None,
+        )
+    };
+    let den = |s: &str| {
+        register_one(
+            residency,
+            &WeightId(format!("{prefix}.{s}")),
+            TransposePolicy::None,
+            None,
+        )
+    };
+    Ok(CaptionProjModality {
+        l1_w: lin("linear_1.weight")?,
+        l1_b: den("linear_1.bias")?,
+        l2_w: lin("linear_2.weight")?,
+        l2_b: den("linear_2.bias")?,
+    })
+}
+
+/// Register the 19B caption projections (`caption_projection.*` video 3840->4096,
+/// `audio_caption_projection.*` 3840->2048) from the DiT GGUF (F16 -> bf16).
+pub fn register_caption_proj<S: WeightSource>(
+    residency: &WeightResidency<S>,
+) -> Result<CaptionProjHandles, LoadError> {
+    Ok(CaptionProjHandles {
+        video: register_caption_proj_modality(residency, "caption_projection")?,
+        audio: register_caption_proj_modality(residency, "audio_caption_projection")?,
+    })
+}
+
+/// Apply one PixArtAlpha projection to `[rows, in_w]` (host f32) -> `[rows, out_w]`.
+/// `linear_1(in->out) -> gelu-tanh -> linear_2(out->out)`, both biased (bf16
+/// matmuls on `matmul_adaln`). Runs in the DiT-resident phase.
+#[allow(clippy::too_many_arguments)]
+async fn caption_project_one<S: WeightSource>(
+    backend: &WgpuBackend,
+    pipes: &DitPipelines,
+    residency: &WeightResidency<S>,
+    workspace: &Workspace<WgpuBackend>,
+    m: &CaptionProjModality,
+    input: &[f32],
+    rows: usize,
+    in_w: usize,
+    out_w: usize,
+) -> Result<Vec<f32>, DitError<S::Error>> {
+    let act = pipes.block.act_dtype;
+    let ab = act_bytes(act);
+    let in_b = ws_upload(backend, workspace, input, act)?;
+    let l1_w = residency.acquire(m.l1_w, backend).await?;
+    let l1_b = residency.acquire(m.l1_b, backend).await?;
+    let l2_w = residency.acquire(m.l2_w, backend).await?;
+    let l2_b = residency.acquire(m.l2_b, backend).await?;
+    let out_b = workspace.alloc(rows as u64 * out_w as u64 * ab)?;
+    {
+        let scope = workspace.batch();
+        let x = ActBuf::dense(scope.import_copy(in_b.as_buf_ref()));
+        // linear_1 -> [rows, out_w]
+        let h1 = {
+            let pre = alloc_matmul_out_buf(&scope, &pipes.block, (rows * out_w) as u32)?;
+            let dims = scope.u32x4_uniform(rows as u32, out_w as u32, in_w as u32, 0)?;
+            let wv = scope.import_copy(l1_w.buf());
+            scope.matmul(
+                &pipes.block.matmul_adaln,
+                &pipes.block.matmuls.adaln,
+                x.data,
+                wv,
+                dims,
+                pre,
+                rows as u32,
+                out_w as u32,
+            )?;
+            let dst = alloc_act(&scope, &pipes.block, rows as u32, out_w as u32)?;
+            op_bias_add(
+                &scope,
+                &pipes.block,
+                pre,
+                scope.import_copy(l1_b.buf()),
+                dst.data,
+                rows as u32,
+                out_w as u32,
+            )?;
+            dst
+        };
+        // gelu-tanh
+        let g = alloc_act(&scope, &pipes.block, rows as u32, out_w as u32)?;
+        scope.dispatch_op::<GeluF32>(&pipes.gelu, &[h1.data], g.data)?;
+        // linear_2 -> [rows, out_w]
+        let pre = alloc_matmul_out_buf(&scope, &pipes.block, (rows * out_w) as u32)?;
+        let dims = scope.u32x4_uniform(rows as u32, out_w as u32, out_w as u32, 0)?;
+        let wv = scope.import_copy(l2_w.buf());
+        scope.matmul(
+            &pipes.block.matmul_adaln,
+            &pipes.block.matmuls.adaln,
+            g.data,
+            wv,
+            dims,
+            pre,
+            rows as u32,
+            out_w as u32,
+        )?;
+        let dst = alloc_act(&scope, &pipes.block, rows as u32, out_w as u32)?;
+        op_bias_add(
+            &scope,
+            &pipes.block,
+            pre,
+            scope.import_copy(l2_b.buf()),
+            dst.data,
+            rows as u32,
+            out_w as u32,
+        )?;
+        let out_h = scope.import_copy(out_b.as_buf_ref());
+        scope.copy_buffer_to_buffer(dst.data, 0, out_h, 0, rows as u64 * out_w as u64 * ab)?;
+        scope.submit_void().await?;
+    }
+    let bytes = backend
+        .read_buffer(out_b.id(), 0, rows as u64 * out_w as u64 * ab)
+        .await?;
+    Ok(crate::common::seq::act_readback_to_f32(
+        act,
+        &bytes,
+        rows * out_w,
+    ))
+}
+
+/// Apply both caption projections: `video_conn[rows,3840] -> vtext[rows,4096]`,
+/// `audio_conn[rows,3840] -> atext[rows,2048]`. Once per request (19B path).
+pub async fn caption_project<S: WeightSource>(
+    backend: &WgpuBackend,
+    pipes: &DitPipelines,
+    residency: &WeightResidency<S>,
+    workspace: &Workspace<WgpuBackend>,
+    h: &CaptionProjHandles,
+    video_conn: &[f32],
+    audio_conn: &[f32],
+    rows: usize,
+) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
+    let cap = dit::CAPTION_CHANNELS; // 3840
+    let vtext = caption_project_one(
+        backend,
+        pipes,
+        residency,
+        workspace,
+        &h.video,
+        video_conn,
+        rows,
+        cap,
+        dit::CROSS_ATTENTION_DIM,
+    )
+    .await?;
+    let atext = caption_project_one(
+        backend,
+        pipes,
+        residency,
+        workspace,
+        &h.audio,
+        audio_conn,
+        rows,
+        cap,
+        dit::AUDIO_CROSS_ATTENTION_DIM,
+    )
+    .await?;
+    Ok((vtext, atext))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,9 +754,15 @@ pub struct DitPipelines {
     /// dequant workspace regardless of source kind, so only the dequant step
     /// varies; this map lets `biased_proj` pick the step matching each weight's
     /// on-disk kind. Built for every K-quant kind the GGUF recipes use (the
-    /// pipeline cache dedups, so the unused kinds cost ~nothing). DP4A i8 stays
-    /// Q8_0-only (its i8 dequant is scheme-specific); the Q4 variant runs dense.
+    /// pipeline cache dedups, so the unused kinds cost ~nothing).
     dense_dequant: std::collections::HashMap<QuantKind, DequantStep>,
+    /// Per-scheme DP4A i8 weight-prep (dequant-then-requant-to-i8) pipelines.
+    /// The `dequant_i8` shader materializes any K-quant weight to (i8, scale,
+    /// qsum), so the qkv + ffn_up i8 sites route each weight by its on-disk kind
+    /// (v62 DiT is mixed: q/k/o/ff_up Q5_K, v/ff_down Q6_K). The matmul_i8
+    /// pipeline consuming the triple is kind-agnostic, so only this prep step
+    /// varies. Empty unless the DP4A path is active (`F16Dp4a`).
+    i8_dequant: std::collections::HashMap<QuantKind, DequantStep>,
     /// `THINFER_LTX_I8_EXTRA=1`: also route the audio-stream qkv/ffn_up and the
     /// v2a cross through DP4A i8. Their A-sides are all normed/modulated
     /// (ada_zero or connector norm_out + modulate), so the i8 act contract
@@ -557,6 +778,12 @@ impl DitPipelines {
         self.dense_dequant.get(&kind)
     }
 
+    /// DP4A i8 weight-prep step for `kind`, or `None` when the i8 path is off or
+    /// this kind was not built (site then falls back to the dense per-kind path).
+    fn i8_dequant(&self, kind: QuantKind) -> Option<&DequantStep> {
+        self.i8_dequant.get(&kind)
+    }
+
     pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
         let acts = DitActs::from_env(backend);
         let i8_extra = acts == DitActs::F16Dp4a
@@ -564,6 +791,27 @@ impl DitPipelines {
         tracing::info!(?acts, i8_extra, "ltx dit acts");
         let cfgs = dit_block_cfgs(acts.act_dtype(), acts == DitActs::F16Dp4a);
         let block = BlockPipelines::compile(backend, &cfgs).await?;
+        // Per-scheme DP4A i8 weight-prep pipelines. `block` builds a single i8
+        // prep pipeline for the cfg's declared Q8_0 kind, but the v62 DiT stores
+        // mixed Q5_K/Q6_K weights, so the qkv + ffn_up i8 sites need a prep step
+        // matching each weight's actual on-disk kind. Built only when the DP4A
+        // path is active (the block's i8 matmul pipeline exists).
+        let mut i8_dequant = std::collections::HashMap::new();
+        if block.matmul_i8_qkv.is_some() {
+            let dq_i8_layout = thinfer_core::ops::dequant_i8::layout();
+            for scheme in [QuantKind::Q8_0, QuantKind::Q5_K, QuantKind::Q6_K] {
+                let wgsl = thinfer_core::ops::dequant_i8::build_wgsl(scheme);
+                let pipeline = backend
+                    .create_pipeline(
+                        &format!("ltx_dit_dequant_i8_{}", scheme.hint()),
+                        &wgsl,
+                        "main",
+                        dq_i8_layout,
+                    )
+                    .await?;
+                i8_dequant.insert(scheme, DequantStep { pipeline, scheme });
+            }
+        }
         // Dense dequant steps keyed by quant kind. Target matches the block's
         // act dtype (F16 acts -> f16 workspace, else bf16), exactly as
         // `BlockPipelines::compile` chooses for its own per-site steps.
@@ -621,6 +869,7 @@ impl DitPipelines {
             gate,
             silu,
             dense_dequant,
+            i8_dequant,
             i8_extra,
         })
     }
@@ -861,7 +1110,7 @@ enum I8Site {
 #[allow(clippy::too_many_arguments)]
 fn biased_proj<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
-    bp: &BlockPipelines,
+    pipes: &DitPipelines,
     src: ActBuf<'wsp>,
     w: BufRef,
     b: BufRef,
@@ -871,13 +1120,22 @@ fn biased_proj<'wsp>(
     i8: I8Site,
     dq_dense: Option<&DequantStep>,
 ) -> Result<ActBuf<'wsp>, WgpuError> {
+    let bp = &pipes.block;
     let pre = alloc_matmul_out_buf(scope, bp, rows * n)?;
     let dims = scope.u32x4_uniform(rows, n, k, 0)?;
     let w_h = scope.import_copy(w);
-    let (mi8, di8) = match i8 {
-        I8Site::None => (None, None),
-        I8Site::Qkv => (bp.matmul_i8_qkv.as_ref(), bp.dequant_i8_qkv.as_ref()),
-        I8Site::FfnUp => (bp.matmul_i8_ffn_up.as_ref(), bp.dequant_i8_ffn_up.as_ref()),
+    // The matmul_i8 pipeline is kind-agnostic (consumes the i8/scale/qsum
+    // triple); the weight-prep step is picked by THIS weight's on-disk kind so
+    // mixed Q5_K/Q6_K sites each prep correctly. Falls back to dense when no i8
+    // prep exists for the kind.
+    let mi8 = match i8 {
+        I8Site::None => None,
+        I8Site::Qkv => bp.matmul_i8_qkv.as_ref(),
+        I8Site::FfnUp => bp.matmul_i8_ffn_up.as_ref(),
+    };
+    let di8 = match i8 {
+        I8Site::None => None,
+        _ => dq_dense.and_then(|d| pipes.i8_dequant(d.scheme)),
     };
     Block::dispatch_matmul_site(
         scope,
@@ -917,8 +1175,8 @@ struct AttnBufs {
     o_b: BufRef,
     q_norm: BufRef,
     k_norm: BufRef,
-    gate_w: BufRef,
-    gate_b: BufRef,
+    gate_w: Option<BufRef>,
+    gate_b: Option<BufRef>,
 }
 
 struct AttnViews<'a> {
@@ -932,8 +1190,8 @@ struct AttnViews<'a> {
     o_b: GpuView<'a>,
     q_norm: GpuView<'a>,
     k_norm: GpuView<'a>,
-    gate_w: GpuView<'a>,
-    gate_b: GpuView<'a>,
+    gate_w: Option<GpuView<'a>>,
+    gate_b: Option<GpuView<'a>>,
 }
 
 impl<'a> AttnViews<'a> {
@@ -942,6 +1200,14 @@ impl<'a> AttnViews<'a> {
         residency: &'a WeightResidency<S>,
         backend: &WgpuBackend,
     ) -> Result<Self, ResidencyError<S::Error, WgpuError>> {
+        let opt = |o: Option<WeightHandle>| async move {
+            match o {
+                Some(h) => Ok::<_, ResidencyError<S::Error, WgpuError>>(Some(
+                    residency.acquire(h, backend).await?,
+                )),
+                None => Ok(None),
+            }
+        };
         Ok(Self {
             q_w: residency.acquire(h.q_w, backend).await?,
             q_b: residency.acquire(h.q_b, backend).await?,
@@ -953,8 +1219,8 @@ impl<'a> AttnViews<'a> {
             o_b: residency.acquire(h.o_b, backend).await?,
             q_norm: residency.acquire(h.q_norm, backend).await?,
             k_norm: residency.acquire(h.k_norm, backend).await?,
-            gate_w: residency.acquire(h.gate_w, backend).await?,
-            gate_b: residency.acquire(h.gate_b, backend).await?,
+            gate_w: opt(h.gate_w).await?,
+            gate_b: opt(h.gate_b).await?,
         })
     }
     fn bufs(&self) -> AttnBufs {
@@ -969,8 +1235,8 @@ impl<'a> AttnViews<'a> {
             o_b: self.o_b.buf(),
             q_norm: self.q_norm.buf(),
             k_norm: self.k_norm.buf(),
-            gate_w: self.gate_w.buf(),
-            gate_b: self.gate_b.buf(),
+            gate_w: self.gate_w.as_ref().map(|v| v.buf()),
+            gate_b: self.gate_b.as_ref().map(|v| v.buf()),
         }
     }
 }
@@ -1092,6 +1358,7 @@ fn attention<'wsp>(
     kv_rows: u32,
     eps: f32,
     qkv_i8: bool,
+    gated: bool,
     dq: AttnDequant<'_>,
 ) -> Result<ActBuf<'wsp>, WgpuError> {
     let bp = &pipes.block;
@@ -1109,10 +1376,11 @@ fn attention<'wsp>(
     // its A-side is normed: n=heads makes it bandwidth-trivial, and the i8 route
     // would add an act_quant pass over the full A-side that costs more than the
     // dense matmul saves. to_out (post-gate outliers) stays dense
-    // (`I8Site::None`). The i8 dequant is Q8_0-specific, so
-    // any non-Q8_0 weight (the Q4_K_M variant) falls to the dense per-kind path.
+    // (`I8Site::None`). Each qkv weight preps through the i8 pipeline matching
+    // its on-disk kind (mixed Q5_K/Q6_K here); a kind with no built prep falls
+    // to the dense per-kind path.
     let qkv_site = |d: Option<&DequantStep>| {
-        if qkv_i8 && d.is_some_and(|s| s.scheme == QuantKind::Q8_0) {
+        if qkv_i8 && d.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
             I8Site::Qkv
         } else {
             I8Site::None
@@ -1147,13 +1415,13 @@ fn attention<'wsp>(
     };
 
     let q = biased_proj(
-        scope, bp, q_a, w.q_w, w.q_b, q_rows, inner, q_dim, q_site, dq.q,
+        scope, pipes, q_a, w.q_w, w.q_b, q_rows, inner, q_dim, q_site, dq.q,
     )?;
     let k = biased_proj(
-        scope, bp, kv_a, w.k_w, w.k_b, kv_rows, inner, kv_dim, k_site, dq.k,
+        scope, pipes, kv_a, w.k_w, w.k_b, kv_rows, inner, kv_dim, k_site, dq.k,
     )?;
     let v = biased_proj(
-        scope, bp, kv_a, w.v_w, w.v_b, kv_rows, inner, kv_dim, v_site, dq.v,
+        scope, pipes, kv_a, w.v_w, w.v_b, kv_rows, inner, kv_dim, v_site, dq.v,
     )?;
 
     // learned qk rms-norm over the FULL inner dim.
@@ -1203,27 +1471,36 @@ fn attention<'wsp>(
         0,
     )?;
 
-    // per-head gate: out = sa * 2*sigmoid(to_gate_logits(gate_src)).
-    let gate_logits = biased_proj(
-        scope,
-        bp,
-        gate_src,
-        w.gate_w,
-        w.gate_b,
-        q_rows,
-        heads,
-        q_dim,
-        I8Site::None,
-        dq.gate,
-    )?;
-    let gated = alloc_act(scope, bp, q_rows, inner)?;
-    scope.dispatch_op::<GatedHeadMulF32>(&pipes.gate, &[sa.data, gate_logits.data], gated.data)?;
+    // per-head gate: out = sa * 2*sigmoid(to_gate_logits(gate_src)). Skipped on
+    // the 19B path (`apply_gated_attention=false`): the SDPA output goes straight
+    // to `to_out`. `gate_src` / `dq.gate` are then unused (no gate weights exist).
+    let attn_out = if gated {
+        let gw = w.gate_w.expect("gated attention needs gate_w");
+        let gb = w.gate_b.expect("gated attention needs gate_b");
+        let gate_logits = biased_proj(
+            scope,
+            pipes,
+            gate_src,
+            gw,
+            gb,
+            q_rows,
+            heads,
+            q_dim,
+            I8Site::None,
+            dq.gate,
+        )?;
+        let g = alloc_act(scope, bp, q_rows, inner)?;
+        scope.dispatch_op::<GatedHeadMulF32>(&pipes.gate, &[sa.data, gate_logits.data], g.data)?;
+        g
+    } else {
+        sa
+    };
 
     // to_out projection + bias -> [q_rows, q_dim].
     biased_proj(
         scope,
-        bp,
-        gated,
+        pipes,
+        attn_out,
         w.o_w,
         w.o_b,
         q_rows,
@@ -1253,21 +1530,21 @@ fn feed_forward<'wsp>(
     // for the VIDEO ffn by default -- the audio stream (small dim, fewer tokens)
     // is too sensitive to i8 at the block-residual level, so it stays dense
     // unless `THINFER_LTX_I8_EXTRA=1` opts it in (its A-side is equally normed).
-    // i8 is Q8_0-specific; a non-Q8_0 ffn_up (Q4_K_M variant) runs the dense
-    // per-kind path.
-    let up = if up_i8 && dq.up.is_some_and(|s| s.scheme == QuantKind::Q8_0) {
+    // i8 covers every kind with a built prep pipeline (Q8_0/Q5_K/Q6_K); a kind
+    // without one runs the dense per-kind path.
+    let up = if up_i8 && dq.up.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
         I8Site::FfnUp
     } else {
         I8Site::None
     };
     let h1 = biased_proj(
-        scope, bp, x, w.up_w, w.up_b, rows, ff_hidden, inner, up, dq.up,
+        scope, pipes, x, w.up_w, w.up_b, rows, ff_hidden, inner, up, dq.up,
     )?;
     let g = alloc_act(scope, bp, rows, ff_hidden)?;
     scope.dispatch_op::<GeluF32>(&pipes.gelu, &[h1.data], g.data)?;
     biased_proj(
         scope,
-        bp,
+        pipes,
         g,
         w.down_w,
         w.down_b,
@@ -1323,6 +1600,7 @@ fn block_forward<'wsp>(
     ones_a: BatchBuf<'wsp>,
     bufs: &BlockBufs,
     quant: BlockQuantKinds,
+    variant: LtxVariant,
     vx_out: ActBuf<'wsp>,
     ax_out: ActBuf<'wsp>,
 ) -> Result<(), WgpuError> {
@@ -1332,6 +1610,9 @@ fn block_forward<'wsp>(
     let ad = dit::AUDIO_DIM as u32;
     let sv = s.video_tokens as u32;
     let sa = s.audio_tokens as u32;
+    // 19B (ltx2-rapid): ungated attention + raw (un-modulated) text cross-attn.
+    let gated = variant.gated_attn;
+    let cross_adaln = variant.cross_adaln;
 
     // Resolve the dense dequant step for each matmul weight from its probed
     // on-disk quant kind. Uniform across attn types (q/k/o/gate one kind, v
@@ -1378,6 +1659,7 @@ fn block_forward<'wsp>(
         sv,
         eps,
         true,
+        gated,
         adq,
     )?;
     let vx1 = alloc_act(scope, bp, sv, vd)?;
@@ -1394,29 +1676,35 @@ fn block_forward<'wsp>(
     // post_sa: x_normed = rms_norm_weightless(vx1).
     let vx_normed = alloc_act(scope, bp, sv, vd)?;
     op_rmsnorm(scope, bp, vx1, ones_v, vx_normed, sv, vd, eps)?;
-    // text cross-attn with q/kv AdaLN.
-    let attn_in = alloc_act(scope, bp, sv, vd)?;
-    op_modulate(
-        scope,
-        bp,
-        vx_normed.data,
-        vmod.cq_scale,
-        vmod.cq_shift,
-        attn_in.data,
-        sv,
-        vd,
-    )?;
-    let enc = alloc_act(scope, bp, s.video_text as u32, vd)?;
-    op_modulate(
-        scope,
-        bp,
-        vtext.data,
-        vmod.ckv_scale,
-        vmod.ckv_shift,
-        enc.data,
-        s.video_text as u32,
-        vd,
-    )?;
+    // text cross-attn. 22B: modulate q (cq) + kv (ckv), gate the residual.
+    // 19B: raw -- normed residual query, raw caption KV, plain-add residual.
+    let (attn_in, enc) = if cross_adaln {
+        let attn_in = alloc_act(scope, bp, sv, vd)?;
+        op_modulate(
+            scope,
+            bp,
+            vx_normed.data,
+            vmod.cq_scale,
+            vmod.cq_shift,
+            attn_in.data,
+            sv,
+            vd,
+        )?;
+        let enc = alloc_act(scope, bp, s.video_text as u32, vd)?;
+        op_modulate(
+            scope,
+            bp,
+            vtext.data,
+            vmod.ckv_scale,
+            vmod.ckv_shift,
+            enc.data,
+            s.video_text as u32,
+            vd,
+        )?;
+        (attn_in, enc)
+    } else {
+        (vx_normed, vtext)
+    };
     let vca = attention(
         scope,
         pipes,
@@ -1431,19 +1719,24 @@ fn block_forward<'wsp>(
         s.video_text as u32,
         eps,
         true,
+        gated,
         adq,
     )?;
     let vx2 = alloc_act(scope, bp, sv, vd)?;
-    op_gate_residual(
-        scope,
-        bp,
-        vx1.data,
-        vmod.cq_gate,
-        vca.data,
-        vx2.data,
-        sv,
-        vd,
-    )?;
+    if cross_adaln {
+        op_gate_residual(
+            scope,
+            bp,
+            vx1.data,
+            vmod.cq_gate,
+            vca.data,
+            vx2.data,
+            sv,
+            vd,
+        )?;
+    } else {
+        op_add(scope, bp, ActBuf::dense(vx1.data), vca, vx2)?;
+    }
 
     // ===================== audio self + text cross =====================
     let norm_ax = ada_zero(
@@ -1471,6 +1764,7 @@ fn block_forward<'wsp>(
         sa,
         eps,
         pipes.i8_extra,
+        gated,
         adq,
     )?;
     let ax1 = alloc_act(scope, bp, sa, ad)?;
@@ -1486,28 +1780,33 @@ fn block_forward<'wsp>(
     )?;
     let ax_normed = alloc_act(scope, bp, sa, ad)?;
     op_rmsnorm(scope, bp, ax1, ones_a, ax_normed, sa, ad, eps)?;
-    let a_attn_in = alloc_act(scope, bp, sa, ad)?;
-    op_modulate(
-        scope,
-        bp,
-        ax_normed.data,
-        amod.cq_scale,
-        amod.cq_shift,
-        a_attn_in.data,
-        sa,
-        ad,
-    )?;
-    let a_enc = alloc_act(scope, bp, s.audio_text as u32, ad)?;
-    op_modulate(
-        scope,
-        bp,
-        atext.data,
-        amod.ckv_scale,
-        amod.ckv_shift,
-        a_enc.data,
-        s.audio_text as u32,
-        ad,
-    )?;
+    let (a_attn_in, a_enc) = if cross_adaln {
+        let a_attn_in = alloc_act(scope, bp, sa, ad)?;
+        op_modulate(
+            scope,
+            bp,
+            ax_normed.data,
+            amod.cq_scale,
+            amod.cq_shift,
+            a_attn_in.data,
+            sa,
+            ad,
+        )?;
+        let a_enc = alloc_act(scope, bp, s.audio_text as u32, ad)?;
+        op_modulate(
+            scope,
+            bp,
+            atext.data,
+            amod.ckv_scale,
+            amod.ckv_shift,
+            a_enc.data,
+            s.audio_text as u32,
+            ad,
+        )?;
+        (a_attn_in, a_enc)
+    } else {
+        (ax_normed, atext)
+    };
     let aca = attention(
         scope,
         pipes,
@@ -1522,19 +1821,24 @@ fn block_forward<'wsp>(
         s.audio_text as u32,
         eps,
         pipes.i8_extra,
+        gated,
         adq,
     )?;
     let ax2 = alloc_act(scope, bp, sa, ad)?;
-    op_gate_residual(
-        scope,
-        bp,
-        ax1.data,
-        amod.cq_gate,
-        aca.data,
-        ax2.data,
-        sa,
-        ad,
-    )?;
+    if cross_adaln {
+        op_gate_residual(
+            scope,
+            bp,
+            ax1.data,
+            amod.cq_gate,
+            aca.data,
+            ax2.data,
+            sa,
+            ad,
+        )?;
+    } else {
+        op_add(scope, bp, ActBuf::dense(ax1.data), aca, ax2)?;
+    }
 
     // ===================== audio <-> video cross =====================
     // vx2/ax2 are the pre-av snapshots (each residual writes a fresh buffer, so
@@ -1575,6 +1879,7 @@ fn block_forward<'wsp>(
         sa,
         eps,
         true,
+        gated,
         adq,
     )?;
     let vx3 = alloc_act(scope, bp, sv, vd)?;
@@ -1625,6 +1930,7 @@ fn block_forward<'wsp>(
         sv,
         eps,
         pipes.i8_extra,
+        gated,
         adq,
     )?;
     let ax3 = alloc_act(scope, bp, sa, ad)?;
@@ -1793,6 +2099,7 @@ pub async fn forward_block_dumped<S: WeightSource>(
     vmod: &HostStreamMod,
     amod: &HostStreamMod,
     freqs: &HostFreqs,
+    variant: LtxVariant,
 ) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
     let vd = dit::DIM;
     let ad = dit::AUDIO_DIM;
@@ -1910,6 +2217,7 @@ pub async fn forward_block_dumped<S: WeightSource>(
             imp(&ones_a_b),
             &bufs,
             BlockQuantKinds::probe(residency),
+            variant,
             ActBuf::dense(imp(&vx_out_b)),
             ActBuf::dense(imp(&ax_out_b)),
         )?;
@@ -2138,23 +2446,39 @@ pub struct DitModel {
     /// reading them back per forward would stall the queue twice per step.
     sst_out_v: Vec<f32>,
     sst_out_a: Vec<f32>,
+    /// Which LTX-2 line (22B / 19B); selects gated attn + prompt/cross AdaLN in
+    /// the block forward and the timestep/table sizing.
+    variant: LtxVariant,
 }
 
 impl DitModel {
-    /// Register `num_layers` blocks + timestep + I/O and cache the per-block
-    /// modulation tables on host (read once; constant across denoise steps).
+    /// Register the shipped LTX-2.3 (22B) DiT. Thin wrapper over
+    /// [`Self::register_variant`] so existing callers stay unchanged.
     pub async fn register<S: WeightSource>(
         backend: &WgpuBackend,
         residency: &WeightResidency<S>,
         num_layers: usize,
     ) -> Result<Self, DitError<S::Error>> {
-        let timestep = cond::register_timestep(residency)?;
+        Self::register_variant(backend, residency, num_layers, LtxVariant::ltx_2_3_22b()).await
+    }
+
+    /// Register `num_layers` blocks + timestep + I/O and cache the per-block
+    /// modulation tables on host (read once; constant across denoise steps).
+    /// `variant` selects the 22B vs 19B conditioning (gated attn, prompt-AdaLN,
+    /// 9- vs 6-way modulation).
+    pub async fn register_variant<S: WeightSource>(
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        num_layers: usize,
+        variant: LtxVariant,
+    ) -> Result<Self, DitError<S::Error>> {
+        let timestep = cond::register_timestep(residency, variant)?;
         let io = register_io(residency)?;
         let mut blocks = Vec::with_capacity(num_layers);
         let mut tables = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let h = register_block(residency, i)?;
-            tables.push(cond::read_block_tables(backend, residency, &h).await?);
+            let h = register_block(residency, i, variant)?;
+            tables.push(cond::read_block_tables(backend, residency, &h, variant).await?);
             blocks.push(h);
         }
         let quant = BlockQuantKinds::probe(residency);
@@ -2169,6 +2493,7 @@ impl DitModel {
             quant,
             sst_out_v,
             sst_out_a,
+            variant,
         })
     }
 
@@ -2235,6 +2560,7 @@ impl DitModel {
             &self.timestep,
             sigma,
             sigma,
+            self.variant,
         )
         .await?;
 
@@ -2321,7 +2647,7 @@ impl DitModel {
             Some(BlockViewsAll::acquire(&self.blocks[0], residency, backend).await?)
         };
         for i in 0..n_blocks {
-            let (vmod_h, amod_h) = cond::assemble_block_mod(&shared, &self.tables[i]);
+            let (vmod_h, amod_h) = cond::assemble_block_mod(&shared, &self.tables[i], self.variant);
             let vmod_b = upload_mod(backend, workspace, &vmod_h, act)?;
             let amod_b = upload_mod(backend, workspace, &amod_h, act)?;
             let views = pending.take().expect("pending block views");
@@ -2352,6 +2678,7 @@ impl DitModel {
                 scope.import_copy(ones_a_b.as_buf_ref()),
                 &bufs,
                 self.quant,
+                self.variant,
                 ActBuf::dense(scope.import_copy(vx_out.as_buf_ref())),
                 ActBuf::dense(scope.import_copy(ax_out.as_buf_ref())),
             )?;

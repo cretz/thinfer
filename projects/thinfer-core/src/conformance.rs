@@ -897,10 +897,11 @@ impl<'a> OpTestContext<'a> {
         let w_out = w_in * p3;
         let n_out = cout * t_out * h_out * w_out;
         let out_len = (n_out as u64) * self.dtype.bytes_per_elem();
-        // U = 12 u32 (cin,t_in,h_in,w_in, p1,p2,p3,t_drop, cout,t_out,h_out,w_out).
-        let mut u = [0u8; 48];
+        // U = 12 u32 + base_cout + 3 pad (16 u32). base_cout == cout = plain
+        // shuffle (no residual tiling); pad to a 16-byte-aligned uniform.
+        let mut u = [0u8; 64];
         for (i, v) in [
-            cin, t_in, h_in, w_in, p1, p2, p3, t_drop, cout, t_out, h_out, w_out,
+            cin, t_in, h_in, w_in, p1, p2, p3, t_drop, cout, t_out, h_out, w_out, cout, 0, 0, 0,
         ]
         .iter()
         .enumerate()

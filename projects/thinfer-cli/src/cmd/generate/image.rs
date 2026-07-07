@@ -5,18 +5,16 @@ use std::path::PathBuf;
 
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
-use thinfer_app::model::{
-    IMAGE_DEFAULT_HEIGHT, IMAGE_DEFAULT_STEPS, IMAGE_DEFAULT_WIDTH, ImageModelId,
-};
-use thinfer_app::request::{ImageFormat, ImageRequest, LoraRef, Secret};
+use thinfer_app::model::ImageModelId;
+use thinfer_app::request::{ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret};
 use thinfer_app::vault::{self, Vault};
 use thinfer_app::wire::{ImageSpec, JobSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 
 #[derive(Args)]
 pub struct GenerateImage {
-    /// Model identifier. Defaults to `zimage-turbo-q4` (Q4_K_M DiT: ~half the
-    /// VRAM/bandwidth of Q8_0 at visually-confirmed-acceptable quality).
+    /// Model identifier. Defaults to `qwen-image-rapid` (a 4-step distilled,
+    /// CFG-free MMDiT with strong prompt adherence).
     #[arg(long, default_value_t = ImageModelId::DEFAULT, value_enum)]
     pub model: ImageModelId,
     #[arg(long)]
@@ -31,15 +29,18 @@ pub struct GenerateImage {
     /// errors if the extension is missing or unrecognized.
     #[arg(long, value_enum)]
     pub output_format: Option<ImageFormat>,
-    /// Image height in pixels. Must be divisible by VAE_SCALE (16).
-    #[arg(long, default_value_t = IMAGE_DEFAULT_HEIGHT)]
-    pub height: u32,
-    /// Image width in pixels. Must be divisible by VAE_SCALE (16).
-    #[arg(long, default_value_t = IMAGE_DEFAULT_WIDTH)]
-    pub width: u32,
-    /// Inference steps. Upstream default is 8 (Turbo).
-    #[arg(long, default_value_t = IMAGE_DEFAULT_STEPS)]
-    pub steps: u32,
+    /// Image height in pixels (must be divisible by VAE_SCALE, 16). Unset -> the
+    /// model's authored default (e.g. 1024 for qwen-image-rapid, 768 for Z-Image).
+    #[arg(long)]
+    pub height: Option<u32>,
+    /// Image width in pixels (must be divisible by VAE_SCALE, 16). Unset -> the
+    /// model's authored default.
+    #[arg(long)]
+    pub width: Option<u32>,
+    /// Inference steps. Unset -> the model's authored default (e.g. 4 for
+    /// qwen-image-rapid, 8 for the Turbo models).
+    #[arg(long)]
+    pub steps: Option<u32>,
     /// Seed. Omit for a randomized seed.
     #[arg(long)]
     pub seed: Option<u64>,
@@ -93,9 +94,11 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         let spec = JobSpec::Image(ImageSpec {
             model: Some(args.model),
             prompt: args.prompt,
-            width: Some(args.width),
-            height: Some(args.height),
-            steps: Some(args.steps),
+            // Unset dims/steps travel as None so the server resolves the model's
+            // authored defaults (matches a bare local run).
+            width: args.width,
+            height: args.height,
+            steps: args.steps,
             seed: args.seed,
             // Edit-over-remote is guarded above (returns early), so no image here.
             input_image: None,
@@ -121,15 +124,23 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         (refs, Some(password))
     };
 
+    // Resolve unset dims/steps to the model's authored defaults (mirrors the
+    // per-model resolution the video path does via `video_defaults`).
+    let defaults = args.model.defaults();
     let req = ImageRequest {
         model: args.model,
         prompt: args.prompt,
-        width: args.width,
-        height: args.height,
-        steps: args.steps,
+        width: args.width.unwrap_or(defaults.width),
+        height: args.height.unwrap_or(defaults.height),
+        steps: args.steps.unwrap_or(defaults.steps),
         seed: args.seed,
         i8_matmul: !args.no_i8_matmul,
-        input_image: args.input_image,
+        input_image: match &args.input_image {
+            Some(p) => Some(ImageBytes(
+                std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,
+            )),
+            None => None,
+        },
         lora,
         vault_password,
         vault_dir: vault::resolve_dir(args.vault_dir.as_deref()),
@@ -168,8 +179,8 @@ fn parse_lora_arg(s: &str) -> (&str, Option<f32>) {
 /// model's stored adapters (by id or decrypted name). Reads the vault password
 /// (prompt / env). The weight is the explicit `:WEIGHT`, else the adapter's
 /// stored suggestion, else 1.0.
-fn resolve_loras(
-    model: ImageModelId,
+pub(super) fn resolve_loras<M: std::fmt::Display + Copy>(
+    model: M,
     vault_dir: Option<&std::path::Path>,
     specs: &[String],
 ) -> Result<(Vec<LoraRef>, Secret), String> {

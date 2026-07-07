@@ -23,6 +23,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # Video output: H.264 encode (Cisco BSD, compiled from source) + MP4 mux. Kept
 # off thinfer-native/-models so web stays free of a wasm software codec.
 openh264 = "0.9"
+# Raw decoder SetOption for error concealment (the safe `openh264` wrapper hides
+# it): a lost reference in a phone clip must not cascade into a frozen tail.
+openh264-sys2 = "0.9"
 mp4 = "0.14"
 # AAC-LC audio encode for the LTX joint-AV MP4 audio track. libfdk-aac built
 # from bundled source via `cc` (same source-build pattern as openh264); no
