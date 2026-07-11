@@ -69,6 +69,24 @@ pub enum WeightPrep {
     Q8_0FromBf16 { n: u32, k: u32 },
     /// bf16 `[n, k]` -> `[k, n]` (nn.Linear upload transpose).
     TransposeBf16 { n: u32, k: u32 },
+    /// f32 `[n, k]` row-major -> bf16 `[k, n]`: fused RNE narrow + nn.Linear
+    /// upload transpose. Replaces the CPU `narrow_f32_to_bf16` +
+    /// `transpose_bf16_cpu` pair on the f32 (safetensors) weight path, which
+    /// dominates cold text-encode / denoise wall time (~1.4s per umT5 layer,
+    /// single-threaded, while the GPU idles). Bit-exact vs `half::bf16::from_f32`.
+    ///
+    /// Banded: `n` is the global row count (the output `[k, n]` column stride);
+    /// the source is just rows `[n0, n0 + band_n)` of `[n, k]`, so the f32
+    /// staging buffer is bounded to one band instead of the whole tensor (a
+    /// whole-tensor f32 spike busts the VRAM budget - 2x the bf16 footprint).
+    /// `n` even and `n0`, `band_n` even keep output u32 writes (two rows each)
+    /// from straddling adjacent threads / bands.
+    NarrowTransposeF32 {
+        n: u32,
+        k: u32,
+        n0: u32,
+        band_n: u32,
+    },
 }
 
 /// Compute backend abstraction. v1 carries a single bind group (group 0); the
@@ -79,6 +97,14 @@ pub trait Backend: 'static {
     type Pipeline;
 
     fn allocate(&self, bytes: u64) -> Result<GpuBufferId, Self::Error>;
+
+    /// Construct the backend's "allocation refused by the budget" error for a
+    /// `bytes`-sized request, WITHOUT touching the device. Used by strict-budget
+    /// workspace allocs (the arbiter's reclaim chain ran dry) so a hard-ceiling
+    /// caller fails at the budget boundary instead of overshooting into a real
+    /// device OOM. Callers that recover (e.g. the VAE tiler) match the same
+    /// variant they match for a device OOM.
+    fn budget_oom_error(&self, bytes: u64) -> Self::Error;
     /// Categorized allocation. Default implementation ignores the category
     /// (test mocks). Real backends override to attribute the bytes to the
     /// right `MemAccount` counter so eviction policy and budget assertions
@@ -129,6 +155,16 @@ pub trait Backend: 'static {
         &self,
         encoder: Self::CommandEncoder,
     ) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Submit `encoder`'s accumulated commands as a standalone command buffer
+    /// WITHOUT awaiting GPU completion, error-scope capture, or timestamp
+    /// resolution. Used to break one logical scope into several command buffers
+    /// so no single submit's GPU time exceeds the OS GPU watchdog (~2s Windows
+    /// TDR) — e.g. a video DiT's multi-second self-attention. The caller
+    /// installs a fresh encoder and keeps the scope's buffer guards alive, so
+    /// the flushed work reads valid resources; any device-loss surfaces at the
+    /// next awaited [`Self::submit`].
+    fn flush_encoder(&self, encoder: Self::CommandEncoder) -> Result<(), Self::Error>;
 
     /// `label` names the pipeline for telemetry (compile/dispatch events,
     /// rollup tables) and backend debug labels; `entry` stays the WGSL entry

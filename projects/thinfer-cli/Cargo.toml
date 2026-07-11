@@ -13,8 +13,16 @@ path = "src/main.rs"
 [dependencies]
 thinfer-core = { path = "../thinfer-core", features = ["trace-subscriber"] }
 thinfer-native = { path = "../thinfer-native" }
-thinfer-models = { path = "../thinfer-models" }
+# The generate orchestration (Job + LocalExecutor + codec) lives here; the CLI
+# is a thin clap adapter. `cli` enables the clap `ValueEnum` derives on the
+# canonical id enums so we reuse them directly as `--model` etc. value types.
+thinfer-app = { path = "../thinfer-app", features = ["cli", "remote"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+# --remote input-image payloads (the wire carries base64 image bytes).
+base64 = "0.22"
+# Hidden interactive password entry for the adapter vault (never a flag/arg, so
+# the password stays out of shell history and the process table).
+rpassword = "7"

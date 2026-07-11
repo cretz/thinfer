@@ -20,9 +20,10 @@ use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{ScopePacker, Workspace, WsBuf};
 use tracing::Instrument;
 
-use crate::z_image::block::{
+use crate::common::block::{
     ActBufRef, Block, BlockConfig, BlockDebugTaps, BlockHandles, BlockPipelines,
 };
+use crate::common::seq::{act_readback_i8_to_f32, attn_mask_zero_bytes_act, freqs_upload_bytes};
 
 /// Residual-stream buffer: a dense activation buffer at the pipeline's
 /// native dtype. Mirrors `block::ActBuf` at the WsBuf (cross-submit) level.
@@ -53,17 +54,17 @@ impl ResStream {
 fn import_act<'wsp>(
     scope: &thinfer_core::workspace::BatchScope<'wsp, WgpuBackend>,
     r: ActBufRef,
-) -> crate::z_image::block::ActBuf<'wsp> {
-    crate::z_image::block::ActBuf::dense(scope.import_copy(r.data))
+) -> crate::common::block::ActBuf<'wsp> {
+    crate::common::block::ActBuf::dense(scope.import_copy(r.data))
 }
+use crate::common::embedders::LinearBiasHandles;
+use crate::common::rope_embedder::RopeEmbedder;
 use crate::z_image::config;
 use crate::z_image::embedders::{
-    CapEmbedder, CapEmbedderConfig, CapEmbedderHandles, LinearBiasHandles, XEmbedder,
-    XEmbedderConfig,
+    CapEmbedder, CapEmbedderConfig, CapEmbedderHandles, XEmbedder, XEmbedderConfig,
 };
 use crate::z_image::final_layer::{FinalLayer, FinalLayerConfig, FinalLayerHandles};
 use crate::z_image::loader::LoadedDitHandles;
-use crate::z_image::rope_embedder::RopeEmbedder;
 use crate::z_image::seq;
 use crate::z_image::t_embedder::{
     TEmbedderWeightHandles, TimestepEmbedder, TimestepEmbedderConfig,
@@ -300,6 +301,7 @@ impl ZImageDit {
             norm_eps: eps,
             adaln_embed_dim: aed,
             modulation,
+            rope_halfrot: false,
         };
 
         let noise_refiner = (0..config::N_REFINER_LAYERS)
@@ -603,13 +605,12 @@ impl ZImageDit {
         .await?;
 
         // --- 4. rope freqs for x ---
-        let x_freqs_bytes =
-            seq::freqs_upload_bytes(pipelines.act_dtype, &self.rope.lookup(&px.pos_ids));
+        let x_freqs_bytes = freqs_upload_bytes(pipelines.act_dtype, &self.rope.lookup(&px.pos_ids));
         let x_freqs = scratch.alloc(x_freqs_bytes.len() as u64)?;
         backend.write_buffer(x_freqs.id, 0, &x_freqs_bytes)?;
 
         // --- 5. x attn mask --- bsz=1 -> all zero.
-        let x_mask_bytes = seq::attn_mask_zero_bytes_act(px.padded_len, pipelines.act_dtype);
+        let x_mask_bytes = attn_mask_zero_bytes_act(px.padded_len, pipelines.act_dtype);
         let x_mask = scratch.alloc(x_mask_bytes.len() as u64)?;
         backend.write_buffer(x_mask.id, 0, &x_mask_bytes)?;
 
@@ -854,10 +855,10 @@ impl ZImageDit {
 
         // --- 9. cap rope freqs + attn mask ---
         let cap_freqs_bytes =
-            seq::freqs_upload_bytes(pipelines.act_dtype, &self.rope.lookup(&cm.pos_ids));
+            freqs_upload_bytes(pipelines.act_dtype, &self.rope.lookup(&cm.pos_ids));
         let cap_freqs = scratch.alloc(cap_freqs_bytes.len() as u64)?;
         backend.write_buffer(cap_freqs.id, 0, &cap_freqs_bytes)?;
-        let cap_mask_bytes = seq::attn_mask_zero_bytes_act(cm.padded_len, pipelines.act_dtype);
+        let cap_mask_bytes = attn_mask_zero_bytes_act(cm.padded_len, pipelines.act_dtype);
         let cap_mask = scratch.alloc(cap_mask_bytes.len() as u64)?;
         backend.write_buffer(cap_mask.id, 0, &cap_mask_bytes)?;
 
@@ -1051,7 +1052,7 @@ impl ZImageDit {
                 .await?;
         }
 
-        let u_mask = seq::attn_mask_zero_bytes_act(seq_u as usize, pipelines.act_dtype);
+        let u_mask = attn_mask_zero_bytes_act(seq_u as usize, pipelines.act_dtype);
         let unified_mask = scratch.alloc(u_mask.len() as u64)?;
         backend.write_buffer(unified_mask.id, 0, &u_mask)?;
 
@@ -1272,7 +1273,8 @@ impl ZImageDit {
                 nxt_ref,
                 &bufs,
                 &b0_block_taps,
-            )?;
+            )
+            .await?;
             acc_encode += t_encode.elapsed();
             // Acquire the next block's weights concurrently with this
             // block's GPU work. Also prefetch idx+2 (unpinned) so the LRU
@@ -1720,7 +1722,7 @@ pub fn scatter_pad_rows_deferred<'wsp>(
 /// the data buffer plus a paired scale buffer for taps whose source is a
 /// paired sdpa_i8 I/O slot (`attn_sdpa` under i8_sdpa). `rows` and `inner`
 /// are the per-tap 2-D shape used to size readback and decode paired taps
-/// via `seq::act_readback_i8_to_f32`. Different taps have different `(rows,
+/// via `act_readback_i8_to_f32`. Different taps have different `(rows,
 /// inner)` (e.g. `attn_q_norm` is `(rows*hq, hd)` while `attn_q` is
 /// `(rows, hq*hd)`).
 struct ActTapBuf {
@@ -1995,7 +1997,7 @@ impl Block0TapBufs {
         let r =
             |slot: &Option<(WsBuf<WgpuBackend>, u32)>| slot.as_ref().map(|(b, _)| b.as_buf_ref());
         let a = |slot: &Option<ActTapBuf>| {
-            slot.as_ref().map(|t| crate::z_image::block::ActTapBufRef {
+            slot.as_ref().map(|t| crate::common::block::ActTapBufRef {
                 data: t.data.as_buf_ref(),
                 scale: t.scale.as_ref().map(|s| s.as_buf_ref()),
             })
@@ -2098,7 +2100,7 @@ impl Block0TapBufs {
             };
         }
         // Activation slots: paired taps (sdpa_i8 I/O sources) decode via
-        // seq::act_readback_i8_to_f32; dense taps read at block dtype.
+        // act_readback_i8_to_f32; dense taps read at block dtype.
         macro_rules! rd_act {
             ($field:ident) => {
                 if let Some(t) = self.$field {
@@ -2116,7 +2118,7 @@ impl Block0TapBufs {
                                 BlockPipelines::i8_scale_bytes(t.rows, t.inner),
                             )
                             .await?;
-                        let out = seq::act_readback_i8_to_f32(
+                        let out = act_readback_i8_to_f32(
                             &data_bytes,
                             &scale_bytes,
                             t.rows as usize,

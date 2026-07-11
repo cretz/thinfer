@@ -146,3 +146,85 @@ The project thesis is "thin inference": low-quant GGUF compute on memory-constra
 - Pipeline disk cache — trait-shaped now, implementation deferred.
 - IR / graph optimizer — deferred per orig-plan.
 - Persistent prefetch hints / runtime-learned residency schedules — deferred.
+
+## Reused engine (shipped w/ Z-Image, substrate for video)
+
+Code is source of truth for internals; below = rules that bite + pointers.
+
+- MemArbiter (arbiter.rs) is the sole VRAM-budget owner; hard ceiling (e2e
+  TRUE_PEAK asserts). Budgets are ceilings, not modes (no --low-vram). Buffer
+  pool, not free+alloc.
+- Matmul DP4A/ORT path + sdpa flash `SdpaF16Sg` reused as-is for Wan
+  full-attention. Subgroups off on NVIDIA (loss); web subgroups need the
+  vendored facade `projects/vendor/wgpu-29.0.3` (markers #5555).
+- Quant: Q4_K_M default, Q8_0 pyref canary, bf16 fallback; CLI defaults q4.
+- VAE: ONE heavy submit at a time (consecutive heavy submits hang the GPU).
+- No env in thinfer-core (binary edge reads env). No eprintln in lib (tracing).
+- PowerPreference high everywhere. GGUF B viewed [N,K]; matmul B [K,N].
+
+## Web (wasm)
+
+- npm `thinfer` (TS/wasm) + OPFS cache (opfs.ts/opfs-worker.ts). No DOM in lib,
+  no lazy downloads, `pnpm build` has no wasm-opt. `pnpm test:web` known-broken
+  (run locally before merge).
+- OPFS quota: Chrome ~60% disk (multi-GB ok); Firefox 2GB / Safari 1GB =
+  Chrome/Edge-only at model scale. Call `navigator.storage.persist()`. Read
+  speed is not a lever (compute-bound).
+- Web caps 128MiB binding / 16KiB workgroup storage; matmul builds 16KiB-fit.
+
+## Ops (commands / validation / flow)
+
+- Validation order: op conformance -> q8 256 pyref e2e -> q4 768 skip-pyref
+  perf e2e. Serial, NEVER parallel GPU runs.
+- e2e env always: `THINFER_TRACE=verbose THINFER_E2E_PNG_DIR=...
+  THINFER_POWER_PREF=high`; perf adds `RUST_LOG="info,thinfer::diag=warn"
+  THINFER_E2E_SKIP_PYREF=1`. Verify non-zero passed count. Read the TRACE
+  rollup tail before any perf target. (Z-Image test names: zimage-plan.md.)
+- web: `cd thinfer-web && pnpm build`; user runs the server, reports numbers.
+- Branch flow: `git commit --amend --no-edit && git push --force-with-lease`,
+  terse. fmt + clippy (all warnings) after edits.
+
+## User LoRA vault (`thinfer_app::vault`, feature `vault`)
+
+- One module in thinfer-app (NOT a crate), enabled by both `cli` and `serve`
+  features so every interface has it (native only; thinfer-web is separate).
+- Crypto: Argon2id(password, per-vault 16B salt) -> 32B key -> AES-256-GCM.
+  A fixed VERIFIER plaintext sealed at init gates every op; any decrypt failure
+  = one opaque `VaultError::Auth` (no oracle). Stateless: key re-derived per op,
+  nothing decrypted cached/persisted. No recovery.
+- On disk: `index.json` (plaintext) = {version, salt, verifier(+nonce),
+  models: {model_id -> [entry]}}; each entry = {blob_id, meta_nonce, enc_meta,
+  content_nonce, size}. `enc_meta` seals {name, extra:{}}. One `<blob_id>.blob`
+  per adapter = RAW ciphertext (no base64 -- 500MB adapters). Index written via
+  temp-file + rename. INVARIANT: disk reveals only blob count/sizes, never which
+  adapters / for which model (names+metadata encrypted; blobs random-id).
+- Per-model scoping: adapters keyed by model id under `models`; list/add/open/
+  remove all take a model. A Krea LoRA is meaningless on another DiT.
+- Fold = the generic `thinfer_models::common::lora` (promoted from ltx::lora;
+  auto-discovery of `diffusion_model.{X}.lora_{A|down}` -> base `{X}.weight`,
+  stacking, per-tensor rank, quant sites -> Q8_0, others preserved). Use path:
+  vault.open -> RAM bytes -> `BytesOpener` (in-mem FileOpener) ->
+  ShardedSafetensorsSource -> discover_specs -> LoraFoldSource wrapping the DiT
+  GGUF, unioned as before. 0-site fold = hard error (wrong-model LoRA).
+- Format: adapters validated BY CONTENT (`ensure_safetensors`, safetensors
+  header) at add time, never by filename -- Civitai download URLs are
+  extensionless; an HTML error page / .pt pickle is rejected with a clear msg.
+- Krea2 COMPATIBILITY (how to tell a LoRA fits Krea 2 Turbo): keys must be
+  `diffusion_model.{blocks.N.(attn.*|mlp.*) | txtfusion.*}.lora_{A|B|down|up}`
+  -- the krea2 MMDiT layout. FLUX.1-Krea-dev LoRAs (`double_blocks`/
+  `single_blocks`) are a DIFFERENT arch and fold 0 sites (the guard errors).
+  Civitai signal: base-model tag "Krea 2" (its own "Krea 2 LoRA" category), NOT
+  "Flux.1 Krea". Trained-on-Raw / applied-on-Turbo is the normal ostris
+  ai-toolkit flow and IS compatible (Raw and Turbo share the DiT). The runtime
+  is the final check: the fold logs the site count; 0 sites = wrong arch.
+- Shared dir: `vault::resolve_dir` = explicit (`--vault-dir` / serve.toml
+  `vault_dir`) > `THINFER_VAULT_DIR` env > `<hf-cache>/vault`, so CLI + serve
+  hit one vault by default (add via CLI -> usable from the web UI same box).
+- Password: transient. `request::Secret` redacts on Debug. CLI reads it via a
+  hidden `rpassword` prompt or `THINFER_VAULT_PASSWORD` (never a flag). serve
+  takes it in the request body over TLS. Never logged anywhere.
+- Surfaces: serve `POST /vault/adapters/{list,add,remove}` (blocking crypto on
+  spawn_blocking) + `ImageSpec.lora/password`; CLI `vault {add,list,remove}` +
+  `generate image --lora NAME_OR_ID[:WEIGHT]` (local only); web per-model
+  Adapters section. Gated by `ImageModelId::supports_adapters` (Krea2 today; the
+  fold is model-agnostic, so a new image DiT just opts in + wires its run path).

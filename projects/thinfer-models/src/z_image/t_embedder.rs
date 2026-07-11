@@ -18,7 +18,7 @@ use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResid
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::{BatchBuf, BatchScope};
 
-use crate::z_image::block::BlockPipelines;
+use crate::common::block::BlockPipelines;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TimestepEmbedderConfig {

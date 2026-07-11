@@ -349,6 +349,123 @@ impl RopeOp for RopeF32HalfRot {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 3-axis MRoPE (Qwen2.5-VL LM): half-rot pairing, but each pair k draws its
+// cos/sin for the real element (x[k]) and the imag element (x[k+pairs]) from
+// DIFFERENT position axes (the [32,48,48] mrope_section split over the 128 dims
+// after `cat(freqs, freqs)`). The caller bakes the per-pair, per-axis cos/sin
+// into `freqs` as 4 values per pair `[cos_lo, sin_lo, cos_hi, sin_hi]`, so the
+// freqs row stride is `pairs * 4 = dim * 2` (twice the half-rot layout).
+//
+// Per pair k (xr = x[k], xi = x[k+pairs]):
+//   out[k]        = xr*cos_lo - xi*sin_lo
+//   out[k+pairs]  = xi*cos_hi + xr*sin_hi
+// When cos_lo==cos_hi && sin_lo==sin_hi (text-only, all axes equal) this is
+// EXACTLY `RopeF32HalfRot`. f16 / i8 are unreachable (encoder is bf16/f32).
+wgsl_with_bf16_variant!(
+    WGSL_F32_MROPE,
+    WGSL_F32_MROPE_BF16 = r#"
+struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> freqs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let total = u.rows * u.heads * u.pairs;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
+    if (idx >= total) { return; }
+    let pair = idx % u.pairs;
+    let rh   = idx / u.pairs;
+    let row  = rh / u.heads;
+    let dim  = u.pairs * 2u;
+    let x_re_off = rh  * dim + pair;
+    let x_im_off = x_re_off + u.pairs;
+    let f_off    = row * (u.pairs * 4u) + pair * 4u;
+    let xr = x[x_re_off];
+    let xi = x[x_im_off];
+    let cos_lo = freqs[f_off];
+    let sin_lo = freqs[f_off + 1u];
+    let cos_hi = freqs[f_off + 2u];
+    let sin_hi = freqs[f_off + 3u];
+    out[x_re_off] = act_store(xr * cos_lo - xi * sin_lo);
+    out[x_im_off] = act_store(xi * cos_hi + xr * sin_hi);
+}
+"#
+);
+
+// Packed-bf16 MRoPE. Same 2-pairs/thread word scheme as the packed half-rot:
+// the real word holds x[2j], x[2j+1]; the imag word holds x[2j+pairs],
+// x[2j+1+pairs]. Each of the two pairs reads its own 4 freqs. `pairs % 2 == 0`.
+const WGSL_BF16_PACKED_MROPE: &str = concat!(
+    act_bf16_prelude!(),
+    r#"
+struct U { rows: u32, heads: u32, pairs: u32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read> freqs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let pair_words = u.pairs >> 1u;
+    let total = u.rows * u.heads * pair_words;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
+    if (idx >= total) { return; }
+    let j  = idx % pair_words;
+    let rh = idx / pair_words;
+    let row = rh / u.heads;
+    let row_w_base = rh * u.pairs;
+    let xr_w = row_w_base + j;
+    let xi_w = row_w_base + pair_words + j;
+    // 4 freqs per pair => 2 words per pair => 4 words cover pairs 2j, 2j+1.
+    let frow_w_base = row * (u.pairs * 2u);
+    let g0 = unpack_bf16x2(freqs[frow_w_base + 4u * j]);       // pair 2j:   cos_lo, sin_lo
+    let g1 = unpack_bf16x2(freqs[frow_w_base + 4u * j + 1u]);  // pair 2j:   cos_hi, sin_hi
+    let g2 = unpack_bf16x2(freqs[frow_w_base + 4u * j + 2u]);  // pair 2j+1: cos_lo, sin_lo
+    let g3 = unpack_bf16x2(freqs[frow_w_base + 4u * j + 3u]);  // pair 2j+1: cos_hi, sin_hi
+    let xr = unpack_bf16x2(x[xr_w]);
+    let xi = unpack_bf16x2(x[xi_w]);
+    let or0 = xr.x * g0.x - xi.x * g0.y;
+    let or1 = xr.y * g2.x - xi.y * g2.y;
+    let oi0 = xi.x * g1.x + xr.x * g1.y;
+    let oi1 = xi.y * g3.x + xr.y * g3.y;
+    out[xr_w] = pack_bf16x2(or0, or1);
+    out[xi_w] = pack_bf16x2(oi0, oi1);
+}
+"#
+);
+
+pub struct RopeF32Mrope;
+
+impl RopeOp for RopeF32Mrope {
+    const KERNEL_ID: &'static str = "rope.f32.mrope";
+    type Dtype = F32;
+    const X: &'static str = "rope_mrope/x";
+    const FREQS: &'static str = "rope_mrope/freqs";
+    const DIMS: &'static str = "rope_mrope/dims";
+    const OUTPUT: &'static str = "rope_mrope/out";
+    fn wgsl(cfg: &WgslConfig) -> &'static str {
+        match (cfg.act_dtype, cfg.bf16_quant_writes) {
+            (ActDtype::F32, false) => WGSL_F32_MROPE,
+            (ActDtype::F32, true) => WGSL_F32_MROPE_BF16,
+            (ActDtype::Bf16, _) => WGSL_BF16_PACKED_MROPE,
+            (ActDtype::F16, _) => {
+                unreachable!("MRoPE (Qwen2.5-VL edit encoder) runs bf16/f32 acts, never f16")
+            }
+            (ActDtype::I8, _) => {
+                unreachable!("MRoPE (Qwen2.5-VL edit encoder) runs bf16/f32 acts, never i8")
+            }
+        }
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+}
+
 #[cfg(feature = "conformance")]
 impl OpTest for RopeF32 {
     fn dtypes(&self) -> &'static [Dtype] {

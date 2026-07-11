@@ -20,5 +20,10 @@ hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rust
 # fancy-regex handles GPT-style byte-level BPE (Qwen3, Llama, etc.).
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
+[target.'cfg(windows)'.dependencies]
+# PrefetchVirtualMemory for MmapFile::will_read (memmap2's advise_range is
+# unix-only). Version pinned to one already in the workspace graph.
+windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_Foundation"] }
+
 [dev-dependencies]
 half = { version = "2", features = ["bytemuck"] }

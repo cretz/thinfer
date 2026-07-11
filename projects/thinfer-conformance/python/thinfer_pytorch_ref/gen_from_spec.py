@@ -61,16 +61,32 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
         return inputs["a"] * inputs["b"]
     if op == "silu":
         return F.silu(inputs["x"])
+    if op == "relu":
+        return F.relu(inputs["x"])
+    if op == "memcat":
+        # MemBlock input assembly: x is [T, C, H, W]; concat current frame with
+        # the previous frame (zero at t=0) on the channel axis -> [T, 2C, H, W].
+        x = inputs["x"]
+        past = torch.zeros_like(x)
+        past[1:] = x[:-1]
+        return torch.cat([x, past], dim=1)
     if op == "silu_mul":
         return F.silu(inputs["a"]) * inputs["b"]
+    if op == "gelu_mul":
+        # gelu_new (tanh approximation) gate, matching HF NewGELUActivation.
+        return F.gelu(inputs["a"], approximate="tanh") * inputs["b"]
     if op == "tanh":
         return torch.tanh(inputs["x"])
     if op == "bcast_affine":
         return inputs["x"] * (inputs["s"] + float(case["bias"]))
     if op == "bcast_fma":
         return inputs["x"] + inputs["s"] * inputs["y"]
+    if op == "bcast_modulate":
+        return inputs["x"] * (inputs["s"] + float(case["bias"])) + inputs["t"]
     if op == "bcast_add":
         return inputs["x"] + inputs["s"]
+    if op == "bcast_mul":
+        return inputs["x"] * inputs["s"]
     if op == "matmul":
         return inputs["a"] @ inputs["b"]
     if op == "rmsnorm":
@@ -111,6 +127,58 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
             stride=(int(case["stride_h"]), int(case["stride_w"])),
             padding=(int(case["pad_h"]), int(case["pad_w"])),
         )
+    if op == "conv3d":
+        # Causal time conv: pad only the front of the time axis (low-time
+        # side) by pad_t; H/W stay symmetric. F.pad order for NCTHW is
+        # (w_l, w_r, h_l, h_r, t_l, t_r).
+        x = F.pad(inputs["x"], (0, 0, 0, 0, int(case["pad_t"]), 0))
+        return F.conv3d(
+            x,
+            inputs["w"],
+            bias=inputs["bias"],
+            stride=(int(case["stride_t"]), int(case["stride_h"]), int(case["stride_w"])),
+            padding=(0, int(case["pad_h"]), int(case["pad_w"])),
+        )
+    if op == "conv1d":
+        return F.conv1d(
+            inputs["x"],
+            inputs["w"],
+            bias=inputs["bias"],
+            stride=int(case["stride"]),
+            padding=int(case["pad"]),
+            dilation=int(case["dilation"]),
+            groups=int(case["groups"]),
+        )
+    if op == "conv_transpose1d":
+        return F.conv_transpose1d(
+            inputs["x"],
+            inputs["w"],
+            bias=inputs["bias"],
+            stride=int(case["stride"]),
+            padding=int(case["pad"]),
+            dilation=int(case["dilation"]),
+            groups=int(case["groups"]),
+        )
+    if op == "snake_beta":
+        # BigVGAN v2 SnakeBeta (log-scale alpha/beta): per-channel over NCL.
+        x = inputs["x"]
+        eps = float(case["eps"])
+        c = x.shape[1]
+        alpha = torch.exp(inputs["alpha"]).reshape(1, c, 1)
+        beta = torch.exp(inputs["beta"]).reshape(1, c, 1)
+        return x + (1.0 / (beta + eps)) * torch.sin(x * alpha).pow(2)
+    if op == "replicate_pad1d":
+        return F.pad(inputs["x"], (int(case["lpad"]), int(case["rpad"])), mode="replicate")
+    if op == "scale":
+        return inputs["x"] * float(case["scale"])
+    if op == "rmsnorm3d":
+        # WanRMS_norm: L2-normalize across the channel axis (dim 1 of NCTHW),
+        # scale by sqrt(C), apply per-channel gain. bias=False in the Wan VAE.
+        x = inputs["x"]
+        gamma = inputs["w"]
+        c = x.shape[1]
+        normed = F.normalize(x, dim=1)
+        return normed * (c**0.5) * gamma.reshape(1, c, 1, 1, 1)
     if op == "transpose12":
         x = inputs["x"]
         return x.transpose(1, 2).contiguous()
@@ -139,6 +207,32 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
         out_re = x_re * cos - x_im * sin
         out_im = x_re * sin + x_im * cos
         return torch.cat((out_re, out_im), dim=-1).contiguous()
+    if op == "gated_head_mul":
+        # out[i] = x[i] * 2*sigmoid(gate[i // head_dim]); head_dim = len(x)/len(gate).
+        x = inputs["x"].reshape(-1)
+        gate = inputs["gate"].reshape(-1)
+        head_dim = x.numel() // gate.numel()
+        g = gate.repeat_interleave(head_dim)
+        return x * (2.0 * torch.sigmoid(g))
+    if op == "pixel_norm3d":
+        # Weightless per-location channel-RMS over NCTHW (eps inside the mean).
+        x = inputs["x"]
+        eps = float(case["eps"])
+        ms = x.pow(2).mean(dim=1, keepdim=True)
+        return x * torch.rsqrt(ms + eps)
+    if op == "depth_to_space3d":
+        # einops b (c p1 p2 p3) t h w -> b c (t p1) (h p2) (w p3); drop the
+        # leading frame when p1 == 2. Input here is [cin, t, h, w] (B=1).
+        x = inputs["x"]
+        p1, p2, p3 = int(case["p1"]), int(case["p2"]), int(case["p3"])
+        cin, t, h, w = x.shape
+        cout = cin // (p1 * p2 * p3)
+        x = x.reshape(cout, p1, p2, p3, t, h, w)
+        x = x.permute(0, 4, 1, 5, 2, 6, 3)  # cout, t, p1, h, p2, w, p3
+        x = x.reshape(cout, t * p1, h * p2, w * p3)
+        if p1 == 2:
+            x = x[:, 1:, :, :]  # drop leading frame
+        return x.contiguous()
     raise ValueError(f"unknown op: {op}")
 
 

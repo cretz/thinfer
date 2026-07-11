@@ -54,6 +54,14 @@ pub const DISPATCH_GPU: &str = "thinfer::dispatch.gpu";
 /// time waiting for `on_submitted_work_done`).
 pub const SUBMIT: &str = "thinfer::submit";
 
+/// DIAGNOSTIC: per-op GPU fence. When enabled at TRACE, the backend submits and
+/// BLOCKS on `device.poll(Wait)` after EVERY dispatch, logging the pipeline name
+/// before and after the drain. Used to localize a GPU device-loss / shader OOB to
+/// a single op: the last "submitting" line without a matching "drained" line is
+/// the faulting op. Massively slows execution (one submit+fence per dispatch);
+/// native-only, for debugging a faulting config. Fields: `pipeline`, `wg_x/y/z`.
+pub const OP_FENCE: &str = "thinfer::op.fence";
+
 /// Backend buffer allocate / free. Fields: `op` ("alloc" | "free"), `id`,
 /// `bytes` (alloc only).
 pub const BUF: &str = "thinfer::buf";
@@ -184,6 +192,11 @@ mod sub_impl {
         total_alloc_bytes: u64,
         peak_live_bytes: u64,
         cur_live_bytes: u64,
+        /// Per-pipeline GPU time from `DISPATCH_GPU` timestamp queries, summed
+        /// across all scopes: (gpu_ms_total, n_dispatches). Answers "which op
+        /// kind owns the wall time" (e.g. weight-feed `narrow_transpose_f32`
+        /// vs `matmul_*`/`sdpa_sg`), which the per-scope table cannot split.
+        pipeline_gpu_ms: HashMap<String, (f64, u64)>,
     }
 
     /// Handle to the rollup's accumulated state. Cheap to clone (Arc inside).
@@ -298,6 +311,12 @@ mod sub_impl {
                 if let Some(ms) = v.gpu_ms {
                     s.dispatch_gpu_ms_total += ms;
                     s.n_dispatch_gpu += 1;
+                    // `s` is unused past this point in the branch, so the
+                    // disjoint `st.pipeline_gpu_ms` reborrow is sound (NLL).
+                    let name = v.pipeline.unwrap_or_else(|| "<unknown>".to_owned());
+                    let e = st.pipeline_gpu_ms.entry(name).or_default();
+                    e.0 += ms;
+                    e.1 += 1;
                 }
             } else if target == SUBMIT {
                 s.n_submits += 1;
@@ -411,6 +430,9 @@ mod sub_impl {
         gpu_ms: Option<f64>,
         finish_ms: Option<f64>,
         submit_call_ms: Option<f64>,
+        /// Only populated for `DISPATCH_GPU` events (carries `pipeline`); SUBMIT
+        /// events leave it `None`.
+        pipeline: Option<String>,
     }
     impl Visit for SubmitVisitor {
         fn record_f64(&mut self, f: &Field, v: f64) {
@@ -421,7 +443,17 @@ mod sub_impl {
                 _ => {}
             }
         }
-        fn record_debug(&mut self, _f: &Field, _v: &dyn core::fmt::Debug) {}
+        fn record_str(&mut self, f: &Field, v: &str) {
+            if f.name() == "pipeline" {
+                self.pipeline = Some(v.to_owned());
+            }
+        }
+        fn record_debug(&mut self, f: &Field, v: &dyn core::fmt::Debug) {
+            if f.name() == "pipeline" {
+                let s = format!("{v:?}");
+                self.pipeline = Some(s.trim_matches('"').to_owned());
+            }
+        }
     }
 
     #[derive(Default)]
@@ -520,6 +552,27 @@ mod sub_impl {
                     write!(w, "{name}={n}")?;
                 }
                 writeln!(w)?;
+            }
+            writeln!(w)?;
+            writeln!(
+                w,
+                "---- gpu_ms by pipeline (timestamp totals, all scopes) ----"
+            )?;
+            let mut by_op: Vec<(&String, &(f64, u64))> = st.pipeline_gpu_ms.iter().collect();
+            by_op.sort_by(|a, b| {
+                b.1.0
+                    .partial_cmp(&a.1.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (name, (ms, n)) in &by_op {
+                writeln!(
+                    w,
+                    "{:<28} {:>12.1} ms {:>8} disp {:>9.3} ms/disp",
+                    name,
+                    ms,
+                    n,
+                    ms / (*n as f64).max(1.0),
+                )?;
             }
             Ok(())
         }

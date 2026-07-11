@@ -58,6 +58,11 @@ pub struct WgpuBackend {
     /// a specific size (the broadcast hint is correct for any size).
     subgroup_min_size: u32,
     subgroup_max_size: u32,
+    /// `Some` when the adapter exposed `VK_KHR_cooperative_matrix` with a
+    /// usable f16-AB / f32-CR square tile and we requested the experimental
+    /// feature on the device. Drives the model layer's coopmat (tensor-core)
+    /// matmul + flash-attention path; `None` => fall back to dense/i8 kernels.
+    coopmat: Option<CoopmatConfig>,
     /// True when this is wgpu's browser WebGPU backend (Tint compiles our
     /// WGSL) rather than a native backend (naga). Tint REQUIRES an `enable
     /// subgroups;` directive on shaders that use subgroup builtins; naga
@@ -131,6 +136,13 @@ pub enum WgpuError {
     Allocate {
         bytes: u64,
         source: wgpu::Error,
+    },
+    /// A strict-budget workspace alloc the arbiter refused (reclaim chain dry,
+    /// would exceed the configured VRAM budget). Synthesized WITHOUT touching the
+    /// device, so it never poisons the wgpu device the way a real OOM can. Treat
+    /// like `Allocate` for OOM-recovery (shrink + retry).
+    BudgetExceeded {
+        bytes: u64,
     },
     SubmitFailed {
         ordinal: u64,
@@ -258,6 +270,24 @@ pub struct WgpuConfig {
     /// installed the rollup subscriber. Silently degrades to off when the
     /// adapter doesn't expose the feature (logged once via `trace::ADAPTER`).
     pub timestamps: bool,
+    /// Opt OUT of the cooperative-matrix (tensor-core) path. Default false
+    /// (path ON when the adapter supports it). The binary edge maps an env
+    /// knob (e.g. `THINFER_NO_COOPMAT`) here so thinfer-core stays env-free.
+    /// When set, OR when no Vulkan adapter exposes `VK_KHR_cooperative_matrix`
+    /// with an f16-AB/f32-CR square config, the model layer falls back to the
+    /// dense bf16 / i8-DP4A kernels (graceful degradation).
+    pub disable_coopmat: bool,
+}
+
+/// A supported cooperative-matrix tile config picked at device creation.
+/// naga 29 only exposes SQUARE tiles (`coop_mat8x8` / `coop_mat16x16`), so we
+/// record the single side length `tile` (== M == N == K) plus whether the HW
+/// reported saturating accumulation for it. f16 inputs, f32 accumulate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoopmatConfig {
+    /// Square tile side: 16 (preferred) or 8. Used as M=N=K of one
+    /// `coopMultiplyAdd`; the kernel loops K-tiles to span the full K.
+    pub tile: u32,
 }
 
 pub struct WgpuPipeline {
@@ -275,7 +305,47 @@ impl WgpuBackend {
     }
 
     pub async fn new_with_config(cfg: WgpuConfig) -> Result<Self, WgpuError> {
-        let instance = wgpu::Instance::default();
+        let power_preference = match cfg.power_preference {
+            PowerPreference::HighPerformance => wgpu::PowerPreference::HighPerformance,
+            PowerPreference::LowPower => wgpu::PowerPreference::LowPower,
+            PowerPreference::None => wgpu::PowerPreference::None,
+        };
+        let adapter_options = wgpu::RequestAdapterOptions {
+            power_preference,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        };
+        // Cooperative matrices are a SPIR-V capability => Vulkan-only. wgpu's
+        // default instance may pick DX12 on Windows, which can never expose
+        // them. When the coopmat path is wanted, prefer a Vulkan-only instance
+        // so the adapter we get can carry `VK_KHR_cooperative_matrix`; if no
+        // Vulkan adapter answers, fall back to the default instance (and the
+        // coopmat path simply stays off). On the web there is no Vulkan and
+        // the path is irrelevant, so we never force backends there.
+        let want_coopmat = !cfg.disable_coopmat && !cfg!(target_arch = "wasm32");
+        let (instance, adapter) = {
+            let mut picked = None;
+            if want_coopmat {
+                let vk = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::VULKAN,
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                });
+                if let Ok(a) = vk.request_adapter(&adapter_options).await {
+                    picked = Some((vk, a));
+                }
+            }
+            match picked {
+                Some(p) => p,
+                None => {
+                    let inst = wgpu::Instance::default();
+                    let a = inst
+                        .request_adapter(&adapter_options)
+                        .await
+                        .map_err(WgpuError::AdapterUnavailable)?;
+                    (inst, a)
+                }
+            }
+        };
         // WGSL `packed_4x8_integer_dot_product` extension probe. Queried on
         // the instance because it's a WGSL-language feature, not a device
         // feature - the same wgpu instance can serve devices that vary in
@@ -286,19 +356,6 @@ impl WgpuBackend {
         let packed_int_dot = instance
             .wgsl_language_features()
             .contains(wgpu::WgslLanguageFeatures::Packed4x8IntegerDotProduct);
-        let power_preference = match cfg.power_preference {
-            PowerPreference::HighPerformance => wgpu::PowerPreference::HighPerformance,
-            PowerPreference::LowPower => wgpu::PowerPreference::LowPower,
-            PowerPreference::None => wgpu::PowerPreference::None,
-        };
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
-            .await
-            .map_err(WgpuError::AdapterUnavailable)?;
         // Request the adapter's max binding size. The downlevel default
         // (128 MiB) is below the largest weight tensors we bind in one go
         // (DiT FFN at 3840*10240*4 = 150 MiB; some VAE convs even larger),
@@ -328,6 +385,36 @@ impl WgpuBackend {
         // backend doesn't surface the feature flag yet). Drives the
         // `MatMulI8Config.use_subgroup` flag on the DP4A matmul pipeline.
         let adapter_has_subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
+        // Cooperative-matrix probe. `EXPERIMENTAL_COOPERATIVE_MATRIX` is
+        // surfaced by wgpu-hal only when `VK_KHR_cooperative_matrix` is present
+        // AND at least one config was reported; `cooperative_matrix_properties`
+        // then lists the supported (M,N,K, AB-type, CR-type) tuples. naga only
+        // emits SQUARE tiles, so we restrict to M==N==K with f16 inputs / f32
+        // accumulate (best numerics, matches the bf16-residual floor the path
+        // targets), preferring the 16-wide tile over 8. Non-saturating so the
+        // accumulate matches a plain fp32 fma reference.
+        let adapter_has_coopmat = want_coopmat
+            && adapter
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        let coopmat = if adapter_has_coopmat {
+            use wgpu::CooperativeScalarType as Cs;
+            let mut best: Option<CoopmatConfig> = None;
+            for p in adapter.cooperative_matrix_properties() {
+                let square = p.m_size == p.n_size && p.n_size == p.k_size;
+                let usable = square
+                    && (p.m_size == 16 || p.m_size == 8)
+                    && p.ab_type == Cs::F16
+                    && p.cr_type == Cs::F32
+                    && !p.saturating_accumulation;
+                if usable && best.is_none_or(|b| p.m_size > b.tile) {
+                    best = Some(CoopmatConfig { tile: p.m_size });
+                }
+            }
+            best
+        } else {
+            None
+        };
         let mut required_features = wgpu::Features::empty();
         if request_ts {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
@@ -337,6 +424,9 @@ impl WgpuBackend {
         }
         if adapter_has_subgroups {
             required_features |= wgpu::Features::SUBGROUP;
+        }
+        if coopmat.is_some() {
+            required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
         }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -358,7 +448,17 @@ impl WgpuBackend {
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 memory_hints: wgpu::MemoryHints::default(),
-                experimental_features: wgpu::ExperimentalFeatures::default(),
+                // SAFETY: `EXPERIMENTAL_COOPERATIVE_MATRIX` is in wgpu's
+                // experimental mask, so request_device rejects it unless the
+                // caller acknowledges the experimental-API token. We only set
+                // this when `coopmat` is Some (the adapter reported a usable
+                // config); the kernels guard every coopmat dispatch on the same
+                // condition, so no experimental op runs without HW support.
+                experimental_features: if coopmat.is_some() {
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::default()
+                },
                 trace: wgpu::Trace::Off,
             })
             .await
@@ -381,6 +481,7 @@ impl WgpuBackend {
             subgroups = adapter_has_subgroups,
             subgroup_min_size = subgroup_min_size,
             subgroup_max_size = subgroup_max_size,
+            coopmat_tile = coopmat.map(|c| c.tile).unwrap_or(0),
             "wgpu adapter",
         );
         let uncaptured: Arc<Mutex<Option<wgpu::Error>>> = Arc::new(Mutex::new(None));
@@ -420,6 +521,7 @@ impl WgpuBackend {
             subgroups: adapter_has_subgroups,
             subgroup_min_size,
             subgroup_max_size,
+            coopmat,
             is_web,
             mem: MemAccount::new(),
             prep_pipelines: Mutex::new(HashMap::new()),
@@ -458,6 +560,21 @@ impl WgpuBackend {
     /// range).
     pub fn subgroup_size_range(&self) -> (u32, u32) {
         (self.subgroup_min_size, self.subgroup_max_size)
+    }
+
+    /// The cooperative-matrix (tensor-core) tile config the device was created
+    /// with, or `None` when the path is unavailable (non-Vulkan adapter, no
+    /// `VK_KHR_cooperative_matrix`, no usable f16/f32 square config, or the
+    /// caller opted out via `WgpuConfig.disable_coopmat`). The model layer
+    /// gates its coopmat matmul + flash-attention kernels on this; when `None`
+    /// it compiles the dense bf16 / i8-DP4A kernels instead.
+    pub fn coopmat(&self) -> Option<CoopmatConfig> {
+        self.coopmat
+    }
+
+    /// Whether the coopmat path is live on this device.
+    pub fn supports_coopmat(&self) -> bool {
+        self.coopmat.is_some()
     }
 
     /// WGSL `enable` directive to prepend to shaders that use subgroup
@@ -636,6 +753,10 @@ impl Backend for WgpuBackend {
         WgpuBackend::allocate_in(self, bytes, cat)
     }
 
+    fn budget_oom_error(&self, bytes: u64) -> Self::Error {
+        WgpuError::BudgetExceeded { bytes }
+    }
+
     fn mem_account(&self) -> &Arc<MemAccount> {
         &self.mem
     }
@@ -760,15 +881,43 @@ impl Backend for WgpuBackend {
             beginning_of_pass_write_index: Some(b),
             end_of_pass_write_index: Some(e),
         });
-        let mut pass = encoder
-            .enc
-            .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes,
-            });
-        pass.set_pipeline(&pipeline.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        {
+            let mut pass = encoder
+                .enc
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes,
+                });
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        }
+        // DIAGNOSTIC: per-op fence (see trace::OP_FENCE). Submit the encoder so
+        // far and block until the GPU drains, so a device-loss / shader OOB
+        // surfaces on THIS op rather than at the coarse scope submit. The last
+        // "submitting" line without a matching "drained" is the faulting op.
+        if tracing::enabled!(target: trace::OP_FENCE, tracing::Level::TRACE) {
+            tracing::trace!(
+                target: trace::OP_FENCE,
+                pipeline = %pipeline.name,
+                wg_x = workgroups[0],
+                wg_y = workgroups[1],
+                wg_z = workgroups[2],
+                phase = "submitting",
+            );
+            let fresh = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            let old = core::mem::replace(&mut encoder.enc, fresh);
+            self.queue.submit([old.finish()]);
+            let res = self.device.poll(wgpu::PollType::wait_indefinitely());
+            tracing::trace!(
+                target: trace::OP_FENCE,
+                pipeline = %pipeline.name,
+                ok = res.is_ok(),
+                phase = "drained",
+            );
+        }
         Ok(())
     }
 
@@ -921,6 +1070,20 @@ impl Backend for WgpuBackend {
         }
     }
 
+    fn flush_encoder(&self, encoder: Self::CommandEncoder) -> Result<(), Self::Error> {
+        // Fire-and-forget: finish + queue.submit, no await, no error-scope, no
+        // timestamp resolve. This splits one logical scope into multiple command
+        // buffers so a multi-second run of heavy dispatches (e.g. the video DiT
+        // self-attention) does not present to the OS GPU watchdog as a single
+        // 2s+ submit and trigger a TDR engine reset. The submit is ordered after
+        // any prior `write_buffer`/submit on the queue; the caller's scope guards
+        // keep the bound buffers alive until the eventual awaited submit drains
+        // the GPU. Unresolved timestamps in `encoder.ts` are dropped (the perf
+        // path uses the awaited `submit`); a device-loss surfaces at that submit.
+        self.queue.submit([encoder.enc.finish()]);
+        Ok(())
+    }
+
     fn create_pipeline(
         &self,
         label: &str,
@@ -1066,6 +1229,9 @@ impl Backend for WgpuBackend {
                     ("q8_0_from_bf16", [pairs, 0, 0, 0])
                 }
                 WeightPrep::TransposeBf16 { n, k } => ("transpose_bf16_2d", [n, k, 0, 0]),
+                WeightPrep::NarrowTransposeF32 { n, k, n0, band_n } => {
+                    ("narrow_transpose_f32", [n, k, n0, band_n])
+                }
             };
             let pipeline = {
                 let cached = self.prep_pipelines.lock().unwrap().get(key).cloned();
@@ -1078,6 +1244,9 @@ impl Backend for WgpuBackend {
                             }
                             WeightPrep::TransposeBf16 { .. } => {
                                 crate::ops::weight_prep::build_transpose_bf16_wgsl()
+                            }
+                            WeightPrep::NarrowTransposeF32 { .. } => {
+                                crate::ops::weight_prep::build_narrow_transpose_f32_wgsl()
                             }
                         };
                         let p = Arc::new(
@@ -1116,6 +1285,11 @@ impl Backend for WgpuBackend {
                     WeightPrep::TransposeBf16 { n, k } => {
                         crate::ops::weight_prep::dispatch_transpose_bf16(
                             self, &mut enc, &pipeline, &bufs, n, k,
+                        )?
+                    }
+                    WeightPrep::NarrowTransposeF32 { n, k, n0, band_n } => {
+                        crate::ops::weight_prep::dispatch_narrow_transpose_f32(
+                            self, &mut enc, &pipeline, &bufs, n, k, n0, band_n,
                         )?
                     }
                 }

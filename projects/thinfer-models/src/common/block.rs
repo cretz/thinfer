@@ -1,6 +1,9 @@
-//! Z-Image transformer block forward, both `modulation` flavors.
+//! Shared DiT transformer block: the `BlockPipelines` kernel set, the
+//! activation/op primitives, and a `Block::forward` for the Z-Image-style
+//! block (both `modulation` flavors). Reused across models (Z-Image drives
+//! `forward`; Wan composes the same pipelines/ops/`dispatch_matmul_site`).
 //!
-//! Sequence per upstream `ZImageTransformerBlock.forward`
+//! Forward sequence per upstream `ZImageTransformerBlock.forward`
 //! (`src/zimage/transformer.py`):
 //!
 //! ```text
@@ -18,9 +21,10 @@ use thinfer_core::backend::{BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::cache::KernelKey;
 use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
-    BcastFmaOp, LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op,
-    QkvSplitF32, QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp,
-    ScatterPadRowsF32, ScatterPadRowsOp, SdpaF32, SdpaOp, SiluF32, SiluMulF32, TanhF32,
+    BcastFmaOp, BcastModulateF32, BcastModulateOp, BcastMulF32, Bf16ToF16, F16ToBf16, GeluF32,
+    LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, QkvSplitF32,
+    QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32,
+    ScatterPadRowsOp, SdpaDecode, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32, TanhF32,
     WeightDtype, WgslConfig,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
@@ -40,6 +44,10 @@ pub struct BlockConfig {
     pub norm_eps: f32,
     pub adaln_embed_dim: usize,
     pub modulation: bool,
+    /// RoPE convention for q/k. `false` (default) drives the interleaved-pair
+    /// `op_rope` (Z-Image / Wan). `true` drives the half-rot `op_rope_halfrot`
+    /// (HF `(k, k+D/2)` pairing) used by Ideogram-4's MRoPE and Qwen3.
+    pub rope_halfrot: bool,
 }
 
 impl BlockConfig {
@@ -82,10 +90,21 @@ pub struct BlockWeightBufs {
 /// compiles one shader per distinct config.
 pub struct BlockMatmuls {
     pub qkv: MatMulF32,
+    /// Self-attention QKV, split from `qkv` (cross-attention) so its weight can
+    /// take a distinct (e.g. i8/Q8_0) encoding. Same shape as `qkv`; identical to
+    /// it unless [`BlockWgslConfigs::matmul_qkv_self`] overrides the weight dtype.
+    pub qkv_self: MatMulF32,
     pub proj: MatMulF32,
     pub ffn_up: MatMulF32,
     pub ffn_down: MatMulF32,
     pub adaln: MatMulF32,
+    /// Module-level dense linears (patch embed, condition embedder, proj_out):
+    /// weights that are NOT folded into the quant block set and so stay bf16
+    /// (`Linear2D [K, N]`). Always bf16-weight, independent of whatever encoding
+    /// the block matmul sites take, so these sites never touch the per-site
+    /// dequant/i8 block pipeline. Square 64x64 tiling (the patch/proj_out M can
+    /// be large, unlike adaln's M=1).
+    pub module: MatMulF32,
 }
 
 impl BlockMatmuls {
@@ -156,18 +175,25 @@ impl BlockMatmuls {
         };
         Self {
             qkv: MatMulF32::new(square(cfgs.matmul_qkv.weight_dtype)),
+            qkv_self: MatMulF32::new(square(cfgs.matmul_qkv_self.weight_dtype)),
             proj: MatMulF32::new(square(cfgs.matmul_proj.weight_dtype)),
             ffn_up: MatMulF32::new(square(cfgs.matmul_ffn_up.weight_dtype)),
             ffn_down: MatMulF32::new(wide_k(cfgs.matmul_ffn_down.weight_dtype)),
             // tn=2 (not DEFAULT tn=1) so AdaLN output can land in packed-bf16
             // storage when `WgslConfig.act_dtype = Bf16`. Output cols are
             // 6*ADALN_EMBED_DIM = 1536 (even) so pairing is clean. M=1 keeps
-            // register blocking pointless, so bm/tm stay at DEFAULT. AdaLN
-            // weight stays bf16 even in the quant-DiT case.
+            // register blocking pointless, so bm/tm stay at DEFAULT. A Quant
+            // adaln weight (Hunyuan mod linears) goes through the dequant-once
+            // path same as `square`: the matmul reads the dense bf16/f16
+            // N-major workspace (b_nmajor), never the quant stream directly.
             adaln: MatMulF32::new(MatMulConfig {
                 tn: 2,
+                b_nmajor: matches!(cfgs.matmul_adaln.weight_dtype, WeightDtype::Quant(_)),
                 ..MatMulConfig::DEFAULT
             }),
+            // Bf16 square (b_nmajor=false): module weights are dense bf16
+            // `Linear2D [K, N]`, never the N-major dequant workspace.
+            module: MatMulF32::new(square(WeightDtype::Bf16)),
         }
     }
 }
@@ -182,22 +208,67 @@ pub struct DequantStep {
     pub scheme: thinfer_core::quant::QuantKind,
 }
 
+/// A matmul site's B operand pre-dequanted ONCE outside the dispatch (a tiled
+/// caller dequants each block weight into persistent workspace buffers and
+/// every activation tile reuses them). Without it, `dispatch_matmul_site*`
+/// re-runs the identical weight dequant inside every call - at video dims
+/// that is once per activation tile, ~32x redundant per block.
+#[derive(Clone, Copy)]
+pub enum PreparedWeight {
+    /// DP4A site: the `dequant_i8` triple (i8 image `[N,K]`, per-32-block
+    /// scale, per-32-block qsum).
+    I8 {
+        i8: BufRef,
+        scale: BufRef,
+        qsum: BufRef,
+    },
+    /// Coopmat / dense-fallback site: the dequanted f16 `[N,K]` n-major image.
+    F16(BufRef),
+}
+
+/// A cooperative-matrix (tensor-core) matmul site. `Some` only for an opt-in
+/// Wan-DiT site when the device exposes a usable coopmat config AND the block
+/// runs the fast_mixed (bf16<->f16) casts. Bundles: an f16-target dequant of
+/// the Quant weight into `[N,K]` nmajor f16, the coopmat matmul pipeline, and
+/// its config. Dispatch (`dispatch_matmul_site_coopmat`) casts the bf16 A-side
+/// to f16, dequants the weight to f16, runs the coopmat matmul (f16 in, f32
+/// accumulate, f16 out), then casts the output back to the bf16 residual.
+pub struct CoopmatStep {
+    pub dequant_f16: DequantStep,
+    pub matmul: WgpuPipeline,
+    pub cfg: thinfer_core::ops::matmul_coopmat::CoopmatMatmulConfig,
+}
+
 pub struct BlockPipelines {
     pub matmuls: BlockMatmuls,
     pub matmul_qkv: WgpuPipeline,
+    /// Self-attention QKV pipeline (cross-attention uses `matmul_qkv`). Compiled
+    /// from [`BlockWgslConfigs::matmul_qkv_self`]; identical to `matmul_qkv`
+    /// unless that slot pins a distinct (i8/Q8_0) weight encoding.
+    pub matmul_qkv_self: WgpuPipeline,
     pub matmul_proj: WgpuPipeline,
     pub matmul_ffn_up: WgpuPipeline,
     pub matmul_ffn_down: WgpuPipeline,
     pub matmul_adaln: WgpuPipeline,
+    /// Module-level dense bf16 matmul (patch embed, condition embedder,
+    /// proj_out). Always reads a bf16 `Linear2D [K, N]` weight directly, so the
+    /// module sites are decoupled from the block's per-site quant pipeline.
+    pub matmul_module: WgpuPipeline,
     /// Per-site dequant pre-pass. `Some` iff the corresponding matmul's
     /// weight_dtype is Quant. When present, the layer forward dequants the
     /// quant weight into a workspace buffer, then runs the bf16-nmajor
     /// matmul against the dense workspace. None means the matmul reads its
     /// weight buffer directly (bf16 or f32 path).
     pub dequant_qkv: Option<DequantStep>,
+    pub dequant_qkv_self: Option<DequantStep>,
     pub dequant_proj: Option<DequantStep>,
     pub dequant_ffn_up: Option<DequantStep>,
     pub dequant_ffn_down: Option<DequantStep>,
+    /// AdaLN/modulation-site dequant. `Some` iff `matmul_adaln.weight_dtype` is
+    /// Quant (Hunyuan mod linears). The site never gets an i8/coopmat pair:
+    /// M=1, and modulation outputs gate the residual stream, so only the
+    /// weight storage quantizes (dequant-once -> dense matmul).
+    pub dequant_adaln: Option<DequantStep>,
     /// DP4A int8 path: per-Quant-site `(dequant_i8 pipeline + scheme,
     /// matmul_i8 pipeline)`. `Some` iff the backend exposes
     /// `WgslLanguageFeatures::Packed4x8IntegerDotProduct` AND the site's
@@ -207,10 +278,12 @@ pub struct BlockPipelines {
     /// the legacy F16 matmul pipeline (`matmul_<site>` below) is still
     /// compiled in this case but goes unused on the I8 site.
     pub dequant_i8_qkv: Option<DequantStep>,
+    pub dequant_i8_qkv_self: Option<DequantStep>,
     pub dequant_i8_proj: Option<DequantStep>,
     pub dequant_i8_ffn_up: Option<DequantStep>,
     pub dequant_i8_ffn_down: Option<DequantStep>,
     pub matmul_i8_qkv: Option<WgpuPipeline>,
+    pub matmul_i8_qkv_self: Option<WgpuPipeline>,
     pub matmul_i8_proj: Option<WgpuPipeline>,
     pub matmul_i8_ffn_up: Option<WgpuPipeline>,
     pub matmul_i8_ffn_down: Option<WgpuPipeline>,
@@ -244,17 +317,43 @@ pub struct BlockPipelines {
     /// && head_dim <= 128`, else falls back to `sdpa`.
     pub sdpa_sg: Option<WgpuPipeline>,
     /// Lane-cluster width (CL) baked into the `sdpa_sg` kernel: 8 when the
-    /// adapter's subgroup min size >= 8, else 4. Sets BR = WG/CL at dispatch.
+    /// adapter's subgroup min size >= 8, else 4. With `sdpa_sg_qr` it sets
+    /// BR = WG/CL*R at dispatch.
     pub sdpa_sg_cl: u32,
+    /// Q rows per lane cluster (R) baked into the `sdpa_sg` kernels
+    /// (Q-register blocking; bit-exact vs R=1). Default 1;
+    /// `THINFER_SDPA_SG_QR` overrides for perf A/B.
+    pub sdpa_sg_qr: u32,
+    /// Temporal sliding-window twin of `sdpa_sg` (`build_f16_sg_windowed_wgsl`).
+    /// Built alongside `sdpa_sg` whenever the subgroup f16 SDPA is. Dispatched
+    /// in place of `sdpa_sg` only when a run sets `attn_window > 0` (video DiT
+    /// self-attention); restricts each query to keys within +-W latent frames,
+    /// breaking the O(frames^2) cost. Changes the output, so it is opt-in.
+    pub sdpa_sg_win: Option<WgpuPipeline>,
+    /// Large-D SDPA (`SdpaF32LargeD`, one workgroup per Q row). `Some` iff
+    /// `BlockWgslConfigs::large_d_sdpa`; dispatch routes `head_dim > 128` here.
+    pub sdpa_large_d: Option<WgpuPipeline>,
+    /// Decode SDPA (`SdpaDecode`, one workgroup per Q row, the workgroup
+    /// cooperates over the KV length). `Some` iff `BlockWgslConfigs::decode_sdpa`.
+    /// For single-query decode against a long KV cache this is ~1-2 orders faster
+    /// than `SdpaF32` (which runs the whole per-head softmax in one thread); the
+    /// caller opts in per-call via [`op_sdpa_decode`]. `head_dim <= 128`.
+    pub sdpa_decode: Option<WgpuPipeline>,
     pub qkv_split: WgpuPipeline,
     pub silu: WgpuPipeline,
     pub silu_mul: WgpuPipeline,
+    /// gelu-tanh activation. Built always (cheap), used by the Hunyuan
+    /// dual-stream block's gelu-tanh FFN; Z-Image/Wan FFNs are SwiGLU and
+    /// drive `silu_mul` instead.
+    pub gelu: WgpuPipeline,
     pub add: WgpuPipeline,
     pub mul: WgpuPipeline,
     pub tanh: WgpuPipeline,
     pub bcast_affine: WgpuPipeline,
     pub bcast_fma: WgpuPipeline,
+    pub bcast_modulate: WgpuPipeline,
     pub bcast_add: WgpuPipeline,
+    pub bcast_mul: WgpuPipeline,
     pub scatter_pad_rows: WgpuPipeline,
     /// Opt-in i8 attention (the only i8 activation storage outside matmul
     /// internals). `Some` iff `BlockWgslConfigs::i8_sdpa`. When enabled the
@@ -266,6 +365,25 @@ pub struct BlockPipelines {
     /// unsound (outlier channels annihilate their block neighbors and the
     /// error compounds across all 30 blocks; see worklog 2026-06-04).
     pub sdpa_i8: Option<WgpuPipeline>,
+    /// Mixed-precision f16 SDPA casts (`Bf16ToF16` / `F16ToBf16`). `Some` iff
+    /// `BlockWgslConfigs::fast_sdpa` AND the acts are bf16 AND the backend has
+    /// subgroups + SHADER_F16. When present, `op_sdpa` casts the (normed,
+    /// f16-safe) Q/K/V to f16, runs the subgroup SDPA, and casts the output
+    /// back to the bf16 residual -- the per-block speedup without exposing the
+    /// outlier-prone residual stream to f16. An F16-act block leaves these
+    /// `None` and feeds f16 Q/K/V to `sdpa_sg` directly.
+    pub cast_to_f16: Option<WgpuPipeline>,
+    pub cast_to_bf16: Option<WgpuPipeline>,
+    /// Opt-in coopmat (tensor-core) matmul on the outlier-bound bf16 sites that
+    /// i8 can't touch (proj = attn-out, ffn_down = gelu product, qkv = cross
+    /// from un-normed text). `Some` only when the device exposes a usable
+    /// coopmat config, the block runs fast_mixed, and the site is opted in via
+    /// [`BlockWgslConfigs::coopmat_acts`]. Takes precedence over the dense/i8
+    /// path in `dispatch_matmul_site_coopmat`; falls back when `None`.
+    pub coopmat_proj: Option<CoopmatStep>,
+    pub coopmat_ffn_down: Option<CoopmatStep>,
+    pub coopmat_qkv: Option<CoopmatStep>,
+    pub coopmat_ffn_up: Option<CoopmatStep>,
     /// On-GPU activation storage dtype for buffers compiled against this set
     /// of pipelines. Drives byte sizing of every transient alloc through the
     /// DiT block forward pass.
@@ -281,6 +399,12 @@ pub struct BlockPipelines {
 #[derive(Clone, Copy, Debug)]
 pub struct BlockWgslConfigs {
     pub matmul_qkv: WgslConfig,
+    /// Self-attention QKV. Split from `matmul_qkv` (which now serves only
+    /// cross-attention) so the self-attn projection can pin a distinct weight
+    /// encoding -- e.g. Q8_0 for the DP4A path -- while cross-attention, whose
+    /// K/V project from un-normed text and overflow under i8 acts, stays dense.
+    /// Set equal to `matmul_qkv` to keep the two identical (the default).
+    pub matmul_qkv_self: WgslConfig,
     pub matmul_proj: WgslConfig,
     pub matmul_ffn_up: WgslConfig,
     pub matmul_ffn_down: WgslConfig,
@@ -292,6 +416,28 @@ pub struct BlockWgslConfigs {
     pub i8_sdpa: bool,
     /// Per-site opt-out of the i8 activation path (see [`DenseActSites`]).
     pub dense_acts: DenseActSites,
+    /// Per-site opt-in of the coopmat tensor-core matmul (see [`CoopmatSites`]).
+    pub coopmat_acts: CoopmatSites,
+    /// Compile the large-D SDPA kernel (`SdpaF32LargeD`, one workgroup per Q
+    /// row, D split across threads) so a block with `head_dim > 128` (e.g.
+    /// Ideogram-4's 256) has a real attention path instead of overrunning the
+    /// `SdpaF32` `MAX_D=128` shared tile. Only F32/F16 acts (the kernel has no
+    /// bf16-packed variant); leave `false` for `head_dim <= 128`.
+    pub large_d_sdpa: bool,
+    /// Opt-in mixed-precision f16 SDPA for a bf16-act block: cast the normed,
+    /// f16-safe Q/K/V to f16, run the subgroup SDPA, cast the output back to the
+    /// bf16 residual. Only takes effect when `ops.act_dtype == Bf16` and the
+    /// backend exposes subgroups + SHADER_F16 (an F16-act block already feeds
+    /// f16 Q/K/V to `sdpa_sg`); a no-op otherwise. Set it only on blocks whose
+    /// SDPA Q/K/V are post-rmsnorm/rope and O(1) (DiT self-attention); leave it
+    /// off for raw-residual encoder attention (umT5 et al.).
+    pub fast_sdpa: bool,
+    /// Compile the decode SDPA kernel (`SdpaDecode`, one workgroup per Q row, the
+    /// workgroup cooperates over the KV length). Set on autoregressive generators
+    /// (the rewriter LM) so single-token decode against a long KV cache is not
+    /// bottlenecked by `SdpaF32`'s one-thread-per-head softmax. `head_dim <= 128`,
+    /// F32/Bf16 acts. The caller opts into it per-call via [`op_sdpa_decode`].
+    pub decode_sdpa: bool,
 }
 
 /// Per-site DP4A opt-out: a site set here keeps its A-side dense at the
@@ -302,9 +448,31 @@ pub struct BlockWgslConfigs {
 /// the outlier's 31 block neighbors and corrupts that token's entire
 /// output row. The weight encoding is unchanged; only the activation
 /// quantization is bypassed.
+/// Per-site opt-IN of the coopmat (tensor-core) matmul. Only the outlier-bound
+/// bf16 sites that the i8 DP4A path can't handle are candidates: `proj`
+/// (attn-out), `ffn_down` (gelu product), and `qkv` (cross-attn from un-normed
+/// text -- the riskiest for f16, enable last). A set site is honored only when
+/// the device exposes a usable coopmat config and the block runs fast_mixed;
+/// otherwise it silently falls back to the dense/i8 path. Narrowly scoped to
+/// the Wan video DiT by design (see memory feedback_coopmat_scope).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoopmatSites {
+    pub proj: bool,
+    pub ffn_down: bool,
+    pub qkv: bool,
+    /// FFN up/gate (SwiGLU input side). Off for the i8 image/video paths (that
+    /// site takes DP4A on its normed A-side); ON only where i8 is unavailable
+    /// (bf16-residual DiTs like Krea whose f16-only i8 path diverges).
+    pub ffn_up: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DenseActSites {
     pub qkv: bool,
+    /// Self-attention QKV (Wan's split site; the shared `Block::forward` never
+    /// uses it). Distinct from `qkv` so a model can i8 the normed self-attn
+    /// projection while keeping cross-attn QKV (un-normed text K/V) dense.
+    pub qkv_self: bool,
     pub proj: bool,
     pub ffn_up: bool,
     pub ffn_down: bool,
@@ -316,6 +484,7 @@ impl BlockWgslConfigs {
     pub fn uniform(cfg: WgslConfig) -> Self {
         Self {
             matmul_qkv: cfg,
+            matmul_qkv_self: cfg,
             matmul_proj: cfg,
             matmul_ffn_up: cfg,
             matmul_ffn_down: cfg,
@@ -323,6 +492,10 @@ impl BlockWgslConfigs {
             ops: cfg,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            coopmat_acts: CoopmatSites::default(),
+            large_d_sdpa: false,
+            fast_sdpa: false,
+            decode_sdpa: false,
         }
     }
 
@@ -341,6 +514,7 @@ impl BlockWgslConfigs {
         // inputs are block-stream activations.
         for c in [
             self.matmul_qkv,
+            self.matmul_qkv_self,
             self.matmul_proj,
             self.matmul_ffn_up,
             self.matmul_ffn_down,
@@ -356,10 +530,16 @@ impl BlockWgslConfigs {
             );
         }
         if self.i8_sdpa {
-            assert_eq!(
-                a,
-                ActDtype::F16,
-                "BlockWgslConfigs: i8_sdpa requires F16 ops (sdpa_i8 reads/writes f16-scaled pairs)"
+            assert!(
+                a == ActDtype::F16 || (a == ActDtype::Bf16 && self.fast_sdpa),
+                "BlockWgslConfigs: i8_sdpa requires F16 ops, or Bf16 ops with fast_sdpa \
+                 (the mixed-precision casts feed act_quant and the dense-bf16 output mode)"
+            );
+        }
+        if self.large_d_sdpa {
+            assert!(
+                matches!(a, ActDtype::F32 | ActDtype::F16),
+                "BlockWgslConfigs: large_d_sdpa supports only F32/F16 acts (no bf16-packed variant)"
             );
         }
     }
@@ -422,14 +602,24 @@ impl BlockPipelines {
             }
         };
         let qkv_mm_cfg = matmul_cfg_for(cfgs.matmul_qkv);
+        let qkv_self_mm_cfg = matmul_cfg_for(cfgs.matmul_qkv_self);
         let proj_mm_cfg = matmul_cfg_for(cfgs.matmul_proj);
         let ffn_up_mm_cfg = matmul_cfg_for(cfgs.matmul_ffn_up);
         let ffn_down_mm_cfg = matmul_cfg_for(cfgs.matmul_ffn_down);
         let qkv_wgsl = matmuls.qkv.wgsl(&qkv_mm_cfg);
+        let qkv_self_wgsl = matmuls.qkv_self.wgsl(&qkv_self_mm_cfg);
         let proj_wgsl = matmuls.proj.wgsl(&proj_mm_cfg);
         let ffn_up_wgsl = matmuls.ffn_up.wgsl(&ffn_up_mm_cfg);
         let ffn_down_wgsl = matmuls.ffn_down.wgsl(&ffn_down_mm_cfg);
-        let adaln_wgsl = matmuls.adaln.wgsl(&cfgs.matmul_adaln);
+        let adaln_mm_cfg = matmul_cfg_for(cfgs.matmul_adaln);
+        let adaln_wgsl = matmuls.adaln.wgsl(&adaln_mm_cfg);
+        // Module-level dense linears: force a bf16 weight regardless of the
+        // block's quant choice (the patch/embedder/proj_out weights stay bf16).
+        let module_cfg = WgslConfig {
+            weight_dtype: WeightDtype::Bf16,
+            ..*cfg
+        };
+        let module_wgsl = matmuls.module.wgsl(&module_cfg);
         // Build dequant pipelines for sites whose source weight is Quant.
         let dq_layout = thinfer_core::ops::dequant::layout();
         let build_dq =
@@ -446,10 +636,17 @@ impl BlockPipelines {
                 }
             };
         let dequant_qkv = build_dq("dequant_qkv", cfgs.matmul_qkv.weight_dtype).await?;
+        let dequant_qkv_self =
+            build_dq("dequant_qkv_self", cfgs.matmul_qkv_self.weight_dtype).await?;
         let dequant_proj = build_dq("dequant_proj", cfgs.matmul_proj.weight_dtype).await?;
         let dequant_ffn_up = build_dq("dequant_ffn_up", cfgs.matmul_ffn_up.weight_dtype).await?;
         let dequant_ffn_down =
             build_dq("dequant_ffn_down", cfgs.matmul_ffn_down.weight_dtype).await?;
+        // AdaLN/modulation site: dequant-once dense only (no i8/coopmat pair).
+        // M=1 and the outputs gate/shift the whole residual stream, so the
+        // activation math stays at full act dtype; only the weight storage is
+        // Quant (Hunyuan mod linears).
+        let dequant_adaln = build_dq("dequant_adaln", cfgs.matmul_adaln.weight_dtype).await?;
         // DP4A int8 path. Gated on the WGSL packed_4x8_integer_dot_product
         // language feature (queried on the wgpu Instance). When present we
         // build a per-site (dequant_i8, matmul_i8) pair for each Quant
@@ -460,10 +657,22 @@ impl BlockPipelines {
         // DP4A path also requires SHADER_F16 because the matmul output is
         // paired vec2<f16> (matching the rest of the F16-act DiT block);
         // when SHADER_F16 is absent, the I8 path is also disabled.
+        let (sg_min, sg_max) = backend.subgroup_size_range();
+        // Mixed-precision opt-in (`fast_sdpa`) for a bf16-act block: builds the
+        // bf16<->f16 act casts so the f16 subgroup SDPA AND the i8 DP4A matmul
+        // (both compute in f16/i8 and accumulate back into the bf16 residual)
+        // can run even though the block acts + residual stay bf16. Needs
+        // subgroups + SHADER_F16, same as the native f16 path.
+        let fast_mixed = cfgs.fast_sdpa
+            && cfg.act_dtype == ActDtype::Bf16
+            && backend.supports_subgroups()
+            && backend.supports_shader_f16()
+            && sg_min >= 4;
+        // DP4A int8 matmul: native on an F16-act block; on a bf16 block it rides
+        // the fast_mixed casts (A-side bf16->f16->i8 in, i8 matmul f16 out->bf16).
         let use_dp4a = backend.supports_packed_int_dot()
             && backend.supports_shader_f16()
-            && cfg.act_dtype == ActDtype::F16;
-        let (sg_min, sg_max) = backend.subgroup_size_range();
+            && (cfg.act_dtype == ActDtype::F16 || fast_mixed);
         // Matmul subgroups: the ORT-style register-resident kernel branches
         // at runtime on `sg_size >= 16` (shuffle path) with a broadcast
         // shared-read fallback, so the flag only requires the feature; any
@@ -482,14 +691,37 @@ impl BlockPipelines {
         // (sg_min=32) -> CL=8 (unchanged); web/mobile, where the browser reports
         // the spec floor of 4, -> CL=4. (sg_min >= 4 guards pathological adapters
         // that expose subgroups but report a sub-spec floor.)
-        let sdpa_sg_cl = if sg_min >= 8 { 8u32 } else { 4u32 };
+        // `THINFER_SDPA_SG_CL` (native perf A/B) overrides within [4, sg_min]:
+        // smaller CL = fewer shuffle-reduce hops per key but more rows in
+        // flight per workgroup. NOT bit-exact across CL values (the per-key
+        // dot's f32 reduce order changes); any default change gates on the
+        // e2e parity bands like a kernel change.
+        let cl_default = if sg_min >= 8 { 8u32 } else { 4u32 };
+        let sdpa_sg_cl = std::env::var("THINFER_SDPA_SG_CL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|c| c.is_power_of_two() && *c >= 4 && *c <= sg_min.max(4))
+            .unwrap_or(cl_default);
+        // Q-register blocking: R Q rows per CL-lane cluster, amortizing the
+        // per-key K/V shared-tile loads + f16->f32 converts across R rows.
+        // BIT-EXACT vs R=1 (each row's f32 accumulation order is unchanged);
+        // costs R x the q/o register set, so occupancy decides the win.
+        // `THINFER_SDPA_SG_QR` A/B override; default 1 until measured.
+        let sdpa_sg_qr = std::env::var("THINFER_SDPA_SG_QR")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|r| matches!(r, 1 | 2 | 4))
+            .unwrap_or(1);
         let use_sdpa_sg =
             cfg.act_dtype == ActDtype::F16 && backend.supports_subgroups() && sg_min >= 4;
+        let build_sdpa_sg = use_sdpa_sg || fast_mixed;
         tracing::info!(
             target: thinfer_core::trace::ADAPTER,
             use_dp4a = use_dp4a,
             sdpa_use_subgroup = use_sdpa_sg,
+            fast_mixed_sdpa = fast_mixed,
             sdpa_sg_cl = sdpa_sg_cl,
+            sdpa_sg_qr = sdpa_sg_qr,
             matmul_i8_tile = i8_cfg.tile,
             matmul_i8_use_subgroup = i8_cfg.use_subgroup,
             shader_f16 = backend.supports_shader_f16(),
@@ -551,6 +783,12 @@ impl BlockPipelines {
             };
         let (dequant_i8_qkv, matmul_i8_qkv) =
             build_i8("qkv", cfgs.matmul_qkv.weight_dtype, cfgs.dense_acts.qkv).await?;
+        let (dequant_i8_qkv_self, matmul_i8_qkv_self) = build_i8(
+            "qkv_self",
+            cfgs.matmul_qkv_self.weight_dtype,
+            cfgs.dense_acts.qkv_self,
+        )
+        .await?;
         let (dequant_i8_proj, matmul_i8_proj) =
             build_i8("proj", cfgs.matmul_proj.weight_dtype, cfgs.dense_acts.proj).await?;
         let (dequant_i8_ffn_up, matmul_i8_ffn_up) = build_i8(
@@ -565,11 +803,87 @@ impl BlockPipelines {
             cfgs.dense_acts.ffn_down,
         )
         .await?;
+        // Coopmat (tensor-core) path: opt-in per site, only when the device
+        // exposes a usable square f16/f32 config, the subgroup width is uniform
+        // (baked as the kernel workgroup size), and the block runs fast_mixed
+        // (so the bf16<->f16 act casts exist). The weight is dequanted to f16
+        // [N,K] nmajor and consumed column-major (b_col_major).
+        let use_coopmat = fast_mixed && backend.coopmat().is_some() && sg_min == sg_max;
+        let build_coopmat = async |label: &str,
+                                   wd: WeightDtype,
+                                   opt_in: bool|
+               -> Result<Option<CoopmatStep>, WgpuError> {
+            if !use_coopmat || !opt_in {
+                return Ok(None);
+            }
+            let WeightDtype::Quant(scheme) = wd else {
+                // Coopmat needs an f16 weight; today only the Quant->f16 dequant
+                // path is wired (the Wan DiT weights are GGUF Quant).
+                return Ok(None);
+            };
+            let dq_wgsl = thinfer_core::ops::dequant::build_wgsl(
+                scheme,
+                thinfer_core::ops::dequant::DequantTarget::F16,
+            );
+            let dq_pipe = backend
+                .create_pipeline(
+                    &format!("dequant_f16_{label}"),
+                    &dq_wgsl,
+                    "main",
+                    thinfer_core::ops::dequant::layout(),
+                )
+                .await?;
+            let cm = backend.coopmat().expect("use_coopmat gates on coopmat()");
+            let mut cfg = thinfer_core::ops::matmul_coopmat::CoopmatMatmulConfig::new(
+                cm.tile,
+                sg_min,
+                thinfer_core::ops::matmul_coopmat::CoopmatOut::F16,
+            );
+            cfg.b_col_major = true;
+            let mm_wgsl = thinfer_core::ops::matmul_coopmat::build_wgsl(&cfg);
+            let mm_pipe = backend
+                .create_pipeline(
+                    &format!("matmul_coopmat_{label}"),
+                    &mm_wgsl,
+                    "main",
+                    thinfer_core::ops::matmul_coopmat::layout(),
+                )
+                .await?;
+            Ok(Some(CoopmatStep {
+                dequant_f16: DequantStep {
+                    pipeline: dq_pipe,
+                    scheme,
+                },
+                matmul: mm_pipe,
+                cfg,
+            }))
+        };
+        let coopmat_proj = build_coopmat(
+            "proj",
+            cfgs.matmul_proj.weight_dtype,
+            cfgs.coopmat_acts.proj,
+        )
+        .await?;
+        let coopmat_ffn_down = build_coopmat(
+            "ffn_down",
+            cfgs.matmul_ffn_down.weight_dtype,
+            cfgs.coopmat_acts.ffn_down,
+        )
+        .await?;
+        let coopmat_qkv =
+            build_coopmat("qkv", cfgs.matmul_qkv.weight_dtype, cfgs.coopmat_acts.qkv).await?;
+        let coopmat_ffn_up = build_coopmat(
+            "ffn_up",
+            cfgs.matmul_ffn_up.weight_dtype,
+            cfgs.coopmat_acts.ffn_up,
+        )
+        .await?;
         // act_quant serves two consumers: the matmul-site dense->paired
         // transcode on every i8 site, and the post-rope q/k/v quantize
         // when i8 attention is enabled.
         let any_i8_site = [
             matmul_i8_qkv.is_some(),
+            matmul_i8_qkv_self.is_some(),
             matmul_i8_proj.is_some(),
             matmul_i8_ffn_up.is_some(),
             matmul_i8_ffn_down.is_some(),
@@ -650,6 +964,9 @@ impl BlockPipelines {
             matmul_qkv: backend
                 .create_pipeline("matmul_qkv", &qkv_wgsl, "main", mm_layout)
                 .await?,
+            matmul_qkv_self: backend
+                .create_pipeline("matmul_qkv_self", &qkv_self_wgsl, "main", mm_layout)
+                .await?,
             matmul_proj: backend
                 .create_pipeline("matmul_proj", &proj_wgsl, "main", mm_layout)
                 .await?,
@@ -662,15 +979,22 @@ impl BlockPipelines {
             matmul_adaln: backend
                 .create_pipeline("matmul_adaln", &adaln_wgsl, "main", mm_layout)
                 .await?,
+            matmul_module: backend
+                .create_pipeline("matmul_module", &module_wgsl, "main", mm_layout)
+                .await?,
             dequant_qkv,
+            dequant_qkv_self,
             dequant_proj,
             dequant_ffn_up,
             dequant_ffn_down,
+            dequant_adaln,
             dequant_i8_qkv,
+            dequant_i8_qkv_self,
             dequant_i8_proj,
             dequant_i8_ffn_up,
             dequant_i8_ffn_down,
             matmul_i8_qkv,
+            matmul_i8_qkv_self,
             matmul_i8_proj,
             matmul_i8_ffn_up,
             matmul_i8_ffn_down,
@@ -720,14 +1044,15 @@ impl BlockPipelines {
                     <SdpaF32 as SdpaOp>::layout(),
                 )
                 .await?,
-            sdpa_sg: if use_sdpa_sg {
+            sdpa_sg: if build_sdpa_sg {
                 // Subgroup-using shader: prepend `enable subgroups;` on the web
-                // (Tint) backend; native (naga) returns "". CL is baked into the
-                // kernel here and must match `sdpa_sg_cl` at dispatch.
+                // (Tint) backend; native (naga) returns "". CL/R are baked into
+                // the kernel here and must match `sdpa_sg_cl`/`sdpa_sg_qr` at
+                // dispatch.
                 let sdpa_sg_wgsl = format!(
                     "{}{}",
                     backend.subgroup_enable_directive(),
-                    thinfer_core::ops::sdpa::build_f16_sg_wgsl(sdpa_sg_cl),
+                    thinfer_core::ops::sdpa::build_f16_sg_wgsl(sdpa_sg_cl, sdpa_sg_qr),
                 );
                 Some(
                     backend
@@ -742,7 +1067,58 @@ impl BlockPipelines {
             } else {
                 None
             },
+            sdpa_sg_win: if build_sdpa_sg {
+                // Same subgroup kernel as `sdpa_sg` plus the temporal-window
+                // tile-skip + per-key fold. Built unconditionally with `sdpa_sg`
+                // (cheap) so a run can switch it on via the uniform at dispatch.
+                let win_wgsl = format!(
+                    "{}{}",
+                    backend.subgroup_enable_directive(),
+                    thinfer_core::ops::sdpa::build_f16_sg_windowed_wgsl(sdpa_sg_cl, sdpa_sg_qr),
+                );
+                Some(
+                    backend
+                        .create_pipeline(
+                            "sdpa_sg_win",
+                            &win_wgsl,
+                            "main",
+                            thinfer_core::ops::sdpa::sg_layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
             sdpa_sg_cl,
+            sdpa_sg_qr,
+            sdpa_large_d: if cfgs.large_d_sdpa {
+                Some(
+                    backend
+                        .create_pipeline(
+                            "sdpa_large_d",
+                            <SdpaF32LargeD as SdpaOp>::wgsl(cfg_compat),
+                            "main",
+                            <SdpaF32LargeD as SdpaOp>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
+            sdpa_decode: if cfgs.decode_sdpa {
+                Some(
+                    backend
+                        .create_pipeline(
+                            "sdpa_decode",
+                            <thinfer_core::ops::SdpaDecode as SdpaOp>::wgsl(cfg_compat),
+                            "main",
+                            <thinfer_core::ops::SdpaDecode as SdpaOp>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
             qkv_split: backend
                 .create_pipeline(
                     "qkv_split",
@@ -761,6 +1137,9 @@ impl BlockPipelines {
                     "main",
                     SiluMulF32::layout(),
                 )
+                .await?,
+            gelu: backend
+                .create_pipeline("gelu", GeluF32::wgsl(cfg_compat), "main", GeluF32::layout())
                 .await?,
             add: backend
                 .create_pipeline("add", AddF32::wgsl(cfg_compat), "main", AddF32::layout())
@@ -787,12 +1166,28 @@ impl BlockPipelines {
                     <BcastFmaF32 as BcastFmaOp>::layout(),
                 )
                 .await?,
+            bcast_modulate: backend
+                .create_pipeline(
+                    "bcast_modulate",
+                    <BcastModulateF32 as BcastModulateOp>::wgsl(cfg_compat),
+                    "main",
+                    <BcastModulateF32 as BcastModulateOp>::layout(),
+                )
+                .await?,
             bcast_add: backend
                 .create_pipeline(
                     "bcast_add",
                     <BcastAddF32 as BcastAddOp>::wgsl(cfg_compat),
                     "main",
                     <BcastAddF32 as BcastAddOp>::layout(),
+                )
+                .await?,
+            bcast_mul: backend
+                .create_pipeline(
+                    "bcast_mul",
+                    <BcastMulF32 as BcastAddOp>::wgsl(cfg_compat),
+                    "main",
+                    <BcastMulF32 as BcastAddOp>::layout(),
                 )
                 .await?,
             scatter_pad_rows: backend
@@ -804,6 +1199,38 @@ impl BlockPipelines {
                 )
                 .await?,
             sdpa_i8,
+            cast_to_f16: if fast_mixed {
+                Some(
+                    backend
+                        .create_pipeline(
+                            "cast_bf16_f16",
+                            <Bf16ToF16 as Op>::wgsl(&cfgs.ops),
+                            "main",
+                            <Bf16ToF16 as Op>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
+            cast_to_bf16: if fast_mixed {
+                Some(
+                    backend
+                        .create_pipeline(
+                            "cast_f16_bf16",
+                            <F16ToBf16 as Op>::wgsl(&cfgs.ops),
+                            "main",
+                            <F16ToBf16 as Op>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
+            coopmat_proj,
+            coopmat_ffn_down,
+            coopmat_qkv,
+            coopmat_ffn_up,
             act_dtype: cfg.act_dtype,
         })
     }
@@ -951,7 +1378,7 @@ impl Block {
         Self { cfg }
     }
 
-    pub fn kernel_keys() -> [KernelKey; 13] {
+    pub fn kernel_keys() -> [KernelKey; 15] {
         [
             kk(<MatMulF32 as MatmulOp>::KERNEL_ID),
             kk(<RmsNormF32 as RmsNormOp>::KERNEL_ID),
@@ -965,7 +1392,9 @@ impl Block {
             kk(<TanhF32 as Op>::KERNEL_ID),
             kk(<BcastAffineF32 as BcastAffineOp>::KERNEL_ID),
             kk(<BcastFmaF32 as BcastFmaOp>::KERNEL_ID),
+            kk(<BcastModulateF32 as BcastModulateOp>::KERNEL_ID),
             kk(<BcastAddF32 as BcastAddOp>::KERNEL_ID),
+            kk(<BcastMulF32 as BcastAddOp>::KERNEL_ID),
         ]
     }
 
@@ -1151,7 +1580,11 @@ impl Block {
 
             let qr = alloc_act(scope, pipelines, rows, hq * hd)?;
             let kr = alloc_act(scope, pipelines, rows, hkv * hd)?;
-            op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+            if cfg.rope_halfrot {
+                op_rope_halfrot(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+            } else {
+                op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+            }
             copy_tap_act(
                 scope,
                 pipelines,
@@ -1160,7 +1593,11 @@ impl Block {
                 rows,
                 hq * hd,
             )?;
-            op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+            if cfg.rope_halfrot {
+                op_rope_halfrot(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+            } else {
+                op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+            }
             copy_tap_act(
                 scope,
                 pipelines,
@@ -1211,6 +1648,7 @@ impl Block {
                 rows,
                 dim,
                 k_proj,
+                None,
                 None,
                 None,
                 taps.proj_wo_b_i8_head,
@@ -1504,7 +1942,7 @@ impl Block {
     /// otherwise consecutive phases share a scope (zero overhead at small
     /// dims). See [`Self::phase_peaks`].
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_taps_packed<'wsp>(
+    pub async fn forward_taps_packed<'wsp>(
         &self,
         packer: &mut ScopePacker<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
@@ -1622,6 +2060,7 @@ impl Block {
                 rows,
                 n_qkv,
                 dim,
+                None,
                 taps.qkv_attn_in_data_head,
                 taps.qkv_attn_in_params_head,
                 taps.qkv_b_i8_head,
@@ -1662,7 +2101,7 @@ impl Block {
         };
 
         // ---- Advance to phase 1 (sdpa + proj + residual1) ----
-        let p1_carry = packer.advance(&p1_in, peaks[1])?;
+        let p1_carry = packer.advance(&p1_in, peaks[1]).await?;
         let mut idx = 0usize;
         let q = pop_act(&p1_carry, &mut idx);
         let k = pop_act(&p1_carry, &mut idx);
@@ -1718,7 +2157,11 @@ impl Block {
 
                 let qr = alloc_act(scope, pipelines, rows, hq * hd)?;
                 let kr = alloc_act(scope, pipelines, rows, hkv * hd)?;
-                op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+                if cfg.rope_halfrot {
+                    op_rope_halfrot(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+                } else {
+                    op_rope(scope, pipelines, qn, freqs_in, qr, rows, hq, hd)?;
+                }
                 copy_tap_act(
                     scope,
                     pipelines,
@@ -1727,7 +2170,11 @@ impl Block {
                     rows,
                     hq * hd,
                 )?;
-                op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+                if cfg.rope_halfrot {
+                    op_rope_halfrot(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+                } else {
+                    op_rope(scope, pipelines, kn, freqs_in, kr, rows, hkv, hd)?;
+                }
                 copy_tap_act(
                     scope,
                     pipelines,
@@ -1777,6 +2224,7 @@ impl Block {
                     rows,
                     dim,
                     k_proj,
+                    None,
                     None,
                     None,
                     taps.proj_wo_b_i8_head,
@@ -1832,7 +2280,7 @@ impl Block {
         };
 
         // ---- Advance to phase 2 (ffn1) ----
-        let p2_carry = packer.advance(&p2_in, peaks[2])?;
+        let p2_carry = packer.advance(&p2_in, peaks[2]).await?;
         let mut idx = 0usize;
         let x1 = pop_act(&p2_carry, &mut idx);
         let scale_mlp = if modulated { Some(p2_carry[idx]) } else { None };
@@ -1929,7 +2377,7 @@ impl Block {
         };
 
         // ---- Advance to phase 3 (ffn2 + residual2) ----
-        let p3_carry = packer.advance(&p3_in, peaks[3])?;
+        let p3_carry = packer.advance(&p3_in, peaks[3]).await?;
         let mut idx = 0usize;
         let h13 = pop_act(&p3_carry, &mut idx);
         let x1 = pop_act(&p3_carry, &mut idx);
@@ -2010,6 +2458,158 @@ impl Block {
     /// text-encoder block, which routes its 7 per-layer matmuls through the
     /// same site logic.
     #[allow(clippy::too_many_arguments)]
+    /// Coopmat-aware matmul site: when `coopmat` is `Some` and the A-side is
+    /// dense (not a paired-i8 sdpa output), run the tensor-core f16 path:
+    /// dequant the Quant weight to f16 `[N,K]` nmajor, cast the bf16 A-side to
+    /// f16, coopmat (f16 in, f32 accumulate, f16 out), cast the output back to
+    /// the bf16 residual. Otherwise fall through to [`Self::dispatch_matmul_site`]
+    /// (dense / dequant-once / DP4A). Keeps coopmat isolated to its opt-in
+    /// callers (Wan `lin`) without touching the shared dispatch signature.
+    /// Dequant a DP4A site's Quant weight into the persistent `(i8, scale,
+    /// qsum)` triple a [`PreparedWeight::I8`] hands back to the site dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_weight_i8<'wsp>(
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        dq: &DequantStep,
+        b_weight: BatchBuf<'wsp>,
+        dst_i8: BatchBuf<'wsp>,
+        dst_scale: BatchBuf<'wsp>,
+        dst_qsum: BatchBuf<'wsp>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), WgpuError> {
+        let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+        scope.dequant_i8(
+            &dq.pipeline,
+            dq.scheme,
+            b_weight,
+            dst_i8,
+            dst_scale,
+            dst_qsum,
+            dq_dims,
+            n,
+            k,
+        )
+    }
+
+    /// Dequant a coopmat/dense-fallback site's Quant weight into the persistent
+    /// f16 `[N,K]` n-major image a [`PreparedWeight::F16`] hands back.
+    pub(crate) fn prepare_weight_f16<'wsp>(
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        dq: &DequantStep,
+        b_weight: BatchBuf<'wsp>,
+        dst: BatchBuf<'wsp>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), WgpuError> {
+        let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+        scope.dequant(&dq.pipeline, dq.scheme, b_weight, dst, dq_dims, n, k)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_matmul_site_coopmat<'wsp>(
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &BlockPipelines,
+        a: ActBuf<'wsp>,
+        b_weight: BatchBuf<'wsp>,
+        out_scratch: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        prepared: Option<PreparedWeight>,
+        coopmat: Option<&CoopmatStep>,
+        matmul_i8: Option<&WgpuPipeline>,
+        dequant_i8: Option<&DequantStep>,
+        dequant_dense: Option<&DequantStep>,
+        matmul_pipeline: &WgpuPipeline,
+        matmul_op: &MatMulF32,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), WgpuError> {
+        // Coopmat only when the dispatch spans at least one full workgroup row
+        // block (`M >= WM`). A sub-WM dispatch (e.g. a short text stream, M=16 <
+        // WM=32) DEVICE-LOSES on the RTX 5070 despite the kernel's ragged/robust
+        // design -- the degenerate single-partial-workgroup case. The dense
+        // fallback is the reference path and such tensors are tiny anyway (the
+        // hot large-M image stream always clears WM).
+        if let Some(cm) = coopmat
+            && a.scale.is_none()
+            && m >= cm.cfg.wm()
+        {
+            // B `[N,K]` is coop-loaded without bounds checks too; a ragged N
+            // would fringe-read past the weight image. Every current model dim
+            // is a WN multiple -- keep it that way or pad the B image.
+            debug_assert_eq!(n % cm.cfg.wn(), 0, "coopmat B needs N % WN == 0");
+            // (1) dequant Quant weight -> f16 [N,K] nmajor (or reuse the
+            // caller's per-block prepared image).
+            let b_f16 = match prepared {
+                Some(PreparedWeight::F16(b)) => scope.import_copy(b),
+                _ => {
+                    let b_f16 = scope.alloc(pipelines.act_bytes(n * k))?;
+                    let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
+                    scope.dequant(
+                        &cm.dequant_f16.pipeline,
+                        cm.dequant_f16.scheme,
+                        b_weight,
+                        b_f16,
+                        dq_dims,
+                        n,
+                        k,
+                    )?;
+                    b_f16
+                }
+            };
+            // (2) cast the bf16 A-side to f16. The staging is padded up to a
+            // whole WM row block: at ragged M the last row-block's coopLoads
+            // read the fringe rows, and robust coop access is NOT reliable on
+            // this stack (see the M < WM guard above) -- an unmapped fringe
+            // page faults the device (nvlddmkm GPUID error, device lost;
+            // wan2.2 video tiles were the first shipped non-WM-multiple M).
+            // Fringe values are irrelevant: the store discards fringe rows.
+            let m_pad = m.next_multiple_of(cm.cfg.wm());
+            let a_f16 = scope.alloc(pipelines.act_bytes(m_pad * k))?;
+            let to_f16 = pipelines
+                .cast_to_f16
+                .as_ref()
+                .expect("cast_to_f16 built whenever a coopmat step exists (fast_mixed)");
+            scope.dispatch_op::<Bf16ToF16>(to_f16, &[a.data], a_f16)?;
+            // (3) coopmat f16 matmul -> f16 out.
+            let mm_out = scope.alloc(pipelines.act_bytes(m * n))?;
+            scope.coopmat(&cm.matmul, &cm.cfg, a_f16, b_f16, mm_out, dims, m, n)?;
+            // (4) cast f16 output back to the bf16 residual.
+            let to_bf16 = pipelines
+                .cast_to_bf16
+                .as_ref()
+                .expect("cast_to_bf16 built whenever a coopmat step exists (fast_mixed)");
+            scope.dispatch_op::<F16ToBf16>(to_bf16, &[mm_out], out_scratch)?;
+            return Ok(());
+        }
+        Self::dispatch_matmul_site_diag(
+            scope,
+            pipelines,
+            a,
+            b_weight,
+            out_scratch,
+            dims,
+            matmul_i8,
+            dequant_i8,
+            dequant_dense,
+            matmul_pipeline,
+            matmul_op,
+            m,
+            n,
+            k,
+            prepared,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_matmul_site<'wsp>(
         scope: &BatchScope<'wsp, WgpuBackend>,
         pipelines: &BlockPipelines,
@@ -2048,6 +2648,7 @@ impl Block {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -2067,6 +2668,7 @@ impl Block {
         m: u32,
         n: u32,
         k: u32,
+        prepared: Option<PreparedWeight>,
         diag_a_i8_head: Option<BufRef>,
         diag_a_params_head: Option<BufRef>,
         diag_b_i8_head: Option<BufRef>,
@@ -2079,25 +2681,25 @@ impl Block {
         if let (Some(mm_i8), Some(dq_i8), Some(aq)) =
             (matmul_i8, dequant_i8, pipelines.act_quant.as_ref())
         {
-            // Dequant the quant weight into (i8, scale, qsum). `qsum[n, t] =
-            // Σ_{k in block} qb[n, k]` carries the asymmetric correction-term
-            // factor consumed by matmul_i8 to subtract the activation zero-
-            // point bias from the DP4A main path.
-            let b_i8 = scope.alloc(n as u64 * k as u64)?;
-            let b_sc = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
-            let b_qs = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
-            let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
-            scope.dequant_i8(
-                &dq_i8.pipeline,
-                dq_i8.scheme,
-                b_weight,
-                b_i8,
-                b_sc,
-                b_qs,
-                dq_dims,
-                n,
-                k,
-            )?;
+            // Dequant the quant weight into (i8, scale, qsum) - or reuse the
+            // caller's per-block prepared triple. `qsum[n, t] = Σ_{k in block}
+            // qb[n, k]` carries the asymmetric correction-term factor consumed
+            // by matmul_i8 to subtract the activation zero-point bias from the
+            // DP4A main path.
+            let (b_i8, b_sc, b_qs) = match prepared {
+                Some(PreparedWeight::I8 { i8, scale, qsum }) => (
+                    scope.import_copy(i8),
+                    scope.import_copy(scale),
+                    scope.import_copy(qsum),
+                ),
+                _ => {
+                    let b_i8 = scope.alloc(n as u64 * k as u64)?;
+                    let b_sc = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
+                    let b_qs = scope.alloc(n as u64 * (k as u64 / 32) * 4)?;
+                    Self::prepare_weight_i8(scope, dq_i8, b_weight, b_i8, b_sc, b_qs, n, k)?;
+                    (b_i8, b_sc, b_qs)
+                }
+            };
             if let Some(dst) = diag_b_i8_head {
                 let dst_b = scope.import_copy(dst);
                 let n = dst.len.min(b_i8.len());
@@ -2113,16 +2715,33 @@ impl Block {
                 let n = dst.len.min(b_qs.len());
                 scope.copy_buffer_to_buffer(b_qs, 0, dst_b, 0, n)?;
             }
+            // On a bf16-act block the i8 path rides the fast_mixed casts:
+            // act_quant reads vec2<f16>, so the dense bf16 A-side is cast to
+            // f16 first (the A-sides routed here are normed/modulated and O(1),
+            // so the f16 clamp never bites), and matmul_i8's f16 output is cast
+            // back to bf16 below. An F16-act block feeds f16 straight through.
+            let bf16_block = pipelines.act_dtype == ActDtype::Bf16;
             // Acquire (a_i8, a_params) — direct from `a` when it is already
             // paired (sdpa_i8 output feeding proj), else transcode via
             // act_quant from the dense `a.data` buffer.
             let (a_i8, a_p) = match a.scale {
                 Some(s) => (a.data, s),
                 None => {
+                    let a_src = if bf16_block {
+                        let a_f16 = scope.alloc(pipelines.act_bytes(m * k))?;
+                        let to_f16 = pipelines
+                            .cast_to_f16
+                            .as_ref()
+                            .expect("cast_to_f16 built for the bf16 i8 matmul path");
+                        scope.dispatch_op::<Bf16ToF16>(to_f16, &[a.data], a_f16)?;
+                        a_f16
+                    } else {
+                        a.data
+                    };
                     let a_i8 = scope.alloc(m as u64 * k as u64)?;
                     let a_p = scope.alloc(m as u64 * (k as u64 / 32) * 4)?;
                     let aq_dims = scope.u32x4_uniform(m, k, 0, 0)?;
-                    scope.act_quant(aq, a.data, a_i8, a_p, aq_dims, m, k)?;
+                    scope.act_quant(aq, a_src, a_i8, a_p, aq_dims, m, k)?;
                     (a_i8, a_p)
                 }
             };
@@ -2168,6 +2787,13 @@ impl Block {
             } else {
                 scope.alloc(4)?
             };
+            // matmul_i8 writes vec2<f16>. On a bf16 block, land it in an f16
+            // temp and cast back to the bf16 `out_scratch` the caller expects.
+            let mm_out = if bf16_block {
+                scope.alloc(pipelines.act_bytes(m * n))?
+            } else {
+                out_scratch
+            };
             scope.matmul_i8(
                 mm_i8,
                 &pipelines.matmul_i8_cfg,
@@ -2176,13 +2802,20 @@ impl Block {
                 b_i8,
                 b_sc,
                 b_qs,
-                out_scratch,
+                mm_out,
                 dims,
                 dbg_out,
                 dbg,
                 m,
                 n,
             )?;
+            if bf16_block {
+                let to_bf16 = pipelines
+                    .cast_to_bf16
+                    .as_ref()
+                    .expect("cast_to_bf16 built for the bf16 i8 matmul path");
+                scope.dispatch_op::<F16ToBf16>(to_bf16, &[mm_out], out_scratch)?;
+            }
             return Ok(());
         }
         // Paired acts × bf16 weights mixed matmul: the proj site consuming
@@ -2225,14 +2858,16 @@ impl Block {
             a.scale.is_none(),
             "paired A-side requires the DP4A or mixed-bf16 matmul path; dispatch_matmul_site fell through"
         );
-        let b_dense = match dequant_dense {
-            Some(dq) => {
+        let b_dense = match (prepared, dequant_dense) {
+            // Per-block prepared f16 image (same [N,K] n-major f16 bytes the
+            // inline dequant would produce).
+            (Some(PreparedWeight::F16(b)), _) => scope.import_copy(b),
+            (_, Some(dq)) => {
                 let dense = scope.alloc(n as u64 * k as u64 * 2)?;
-                let dq_dims = scope.u32x4_uniform(n, k, 0, 0)?;
-                scope.dequant(&dq.pipeline, dq.scheme, b_weight, dense, dq_dims, n, k)?;
+                Self::prepare_weight_f16(scope, dq, b_weight, dense, n, k)?;
                 dense
             }
-            None => b_weight,
+            (_, None) => b_weight,
         };
         scope.matmul(
             matmul_pipeline,
@@ -2265,6 +2900,17 @@ impl Block {
         let pre = scope.alloc(full_bytes)?;
         let dims_g = scope.u32x4_uniform(b, four_dim, ad, 0)?;
         let aw = scope.import_copy(w.weight);
+        // Quant adaln weight: dequant once into the dense N-major workspace the
+        // adaln matmul was compiled against (b_nmajor; see BlockMatmuls::for_cfgs).
+        // Never feed the quant stream to the dense pipeline directly.
+        let aw = match pipelines.dequant_adaln.as_ref() {
+            Some(dq) => {
+                let dense = scope.alloc(four_dim as u64 * ad as u64 * 2)?;
+                Self::prepare_weight_f16(scope, dq, aw, dense, four_dim, ad)?;
+                dense
+            }
+            None => aw,
+        };
         scope.matmul(
             &pipelines.matmul_adaln,
             &pipelines.matmuls.adaln,
@@ -2400,6 +3046,47 @@ pub(crate) fn alloc_act<'wsp>(
     Ok(ActBuf::dense(scope.alloc(pipelines.act_bytes(rows * dim))?))
 }
 
+/// Quantize a dense (bf16/f16) A-side to the paired i8 form `[m, k]` ONCE, so
+/// several DP4A matmul sites that share the SAME A-side (the separate q/k/v
+/// projections, whose input is the one modulated stream) consume it without
+/// each re-running `act_quant` (+ the bf16->f16 cast) internally. The result is
+/// BIT-IDENTICAL to letting every `dispatch_matmul_site` quantize on its own
+/// (act_quant is deterministic), so it preserves parity exactly. ONLY valid
+/// when the consuming sites take the DP4A path (Quant weight, so `act_quant`/
+/// the i8 matmul are built); on a dense path pass the dense `ActBuf` instead.
+/// Mirrors the dense->paired transcode inside `dispatch_matmul_site_diag`.
+pub(crate) fn quantize_act_paired<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    a: BatchBuf<'wsp>,
+    m: u32,
+    k: u32,
+) -> Result<ActBuf<'wsp>, WgpuError> {
+    let aq = pipelines
+        .act_quant
+        .as_ref()
+        .expect("quantize_act_paired called off the i8 path (no act_quant pipeline)");
+    // bf16 block: act_quant reads vec2<f16>, so cast the bf16 A-side to f16
+    // first (these A-sides are normed/modulated and O(1), so the clamp never
+    // bites). An f16-act block feeds straight through.
+    let a_src = if pipelines.act_dtype == ActDtype::Bf16 {
+        let a_f16 = scope.alloc(pipelines.act_bytes(m * k))?;
+        let to_f16 = pipelines
+            .cast_to_f16
+            .as_ref()
+            .expect("cast_to_f16 built on the bf16 i8 path");
+        scope.dispatch_op::<Bf16ToF16>(to_f16, &[a], a_f16)?;
+        a_f16
+    } else {
+        a
+    };
+    let a_i8 = scope.alloc(m as u64 * k as u64)?;
+    let a_p = scope.alloc(m as u64 * (k as u64 / 32) * 4)?;
+    let aq_dims = scope.u32x4_uniform(m, k, 0, 0)?;
+    scope.act_quant(aq, a_src, a_i8, a_p, aq_dims, m, k)?;
+    Ok(ActBuf::paired(a_i8, a_p))
+}
+
 /// Allocate an ActBuf for an sdpa_i8 input/output slot. The data half is
 /// packed i8 (`rows * dim` bytes); data and scale halves are co-located in
 /// one underlying buffer via `alloc_pair` (data at offset 0, scale right
@@ -2421,9 +3108,11 @@ fn alloc_act_sdpa_io<'wsp>(
     })
 }
 
-/// Quantize a dense F16 act into a fused paired sdpa_i8 I/O slot via
-/// `act_quant`. Only called when `pipelines.i8_sdpa()`.
-fn quant_for_sdpa<'wsp>(
+/// Quantize a dense act into a fused paired sdpa_i8 I/O slot via `act_quant`.
+/// Only called when `pipelines.i8_sdpa()`. On a bf16-act block the source is
+/// cast to f16 first (act_quant reads vec2<f16>); valid ONLY for normed/roped
+/// O(1) Q/K/V, the same contract as `fast_sdpa`.
+pub(crate) fn quant_for_sdpa<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     src: ActBuf<'wsp>,
@@ -2436,8 +3125,19 @@ fn quant_for_sdpa<'wsp>(
         .act_quant
         .as_ref()
         .expect("act_quant pipeline must be built when sdpa_i8 is");
+    let src_f16 = if pipelines.act_dtype == ActDtype::Bf16 {
+        let f16 = scope.alloc(pipelines.act_bytes(rows * dim))?;
+        let to_f16 = pipelines
+            .cast_to_f16
+            .as_ref()
+            .expect("cast_to_f16 built on the bf16 i8_sdpa path");
+        scope.dispatch_op::<Bf16ToF16>(to_f16, &[src.data], f16)?;
+        f16
+    } else {
+        src.data
+    };
     let u = scope.u32x4_uniform(rows, dim, 0, 0)?;
-    scope.act_quant(aq, src.data, dd, ds, u, rows, dim)?;
+    scope.act_quant(aq, src_f16, dd, ds, u, rows, dim)?;
     Ok(dst)
 }
 
@@ -2556,7 +3256,7 @@ fn op_qkv_split<'wsp>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn op_rope<'wsp>(
+pub(crate) fn op_rope<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipelines: &BlockPipelines,
     src: ActBuf<'wsp>,
@@ -2607,6 +3307,8 @@ pub(crate) fn op_rope_halfrot<'wsp>(
     )
 }
 
+/// SDPA with the bf16 residual path. The default for every site; see
+/// [`op_sdpa_f16`] for the self-attention mixed-precision variant.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn op_sdpa<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
@@ -2625,19 +3327,379 @@ pub(crate) fn op_sdpa<'wsp>(
     scale: f32,
     has_mask: u32,
 ) -> Result<(), WgpuError> {
+    op_sdpa_impl(
+        scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
+        false, 0, 0, 0,
+    )
+}
+
+/// Decode-optimized SDPA: dispatches `SdpaDecode` (one workgroup per query row,
+/// the workgroup cooperates over the KV length via per-tile barriers). For
+/// single-token decode (`s_q == 1`) against a long KV cache this replaces
+/// `SdpaF32`'s one-thread-per-head serial softmax with a full workgroup, ~1-2
+/// orders faster. Requires the `sdpa_decode` pipeline (`decode_sdpa` config);
+/// falls back to [`op_sdpa`] when it was not built. Bit-equivalent to `op_sdpa`
+/// (identical f32 online-softmax math). Whole-tensor single dispatch: at `s_q`
+/// small the per-row cost is `~O(s_k)` on a full workgroup, well under the TDR.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_sdpa_decode<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    s_k: u32,
+    h_q: u32,
+    h_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    has_mask: u32,
+) -> Result<(), WgpuError> {
+    let Some(dec) = pipelines.sdpa_decode.as_ref() else {
+        return op_sdpa(
+            scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
+        );
+    };
+    let q = q.data;
+    let k = k.data;
+    let v = v.data;
+    let dst = dst.data;
     let u = sdpa_uniform(scope, b, h_q, h_kv, s_q, s_k, head_dim, scale, has_mask)?;
-    if let Some(sdpa_i8) = pipelines.sdpa_i8.as_ref() {
+    let m_c = scope.subview(&mask, 0, mask.len());
+    scope.sdpa::<SdpaDecode>(dec, q, k, v, m_c, u, dst, b, s_q, h_q)
+}
+
+/// SDPA that opts into the mixed-precision f16 path when the block compiled it
+/// (`BlockWgslConfigs::fast_sdpa` on a bf16-act block). Use ONLY where Q/K/V are
+/// post-rmsnorm/rope and O(1) (DiT self-attention). Falls back to [`op_sdpa`]'s
+/// behavior when the f16 pipelines were not built.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_sdpa_f16<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    s_k: u32,
+    h_q: u32,
+    h_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    has_mask: u32,
+) -> Result<(), WgpuError> {
+    op_sdpa_impl(
+        scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
+        true, 0, 0, 0,
+    )
+}
+
+/// Mixed-precision f16 SDPA restricted to a temporal sliding window: each query
+/// attends only to keys within `±window` latent frames, where `period` is the
+/// token count per latent frame (frame-major `(f, h, w)` layout). `txt_start` is
+/// the first joint-token index that is text (always-in-window; image queries
+/// attend all text, text queries attend everything) -- pure-video callers pass
+/// `s_k`. Falls back to the full [`op_sdpa_f16`] behavior when `window == 0` or
+/// the windowed pipeline was not built. Use ONLY for video DiT self-attention
+/// (Q/K/V normed/roped).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn op_sdpa_f16_win<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    s_k: u32,
+    h_q: u32,
+    h_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    has_mask: u32,
+    period: u32,
+    window: u32,
+    txt_start: u32,
+) -> Result<(), WgpuError> {
+    op_sdpa_impl(
+        scope, pipelines, q, k, v, mask, dst, b, s_q, s_k, h_q, h_kv, head_dim, scale, has_mask,
+        true, period, window, txt_start,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn op_sdpa_impl<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: ActBuf<'wsp>,
+    k: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    s_k: u32,
+    h_q: u32,
+    h_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    has_mask: u32,
+    allow_f16: bool,
+    period: u32,
+    window: u32,
+    txt_start: u32,
+) -> Result<(), WgpuError> {
+    // The i8 paired path (opt-in): taken only when the caller actually
+    // quantized Q/K/V into paired slots (a block may compile sdpa_i8 for its
+    // long self-attention while keeping short cross-attn calls dense). The
+    // output form follows `dst`: paired (feeds a paired-A matmul, z_image
+    // proj) or dense at the act dtype (no output quantize; Wan's Q8 proj).
+    if let Some(sdpa_i8) = pipelines.sdpa_i8.as_ref()
+        && q.scale.is_some()
+    {
         let (qd, qs) = q.paired_unchecked();
         let (kd, ks) = k.paired_unchecked();
         let (vd, vs) = v.paired_unchecked();
-        let (dd, ds) = dst.paired_unchecked();
         let q_fused = scope.fuse_pair(qd, qs);
         let k_fused = scope.fuse_pair(kd, ks);
         let v_fused = scope.fuse_pair(vd, vs);
-        let o_fused = scope.fuse_pair(dd, ds);
-        scope.sdpa_i8(
-            sdpa_i8, q_fused, k_fused, v_fused, mask, o_fused, u, b, s_q, h_q, head_dim,
+        let (o_buf, out_mode) = match dst.scale {
+            Some(_) => {
+                let (dd, ds) = dst.paired_unchecked();
+                (scope.fuse_pair(dd, ds), 0u32)
+            }
+            None => (
+                dst.data,
+                match pipelines.act_dtype {
+                    ActDtype::F16 => 1,
+                    ActDtype::Bf16 => 2,
+                    a => unreachable!("sdpa_i8 dense out unsupported at act dtype {a:?}"),
+                },
+            ),
+        };
+        // Q-row chunking under the ~2s Windows GPU watchdog, same scheme as
+        // the f16/dense paths below; each heavy chunk flushes into its own
+        // submit. Bit-exact: every kernel offset derives from the GLOBAL row
+        // index (`u.row0 + local`) and all buffers stay bound whole.
+        let max_rows = if b == 1 && has_mask == 0 {
+            sdpa_chunk_rows_i8(s_k)
+        } else {
+            s_q.max(1)
+        };
+        let chunked = max_rows < s_q;
+        let mut r0 = 0u32;
+        while r0 < s_q {
+            let rows = (s_q - r0).min(max_rows);
+            let u = sdpa_uniform_i8(
+                scope, b, h_q, h_kv, s_q, s_k, head_dim, scale, has_mask, r0, out_mode,
+            )?;
+            scope.sdpa_i8(
+                sdpa_i8, q_fused, k_fused, v_fused, mask, o_buf, u, b, rows, h_q, head_dim,
+            )?;
+            r0 += rows;
+            if chunked {
+                scope.flush()?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Mixed-precision f16 SDPA (opt-in via fast_sdpa; bf16-act self-attention
+    // only). The residual stream stays bf16 (outlier channels exceed f16's
+    // +-65504), but these Q/K/V are normed/roped and O(1), so casting them to
+    // f16 for the subgroup kernel is loss-free; the output casts straight back
+    // to bf16. K/V cast whole (the kernel reads them entirely per query tile);
+    // Q and output cast per chunk so the f16 scratch stays bounded at long
+    // clips. Same TDR row-chunking as the SdpaF32 path -- a single 32k-row f16
+    // dispatch still trips the 2s watchdog; the f16 kernel is ~2x faster, so a
+    // chunk carries ~2x the rows under the same budget. b>1 / masked calls take
+    // the whole-tensor path.
+    if allow_f16
+        && let (Some(sdpa_sg), Some(to_f16), Some(to_bf16)) = (
+            pipelines
+                .sdpa_sg
+                .as_ref()
+                .filter(|_| head_dim.is_multiple_of(32) && head_dim <= 128),
+            pipelines.cast_to_f16.as_ref(),
+            pipelines.cast_to_bf16.as_ref(),
         )
+    {
+        let q = q.data;
+        let k = k.data;
+        let v = v.data;
+        let dst = dst.data;
+        let kv_bytes = pipelines.act_bytes(s_k * h_kv * head_dim);
+        let k_f16 = scope.alloc(kv_bytes)?;
+        let v_f16 = scope.alloc(kv_bytes)?;
+        scope.dispatch_op::<Bf16ToF16>(to_f16, &[scope.subview(&k, 0, kv_bytes)], k_f16)?;
+        scope.dispatch_op::<Bf16ToF16>(to_f16, &[scope.subview(&v, 0, kv_bytes)], v_f16)?;
+        let row_elems = h_q * head_dim;
+        let max_rows = if b == 1 && has_mask == 0 {
+            sdpa_chunk_rows_f16(s_k)
+        } else {
+            s_q.max(1)
+        };
+        // Temporal sliding window: dispatch the windowed twin kernel when a run
+        // requested it (`window > 0`) and it compiled. `row_off = r0` lets a
+        // chunked Q range recover each query's GLOBAL latent frame.
+        let windowed =
+            window > 0 && period > 0 && b == 1 && has_mask == 0 && pipelines.sdpa_sg_win.is_some();
+        let sg_pipe = if windowed {
+            pipelines.sdpa_sg_win.as_ref().unwrap()
+        } else {
+            sdpa_sg
+        };
+        let chunked = max_rows < s_q;
+        let mut r0 = 0u32;
+        while r0 < s_q {
+            let rows = (s_q - r0).min(max_rows);
+            let off = pipelines.act_bytes(r0 * row_elems);
+            let len = pipelines.act_bytes(rows * row_elems);
+            let q_f16 = scope.alloc(len)?;
+            scope.dispatch_op::<Bf16ToF16>(to_f16, &[scope.subview(&q, off, len)], q_f16)?;
+            let o_f16 = scope.alloc(len)?;
+            let m_c = scope.subview(&mask, 0, mask.len());
+            let u = if windowed {
+                sdpa_uniform_win(
+                    scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask, period, window, r0,
+                    txt_start,
+                )?
+            } else {
+                sdpa_uniform(scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask)?
+            };
+            scope.sdpa_sg(
+                sg_pipe,
+                q_f16,
+                k_f16,
+                v_f16,
+                m_c,
+                u,
+                o_f16,
+                pipelines.sdpa_sg_cl,
+                pipelines.sdpa_sg_qr,
+                b,
+                rows,
+                h_q,
+            )?;
+            scope.dispatch_op::<F16ToBf16>(to_bf16, &[o_f16], scope.subview(&dst, off, len))?;
+            r0 += rows;
+            if chunked {
+                scope.flush()?;
+            }
+        }
+        return Ok(());
+    }
+    // Dense path. A single flash-attention SDPA dispatch is ~O(s_q * s_k); on a
+    // large token grid (video DiT self-attention) it runs long enough to trip
+    // the ~2s Windows GPU watchdog (TDR), which resets the engine mid-dispatch
+    // and surfaces as "device lost" (nvlddmkm Event 153). Each BR=64 query tile
+    // is an independent workgroup, so splitting the query range across several
+    // dispatches is BIT-EXACT: query row `r0+sq` of a chunk bound at row offset
+    // `r0` lands at the same global element (q_off is independent of s_q at
+    // b==1), and K/V/keys stay whole. We chunk only the small-D `SdpaF32` path
+    // (the measured offender); the `large_d` (VAE) and subgroup-f16 (LTX) paths
+    // and any b>1 / masked call take the whole-tensor path unchanged.
+    let q = q.data;
+    let k = k.data;
+    let v = v.data;
+    let dst = dst.data;
+    // The SdpaF32 small-D fallback is selected iff large-D (head_dim>128) and
+    // the subgroup-f16 path (sg present, head_dim%32==0) both don't apply.
+    let uses_small_f32 =
+        head_dim <= 128 && !(pipelines.sdpa_sg.is_some() && head_dim.is_multiple_of(32));
+    let max_rows = if b == 1 && has_mask == 0 && uses_small_f32 {
+        sdpa_chunk_rows(s_k)
+    } else {
+        s_q.max(1)
+    };
+    let row_elems = h_q * head_dim;
+    // When we split, the OS GPU watchdog (a per-submit timer) is only respected
+    // if each heavy chunk lands in its OWN submit: dispatches inside one command
+    // buffer are not preempted, so 4 chunks in one submit still trips the 2s TDR.
+    // Flush after each chunk to break the scope's submit at chunk boundaries.
+    let chunked = max_rows < s_q;
+    let mut r0 = 0u32;
+    while r0 < s_q {
+        let rows = (s_q - r0).min(max_rows);
+        let off = pipelines.act_bytes(r0 * row_elems);
+        let len = pipelines.act_bytes(rows * row_elems);
+        let q_c = scope.subview(&q, off, len);
+        let o_c = scope.subview(&dst, off, len);
+        let k_c = scope.subview(&k, 0, k.len());
+        let v_c = scope.subview(&v, 0, v.len());
+        let m_c = scope.subview(&mask, 0, mask.len());
+        let u = sdpa_uniform(scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask)?;
+        dispatch_sdpa_dense(
+            scope, pipelines, q_c, k_c, v_c, m_c, o_c, u, b, rows, h_q, head_dim,
+        )?;
+        r0 += rows;
+        if chunked {
+            scope.flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// Queries-per-dispatch cap that keeps one `SdpaF32` flash-attention dispatch
+/// under the ~2s Windows GPU watchdog. Cost is ~O(rows * s_k); bound the product
+/// to ~10M, measured ~0.6s for the bf16 kernel on the 8GB RTX 5070 Laptop
+/// (~3x under the 2s reset). Rounds down to a BR=64 multiple (the workgroup tile)
+/// so chunk offsets stay storage-binding aligned; min one tile.
+fn sdpa_chunk_rows(s_k: u32) -> u32 {
+    const MAX_QK: u64 = 10_000_000;
+    let rows = (MAX_QK / s_k.max(1) as u64) as u32;
+    (rows / 64 * 64).max(64)
+}
+
+/// Queries-per-dispatch cap for the f16 subgroup SDPA. The kernel is ~2x faster
+/// than `SdpaF32`, so a 2x-larger QK budget keeps each chunk under the 2s
+/// watchdog with about half the submits. Each output row is independent, so any
+/// row count is bit-exact; rounding to a 64 multiple keeps chunk offsets
+/// storage-binding aligned.
+fn sdpa_chunk_rows_f16(s_k: u32) -> u32 {
+    const MAX_QK: u64 = 20_000_000;
+    let rows = (MAX_QK / s_k.max(1) as u64) as u32;
+    (rows / 64 * 64).max(64)
+}
+
+/// Queries-per-dispatch cap for the i8 SDPA. Same 20M QK budget as the f16
+/// subgroup path: measured headroom there is ~10x under the 2s watchdog, so
+/// even if the i8 kernel lands slower per QK pair it stays well clear. Rounds
+/// to the BR=64 workgroup tile.
+fn sdpa_chunk_rows_i8(s_k: u32) -> u32 {
+    const MAX_QK: u64 = 20_000_000;
+    let rows = (MAX_QK / s_k.max(1) as u64) as u32;
+    (rows / 64 * 64).max(64)
+}
+
+/// Dense SDPA variant selection (no i8): large-D (VAE), subgroup-f16 (LTX), or
+/// the `SdpaF32` small-D fallback. Shared by the whole-tensor and chunked paths.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_sdpa_dense<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &BlockPipelines,
+    q: BatchBuf<'wsp>,
+    k: BatchBuf<'wsp>,
+    v: BatchBuf<'wsp>,
+    mask: BatchBuf<'wsp>,
+    out: BatchBuf<'wsp>,
+    u: BatchBuf<'wsp>,
+    b: u32,
+    s_q: u32,
+    h_q: u32,
+    head_dim: u32,
+) -> Result<(), WgpuError> {
+    if let Some(sdpa_large_d) = pipelines.sdpa_large_d.as_ref().filter(|_| head_dim > 128) {
+        scope.sdpa::<SdpaF32LargeD>(sdpa_large_d, q, k, v, mask, u, out, b, s_q, h_q)
     } else if let Some(sdpa_sg) = pipelines
         .sdpa_sg
         .as_ref()
@@ -2645,30 +3707,20 @@ pub(crate) fn op_sdpa<'wsp>(
     {
         scope.sdpa_sg(
             sdpa_sg,
-            q.data,
-            k.data,
-            v.data,
+            q,
+            k,
+            v,
             mask,
             u,
-            dst.data,
+            out,
             pipelines.sdpa_sg_cl,
+            pipelines.sdpa_sg_qr,
             b,
             s_q,
             h_q,
         )
     } else {
-        scope.sdpa::<SdpaF32>(
-            &pipelines.sdpa,
-            q.data,
-            k.data,
-            v.data,
-            mask,
-            u,
-            dst.data,
-            b,
-            s_q,
-            h_q,
-        )
+        scope.sdpa::<SdpaF32>(&pipelines.sdpa, q, k, v, mask, u, out, b, s_q, h_q)
     }
 }
 
@@ -2886,7 +3938,7 @@ fn rmsnorm_uniform<'wsp>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sdpa_uniform<'wsp>(
+pub(crate) fn sdpa_uniform<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     b: u32,
     h_q: u32,
@@ -2906,6 +3958,76 @@ fn sdpa_uniform<'wsp>(
     bytes[20..24].copy_from_slice(&d.to_le_bytes());
     bytes[24..28].copy_from_slice(&scale.to_le_bytes());
     bytes[28..32].copy_from_slice(&has_mask.to_le_bytes());
+    scope.write_uniform(&bytes)
+}
+
+/// Uniform for the windowed subgroup SDPA: the 8 base fields plus `period`
+/// (tokens per latent frame), `window` (radius in frames), `row_off` (the
+/// global row index of this dispatch's first query, so a chunked Q range still
+/// recovers each query's global frame), and `txt_start` (first joint-token index
+/// that is text -- always-in-window; pure-video callers pass `s_k`). 48 bytes
+/// (12 u32) keeps the uniform 16-byte aligned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_uniform_win<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    b: u32,
+    h_q: u32,
+    h_kv: u32,
+    s_q: u32,
+    s_k: u32,
+    d: u32,
+    scale: f32,
+    has_mask: u32,
+    period: u32,
+    window: u32,
+    row_off: u32,
+    txt_start: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 48];
+    bytes[0..4].copy_from_slice(&b.to_le_bytes());
+    bytes[4..8].copy_from_slice(&h_q.to_le_bytes());
+    bytes[8..12].copy_from_slice(&h_kv.to_le_bytes());
+    bytes[12..16].copy_from_slice(&s_q.to_le_bytes());
+    bytes[16..20].copy_from_slice(&s_k.to_le_bytes());
+    bytes[20..24].copy_from_slice(&d.to_le_bytes());
+    bytes[24..28].copy_from_slice(&scale.to_le_bytes());
+    bytes[28..32].copy_from_slice(&has_mask.to_le_bytes());
+    bytes[32..36].copy_from_slice(&period.to_le_bytes());
+    bytes[36..40].copy_from_slice(&window.to_le_bytes());
+    bytes[40..44].copy_from_slice(&row_off.to_le_bytes());
+    bytes[44..48].copy_from_slice(&txt_start.to_le_bytes());
+    scope.write_uniform(&bytes)
+}
+
+/// Uniform for the i8 SDPA: the 8 base fields plus `row0` (the global row
+/// index of this dispatch's first query, for Q-row chunking) and `out_mode`
+/// (0 = paired i8 out, 1 = dense packed f16, 2 = dense packed bf16). 48 bytes
+/// (12 u32) keeps the uniform 16-byte aligned.
+#[allow(clippy::too_many_arguments)]
+fn sdpa_uniform_i8<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    b: u32,
+    h_q: u32,
+    h_kv: u32,
+    s_q: u32,
+    s_k: u32,
+    d: u32,
+    scale: f32,
+    has_mask: u32,
+    row0: u32,
+    out_mode: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 48];
+    bytes[0..4].copy_from_slice(&b.to_le_bytes());
+    bytes[4..8].copy_from_slice(&h_q.to_le_bytes());
+    bytes[8..12].copy_from_slice(&h_kv.to_le_bytes());
+    bytes[12..16].copy_from_slice(&s_q.to_le_bytes());
+    bytes[16..20].copy_from_slice(&s_k.to_le_bytes());
+    bytes[20..24].copy_from_slice(&d.to_le_bytes());
+    bytes[24..28].copy_from_slice(&scale.to_le_bytes());
+    bytes[28..32].copy_from_slice(&has_mask.to_le_bytes());
+    bytes[32..36].copy_from_slice(&row0.to_le_bytes());
+    bytes[36..40].copy_from_slice(&out_mode.to_le_bytes());
     scope.write_uniform(&bytes)
 }
 

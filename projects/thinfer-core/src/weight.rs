@@ -1,6 +1,6 @@
 use crate::tensor::{Shape, StorageEncoding};
 use core::future::Future;
-use half::bf16;
+use half::{bf16, f16};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -139,24 +139,25 @@ pub enum DecodeError {
 
 /// Streaming storage->fp32 decoder. Mirrors `sanity::ValidateState`'s shape
 /// but writes decoded bytes into caller-owned memory instead of xor'ing into
-/// a sink. fp16 is rejected at construction time: Z-Image's bf16 training
-/// makes the fp16 magnitude clamp unsafe, and we have no other fp16 model
-/// in M1.
+/// a sink. Supports the F32 / Bf16 / F16 on-wire dtypes (F16 added for the
+/// GGUF VAEs, whose conv weights ship fp16); both 2-byte forms expand to fp32
+/// host-side, then the upload path converts to the device weight dtype.
 ///
 /// Use via successive `feed(src, &mut dst[written..])` calls; carry across
 /// chunks is internal. Call `finish` at end-of-tensor to assert no half-pair
 /// remains.
 pub struct Decoder {
     encoding: StorageEncoding,
-    bf16_carry: Option<u8>,
+    /// Leftover odd byte of a 2-byte element (Bf16 or F16) across chunks.
+    carry: Option<u8>,
 }
 
 impl Decoder {
     pub fn new(encoding: StorageEncoding) -> Result<Self, DecodeError> {
         match encoding {
-            StorageEncoding::F32 | StorageEncoding::Bf16 => Ok(Self {
+            StorageEncoding::F32 | StorageEncoding::Bf16 | StorageEncoding::F16 => Ok(Self {
                 encoding,
-                bf16_carry: None,
+                carry: None,
             }),
             enc => Err(DecodeError::UnsupportedEncoding(enc)),
         }
@@ -174,24 +175,32 @@ impl Decoder {
                 dst[..src.len()].copy_from_slice(src);
                 Ok(src.len())
             }
-            StorageEncoding::Bf16 => self.feed_bf16(src, dst),
+            StorageEncoding::Bf16 => self.feed_pairs(src, dst, write_bf16_pair),
+            StorageEncoding::F16 => self.feed_pairs(src, dst, write_f16_pair),
             _ => unreachable!("rejected in new()"),
         }
     }
 
-    fn feed_bf16(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, DecodeError> {
+    /// Expand little-endian 2-byte elements to fp32 via `write`, carrying any
+    /// odd trailing byte to the next chunk. Shared by Bf16 and F16.
+    fn feed_pairs(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        write: fn(u8, u8, &mut [u8]),
+    ) -> Result<usize, DecodeError> {
         let mut written = 0;
         let mut start = 0;
-        if let Some(c) = self.bf16_carry.take() {
+        if let Some(c) = self.carry.take() {
             if let Some(&b) = src.first() {
                 if dst.len() < 4 {
                     return Err(DecodeError::DstTooSmall);
                 }
-                write_bf16_pair(c, b, &mut dst[..4]);
+                write(c, b, &mut dst[..4]);
                 written += 4;
                 start = 1;
             } else {
-                self.bf16_carry = Some(c);
+                self.carry = Some(c);
                 return Ok(0);
             }
         }
@@ -203,17 +212,17 @@ impl Decoder {
             return Err(DecodeError::DstTooSmall);
         }
         for pair in pairs {
-            write_bf16_pair(pair[0], pair[1], &mut dst[written..written + 4]);
+            write(pair[0], pair[1], &mut dst[written..written + 4]);
             written += 4;
         }
         if let Some(&b) = remainder.first() {
-            self.bf16_carry = Some(b);
+            self.carry = Some(b);
         }
         Ok(written)
     }
 
     pub fn finish(self) -> Result<(), DecodeError> {
-        if self.bf16_carry.is_some() {
+        if self.carry.is_some() {
             return Err(DecodeError::TrailingByte);
         }
         Ok(())
@@ -222,6 +231,11 @@ impl Decoder {
 
 fn write_bf16_pair(lo: u8, hi: u8, dst: &mut [u8]) {
     let f = bf16::from_bits(u16::from_le_bytes([lo, hi])).to_f32();
+    dst[..4].copy_from_slice(&f.to_ne_bytes());
+}
+
+fn write_f16_pair(lo: u8, hi: u8, dst: &mut [u8]) {
+    let f = f16::from_bits(u16::from_le_bytes([lo, hi])).to_f32();
     dst[..4].copy_from_slice(&f.to_ne_bytes());
 }
 
@@ -303,11 +317,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fp16() {
-        assert!(matches!(
-            Decoder::new(StorageEncoding::F16),
-            Err(DecodeError::UnsupportedEncoding(StorageEncoding::F16))
-        ));
+    fn f16_to_fp32_matches_half_crate() {
+        // f16 values incl. one (65504) that overflows bf16's range to prove the
+        // decoder reads the value as true fp16, not bf16.
+        let vals = [1.0f32, -2.5, 0.0, 65504.0];
+        let mut src = Vec::with_capacity(8);
+        for &v in &vals {
+            src.extend_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+        }
+        let mut dst = vec![0u8; 16];
+        let n = decode_into(StorageEncoding::F16, &src, &mut dst).unwrap();
+        assert_eq!(n, 16);
+        let got: Vec<f32> = dst
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, vec![1.0, -2.5, 0.0, 65504.0]);
+    }
+
+    #[test]
+    fn f16_streaming_carry_split() {
+        let vals = [1.0f32, -2.5, 0.5, 0.25];
+        let mut src = Vec::with_capacity(8);
+        for &v in &vals {
+            src.extend_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+        }
+        for split in [1usize, 3, 5, 7] {
+            let mut d = Decoder::new(StorageEncoding::F16).unwrap();
+            let mut dst = [0u8; 16];
+            let mut written = 0;
+            written += d.feed(&src[..split], &mut dst[written..]).unwrap();
+            written += d.feed(&src[split..], &mut dst[written..]).unwrap();
+            d.finish().unwrap();
+            assert_eq!(written, 16, "split={split}");
+            let got: Vec<f32> = dst
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(got, vec![1.0, -2.5, 0.5, 0.25], "split={split}");
+        }
     }
 
     #[test]

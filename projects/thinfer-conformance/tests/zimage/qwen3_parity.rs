@@ -23,7 +23,7 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::trace;
 use thinfer_core::workspace::Workspace;
-use thinfer_models::z_image::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
+use thinfer_models::common::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
 use thinfer_models::z_image::manifest::{self, role};
 use thinfer_models::z_image::text_encoder::{
     self, Qwen3BlockOpsHost, Qwen3Encoder, Qwen3Taps, register_qwen3_handles,
@@ -93,7 +93,7 @@ async fn qwen3_parity() {
         .await
         .expect("tokenizer load");
     let mut ids = tokenizer
-        .encode(&format_qwen3_prompt(PROMPT))
+        .encode(&format_qwen3_prompt(PROMPT), false)
         .expect("tokenize");
     if !ids.len().is_multiple_of(2) {
         ids.push(*ids.last().unwrap());
@@ -172,6 +172,7 @@ async fn qwen3_parity() {
             _ => PowerPreference::HighPerformance,
         },
         timestamps: std::env::var("THINFER_TRACE").is_ok(),
+        disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
     };
     let backend = Arc::new(
         WgpuBackend::new_with_config(cfg)
@@ -196,6 +197,7 @@ async fn qwen3_parity() {
     };
     let cfgs = BlockWgslConfigs {
         matmul_qkv: matmul,
+        matmul_qkv_self: matmul,
         matmul_proj: matmul,
         matmul_ffn_up: matmul,
         // Mirrors pipeline.rs encoder_cfgs: ffn_down weights stay bf16
@@ -205,6 +207,10 @@ async fn qwen3_parity() {
         ops,
         i8_sdpa: false,
         dense_acts: DenseActSites::default(),
+        coopmat_acts: Default::default(),
+        large_d_sdpa: false,
+        fast_sdpa: false,
+        decode_sdpa: false,
     };
     eprintln!("qwen3-parity: act_dtype={act:?}");
     let pipelines = BlockPipelines::compile(&backend, &cfgs)

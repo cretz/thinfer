@@ -4,6 +4,8 @@ members = [
     "thinfer-core",
     "thinfer-native",
     "thinfer-web",
+    "thinfer-app",
+    "thinfer-serve",
     "thinfer-cli",
     "thinfer-models",
     "thinfer-conformance",

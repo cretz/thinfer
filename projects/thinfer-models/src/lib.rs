@@ -1,3 +1,12 @@
 // thinfer-models: pipeline glue per model (Z-Image, LTX, ...).
 
+pub mod common;
+pub mod faceswap;
+pub mod hunyuan;
+pub mod ideogram4;
+pub mod krea;
+pub mod ltx;
+pub mod qwen3_lm;
+pub mod qwen_image;
+pub mod wan;
 pub mod z_image;

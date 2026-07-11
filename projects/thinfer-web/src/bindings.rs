@@ -78,6 +78,8 @@ impl WasmEngine {
         let cfg = WgpuConfig {
             power_preference,
             timestamps: false,
+            // Coopmat is a native-Vulkan path; never available on the web.
+            disable_coopmat: true,
         };
         let backend = WgpuBackend::new_with_config(cfg)
             .await
@@ -259,11 +261,17 @@ impl WebTokenizer {
 }
 
 impl Tokenizer for WebTokenizer {
-    fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, TokenizerError> {
         let enc = self
             .inner
-            .encode(text, false)
+            .encode(text, add_special_tokens)
             .map_err(|e| TokenizerError::Encode(e.to_string()))?;
         Ok(enc.get_ids().to_vec())
+    }
+
+    fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, TokenizerError> {
+        self.inner
+            .decode(ids, skip_special_tokens)
+            .map_err(|e| TokenizerError::Decode(e.to_string()))
     }
 }

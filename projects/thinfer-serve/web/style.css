@@ -1,0 +1,168 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 48rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+#server {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+#server input {
+  flex: 1 1 16rem;
+}
+
+#token-hint {
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+#fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  border: none;
+  padding: 0;
+}
+
+#fields > button {
+  grid-column: 2;
+  justify-self: start;
+  padding: 0.4rem 1.2rem;
+}
+
+/* The reference-image, audio, encoder, steps, etc. rows each wrap a label+input
+   pair in a div; `display: contents` promotes them into the #fields grid so they
+   align like every other row (label in column 1, input in column 2) instead of
+   cramming into one cell (which shoves every following row's label into column 2,
+   visibly mis-wrapping the rows below -- e.g. Quality/Seed). Guarded with
+   :not([hidden]) so the `hidden` attribute still collapses the row. */
+#input-image-row:not([hidden]),
+#source-image-row:not([hidden]),
+#input-video-row:not([hidden]),
+#guide-scale-row:not([hidden]),
+#audio-row:not([hidden]),
+#upscale-row:not([hidden]),
+#encoder-row:not([hidden]),
+#steps-row:not([hidden]),
+#coopmat-row:not([hidden]),
+#rewrite-row:not([hidden]),
+#rewrite-quality-row:not([hidden]),
+#attn-window-row:not([hidden]) {
+  display: contents;
+}
+/* The Quality (VAE) row is `.video-only` (hidden in image mode via the class, not
+   the `hidden` attribute), so gate its contents-promotion on video mode -- an
+   ungated `#vae-row` (id) would beat the `.video-only` (class) display:none and
+   leak the row onto image gens. */
+body.kind-video #vae-row:not([hidden]) {
+  display: contents;
+}
+
+/* Per-type field visibility is toggled by a body class set in app.js. */
+.image-only,
+.video-only {
+  display: none;
+}
+body.kind-image .image-only,
+body.kind-video .video-only {
+  display: revert;
+}
+/* The `hidden` attribute must always win, even over the kind-based reveal above
+   (app.js hides e.g. the Wan VAE row for LTX). Author `!important` beats the
+   `display: revert` rule that would otherwise un-hide a `.video-only` element. */
+[hidden] {
+  display: none !important;
+}
+
+/* The adapter (LoRA) vault is a self-contained collapsible block, NOT part of
+   the label/input grid: it spans both columns and lays out its own controls, so
+   its password field / list / add-form never fight the two-column form grid. */
+#adapters-section {
+  grid-column: 1 / -1;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.75rem;
+}
+#adapters-section > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+/* Inner label|input grid, mirroring #fields but scoped to the section. */
+.adapters-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  margin-top: 0.75rem;
+}
+/* Full-width sub-rows: the List button + status, the rendered list, and the
+   nested add-form each span both inner columns. */
+.adapters-actions,
+#adapters-list,
+#adapters-add {
+  grid-column: 1 / -1;
+}
+.adapters-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+#adapters-status {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+/* One rendered adapter: checkbox, name (grows), weight, remove. */
+.adapter-item {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.15rem 0;
+}
+.adapter-item label {
+  flex: 1;
+  min-width: 0;
+}
+.adapter-weight {
+  width: 4rem;
+}
+#adapters-add > summary {
+  cursor: pointer;
+}
+.adapters-add-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.4rem 0.8rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+.adapters-add-body > button {
+  grid-column: 2;
+  justify-self: start;
+}
+
+#status {
+  margin: 1rem 0;
+  font-variant-numeric: tabular-nums;
+  white-space: pre-wrap;
+}
+
+#image-out,
+#video-out {
+  max-width: 100%;
+}
+
+#log {
+  width: 100%;
+  margin-top: 1rem;
+  font-family: monospace;
+  font-size: 0.8rem;
+  white-space: pre;
+}

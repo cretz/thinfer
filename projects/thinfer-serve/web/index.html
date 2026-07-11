@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Served same-origin by thinfer-serve, so everything is 'self'. blob: is
+         the generated PNG (img) / MP4 (media) object URL. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src blob:; media-src blob:; base-uri 'none'; form-action 'none'"
+    />
+    <title>thinfer</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <h1>thinfer</h1>
+    <section id="server">
+      <label for="token">Auth token</label>
+      <input id="token" type="password" placeholder="(none, if the server is open)" />
+      <span id="token-hint">Stored in this browser only.</span>
+    </section>
+    <form id="form">
+      <fieldset id="fields">
+        <label for="kind">Type</label>
+        <select id="kind">
+          <option value="image" selected>Image</option>
+          <option value="video">Video</option>
+          <option value="face-swap">Face swap</option>
+        </select>
+
+        <label for="model">Model</label>
+        <select id="model"></select>
+
+        <label for="prompt" id="prompt-label">Prompt</label>
+        <textarea id="prompt" rows="3" required>a corgi wearing a tiny wizard hat, studio photo</textarea>
+
+        <!-- Reference image for edit models (qwen-image-edit). app.js shows this
+             row only when an edit model is selected and requires a file then. -->
+        <div id="input-image-row" hidden>
+          <label for="input-image">Reference image</label>
+          <input id="input-image" type="file" accept="image/png,image/jpeg" />
+        </div>
+
+        <!-- ltx2-rapid native I2V: frame-0 conditioning strength (only shown with
+             an input image on rapid). 1 = lock the input frame, lower = drift. -->
+        <div id="strength-row" hidden>
+          <label for="strength">Frame-0 strength</label>
+          <input id="strength" type="number" min="0" max="1" step="0.05" value="1" />
+        </div>
+
+        <!-- DreamID-V (diffusion video face-swap) + the HyperSwap face-swap flow.
+             app.js reveals these for those models and requires both then: the
+             source FACE image and the TARGET video to swap it into. The video is
+             uploaded as base64 and handled RAM-first server-side (encrypted spill
+             for large clips); neither ever lands on the server as plaintext past
+             the ephemeral job dir. -->
+        <div id="source-image-row" hidden>
+          <label for="source-image">Source face</label>
+          <input id="source-image" type="file" accept="image/png,image/jpeg" />
+        </div>
+        <div id="input-video-row" hidden>
+          <label for="input-video">Target video</label>
+          <input id="input-video" type="file" accept="video/mp4" />
+        </div>
+        <!-- Face-swap compositing options (HyperSwap path only). Both change the
+             visual output, so they are opt-in; app.js reveals these rows only for
+             the face-swap kind. -->
+        <div id="occlusion-mask-row" hidden
+          title="Let hands/hair/glasses crossing the face show through instead of swapped pixels (adds one pass per face)">
+          <label for="occlusion-mask">Occlusion mask (XSeg)</label>
+          <input id="occlusion-mask" type="checkbox" />
+        </div>
+        <div id="hyperswap-mask-row" hidden
+          title="Tighten the blend to the region HyperSwap actually synthesized (free)">
+          <label for="hyperswap-mask">HyperSwap mask</label>
+          <input id="hyperswap-mask" type="checkbox" checked />
+        </div>
+        <div id="enhance-row" hidden
+          title="Run the GFPGAN face enhancer on each swapped face (restores skin/eye/teeth detail; adds a pass per face)">
+          <label for="enhance">Enhance (GFPGAN)</label>
+          <input id="enhance" type="checkbox" />
+        </div>
+        <div id="detect-stride-row" hidden
+          title="Detect faces every Nth frame, reusing the last detection in between. 1 = every frame. Higher is faster but tracks fast head motion less tightly.">
+          <label for="detect-stride">Detect every N frames</label>
+          <input id="detect-stride" type="number" min="1" step="1" value="1" />
+        </div>
+        <div id="bitrate-scale-row" hidden
+          title="Output bitrate as a multiple of the source video's bitrate. 1.15 matches the input's size/quality with a small cushion; higher is larger/cleaner, lower is smaller/softer.">
+          <label for="bitrate-scale">Bitrate x source</label>
+          <input id="bitrate-scale" type="number" min="0.1" step="0.05" value="1.15" />
+        </div>
+        <div id="trim-start-row" hidden
+          title="Only swap and output the source starting at this many seconds (rebased to 0). Blank = clip start.">
+          <label for="trim-start">Start (s)</label>
+          <input id="trim-start" type="number" min="0" step="0.1" placeholder="(clip start)" />
+        </div>
+        <div id="trim-end-row" hidden
+          title="Only swap and output the source up to this many seconds. Blank = clip end.">
+          <label for="trim-end">End (s)</label>
+          <input id="trim-end" type="number" min="0" step="0.1" placeholder="(clip end)" />
+        </div>
+
+        <!-- Adapter (LoRA) vault: one self-contained collapsible section (spans
+             the full form width, own internal layout) so it stays out of the
+             label/input grid. app.js reveals it only for image models that
+             support adapters (e.g. krea-2-turbo). Adapters belong to a model and
+             are encrypted at rest; the password unlocks them for listing / adding
+             / use, rides each request only, and is kept in this tab's memory. -->
+        <details id="adapters-section" hidden>
+          <summary>Adapters (LoRA)</summary>
+          <div class="adapters-body">
+            <label for="vault-password">Password</label>
+            <input id="vault-password" type="password" placeholder="unlocks your adapter vault" autocomplete="off" />
+
+            <div class="adapters-actions">
+              <button id="adapters-refresh" type="button">List adapters</button>
+              <span id="adapters-status"></span>
+            </div>
+
+            <!-- Checkbox + per-adapter weight per stored adapter (filled by
+                 app.js from POST /vault/adapters/list). Checked adapters are
+                 folded into the DiT for this generation, in listed order. -->
+            <div id="adapters-list"></div>
+
+            <details id="adapters-add">
+              <summary>Add adapter by URL</summary>
+              <div class="adapters-add-body">
+                <label for="adapter-url">URL</label>
+                <input id="adapter-url" type="url" placeholder="https://civitai.com/api/download/models/…" />
+                <label for="adapter-token">Token</label>
+                <input id="adapter-token" type="password" placeholder="Civitai token, if the file needs one" autocomplete="off" />
+                <label for="adapter-name">Name</label>
+                <input id="adapter-name" type="text" placeholder="(defaults to the download filename)" />
+                <label for="adapter-weight">Default weight</label>
+                <input id="adapter-weight" type="text" inputmode="decimal" placeholder="1.0" />
+                <button id="adapter-add-btn" type="button">Add to vault</button>
+              </div>
+            </details>
+          </div>
+        </details>
+
+        <label for="preset">Size</label>
+        <select id="preset"></select>
+
+        <label for="width">Width</label>
+        <input id="width" type="number" value="768" min="16" step="16" />
+        <label for="height">Height</label>
+        <input id="height" type="number" value="768" min="16" step="16" />
+
+        <!-- Hidden for LTX (app.js): the distilled two-stage schedule is fixed
+             (8 + 3 = 11 steps), so the steps field does not apply there. -->
+        <div id="steps-row">
+          <label for="steps">Steps</label>
+          <input id="steps" type="number" value="8" min="1" />
+        </div>
+
+        <!-- DreamID-V only (app.js reveals it): image-CFG guidance scale on the
+             source-face reference. Higher = stronger identity transfer. -->
+        <div id="guide-scale-row" hidden>
+          <label for="guide-scale">Guidance (face)</label>
+          <input id="guide-scale" type="number" value="4" min="0" step="0.5" />
+        </div>
+
+        <label for="duration" class="video-only">Duration (s)</label>
+        <input id="duration" class="video-only" type="text" inputmode="decimal" placeholder="(seconds)" />
+
+        <!-- Wan-only: the LightTAE (tiny) vs full VAE choice. Hidden for LTX
+             (app.js), which always runs its own full CausalVideoAutoencoder and
+             ignores this knob. -->
+        <div id="vae-row" class="video-only">
+          <label for="vae">Quality</label>
+          <select id="vae">
+            <option value="tiny" selected>Tiny VAE (fast, default)</option>
+            <option value="tiny-ft" id="vae-opt-tiny-ft" hidden>Tiny VAE — Hunyuan-tuned (fast, better)</option>
+            <option value="full">Full VAE (clean, slower)</option>
+          </select>
+        </div>
+
+        <!-- LTX joint audio-video only. app.js reveals this row for LTX and
+             hides it otherwise (the Wan models are silent). Unchecking skips the
+             audio VAE + vocoder tail for a faster, video-only MP4. -->
+        <div id="audio-row" hidden>
+          <label for="audio">Audio</label>
+          <input id="audio" type="checkbox" checked />
+        </div>
+
+        <!-- LTX-2.3 distilled only. app.js reveals this for LTX and checks it by
+             default (the in-distribution widescreen regime needs two-stage). On =
+             stage-1 half-res denoise -> 2x latent upscale -> 3-step refine. Off =
+             single-stage at the target res: only useful as a fast low-res preview
+             (single-stage OOMs the widescreen default). -->
+        <div id="upscale-row" hidden>
+          <label for="upscale">Upscale (hi-res refine)</label>
+          <input id="upscale" type="checkbox" />
+        </div>
+
+        <!-- LTX-2.3 only (all LTX/Sulphur models share the Gemma encoder).
+             app.js reveals this for LTX and hides it otherwise. q4 is ~2.8x
+             faster to encode the prompt (~16s -> ~6s) at lower-precision
+             conditioning; q8 is the quality baseline. -->
+        <div id="encoder-row" hidden>
+          <label for="encoder">Text encoder</label>
+          <select id="encoder">
+            <option value="q8" selected>Q8 (quality, default)</option>
+            <option value="q4">Q4 (fast encode)</option>
+          </select>
+        </div>
+
+        <!-- Cooperative-matrix (tensor-core) acceleration for the Wan video DiT
+             matmuls. On by default; app.js greys this out via GET /capabilities
+             when the server GPU doesn't expose a usable coopmat config. Unticking
+             forces the dense/i8 path (A/B, debugging). -->
+        <div id="coopmat-row">
+          <label for="coopmat">Tensor-core (coopmat)</label>
+          <input id="coopmat" type="checkbox" checked />
+        </div>
+
+        <!-- HunyuanVideo 1.5 only (app.js reveals it for that model). Expands a
+             short prompt into a detailed, structured caption via the rewrite
+             endpoint before encoding: the model is trained on long captions, so
+             raw short prompts are out-of-distribution and look incoherent. Needs
+             the rewrite service running (THINFER_T2V_REWRITE_URL); serve falls
+             back to the raw prompt if it is unreachable. -->
+        <div id="rewrite-row" hidden>
+          <label for="rewrite">Enhance prompt (recommended)</label>
+          <input id="rewrite" type="checkbox" checked />
+        </div>
+
+        <!-- Hunyuan-only: which on-device rewriter model expands the prompt.
+             Fast = the ~2.5GB Qwen3-VL-4B (default, quick even under a tight VRAM
+             budget); Full = the ~5.85GB Qwen3-VL-8B (slightly richer captions,
+             much slower as it streams weights). Shown for Hunyuan (app.js). -->
+        <div id="rewrite-quality-row" hidden>
+          <label for="rewrite-quality">Rewriter</label>
+          <select id="rewrite-quality">
+            <option value="fast" selected>Fast (4B, default)</option>
+            <option value="full">Full (8B, slower)</option>
+          </select>
+        </div>
+
+        <!-- Wan2.2 14B only (app.js reveals it for that model). Temporal
+             self-attention window radius in LATENT frames: restricts DiT
+             self-attention to +-N latent frames, cutting the O(frames^2) cost on
+             long clips at the price of long-range temporal coherence. Empty =
+             full attention. Only affects the long-clip activation-tiled path. -->
+        <div id="attn-window-row" hidden>
+          <label for="attn-window">Attention window (frames)</label>
+          <input id="attn-window" type="number" min="0" title="Latent-frame radius. Blank = model default (Wan2.2 3, AnyFlow/Hunyuan full). 0 = full attention. On AnyFlow the first denoise step always runs full attention (anchors the scene); the window speeds up the later steps." />
+        </div>
+
+        <label for="seed">Seed</label>
+        <input id="seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />
+
+        <button id="generate" type="submit">Generate</button>
+      </fieldset>
+    </form>
+    <button id="cancel" type="button" hidden>Cancel</button>
+    <p id="status">Idle.</p>
+    <img id="image-out" alt="" hidden />
+    <video id="video-out" controls playsinline hidden></video>
+    <p><a id="download" hidden download>Download</a></p>
+    <!-- Progress + errors mirror here, since phones have no dev console. -->
+    <textarea id="log" rows="10" readonly></textarea>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -26,9 +26,10 @@ use thinfer_core::trace;
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 
-use crate::z_image::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
+use crate::common::block::{BlockPipelines, BlockWgslConfigs, DenseActSites};
+use crate::common::loader::LoadError;
 use crate::z_image::dit::{Block0Taps, DitInputs, DitShape, DitTaps, ZImageDit};
-use crate::z_image::loader::{LoadError, register_dit_handles};
+use crate::z_image::loader::register_dit_handles;
 use crate::z_image::scheduler::FlowMatchEulerScheduler;
 use crate::z_image::text_encoder::{
     EmbedLookupError, Qwen3Encoder, Qwen3ForwardError, Qwen3Handles, register_qwen3_handles,
@@ -422,6 +423,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         for slots in &per_layer_weights {
             let cfgs = BlockWgslConfigs {
                 matmul_qkv: mk_main(slots[0]),
+                matmul_qkv_self: mk_main(slots[0]),
                 matmul_proj: mk_main(slots[1]),
                 matmul_ffn_up: mk_main(slots[2]),
                 matmul_ffn_down: mk_main(slots[3]),
@@ -429,6 +431,10 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 ops: ops_template_bf16w,
                 i8_sdpa,
                 dense_acts: DenseActSites::default(),
+                coopmat_acts: crate::common::block::CoopmatSites::default(),
+                large_d_sdpa: false,
+                fast_sdpa: false,
+                decode_sdpa: false,
             };
             block_pipelines.push(BlockPipelines::compile(&backend, &cfgs).await?);
         }
@@ -471,6 +477,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         let transcoded = WeightDtype::Quant(encoder_transcode);
         let encoder_cfgs = BlockWgslConfigs {
             matmul_qkv: encoder_slot(&qwen3_l0.layers[0].q_proj, transcoded),
+            matmul_qkv_self: encoder_slot(&qwen3_l0.layers[0].q_proj, transcoded),
             matmul_proj: encoder_slot(&qwen3_l0.layers[0].o_proj, transcoded),
             matmul_ffn_up: encoder_slot(&qwen3_l0.layers[0].mlp_gate, transcoded),
             matmul_ffn_down: encoder_slot(&qwen3_l0.layers[0].mlp_down, WeightDtype::Bf16),
@@ -478,6 +485,10 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ops: encoder_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            coopmat_acts: crate::common::block::CoopmatSites::default(),
+            large_d_sdpa: false,
+            fast_sdpa: false,
+            decode_sdpa: false,
         };
         let encoder_block_pipelines = BlockPipelines::compile(&backend, &encoder_cfgs).await?;
         // DiT-side encoder ops (x/t/cap embedders + refiners + final_layer):
@@ -501,6 +512,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         };
         let dit_encoder_cfgs = BlockWgslConfigs {
             matmul_qkv: refiner_matmul_cfg,
+            matmul_qkv_self: refiner_matmul_cfg,
             matmul_proj: refiner_matmul_cfg,
             matmul_ffn_up: refiner_matmul_cfg,
             matmul_ffn_down: refiner_matmul_cfg,
@@ -508,6 +520,10 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ops: dit_encoder_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            coopmat_acts: crate::common::block::CoopmatSites::default(),
+            large_d_sdpa: false,
+            fast_sdpa: false,
+            decode_sdpa: false,
         };
         let dit_encoder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_encoder_cfgs).await?;
@@ -516,6 +532,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // final-layer linears are never transcoded).
         let dit_embedder_cfgs = BlockWgslConfigs {
             matmul_qkv: dit_encoder_ops,
+            matmul_qkv_self: dit_encoder_ops,
             matmul_proj: dit_encoder_ops,
             matmul_ffn_up: dit_encoder_ops,
             matmul_ffn_down: dit_encoder_ops,
@@ -523,6 +540,10 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             ops: dit_encoder_ops,
             i8_sdpa: false,
             dense_acts: DenseActSites::default(),
+            coopmat_acts: crate::common::block::CoopmatSites::default(),
+            large_d_sdpa: false,
+            fast_sdpa: false,
+            decode_sdpa: false,
         };
         let dit_embedder_block_pipelines =
             BlockPipelines::compile(&backend, &dit_embedder_cfgs).await?;
@@ -537,6 +558,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             pipelines: vae_pipelines,
             handles: vae_handles,
             tile_cfg: VaeTileConfig::default(),
+            arch: crate::z_image::vae::Z_IMAGE_KL_VAE,
         };
         Ok(Self {
             backend,
@@ -780,9 +802,11 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         let token_ids = {
             let _s = trace::scope!("tokenize").entered();
             let wrapped = format_qwen3_prompt(&params.prompt);
+            // Chat-template specials are already literal text in `wrapped`; do
+            // not let the tokenizer insert its own (would add a stray BOS/EOS).
             let ids = self
                 .tokenizer
-                .encode(&wrapped)
+                .encode(&wrapped, false)
                 .map_err(GenerateError::Tokenizer)?;
             tracing::debug!(n_tokens = ids.len(), "tokenize done");
             if ids.len() > MAX_PROMPT_TOKENS {
@@ -1369,7 +1393,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     if inner == 0 || !inner.is_multiple_of(32) {
                         return;
                     }
-                    crate::z_image::seq::diag_quant_roundtrip_loss(label, v, seq_u as usize, inner);
+                    crate::common::seq::diag_quant_roundtrip_loss(label, v, seq_u as usize, inner);
                 };
                 if let Some(v) = &b0.attn_qkv_f16_pre_quant {
                     print("block0.attn_qkv_f16_pre_quant", v);

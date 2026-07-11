@@ -16,8 +16,6 @@
 //! Upstream does the computation in f64 then casts to f32, which we mirror to
 //! keep numerics aligned for differential tests.
 
-use crate::z_image::config;
-
 #[derive(Clone, Debug)]
 pub struct RopeEmbedder {
     pub theta: f32,
@@ -29,14 +27,6 @@ pub struct RopeEmbedder {
 }
 
 impl RopeEmbedder {
-    pub fn z_image() -> Self {
-        Self::new(
-            config::ROPE_THETA,
-            config::ROPE_AXES_DIMS,
-            config::ROPE_AXES_LENS,
-        )
-    }
-
     pub fn new(theta: f32, axes_dims: [usize; 3], axes_lens: [usize; 3]) -> Self {
         let theta_f64 = theta as f64;
         let tables = std::array::from_fn(|i| {
@@ -90,6 +80,46 @@ impl RopeEmbedder {
                 );
                 let src_off = (coord as usize) * d;
                 out[dst_off..dst_off + d].copy_from_slice(&self.tables[axis][src_off..src_off + d]);
+                dst_off += d;
+            }
+        }
+        out
+    }
+
+    /// `lookup` variant that accepts SIGNED coordinates. A negative position
+    /// `p` rotates by angle `p * f_j`; since `cos` is even and `sin` is odd this
+    /// is the complex conjugate of `|p|`'s row: `(cos(|p|f), -sin(|p|f))`. Used
+    /// by centered-RoPE models (Qwen-Image `scale_rope` centers the h/w axes
+    /// around 0). The non-negative path is bit-identical to [`Self::lookup`].
+    /// `|coord|` must be `< axes_lens[axis]`.
+    pub fn lookup_signed(&self, ids: &[i32]) -> Vec<f32> {
+        assert!(ids.len().is_multiple_of(3), "ids must be [seq, 3]");
+        let seq = ids.len() / 3;
+        let hd = self.head_dim();
+        let mut out = vec![0.0_f32; seq * hd];
+        for row in 0..seq {
+            let mut dst_off = row * hd;
+            for axis in 0..3 {
+                let coord = ids[row * 3 + axis];
+                let d = self.axes_dims[axis];
+                let mag = coord.unsigned_abs() as usize;
+                debug_assert!(
+                    mag < self.axes_lens[axis],
+                    "rope |coord| {} >= axes_lens[{}]={} (row {row})",
+                    mag,
+                    axis,
+                    self.axes_lens[axis]
+                );
+                let src = &self.tables[axis][mag * d..mag * d + d];
+                let dst = &mut out[dst_off..dst_off + d];
+                if coord < 0 {
+                    // Conjugate: re unchanged, im negated (im at odd lanes).
+                    for (j, &v) in src.iter().enumerate() {
+                        dst[j] = if j % 2 == 1 { -v } else { v };
+                    }
+                } else {
+                    dst.copy_from_slice(src);
+                }
                 dst_off += d;
             }
         }
@@ -160,6 +190,25 @@ mod tests {
         approx(out[3], 2.0_f32.sin(), 1e-6);
         approx(out[4], 3.0_f32.cos(), 1e-6);
         approx(out[5], 3.0_f32.sin(), 1e-6);
+    }
+
+    #[test]
+    fn lookup_signed_positive_matches_lookup_and_negative_conjugates() {
+        let r = RopeEmbedder::new(10_000.0, [4, 2, 2], [16, 16, 16]);
+        // Non-negative coords: bit-identical to `lookup`.
+        let ids = vec![3_i32, 1, 2];
+        assert_eq!(r.lookup(&ids), r.lookup_signed(&ids));
+        // Negative coord on one axis = conjugate (re same, im negated) of |coord|.
+        let pos = r.lookup_signed(&[0_i32, 5, 0]);
+        let neg = r.lookup_signed(&[0_i32, -5, 0]);
+        let hd = r.head_dim();
+        for j in 0..hd {
+            if j % 2 == 0 {
+                approx(neg[j], pos[j], 0.0); // re unchanged
+            } else {
+                approx(neg[j], -pos[j], 0.0); // im negated
+            }
+        }
     }
 
     #[test]

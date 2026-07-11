@@ -38,6 +38,12 @@ pub struct Conv2dConfig {
     pub tm: u32,
     /// Register-block cols per thread.
     pub tn: u32,
+    /// Double-buffer the shared A/B tiles: prefetch strip `t+1` while the FMA
+    /// loop consumes strip `t`, so global-load latency overlaps compute instead
+    /// of stalling every thread at the load barrier. Doubles workgroup storage
+    /// (must stay under the 32 KiB cap). Numerically identical to the
+    /// single-buffered path (same ascending-k f32 accumulation).
+    pub prefetch: bool,
 }
 
 impl Conv2dConfig {
@@ -47,6 +53,7 @@ impl Conv2dConfig {
         bk: 32,
         tm: 4,
         tn: 4,
+        prefetch: false,
     };
 
     pub const fn wg_x(&self) -> u32 {
@@ -102,13 +109,14 @@ pub trait Conv2dOp {
     fn hint(&self, cfg: &WgslConfig) -> String {
         let c = self.config();
         format!(
-            "{}-bm{}_bn{}_bk{}_tm{}_tn{}",
+            "{}-bm{}_bn{}_bk{}_tm{}_tn{}_pf{}",
             cfg.hint(),
             c.bm,
             c.bn,
             c.bk,
             c.tm,
             c.tn,
+            c.prefetch as u32,
         )
     }
 }
@@ -178,16 +186,21 @@ fn build_wgsl(c: &Conv2dConfig, cfg: &WgslConfig) -> String {
     let tile_b_size = bk * bn;
     let a_loads_per_thread = tile_a_size.div_ceil(threads);
     let b_loads_per_thread = tile_b_size.div_ceil(threads);
+    // Double-buffering keeps two strips of A/B resident so the next strip's
+    // global loads overlap the current strip's FMAs (latency hiding). Storage
+    // doubles.
+    let n_buf: u32 = if c.prefetch { 2 } else { 1 };
 
     // Same workgroup-storage budget rationale as matmul.rs: naga does not
     // validate var<workgroup> size against the device limit, so enforce the
     // 32 KiB downlevel cap here.
     const MAX_WORKGROUP_STORAGE: u32 = 32768;
-    let total_shared = (tile_a_size + tile_b_size) * 4;
+    let total_shared = (tile_a_size + tile_b_size) * 4 * n_buf;
     assert!(
         total_shared <= MAX_WORKGROUP_STORAGE,
         "conv2d kernel exceeds workgroup storage budget: bm={bm} bn={bn} bk={bk} \
-         total={total_shared} > limit={MAX_WORKGROUP_STORAGE}",
+         prefetch={} total={total_shared} > limit={MAX_WORKGROUP_STORAGE}",
+        c.prefetch,
     );
 
     let f16_prelude = if act_f16 { "enable f16;\n" } else { "" };
@@ -246,24 +259,113 @@ fn build_wgsl(c: &Conv2dConfig, cfg: &WgslConfig) -> String {
             acc_decls.push_str(&format!("    var acc_{i}_{j}: f32 = 0.0;\n"));
         }
     }
-    let mut inner_fmas = String::new();
-    for i in 0..tm {
-        inner_fmas.push_str(&format!(
-            "            let a_{i}: f32 = tile_a[(lid.y * TM + {i}u) * BK + kk];\n"
-        ));
-    }
-    for j in 0..tn {
-        inner_fmas.push_str(&format!(
-            "            let b_{j}: f32 = tile_b[kk * BN + lid.x * TN + {j}u];\n"
-        ));
-    }
-    for i in 0..tm {
-        for j in 0..tn {
-            inner_fmas.push_str(&format!(
-                "            acc_{i}_{j} = fma(a_{i}, b_{j}, acc_{i}_{j});\n"
+    // A-tile load: weight [Cout, K] row-major into `tile_a[a_off + idx]` for
+    // K-strip starting at `k0`. B-tile load: virtual im2col [K, M] into
+    // `tile_b[b_off + idx]`; bc is the fast index so consecutive threads gather
+    // consecutive wi (coalesced x reads); zero-fill at padding / OOB.
+    let emit_load = |k0: &str, a_off: &str, b_off: &str| -> String {
+        format!(
+            r#"        for (var s: u32 = 0u; s < {a_loads_per_thread}u; s = s + 1u) {{
+            let idx: u32 = s * THREADS + tid;
+            if (idx < BM * BK) {{
+                let ar: u32 = idx / BK;
+                let ac: u32 = idx % BK;
+                let gr: u32 = bm0 + ar;
+                let gc: u32 = ({k0}) + ac;
+                var v: f32 = 0.0;
+                if (gr < u.cout && gc < kdim) {{
+                    v = load_w(gr * kdim + gc);
+                }}
+                tile_a[({a_off}) + idx] = v;
+            }}
+        }}
+        for (var s: u32 = 0u; s < {b_loads_per_thread}u; s = s + 1u) {{
+            let idx: u32 = s * THREADS + tid;
+            if (idx < BK * BN) {{
+                let br: u32 = idx / BN;
+                let bc: u32 = idx % BN;
+                let gr: u32 = ({k0}) + br;
+                let gc: u32 = bn0 + bc;
+                var v: f32 = 0.0;
+                if (gr < kdim && gc < m_total) {{
+                    let ci: u32 = gr / khkw;
+                    let r: u32 = gr - ci * khkw;
+                    let dh: u32 = r / u.kw;
+                    let dw: u32 = r - dh * u.kw;
+                    let ho: u32 = gc / u.w_out;
+                    let wo: u32 = gc - ho * u.w_out;
+                    let hi: i32 = i32(ho * u.stride_h + dh) - i32(u.pad_h);
+                    let wi: i32 = i32(wo * u.stride_w + dw) - i32(u.pad_w);
+                    if (hi >= 0 && hi < i32(u.h_in) && wi >= 0 && wi < i32(u.w_in)) {{
+                        v = load_x(x_base + ci * hw_in + u32(hi) * u.w_in + u32(wi));
+                    }}
+                }}
+                tile_b[({b_off}) + idx] = v;
+            }}
+        }}
+"#
+        )
+    };
+    // Explicit-scalar register block (kernel register rule): read the resident
+    // A/B strip at `a_off`/`b_off` and FMA into the tm x tn accumulators.
+    let emit_compute = |a_off: &str, b_off: &str| -> String {
+        let mut s = String::new();
+        for i in 0..tm {
+            s.push_str(&format!(
+                "            let a_{i}: f32 = tile_a[({a_off}) + (lid.y * TM + {i}u) * BK + kk];\n"
             ));
         }
-    }
+        for j in 0..tn {
+            s.push_str(&format!(
+                "            let b_{j}: f32 = tile_b[({b_off}) + kk * BN + lid.x * TN + {j}u];\n"
+            ));
+        }
+        for i in 0..tm {
+            for j in 0..tn {
+                s.push_str(&format!(
+                    "            acc_{i}_{j} = fma(a_{i}, b_{j}, acc_{i}_{j});\n"
+                ));
+            }
+        }
+        s
+    };
+
+    // Main K-loop. Single-buffered: load strip t, barrier, compute, barrier.
+    // Double-buffered: preload strip 0, then each iter issues strip t+1's loads
+    // into the idle buffer while the FMA loop consumes strip t (latency hiding),
+    // with one barrier per iter separating a buffer's fill from its next read.
+    let main_loop = if c.prefetch {
+        let load0 = emit_load("0u", "0u", "0u");
+        let load_next = emit_load("(t + 1u) * BK", "nxt * TA", "nxt * TB");
+        let compute = emit_compute("cur * TA", "cur * TB");
+        format!(
+            r#"    let num_tiles: u32 = (kdim + BK - 1u) / BK;
+{load0}    workgroupBarrier();
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {{
+        let cur: u32 = t & 1u;
+        if (t + 1u < num_tiles) {{
+            let nxt: u32 = (t + 1u) & 1u;
+{load_next}        }}
+        for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {{
+{compute}        }}
+        workgroupBarrier();
+    }}
+"#
+        )
+    } else {
+        let load = emit_load("t * BK", "0u", "0u");
+        let compute = emit_compute("0u", "0u");
+        format!(
+            r#"    let num_tiles: u32 = (kdim + BK - 1u) / BK;
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {{
+{load}        workgroupBarrier();
+        for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {{
+{compute}        }}
+        workgroupBarrier();
+    }}
+"#
+        )
+    };
     let mut store_loop = String::new();
     for i in 0..tm {
         store_loop.push_str(&format!(
@@ -313,9 +415,11 @@ const BK: u32 = {bk}u;
 const TM: u32 = {tm}u;
 const TN: u32 = {tn}u;
 const THREADS: u32 = {threads}u;
+const TA: u32 = {tile_a_size}u;
+const TB: u32 = {tile_b_size}u;
 
-var<workgroup> tile_a: array<f32, {tile_a_size}u>;
-var<workgroup> tile_b: array<f32, {tile_b_size}u>;
+var<workgroup> tile_a: array<f32, {tile_a_total}u>;
+var<workgroup> tile_b: array<f32, {tile_b_total}u>;
 
 @compute @workgroup_size({wg_x}, {wg_y}, 1)
 fn main(
@@ -333,62 +437,11 @@ fn main(
     let out_base: u32 = wid.z * u.cout * m_total;
 
 {acc_decls}
-    let num_tiles: u32 = (kdim + BK - 1u) / BK;
-    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {{
-        let k0: u32 = t * BK;
-
-        // A-tile: weight [Cout, K] row-major; gr = Cout row, gc = K col.
-        for (var s: u32 = 0u; s < {a_loads_per_thread}u; s = s + 1u) {{
-            let idx: u32 = s * THREADS + tid;
-            if (idx < BM * BK) {{
-                let ar: u32 = idx / BK;
-                let ac: u32 = idx % BK;
-                let gr: u32 = bm0 + ar;
-                let gc: u32 = k0 + ac;
-                var v: f32 = 0.0;
-                if (gr < u.cout && gc < kdim) {{
-                    v = load_w(gr * kdim + gc);
-                }}
-                tile_a[idx] = v;
-            }}
-        }}
-        // B-tile: virtual im2col [K, M]; gr = k -> (ci, dh, dw),
-        // gc = spatial -> (ho, wo). Zero-fill at padding / OOB. bc is the
-        // fast index, so consecutive threads gather consecutive wi
-        // (coalesced x reads).
-        for (var s: u32 = 0u; s < {b_loads_per_thread}u; s = s + 1u) {{
-            let idx: u32 = s * THREADS + tid;
-            if (idx < BK * BN) {{
-                let br: u32 = idx / BN;
-                let bc: u32 = idx % BN;
-                let gr: u32 = k0 + br;
-                let gc: u32 = bn0 + bc;
-                var v: f32 = 0.0;
-                if (gr < kdim && gc < m_total) {{
-                    let ci: u32 = gr / khkw;
-                    let r: u32 = gr - ci * khkw;
-                    let dh: u32 = r / u.kw;
-                    let dw: u32 = r - dh * u.kw;
-                    let ho: u32 = gc / u.w_out;
-                    let wo: u32 = gc - ho * u.w_out;
-                    let hi: i32 = i32(ho * u.stride_h + dh) - i32(u.pad_h);
-                    let wi: i32 = i32(wo * u.stride_w + dw) - i32(u.pad_w);
-                    if (hi >= 0 && hi < i32(u.h_in) && wi >= 0 && wi < i32(u.w_in)) {{
-                        v = load_x(x_base + ci * hw_in + u32(hi) * u.w_in + u32(wi));
-                    }}
-                }}
-                tile_b[idx] = v;
-            }}
-        }}
-        workgroupBarrier();
-
-        for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {{
-{inner_fmas}        }}
-        workgroupBarrier();
-    }}
-
+{main_loop}
 {store_loop}}}
-"#
+"#,
+        tile_a_total = tile_a_size * n_buf,
+        tile_b_total = tile_b_size * n_buf,
     )
 }
 

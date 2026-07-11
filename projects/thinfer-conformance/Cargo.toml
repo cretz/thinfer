@@ -17,6 +17,7 @@ serde_json = "1"
 
 [dev-dependencies]
 half = "2"
+png = "0.17"
 pollster = "0.4"
 safetensors = "0.4"
 tempfile = "3"
@@ -34,3 +35,37 @@ conformance = []
 # Opt-in Z-Image end-to-end tests that touch the local HF cache. Skip
 # cleanly if the relevant files aren't cached; never trigger a download.
 zimage-e2e = []
+# Opt-in SkyReels-V2 (Wan) video end-to-end parity test. Same discipline as
+# zimage-e2e: touches the local HF cache, skips cleanly when uncached.
+wan-e2e = []
+# Opt-in Ideogram-4 parity tests (encoder, DiT, VAE, e2e). Same discipline:
+# touches the local HF cache (GGUFs), skips cleanly when uncached.
+ideogram4-e2e = []
+# Opt-in Qwen-Image-Edit-Rapid-AIO parity tests (VAE, encoder, DiT, e2e). Same
+# discipline: touches the local HF cache (GGUFs), skips cleanly when uncached.
+qwen-image-e2e = []
+# Opt-in Krea 2 Turbo t2i health/perf e2e. Touches the local HF cache
+# (realrebelai Krea GGUF + Qwen3-VL-4B GGUF + Wan2.1 VAE + tokenizer); skips
+# cleanly when uncached. Doubles as the perf rollup (gpu_ms by pipeline).
+krea-e2e = []
+# Opt-in face-swap ONNX executor parity + pipeline e2e. Resolves the FaceFusion
+# ONNX models from the HF cache; compares the thinfer ONNX executor against
+# onnxruntime goldens. Skips cleanly when goldens/models are absent.
+faceswap-e2e = []
+# Opt-in DreamID-V-Wan-1.3B-Faster health e2e (video face swap). Loads the
+# offline-converted DiT + baked context (local scratch paths via env), the Wan2.1
+# VAE from cache, and the DreamID-V repo test-case assets (decoded via the ffmpeg
+# CLI). Skips cleanly when any input is absent. Proves the pipeline runs end to
+# end + produces structured (finite, non-constant) output; NOT the torch parity
+# gate.
+dreamidv-e2e = []
+# Opt-in LTX-2.3 parity tests (Gemma encoder + FE V2, connector, VAE, DiT, e2e).
+# Needs the unsloth LTX-2.3 + gemma QAT GGUF bundle in cache + `uv`.
+ltx-e2e = []
+# Opt-in HunyuanVideo 1.5 (480p T2V) parity tests (VAE, encoder, refiner, DiT,
+# e2e). Same discipline: touches the local HF cache, skips cleanly when uncached.
+hunyuan-e2e = []
+# Opt-in native prompt-rewriter (Qwen3-VL-8B-Instruct) load-smoke test. Loads the
+# cached Q5_K_M GGUF, audits tensor names/shapes, registers all weights. GPU-free.
+# Same discipline: touches the local HF cache, skips cleanly when uncached.
+qwen3-lm = []

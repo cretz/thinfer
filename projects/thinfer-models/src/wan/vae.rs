@@ -1,0 +1,3994 @@
+//! Wan 3D causal video VAE (`AutoencoderKLWan`, Wan2.1 config; `is_residual`
+//! false). Source: `third-party/diffusers/.../autoencoder_kl_wan.py`.
+//!
+//! Config (SkyReels-V2-DF-1.3B / Wan2.1):
+//! - `base_dim = 96`, `z_dim = 16`, `dim_mult = [1, 2, 4, 4]`,
+//!   `num_res_blocks = 2`, `temperal_downsample = [F, T, T]` (so the decoder
+//!   upsamples temporally on blocks 0,1 and spatially-only on block 2; block 3
+//!   does neither). 4x temporal / 8x spatial compression.
+//! - `WanRMS_norm` (channel-dim RMS, no bias, `* sqrt(C) * gamma`) everywhere a
+//!   norm appears (no GroupNorm, unlike Z-Image).
+//! - All convs are `WanCausalConv3d` (front-padded time, symmetric H/W) EXCEPT
+//!   the spatial resample convs, which are per-frame `nn.Conv2d` applied over a
+//!   `[B*T, C, H, W]` reshape (so we reuse the 2D conv kernel for those).
+//!
+//! Decode (`_decode`): `post_quant_conv -> [per latent frame] decoder(...)`,
+//! cat over time, `clamp[-1, 1]`. The decoder is conv_in -> mid(resnet, attn,
+//! resnet) -> 4 up_blocks -> norm_out -> silu -> conv_out. Encode is the mirror
+//! image: conv_in -> 4 down stages -> mid -> norm_out -> silu -> conv_out ->
+//! quant_conv, fed one 4-frame chunk at a time.
+//!
+//! Causality is realized with a host-side `feat_cache`: the per-frame loop keeps
+//! the trailing input frames each causal conv needs and front-assembles them
+//! before dispatch (see the forward driver). This file declares the typed
+//! `WeightId` bundles, residency handles, GPU views, `BufRef` bundles, and the
+//! compiled-pipeline set. The forward driver lands in a follow-up.
+
+use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
+use thinfer_core::cache::KernelKey;
+use thinfer_core::mem::VramCategory;
+use thinfer_core::ops::{
+    ActDtype, AddF32, BcastAddF32, BcastAddOp, ConcatTimeF32, ConcatTimeOp, Conv2dConfig,
+    Conv2dF32, Conv2dOp, Conv3dConfig, Conv3dF32, Conv3dOp, DupUp3dF32, DupUp3dOp, MatMulConfig,
+    MatMulF32, MatmulOp, Op, RmsNorm3dF32, RmsNorm3dOp, SdpaF32LargeD, SdpaOp, SiluF32,
+    Transpose12F32, Transpose12Op, Upsample2dNearestF32, Upsample2dNearestOp, WgslConfig,
+};
+use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
+use thinfer_core::trace::PHASE;
+use thinfer_core::weight::{WeightId, WeightSource};
+use thinfer_core::workspace::{BatchBuf, BatchScope, ScopePacker, Workspace, WsBuf};
+use tracing::Instrument;
+
+use crate::common::loader::{LoadError, register_passthrough};
+
+// ============================================================================
+// Config: derived dims for the Wan2.1 VAE encoder + decoder.
+// ============================================================================
+
+/// Per-variant geometry for the `AutoencoderKLWan` video VAE. A runtime struct
+/// (mirrors [`crate::wan::dit_block::WanDitConfig`]) so a new VAE variant is a
+/// ctor, not a fork: the `is_residual` / `patch_size` flags gate the Wan2.2
+/// structural branches (residual up/down + pixel-shuffle) while the shared
+/// causal-conv decode engine stays single-sourced. All per-stage dims are
+/// methods over `dim_mult` + base dims, so the same code serves Wan2.1 (8x,
+/// z16, non-residual) and FastWan2.2-TI2V (16x, z48, residual) variants.
+#[derive(Clone, Debug)]
+pub struct WanVaeConfig {
+    /// Encoder base channel count.
+    pub base_dim: usize,
+    /// Decoder base channel count (Wan2.2 splits this from `base_dim`).
+    pub decoder_base_dim: usize,
+    pub z_dim: usize,
+    /// Encoder `conv_in` input channels (= raw pixel channels * patch_size^2
+    /// when `patch_size` packs; decoder `conv_out` emits `out_channels`).
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub dim_mult: Vec<usize>,
+    pub num_res_blocks: usize,
+    /// `temperal_downsample` (encoder order, low->high res).
+    pub temporal_downsample: Vec<bool>,
+    /// Wan2.2 residual up/down blocks (`AvgDown3D`/`DupUp3D` shortcuts) when set.
+    pub is_residual: bool,
+    /// Pixel-(un)shuffle factor at the in/out boundary (Wan2.2 = 2; Wan2.1 = 1).
+    pub patch_size: usize,
+    /// Total spatial / temporal compression (decoder upsamples
+    /// `spatial_compression / patch_size`; the trailing patch unshuffle covers
+    /// the rest).
+    pub spatial_compression: usize,
+    pub temporal_compression: usize,
+    /// RMS norm eps floor (matches `F.normalize` default in `WanRMS_norm`).
+    pub norm_eps: f32,
+    /// Baked latent normalization (`z_dim`-vector each); decode pre-scales the
+    /// latent by `z * std + mean` per channel before `post_quant_conv`.
+    pub latents_mean: Vec<f32>,
+    pub latents_std: Vec<f32>,
+}
+
+impl WanVaeConfig {
+    /// FastWan2.2-TI2V-5B VAE (`vae/config.json`): 16x spatial / 4x temporal,
+    /// z48, residual up/down, patch_size 2. Decoder dims (decoder_base_dim 256 *
+    /// `[dim_mult[-1]] + dim_mult[::-1]`) = `[1024, 1024, 1024, 512, 256]`.
+    pub fn fastwan_ti2v_5b() -> Self {
+        Self {
+            base_dim: 160,
+            decoder_base_dim: 256,
+            z_dim: 48,
+            in_channels: 12,
+            out_channels: 12,
+            dim_mult: vec![1, 2, 4, 4],
+            num_res_blocks: 2,
+            temporal_downsample: vec![false, true, true],
+            is_residual: true,
+            patch_size: 2,
+            spatial_compression: 16,
+            temporal_compression: 4,
+            norm_eps: 1e-12,
+            latents_mean: vec![
+                -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382,
+                0.0542, 0.2813, 0.0891, 0.157, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698,
+                0.5109, 0.2665, -0.2108, -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567,
+                -0.0729, 0.0899, -0.2799, -0.123, -0.0313, -0.1649, 0.0117, 0.0723, -0.2839,
+                -0.2083, -0.052, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681,
+                -0.0667,
+            ],
+            latents_std: vec![
+                0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.499, 0.4818, 0.5013, 0.8158, 1.0344,
+                0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804,
+                0.5833, 1.4146, 0.8986, 0.5659, 0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999,
+                0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
+                0.3971, 1.06, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
+            ],
+        }
+    }
+
+    /// Wan2.1 VAE (`AutoencoderKLWan` diffusers defaults; the VAE Wan2.2-A14B
+    /// ships, `Wan2.1_VAE.safetensors`): base_dim 96 (decoder_base_dim defaults to
+    /// base_dim), z_dim 16, in/out 3 (raw RGB, no patch packing), dim_mult
+    /// [1,2,4,4], 2 res blocks, temperal_downsample [F,T,T] -> 8x spatial / 4x
+    /// temporal, NON-residual (no AvgDown/DupUp shortcuts), patch_size 1 (no
+    /// pixel-(un)shuffle). norm_eps 1e-12 (`WanRMS_norm` F.normalize default).
+    /// latents_mean/std are the 16-vecs baked in autoencoder_kl_wan.py.
+    pub fn wan2_1() -> Self {
+        Self {
+            base_dim: 96,
+            decoder_base_dim: 96,
+            z_dim: 16,
+            in_channels: 3,
+            out_channels: 3,
+            dim_mult: vec![1, 2, 4, 4],
+            num_res_blocks: 2,
+            temporal_downsample: vec![false, true, true],
+            is_residual: false,
+            patch_size: 1,
+            spatial_compression: 8,
+            temporal_compression: 4,
+            norm_eps: 1e-12,
+            latents_mean: vec![
+                -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134,
+                -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+            ],
+            latents_std: vec![
+                2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526,
+                2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
+            ],
+        }
+    }
+
+    /// `temperal_upsample` = reversed `temperal_downsample` (decoder order).
+    fn temporal_upsample(&self, i: usize) -> bool {
+        self.temporal_downsample[self.temporal_downsample.len() - 1 - i]
+    }
+
+    /// Decoder spatial upsample factor (8x for both Wan2.1 and 2.2; the rest of
+    /// `spatial_compression` is the trailing patch unshuffle).
+    pub fn decoder_spatial_scale(&self) -> usize {
+        self.spatial_compression / self.patch_size
+    }
+    /// Pixel channels after the final unpatchify (`out_channels / patch_size^2`).
+    pub fn pixel_channels(&self) -> usize {
+        self.out_channels / (self.patch_size * self.patch_size)
+    }
+
+    // --- decoder per-stage dims ---
+    pub fn n_up_blocks(&self) -> usize {
+        self.dim_mult.len()
+    }
+    /// Up_blocks / encoder mid use `num_res_blocks + 1` resnets.
+    pub fn resnets_per_up_block(&self) -> usize {
+        self.num_res_blocks + 1
+    }
+    /// Decoder per-stage channel dims: `decoder_base_dim * ([dim_mult[-1]] +
+    /// dim_mult[::-1])`. Length `n_up_blocks + 1`.
+    pub fn dec_dim(&self, i: usize) -> usize {
+        let n = self.dim_mult.len();
+        let mult = if i == 0 {
+            self.dim_mult[n - 1]
+        } else {
+            self.dim_mult[n - i]
+        };
+        self.decoder_base_dim * mult
+    }
+    /// Channels feeding the mid block / conv_in output (= `dec_dim(0)`).
+    pub fn mid_channels(&self) -> usize {
+        self.dec_dim(0)
+    }
+    /// Up_block `i` output channels (`dims[i+1]`).
+    pub fn up_out_channels(&self, i: usize) -> usize {
+        self.dec_dim(i + 1)
+    }
+    /// Up_block `i` input channels. Wan2.1 halves for `i > 0` (the previous
+    /// upsampler's spatial conv maps `out -> out/2`); the Wan2.2 residual path
+    /// keeps full channels.
+    pub fn up_in_channels(&self, i: usize) -> usize {
+        if self.is_residual || i == 0 {
+            self.dec_dim(i)
+        } else {
+            self.dec_dim(i) / 2
+        }
+    }
+    /// Up_block `i` has an upsampler on all but the last block.
+    pub fn up_has_upsampler(&self, i: usize) -> bool {
+        i + 1 < self.n_up_blocks()
+    }
+    /// Whether up_block `i`'s upsampler upsamples in time (`upsample3d`).
+    pub fn up_temporal(&self, i: usize) -> bool {
+        self.up_has_upsampler(i) && self.temporal_upsample(i)
+    }
+    /// Upsampler spatial conv output channels. Wan2.1 halves (`out/2`); the
+    /// Wan2.2 residual upsampler keeps `out_dim` (`upsample_out_dim=out_dim`).
+    pub fn up_resample_out(&self, i: usize) -> usize {
+        if self.is_residual {
+            self.up_out_channels(i)
+        } else {
+            self.up_out_channels(i) / 2
+        }
+    }
+    /// `DupUp3D` channel `repeat_interleave` count for residual up_block `i`
+    /// (`out * factor_t * factor_s^2 / in`, factor_s fixed at 2 for up_flag).
+    pub fn up_dup_repeats(&self, i: usize) -> usize {
+        let ft = if self.up_temporal(i) { 2 } else { 1 };
+        let factor = ft * 2 * 2;
+        self.up_out_channels(i) * factor / self.up_in_channels(i)
+    }
+
+    // --- encoder per-stage dims ---
+    pub fn n_down_stages(&self) -> usize {
+        self.dim_mult.len()
+    }
+    /// Encoder per-stage channel dims: `base_dim * ([1] + dim_mult)`.
+    pub fn enc_dim(&self, i: usize) -> usize {
+        let mult = if i == 0 { 1 } else { self.dim_mult[i - 1] };
+        self.base_dim * mult
+    }
+    pub fn down_in_channels(&self, i: usize) -> usize {
+        self.enc_dim(i)
+    }
+    pub fn down_out_channels(&self, i: usize) -> usize {
+        self.enc_dim(i + 1)
+    }
+    pub fn down_has_downsampler(&self, i: usize) -> bool {
+        i + 1 < self.n_down_stages()
+    }
+    /// Whether down stage `i`'s downsampler downsamples in time (`downsample3d`).
+    pub fn down_temporal(&self, i: usize) -> bool {
+        self.down_has_downsampler(i) && self.temporal_downsample[i]
+    }
+    /// Encoder mid / norm_out channels (= last enc_dim).
+    pub fn enc_mid_channels(&self) -> usize {
+        self.enc_dim(self.n_down_stages())
+    }
+    /// Encoder latent output channels before quant_conv (`z_dim * 2`).
+    pub fn z_dim_x2(&self) -> usize {
+        self.z_dim * 2
+    }
+}
+
+// ============================================================================
+// Weight ID bundles
+// ============================================================================
+
+/// `WanCausalConv3d` (or per-frame `nn.Conv2d`): weight `[Cout, Cin, kT, kH,
+/// kW]` (or `[Cout, Cin, kH, kW]`) + bias `[Cout]`. Always passthrough (no
+/// transpose), like Z-Image conv2d.
+#[derive(Clone, Debug)]
+pub struct ConvWeights {
+    pub weight: WeightId,
+    pub bias: WeightId,
+}
+
+/// `WanRMS_norm`: per-channel gain only (no bias).
+#[derive(Clone, Debug)]
+pub struct RmsWeights {
+    pub gamma: WeightId,
+}
+
+/// `WanResidualBlock`: norm1 -> conv1 -> norm2 -> conv2 (+ conv_shortcut when
+/// `in != out`).
+#[derive(Clone, Debug)]
+pub struct ResnetWeights {
+    pub norm1: RmsWeights,
+    pub conv1: ConvWeights,
+    pub norm2: RmsWeights,
+    pub conv2: ConvWeights,
+    pub conv_shortcut: Option<ConvWeights>,
+}
+
+/// `WanAttentionBlock`: channel RMS norm, fused `to_qkv` 1x1 conv (`C -> 3C`),
+/// `proj` 1x1 conv (`C -> C`). Single head over `H*W` spatial tokens per frame.
+#[derive(Clone, Debug)]
+pub struct AttnWeights {
+    pub norm: RmsWeights,
+    pub to_qkv: ConvWeights,
+    pub proj: ConvWeights,
+}
+
+/// `WanMidBlock`: resnet -> attention -> resnet.
+#[derive(Clone, Debug)]
+pub struct MidBlockWeights {
+    pub resnets: [ResnetWeights; 2],
+    pub attention: AttnWeights,
+}
+
+/// `WanResample` (decoder upsample): a per-frame spatial conv (`Conv2d`, kept in
+/// `resample.1`) plus, for `upsample3d`, a temporal `time_conv` causal 3D conv.
+#[derive(Clone, Debug)]
+pub struct UpsampleWeights {
+    pub spatial_conv: ConvWeights,
+    pub time_conv: Option<ConvWeights>,
+}
+
+/// `WanUpBlock`: `num_res_blocks + 1` resnets, optional upsampler.
+#[derive(Clone, Debug)]
+pub struct UpBlockWeights {
+    pub resnets: Vec<ResnetWeights>,
+    pub upsampler: Option<UpsampleWeights>,
+}
+
+/// `WanResample` (encoder downsample): a per-frame strided spatial conv plus,
+/// for `downsample3d`, a temporal `time_conv` (stride-2 in time).
+#[derive(Clone, Debug)]
+pub struct DownsampleWeights {
+    pub spatial_conv: ConvWeights,
+    pub time_conv: Option<ConvWeights>,
+}
+
+/// One encoder down stage: `num_res_blocks` resnets + optional downsampler.
+#[derive(Clone, Debug)]
+pub struct DownStageWeights {
+    pub resnets: Vec<ResnetWeights>,
+    pub downsampler: Option<DownsampleWeights>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VaeDecoderWeights {
+    /// `AutoencoderKLWan.post_quant_conv` (`z_dim -> z_dim`, 1x1), applied
+    /// before the decoder proper.
+    pub post_quant_conv: ConvWeights,
+    pub conv_in: ConvWeights,
+    pub mid_block: MidBlockWeights,
+    pub up_blocks: Vec<UpBlockWeights>,
+    pub norm_out: RmsWeights,
+    pub conv_out: ConvWeights,
+}
+
+#[derive(Clone, Debug)]
+pub struct VaeEncoderWeights {
+    pub conv_in: ConvWeights,
+    pub down_stages: Vec<DownStageWeights>,
+    pub mid_block: MidBlockWeights,
+    pub norm_out: RmsWeights,
+    pub conv_out: ConvWeights,
+    /// `AutoencoderKLWan.quant_conv` (`2*z_dim -> 2*z_dim`, 1x1).
+    pub quant_conv: ConvWeights,
+}
+
+impl VaeDecoderWeights {
+    pub fn new(cfg: &WanVaeConfig) -> Self {
+        let conv = conv_ids;
+        let rms = rms_ids;
+
+        let mid_block = MidBlockWeights {
+            resnets: [
+                resnet_ids("decoder.mid_block.resnets.0", false),
+                resnet_ids("decoder.mid_block.resnets.1", false),
+            ],
+            attention: attn_ids("decoder.mid_block.attentions.0"),
+        };
+
+        let mut up_blocks = Vec::with_capacity(cfg.n_up_blocks());
+        for i in 0..cfg.n_up_blocks() {
+            let cin = cfg.up_in_channels(i);
+            let cout = cfg.up_out_channels(i);
+            let mut resnets = Vec::with_capacity(cfg.resnets_per_up_block());
+            for j in 0..cfg.resnets_per_up_block() {
+                let rin = if j == 0 { cin } else { cout };
+                resnets.push(resnet_ids(
+                    &format!("decoder.up_blocks.{i}.resnets.{j}"),
+                    rin != cout,
+                ));
+            }
+            // The residual up_block's `upsamplers` live directly under the block
+            // (Wan2.1 nests them in `upsamplers.0`); the avg_shortcut (DupUp3D)
+            // is parameter-free, so it needs no weight ids.
+            let upsampler = cfg.up_has_upsampler(i).then(|| {
+                let p = if cfg.is_residual {
+                    format!("decoder.up_blocks.{i}.upsampler")
+                } else {
+                    format!("decoder.up_blocks.{i}.upsamplers.0")
+                };
+                UpsampleWeights {
+                    spatial_conv: conv(&format!("{p}.resample.1")),
+                    time_conv: cfg.up_temporal(i).then(|| conv(&format!("{p}.time_conv"))),
+                }
+            });
+            up_blocks.push(UpBlockWeights { resnets, upsampler });
+        }
+
+        Self {
+            post_quant_conv: conv("post_quant_conv"),
+            conv_in: conv("decoder.conv_in"),
+            mid_block,
+            up_blocks,
+            norm_out: rms("decoder.norm_out"),
+            conv_out: conv("decoder.conv_out"),
+        }
+    }
+}
+
+impl VaeEncoderWeights {
+    /// NB: the encoder is not on the generation (decode) path; the Wan2.2
+    /// residual down-block flat-index layout (avg_shortcut) is unported, so this
+    /// currently builds the Wan2.1 non-residual naming. Kept compiling for the
+    /// encode() entry point; revisit when encode parity is needed.
+    pub fn new(cfg: &WanVaeConfig) -> Self {
+        let conv = conv_ids;
+        let rms = rms_ids;
+
+        // Encoder `down_blocks` is a flat ModuleList: each stage contributes
+        // `num_res_blocks` resnets then (for all but the last) a downsampler, so
+        // stage `i` starts at flat index `i * (num_res_blocks + 1)`.
+        let mut down_stages = Vec::with_capacity(cfg.n_down_stages());
+        for i in 0..cfg.n_down_stages() {
+            let cin = cfg.down_in_channels(i);
+            let cout = cfg.down_out_channels(i);
+            let base = i * (cfg.num_res_blocks + 1);
+            let mut resnets = Vec::with_capacity(cfg.num_res_blocks);
+            for j in 0..cfg.num_res_blocks {
+                let rin = if j == 0 { cin } else { cout };
+                resnets.push(resnet_ids(
+                    &format!("encoder.down_blocks.{}", base + j),
+                    rin != cout,
+                ));
+            }
+            let downsampler = cfg.down_has_downsampler(i).then(|| {
+                let p = format!("encoder.down_blocks.{}", base + cfg.num_res_blocks);
+                DownsampleWeights {
+                    spatial_conv: conv(&format!("{p}.resample.1")),
+                    time_conv: cfg
+                        .down_temporal(i)
+                        .then(|| conv(&format!("{p}.time_conv"))),
+                }
+            });
+            down_stages.push(DownStageWeights {
+                resnets,
+                downsampler,
+            });
+        }
+
+        let mid_block = MidBlockWeights {
+            resnets: [
+                resnet_ids("encoder.mid_block.resnets.0", false),
+                resnet_ids("encoder.mid_block.resnets.1", false),
+            ],
+            attention: attn_ids("encoder.mid_block.attentions.0"),
+        };
+
+        Self {
+            conv_in: conv("encoder.conv_in"),
+            down_stages,
+            mid_block,
+            norm_out: rms("encoder.norm_out"),
+            conv_out: conv("encoder.conv_out"),
+            quant_conv: conv("quant_conv"),
+        }
+    }
+}
+
+fn conv_ids(prefix: &str) -> ConvWeights {
+    ConvWeights {
+        weight: WeightId(format!("{prefix}.weight")),
+        bias: WeightId(format!("{prefix}.bias")),
+    }
+}
+
+fn rms_ids(prefix: &str) -> RmsWeights {
+    // `WanRMS_norm.gamma`.
+    RmsWeights {
+        gamma: WeightId(format!("{prefix}.gamma")),
+    }
+}
+
+fn resnet_ids(prefix: &str, has_shortcut: bool) -> ResnetWeights {
+    ResnetWeights {
+        norm1: rms_ids(&format!("{prefix}.norm1")),
+        conv1: conv_ids(&format!("{prefix}.conv1")),
+        norm2: rms_ids(&format!("{prefix}.norm2")),
+        conv2: conv_ids(&format!("{prefix}.conv2")),
+        conv_shortcut: has_shortcut.then(|| conv_ids(&format!("{prefix}.conv_shortcut"))),
+    }
+}
+
+fn attn_ids(prefix: &str) -> AttnWeights {
+    AttnWeights {
+        norm: rms_ids(&format!("{prefix}.norm")),
+        to_qkv: conv_ids(&format!("{prefix}.to_qkv")),
+        proj: conv_ids(&format!("{prefix}.proj")),
+    }
+}
+
+// ============================================================================
+// Residency handles (no GPU allocation; bytes flow on `acquire`)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConvHandles {
+    pub weight: WeightHandle,
+    pub bias: WeightHandle,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RmsHandles {
+    pub gamma: WeightHandle,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ResnetHandles {
+    pub norm1: RmsHandles,
+    pub conv1: ConvHandles,
+    pub norm2: RmsHandles,
+    pub conv2: ConvHandles,
+    pub conv_shortcut: Option<ConvHandles>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AttnHandles {
+    pub norm: RmsHandles,
+    pub to_qkv: ConvHandles,
+    pub proj: ConvHandles,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MidBlockHandles {
+    pub resnets: [ResnetHandles; 2],
+    pub attention: AttnHandles,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UpsampleHandles {
+    pub spatial_conv: ConvHandles,
+    pub time_conv: Option<ConvHandles>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpBlockHandles {
+    pub resnets: Vec<ResnetHandles>,
+    pub upsampler: Option<UpsampleHandles>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DownsampleHandles {
+    pub spatial_conv: ConvHandles,
+    pub time_conv: Option<ConvHandles>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DownStageHandles {
+    pub resnets: Vec<ResnetHandles>,
+    pub downsampler: Option<DownsampleHandles>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VaeDecoderHandles {
+    pub post_quant_conv: ConvHandles,
+    pub conv_in: ConvHandles,
+    pub mid_block: MidBlockHandles,
+    pub up_blocks: Vec<UpBlockHandles>,
+    pub norm_out: RmsHandles,
+    pub conv_out: ConvHandles,
+}
+
+#[derive(Clone, Debug)]
+pub struct VaeEncoderHandles {
+    pub conv_in: ConvHandles,
+    pub down_stages: Vec<DownStageHandles>,
+    pub mid_block: MidBlockHandles,
+    pub norm_out: RmsHandles,
+    pub conv_out: ConvHandles,
+    pub quant_conv: ConvHandles,
+}
+
+// ============================================================================
+// Registration: build handles from weight names (no GPU upload yet).
+// ============================================================================
+
+fn reg_conv<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &ConvWeights,
+) -> Result<ConvHandles, LoadError> {
+    Ok(ConvHandles {
+        weight: register_passthrough(residency, &w.weight)?,
+        bias: register_passthrough(residency, &w.bias)?,
+    })
+}
+
+fn reg_rms<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &RmsWeights,
+) -> Result<RmsHandles, LoadError> {
+    Ok(RmsHandles {
+        gamma: register_passthrough(residency, &w.gamma)?,
+    })
+}
+
+fn reg_resnet<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &ResnetWeights,
+) -> Result<ResnetHandles, LoadError> {
+    Ok(ResnetHandles {
+        norm1: reg_rms(residency, &w.norm1)?,
+        conv1: reg_conv(residency, &w.conv1)?,
+        norm2: reg_rms(residency, &w.norm2)?,
+        conv2: reg_conv(residency, &w.conv2)?,
+        conv_shortcut: match &w.conv_shortcut {
+            Some(c) => Some(reg_conv(residency, c)?),
+            None => None,
+        },
+    })
+}
+
+fn reg_attn<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &AttnWeights,
+) -> Result<AttnHandles, LoadError> {
+    Ok(AttnHandles {
+        norm: reg_rms(residency, &w.norm)?,
+        to_qkv: reg_conv(residency, &w.to_qkv)?,
+        proj: reg_conv(residency, &w.proj)?,
+    })
+}
+
+fn reg_mid<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &MidBlockWeights,
+) -> Result<MidBlockHandles, LoadError> {
+    Ok(MidBlockHandles {
+        resnets: [
+            reg_resnet(residency, &w.resnets[0])?,
+            reg_resnet(residency, &w.resnets[1])?,
+        ],
+        attention: reg_attn(residency, &w.attention)?,
+    })
+}
+
+pub fn register_decoder<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &VaeDecoderWeights,
+) -> Result<VaeDecoderHandles, LoadError> {
+    let mut up_blocks = Vec::with_capacity(w.up_blocks.len());
+    for ub in &w.up_blocks {
+        let mut resnets = Vec::with_capacity(ub.resnets.len());
+        for r in &ub.resnets {
+            resnets.push(reg_resnet(residency, r)?);
+        }
+        let upsampler = match &ub.upsampler {
+            Some(u) => Some(UpsampleHandles {
+                spatial_conv: reg_conv(residency, &u.spatial_conv)?,
+                time_conv: match &u.time_conv {
+                    Some(c) => Some(reg_conv(residency, c)?),
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+        up_blocks.push(UpBlockHandles { resnets, upsampler });
+    }
+    Ok(VaeDecoderHandles {
+        post_quant_conv: reg_conv(residency, &w.post_quant_conv)?,
+        conv_in: reg_conv(residency, &w.conv_in)?,
+        mid_block: reg_mid(residency, &w.mid_block)?,
+        up_blocks,
+        norm_out: reg_rms(residency, &w.norm_out)?,
+        conv_out: reg_conv(residency, &w.conv_out)?,
+    })
+}
+
+pub fn register_encoder<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &VaeEncoderWeights,
+) -> Result<VaeEncoderHandles, LoadError> {
+    let mut down_stages = Vec::with_capacity(w.down_stages.len());
+    for ds in &w.down_stages {
+        let mut resnets = Vec::with_capacity(ds.resnets.len());
+        for r in &ds.resnets {
+            resnets.push(reg_resnet(residency, r)?);
+        }
+        let downsampler = match &ds.downsampler {
+            Some(d) => Some(DownsampleHandles {
+                spatial_conv: reg_conv(residency, &d.spatial_conv)?,
+                time_conv: match &d.time_conv {
+                    Some(c) => Some(reg_conv(residency, c)?),
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+        down_stages.push(DownStageHandles {
+            resnets,
+            downsampler,
+        });
+    }
+    Ok(VaeEncoderHandles {
+        conv_in: reg_conv(residency, &w.conv_in)?,
+        down_stages,
+        mid_block: reg_mid(residency, &w.mid_block)?,
+        norm_out: reg_rms(residency, &w.norm_out)?,
+        conv_out: reg_conv(residency, &w.conv_out)?,
+        quant_conv: reg_conv(residency, &w.quant_conv)?,
+    })
+}
+
+// ============================================================================
+// GpuView bundles (pin guards; `bufs()` materializes BufRefs)
+// ============================================================================
+
+pub struct ConvViews<'a> {
+    pub weight: GpuView<'a>,
+    pub bias: GpuView<'a>,
+}
+pub struct RmsViews<'a> {
+    pub gamma: GpuView<'a>,
+}
+pub struct ResnetViews<'a> {
+    pub norm1: RmsViews<'a>,
+    pub conv1: ConvViews<'a>,
+    pub norm2: RmsViews<'a>,
+    pub conv2: ConvViews<'a>,
+    pub conv_shortcut: Option<ConvViews<'a>>,
+}
+pub struct AttnViews<'a> {
+    pub norm: RmsViews<'a>,
+    pub to_qkv: ConvViews<'a>,
+    pub proj: ConvViews<'a>,
+}
+pub struct MidBlockViews<'a> {
+    pub resnets: [ResnetViews<'a>; 2],
+    pub attention: AttnViews<'a>,
+}
+pub struct UpsampleViews<'a> {
+    pub spatial_conv: ConvViews<'a>,
+    pub time_conv: Option<ConvViews<'a>>,
+}
+pub struct UpBlockViews<'a> {
+    pub resnets: Vec<ResnetViews<'a>>,
+    pub upsampler: Option<UpsampleViews<'a>>,
+}
+pub struct DownsampleViews<'a> {
+    pub spatial_conv: ConvViews<'a>,
+    pub time_conv: Option<ConvViews<'a>>,
+}
+pub struct DownStageViews<'a> {
+    pub resnets: Vec<ResnetViews<'a>>,
+    pub downsampler: Option<DownsampleViews<'a>>,
+}
+pub struct VaeDecoderViews<'a> {
+    pub post_quant_conv: ConvViews<'a>,
+    pub conv_in: ConvViews<'a>,
+    pub mid_block: MidBlockViews<'a>,
+    pub up_blocks: Vec<UpBlockViews<'a>>,
+    pub norm_out: RmsViews<'a>,
+    pub conv_out: ConvViews<'a>,
+}
+pub struct VaeEncoderViews<'a> {
+    pub conv_in: ConvViews<'a>,
+    pub down_stages: Vec<DownStageViews<'a>>,
+    pub mid_block: MidBlockViews<'a>,
+    pub norm_out: RmsViews<'a>,
+    pub conv_out: ConvViews<'a>,
+    pub quant_conv: ConvViews<'a>,
+}
+
+// ============================================================================
+// BufRef bundles (post-acquire, for forward driver)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConvBufs {
+    pub weight: thinfer_core::backend::BufRef,
+    pub bias: thinfer_core::backend::BufRef,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct RmsBufs {
+    pub gamma: thinfer_core::backend::BufRef,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ResnetBufs {
+    pub norm1: RmsBufs,
+    pub conv1: ConvBufs,
+    pub norm2: RmsBufs,
+    pub conv2: ConvBufs,
+    pub conv_shortcut: Option<ConvBufs>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct AttnBufs {
+    pub norm: RmsBufs,
+    pub to_qkv: ConvBufs,
+    pub proj: ConvBufs,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct MidBlockBufs {
+    pub resnets: [ResnetBufs; 2],
+    pub attention: AttnBufs,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct UpsampleBufs {
+    pub spatial_conv: ConvBufs,
+    pub time_conv: Option<ConvBufs>,
+}
+#[derive(Clone, Debug)]
+pub struct UpBlockBufs {
+    pub resnets: Vec<ResnetBufs>,
+    pub upsampler: Option<UpsampleBufs>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct DownsampleBufs {
+    pub spatial_conv: ConvBufs,
+    pub time_conv: Option<ConvBufs>,
+}
+#[derive(Clone, Debug)]
+pub struct DownStageBufs {
+    pub resnets: Vec<ResnetBufs>,
+    pub downsampler: Option<DownsampleBufs>,
+}
+#[derive(Clone, Debug)]
+pub struct VaeDecoderBufs {
+    pub post_quant_conv: ConvBufs,
+    pub conv_in: ConvBufs,
+    pub mid_block: MidBlockBufs,
+    pub up_blocks: Vec<UpBlockBufs>,
+    pub norm_out: RmsBufs,
+    pub conv_out: ConvBufs,
+}
+#[derive(Clone, Debug)]
+pub struct VaeEncoderBufs {
+    pub conv_in: ConvBufs,
+    pub down_stages: Vec<DownStageBufs>,
+    pub mid_block: MidBlockBufs,
+    pub norm_out: RmsBufs,
+    pub conv_out: ConvBufs,
+    pub quant_conv: ConvBufs,
+}
+
+impl ConvViews<'_> {
+    pub fn bufs(&self) -> ConvBufs {
+        ConvBufs {
+            weight: self.weight.buf(),
+            bias: self.bias.buf(),
+        }
+    }
+}
+impl RmsViews<'_> {
+    pub fn bufs(&self) -> RmsBufs {
+        RmsBufs {
+            gamma: self.gamma.buf(),
+        }
+    }
+}
+impl ResnetViews<'_> {
+    pub fn bufs(&self) -> ResnetBufs {
+        ResnetBufs {
+            norm1: self.norm1.bufs(),
+            conv1: self.conv1.bufs(),
+            norm2: self.norm2.bufs(),
+            conv2: self.conv2.bufs(),
+            conv_shortcut: self.conv_shortcut.as_ref().map(|c| c.bufs()),
+        }
+    }
+}
+impl AttnViews<'_> {
+    pub fn bufs(&self) -> AttnBufs {
+        AttnBufs {
+            norm: self.norm.bufs(),
+            to_qkv: self.to_qkv.bufs(),
+            proj: self.proj.bufs(),
+        }
+    }
+}
+impl MidBlockViews<'_> {
+    pub fn bufs(&self) -> MidBlockBufs {
+        MidBlockBufs {
+            resnets: [self.resnets[0].bufs(), self.resnets[1].bufs()],
+            attention: self.attention.bufs(),
+        }
+    }
+}
+impl UpBlockViews<'_> {
+    pub fn bufs(&self) -> UpBlockBufs {
+        UpBlockBufs {
+            resnets: self.resnets.iter().map(|r| r.bufs()).collect(),
+            upsampler: self.upsampler.as_ref().map(|u| UpsampleBufs {
+                spatial_conv: u.spatial_conv.bufs(),
+                time_conv: u.time_conv.as_ref().map(|c| c.bufs()),
+            }),
+        }
+    }
+}
+impl DownStageViews<'_> {
+    pub fn bufs(&self) -> DownStageBufs {
+        DownStageBufs {
+            resnets: self.resnets.iter().map(|r| r.bufs()).collect(),
+            downsampler: self.downsampler.as_ref().map(|d| DownsampleBufs {
+                spatial_conv: d.spatial_conv.bufs(),
+                time_conv: d.time_conv.as_ref().map(|c| c.bufs()),
+            }),
+        }
+    }
+}
+impl VaeDecoderViews<'_> {
+    pub fn bufs(&self) -> VaeDecoderBufs {
+        VaeDecoderBufs {
+            post_quant_conv: self.post_quant_conv.bufs(),
+            conv_in: self.conv_in.bufs(),
+            mid_block: self.mid_block.bufs(),
+            up_blocks: self.up_blocks.iter().map(|u| u.bufs()).collect(),
+            norm_out: self.norm_out.bufs(),
+            conv_out: self.conv_out.bufs(),
+        }
+    }
+}
+impl VaeEncoderViews<'_> {
+    pub fn bufs(&self) -> VaeEncoderBufs {
+        VaeEncoderBufs {
+            conv_in: self.conv_in.bufs(),
+            down_stages: self.down_stages.iter().map(|d| d.bufs()).collect(),
+            mid_block: self.mid_block.bufs(),
+            norm_out: self.norm_out.bufs(),
+            conv_out: self.conv_out.bufs(),
+            quant_conv: self.quant_conv.bufs(),
+        }
+    }
+}
+
+// ============================================================================
+// `acquire` impls (page weights resident; return pin guards)
+// ============================================================================
+
+impl ConvHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<ConvViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        Ok(ConvViews {
+            weight: residency.acquire(self.weight, backend).await?,
+            bias: residency.acquire(self.bias, backend).await?,
+        })
+    }
+}
+
+impl RmsHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<RmsViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        Ok(RmsViews {
+            gamma: residency.acquire(self.gamma, backend).await?,
+        })
+    }
+}
+
+impl ResnetHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<ResnetViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        Ok(ResnetViews {
+            norm1: self.norm1.acquire(residency, backend).await?,
+            conv1: self.conv1.acquire(residency, backend).await?,
+            norm2: self.norm2.acquire(residency, backend).await?,
+            conv2: self.conv2.acquire(residency, backend).await?,
+            conv_shortcut: match self.conv_shortcut {
+                Some(c) => Some(c.acquire(residency, backend).await?),
+                None => None,
+            },
+        })
+    }
+}
+
+impl AttnHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<AttnViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        Ok(AttnViews {
+            norm: self.norm.acquire(residency, backend).await?,
+            to_qkv: self.to_qkv.acquire(residency, backend).await?,
+            proj: self.proj.acquire(residency, backend).await?,
+        })
+    }
+}
+
+impl MidBlockHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<MidBlockViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        Ok(MidBlockViews {
+            resnets: [
+                self.resnets[0].acquire(residency, backend).await?,
+                self.resnets[1].acquire(residency, backend).await?,
+            ],
+            attention: self.attention.acquire(residency, backend).await?,
+        })
+    }
+}
+
+impl UpBlockHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<UpBlockViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        let mut resnets = Vec::with_capacity(self.resnets.len());
+        for r in &self.resnets {
+            resnets.push(r.acquire(residency, backend).await?);
+        }
+        let upsampler = match &self.upsampler {
+            Some(u) => Some(UpsampleViews {
+                spatial_conv: u.spatial_conv.acquire(residency, backend).await?,
+                time_conv: match &u.time_conv {
+                    Some(c) => Some(c.acquire(residency, backend).await?),
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+        Ok(UpBlockViews { resnets, upsampler })
+    }
+}
+
+impl DownStageHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<DownStageViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        let mut resnets = Vec::with_capacity(self.resnets.len());
+        for r in &self.resnets {
+            resnets.push(r.acquire(residency, backend).await?);
+        }
+        let downsampler = match &self.downsampler {
+            Some(d) => Some(DownsampleViews {
+                spatial_conv: d.spatial_conv.acquire(residency, backend).await?,
+                time_conv: match &d.time_conv {
+                    Some(c) => Some(c.acquire(residency, backend).await?),
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+        Ok(DownStageViews {
+            resnets,
+            downsampler,
+        })
+    }
+}
+
+impl VaeDecoderHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<VaeDecoderViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        let mut up_blocks = Vec::with_capacity(self.up_blocks.len());
+        for ub in &self.up_blocks {
+            up_blocks.push(ub.acquire(residency, backend).await?);
+        }
+        Ok(VaeDecoderViews {
+            post_quant_conv: self.post_quant_conv.acquire(residency, backend).await?,
+            conv_in: self.conv_in.acquire(residency, backend).await?,
+            mid_block: self.mid_block.acquire(residency, backend).await?,
+            up_blocks,
+            norm_out: self.norm_out.acquire(residency, backend).await?,
+            conv_out: self.conv_out.acquire(residency, backend).await?,
+        })
+    }
+}
+
+impl VaeEncoderHandles {
+    pub async fn acquire<'r, S: WeightSource>(
+        &self,
+        residency: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<VaeEncoderViews<'r>, ResidencyError<S::Error, WgpuError>> {
+        let mut down_stages = Vec::with_capacity(self.down_stages.len());
+        for ds in &self.down_stages {
+            down_stages.push(ds.acquire(residency, backend).await?);
+        }
+        Ok(VaeEncoderViews {
+            conv_in: self.conv_in.acquire(residency, backend).await?,
+            down_stages,
+            mid_block: self.mid_block.acquire(residency, backend).await?,
+            norm_out: self.norm_out.acquire(residency, backend).await?,
+            conv_out: self.conv_out.acquire(residency, backend).await?,
+            quant_conv: self.quant_conv.acquire(residency, backend).await?,
+        })
+    }
+}
+
+// ============================================================================
+// Compiled pipelines
+// ============================================================================
+
+/// One compiled conv3d variant: pipeline + the op (tile config) it was built
+/// from.
+pub struct Conv3dPipeline {
+    pub pipeline: thinfer_core::backend::WgpuPipeline,
+    pub op: Conv3dF32,
+}
+
+impl Conv3dPipeline {
+    async fn compile(
+        backend: &WgpuBackend,
+        label: &str,
+        cfg: &WgslConfig,
+        tile: Conv3dConfig,
+    ) -> Result<Self, WgpuError> {
+        use thinfer_core::backend::Backend;
+        let op = Conv3dF32::new(tile);
+        let pipeline = backend
+            .create_pipeline(
+                label,
+                &op.wgsl(cfg),
+                "main",
+                <Conv3dF32 as Conv3dOp>::layout(),
+            )
+            .await?;
+        Ok(Self { pipeline, op })
+    }
+}
+
+/// One compiled conv2d variant (the per-frame spatial resample convs).
+pub struct Conv2dPipeline {
+    pub pipeline: thinfer_core::backend::WgpuPipeline,
+    pub op: Conv2dF32,
+}
+
+impl Conv2dPipeline {
+    async fn compile(
+        backend: &WgpuBackend,
+        label: &str,
+        cfg: &WgslConfig,
+        tile: Conv2dConfig,
+    ) -> Result<Self, WgpuError> {
+        use thinfer_core::backend::Backend;
+        let op = Conv2dF32::new(tile);
+        let pipeline = backend
+            .create_pipeline(
+                label,
+                &op.wgsl(cfg),
+                "main",
+                <Conv2dF32 as Conv2dOp>::layout(),
+            )
+            .await?;
+        Ok(Self { pipeline, op })
+    }
+}
+
+/// Mid-block 1-head attention linear matmul tile (tokens x C @ C x C). Same
+/// config serves q/k/v/proj.
+const VAE_MATMUL_CFG: MatMulConfig = MatMulConfig {
+    bm: 64,
+    bn: 64,
+    bk: 16,
+    tm: 4,
+    tn: 4,
+    b_nmajor: false,
+};
+
+/// Small-N conv3d tile: conv_out (cout=3) / latent convs (cout=16/32). The
+/// default bm=64 tile idles most rows when cout is tiny.
+const CONV3D_TILE_SMALL_N: Conv3dConfig = Conv3dConfig {
+    bm: 4,
+    bn: 128,
+    bk: 32,
+    tm: 1,
+    tn: 2,
+};
+
+/// Decoder conv tiles. The VAE decode is conv-GPU bound (~95% of wall is
+/// conv3d+conv2d) and the implicit-GEMM kernels are memory-bandwidth bound, so
+/// global traffic per output (`bk*(1/bm + 1/bn)`) is the lever: `bm=128` halves
+/// the weight-side reads vs the 64x64 default. The register block (`tm*tn=48`,
+/// 256 threads) is the occupancy sweet spot found by sweep -- 64 accumulators
+/// (128x128) regressed on register pressure, 32 (128x64) left throughput on the
+/// table. Bit-identical to the default tile: f32 accumulation in ascending-k
+/// order is independent of the tile shape. Measured -27% conv3d / -28% conv2d
+/// ms/disp at 576x576 (RTX 5070 Laptop). Distinct from the global
+/// `Conv*Config::DEFAULT` (shared by other models) on purpose.
+const WAN_VAE_CONV3D_TILE: Conv3dConfig = Conv3dConfig {
+    bm: 128,
+    bn: 96,
+    bk: 16,
+    tm: 8,
+    tn: 6,
+};
+const WAN_VAE_CONV2D_TILE: Conv2dConfig = Conv2dConfig {
+    bm: 128,
+    bn: 96,
+    bk: 16,
+    tm: 8,
+    tn: 6,
+    prefetch: false,
+};
+
+/// Every WGSL pipeline the Wan VAE forward dispatches. Shared encoder + decoder.
+pub struct WanVaePipelines {
+    /// Activation storage dtype: F16 when the device has `SHADER_F16`, else F32.
+    pub act_dtype: ActDtype,
+    pub act_size: u64,
+    pub conv3d: Conv3dPipeline,
+    pub conv3d_small_n: Conv3dPipeline,
+    pub conv2d: Conv2dPipeline,
+    /// Time-axis concat for `feat_cache` assembly (see `concat_time` op).
+    pub concat_time: thinfer_core::backend::WgpuPipeline,
+    pub rmsnorm3d: thinfer_core::backend::WgpuPipeline,
+    pub silu: thinfer_core::backend::WgpuPipeline,
+    pub upsample: thinfer_core::backend::WgpuPipeline,
+    pub add: thinfer_core::backend::WgpuPipeline,
+    pub matmul: thinfer_core::backend::WgpuPipeline,
+    pub matmul_op: MatMulF32,
+    pub bcast_add: thinfer_core::backend::WgpuPipeline,
+    pub sdpa_large_d: thinfer_core::backend::WgpuPipeline,
+    pub transpose12: thinfer_core::backend::WgpuPipeline,
+    /// Wan2.2 residual up-block avg_shortcut (`DupUp3D`); unused by Wan2.1.
+    pub dupup3d: thinfer_core::backend::WgpuPipeline,
+}
+
+impl WanVaePipelines {
+    pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
+        use thinfer_core::backend::Backend;
+        let act_dtype = if backend.supports_shader_f16() {
+            ActDtype::F16
+        } else {
+            ActDtype::F32
+        };
+        let cfg = &WgslConfig {
+            bf16_quant_writes: false,
+            act_dtype,
+            weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
+        };
+        Ok(Self {
+            act_dtype,
+            act_size: act_dtype.bytes_per_elem(),
+            conv3d: Conv3dPipeline::compile(backend, "wan_vae_conv3d", cfg, WAN_VAE_CONV3D_TILE)
+                .await?,
+            conv3d_small_n: Conv3dPipeline::compile(
+                backend,
+                "wan_vae_conv3d_small_n",
+                cfg,
+                CONV3D_TILE_SMALL_N,
+            )
+            .await?,
+            conv2d: Conv2dPipeline::compile(backend, "wan_vae_conv2d", cfg, WAN_VAE_CONV2D_TILE)
+                .await?,
+            concat_time: backend
+                .create_pipeline(
+                    "wan_vae_concat_time",
+                    &<ConcatTimeF32 as ConcatTimeOp>::wgsl(cfg),
+                    "main",
+                    <ConcatTimeF32 as ConcatTimeOp>::layout(),
+                )
+                .await?,
+            rmsnorm3d: backend
+                .create_pipeline(
+                    "wan_vae_rmsnorm3d",
+                    &<RmsNorm3dF32 as RmsNorm3dOp>::wgsl(cfg),
+                    "main",
+                    <RmsNorm3dF32 as RmsNorm3dOp>::layout(),
+                )
+                .await?,
+            silu: backend
+                .create_pipeline(
+                    "wan_vae_silu",
+                    SiluF32::wgsl(cfg),
+                    "main",
+                    SiluF32::layout(),
+                )
+                .await?,
+            upsample: backend
+                .create_pipeline(
+                    "wan_vae_upsample",
+                    <Upsample2dNearestF32 as Upsample2dNearestOp>::wgsl(cfg),
+                    "main",
+                    <Upsample2dNearestF32 as Upsample2dNearestOp>::layout(),
+                )
+                .await?,
+            add: backend
+                .create_pipeline("wan_vae_add", AddF32::wgsl(cfg), "main", AddF32::layout())
+                .await?,
+            matmul: {
+                let op = MatMulF32::new(VAE_MATMUL_CFG);
+                backend
+                    .create_pipeline(
+                        "wan_vae_matmul",
+                        &op.wgsl(cfg),
+                        "main",
+                        <MatMulF32 as MatmulOp>::layout(),
+                    )
+                    .await?
+            },
+            matmul_op: MatMulF32::new(VAE_MATMUL_CFG),
+            bcast_add: backend
+                .create_pipeline(
+                    "wan_vae_bcast_add",
+                    <BcastAddF32 as BcastAddOp>::wgsl(cfg),
+                    "main",
+                    <BcastAddF32 as BcastAddOp>::layout(),
+                )
+                .await?,
+            sdpa_large_d: backend
+                .create_pipeline(
+                    "wan_vae_sdpa_large_d",
+                    <SdpaF32LargeD as SdpaOp>::wgsl(cfg),
+                    "main",
+                    <SdpaF32LargeD as SdpaOp>::layout(),
+                )
+                .await?,
+            transpose12: backend
+                .create_pipeline(
+                    "wan_vae_transpose12",
+                    <Transpose12F32 as Transpose12Op>::wgsl(cfg),
+                    "main",
+                    <Transpose12F32 as Transpose12Op>::layout(),
+                )
+                .await?,
+            dupup3d: backend
+                .create_pipeline(
+                    "wan_vae_dupup3d",
+                    <DupUp3dF32 as DupUp3dOp>::wgsl(cfg),
+                    "main",
+                    <DupUp3dF32 as DupUp3dOp>::layout(),
+                )
+                .await?,
+        })
+    }
+
+    pub fn kernel_keys() -> [KernelKey; 12] {
+        let kk = |id: &'static str| KernelKey {
+            kernel_id: id,
+            hint: String::new(),
+        };
+        [
+            kk(<Conv3dF32 as Conv3dOp>::KERNEL_ID),
+            kk(<Conv2dF32 as Conv2dOp>::KERNEL_ID),
+            kk(<ConcatTimeF32 as ConcatTimeOp>::KERNEL_ID),
+            kk(<RmsNorm3dF32 as RmsNorm3dOp>::KERNEL_ID),
+            kk(<SiluF32 as Op>::KERNEL_ID),
+            kk(<Upsample2dNearestF32 as Upsample2dNearestOp>::KERNEL_ID),
+            kk(<AddF32 as Op>::KERNEL_ID),
+            kk(<MatMulF32 as MatmulOp>::KERNEL_ID),
+            kk(<BcastAddF32 as BcastAddOp>::KERNEL_ID),
+            kk(<SdpaF32LargeD as SdpaOp>::KERNEL_ID),
+            kk(<Transpose12F32 as Transpose12Op>::KERNEL_ID),
+            kk(<DupUp3dF32 as DupUp3dOp>::KERNEL_ID),
+        ]
+    }
+}
+
+// ============================================================================
+// Forward driver (decoder). Encoder lands in a follow-up.
+// ============================================================================
+//
+// The decoder runs `_decode` (`autoencoder_kl_wan.py`) one latent frame at a
+// time: each frame is its own `BatchScope` + submit (the VAE single-heavy-submit
+// rule), and causality is carried between frames by a host-side `feat_cache`
+// (one entry per `kt=3` causal conv, assembled in front of the next frame's
+// conv with `concat_time`). All activations are NCTHW row-major; the only
+// excursions are inside the spatial resample (per-frame NTCHW for the 2D conv)
+// and the mid-block attention (token layout for sdpa). B is fixed at 1 (one
+// video), which lets the attention channel-split use contiguous sub-ranges.
+
+/// NCTHW activation shape carried through the decoder.
+#[derive(Clone, Copy, Debug)]
+struct Shape5 {
+    b: u32,
+    c: u32,
+    t: u32,
+    h: u32,
+    w: u32,
+}
+
+impl Shape5 {
+    fn elems(&self) -> u32 {
+        self.b * self.c * self.t * self.h * self.w
+    }
+    fn bytes(&self, act_size: u64) -> u64 {
+        self.elems() as u64 * act_size
+    }
+    /// Positions for `rmsnorm3d` (one thread per `(b, t, h, w)`).
+    fn n_pos(&self) -> u32 {
+        self.b * self.t * self.h * self.w
+    }
+    /// Per-channel time stride for `rmsnorm3d` (`T*H*W`).
+    fn thw(&self) -> u32 {
+        self.t * self.h * self.w
+    }
+}
+
+/// Per-submit work cap for the decoder's `ScopePacker` (NOT the VRAM ceiling).
+/// At native res a single full-res frame is ~2.3s of GPU work; one submit that
+/// long trips the Windows 2s GPU watchdog (TDR). The packer accumulates phase
+/// outputs into a scope until their bytes exceed this cap, then cuts a fresh
+/// submit, so each submit stays well under the watchdog. Sized so small
+/// (parity, 64px) frames stay a single submit -- bit-identical to no packing --
+/// while full-res resnets (~400 MB output each) land one-per-submit.
+const VAE_SUBMIT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+
+// Spatial tiling of the decode (native res). A full-frame decode keeps the
+// whole activation pyramid + per-conv `FeatCache` live at output res, which
+// overruns the VRAM budget at 540P+. The arbiter budget can only reclaim *idle*
+// buffers; the decode's caches + chain are all simultaneously *live*, so nothing
+// is reclaimable and a full frame overshoots the budget straight to a hardware
+// OOM. Tiling is the only lever that shrinks the live set itself: the decode
+// runs in overlapping latent tiles whose size is derived from the budget
+// (`vae_tile_dims`), bounding the per-tile working set -- and thus peak VRAM --
+// regardless of output resolution. Adjacent tiles overlap by a halo that absorbs
+// each tile's interior zero-pad seam error and is feather-blended away. When
+// both latent dims fit one tile (parity res), the plan is a single full tile
+// with unit weights -> bit-identical to the untiled path. Sizes are in LATENT
+// pixels (output is 8x).
+
+/// Floor: an 8-latent (64px) decode tile fits any usable device. Shared by the
+/// tile sizer and the decode OOM-retry (a tile already at the floor cannot
+/// shrink further, so the error propagates).
+const VAE_DEC_TILE_MIN: u32 = 8;
+/// Fraction of the workspace budget the INITIAL decode tile is sized to (LTX
+/// precedent): the peak model tracks the measured points closely but does not
+/// model pool size-class fragmentation / staging exactly, so seeding AT the
+/// budget edge OOMs on the first native-res tile (measured: 832x480x81f under
+/// a 6 GiB budget picked tile 26 whose real peak overran by ~5%). The margin
+/// lands the common case on the first try; the strict-budget re-seed corrects
+/// any remaining error without a device OOM.
+const VAE_SEED_SAFETY: f64 = 0.82;
+/// Budget step-down per OOM re-seed (balanced shrink, not an axis halve).
+const VAE_OOM_SHRINK: f64 = 0.7;
+
+/// Largest square latent tile (and its overlap) whose decode working set fits
+/// `workspace_budget` (the VRAM budget already net of the resident VAE weights
+/// and staging; see the decode call site). The live set has two parts, both
+/// scaling with the per-group output frame count `max_tout`: each
+/// `decode_frame` temporally upsamples one latent frame to `tout` video frames
+/// (`temporal_compression` for every group after the first), and the high-res
+/// up_blocks then run at that T.
+///
+///   ws(area, tout) = FIXED(tout) + area * PER_AREA(tout)
+///
+/// `area`-scaling shrinks with the tile; `FIXED` (the temporal buffers carried
+/// across the up_blocks) does NOT -- it is a floor tiling cannot pass, so
+/// there is a min budget below which even `TILE_MIN` will not fit. Calibrated
+/// from four measured f16 points on the FastWan2.2-TI2V-5B decoder
+/// (`decoder_base_dim` 256; tile 11 & 22 at tout 1 & 4): tout=1 has ~no fixed
+/// term and ~2.4 MiB/area; tout=4 adds ~553 MiB fixed and ~6.0 MiB/area. Every
+/// term of the live set (activations, feat_cache, DupUp saves) is linear in
+/// the per-stage channel counts, which are all `decoder_base_dim * mult` with
+/// the same mult vector across variants, so other configs scale the calibrated
+/// bytes by `decoder_base_dim / 256` (Wan2.1 at base 96 -> 0.375x, matching an
+/// analytic walk of its stage shapes). The old area-only model (one constant)
+/// undercounted small tiles and the tout=4 groups, overrunning a thin budget
+/// at 540P+. Recalibrate these if the decoder graph changes.
+fn vae_tile_dims(
+    workspace_budget: u64,
+    act_size: u64,
+    max_tout: u32,
+    cfg: &WanVaeConfig,
+) -> (u32, u32) {
+    /// Fixed (tile-independent) workspace bytes at f16 per output frame beyond
+    /// the first: the temporal buffers the up_blocks carry across frames.
+    const FIXED_PER_EXTRA_T_F16: u64 = 193_000_000;
+    /// Workspace bytes per latent-px^2 at f16, T-independent stages.
+    const AREA_BASE_F16: u64 = 1_260_000;
+    /// Additional workspace bytes per latent-px^2 at f16, per output frame.
+    const AREA_PER_T_F16: u64 = 1_270_000;
+    /// `decoder_base_dim` the constants were measured on (FastWan2.2-TI2V-5B).
+    const CAL_BASE_DIM: u64 = 256;
+    /// Upper cap so a huge budget doesn't pick a TDR-prone megatile.
+    const TILE_MAX: u32 = 96;
+
+    // Channel scale vs the calibration decoder (see doc comment).
+    let base = cfg.decoder_base_dim as u64;
+    let fixed = FIXED_PER_EXTRA_T_F16 * u64::from(max_tout.saturating_sub(1)) * act_size / 2 * base
+        / CAL_BASE_DIM;
+    let per_area = ((AREA_BASE_F16 + AREA_PER_T_F16 * u64::from(max_tout)) * act_size / 2 * base
+        / CAL_BASE_DIM)
+        .max(1);
+    let area = workspace_budget.saturating_sub(fixed) / per_area;
+    let tile = ((area as f64).sqrt() as u32).clamp(VAE_DEC_TILE_MIN, TILE_MAX);
+    // Overlap ~1/4 of the tile (>=4 latent / 32px) for a smooth feather seam.
+    let overlap = (tile / 4).max(4);
+    (tile, overlap)
+}
+
+/// Input-pixel halo radius added on every side of an encoder tile so its valid
+/// (non-halo) latent output is bit-exact through the CONV stack vs the untiled
+/// encode. Derived by walking one /8 latent output pixel back through the
+/// spatial conv stack (conv_in 3x3; per down stage 2 resnets = 4x 3x3 pad-1
+/// convs; 3 stride-2 3x3 downsamplers between stages 0/1/2; mid block 2 resnets
+/// = 4x 3x3): backward radius accumulates 4 (mid) +4 (stage3) -> 8 at /8;
+/// `*2+1` through each stride-2 downsampler with +4 convs per level lands at
+/// ~100 input px. Rounded UP to 128 (a clean 16-latent-px = 64-px-multiple
+/// band) for margin. The mid block's attention is GLOBAL over the tile's
+/// spatial positions (same as the decoder's per-tile mid attention), so it is
+/// NOT made exact by any finite halo; this 128-px context band is the same
+/// approximation the GREEN decoder tiling accepts, hidden here by cropping the
+/// halo (vs the decoder's feather blend). A single full tile bypasses tiling
+/// entirely and stays byte-identical.
+const ENC_HALO_PX: u32 = 128;
+
+/// Largest square INPUT tile (and its halo) whose encode working set fits
+/// `workspace_budget`. The encoder's early FULL-res stages dominate: conv_in +
+/// down stage 0 run at the tile's input H*W with `base_dim` channels before any
+/// spatial downsample, so the live set scales with the input tile AREA (in
+/// pixels, not latent). `tile`/`overlap` here are in LATENT pixels (so the
+/// valid output region is a clean multiple of 8 px = 1 latent px and crops
+/// align); the input extent encoded is `tile*8 + 2*halo`. Calibrated
+/// conservatively from the full-res activation footprint (96ch * area at
+/// `act_size`, times a stack-depth factor); recalibrate if the encoder graph
+/// changes.
+fn vae_encode_tile_dims(workspace_budget: u64, act_size: u64) -> (u32, u32) {
+    /// Workspace bytes per INPUT-px^2 at f16: `base_dim` (96) channels carried
+    /// through conv_in + stage-0 resnets at full res, times a depth factor for
+    /// the concurrent live buffers (conv in/out, residual, norm scratch).
+    const AREA_PER_INPX_F16: u64 = 96 * 12 / 2; // ~576 B / input px^2 at f16
+    /// Fixed overhead independent of tile area (uniforms, small buffers, the
+    /// downsampled deeper stages whose area is <=1/4 the full-res term).
+    const FIXED_F16: u64 = 64 * 1024 * 1024;
+    /// Upper cap so a huge budget doesn't pick a TDR-prone megatile.
+    const TILE_MAX: u32 = 48; // latent px (384 valid + 256 halo = 640 input px)
+    /// Floor: an 8-latent (64px valid) tile fits any usable device.
+    const TILE_MIN: u32 = 8;
+
+    let fixed = FIXED_F16 * act_size / 2;
+    let per_inpx = (AREA_PER_INPX_F16 * act_size / 2).max(1);
+    // Solve for the LATENT tile `t` whose INPUT area `(8t + 2*halo)^2` fits the
+    // area budget: input_area <= (budget - fixed) / per_inpx.
+    let in_area = workspace_budget.saturating_sub(fixed) / per_inpx;
+    let in_side = (in_area as f64).sqrt() as u32;
+    let valid_in = in_side.saturating_sub(2 * ENC_HALO_PX);
+    let tile = (valid_in / 8).clamp(TILE_MIN, TILE_MAX);
+    // Non-overlapping valid latent regions (halo gives the cross-tile context),
+    // so `overlap = 0`: `plan_tiles` steps by `tile`.
+    (tile, 0)
+}
+
+/// Tiles covering `[0, n)` latent pixels along one axis: `(start, extent)` pairs
+/// stepping by `tile - overlap`, each extent capped at `tile` and clamped to the
+/// end. A single `(0, n)` tile when `n <= tile` (the parity-res fast path).
+fn plan_tiles(n: u32, tile: u32, overlap: u32) -> Vec<(u32, u32)> {
+    if n <= tile {
+        return vec![(0, n)];
+    }
+    let step = tile - overlap;
+    let mut tiles = Vec::new();
+    let mut start = 0;
+    loop {
+        let ext = (n - start).min(tile);
+        tiles.push((start, ext));
+        if start + ext >= n {
+            break;
+        }
+        start += step;
+    }
+    tiles
+}
+
+/// Per-output-pixel feather weights along one tiled axis (length `ext * scale`,
+/// where `scale` is the latent->output spatial factor). Linearly ramps 0->1 over
+/// the `overlap`-wide band on any edge that abuts a neighbor
+/// (`has_prev`/`has_next`) and holds 1 elsewhere; true image borders get no
+/// ramp. Two adjacent tiles' complementary ramps sum to ~1 over their shared
+/// overlap (partition of unity); the small floor keeps `wsum` positive.
+fn feather_1d(ext: u32, overlap: u32, scale: u32, has_prev: bool, has_next: bool) -> Vec<f32> {
+    let len = (ext * scale) as usize;
+    let ramp = ((overlap * scale) as usize).min(len) as f32;
+    (0..len)
+        .map(|i| {
+            let mut w = 1.0f32;
+            if has_prev {
+                w = w.min((i as f32 + 0.5) / ramp);
+            }
+            if has_next {
+                w = w.min(((len - i) as f32 - 0.5) / ramp);
+            }
+            w.clamp(0.0, 1.0).max(1e-4)
+        })
+        .collect()
+}
+
+/// Activation bytes of a `[1, c, t, h, w]` tensor: the `ScopePacker` phase peak.
+fn peak_bytes(c: u32, t: u32, h: u32, w: u32, asz: u64) -> u64 {
+    c as u64 * t as u64 * h as u64 * w as u64 * asz
+}
+
+#[derive(Debug)]
+pub enum WanVaeError {
+    Wgpu(WgpuError),
+}
+
+impl From<WgpuError> for WanVaeError {
+    fn from(e: WgpuError) -> Self {
+        Self::Wgpu(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// feat_cache
+// ---------------------------------------------------------------------------
+
+/// One `feat_cache` slot. Mirrors the per-conv entry in `_feat_map`: `None`
+/// before the first frame, `Rep` for the one-shot `upsample3d` zero-prefix
+/// marker, or the trailing `t` (<= 2) frames of a conv's input held in a
+/// workspace buffer that survives across per-frame submits.
+enum FeatEntry {
+    None,
+    Rep,
+    Frames { buf: WsBuf<WgpuBackend>, t: u32 },
+}
+
+/// Per-decode causal-conv cache. `idx` resets to 0 at the start of each frame
+/// and is advanced by exactly the convs that pyref advances `feat_idx` for
+/// (conv_in, every resnet conv1/conv2, upsample3d time_conv, conv_out - never
+/// conv_shortcut / quant / qkv / proj). Entries grow lazily on frame 0 and are
+/// then indexed in lockstep.
+struct FeatCache {
+    entries: Vec<FeatEntry>,
+    idx: usize,
+}
+
+impl FeatCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            idx: 0,
+        }
+    }
+    fn reset(&mut self) {
+        self.idx = 0;
+    }
+    /// Claim the next slot, growing with `None` on the first frame.
+    fn next(&mut self) -> usize {
+        let i = self.idx;
+        if i == self.entries.len() {
+            self.entries.push(FeatEntry::None);
+        }
+        self.idx += 1;
+        i
+    }
+}
+
+// ---------------------------------------------------------------------------
+// uniform builders
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn conv3d_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    inb: (u32, u32, u32, u32, u32), // (b, cin, t_in, h_in, w_in)
+    out: (u32, u32, u32, u32),      // (cout, t_out, h_out, w_out)
+    ker: (u32, u32, u32),           // (kt, kh, kw)
+    pad: (u32, u32, u32),           // (pad_t, pad_h, pad_w)
+    stride: (u32, u32, u32),        // (stride_t, stride_h, stride_w)
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let fields: [u32; 20] = [
+        inb.0, inb.1, out.0, inb.2, inb.3, inb.4, out.1, out.2, out.3, ker.0, ker.1, ker.2, pad.0,
+        pad.1, pad.2, stride.0, stride.1, stride.2, 0, 0,
+    ];
+    let mut bytes = [0u8; 80];
+    for (i, v) in fields.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    scope.write_uniform(&bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn concat_time_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    b: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    a_t: u32,
+    b_t: u32,
+    a_start: u32,
+    a_count: u32,
+    b_start: u32,
+    b_count: u32,
+    a_zero: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let fields: [u32; 12] = [
+        b, c, h, w, a_t, b_t, a_start, a_count, b_start, b_count, a_zero, 0,
+    ];
+    let mut bytes = [0u8; 48];
+    for (i, v) in fields.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    scope.write_uniform(&bytes)
+}
+
+fn rmsnorm3d_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    n_pos: u32,
+    channels: u32,
+    stride: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&n_pos.to_le_bytes());
+    bytes[4..8].copy_from_slice(&channels.to_le_bytes());
+    bytes[8..12].copy_from_slice(&stride.to_le_bytes());
+    scope.write_uniform(&bytes)
+}
+
+fn conv2d_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    inb: (u32, u32, u32, u32),           // (b, cin, h_in, w_in)
+    out: (u32, u32, u32),                // (cout, h_out, w_out)
+    ker: (u32, u32, u32, u32, u32, u32), // (kh, kw, pad_h, pad_w, stride_h, stride_w)
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let fields: [u32; 16] = [
+        inb.0, inb.1, out.0, inb.2, inb.3, out.1, out.2, ker.0, ker.1, ker.2, ker.3, ker.4, ker.5,
+        0, 0, 0,
+    ];
+    let mut bytes = [0u8; 64];
+    for (i, v) in fields.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    scope.write_uniform(&bytes)
+}
+
+fn upsample_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    b: u32,
+    c: u32,
+    h_in: u32,
+    w_in: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&b.to_le_bytes());
+    bytes[4..8].copy_from_slice(&c.to_le_bytes());
+    bytes[8..12].copy_from_slice(&h_in.to_le_bytes());
+    bytes[12..16].copy_from_slice(&w_in.to_le_bytes());
+    scope.write_uniform(&bytes)
+}
+
+fn transpose12_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    d0: u32,
+    d1: u32,
+    d2: u32,
+    d3: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    scope.u32x4_uniform(d0, d1, d2, d3)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dupup3d_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    in_c: u32,
+    out_c: u32,
+    ft: u32,
+    fs: u32,
+    t_in: u32,
+    h_in: u32,
+    w_in: u32,
+    repeats: u32,
+    t_drop: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let fields: [u32; 12] = [
+        in_c, out_c, ft, fs, t_in, h_in, w_in, repeats, t_drop, 0, 0, 0,
+    ];
+    let mut bytes = [0u8; 48];
+    for (i, v) in fields.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    scope.write_uniform(&bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sdpa_uniform<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    b: u32,
+    h_q: u32,
+    h_kv: u32,
+    s_q: u32,
+    s_k: u32,
+    d: u32,
+    scale: f32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&b.to_le_bytes());
+    bytes[4..8].copy_from_slice(&h_q.to_le_bytes());
+    bytes[8..12].copy_from_slice(&h_kv.to_le_bytes());
+    bytes[12..16].copy_from_slice(&s_q.to_le_bytes());
+    bytes[16..20].copy_from_slice(&s_k.to_le_bytes());
+    bytes[20..24].copy_from_slice(&d.to_le_bytes());
+    bytes[24..28].copy_from_slice(&scale.to_le_bytes());
+    // has_mask = 0.
+    scope.write_uniform(&bytes)
+}
+
+// ---------------------------------------------------------------------------
+// low-level op wrappers (all run inside one frame's BatchScope)
+// ---------------------------------------------------------------------------
+
+/// Pick the conv3d tile regime: tiny-`cout` convs (conv_out=3, latent=16/32)
+/// idle most rows of the default bm=64 tile.
+fn conv3d_pipeline(pl: &WanVaePipelines, cout: u32) -> &Conv3dPipeline {
+    if cout <= 32 {
+        &pl.conv3d_small_n
+    } else {
+        &pl.conv3d
+    }
+}
+
+/// `conv3d(x, w) + bias` with explicit geometry. Front-pads time by `pad_t`
+/// (causal), symmetric `pad_h`/`pad_w`. Output NCTHW.
+#[allow(clippy::too_many_arguments)]
+fn conv3d_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    in_shape: Shape5,
+    w: &'wsp ConvBufs,
+    cout: u32,
+    ker: (u32, u32, u32),
+    pad: (u32, u32, u32),
+    stride: (u32, u32, u32),
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let (kt, kh, kw) = ker;
+    let (pad_t, pad_h, pad_w) = pad;
+    let (st, sh, sw) = stride;
+    let t_out = (in_shape.t + pad_t - kt) / st + 1;
+    let h_out = (in_shape.h + 2 * pad_h - kh) / sh + 1;
+    let w_out = (in_shape.w + 2 * pad_w - kw) / sw + 1;
+    let out_shape = Shape5 {
+        b: in_shape.b,
+        c: cout,
+        t: t_out,
+        h: h_out,
+        w: w_out,
+    };
+    let out = scope.alloc(out_shape.bytes(pl.act_size))?;
+    let u = conv3d_uniform(
+        scope,
+        (in_shape.b, in_shape.c, in_shape.t, in_shape.h, in_shape.w),
+        (cout, t_out, h_out, w_out),
+        ker,
+        pad,
+        stride,
+    )?;
+    let wb = scope.import(&w.weight);
+    let bb = scope.import(&w.bias);
+    let conv = conv3d_pipeline(pl, cout);
+    scope.conv3d(
+        &conv.pipeline,
+        &conv.op,
+        x,
+        wb,
+        bb,
+        u,
+        out,
+        cout,
+        t_out * h_out * w_out,
+        in_shape.b,
+    )?;
+    Ok((out, out_shape))
+}
+
+/// 1x1x1 pointwise conv (post_quant, conv_shortcut, attention qkv/proj). Never
+/// cached (kt=1 has no causal front pad).
+fn conv3d_1x1x1<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    in_shape: Shape5,
+    w: &'wsp ConvBufs,
+    cout: u32,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    conv3d_run(
+        scope,
+        pl,
+        x,
+        in_shape,
+        w,
+        cout,
+        (1, 1, 1),
+        (0, 0, 0),
+        (1, 1, 1),
+    )
+}
+
+fn rmsnorm3d_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    shape: Shape5,
+    w: &'wsp RmsBufs,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let out = scope.alloc(shape.bytes(pl.act_size))?;
+    let u = rmsnorm3d_uniform(scope, shape.n_pos(), shape.c, shape.thw())?;
+    let gamma = scope.import(&w.gamma);
+    scope.rmsnorm3d::<RmsNorm3dF32>(&pl.rmsnorm3d, x, gamma, u, out, shape.n_pos())?;
+    Ok(out)
+}
+
+fn silu_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    shape: Shape5,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let out = scope.alloc(shape.bytes(pl.act_size))?;
+    scope.dispatch_op::<SiluF32>(&pl.silu, &[x], out)?;
+    Ok(out)
+}
+
+fn add_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    a: BatchBuf<'wsp>,
+    b: BatchBuf<'wsp>,
+    shape: Shape5,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let out = scope.alloc(shape.bytes(pl.act_size))?;
+    scope.dispatch_op::<AddF32>(&pl.add, &[a, b], out)?;
+    Ok(out)
+}
+
+/// `DupUp3D` (Wan2.2 residual up-shortcut): duplicate-upsample `in_shape`
+/// (`[1, in_c, t, h, w]`) by `ft` in time / `fs` per spatial axis with the
+/// channel regroup, dropping the leading `t_drop` output frames (first_chunk
+/// trim). Output `[1, out_c, t*ft - t_drop, h*fs, w*fs]`.
+#[allow(clippy::too_many_arguments)]
+fn dupup3d_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    in_shape: Shape5,
+    out_c: u32,
+    ft: u32,
+    fs: u32,
+    repeats: u32,
+    t_drop: u32,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let out_shape = Shape5 {
+        b: in_shape.b,
+        c: out_c,
+        t: in_shape.t * ft - t_drop,
+        h: in_shape.h * fs,
+        w: in_shape.w * fs,
+    };
+    let out = scope.alloc(out_shape.bytes(pl.act_size))?;
+    let u = dupup3d_uniform(
+        scope, in_shape.c, out_c, ft, fs, in_shape.t, in_shape.h, in_shape.w, repeats, t_drop,
+    )?;
+    scope.dupup3d::<DupUp3dF32>(&pl.dupup3d, x, u, out, out_shape.elems())?;
+    Ok((out, out_shape))
+}
+
+/// `transpose12` over a flat `[d0, d1, d2, d3]` view: `out[d0,d2,d1,d3] =
+/// in[d0,d1,d2,d3]`.
+fn transpose12_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    d0: u32,
+    d1: u32,
+    d2: u32,
+    d3: u32,
+) -> Result<BatchBuf<'wsp>, WgpuError> {
+    let out = scope.alloc((d0 * d1 * d2 * d3) as u64 * pl.act_size)?;
+    let u = transpose12_uniform(scope, d0, d1, d2, d3)?;
+    scope.transpose12::<Transpose12F32>(&pl.transpose12, x, u, out, d0 * d1 * d2 * d3)?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// causal conv with feat_cache
+// ---------------------------------------------------------------------------
+
+/// A `kt=3` causal conv (`conv_in`, resnet conv1/conv2, conv_out) with
+/// `feat_cache`. Assembles the previous frame's trailing input frames in front
+/// of `x` (`concat_time`), runs the conv so `Tout == Tin`, then stashes this
+/// frame's trailing frames for the next call. `kh`/`kw` are 3 (symmetric pad 1)
+/// or 1 (time-only, pad 0). `retire` collects displaced cache buffers so they
+/// outlive the submit that still reads them.
+#[allow(clippy::too_many_arguments)]
+fn causal_conv3d<'wsp>(
+    workspace: &'wsp Workspace<WgpuBackend>,
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    fc: &mut FeatCache,
+    retire: &mut Vec<FeatEntry>,
+    x: BatchBuf<'wsp>,
+    in_shape: Shape5,
+    w: &'wsp ConvBufs,
+    cout: u32,
+    kh: u32,
+    kw: u32,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let idx = fc.next();
+    let old_t = match &fc.entries[idx] {
+        FeatEntry::Frames { t, .. } => *t,
+        _ => 0,
+    };
+    let tin = in_shape.t;
+    let cin = in_shape.c;
+    let (h, ww) = (in_shape.h, in_shape.w);
+    let asz = pl.act_size;
+
+    // Assemble [old_cache ++ x] in front of the conv (or just x on frame 0).
+    let (assembled, assembled_t) = if old_t > 0 {
+        let old_ref = match &fc.entries[idx] {
+            FeatEntry::Frames { buf, .. } => buf.as_buf_ref(),
+            _ => unreachable!(),
+        };
+        let a = scope.import_copy(old_ref);
+        let asm = Shape5 {
+            b: in_shape.b,
+            c: cin,
+            t: old_t + tin,
+            h,
+            w: ww,
+        };
+        let out = scope.alloc(asm.bytes(asz))?;
+        let u = concat_time_uniform(
+            scope, in_shape.b, cin, h, ww, old_t, tin, 0, old_t, 0, tin, 0,
+        )?;
+        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, a, x, u, out, asm.elems())?;
+        (out, old_t + tin)
+    } else {
+        (x, tin)
+    };
+    let assembled_shape = Shape5 {
+        b: in_shape.b,
+        c: cin,
+        t: assembled_t,
+        h,
+        w: ww,
+    };
+    // kt=3 with front pad (2 - old_t) over the assembled tensor keeps Tout=Tin.
+    let pad_t = 2 - old_t;
+    let pad_h = (kh - 1) / 2;
+    let pad_w = (kw - 1) / 2;
+    let (out, out_shape) = conv3d_run(
+        scope,
+        pl,
+        assembled,
+        assembled_shape,
+        w,
+        cout,
+        (3, kh, kw),
+        (pad_t, pad_h, pad_w),
+        (1, 1, 1),
+    )?;
+
+    // Build next cache = trailing <=2 frames of THIS conv input `x`, padding
+    // with the previous cache's last frame when only one frame is available.
+    let new_t = if tin >= 2 || old_t > 0 { 2 } else { 1 };
+    let cache_shape = Shape5 {
+        b: in_shape.b,
+        c: cin,
+        t: new_t,
+        h,
+        w: ww,
+    };
+    let new_buf = workspace.alloc(cache_shape.bytes(asz))?;
+    let new_ref = new_buf.as_buf_ref();
+    let nb = scope.import_copy(new_ref);
+    if tin >= 2 {
+        // A = x tail (last 2 frames); B unused (bind x).
+        let u = concat_time_uniform(scope, in_shape.b, cin, h, ww, tin, tin, tin - 2, 2, 0, 0, 0)?;
+        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, x, x, u, nb, cache_shape.elems())?;
+    } else if old_t > 0 {
+        // A = old cache last frame, B = x (single frame).
+        let old_ref = match &fc.entries[idx] {
+            FeatEntry::Frames { buf, .. } => buf.as_buf_ref(),
+            _ => unreachable!(),
+        };
+        let a = scope.import_copy(old_ref);
+        let u = concat_time_uniform(
+            scope,
+            in_shape.b,
+            cin,
+            h,
+            ww,
+            old_t,
+            tin,
+            old_t - 1,
+            1,
+            0,
+            1,
+            0,
+        )?;
+        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, a, x, u, nb, cache_shape.elems())?;
+    } else {
+        // First frame, single input frame: cache just that frame.
+        let u = concat_time_uniform(scope, in_shape.b, cin, h, ww, tin, tin, 0, 1, 0, 0, 0)?;
+        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, x, x, u, nb, cache_shape.elems())?;
+    }
+
+    retire.push(std::mem::replace(
+        &mut fc.entries[idx],
+        FeatEntry::Frames {
+            buf: new_buf,
+            t: new_t,
+        },
+    ));
+    Ok((out, out_shape))
+}
+
+// ---------------------------------------------------------------------------
+// resnet / attention / upsampler / up_block
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn resnet_forward<'wsp>(
+    workspace: &'wsp Workspace<WgpuBackend>,
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    fc: &mut FeatCache,
+    retire: &mut Vec<FeatEntry>,
+    x: BatchBuf<'wsp>,
+    in_shape: Shape5,
+    cout: u32,
+    w: &'wsp ResnetBufs,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    // Shortcut (1x1x1 conv when channels change, else identity).
+    let (skip, _) = match &w.conv_shortcut {
+        Some(cs) => conv3d_1x1x1(scope, pl, x, in_shape, cs, cout)?,
+        None => (x, in_shape),
+    };
+    let h0 = rmsnorm3d_run(scope, pl, x, in_shape, &w.norm1)?;
+    let h1 = silu_run(scope, pl, h0, in_shape)?;
+    let (h2, sh2) = causal_conv3d(
+        workspace, scope, pl, fc, retire, h1, in_shape, &w.conv1, cout, 3, 3,
+    )?;
+    let h3 = rmsnorm3d_run(scope, pl, h2, sh2, &w.norm2)?;
+    let h4 = silu_run(scope, pl, h3, sh2)?;
+    let (h5, sh5) = causal_conv3d(
+        workspace, scope, pl, fc, retire, h4, sh2, &w.conv2, cout, 3, 3,
+    )?;
+    let out = add_run(scope, pl, skip, h5, sh5)?;
+    Ok((out, sh5))
+}
+
+/// Mid-block single-head spatial self-attention (`WanAttentionBlock`). Decoder
+/// mid always runs at `T=1` (temporal upsampling happens later, in the up
+/// blocks), and `B=1`, so the channel split feeds contiguous sub-ranges. qkv /
+/// proj are 1x1 convs over NCTHW; sdpa runs over `H*W` tokens with `D=C`.
+fn mid_attention_forward<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    shape: Shape5,
+    w: &'wsp AttnBufs,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    debug_assert_eq!(shape.b, 1, "mid attention assumes B=1");
+    debug_assert_eq!(shape.t, 1, "decoder mid attention runs at T=1");
+    let c = shape.c;
+    let hw = shape.h * shape.w;
+    let asz = pl.act_size;
+
+    let normed = rmsnorm3d_run(scope, pl, x, shape, &w.norm)?;
+    let (qkv, _) = conv3d_1x1x1(scope, pl, normed, shape, &w.to_qkv, 3 * c)?;
+
+    // Split the 3C channels into contiguous q/k/v blocks (B=T=1) and turn each
+    // [1, C, H*W] block into [1, H*W, C] sdpa tokens via transpose12.
+    let block_bytes = (c * hw) as u64 * asz;
+    let mut tokens = [None, None, None];
+    for (g, slot) in tokens.iter_mut().enumerate() {
+        let blk = scope.alloc(block_bytes)?;
+        scope.copy_buffer_to_buffer(qkv, g as u64 * block_bytes, blk, 0, block_bytes)?;
+        // [1, C, H*W] -> [1, H*W, C].
+        *slot = Some(transpose12_run(scope, pl, blk, 1, c, hw, 1)?);
+    }
+    let q = tokens[0].unwrap();
+    let k = tokens[1].unwrap();
+    let v = tokens[2].unwrap();
+
+    let mask = scope.write_uniform(&0f32.to_le_bytes())?;
+    let attn = scope.alloc(block_bytes)?;
+    let scale = 1.0_f32 / (c as f32).sqrt();
+    let u = sdpa_uniform(scope, 1, 1, 1, hw, hw, c, scale)?;
+    scope.sdpa::<SdpaF32LargeD>(&pl.sdpa_large_d, q, k, v, mask, u, attn, 1, hw, 1)?;
+
+    // [1, H*W, C] -> [1, C, H*W] -> NCTHW, then proj (1x1) + residual.
+    let restored = transpose12_run(scope, pl, attn, 1, hw, c, 1)?;
+    let (proj, _) = conv3d_1x1x1(scope, pl, restored, shape, &w.proj, c)?;
+    let out = add_run(scope, pl, x, proj, shape)?;
+    Ok((out, shape))
+}
+
+/// Per-frame spatial resample (`nearest-exact` 2x + 3x3 conv, `out -> out/2`),
+/// applied over every time frame. NCTHW in, NCTHW out with `H,W` doubled. The
+/// 2D conv runs in NTCHW (batch `= B*T`); `nearest-exact` equals plain
+/// `nearest` for integer 2x scale, so `Upsample2dNearestF32` is exact here.
+fn spatial_resample<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    shape: Shape5,
+    w: &'wsp ConvBufs,
+    cout: u32,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let (b, c, t, h, ww) = (shape.b, shape.c, shape.t, shape.h, shape.w);
+    let bt = b * t;
+    let hw = h * ww;
+    // NCTHW -> NTCHW.
+    let ntchw = transpose12_run(scope, pl, x, b, c, t, hw)?;
+
+    // nearest 2x over [B*T, C, H, W].
+    let up_h = h * 2;
+    let up_w = ww * 2;
+    let up_shape = Shape5 {
+        b: bt,
+        c,
+        t: 1,
+        h: up_h,
+        w: up_w,
+    };
+    let up = scope.alloc(up_shape.bytes(pl.act_size))?;
+    let uu = upsample_uniform(scope, bt, c, h, ww)?;
+    scope.upsample2d_nearest::<Upsample2dNearestF32>(
+        &pl.upsample,
+        ntchw,
+        uu,
+        up,
+        up_shape.elems(),
+    )?;
+
+    // 3x3 conv (pad 1, stride 1): out channels = cout, spatial unchanged.
+    let conv_shape = Shape5 {
+        b: bt,
+        c: cout,
+        t: 1,
+        h: up_h,
+        w: up_w,
+    };
+    let cout_buf = scope.alloc(conv_shape.bytes(pl.act_size))?;
+    let cu = conv2d_uniform(
+        scope,
+        (bt, c, up_h, up_w),
+        (cout, up_h, up_w),
+        (3, 3, 1, 1, 1, 1),
+    )?;
+    let wb = scope.import(&w.weight);
+    let bb = scope.import(&w.bias);
+    scope.conv2d(
+        &pl.conv2d.pipeline,
+        &pl.conv2d.op,
+        up,
+        wb,
+        bb,
+        cu,
+        cout_buf,
+        cout,
+        up_h * up_w,
+        bt,
+    )?;
+
+    // NTCHW -> NCTHW.
+    let out = transpose12_run(scope, pl, cout_buf, b, t, cout, up_h * up_w)?;
+    Ok((
+        out,
+        Shape5 {
+            b,
+            c: cout,
+            t,
+            h: up_h,
+            w: up_w,
+        },
+    ))
+}
+
+/// Decoder up_block: `num_res_blocks + 1` resnets then an optional upsampler.
+/// `temporal` selects the `upsample3d` path (time_conv + 2x time interleave)
+/// over `upsample2d` (spatial only). `out_c` is the block output channels;
+/// the upsampler's spatial conv then halves to `out_c/2`. Each resnet and the
+/// upsampler is a `ScopePacker` phase: at native res they land in separate
+/// submits (watchdog-safe), at parity res they collapse into one.
+#[allow(clippy::too_many_arguments)]
+async fn up_block_forward<'wsp>(
+    workspace: &'wsp Workspace<WgpuBackend>,
+    packer: &mut ScopePacker<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    fc: &mut FeatCache,
+    retire: &mut Vec<FeatEntry>,
+    mut x: BatchBuf<'wsp>,
+    mut shape: Shape5,
+    out_c: u32,
+    temporal: bool,
+    w: &'wsp UpBlockBufs,
+    asz: u64,
+    is_residual: bool,
+    // Upsampler spatial-conv output channels (`out_c` residual, `out_c/2` 2.1).
+    resample_out: u32,
+    // `DupUp3D` channel `repeat_interleave` count (residual shortcut only).
+    dup_repeats: u32,
+    // True on the first decoded frame group (drives the `DupUp3D` temporal trim).
+    first_chunk: bool,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    // Wan2.2 residual avg_shortcut (`DupUp3D`) input is the up_block input
+    // (pre-resnet); persist it across the resnet/upsampler submits and add it
+    // back after the upsampler. Parameter-free, so only the activation is saved.
+    let do_shortcut = is_residual && w.upsampler.is_some();
+    let saved = if do_shortcut {
+        let in_shape = shape;
+        let ws = workspace.alloc(in_shape.bytes(asz))?;
+        let dst = packer.scope().import_copy(ws.as_buf_ref());
+        packer
+            .scope()
+            .copy_buffer_to_buffer(x, 0, dst, 0, in_shape.bytes(asz))?;
+        Some((ws, in_shape))
+    } else {
+        None
+    };
+
+    for resnet in &w.resnets {
+        // Resnets preserve t/h/w; only the channel count moves to out_c.
+        let peak = peak_bytes(out_c, shape.t, shape.h, shape.w, asz);
+        x = packer.advance(&[x], peak).await?.pop().unwrap();
+        let (y, sh) = resnet_forward(
+            workspace,
+            packer.scope(),
+            pl,
+            fc,
+            retire,
+            x,
+            shape,
+            out_c,
+            resnet,
+        )?;
+        x = y;
+        shape = sh;
+    }
+    let Some(up) = &w.upsampler else {
+        return Ok((x, shape));
+    };
+
+    // Upsampler phase: spatial 2x always, time 2x when temporal. The spatial
+    // conv emits `resample_out` channels (`out_c` for the Wan2.2 residual path,
+    // `out_c/2` for Wan2.1).
+    let up_t = if temporal { shape.t * 2 } else { shape.t };
+    let up_peak = peak_bytes(resample_out, up_t, shape.h * 2, shape.w * 2, asz);
+    x = packer.advance(&[x], up_peak).await?.pop().unwrap();
+    let scope = packer.scope();
+
+    // upsample3d: causal time_conv (out_c -> 2*out_c) then 2x time interleave.
+    // First frame is a one-shot "Rep" marker: no time_conv, no doubling.
+    if temporal {
+        let tc = up
+            .time_conv
+            .as_ref()
+            .expect("temporal upsampler has time_conv");
+        let idx = fc.next();
+        // Extract the slot kind without holding a borrow across the mutation.
+        let (is_first, old_t) = match &fc.entries[idx] {
+            FeatEntry::None => (true, 0),
+            FeatEntry::Rep => (false, 0), // Rep -> conv with full front pad (no prepend).
+            FeatEntry::Frames { t, .. } => (false, *t),
+        };
+        if is_first {
+            // First frame: mark Rep, skip time_conv + doubling entirely.
+            fc.entries[idx] = FeatEntry::Rep;
+        } else {
+            {
+                let cin = shape.c;
+                let (h, ww) = (shape.h, shape.w);
+                let tin = shape.t;
+                let asz = pl.act_size;
+
+                // Assemble cached frames in front (Rep -> none; front pad covers it).
+                let (assembled, assembled_t) = if old_t > 0 {
+                    let old_ref = match &fc.entries[idx] {
+                        FeatEntry::Frames { buf, .. } => buf.as_buf_ref(),
+                        _ => unreachable!(),
+                    };
+                    let a = scope.import_copy(old_ref);
+                    let asm = Shape5 {
+                        b: shape.b,
+                        c: cin,
+                        t: old_t + tin,
+                        h,
+                        w: ww,
+                    };
+                    let out = scope.alloc(asm.bytes(asz))?;
+                    let u = concat_time_uniform(
+                        scope, shape.b, cin, h, ww, old_t, tin, 0, old_t, 0, tin, 0,
+                    )?;
+                    scope.concat_time::<ConcatTimeF32>(
+                        &pl.concat_time,
+                        a,
+                        x,
+                        u,
+                        out,
+                        asm.elems(),
+                    )?;
+                    (out, old_t + tin)
+                } else {
+                    (x, tin)
+                };
+                let asm_shape = Shape5 {
+                    b: shape.b,
+                    c: cin,
+                    t: assembled_t,
+                    h,
+                    w: ww,
+                };
+                let pad_t = 2 - old_t;
+                let (conv, conv_shape) = conv3d_run(
+                    scope,
+                    pl,
+                    assembled,
+                    asm_shape,
+                    tc,
+                    2 * cin,
+                    (3, 1, 1),
+                    (pad_t, 0, 0),
+                    (1, 1, 1),
+                )?;
+                debug_assert_eq!(conv_shape.t, tin);
+
+                // Build next cache = trailing <=2 frames of `x`, zero-filling
+                // when only one frame is available (Rep) or padding with the
+                // previous cache's last frame.
+                let new_t = 2u32;
+                let cache_shape = Shape5 {
+                    b: shape.b,
+                    c: cin,
+                    t: new_t,
+                    h,
+                    w: ww,
+                };
+                let new_buf = workspace.alloc(cache_shape.bytes(asz))?;
+                let nb = scope.import_copy(new_buf.as_buf_ref());
+                if tin >= 2 {
+                    let u = concat_time_uniform(
+                        scope,
+                        shape.b,
+                        cin,
+                        h,
+                        ww,
+                        tin,
+                        tin,
+                        tin - 2,
+                        2,
+                        0,
+                        0,
+                        0,
+                    )?;
+                    scope.concat_time::<ConcatTimeF32>(
+                        &pl.concat_time,
+                        x,
+                        x,
+                        u,
+                        nb,
+                        cache_shape.elems(),
+                    )?;
+                } else if old_t > 0 {
+                    let old_ref = match &fc.entries[idx] {
+                        FeatEntry::Frames { buf, .. } => buf.as_buf_ref(),
+                        _ => unreachable!(),
+                    };
+                    let a = scope.import_copy(old_ref);
+                    let u = concat_time_uniform(
+                        scope,
+                        shape.b,
+                        cin,
+                        h,
+                        ww,
+                        old_t,
+                        tin,
+                        old_t - 1,
+                        1,
+                        0,
+                        1,
+                        0,
+                    )?;
+                    scope.concat_time::<ConcatTimeF32>(
+                        &pl.concat_time,
+                        a,
+                        x,
+                        u,
+                        nb,
+                        cache_shape.elems(),
+                    )?;
+                } else {
+                    // Rep: prepend a zero frame in front of the single input frame.
+                    let u =
+                        concat_time_uniform(scope, shape.b, cin, h, ww, tin, tin, 0, 1, 0, 1, 1)?;
+                    scope.concat_time::<ConcatTimeF32>(
+                        &pl.concat_time,
+                        x,
+                        x,
+                        u,
+                        nb,
+                        cache_shape.elems(),
+                    )?;
+                }
+                retire.push(std::mem::replace(
+                    &mut fc.entries[idx],
+                    FeatEntry::Frames {
+                        buf: new_buf,
+                        t: new_t,
+                    },
+                ));
+
+                // 2x time interleave: conv out [b, 2C, t, hw] with channel =
+                // g*C + ch maps to out[b, ch, 2t+g, hw]. Realized as two
+                // transpose12s: split g out of the channel block, then move it
+                // inside the time axis.
+                let hw = h * ww;
+                // [b, 2, C, t*hw] -> [b, C, 2, t*hw].
+                let p = transpose12_run(scope, pl, conv, shape.b, 2, cin, tin * hw)?;
+                // [b*C, 2, t, hw] -> [b*C, t, 2, hw] == [b, C, 2t, hw].
+                let q = transpose12_run(scope, pl, p, shape.b * cin, 2, tin, hw)?;
+                x = q;
+                shape = Shape5 {
+                    b: shape.b,
+                    c: cin,
+                    t: tin * 2,
+                    h,
+                    w: ww,
+                };
+            }
+        }
+    }
+
+    // Spatial resample (every frame): out_c -> resample_out, H/W doubled.
+    let (mut x_out, shape_out) =
+        spatial_resample(scope, pl, x, shape, &up.spatial_conv, resample_out)?;
+
+    // Wan2.2 residual: add the DupUp3D-upsampled block input. `factor_s` is 2
+    // (the spatial upsample), `factor_t` 2 when this block upsamples in time.
+    if let Some((ws, in_shape)) = saved {
+        let ft = if temporal { 2 } else { 1 };
+        let t_drop = if first_chunk && ft > 1 { ft - 1 } else { 0 };
+        let src = scope.import_copy(ws.as_buf_ref());
+        let (shortcut, sc_shape) =
+            dupup3d_run(scope, pl, src, in_shape, out_c, ft, 2, dup_repeats, t_drop)?;
+        debug_assert_eq!(
+            (sc_shape.c, sc_shape.t, sc_shape.h, sc_shape.w),
+            (shape_out.c, shape_out.t, shape_out.h, shape_out.w),
+            "DupUp3D shortcut shape must match the upsampler output",
+        );
+        x_out = add_run(scope, pl, x_out, shortcut, shape_out)?;
+    }
+    Ok((x_out, shape_out))
+}
+
+// ---------------------------------------------------------------------------
+// stage taps (e2e bisection)
+// ---------------------------------------------------------------------------
+//
+// Each stage activation is a scope-local `BatchBuf` that does not survive the
+// frame/chunk submit, so a tapped stage is first copied into a workspace buffer
+// inside the submit (`persist_stage`) and read back afterwards (`read_into_f32`).
+// To keep readback cost off the hot path, taps capture exactly one frame/chunk
+// (`frame`/`chunk`); the final stage (`conv_out` for decode, `quant_conv` for
+// encode) is already exposed by the `decode`/`encode` return value.
+
+/// Per-stage decoder taps. `frame` selects which decoded frame to capture; each
+/// `Some` sink is filled with that frame's stage output (NCTHW f32, row-major).
+#[derive(Default)]
+pub struct WanVaeDecodeTaps<'a> {
+    pub frame: usize,
+    pub post_quant: Option<&'a mut Vec<f32>>,
+    pub conv_in: Option<&'a mut Vec<f32>>,
+    pub mid: Option<&'a mut Vec<f32>>,
+    /// One sink per up_block output (`len == up_blocks.len()` once filled).
+    pub up_blocks: Option<&'a mut Vec<Vec<f32>>>,
+}
+
+/// Per-stage encoder taps. `chunk` selects which input chunk to capture; each
+/// `Some` sink is filled with that chunk's stage output (NCTHW f32, row-major).
+#[derive(Default)]
+pub struct WanVaeEncodeTaps<'a> {
+    pub chunk: usize,
+    pub conv_in: Option<&'a mut Vec<f32>>,
+    /// One sink per down_stage output (`len == down_stages.len()` once filled).
+    pub down_stages: Option<&'a mut Vec<Vec<f32>>>,
+    pub mid: Option<&'a mut Vec<f32>>,
+    pub conv_out: Option<&'a mut Vec<f32>>,
+}
+
+/// Copy a scope-local stage activation into a workspace buffer that outlives the
+/// submit, returning `(buffer, n_elems)` for a post-submit `read_into_f32`.
+fn persist_stage<'wsp>(
+    workspace: &'wsp Workspace<WgpuBackend>,
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    buf: BatchBuf<'wsp>,
+    shape: Shape5,
+    asz: u64,
+) -> Result<(WsBuf<WgpuBackend>, usize), WgpuError> {
+    let bytes = shape.bytes(asz);
+    let ws = workspace.alloc(bytes)?;
+    let dst = scope.import_copy(ws.as_buf_ref());
+    scope.copy_buffer_to_buffer(buf, 0, dst, 0, bytes)?;
+    Ok((ws, shape.elems() as usize))
+}
+
+/// Read a persisted stage buffer into an optional tap sink (no-op when either is
+/// `None`).
+async fn read_stage(
+    backend: &WgpuBackend,
+    asz: u64,
+    persisted: &Option<(WsBuf<WgpuBackend>, usize)>,
+    sink: Option<&mut Vec<f32>>,
+) -> Result<(), WgpuError> {
+    if let (Some((ws, n)), Some(s)) = (persisted, sink) {
+        let act = if asz == 2 {
+            ActDtype::F16
+        } else {
+            ActDtype::F32
+        };
+        read_into_f32(backend, &ws.as_buf_ref(), *n, act, s).await?;
+    }
+    Ok(())
+}
+
+/// Read a GPU buffer of `n` activation elements into `sink` as f32.
+async fn read_into_f32(
+    backend: &WgpuBackend,
+    buf: &BufRef,
+    n: usize,
+    act: ActDtype,
+    sink: &mut Vec<f32>,
+) -> Result<(), WgpuError> {
+    let bytes = backend
+        .read_buffer(buf.id, buf.offset, n as u64 * act.bytes_per_elem())
+        .await?;
+    *sink = act_bytes_to_f32_vec(act.bytes_per_elem(), &bytes);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// per-frame decoder + top-level decode
+// ---------------------------------------------------------------------------
+
+/// Decode one latent frame `[1, z_dim, 1, h, w]` (already pre-scaled) into a
+/// `[1, 3, Tout, h*8, w*8]` chunk written to `out_ref`. Runs the whole frame in
+/// one BatchScope + submit. `Tout` is 1 on frame 0 (Rep markers suppress the
+/// temporal doubling) and 4 afterwards.
+#[allow(clippy::too_many_arguments)]
+async fn decode_frame(
+    backend: &WgpuBackend,
+    workspace: &Workspace<WgpuBackend>,
+    pl: &WanVaePipelines,
+    cfg: &WanVaeConfig,
+    bufs: &VaeDecoderBufs,
+    fc: &mut FeatCache,
+    frame_in: &BufRef,
+    h_in: u32,
+    w_in: u32,
+    out_ref: &BufRef,
+    frame_idx: usize,
+    taps: Option<&mut WanVaeDecodeTaps<'_>>,
+) -> Result<Shape5, WanVaeError> {
+    fc.reset();
+    // Old cache buffers displaced this frame; held until the submit completes.
+    let mut retire: Vec<FeatEntry> = Vec::new();
+    let asz = pl.act_size;
+    // Which stages to persist this frame (only the selected frame, only the
+    // sinks the caller asked for).
+    let (want_post, want_conv_in, want_mid, want_ups) = match &taps {
+        Some(t) if t.frame == frame_idx => (
+            t.post_quant.is_some(),
+            t.conv_in.is_some(),
+            t.mid.is_some(),
+            t.up_blocks.is_some(),
+        ),
+        _ => (false, false, false, false),
+    };
+    let mut p_post = None;
+    let mut p_conv_in = None;
+    let mut p_mid = None;
+    let mut p_ups: Vec<(WsBuf<WgpuBackend>, usize)> = Vec::new();
+    let out_shape;
+    {
+        // ScopePacker splits the frame into multiple submits so no single one
+        // exceeds the GPU watchdog at native res (see VAE_SUBMIT_BUDGET_BYTES).
+        // At parity res every phase fits the budget -> one submit, identical to
+        // the unpacked path. Carried activations (`advance`) survive cuts via
+        // the packer's hold-bag; `retire`/persisted taps are workspace-owned.
+        let mut packer = ScopePacker::new(workspace, VAE_SUBMIT_BUDGET_BYTES);
+        let z_dim = cfg.z_dim as u32;
+        let in_shape = Shape5 {
+            b: 1,
+            c: z_dim,
+            t: 1,
+            h: h_in,
+            w: w_in,
+        };
+        let z = packer.scope().import_copy(*frame_in);
+
+        // post_quant_conv (1x1x1, pointwise in time so per-frame == whole).
+        let z = packer
+            .advance(&[z], peak_bytes(z_dim, 1, h_in, w_in, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let (x, sh) = conv3d_1x1x1(
+            packer.scope(),
+            pl,
+            z,
+            in_shape,
+            &bufs.post_quant_conv,
+            z_dim,
+        )?;
+        if want_post {
+            p_post = Some(persist_stage(workspace, packer.scope(), x, sh, asz)?);
+        }
+
+        // conv_in (causal 3x3x3).
+        let mid_c = cfg.mid_channels() as u32;
+        let x = packer
+            .advance(&[x], peak_bytes(mid_c, sh.t, sh.h, sh.w, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let (mut x, mut sh) = causal_conv3d(
+            workspace,
+            packer.scope(),
+            pl,
+            fc,
+            &mut retire,
+            x,
+            sh,
+            &bufs.conv_in,
+            mid_c,
+            3,
+            3,
+        )?;
+        if want_conv_in {
+            p_conv_in = Some(persist_stage(workspace, packer.scope(), x, sh, asz)?);
+        }
+
+        // mid_block: resnet -> attention -> resnet (latent res, T=1).
+        x = packer
+            .advance(&[x], peak_bytes(mid_c, sh.t, sh.h, sh.w, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let (m0, s0) = resnet_forward(
+            workspace,
+            packer.scope(),
+            pl,
+            fc,
+            &mut retire,
+            x,
+            sh,
+            mid_c,
+            &bufs.mid_block.resnets[0],
+        )?;
+        let m0 = packer
+            .advance(&[m0], peak_bytes(mid_c, s0.t, s0.h, s0.w, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let (m1, s1) =
+            mid_attention_forward(packer.scope(), pl, m0, s0, &bufs.mid_block.attention)?;
+        let m1 = packer
+            .advance(&[m1], peak_bytes(mid_c, s1.t, s1.h, s1.w, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let (m2, s2) = resnet_forward(
+            workspace,
+            packer.scope(),
+            pl,
+            fc,
+            &mut retire,
+            m1,
+            s1,
+            mid_c,
+            &bufs.mid_block.resnets[1],
+        )?;
+        x = m2;
+        sh = s2;
+        if want_mid {
+            p_mid = Some(persist_stage(workspace, packer.scope(), x, sh, asz)?);
+        }
+
+        // up_blocks 0..N (each resnet/upsampler is its own packer phase).
+        for (i, ub) in bufs.up_blocks.iter().enumerate() {
+            let out_c = cfg.up_out_channels(i) as u32;
+            let temporal = cfg.up_temporal(i);
+            let (y, s) = up_block_forward(
+                workspace,
+                &mut packer,
+                pl,
+                fc,
+                &mut retire,
+                x,
+                sh,
+                out_c,
+                temporal,
+                ub,
+                asz,
+                cfg.is_residual,
+                cfg.up_resample_out(i) as u32,
+                cfg.up_dup_repeats(i) as u32,
+                frame_idx == 0,
+            )
+            .await?;
+            x = y;
+            sh = s;
+            if want_ups {
+                p_ups.push(persist_stage(workspace, packer.scope(), x, sh, asz)?);
+            }
+        }
+
+        // norm_out -> silu -> conv_out (causal 3x3x3). For Wan2.2 the decoder
+        // emits `out_channels` (12 = 3*patch^2) packed channels at the decoder
+        // spatial scale; the trailing patch unshuffle (host-side) recovers the
+        // 3-channel video at full resolution.
+        x = packer
+            .advance(&[x], peak_bytes(sh.c, sh.t, sh.h, sh.w, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let n = rmsnorm3d_run(packer.scope(), pl, x, sh, &bufs.norm_out)?;
+        let a = silu_run(packer.scope(), pl, n, sh)?;
+        let (cout, cout_shape) = causal_conv3d(
+            workspace,
+            packer.scope(),
+            pl,
+            fc,
+            &mut retire,
+            a,
+            sh,
+            &bufs.conv_out,
+            cfg.out_channels as u32,
+            3,
+            3,
+        )?;
+        out_shape = cout_shape;
+
+        let dst = packer.scope().import_copy(*out_ref);
+        packer
+            .scope()
+            .copy_buffer_to_buffer(cout, 0, dst, 0, cout_shape.bytes(pl.act_size))?;
+        packer
+            .finish_void()
+            .instrument(
+                tracing::debug_span!(target: PHASE, "wan_vae.decode_frame", frame = frame_idx),
+            )
+            .await
+            .map_err(WanVaeError::Wgpu)?;
+    }
+    // `retire` drops here (post-submit): displaced caches return to the pool.
+    drop(retire);
+
+    // Post-submit tap readback (selected frame only).
+    if let Some(t) = taps
+        && t.frame == frame_idx
+    {
+        read_stage(backend, asz, &p_post, t.post_quant.as_deref_mut()).await?;
+        read_stage(backend, asz, &p_conv_in, t.conv_in.as_deref_mut()).await?;
+        read_stage(backend, asz, &p_mid, t.mid.as_deref_mut()).await?;
+        if let Some(sink) = t.up_blocks.as_deref_mut() {
+            sink.clear();
+            for (ws, n) in &p_ups {
+                let act = if asz == 2 {
+                    ActDtype::F16
+                } else {
+                    ActDtype::F32
+                };
+                let mut v = Vec::new();
+                read_into_f32(backend, &ws.as_buf_ref(), *n, act, &mut v).await?;
+                sink.push(v);
+            }
+        }
+    }
+    Ok(out_shape)
+}
+
+/// Decode one spatial latent tile (`[r0, r0+hext) x [c0, c0+wext)`) across all
+/// `f` frame groups and feather-blend its output into the host `video`
+/// accumulator (weighted sum) + `wsum` (per-pixel weight, channel-independent).
+/// The tile carries its own `FeatCache` across frames; `weights_h`/`weights_w`
+/// are the separable feather ramps (`feather_1d`) for this tile's edges. `taps`
+/// is only meaningful for the single full-frame tile (parity bisection). The
+/// caller normalizes (`video /= wsum`) and clamps once after every tile lands.
+#[allow(clippy::too_many_arguments)]
+async fn decode_tile<S: WeightSource>(
+    backend: &WgpuBackend,
+    workspace: &mut Workspace<WgpuBackend>,
+    pl: &WanVaePipelines,
+    cfg: &WanVaeConfig,
+    bufs: &VaeDecoderBufs,
+    latents: &[f32],
+    f: usize,
+    h_in: usize,
+    w_in: usize,
+    tile: (u32, u32, u32, u32), // (r0, c0, hext, wext) in latent pixels
+    weights_h: &[f32],
+    weights_w: &[f32],
+    t_total: usize,
+    video: &mut [f32],
+    wsum: &mut [f32],
+    mut taps: Option<&mut WanVaeDecodeTaps<'_>>,
+) -> Result<(), WanVaeDecodeError<S::Error>> {
+    let (r0, c0, hext, wext) = tile;
+    let (r0, c0, hext, wext) = (r0 as usize, c0 as usize, hext as usize, wext as usize);
+    let z_dim = cfg.z_dim;
+    let asz = pl.act_size;
+    let spat = cfg.spatial_compression; // final output scale per latent px (16)
+    let dec_scale = cfg.decoder_spatial_scale(); // decoder conv output scale (8)
+    let patch = cfg.patch_size; // trailing pixel-unshuffle factor (2)
+    let packed_c = cfg.out_channels; // decoder conv_out channels (12 = 3*patch^2)
+    let (h_out, w_out) = (h_in * spat, w_in * spat);
+    let hw_out = h_out * w_out;
+    let (dh, dw) = (hext * dec_scale, wext * dec_scale); // decoder output H/W per frame
+    let dec_hw = dh * dw;
+    let tile_elems = z_dim * hext * wext;
+
+    let mut fc = FeatCache::new();
+    let mut t_off = 0usize;
+    for i in 0..f {
+        // Slice + denormalize this tile's latent frame (CTHW, channel-major over
+        // the F axis), uploading as act bytes.
+        let mut scaled = vec![0.0_f32; tile_elems];
+        for c in 0..z_dim {
+            let std = cfg.latents_std[c];
+            let mean = cfg.latents_mean[c];
+            for hh in 0..hext {
+                for ww in 0..wext {
+                    let src = (c * f + i) * h_in * w_in + (r0 + hh) * w_in + (c0 + ww);
+                    scaled[(c * hext + hh) * wext + ww] = latents[src] * std + mean;
+                }
+            }
+        }
+        let in_bytes = f32s_to_act_bytes(asz, &scaled);
+        let in_buf = workspace.alloc(in_bytes.len() as u64)?;
+        backend.write_buffer(in_buf.id(), 0, &in_bytes)?;
+
+        let tout = if i == 0 { 1 } else { cfg.temporal_compression };
+        let out_bytes = (packed_c * tout * dec_hw) as u64 * asz;
+        let out_buf = workspace.alloc(out_bytes)?;
+        let out_ref = out_buf.as_buf_ref();
+
+        let shape = decode_frame(
+            backend,
+            &*workspace,
+            pl,
+            cfg,
+            bufs,
+            &mut fc,
+            &in_buf.as_buf_ref(),
+            hext as u32,
+            wext as u32,
+            &out_ref,
+            i,
+            taps.as_deref_mut(),
+        )
+        .await?;
+        debug_assert_eq!(shape.t as usize, tout);
+        debug_assert_eq!(shape.c as usize, packed_c);
+        debug_assert_eq!((shape.h as usize, shape.w as usize), (dh, dw));
+
+        if std::env::var_os("THINFER_VAE_MEM").is_some() {
+            let acct = backend.mem_account();
+            eprintln!(
+                "[vae_mem] tile=({r0},{c0},{hext},{wext}) group={i} tout={tout} ws_cur={}MiB ws_peak={}MiB vram_peak={}MiB",
+                acct.vram_current(VramCategory::Workspace) / (1024 * 1024),
+                acct.vram_peak(VramCategory::Workspace) / (1024 * 1024),
+                acct.vram_total_peak() / (1024 * 1024),
+            );
+        }
+
+        let host = backend
+            .read_buffer(out_ref.id, out_ref.offset, out_bytes)
+            .instrument(tracing::debug_span!(target: PHASE, "wan_vae.readback", frame = i))
+            .await?;
+        let vals = act_bytes_to_f32_vec(asz, &host);
+
+        // Unpatchify + feather-blend this group's `[packed_c, tout, dh, dw]`
+        // block into the 16x video. The pixel unshuffle maps packed channel `cp`
+        // -> video channel `cp / patch^2` at spatial sub-offset `(d3, d2)` where
+        // `d3 = cp % patch` (height), `d2 = (cp / patch) % patch` (width). For a
+        // given video channel the `patch^2` packed channels tile every output
+        // pixel exactly once, so `wsum` accumulates on the `ch == 0` packed set.
+        for cp in 0..packed_c {
+            let ch = cp / (patch * patch);
+            let d3 = cp % patch;
+            let d2 = (cp / patch) % patch;
+            for tt in 0..tout {
+                let t = t_off + tt;
+                for h8 in 0..dh {
+                    let hh = h8 * patch + d3; // local 16x H within tile
+                    let wh = weights_h[hh];
+                    let oh = r0 * spat + hh;
+                    for w8 in 0..dw {
+                        let ww = w8 * patch + d2; // local 16x W within tile
+                        let wgt = wh * weights_w[ww];
+                        let ow = c0 * spat + ww;
+                        let src = (cp * tout + tt) * dec_hw + h8 * dw + w8;
+                        let pix = t * hw_out + oh * w_out + ow;
+                        video[ch * t_total * hw_out + pix] += vals[src] * wgt;
+                        if ch == 0 {
+                            wsum[pix] += wgt;
+                        }
+                    }
+                }
+            }
+        }
+        t_off += tout;
+    }
+    Ok(())
+}
+
+/// Wan VAE decoder. Decodes `[z_dim, F, h, w]` latents (B=1) into a video
+/// `[3, 4F-3, h*8, w*8]` in `[-1, 1]`, frame group by frame group. Applies the
+/// baked `z * std + mean` per-channel latent denormalization host-side before
+/// upload (mirrors the Wan pipeline's pre-decode scaling). At native res the
+/// decode runs in overlapping spatial tiles (`plan_tiles`) feather-blended into
+/// the output, bounding peak VRAM to one tile's working set; at parity res it
+/// collapses to a single unit-weight tile (bit-identical to the untiled path).
+pub struct WanVaeDecoder {
+    pub pipelines: WanVaePipelines,
+    pub handles: VaeDecoderHandles,
+    pub cfg: WanVaeConfig,
+    /// Total GPU bytes of the decoder weights (all fit resident). Reserved out
+    /// of the VRAM budget when sizing the tile workspace, so weights stay
+    /// resident (no per-tile re-streaming) and the true peak holds the budget.
+    pub weight_footprint: u64,
+}
+
+#[derive(Debug)]
+pub enum WanVaeDecodeError<SE: core::fmt::Debug> {
+    Forward(WanVaeError),
+    Residency(ResidencyError<SE, WgpuError>),
+}
+
+impl<SE: core::fmt::Debug> From<WanVaeError> for WanVaeDecodeError<SE> {
+    fn from(e: WanVaeError) -> Self {
+        Self::Forward(e)
+    }
+}
+impl<SE: core::fmt::Debug> From<WgpuError> for WanVaeDecodeError<SE> {
+    fn from(e: WgpuError) -> Self {
+        Self::Forward(WanVaeError::Wgpu(e))
+    }
+}
+impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for WanVaeDecodeError<SE> {
+    fn from(e: ResidencyError<SE, WgpuError>) -> Self {
+        Self::Residency(e)
+    }
+}
+
+impl WanVaeDecoder {
+    /// Decode `latents` (CTHW row-major, `z_dim * f * h_in * w_in` f32) into a
+    /// host video tensor CTHW `[3, 4*f-3, h_in*8, w_in*8]` f32 clamped to
+    /// `[-1, 1]`.
+    pub async fn decode<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &mut Workspace<WgpuBackend>,
+        latents: &[f32],
+        f: usize,
+        h_in: usize,
+        w_in: usize,
+    ) -> Result<Vec<f32>, WanVaeDecodeError<S::Error>> {
+        self.decode_with_taps(backend, residency, workspace, latents, f, h_in, w_in, None)
+            .await
+    }
+
+    /// `decode` with per-stage taps captured on `taps.frame` for e2e bisection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn decode_with_taps<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &mut Workspace<WgpuBackend>,
+        latents: &[f32],
+        f: usize,
+        h_in: usize,
+        w_in: usize,
+        mut taps: Option<&mut WanVaeDecodeTaps<'_>>,
+    ) -> Result<Vec<f32>, WanVaeDecodeError<S::Error>> {
+        let cfg = &self.cfg;
+        let z_dim = cfg.z_dim;
+        let spat = cfg.spatial_compression;
+        let pix_c = cfg.pixel_channels();
+        let frame_elems = z_dim * h_in * w_in;
+        assert_eq!(
+            latents.len(),
+            frame_elems * f,
+            "decode: expected {} latents, got {}",
+            frame_elems * f,
+            latents.len()
+        );
+        let (h_out, w_out) = (h_in * spat, w_in * spat);
+
+        let views = self
+            .handles
+            .acquire(residency, backend)
+            .instrument(tracing::debug_span!(target: PHASE, "wan_vae.acquire"))
+            .await?;
+        let bufs = views.bufs();
+
+        // Output video: CTHW with the time axis concatenated across frame
+        // groups (group 0 -> 1 frame, each later group -> `temporal_compression`).
+        let t_total = if f == 0 {
+            0
+        } else {
+            cfg.temporal_compression * f - (cfg.temporal_compression - 1)
+        };
+        let hw_out = h_out * w_out;
+        // `video` accumulates feather-weighted tile outputs; `wsum` the matching
+        // per-pixel weights (channel-independent). Normalized + clamped below.
+        let mut video = vec![0.0_f32; pix_c * t_total * hw_out];
+        let mut wsum = vec![0.0_f32; t_total * hw_out];
+
+        // Latent tile size derived from the live VRAM budget (not a fixed
+        // const): bigger tiles on a roomy device, smaller on thin hardware, so
+        // peak VRAM tracks the budget instead of a hardcoded ceiling.
+        let budget = residency.arbiter().budget_bytes();
+        // Worst-case per-group output frames: groups after the first temporally
+        // upsample one latent frame to `temporal_compression` video frames, the
+        // peak the tile must hold. A single-frame (image) decode never hits it.
+        let max_tout = if f <= 1 {
+            1
+        } else {
+            cfg.temporal_compression as u32
+        };
+        // Reserve the real fixed footprint out of the budget before sizing the
+        // (non-evictable) tile workspace: the resident VAE weights (all fit) +
+        // readback/upload staging + fragmentation. Budget-independent -- not a
+        // budget fraction. An unbounded budget tiles against a 2 GiB reference.
+        const VAE_STAGING_RESERVE: u64 = 256 * 1024 * 1024;
+        let eff_budget = if budget == u64::MAX {
+            2 * 1024 * 1024 * 1024
+        } else {
+            budget
+        };
+        let reserve = self.weight_footprint + VAE_STAGING_RESERVE;
+        let workspace_budget = eff_budget.saturating_sub(reserve);
+        // Seed the tile below the workspace budget (VAE_SEED_SAFETY) and step
+        // it down on OOM (LTX precedent): the peak model does not capture pool
+        // fragmentation exactly, so the margin lands the common case on the
+        // first try and the strict-budget retry converges any residual error
+        // WITHOUT a device OOM.
+        let mut seed_budget = (workspace_budget as f64 * VAE_SEED_SAFETY) as u64;
+        let (mut tile, mut overlap) =
+            vae_tile_dims(seed_budget, self.pipelines.act_size, max_tout, cfg);
+        // Hold everything-but-weights free so the arbiter caps weight residency
+        // at the footprint (all VAE weights stay resident, no per-tile
+        // re-streaming) while the tile workspace + staging cannot push the true
+        // peak past the budget. The DiT step loop uses the same mechanism.
+        if budget != u64::MAX {
+            residency.set_transient_reserve(eff_budget.saturating_sub(self.weight_footprint));
+            // Hard ceiling: an over-budget tile alloc fails AT the budget with
+            // `BudgetExceeded` (retryable, device untouched) instead of
+            // overshooting into a real device OOM.
+            workspace.set_strict_budget(true);
+        }
+
+        'attempt: loop {
+            // Overlapping latent tiles per axis; a single full tile at parity
+            // res (bit-identical to the untiled path).
+            let tiles_h = plan_tiles(h_in as u32, tile, overlap);
+            let tiles_w = plan_tiles(w_in as u32, tile, overlap);
+            if std::env::var_os("THINFER_VAE_MEM").is_some() {
+                eprintln!(
+                    "[vae_mem] budget={}MiB weights={}MiB reserve={}MiB ws_budget={}MiB seed={}MiB act_size={} tile={} overlap={} grid={}x{} (h_in={} w_in={} f={})",
+                    budget / (1024 * 1024),
+                    self.weight_footprint / (1024 * 1024),
+                    reserve / (1024 * 1024),
+                    workspace_budget / (1024 * 1024),
+                    seed_budget / (1024 * 1024),
+                    self.pipelines.act_size,
+                    tile,
+                    overlap,
+                    tiles_h.len(),
+                    tiles_w.len(),
+                    h_in,
+                    w_in,
+                    f,
+                );
+            }
+            let single = tiles_h.len() == 1 && tiles_w.len() == 1;
+            for &(r0, hext) in &tiles_h {
+                let weights_h = feather_1d(
+                    hext,
+                    overlap,
+                    spat as u32,
+                    r0 > 0,
+                    (r0 + hext) < h_in as u32,
+                );
+                for &(c0, wext) in &tiles_w {
+                    let weights_w = feather_1d(
+                        wext,
+                        overlap,
+                        spat as u32,
+                        c0 > 0,
+                        (c0 + wext) < w_in as u32,
+                    );
+                    // Taps (parity bisection) only apply to the single full tile.
+                    let tile_taps = if single { taps.as_deref_mut() } else { None };
+                    match decode_tile::<S>(
+                        backend,
+                        workspace,
+                        &self.pipelines,
+                        cfg,
+                        &bufs,
+                        latents,
+                        f,
+                        h_in,
+                        w_in,
+                        (r0, c0, hext, wext),
+                        &weights_h,
+                        &weights_w,
+                        t_total,
+                        &mut video,
+                        &mut wsum,
+                        tile_taps,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(WanVaeDecodeError::Forward(WanVaeError::Wgpu(
+                            WgpuError::Allocate { .. } | WgpuError::BudgetExceeded { .. },
+                        ))) if tile > VAE_DEC_TILE_MIN => {
+                            // Per-tile workspace didn't fit. OOM hits at alloc
+                            // (pre-submit), so the failed tile left nothing
+                            // live -- drain the pool and re-seed from a smaller
+                            // budget, stepping down until the plan strictly
+                            // shrinks. Restart the whole grid: the accumulators
+                            // hold partial feather sums from the old plan.
+                            workspace.drain_pool();
+                            let prev = (tile, overlap);
+                            loop {
+                                seed_budget = ((seed_budget as f64 * VAE_OOM_SHRINK) as u64).max(1);
+                                let (nt, no) = vae_tile_dims(
+                                    seed_budget,
+                                    self.pipelines.act_size,
+                                    max_tout,
+                                    cfg,
+                                );
+                                tile = nt;
+                                overlap = no;
+                                if (tile, overlap) != prev || tile == VAE_DEC_TILE_MIN {
+                                    break;
+                                }
+                            }
+                            tracing::warn!(
+                                target: thinfer_core::trace::DIAG,
+                                from_tile = prev.0, to_tile = tile,
+                                seed_mb = seed_budget / (1024 * 1024),
+                                "wan vae decode OOM; re-seeding smaller",
+                            );
+                            video.fill(0.0);
+                            wsum.fill(0.0);
+                            continue 'attempt;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // Return this tile's idle buffers to the pool before the
+                    // next tile grows it, keeping the live set to one tile.
+                    if !single {
+                        workspace.drain_pool();
+                    }
+                }
+            }
+            break;
+        }
+
+        // Normalize the feather blend (wsum is unit everywhere for a single
+        // tile -> exact passthrough) and clamp to [-1, 1].
+        for ch in 0..pix_c {
+            let base = ch * t_total * hw_out;
+            for pix in 0..(t_total * hw_out) {
+                video[base + pix] = (video[base + pix] / wsum[pix]).clamp(-1.0, 1.0);
+            }
+        }
+
+        Ok(video)
+    }
+}
+
+// ===========================================================================
+// Forward driver (encoder).
+// ===========================================================================
+//
+// The encoder runs `_encode` (`autoencoder_kl_wan.py`) one input chunk at a
+// time: chunk 0 is a single frame, every later chunk is the next 4 frames, and
+// each chunk emits exactly one latent frame (4x temporal compression). Each
+// chunk is its own `BatchScope` + submit (the VAE single-heavy-submit rule),
+// with a host-side `feat_cache` carrying causality across chunks. The cache
+// covers the same kt=3 causal convs as the decoder (conv_in, every resnet
+// conv1/conv2, conv_out) plus the per-stage `downsample3d` time_conv. The two
+// temporal down stages collapse a 4-frame chunk 4 -> 2 -> 1 before the mid
+// block, so the mid block (and its attention) run at T=1, exactly like the
+// decoder; `mid_attention_forward` is reused unchanged.
+//
+// quant_conv (1x1x1, 2*z_dim -> 2*z_dim) is pointwise in time, so applying it
+// per chunk equals applying it to the whole concatenated latent.
+
+// ---------------------------------------------------------------------------
+// downsample helpers
+// ---------------------------------------------------------------------------
+
+/// Per-frame spatial downsample (`ZeroPad2d((0, 1, 0, 1))` + 3x3 stride-2
+/// `Conv2d`, channels unchanged), applied over every time frame. NCTHW in,
+/// NCTHW out with `H, W` halved. The 2D conv runs in NTCHW (batch `= B*T`).
+/// The right/bottom-only zero pad is realized implicitly: a `pad=0 stride=2`
+/// conv whose `h_out = h_in/2` reads `hi = ho*2 + dh` and the kernel zero-fills
+/// every `hi >= h_in` gather (the bottom/right pad), so no asymmetric-pad op is
+/// needed.
+fn spatial_downsample<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    x: BatchBuf<'wsp>,
+    shape: Shape5,
+    w: &'wsp ConvBufs,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let (b, c, t, h, ww) = (shape.b, shape.c, shape.t, shape.h, shape.w);
+    let bt = b * t;
+    let hw = h * ww;
+    // NCTHW -> NTCHW.
+    let ntchw = transpose12_run(scope, pl, x, b, c, t, hw)?;
+
+    let dn_h = h / 2;
+    let dn_w = ww / 2;
+    let conv_shape = Shape5 {
+        b: bt,
+        c,
+        t: 1,
+        h: dn_h,
+        w: dn_w,
+    };
+    let cout_buf = scope.alloc(conv_shape.bytes(pl.act_size))?;
+    let cu = conv2d_uniform(scope, (bt, c, h, ww), (c, dn_h, dn_w), (3, 3, 0, 0, 2, 2))?;
+    let wb = scope.import(&w.weight);
+    let bb = scope.import(&w.bias);
+    scope.conv2d(
+        &pl.conv2d.pipeline,
+        &pl.conv2d.op,
+        ntchw,
+        wb,
+        bb,
+        cu,
+        cout_buf,
+        c,
+        dn_h * dn_w,
+        bt,
+    )?;
+
+    // NTCHW -> NCTHW.
+    let out = transpose12_run(scope, pl, cout_buf, b, t, c, dn_h * dn_w)?;
+    Ok((
+        out,
+        Shape5 {
+            b,
+            c,
+            t,
+            h: dn_h,
+            w: dn_w,
+        },
+    ))
+}
+
+/// `downsample3d` temporal conv (`WanCausalConv3d(c, c, (3,1,1), stride=(2,1,1),
+/// padding=0)`). Unlike the kt=3 stride-1 causal convs this has no internal
+/// front pad; causality is carried by manually prepending the previous chunk's
+/// last (spatially-downsampled) frame. On the first chunk the cache is empty:
+/// the frame is stashed and `x` passes through untouched (pyref stores
+/// `x.clone()` and skips the conv). Later chunks prepend the cached frame, run
+/// the stride-2 conv (`Tout = (Tin + 1 - 3) / 2 + 1`), and restash `x`'s last
+/// frame.
+#[allow(clippy::too_many_arguments)]
+fn downsample_temporal<'wsp>(
+    workspace: &'wsp Workspace<WgpuBackend>,
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    fc: &mut FeatCache,
+    retire: &mut Vec<FeatEntry>,
+    x: BatchBuf<'wsp>,
+    in_shape: Shape5,
+    w: &'wsp ConvBufs,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let idx = fc.next();
+    let cin = in_shape.c;
+    let (h, ww) = (in_shape.h, in_shape.w);
+    let tin = in_shape.t;
+    let asz = pl.act_size;
+
+    let has_cache = matches!(fc.entries[idx], FeatEntry::Frames { .. });
+
+    // Stash this chunk's last frame for the next chunk (always 1 frame).
+    let cache_shape = Shape5 {
+        b: in_shape.b,
+        c: cin,
+        t: 1,
+        h,
+        w: ww,
+    };
+    let new_buf = workspace.alloc(cache_shape.bytes(asz))?;
+    let nb = scope.import_copy(new_buf.as_buf_ref());
+    let u = concat_time_uniform(scope, in_shape.b, cin, h, ww, tin, tin, tin - 1, 1, 0, 0, 0)?;
+    scope.concat_time::<ConcatTimeF32>(&pl.concat_time, x, x, u, nb, cache_shape.elems())?;
+
+    if !has_cache {
+        // First chunk: cache the frame, pass `x` through unchanged.
+        retire.push(std::mem::replace(
+            &mut fc.entries[idx],
+            FeatEntry::Frames { buf: new_buf, t: 1 },
+        ));
+        return Ok((x, in_shape));
+    }
+
+    // Prepend the cached frame, then a stride-2 kt=3 conv with no front pad.
+    let old_ref = match &fc.entries[idx] {
+        FeatEntry::Frames { buf, .. } => buf.as_buf_ref(),
+        _ => unreachable!(),
+    };
+    let a = scope.import_copy(old_ref);
+    let asm = Shape5 {
+        b: in_shape.b,
+        c: cin,
+        t: tin + 1,
+        h,
+        w: ww,
+    };
+    let asm_buf = scope.alloc(asm.bytes(asz))?;
+    let au = concat_time_uniform(scope, in_shape.b, cin, h, ww, 1, tin, 0, 1, 0, tin, 0)?;
+    scope.concat_time::<ConcatTimeF32>(&pl.concat_time, a, x, au, asm_buf, asm.elems())?;
+
+    let (out, out_shape) = conv3d_run(
+        scope,
+        pl,
+        asm_buf,
+        asm,
+        w,
+        cin,
+        (3, 1, 1),
+        (0, 0, 0),
+        (2, 1, 1),
+    )?;
+
+    retire.push(std::mem::replace(
+        &mut fc.entries[idx],
+        FeatEntry::Frames { buf: new_buf, t: 1 },
+    ));
+    Ok((out, out_shape))
+}
+
+/// Encoder down stage: `num_res_blocks` resnets (`in_c -> out_c` on the first,
+/// then `out_c -> out_c`) then an optional downsampler (spatial 2x always,
+/// plus the temporal conv for `downsample3d`).
+#[allow(clippy::too_many_arguments)]
+fn down_stage_forward<'wsp>(
+    workspace: &'wsp Workspace<WgpuBackend>,
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    fc: &mut FeatCache,
+    retire: &mut Vec<FeatEntry>,
+    mut x: BatchBuf<'wsp>,
+    mut shape: Shape5,
+    out_c: u32,
+    temporal: bool,
+    w: &'wsp DownStageBufs,
+) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    for resnet in &w.resnets {
+        let (y, sh) = resnet_forward(workspace, scope, pl, fc, retire, x, shape, out_c, resnet)?;
+        x = y;
+        shape = sh;
+    }
+    let Some(ds) = &w.downsampler else {
+        return Ok((x, shape));
+    };
+
+    // Spatial first (per-frame), then the temporal conv for downsample3d.
+    let (y, sh) = spatial_downsample(scope, pl, x, shape, &ds.spatial_conv)?;
+    x = y;
+    shape = sh;
+    if temporal {
+        let tc = ds
+            .time_conv
+            .as_ref()
+            .expect("temporal downsampler has time_conv");
+        let (y, sh) = downsample_temporal(workspace, scope, pl, fc, retire, x, shape, tc)?;
+        x = y;
+        shape = sh;
+    }
+    Ok((x, shape))
+}
+
+// ---------------------------------------------------------------------------
+// per-chunk encoder + top-level encode
+// ---------------------------------------------------------------------------
+
+/// Encode one input chunk `[1, 3, tin, h, w]` (`tin` = 1 on chunk 0, else 4)
+/// into one latent frame `[1, 2*z_dim, 1, h/8, w/8]` written to `out_ref`.
+/// Runs the whole chunk in one BatchScope + submit.
+#[allow(clippy::too_many_arguments)]
+async fn encode_chunk(
+    backend: &WgpuBackend,
+    workspace: &Workspace<WgpuBackend>,
+    pl: &WanVaePipelines,
+    cfg: &WanVaeConfig,
+    bufs: &VaeEncoderBufs,
+    fc: &mut FeatCache,
+    chunk_in: &BufRef,
+    tin: u32,
+    h_in: u32,
+    w_in: u32,
+    out_ref: &BufRef,
+    chunk_idx: usize,
+    taps: Option<&mut WanVaeEncodeTaps<'_>>,
+) -> Result<Shape5, WanVaeError> {
+    fc.reset();
+    let mut retire: Vec<FeatEntry> = Vec::new();
+    let asz = pl.act_size;
+    let (want_conv_in, want_downs, want_mid, want_conv_out) = match &taps {
+        Some(t) if t.chunk == chunk_idx => (
+            t.conv_in.is_some(),
+            t.down_stages.is_some(),
+            t.mid.is_some(),
+            t.conv_out.is_some(),
+        ),
+        _ => (false, false, false, false),
+    };
+    let mut p_conv_in = None;
+    let mut p_downs: Vec<(WsBuf<WgpuBackend>, usize)> = Vec::new();
+    let mut p_mid = None;
+    let mut p_conv_out = None;
+    let out_shape;
+    {
+        let scope = workspace.batch();
+        let x0 = scope.import(chunk_in);
+        let in_shape = Shape5 {
+            b: 1,
+            c: cfg.in_channels as u32,
+            t: tin,
+            h: h_in,
+            w: w_in,
+        };
+
+        // conv_in (causal 3x3x3).
+        let (mut x, mut sh) = causal_conv3d(
+            workspace,
+            &scope,
+            pl,
+            fc,
+            &mut retire,
+            x0,
+            in_shape,
+            &bufs.conv_in,
+            cfg.enc_dim(0) as u32,
+            3,
+            3,
+        )?;
+        if want_conv_in {
+            p_conv_in = Some(persist_stage(workspace, &scope, x, sh, asz)?);
+        }
+
+        // down stages 0..N.
+        for (i, ds) in bufs.down_stages.iter().enumerate() {
+            let out_c = cfg.down_out_channels(i) as u32;
+            let temporal = cfg.down_temporal(i);
+            let (y, s) = down_stage_forward(
+                workspace,
+                &scope,
+                pl,
+                fc,
+                &mut retire,
+                x,
+                sh,
+                out_c,
+                temporal,
+                ds,
+            )?;
+            x = y;
+            sh = s;
+            if want_downs {
+                p_downs.push(persist_stage(workspace, &scope, x, sh, asz)?);
+            }
+        }
+
+        // mid_block: resnet -> attention -> resnet (T=1 here).
+        let (m0, s0) = resnet_forward(
+            workspace,
+            &scope,
+            pl,
+            fc,
+            &mut retire,
+            x,
+            sh,
+            cfg.enc_mid_channels() as u32,
+            &bufs.mid_block.resnets[0],
+        )?;
+        let (m1, s1) = mid_attention_forward(&scope, pl, m0, s0, &bufs.mid_block.attention)?;
+        let (m2, s2) = resnet_forward(
+            workspace,
+            &scope,
+            pl,
+            fc,
+            &mut retire,
+            m1,
+            s1,
+            cfg.enc_mid_channels() as u32,
+            &bufs.mid_block.resnets[1],
+        )?;
+        x = m2;
+        sh = s2;
+        if want_mid {
+            p_mid = Some(persist_stage(workspace, &scope, x, sh, asz)?);
+        }
+
+        // norm_out -> silu -> conv_out (causal 3x3x3, cout=2*z_dim).
+        let n = rmsnorm3d_run(&scope, pl, x, sh, &bufs.norm_out)?;
+        let a = silu_run(&scope, pl, n, sh)?;
+        let (c_out, c_sh) = causal_conv3d(
+            workspace,
+            &scope,
+            pl,
+            fc,
+            &mut retire,
+            a,
+            sh,
+            &bufs.conv_out,
+            cfg.z_dim_x2() as u32,
+            3,
+            3,
+        )?;
+        if want_conv_out {
+            p_conv_out = Some(persist_stage(workspace, &scope, c_out, c_sh, asz)?);
+        }
+
+        // quant_conv (1x1x1, pointwise in time so per-chunk == whole).
+        let (q, q_sh) = conv3d_1x1x1(
+            &scope,
+            pl,
+            c_out,
+            c_sh,
+            &bufs.quant_conv,
+            cfg.z_dim_x2() as u32,
+        )?;
+        out_shape = q_sh;
+
+        let dst = scope.import(out_ref);
+        scope.copy_buffer_to_buffer(q, 0, dst, 0, q_sh.bytes(pl.act_size))?;
+        scope
+            .submit_void()
+            .instrument(tracing::debug_span!(target: PHASE, "wan_vae.submit", phase = "encode_chunk", chunk = chunk_idx))
+            .await
+            .map_err(WanVaeError::Wgpu)?;
+    }
+    drop(retire);
+
+    if let Some(t) = taps
+        && t.chunk == chunk_idx
+    {
+        read_stage(backend, asz, &p_conv_in, t.conv_in.as_deref_mut()).await?;
+        read_stage(backend, asz, &p_mid, t.mid.as_deref_mut()).await?;
+        read_stage(backend, asz, &p_conv_out, t.conv_out.as_deref_mut()).await?;
+        if let Some(sink) = t.down_stages.as_deref_mut() {
+            sink.clear();
+            for (ws, n) in &p_downs {
+                let act = if asz == 2 {
+                    ActDtype::F16
+                } else {
+                    ActDtype::F32
+                };
+                let mut v = Vec::new();
+                read_into_f32(backend, &ws.as_buf_ref(), *n, act, &mut v).await?;
+                sink.push(v);
+            }
+        }
+    }
+    Ok(out_shape)
+}
+
+/// Wan VAE encoder. Encodes a video `[3, F, h, w]` in `[-1, 1]` (B=1, F = 4k+1)
+/// into latent distribution params `[2*z_dim, k+1, h/8, w/8]` (mean ++ logvar),
+/// chunk by chunk (chunk 0 = frame 0, each later chunk = the next 4 frames).
+pub struct WanVaeEncoder {
+    pub pipelines: WanVaePipelines,
+    pub handles: VaeEncoderHandles,
+    pub cfg: WanVaeConfig,
+    /// Total GPU bytes of the encoder weights (all fit resident). Reserved out
+    /// of the VRAM budget when sizing the spatial input-tile workspace, so
+    /// weights stay resident (no per-tile re-streaming) and the true peak holds
+    /// the budget. Mirrors `WanVaeDecoder::weight_footprint`.
+    pub weight_footprint: u64,
+}
+
+#[derive(Debug)]
+pub enum WanVaeEncodeError<SE: core::fmt::Debug> {
+    Forward(WanVaeError),
+    Residency(ResidencyError<SE, WgpuError>),
+}
+
+impl<SE: core::fmt::Debug> From<WanVaeError> for WanVaeEncodeError<SE> {
+    fn from(e: WanVaeError) -> Self {
+        Self::Forward(e)
+    }
+}
+impl<SE: core::fmt::Debug> From<WgpuError> for WanVaeEncodeError<SE> {
+    fn from(e: WgpuError) -> Self {
+        Self::Forward(WanVaeError::Wgpu(e))
+    }
+}
+impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for WanVaeEncodeError<SE> {
+    fn from(e: ResidencyError<SE, WgpuError>) -> Self {
+        Self::Residency(e)
+    }
+}
+
+impl WanVaeEncoder {
+    /// Encode `video` (CTHW row-major, `3 * f * h_in * w_in` f32, `f = 4k+1`)
+    /// into host latent params CTHW `[2*z_dim, k+1, h_in/8, w_in/8]` f32.
+    pub async fn encode<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &mut Workspace<WgpuBackend>,
+        video: &[f32],
+        f: usize,
+        h_in: usize,
+        w_in: usize,
+    ) -> Result<Vec<f32>, WanVaeEncodeError<S::Error>> {
+        self.encode_with_taps(backend, residency, workspace, video, f, h_in, w_in, None)
+            .await
+    }
+
+    /// `encode` with per-stage taps captured on `taps.chunk` for e2e bisection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn encode_with_taps<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        workspace: &mut Workspace<WgpuBackend>,
+        video: &[f32],
+        f: usize,
+        h_in: usize,
+        w_in: usize,
+        mut taps: Option<&mut WanVaeEncodeTaps<'_>>,
+    ) -> Result<Vec<f32>, WanVaeEncodeError<S::Error>> {
+        let hw_in = h_in * w_in;
+        assert_eq!(
+            video.len(),
+            3 * f * hw_in,
+            "encode: expected {} input samples, got {}",
+            3 * f * hw_in,
+            video.len()
+        );
+        assert!(
+            f >= 1 && (f - 1).is_multiple_of(4),
+            "encode: F must be 4k+1, got {f}"
+        );
+        let cfg = &self.cfg;
+        let asz = self.pipelines.act_size;
+        let (h_out, w_out) = (h_in / 8, w_in / 8);
+        let hw_out = h_out * w_out;
+        let zc = cfg.z_dim_x2();
+
+        let views = self
+            .handles
+            .acquire(residency, backend)
+            .instrument(tracing::debug_span!(target: PHASE, "wan_vae.acquire"))
+            .await?;
+        let bufs = views.bufs();
+
+        let n_chunks = 1 + (f - 1) / 4;
+        // Latent CTHW: time axis concatenated across chunks (1 latent frame each).
+        let mut latent = vec![0.0_f32; zc * n_chunks * hw_out];
+
+        // --- budget-derived spatial input tiling ---
+        // Size an INPUT tile from the live VRAM budget (analogous to decode):
+        // the encoder's full-res early stages dominate, so peak scales with the
+        // input tile area. Reserve the resident weights + staging out of the
+        // budget before sizing the (non-evictable) tile workspace, and hold the
+        // rest as a transient reserve so weights stay resident while the tile
+        // workspace + staging cannot push the true peak past the budget.
+        let budget = residency.arbiter().budget_bytes();
+        const VAE_STAGING_RESERVE: u64 = 256 * 1024 * 1024;
+        let eff_budget = if budget == u64::MAX {
+            2 * 1024 * 1024 * 1024
+        } else {
+            budget
+        };
+        let reserve = self.weight_footprint + VAE_STAGING_RESERVE;
+        let workspace_budget = eff_budget.saturating_sub(reserve);
+        let (tile, overlap) = vae_encode_tile_dims(workspace_budget, asz);
+        if budget != u64::MAX {
+            residency.set_transient_reserve(eff_budget.saturating_sub(self.weight_footprint));
+        }
+
+        // Non-overlapping valid LATENT tiles per axis (the halo, not overlap,
+        // supplies cross-tile context). A single full tile at parity res ==
+        // the untiled encode, bit-identical.
+        let tiles_h = plan_tiles(h_out as u32, tile, overlap);
+        let tiles_w = plan_tiles(w_out as u32, tile, overlap);
+        let single = tiles_h.len() == 1 && tiles_w.len() == 1;
+        let halo = ENC_HALO_PX as usize;
+        let mem_dbg = std::env::var_os("THINFER_VAE_MEM").is_some();
+        if mem_dbg {
+            eprintln!(
+                "[vae_mem] ENCODE budget={}MiB weights={}MiB ws_budget={}MiB act_size={} tile={} halo={} grid={}x{} (h_in={} w_in={} f={})",
+                budget / (1024 * 1024),
+                self.weight_footprint / (1024 * 1024),
+                workspace_budget / (1024 * 1024),
+                asz,
+                tile,
+                halo,
+                tiles_h.len(),
+                tiles_w.len(),
+                h_in,
+                w_in,
+                f,
+            );
+        }
+
+        // Each spatial tile carries its OWN temporal feat_cache across chunks
+        // (the cache holds per-conv spatial buffers, so it is tile-local).
+        for &(lr0, lhext) in &tiles_h {
+            // Input rows: valid region [lr0*8, (lr0+lhext)*8) grown by the halo
+            // on each side, clamped to the image (true borders get no halo,
+            // exactly the untiled edge behavior).
+            let vr0 = lr0 as usize * 8;
+            let in_r0 = vr0.saturating_sub(halo);
+            let in_r1 = ((lr0 + lhext) as usize * 8 + halo).min(h_in);
+            let in_h = in_r1 - in_r0;
+            // Valid latent rows' offset within this tile's latent output.
+            let crop_r = (vr0 - in_r0) / 8;
+            for &(lc0, lwext) in &tiles_w {
+                let vc0 = lc0 as usize * 8;
+                let in_c0 = vc0.saturating_sub(halo);
+                let in_c1 = ((lc0 + lwext) as usize * 8 + halo).min(w_in);
+                let in_w = in_c1 - in_c0;
+                let crop_c = (vc0 - in_c0) / 8;
+                let tile_hw_in = in_h * in_w;
+                let tile_h_out = in_h / 8;
+                let tile_w_out = in_w / 8;
+                let tile_hw_out = tile_h_out * tile_w_out;
+
+                let mut fc = FeatCache::new();
+                for i in 0..n_chunks {
+                    // Slice this chunk's frames (chunk 0 = frame 0; chunk i =
+                    // frames [1+4(i-1), 1+4i)) restricted to the tile's input
+                    // window, into NCTHW [1, 3, tin, in_h, in_w].
+                    let (f0, tin) = if i == 0 {
+                        (0usize, 1usize)
+                    } else {
+                        (1 + 4 * (i - 1), 4usize)
+                    };
+                    let mut chunk = vec![0.0_f32; 3 * tin * tile_hw_in];
+                    for c in 0..3 {
+                        for tt in 0..tin {
+                            for rr in 0..in_h {
+                                let src = (c * f + (f0 + tt)) * hw_in + (in_r0 + rr) * w_in + in_c0;
+                                let dst = ((c * tin + tt) * in_h + rr) * in_w;
+                                chunk[dst..dst + in_w].copy_from_slice(&video[src..src + in_w]);
+                            }
+                        }
+                    }
+                    let in_bytes = f32s_to_act_bytes(asz, &chunk);
+                    let in_buf = workspace.alloc(in_bytes.len() as u64)?;
+                    backend.write_buffer(in_buf.id(), 0, &in_bytes)?;
+
+                    let out_bytes = (zc * tile_hw_out) as u64 * asz;
+                    let out_buf = workspace.alloc(out_bytes)?;
+                    let out_ref = out_buf.as_buf_ref();
+
+                    // Taps (parity bisection) only apply to the single full tile.
+                    let tile_taps = if single { taps.as_deref_mut() } else { None };
+                    if mem_dbg {
+                        use thinfer_core::backend::Backend;
+                        let mem = backend.mem_account();
+                        eprintln!(
+                            "[vae_mem]   tile h=[{}..{}] w=[{}..{}] in={}x{} chunk={} vram_total={}MiB (W={}MiB Ws={}MiB St={}MiB)",
+                            lr0,
+                            lr0 + lhext,
+                            lc0,
+                            lc0 + lwext,
+                            in_h,
+                            in_w,
+                            i,
+                            mem.vram_total_current() / (1024 * 1024),
+                            mem.vram_current(VramCategory::Weights) / (1024 * 1024),
+                            mem.vram_current(VramCategory::Workspace) / (1024 * 1024),
+                            mem.vram_current(VramCategory::Staging) / (1024 * 1024),
+                        );
+                    }
+                    let t_tile = std::time::Instant::now();
+                    let shape = encode_chunk(
+                        backend,
+                        &*workspace,
+                        &self.pipelines,
+                        cfg,
+                        &bufs,
+                        &mut fc,
+                        &in_buf.as_buf_ref(),
+                        tin as u32,
+                        in_h as u32,
+                        in_w as u32,
+                        &out_ref,
+                        i,
+                        tile_taps,
+                    )
+                    .await?;
+                    debug_assert_eq!(shape.t, 1);
+                    debug_assert_eq!(shape.c as usize, zc);
+                    debug_assert_eq!(shape.h as usize, tile_h_out);
+                    debug_assert_eq!(shape.w as usize, tile_w_out);
+
+                    let host = backend
+                        .read_buffer(out_ref.id, out_ref.offset, out_bytes)
+                        .instrument(
+                            tracing::debug_span!(target: PHASE, "wan_vae.readback", chunk = i),
+                        )
+                        .await?;
+                    if mem_dbg {
+                        eprintln!(
+                            "[vae_mem]   tile chunk={} encode+readback {}ms",
+                            i,
+                            t_tile.elapsed().as_millis()
+                        );
+                    }
+                    let vals = act_bytes_to_f32_vec(asz, &host);
+
+                    // Crop the halo and place this tile's valid [zc, lhext,
+                    // lwext] latent block into the full CTHW latent at time i.
+                    // Non-overlapping, so a plain copy (no feather blend).
+                    for ch in 0..zc {
+                        for rr in 0..lhext as usize {
+                            let src = (ch * tile_h_out + (crop_r + rr)) * tile_w_out + crop_c;
+                            let dst = ((ch * n_chunks + i) * h_out + (lr0 as usize + rr)) * w_out
+                                + lc0 as usize;
+                            latent[dst..dst + lwext as usize]
+                                .copy_from_slice(&vals[src..src + lwext as usize]);
+                        }
+                    }
+                    // Return this tile's idle buffers to the pool before the next
+                    // grows it, so the live set stays bounded to one tile.
+                    if !single {
+                        workspace.drain_pool();
+                    }
+                }
+            }
+        }
+
+        Ok(latent)
+    }
+}
+
+/// Act-dtype-aware readback conversion (`act_size == 2` decodes f16).
+pub(crate) fn act_bytes_to_f32_vec(act_size: u64, bytes: &[u8]) -> Vec<f32> {
+    if act_size == 2 {
+        bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    } else {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+}
+
+/// Act-dtype-aware upload conversion (`act_size == 2` encodes f16).
+pub(crate) fn f32s_to_act_bytes(act_size: u64, vals: &[f32]) -> Vec<u8> {
+    if act_size == 2 {
+        let mut out = Vec::with_capacity(vals.len() * 2);
+        for v in vals {
+            out.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+        }
+        out
+    } else {
+        let mut out = Vec::with_capacity(vals.len() * 4);
+        for v in vals {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+}

@@ -68,6 +68,41 @@ impl WeightReader for MmapFile {
         dst.copy_from_slice(&self.mmap[off..end]);
         Ok(())
     }
+
+    /// Real OS readahead. The streaming chunk loop hints `READ_PREFETCH_CHUNKS`
+    /// ahead; starting the page-in now (batched large IOs) means `read_at`'s
+    /// memcpy hits resident pages instead of fault-per-page at disk latency
+    /// (measured: cold Gemma stream read_at ~1GB/s = 12.5s of a 15s encode).
+    /// Best-effort: a failed or ignored hint only costs speed, never bytes.
+    fn will_read(&mut self, offset: u64, len: u64) {
+        let off = offset as usize;
+        let Some(end) = off.checked_add(len as usize) else {
+            return;
+        };
+        if len == 0 || end > self.mmap.len() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let _ = self
+                .mmap
+                .advise_range(memmap2::Advice::WillNeed, off, len as usize);
+        }
+        #[cfg(windows)]
+        // SAFETY: the range is inside the live mapping (bounds-checked above);
+        // PrefetchVirtualMemory only initiates paging, it does not mutate.
+        unsafe {
+            use windows_sys::Win32::System::Memory::{
+                PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let entry = WIN32_MEMORY_RANGE_ENTRY {
+                VirtualAddress: self.mmap.as_ptr().add(off) as *mut core::ffi::c_void,
+                NumberOfBytes: len as usize,
+            };
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+        }
+    }
 }
 
 /// Sequential read-bandwidth bench over the real weight-read paths. Gated on
@@ -131,5 +166,51 @@ mod read_bench {
             off += n as u64;
         }
         report("File::read (warm)", len, t.elapsed().as_secs_f64());
+    }
+}
+
+/// Smoke-test the `.pt` reader against a real `torch.save` checkpoint (e.g.
+/// LongLive `model_bf16.pt`). Gated on `THINFER_PT_PATH` (skips when unset).
+/// Parses the ZIP64 directory + pickle index, then prints every tensor name,
+/// shape and dtype - both proof the parser handles a 10GB real file and the
+/// source of truth for the DiT rename map.
+#[cfg(test)]
+mod pt_smoke {
+    use super::*;
+    use thinfer_core::format::pytorch::PytorchSource;
+    use thinfer_core::weight::WeightSource;
+
+    #[test]
+    fn dump_pt_catalog() {
+        let Some(path) = std::env::var_os("THINFER_PT_PATH") else {
+            eprintln!("pt_smoke: THINFER_PT_PATH unset; skipping");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let opener = MmapFileOpener::new(&path).await.unwrap();
+            let src = PytorchSource::open(opener).await.expect("parse .pt");
+            let mut names: Vec<_> = src
+                .catalog()
+                .entries
+                .iter()
+                .map(|(id, e)| {
+                    (
+                        id.0.clone(),
+                        format!("{:?}", e.shape.0),
+                        e.encoding_label.clone(),
+                        e.size,
+                    )
+                })
+                .collect();
+            names.sort();
+            let total: u64 = names.iter().map(|(_, _, _, sz)| *sz).sum();
+            eprintln!("pt_smoke: {} tensors, {} bytes total", names.len(), total);
+            for (n, shape, dt, sz) in &names {
+                eprintln!("pt_smoke: {n}\t{dt}\t{shape}\t{sz}");
+            }
+        });
     }
 }

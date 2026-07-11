@@ -137,6 +137,13 @@ pub struct Workspace<B: Backend> {
     /// runs. [`MemArbiter::unlimited`] disables the gate (unit tests that
     /// don't care about VRAM accounting).
     arbiter: Arc<MemArbiter>,
+    /// Strict (hard-ceiling) budget mode. When set, a pool-miss alloc that the
+    /// arbiter can't fit under the budget (reclaim ran dry) FAILS with
+    /// `budget_oom_error` instead of overshooting into `backend.allocate` (a
+    /// real device OOM). Default off (soft budget = overshoot + trace). The LTX
+    /// VAE turns it on so its adaptive tiler shrinks at the budget boundary
+    /// rather than after a device OOM (which can poison a long-lived device).
+    strict: std::sync::atomic::AtomicBool,
 }
 
 impl<B: Backend> Workspace<B> {
@@ -158,7 +165,16 @@ impl<B: Backend> Workspace<B> {
             backend,
             inner,
             arbiter,
+            strict: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Enable/disable strict (hard-ceiling) budget allocation. See the `strict`
+    /// field. Idempotent; cheap interior mutability so callers holding `&self`
+    /// (e.g. inside `decode`) can scope it.
+    pub fn set_strict_budget(&self, strict: bool) {
+        self.strict
+            .store(strict, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Current sum of idle pool bytes. Cheap. Used by dispatch-layer
@@ -199,12 +215,22 @@ impl<B: Backend> Workspace<B> {
             None => {
                 // Pool miss → about to grow VRAM. The arbiter reclaims
                 // (idle pool entries, then evictable weights) until the new
-                // class fits under the budget. If even the full chain can't
-                // make room, `backend.allocate` overshoots and the test
-                // budget assert surfaces the true working-set overrun rather
-                // than us silently failing.
-                self.arbiter
-                    .ensure_headroom(self.backend.mem_account(), class);
+                // class fits under the budget. In SOFT mode, if even the full
+                // chain can't make room, `backend.allocate` overshoots and the
+                // test budget assert surfaces the true working-set overrun. In
+                // STRICT mode, a dry reclaim FAILS here (budget = hard ceiling)
+                // so the caller shrinks + retries before any device OOM.
+                if self.strict.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !self
+                        .arbiter
+                        .reclaim_until_fits(self.backend.mem_account(), class)
+                    {
+                        return Err(self.backend.budget_oom_error(class));
+                    }
+                } else {
+                    self.arbiter
+                        .ensure_headroom(self.backend.mem_account(), class);
+                }
                 let id = self.backend.allocate(class)?;
                 (
                     OwnedBuffer {
@@ -466,6 +492,26 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         Ok((fused, a, b))
     }
 
+    /// A sub-view of an existing scope buffer at `byte_offset` for `byte_len`
+    /// bytes (same backing allocation, no new alloc). Used to slice a
+    /// query-row range out of an sdpa Q/Out buffer for watchdog-safe chunked
+    /// dispatch. `byte_offset` must satisfy the backend's storage-binding
+    /// alignment (256B on the wgpu path); callers chunk on 64-row boundaries,
+    /// which is aligned for every act dtype in use. Borrows `src` (BatchBuf is
+    /// not Copy) so the caller can re-slice the same buffer across chunks.
+    pub fn subview(&self, src: &BatchBuf<'wsp>, byte_offset: u64, byte_len: u64) -> BatchBuf<'wsp> {
+        debug_assert!(
+            byte_offset + byte_len <= src.buf.len,
+            "subview out of range: {byte_offset}+{byte_len} > {}",
+            src.buf.len
+        );
+        BatchBuf {
+            buf: BufRef::view(src.buf.id, src.buf.offset + byte_offset, byte_len),
+            scope_id: self.scope_id,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Recompose a fused storage view from two BatchBufs that were minted as
     /// adjacent halves of one `alloc_pair` allocation. Asserts shared id and
     /// adjacency. Used to rebuild an `ActBuf::fused` after pack/unpack across
@@ -553,6 +599,22 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         RefMut::map(self.encoder.borrow_mut(), |o| {
             o.as_mut().expect("BatchScope encoder already taken")
         })
+    }
+
+    /// Submit the commands encoded so far as a standalone command buffer and
+    /// keep encoding into a fresh one, WITHOUT consuming the scope or awaiting
+    /// GPU completion (see [`Backend::flush_encoder`]). Scratch guards are
+    /// retained, so the flushed work reads valid buffers. Used to bound a single
+    /// submit's GPU time under the OS GPU watchdog when one scope would otherwise
+    /// encode a multi-second run of heavy dispatches (the video DiT
+    /// self-attention). A no-op-shaped flush is cheap but not free (a real
+    /// submit), so callers flush only when they have actually split heavy work.
+    pub fn flush(&self) -> Result<(), B::Error> {
+        let mut slot = self.encoder.borrow_mut();
+        let enc = slot.take().expect("BatchScope encoder already taken");
+        self.backend.flush_encoder(enc)?;
+        *slot = Some(self.backend.create_command_encoder());
+        Ok(())
     }
 
     /// Consume the scope: submit the encoder, await GPU completion, then
@@ -735,6 +797,41 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             &mut self.encoder_mut(),
             pipeline,
             op,
+            &bufs,
+            m,
+            n,
+        )
+    }
+
+    /// Dispatch the cooperative-matrix (tensor-core) matmul: `out[M,N] =
+    /// a[M,K] @ b`, with `a` f16 row-major, `b` f16 (layout per `cfg.b_col_major`),
+    /// `dims` the `(m,n,k,_)` uniform. See `ops::matmul_coopmat`.
+    pub fn coopmat(
+        &self,
+        pipeline: &B::Pipeline,
+        cfg: &crate::ops::matmul_coopmat::CoopmatMatmulConfig,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        dims: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+        let out = self.resolve(out);
+        let dims = self.resolve(dims);
+        let bufs = crate::ops::matmul_coopmat::CoopmatBufs {
+            a: &a,
+            b: &b,
+            out: &out,
+            dims: &dims,
+        };
+        crate::ops::matmul_coopmat::dispatch_coopmat(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            cfg,
             &bufs,
             m,
             n,
@@ -971,6 +1068,8 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    /// `rows` is the dispatch's Q-row count (chunk size); the uniform carries
+    /// the chunk's global `row0`. Buffers are bound whole.
     #[allow(clippy::too_many_arguments)]
     pub fn sdpa_i8(
         &self,
@@ -982,7 +1081,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         out: BatchBuf<'wsp>,
         uniform: BatchBuf<'wsp>,
         b: u32,
-        s_q: u32,
+        rows: u32,
         h_q: u32,
         d: u32,
     ) -> Result<(), B::Error> {
@@ -1006,14 +1105,15 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &bufs,
             b,
-            s_q,
+            rows,
             h_q,
             d,
         )
     }
 
-    /// CL-parameterized subgroup sdpa. `cl` must match the value the bound
-    /// `pipeline` was built with (it sets BR = WG/CL for the workgroup grid).
+    /// CL/R-parameterized subgroup sdpa. `cl` and `r` must match the values
+    /// the bound `pipeline` was built with (they set BR = WG/CL*R for the
+    /// workgroup grid).
     #[allow(clippy::too_many_arguments)]
     pub fn sdpa_sg(
         &self,
@@ -1025,6 +1125,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         uniform: BatchBuf<'wsp>,
         out: BatchBuf<'wsp>,
         cl: u32,
+        r: u32,
         b: u32,
         s_q: u32,
         h_q: u32,
@@ -1049,6 +1150,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &bufs,
             cl,
+            r,
             b,
             s_q,
             h_q,
@@ -1229,6 +1331,38 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn bcast_modulate<O: crate::ops::BcastModulateOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        s: BatchBuf<'wsp>,
+        t: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_elems: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let s = self.resolve(s);
+        let t = self.resolve(t);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::BcastModulateBufs {
+            x: &x,
+            s: &s,
+            t: &t,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_bcast_modulate::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_elems,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn rope<O: crate::ops::RopeOp>(
         &self,
         pipeline: &B::Pipeline,
@@ -1338,6 +1472,295 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv3d<O: crate::ops::Conv3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        op: &O,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        cout: u32,
+        m_spatial: u32,
+        batch: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let bias = self.resolve(bias);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::Conv3dBufs {
+            x: &x,
+            w: &w,
+            bias: &bias,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_conv3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            op,
+            &bufs,
+            cout,
+            m_spatial,
+            batch,
+        )
+    }
+
+    pub fn rmsnorm3d<O: crate::ops::RmsNorm3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_pos: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::RmsNorm3dBufs {
+            x: &x,
+            w: &w,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_rmsnorm3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_pos,
+        )
+    }
+
+    pub fn pixel_norm3d<O: crate::ops::PixelNorm3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_pos: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::PixelNorm3dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_pixel_norm3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_pos,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d<O: crate::ops::Conv1dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let bias = self.resolve(bias);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::Conv1dBufs {
+            x: &x,
+            w: &w,
+            bias: &bias,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_conv1d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d<O: crate::ops::ConvTranspose1dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let bias = self.resolve(bias);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ConvTranspose1dBufs {
+            x: &x,
+            w: &w,
+            bias: &bias,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_conv_transpose1d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
+    pub fn scale<O: crate::ops::ScaleOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ScaleBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_scale::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n,
+        )
+    }
+
+    pub fn replicate_pad1d<O: crate::ops::ReplicatePad1dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ReplicatePad1dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_replicate_pad1d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
+    pub fn snake_beta<O: crate::ops::SnakeBetaOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        alpha: BatchBuf<'wsp>,
+        beta: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let alpha = self.resolve(alpha);
+        let beta = self.resolve(beta);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::SnakeBetaBufs {
+            x: &x,
+            alpha: &alpha,
+            beta: &beta,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_snake_beta::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n,
+        )
+    }
+
+    pub fn depth_to_space3d<O: crate::ops::DepthToSpace3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::DepthToSpace3dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_depth_to_space3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
+    pub fn concat_time<O: crate::ops::ConcatTimeOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::ConcatTimeBufs {
+            a: &a,
+            b: &b,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_concat_time::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
+        )
+    }
+
     pub fn transpose12<O: crate::ops::Transpose12Op>(
         &self,
         pipeline: &B::Pipeline,
@@ -1388,6 +1811,38 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &bufs,
             n_elems,
+        )
+    }
+
+    /// Expand a compact relative-position bias `table [num_buckets, H]` +
+    /// `bucket_map [S,S]` (u32) into a dense per-head SDPA mask `[H,S,S]`.
+    /// `n` is the output element count (f32 acts) or word count (`H*S*S/2`,
+    /// packed acts).
+    pub fn relpos_bias<O: crate::ops::RelposBiasOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        table: BatchBuf<'wsp>,
+        bucket_map: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let table = self.resolve(table);
+        let bucket_map = self.resolve(bucket_map);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::RelposBiasBufs {
+            table: &table,
+            bucket_map: &bucket_map,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_relpos_bias::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n,
         )
     }
 
@@ -1445,6 +1900,91 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &bufs,
             n_out_elems,
+        )
+    }
+
+    pub fn dupup3d<O: crate::ops::DupUp3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out_elems: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::DupUp3dBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_dupup3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out_elems,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hunyuan_upsample3d<O: crate::ops::HunyuanUpsample3dOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        h: BatchBuf<'wsp>,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_out_elems: u32,
+    ) -> Result<(), B::Error> {
+        let h = self.resolve(h);
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::HunyuanUpsample3dBufs {
+            h: &h,
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_hunyuan_upsample3d::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out_elems,
+        )
+    }
+
+    /// `memcat` (MemBlock cat-with-prev-frame): `x [T,C,H,W]` -> `[T,2C,H,W]`
+    /// with the causal one-frame shift fused (see `ops::memcat`). `n_out` is the
+    /// output element count (`T*2C*H*W`).
+    pub fn memcat<O: crate::ops::MemCatOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        prev: BatchBuf<'wsp>,
+        n_out: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let prev = self.resolve(prev);
+        let bufs = crate::ops::MemCatBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+            prev: &prev,
+        };
+        crate::ops::dispatch_memcat::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_out,
         )
     }
 
@@ -1552,7 +2092,7 @@ impl<'wsp> BatchScope<'wsp, crate::backend::WgpuBackend> {
 /// let q = scope1.alloc(...)?;
 /// // ...dispatches into scope1...
 /// // Cut between phases (or keep going in same scope if budget allows).
-/// let [q_in_p2] = packer.advance([q], peak_p2)?;
+/// let [q_in_p2] = packer.advance([q], peak_p2).await?;
 /// let scope2 = packer.scope();
 /// // ...dispatches into scope2, q_in_p2 is a valid BatchBuf here...
 /// packer.finish().await?;
@@ -1575,6 +2115,15 @@ where
     B::Error: 'wsp,
     B: 'wsp,
 {
+    /// Max submits left in flight (queued but not yet awaited) before a `cut`
+    /// blocks to drain the oldest. Bounds peak VRAM to ~this many phases of
+    /// workspace: each cut scope's guards stay live until its completion future
+    /// is awaited, so without this bound a long-lived packer (e.g. the whole
+    /// VAE frame decode) pins every phase's scratch at once and OOMs at native
+    /// res. 2 keeps one submit overlapping GPU exec with the next phase's encode
+    /// while still recycling buffers back to the pool every cut.
+    const MAX_INFLIGHT: usize = 2;
+
     /// New packer with a single open scope and no live workspace charged.
     pub fn new(workspace: &'wsp Workspace<B>, budget_bytes: u64) -> Self {
         Self {
@@ -1627,7 +2176,7 @@ where
     /// The prior cut's carry (now stale w.r.t. fresh scopes) folds into the
     /// just-submitted scope's completion future so it releases to pool when
     /// GPU finishes consuming it.
-    pub fn cut(
+    pub async fn cut(
         &mut self,
         carry_in: &[BatchBuf<'wsp>],
         peak_bytes: u64,
@@ -1678,6 +2227,14 @@ where
         };
         self.pending.push(Box::pin(completion));
         self.carry_holds = new_carry;
+        // Backpressure: drain the oldest in-flight submits until at most
+        // MAX_INFLIGHT remain. Awaiting a completion future drops its scope's
+        // guards (and folded prior carry) back to the pool, so the next scope's
+        // allocs reuse those buffers instead of growing VRAM. `carry_holds` is
+        // already moved above, so the live carry survives the await.
+        while self.pending.len() > Self::MAX_INFLIGHT {
+            self.pending.remove(0).await?;
+        }
         self.current = Some(self.workspace.batch());
         self.current_live = peak_bytes;
         let new_scope = self.current.as_ref().unwrap();
@@ -1693,13 +2250,13 @@ where
     /// Decide-and-cut helper. If `would_overflow(peak_bytes)` then `cut(...)`
     /// else pass `carry_in` through (still valid in the current scope) and
     /// `charge(peak_bytes)`. Returns the BatchBufs to use in the next phase.
-    pub fn advance(
+    pub async fn advance(
         &mut self,
         carry_in: &[BatchBuf<'wsp>],
         peak_bytes: u64,
     ) -> Result<Vec<BatchBuf<'wsp>>, B::Error> {
         if self.would_overflow(peak_bytes) {
-            self.cut(carry_in, peak_bytes)
+            self.cut(carry_in, peak_bytes).await
         } else {
             self.charge(peak_bytes);
             Ok(carry_in.to_vec())
@@ -1785,6 +2342,7 @@ mod tests {
             self.allocated.lock().unwrap().insert(id);
             Ok(id)
         }
+        fn budget_oom_error(&self, _bytes: u64) {}
         fn free(&self, id: GpuBufferId) {
             self.allocated.lock().unwrap().remove(&id);
         }
@@ -1816,6 +2374,9 @@ mod tests {
             Ok(())
         }
         async fn submit(&self, _: ()) -> Result<(), ()> {
+            Ok(())
+        }
+        fn flush_encoder(&self, _: ()) -> Result<(), ()> {
             Ok(())
         }
         async fn create_pipeline(
