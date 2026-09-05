@@ -348,17 +348,44 @@ fn build_freqs(s: Streams, v_pos: &[f32], a_pos: &[f32]) -> HostFreqs {
 /// multi-block loop (1 block here; trivially repeated for the 48-layer run).
 #[tokio::test(flavor = "current_thread")]
 async fn dit_full_parity() {
-    use thinfer_models::ltx::dit::DitModel;
-
-    let _trace = thinfer_core::trace::init_from_env();
-    let dit_fr = manifest::MANIFEST
-        .get(role::DIT_GGUF_Q8_0)
-        .expect("dit role");
-    let Some(dit_path) = cache::resolve(dit_fr) else {
-        eprintln!("skipped[ltx dit_full_parity]: DiT GGUF not in HF cache");
+    let Some(dit_path) = full_parity_dit("dit_full_parity") else {
         return;
     };
     let tmp = ensure_pyref(&dit_path);
+    run_full_parity(&dit_path, &tmp).await;
+}
+
+/// The same gate at M >= WM, where the coopmat (tensor-core) matmul actually
+/// runs. `dit_full_parity` alone CANNOT cover it: its reference is 4 video / 4
+/// audio tokens, the coopmat dispatch requires `M >= WM` (32) and silently falls
+/// back to dense below that, so the tiny gate validates only the fallback and is
+/// bit-identical with coopmat on or off. This one regenerates the pyref at 64
+/// tokens so the tensor-core path is the thing under test.
+#[tokio::test(flavor = "current_thread")]
+async fn dit_full_parity_large_m() {
+    let Some(dit_path) = full_parity_dit("dit_full_parity_large_m") else {
+        return;
+    };
+    let tmp = ensure_pyref_large_m(&dit_path);
+    run_full_parity(&dit_path, &tmp).await;
+}
+
+/// Resolve the Q8_0 DiT, or `None` (with a skip note) when it is not cached.
+fn full_parity_dit(test: &str) -> Option<PathBuf> {
+    let dit_fr = manifest::MANIFEST
+        .get(role::DIT_GGUF_Q8_0)
+        .expect("dit role");
+    let path = cache::resolve(dit_fr);
+    if path.is_none() {
+        eprintln!("skipped[ltx {test}]: DiT GGUF not in HF cache");
+    }
+    path
+}
+
+async fn run_full_parity(dit_path: &Path, tmp: &Path) {
+    use thinfer_models::ltx::dit::DitModel;
+
+    let _trace = thinfer_core::trace::init_from_env();
     let meta = std::fs::read_to_string(tmp.join("meta.txt")).expect("meta.txt");
     let m: Vec<usize> = meta
         .split_whitespace()
@@ -395,7 +422,7 @@ async fn dit_full_parity() {
     let pipelines = DitPipelines::compile(&backend)
         .await
         .expect("compile dit pipelines");
-    let opener = MmapFileOpener::new(&dit_path)
+    let opener = MmapFileOpener::new(dit_path)
         .await
         .unwrap_or_else(|e| panic!("open {}: {e}", dit_path.display()));
     let src = GgufSource::open(opener).await.expect("parse dit gguf");
@@ -596,6 +623,29 @@ fn ensure_pyref(dit_path: &Path) -> PathBuf {
     tmp
 }
 
+/// Run (or reuse) the 22B 1-block pyref at 64 video/audio tokens, so `M >= WM`
+/// and the coopmat matmul is exercised. Own tmp dir: the token count changes
+/// every dumped tensor's shape, so it must not share the tiny cache.
+fn ensure_pyref_large_m(dit_path: &Path) -> PathBuf {
+    const TOKENS: u32 = 64;
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ltx_dit_parity_large_m");
+    std::fs::create_dir_all(&tmp).expect("tmpdir");
+    let marker = tmp.join("done.txt");
+    if tmp.join("v_vel.bin").exists() && marker.exists() {
+        eprintln!(
+            "ltx dit-parity(large M): reusing cached pyref dumps ({})",
+            tmp.display()
+        );
+    } else {
+        for ent in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+            let _ = std::fs::remove_file(ent.path());
+        }
+        run_python_ref_tokens(dit_path, &tmp, "22b", Some(TOKENS));
+        std::fs::write(&marker, "ok").expect("write marker");
+    }
+    tmp
+}
+
 /// Run (or reuse) the 19B (ltx2-rapid) 1-block pyref dumps; separate tmp dir from
 /// the 22B set so the two caches don't collide.
 fn ensure_pyref_rapid(dit_path: &Path) -> PathBuf {
@@ -618,24 +668,35 @@ fn ensure_pyref_rapid(dit_path: &Path) -> PathBuf {
 }
 
 fn run_python_ref(dit: &Path, out_dir: &Path, variant: &str) {
+    run_python_ref_tokens(dit, out_dir, variant, None);
+}
+
+/// `tokens` overrides the reference's video/audio token counts (default 4 each).
+/// Only the large-M gate passes it; see [`ensure_pyref_large_m`].
+fn run_python_ref_tokens(dit: &Path, out_dir: &Path, variant: &str, tokens: Option<u32>) {
     let py_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python");
-    let status = Command::new("uv")
-        .args([
-            "run",
-            "--directory",
-            py_dir.to_str().unwrap(),
-            "--with",
-            "gguf",
-            "python",
-            "-m",
-            "thinfer_pytorch_ref.ltx.gen_dit_ref",
-            "--dit-gguf",
-            dit.to_str().unwrap(),
-            "--variant",
-            variant,
-            "--out",
-            out_dir.to_str().unwrap(),
-        ])
+    let mut cmd = Command::new("uv");
+    cmd.args([
+        "run",
+        "--directory",
+        py_dir.to_str().unwrap(),
+        "--with",
+        "gguf",
+        "python",
+        "-m",
+        "thinfer_pytorch_ref.ltx.gen_dit_ref",
+        "--dit-gguf",
+        dit.to_str().unwrap(),
+        "--variant",
+        variant,
+        "--out",
+        out_dir.to_str().unwrap(),
+    ]);
+    if let Some(t) = tokens {
+        cmd.env("THINFER_LTX_REF_TV", t.to_string())
+            .env("THINFER_LTX_REF_TA", t.to_string());
+    }
+    let status = cmd
         .status()
         .expect("failed to spawn `uv run` (is uv installed?)");
     assert!(status.success(), "ltx dit pyref failed");

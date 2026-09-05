@@ -374,7 +374,8 @@ Opt-in web levers already exist: `#encoder` Q4 (~-25s), `#rewrite` off (~-22s).
   `ltx2-rapid-plan.md`.
 - **LTX-2.3 distilled + Sulphur-2** (22B joint AV) -- `ltx-plan.md`. Sulphur
   VERIFIED end to end 2026-09-05 (video + audio, eyeballed): 768x512 5s/121f =
-  **708s / 744s**, 3s/73f = ~460-490s. Weights confirmed current (the Jun-10/13
+  **503s / 509s** with coopmat (was 708s / 744s dense, -30%); 3s/73f = 334s (was
+  486s). Total GPU 288s -> 202s on the 3s clip. Weights confirmed current (the Jun-10/13
   base-repo commits touched only `prompt_enhancer_uncensored/`, not the DiT; local
   Q8_0 + distill LoRA match remote sizes/oid). Distill stack = the ecosystem
   default (dev + `...lora-1.1_fro90_ceil72_condsafe` @ 1.0).
@@ -431,7 +432,21 @@ Opt-in web levers already exist: `#encoder` Q4 (~-25s), `#rewrite` off (~-22s).
   (B=1 forward is ~13x over compute-ideal because each dispatch underfills the GPU).
   Remaining levers are all system-level (batch detection -- BLOCKED by an executor
   batch>1 correctness bug in SCRFD; f16 acts; codec), none conv-kernel.
-- **Coopmat is a MATMUL-ONLY win.** Shared-memory staging is a dead end (slower than
+- **Coopmat DOES apply to a native f16-act DiT, and is a precision GAIN there.**
+  The gate was `fast_mixed` (a bf16-acts concept: it exists to build the bf16<->f16
+  casts), which locked out exactly the blocks that need no casts at all. On the
+  LTX DiT (`F16Dp4a`) the A-side, residual and coopmat operand are already the same
+  f16 values, so the "cast" is just the WM row padding and the output cast vanishes.
+  Result: `matmul_qkv` 11.33 -> 5.48 ms/disp, 3s clip 486s -> 334s, and vs pyref
+  coopmat is CLOSER than the dense path it replaced (video rel 0.088% vs 0.123%,
+  f32 accumulator). H3's ~9% divergence was the f32->f16 A-side cast, not coopmat.
+- **A parity gate at tiny dims cannot see coopmat.** `dit_full_parity` runs 4
+  video / 4 audio tokens; coopmat needs `M >= WM` (32) and silently falls back to
+  dense below it, so that gate was bit-identical with coopmat on or off and proved
+  nothing about it. `dit_full_parity_large_m` (64 tokens, own pyref cache) is the
+  one that actually covers the kernel. Check M against WM before trusting any
+  coopmat result.
+- **Coopmat is otherwise a MATMUL-ONLY win.** Shared-memory staging is a dead end (slower than
   L2-served global coopLoad). Flash-attn coopmat SDPA ~13x slower than `sdpa_sg`.
   cross-qkv coopmat DEVICE-LOSES (un-normed text > f16 65504). Coopmat device-loses
   for M < WM(32) AND fringe-reads past the A-side alloc for ragged M -> pad staging
@@ -521,22 +536,26 @@ staging; read the `gpu_ms by pipeline` rollup first. coopmat needs
 
 ## Open / Next (by track)
 
-- **sulphur-2 / ltx-2.3 perf** (measured 2026-09-05 at 768x512, two-stage 8+3):
-  where the 708s 5s run goes -- stage2 denoise **314s** (3 steps at ~105s), stage1
-  **200s** (8 at ~28s), VAE decode **114s**, setup **75s**. Ranked next levers:
-  1. **coopmat on the LTX DiT** -- the biggest untried lever. `matmul_qkv` (all
-     dense block projections) is 148s of GPU on the 3s run, ~2x more than every
-     other pipeline combined. `CoopmatSites` already exists in `common::block` and
-     LTX wires it to `default()` (all off). NB the H3 blocker does NOT apply here:
-     H3's ~9% divergence came from casting f32 A-sides to f16, and LTX already runs
-     `F16Dp4a` (A-sides are f16 already), so the cast is a no-op. `dit_full_parity`
-     (1 block vs pyref, SLOPE_TOL 0.01 / REL_TOL 0.005) is the gate; it runs, unlike
-     a full-22B pyref.
-  2. **The Sulphur LoRA fold is now the fixed-cost floor** (~60s, 676 sites,
-     12.8GB host cache). It is fully backgrounded (see below) but only ~23s of
-     encoder + connector work exists to hide it behind. Faster fold (GPU dequant/
-     requant, or across-site parallelism) is the remaining win.
-  3. VAE decode 114s at 121f. LTX ships no tiny decoder; it tiles.
+- **sulphur-2 / ltx-2.3 perf.** COOPMAT IS ON and is the big win (see Status).
+  Where the remaining 506s 5s run goes, at 768x512 two-stage 8+3: stage2 denoise
+  **198s** (3 steps at ~66s), stage1 **138s** (8 at ~19s), VAE decode **97s**,
+  setup **71s**. Ranked next levers:
+  1. **VAE decode, 97s** and now the largest non-denoise block. `ltx_vae_conv3d`
+     is 44.6s of GPU on the 3s clip at 23.6ms/disp. LTX ships no tiny (TAEHV)
+     decoder and the conv3d im2col hoist is a known dead end, so this needs a new
+     idea, not a retry. Its acts may still be f32 (H3's video VAE deliberately is);
+     f16 there is a quality call on the final picture, not a free win.
+  2. **The Sulphur LoRA fold is the fixed-cost floor** (~60s, 676 sites, 12.8GB
+     host cache). Already fully backgrounded, but only ~23s of encoder + connector
+     exists to hide it behind. No pre-distilled Sulphur GGUF exists upstream (only
+     `sulphur_dev-*`; the distilled builds are bf16/fp8 safetensors), and both
+     obvious shortcuts are barred -- self-quantizing one, or caching the folded
+     DiT to disk. So the win has to be a faster fold: GPU dequant/requant, or
+     across-site parallelism (rows already fan out within a site).
+  3. DiT streaming. Q6_K (18.7GB vs Q8_0 22.8GB) would cut ~18% of the per-step
+     bytes and coopmat dequants to f16 anyway, so the source kind no longer
+     affects matmul speed -- but the fold re-encodes to Q8_0 regardless, so only
+     the unfolded sites shrink. Quality unmeasured. Not attempted.
 - **DON'T re-litigate the LTX residency cap.** 2G vs 6G, interleaved A/B at
   256x256/9f: 163.4 / 164.1 / 164.2 / 155.7s. No signal, and it cannot help much
   anyway -- each `WeightResidency` builds its OWN `MemArbiter` over the full

@@ -868,7 +868,13 @@ impl BlockPipelines {
         // (baked as the kernel workgroup size), and the block runs fast_mixed
         // (so the bf16<->f16 act casts exist). The weight is dequanted to f16
         // [N,K] nmajor and consumed column-major (b_col_major).
-        let use_coopmat = fast_mixed && backend.coopmat().is_some() && sg_min == sg_max;
+        // A native F16-act block needs no casts at all: its A-side, its residual
+        // and the coopmat operand dtype are all already f16, so the bf16<->f16
+        // pair that `fast_mixed` exists to provide is a no-op there. Gating
+        // coopmat on `fast_mixed` alone locked the tensor cores out of exactly
+        // the blocks that could use them most cheaply (the LTX DiT).
+        let coopmat_acts_ok = fast_mixed || cfg.act_dtype == ActDtype::F16;
+        let use_coopmat = coopmat_acts_ok && backend.coopmat().is_some() && sg_min == sg_max;
         let build_coopmat = async |label: &str,
                                    wd: WeightDtype,
                                    opt_in: bool|
@@ -2639,13 +2645,22 @@ impl Block {
             // page faults the device (nvlddmkm GPUID error, device lost;
             // wan2.2 video tiles were the first shipped non-WM-multiple M).
             // Fringe values are irrelevant: the store discards fringe rows.
+            let bf16_acts = pipelines.act_dtype == ActDtype::Bf16;
             let m_pad = m.next_multiple_of(cm.cfg.wm());
             let a_f16 = scope.alloc(pipelines.act_bytes(m_pad * k))?;
-            let to_f16 = pipelines
-                .cast_to_f16
-                .as_ref()
-                .expect("cast_to_f16 built whenever a coopmat step exists (fast_mixed)");
-            scope.dispatch_op::<Bf16ToF16>(to_f16, &[a.data], a_f16)?;
+            if bf16_acts {
+                let to_f16 = pipelines
+                    .cast_to_f16
+                    .as_ref()
+                    .expect("cast_to_f16 built whenever a bf16 coopmat step exists (fast_mixed)");
+                scope.dispatch_op::<Bf16ToF16>(to_f16, &[a.data], a_f16)?;
+            } else {
+                // F16 acts: the A-side is ALREADY the coopmat operand dtype, so
+                // the "cast" is just the WM row-block padding. Copy the real rows
+                // and leave the fringe uninitialized -- it only has to be MAPPED
+                // (that is what the padding is for), and the store discards it.
+                scope.copy_buffer_to_buffer(a.data, 0, a_f16, 0, pipelines.act_bytes(m * k))?;
+            }
             // (3) coopmat matmul. The accumulator is f32 either way; the OUTPUT
             // encoding is the site's choice. F16 is the compact default, but a
             // site whose output can leave the f16 range (a wide pre-activation
@@ -2656,6 +2671,20 @@ impl Block {
                 cm.cfg.out,
                 thinfer_core::ops::matmul_coopmat::CoopmatOut::F32
             );
+            // F16 acts + an f16 coopmat output: the result is already in the
+            // residual's dtype, so the matmul writes straight to the site's
+            // scratch and the output cast disappears. (`BlockPipelines` only ever
+            // builds F16-out steps; the F32-out variant is the standalone
+            // `build_coopmat_step` used where a wide pre-activation can leave
+            // f16 range.)
+            if !bf16_acts {
+                assert!(
+                    !f32_out,
+                    "f32-out coopmat on an f16-act block needs an F32->F16 cast; not wired",
+                );
+                scope.coopmat(&cm.matmul, &cm.cfg, a_f16, b_f16, out_scratch, dims, m, n)?;
+                return Ok(());
+            }
             let mm_out = scope.alloc(if f32_out {
                 m as u64 * n as u64 * 4
             } else {

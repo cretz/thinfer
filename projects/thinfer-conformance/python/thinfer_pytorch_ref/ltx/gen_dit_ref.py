@@ -35,7 +35,16 @@ import numpy as np
 import torch
 
 # Tiny dims (B=1). Exercises every sublayer; av-cross needs both streams present.
-TV, TA, TVT, TAT = 4, 4, 6, 6
+#
+# Token counts are overridable because the tiny default cannot reach the coopmat
+# (tensor-core) matmul at all: that path requires M >= WM (32) and falls back to
+# dense below it, so a 4-token reference silently validates only the fallback.
+# `ltx dit_full_parity_large_m` regenerates this at 64 to cover the real kernel.
+import os
+
+TV = int(os.environ.get("THINFER_LTX_REF_TV", "4"))
+TA = int(os.environ.get("THINFER_LTX_REF_TA", "4"))
+TVT, TAT = 6, 6
 SIGMA = 0.7
 
 VIDEO_MAX_POS = [20, 2048, 2048]

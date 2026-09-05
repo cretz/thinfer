@@ -737,7 +737,24 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
         ops,
         i8_sdpa: false,
         dense_acts,
-        coopmat_acts: crate::common::block::CoopmatSites::default(),
+        // Coopmat (tensor cores) on every main matmul. `matmul_qkv` carries all
+        // of them and was 148s of ~270s GPU on a 3s clip, more than every other
+        // pipeline combined; on tensor cores that site runs at 5.48ms per
+        // dispatch instead of 11.33ms and the whole 3s clip goes 486s -> 334s.
+        //
+        // The H3 blocker does NOT apply: there, coopmat cost ~9% divergence
+        // because the f32 A-sides had to be cast down to f16. This block is
+        // ALREADY `F16Dp4a`, so the A-side, the residual and the coopmat operand
+        // are the same f16 values the dense path uses -- no new rounding, no new
+        // range exposure. Measured, it is a precision GAIN (f32 accumulator):
+        // see `dit_full_parity_large_m`, the gate that actually reaches this path
+        // (the 4-token `dit_full_parity` is below WM and cannot).
+        coopmat_acts: crate::common::block::CoopmatSites {
+            proj: true,
+            ffn_down: true,
+            qkv: true,
+            ffn_up: true,
+        },
         large_d_sdpa: false,
         fast_sdpa: false,
         decode_sdpa: false,
@@ -1147,13 +1164,34 @@ fn biased_proj<'wsp>(
         I8Site::None => None,
         _ => dq_dense.and_then(|d| pipes.i8_dequant(d.scheme)),
     };
-    Block::dispatch_matmul_site(
+    // Tensor cores. This takes over BOTH the dense sites (proj, ffn_down, the
+    // audio stream, the text cross -- the bulk of DiT matmul time on the gated
+    // 22B) and the sites the i8 router would have taken, since the A-side is not
+    // pre-quantized at this point. That is the right outcome on both axes:
+    // measured at 768x512, `matmul_qkv` 148.1s/11.33ms per disp became
+    // `matmul_coopmat_qkv` 78.1s/5.48ms, and `dit_full_parity_large_m` puts
+    // coopmat CLOSER to the pyref than the dense path it replaces (video rel
+    // 0.088% vs 0.123%) because the coopmat accumulator is f32. Sub-WM
+    // dispatches still fall back to dense inside the dispatch.
+    //
+    // A step's dequant is compiled for ONE quant kind, so only take it when this
+    // weight's on-disk kind matches: the Q4_K_M variant ships each block MIXED
+    // (Q4_K + Q6_K), and forcing one scheme across both would decode garbage.
+    // All four site steps are the same config here (every LTX matmul cfg is the
+    // same `mm`), so `qkv` stands for the set.
+    let cm = bp
+        .coopmat_qkv
+        .as_ref()
+        .filter(|cm| dq_dense.is_some_and(|d| d.scheme == cm.dequant_f16.scheme));
+    Block::dispatch_matmul_site_coopmat(
         scope,
         bp,
         src,
         w_h,
         pre,
         dims,
+        None,
+        cm,
         mi8,
         di8,
         dq_dense,
