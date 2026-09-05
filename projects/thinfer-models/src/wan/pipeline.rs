@@ -422,6 +422,22 @@ impl WanVariant {
         }
     }
 
+    /// Qualcomm-AI-Research/mobilewan: the FastWan2.2-TI2V-5B backbone with
+    /// per-block PRUNED self-attention heads (`cfg.rehyat`), FastWan VAE + umT5.
+    /// No block transcode (bf16, parity-first like LongLive): the pruned
+    /// self-attention runs the untiled DENSE per-block-N path, so its qkv/proj
+    /// weights must stay bf16 (the i8/coopmat prepared-weight shapes assume the
+    /// full N). Bf16 acts (f32 exponent range) keep the novel variable-head path
+    /// off the f16 edge. `ffn_up` still takes the opt-in i8 (standard FFN).
+    pub fn mobilewan() -> Self {
+        Self {
+            dit: WanDitConfig::mobilewan(),
+            block_transcode: None,
+            act_pref: Some(ActDtype::Bf16),
+            ..Self::fastwan_ti2v_5b()
+        }
+    }
+
     /// nvidia/AnyFlow-Wan2.1-T2V-14B: single 14B expert (bf16 safetensors ->
     /// Q8_0 block transcode at load), the Wan2.1 VAE, the any-step flow-map
     /// denoise (user step count). Bf16 acts (14B residual overflows f16, same
@@ -554,7 +570,12 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // to 65504). The split is the separate `matmul_qkv_self` pipeline +
         // `WanI8Sites.qkv_self` transcode. ffn_up's A-side is clean too.
         let i8_sites = WanI8Sites {
-            qkv_self: q8,
+            // mobilewan runs the pruned self-attention on the untiled DENSE
+            // per-block-N path, so its qkv weights stay bf16 (the i8 prepared
+            // triple assumes the full N). The qkv_self SITE must compile bf16 to
+            // match, or the block reads garbage. ffn_up (the standard shared FFN)
+            // still takes the opt-in i8.
+            qkv_self: if cfg.rehyat { None } else { q8 },
             ffn_up: q8,
         };
         let umt5_handles = register_umt5_handles(&residency, None)?;
@@ -683,6 +704,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 true,
                 i8_sdpa,
             ),
+            cfg.rehyat,
         )
         .await?;
         let umt5_pipelines = Umt5Pipelines::compile(
@@ -1693,6 +1715,16 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                             proj_out,
                         });
                     }
+                    // mobilewan (rehyat) allocates VARIABLE-size F32-island buffers
+                    // per block (per-block pruned head count h_i), so the workspace
+                    // pool accumulates many size classes across a step's blocks and,
+                    // undrained, keeps growing across steps -> the 8GB card overshoots
+                    // and wgpu stalls (the "hang after ~step 2"). Drain between steps
+                    // for the rehyat path so each step starts from a clean pool. Other
+                    // Wan models keep the cross-step pool reuse (uniform sizes).
+                    if self.cfg.rehyat {
+                        workspace.drain_pool();
+                    }
                 }
             }
             // --- UniPC multistep (flow_shift=8.0, CFG-free): feed each step's DiT
@@ -1731,6 +1763,12 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         )
                         .await?;
                     sample = unipc.step(&out.image, &sample);
+                    // See the DMD loop: drain the rehyat pool between steps so
+                    // mobilewan's variable-size F32-island buffers don't accumulate
+                    // across steps and overshoot the card.
+                    if self.cfg.rehyat {
+                        workspace.drain_pool();
+                    }
                 }
             }
         }

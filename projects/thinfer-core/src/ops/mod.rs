@@ -33,6 +33,7 @@ pub mod gelu_mul;
 pub mod group_norm;
 pub mod hunyuan_upsample3d;
 pub mod layernorm;
+pub mod leaky_relu;
 pub mod matmul;
 pub mod matmul_coopmat;
 pub mod matmul_i8;
@@ -41,6 +42,7 @@ pub mod memcat;
 pub mod mul;
 pub mod pixel_norm3d;
 pub mod qkv_split;
+pub mod rehyat;
 pub mod relpos_bias;
 pub mod relu;
 pub mod replicate_pad1d;
@@ -55,6 +57,7 @@ pub mod sdpa_i8;
 pub mod sigmoid_mul;
 pub mod silu;
 pub mod silu_mul;
+pub mod silu_mul_fused;
 pub mod snake_beta;
 pub mod softmax;
 pub mod tanh;
@@ -72,7 +75,7 @@ pub use bcast_fma::{BcastFmaBufs, BcastFmaF32, BcastFmaOp};
 pub(crate) use bcast_modulate::dispatch_bcast_modulate;
 pub use bcast_modulate::{BcastModulateBufs, BcastModulateF32, BcastModulateOp};
 pub use bcast_mul::BcastMulF32;
-pub use cast_act::{Bf16ToF16, F16ToBf16};
+pub use cast_act::{Bf16ToF16, Bf16ToF32, F16ToBf16, F32ToBf16};
 pub(crate) use concat_time::dispatch_concat_time;
 pub use concat_time::{ConcatTimeBufs, ConcatTimeF32, ConcatTimeOp};
 pub(crate) use conv_transpose1d::dispatch_conv_transpose1d;
@@ -99,6 +102,8 @@ pub(crate) use hunyuan_upsample3d::dispatch_hunyuan_upsample3d;
 pub use hunyuan_upsample3d::{HunyuanUpsample3dBufs, HunyuanUpsample3dF32, HunyuanUpsample3dOp};
 pub(crate) use layernorm::dispatch_layernorm;
 pub use layernorm::{LayerNormBufs, LayerNormF32, LayerNormOp};
+pub(crate) use leaky_relu::dispatch_leaky_relu;
+pub use leaky_relu::{LeakyReluBufs, LeakyReluF32, LeakyReluOp, leaky_relu_uniform_bytes};
 pub use matmul::{MatMulConfig, MatMulF32, MatmulBufs, MatmulOp, dispatch_matmul};
 pub(crate) use memcat::dispatch_memcat;
 pub use memcat::{MemCatBufs, MemCatF32, MemCatOp};
@@ -106,7 +111,16 @@ pub use mul::MulF32;
 pub(crate) use pixel_norm3d::dispatch_pixel_norm3d;
 pub use pixel_norm3d::{PixelNorm3dBufs, PixelNorm3dF32, PixelNorm3dOp};
 pub(crate) use qkv_split::dispatch_qkv_split;
-pub use qkv_split::{QkvSplitBufs, QkvSplitF32, QkvSplitOp};
+pub use qkv_split::{QkvSplitBufs, QkvSplitF32, QkvSplitHeadwiseF32, QkvSplitOp};
+pub use rehyat::{
+    GroupedMatmulBufs, GroupedMatmulF32, GroupedMatmulOp, PolyExpandBufs, PolyExpandF32,
+    PolyExpandOp, RehyatAttnBufs, RehyatAttnF32, RehyatAttnOp, RehyatStateUpdateBufs,
+    RehyatStateUpdateF32, RehyatStateUpdateOp,
+};
+pub(crate) use rehyat::{
+    dispatch_grouped_matmul, dispatch_poly_expand, dispatch_rehyat_attn,
+    dispatch_rehyat_state_update,
+};
 pub(crate) use relpos_bias::dispatch_relpos_bias;
 pub use relpos_bias::{
     RelposBiasBufs, RelposBiasF32, RelposBiasOp, relative_position_bucket, relpos_bucket_map,
@@ -123,7 +137,7 @@ pub use rmsnorm_gemma::RmsNormGemmaF32;
 pub(crate) use rmsnorm3d::dispatch_rmsnorm3d;
 pub use rmsnorm3d::{RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp};
 pub(crate) use rope::dispatch_rope;
-pub use rope::{RopeBufs, RopeF32, RopeF32HalfRot, RopeF32Mrope, RopeOp};
+pub use rope::{RopeBufs, RopeF32, RopeF32HalfRot, RopeF32HalfRotPartial, RopeF32Mrope, RopeOp};
 pub(crate) use scale::dispatch_scale;
 pub use scale::{ScaleBufs, ScaleF32, ScaleOp, scale_uniform_bytes};
 pub(crate) use scatter_pad_rows::dispatch_scatter_pad_rows;
@@ -136,6 +150,9 @@ pub(crate) use sdpa::{dispatch_sdpa, dispatch_sdpa_f16_sg};
 pub use sigmoid_mul::SigmoidMulF32;
 pub use silu::SiluF32;
 pub use silu_mul::SiluMulF32;
+#[cfg(feature = "conformance")]
+pub(crate) use silu_mul_fused::dispatch_silu_mul_fused;
+pub use silu_mul_fused::{SiluMulFusedBufs, SiluMulFusedF32, SiluMulFusedOp};
 pub(crate) use snake_beta::dispatch_snake_beta;
 pub use snake_beta::{SnakeBetaBufs, SnakeBetaF32, SnakeBetaOp, snake_beta_uniform_bytes};
 #[cfg(feature = "conformance")]

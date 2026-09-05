@@ -240,6 +240,7 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
                 true,
                 false,
             ),
+            false,
         )
         .await?;
 

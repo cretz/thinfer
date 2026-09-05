@@ -13,6 +13,7 @@ pub mod download;
 pub mod executor;
 pub mod hunyuan;
 pub mod ltx;
+pub mod minimax;
 pub mod model;
 pub mod preprocess;
 pub mod progress;

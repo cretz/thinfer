@@ -499,7 +499,7 @@ async fn t2v_e2e_health() {
             .await
             .expect("audio vae decode");
         let mel_frames = 4 * ta - 3;
-        let voc_pipes = VocoderPipelines::compile(&backend)
+        let voc_pipes = VocoderPipelines::compile(&backend, "ltx_vocoder")
             .await
             .expect("compile vocoder");
         let vocoder = Vocoder::new(voc_pipes, &residency, &backend)

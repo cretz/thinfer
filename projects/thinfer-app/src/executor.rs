@@ -177,9 +177,16 @@ impl LocalExecutor {
         let residency = WeightResidency::new(source, image_budget(req.budget));
         let model = {
             let _s = tracing::info_span!("model_load").entered();
-            ZImageModel::load(self.backend.clone(), residency, tokenizer)
-                .await
-                .map_err(|e| format!("model load: {e:?}"))?
+            // Default Q8: a bf16-source DiT (the bf16 variant) transcodes to Q8
+            // at load for the fast i8 matmul. `--full-precision` opts into bf16.
+            ZImageModel::load(
+                self.backend.clone(),
+                residency,
+                tokenizer,
+                !req.full_precision,
+            )
+            .await
+            .map_err(|e| format!("model load: {e:?}"))?
         };
         let png = model
             .generate(&params, Some(&progress))
@@ -773,6 +780,11 @@ impl LocalExecutor {
         if req.model.is_ltx() {
             return crate::ltx::run(&self.backend, req, sink).await;
         }
+        // MiniMax-H3: one packed sequence under full self-attention, its own
+        // conditioner and two VAEs. Dispatch before any Wan lookup.
+        if req.model.is_minimax() {
+            return crate::minimax::run(&self.backend, req, sink).await;
+        }
         // HunyuanVideo 1.5: its own encoder/refiner/DiT/VAE pipeline, no Wan
         // variant/sampler/vae machinery. Dispatch before any Wan lookup; the
         // causal I2V variant has its own driver (chunked AR + image cond).
@@ -965,6 +977,10 @@ impl LocalExecutor {
                 // list); the variant flips the 14B geometry + delta embedder +
                 // Q8 block transcode + the any-step denoise.
                 WanVariant::anyflow_t2v_14b()
+            } else if matches!(req.model, VideoModelId::Mobilewan) {
+                // FastWan backbone (5 DiT shards lead) with per-block pruned
+                // self-attention heads; bf16 dense self-attn path.
+                WanVariant::mobilewan()
             } else {
                 WanVariant::fastwan_ti2v_5b()
             };

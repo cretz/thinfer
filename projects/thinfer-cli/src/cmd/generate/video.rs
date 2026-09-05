@@ -126,6 +126,14 @@ pub struct GenerateVideo {
     /// res. Default off = single-stage denoise at the target res. Ignored by Wan.
     #[arg(long)]
     pub upscale: bool,
+    /// LTX single-stage joint-AV only: refine the denoise schedule for better
+    /// audio. The distilled 8-step table under-resolves the delicate audio
+    /// residual (speech drifts to gibberish); this subdivides the coarse sigma
+    /// jumps into more Euler substeps (~2x slower denoise). Applies to ltx2-rapid
+    /// (always single-stage) and the 22B line when `--upscale` is off. Ignored by
+    /// the two-stage and Wan models.
+    #[arg(long)]
+    pub audio_hq: bool,
     /// HunyuanVideo 1.5 only: skip prompt rewriting and send the raw prompt. By
     /// default a short prompt is expanded into a detailed, structured caption by
     /// the on-device Qwen3-VL rewriter (the model is trained on long captions;
@@ -210,6 +218,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             i8_matmul: Some(!args.no_i8_matmul),
             audio: Some(!args.no_audio),
             upscale: Some(args.upscale || args.model.two_stage_default()),
+            audio_hq: Some(args.audio_hq),
             rewrite: Some(!args.no_rewrite),
             rewrite_quality: Some(args.rewrite_quality),
             public_key: None,
@@ -275,6 +284,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         // 8GB and low-res single-stage is OOD); `--upscale` is store-true, so OR
         // with the model default. Wan ignores upscale.
         upscale: args.upscale || args.model.two_stage_default(),
+        audio_hq: args.audio_hq,
         rewrite: !args.no_rewrite,
         rewrite_quality: args.rewrite_quality,
         lora,

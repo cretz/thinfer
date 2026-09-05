@@ -117,6 +117,16 @@ pub struct WanDitConfig {
     /// so their forward is unchanged. Implies `in_channels` carries the extra
     /// conditioning latents concatenated on the channel axis.
     pub ref_conv: bool,
+    /// mobilewan: per-block PRUNED self-attention head counts. The checkpoint
+    /// nests self-attention under `attn1.base_attention.*` and each block's q/k/v
+    /// project to `h_i * head_dim` (`h_i` in 11..=24, read from the loaded weight
+    /// shape) instead of the full `num_heads * head_dim`; the out-proj maps back
+    /// to `dim`. Cross-attention (`attn2`) keeps full `num_heads`, and the block
+    /// dim / FFN / residual are unchanged. `true` forces the untiled per-block
+    /// variable-head self-attention path in the driver (the ReHyAt `q_embed`/
+    /// `k_embed` linear-attention maps are unused: we run full softmax). `false`
+    /// on every other Wan model, leaving their forward bit-identical.
+    pub rehyat: bool,
 }
 
 impl WanDitConfig {
@@ -133,6 +143,22 @@ impl WanDitConfig {
             out_channels: 48,
             delta_embedder: false,
             ref_conv: false,
+            rehyat: false,
+        }
+    }
+
+    /// Qualcomm-AI-Research/mobilewan: the FastWan2.2-TI2V-5B backbone (dim 3072,
+    /// ffn 14336, 30 layers, in/out 48, umT5 + Wan2.2 VAE) with per-block PRUNED
+    /// self-attention heads (`rehyat`). Same geometry otherwise, so it shares the
+    /// FastWan condition embedder / patch embed / proj_out / VAE. `num_heads` 24 is
+    /// the FULL count (cross-attention + the block dim); the pruned per-block
+    /// self-attention head counts are read from the loaded weight shapes. No
+    /// public ReHyAt reference, so self-attention runs full softmax over the
+    /// pruned heads (the `q_embed`/`k_embed` maps are skipped at load).
+    pub fn mobilewan() -> Self {
+        Self {
+            rehyat: true,
+            ..Self::fastwan_ti2v_5b()
         }
     }
 
@@ -153,6 +179,7 @@ impl WanDitConfig {
             out_channels: 16,
             delta_embedder: false,
             ref_conv: true,
+            rehyat: false,
         }
     }
 
@@ -180,6 +207,7 @@ impl WanDitConfig {
             out_channels: 16,
             delta_embedder: false,
             ref_conv: false,
+            rehyat: false,
         }
     }
 
@@ -212,23 +240,133 @@ impl WanDitConfig {
 pub struct WanDitPipelines {
     pub block: BlockPipelines,
     pub gelu: WgpuPipeline,
+    /// mobilewan ReHyAt self-attention kernels (F32; `None` on every other Wan
+    /// model). Compiled only when the config is `rehyat`.
+    pub rehyat: Option<RehyatPipelines>,
+}
+
+/// The F32 kernel set for mobilewan ReHyAt self-attention (see
+/// `thinfer_core::ops::rehyat`). The self-attn runs an F32 island: q/k/v and the
+/// grouped-conv weights are cast bf16->f32, phi + the hybrid attention run in
+/// F32, and the output is cast back to bf16 for the out-projection.
+pub struct RehyatPipelines {
+    pub grouped_matmul: WgpuPipeline,
+    pub poly_expand: WgpuPipeline,
+    pub attn: WgpuPipeline,
+    pub state_update: WgpuPipeline,
+    pub bf16_to_f32: WgpuPipeline,
+    pub f32_to_bf16: WgpuPipeline,
+    /// `1/sqrt(head_dim)` query pre-scale (F32), applied before phi_q + attention.
+    pub scale: WgpuPipeline,
+    /// F32 GELU / ReLU for the phi feature-embed stacks (the block `gelu` runs the
+    /// block act dtype = bf16, so the F32 island needs its own).
+    pub gelu_f32: WgpuPipeline,
+    pub relu_f32: WgpuPipeline,
 }
 
 impl WanDitPipelines {
     pub async fn compile(
         backend: &WgpuBackend,
         cfgs: &crate::common::block::BlockWgslConfigs,
+        rehyat: bool,
     ) -> Result<Self, WgpuError> {
+        use thinfer_core::ops::{
+            Bf16ToF32, F32ToBf16, GroupedMatmulF32, GroupedMatmulOp, Op, PolyExpandF32,
+            PolyExpandOp, RehyatAttnF32, RehyatAttnOp, RehyatStateUpdateF32, RehyatStateUpdateOp,
+            ReluF32, ScaleF32, ScaleOp, WgslConfig,
+        };
         let block = BlockPipelines::compile(backend, cfgs).await?;
         let gelu = backend
             .create_pipeline(
                 "wan_gelu",
-                <GeluF32 as thinfer_core::ops::Op>::wgsl(&cfgs.ops),
+                <GeluF32 as Op>::wgsl(&cfgs.ops),
                 "main",
-                <GeluF32 as thinfer_core::ops::Op>::layout(),
+                <GeluF32 as Op>::layout(),
             )
             .await?;
-        Ok(Self { block, gelu })
+        let rehyat = if rehyat {
+            Some(RehyatPipelines {
+                grouped_matmul: backend
+                    .create_pipeline(
+                        "mobilewan_grouped_matmul",
+                        <GroupedMatmulF32 as GroupedMatmulOp>::wgsl(&cfgs.ops),
+                        "main",
+                        <GroupedMatmulF32 as GroupedMatmulOp>::layout(),
+                    )
+                    .await?,
+                poly_expand: backend
+                    .create_pipeline(
+                        "mobilewan_poly_expand",
+                        <PolyExpandF32 as PolyExpandOp>::wgsl(&cfgs.ops),
+                        "main",
+                        <PolyExpandF32 as PolyExpandOp>::layout(),
+                    )
+                    .await?,
+                attn: backend
+                    .create_pipeline(
+                        "mobilewan_rehyat_attn",
+                        <RehyatAttnF32 as RehyatAttnOp>::wgsl(&cfgs.ops),
+                        "main",
+                        <RehyatAttnF32 as RehyatAttnOp>::layout(),
+                    )
+                    .await?,
+                state_update: backend
+                    .create_pipeline(
+                        "mobilewan_rehyat_state_update",
+                        <RehyatStateUpdateF32 as RehyatStateUpdateOp>::wgsl(&cfgs.ops),
+                        "main",
+                        <RehyatStateUpdateF32 as RehyatStateUpdateOp>::layout(),
+                    )
+                    .await?,
+                bf16_to_f32: backend
+                    .create_pipeline(
+                        "mobilewan_bf16_to_f32",
+                        <Bf16ToF32 as Op>::wgsl(&cfgs.ops),
+                        "main",
+                        <Bf16ToF32 as Op>::layout(),
+                    )
+                    .await?,
+                f32_to_bf16: backend
+                    .create_pipeline(
+                        "mobilewan_f32_to_bf16",
+                        <F32ToBf16 as Op>::wgsl(&cfgs.ops),
+                        "main",
+                        <F32ToBf16 as Op>::layout(),
+                    )
+                    .await?,
+                scale: backend
+                    .create_pipeline(
+                        "mobilewan_qscale",
+                        &<ScaleF32 as ScaleOp>::wgsl(&WgslConfig::FP32),
+                        "main",
+                        <ScaleF32 as ScaleOp>::layout(),
+                    )
+                    .await?,
+                gelu_f32: backend
+                    .create_pipeline(
+                        "mobilewan_gelu_f32",
+                        <GeluF32 as Op>::wgsl(&WgslConfig::FP32),
+                        "main",
+                        <GeluF32 as Op>::layout(),
+                    )
+                    .await?,
+                relu_f32: backend
+                    .create_pipeline(
+                        "mobilewan_relu_f32",
+                        <ReluF32 as Op>::wgsl(&WgslConfig::FP32),
+                        "main",
+                        <ReluF32 as Op>::layout(),
+                    )
+                    .await?,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            block,
+            gelu,
+            rehyat,
+        })
     }
 }
 
@@ -264,7 +402,7 @@ impl WanDitBlockShape {
         }
     }
 
-    fn sdpa_scale(&self) -> f32 {
+    pub(crate) fn sdpa_scale(&self) -> f32 {
         1.0 / (self.head_dim as f32).sqrt()
     }
 }
@@ -286,11 +424,35 @@ pub struct WanAttnBufs {
     pub norm_k: BufRef,
 }
 
+/// mobilewan ReHyAt feature-embedding buffers for one self-attn stage (q_embed
+/// or k_embed). Two grouped 1x1 convs (`groups = h_i`, so per-head linears):
+/// `conv1` head_dim -> degree*head_dim (128 -> 384) then GELU; `conv2`
+/// 384 -> 384 then ReLU. conv weights are `[out_ch, in_ch/groups, 1, 1]`, loaded
+/// as `[out_ch, in_ch/groups]` (the trailing 1x1 kernel is inert). Followed by the
+/// polynomial expansion in the driver (not a weight).
+#[derive(Clone, Debug)]
+pub struct QkEmbedBufs {
+    pub conv1_w: BufRef,
+    pub conv1_b: BufRef,
+    pub conv2_w: BufRef,
+    pub conv2_b: BufRef,
+}
+
+/// mobilewan ReHyAt embeds for one block: the `q_embed` and `k_embed` stacks.
+#[derive(Clone, Debug)]
+pub struct RehyatBufs {
+    pub q_embed: QkEmbedBufs,
+    pub k_embed: QkEmbedBufs,
+}
+
 /// All resident GPU buffers for one Wan DiT block.
 #[derive(Clone, Debug)]
 pub struct WanDitBlockBufs {
     pub self_attn: WanAttnBufs,
     pub cross_attn: WanAttnBufs,
+    /// mobilewan-only ReHyAt feature-embedding weights (`None` on every other
+    /// Wan model, whose self-attn is plain softmax).
+    pub rehyat: Option<RehyatBufs>,
     /// norm2 (cross_attn_norm) affine weight + bias `[inner]`.
     pub norm2_w: BufRef,
     pub norm2_b: BufRef,
@@ -318,6 +480,22 @@ pub struct WanAttnHandles {
     pub norm_k: WeightHandle,
 }
 
+/// Residency handles mirroring [`QkEmbedBufs`] (one ReHyAt feature embed).
+#[derive(Clone, Debug)]
+pub struct QkEmbedHandles {
+    pub conv1_w: WeightHandle,
+    pub conv1_b: WeightHandle,
+    pub conv2_w: WeightHandle,
+    pub conv2_b: WeightHandle,
+}
+
+/// Residency handles mirroring [`RehyatBufs`] (the q_embed + k_embed stacks).
+#[derive(Clone, Debug)]
+pub struct RehyatHandles {
+    pub q_embed: QkEmbedHandles,
+    pub k_embed: QkEmbedHandles,
+}
+
 /// Residency handles for one Wan DiT block, mirroring [`WanDitBlockBufs`] plus
 /// the per-block `scale_shift_table` `[6, inner]` the driver sums with
 /// `timestep_proj` to produce the six modulation signals.
@@ -325,6 +503,8 @@ pub struct WanAttnHandles {
 pub struct WanDitBlockHandles {
     pub self_attn: WanAttnHandles,
     pub cross_attn: WanAttnHandles,
+    /// mobilewan-only ReHyAt feature embeds (`None` on every other Wan model).
+    pub rehyat: Option<RehyatHandles>,
     pub norm2_w: WeightHandle,
     pub norm2_b: WeightHandle,
     pub ffn_up_w: WeightHandle,
@@ -332,6 +512,13 @@ pub struct WanDitBlockHandles {
     pub ffn_down_w: WeightHandle,
     pub ffn_down_b: WeightHandle,
     pub scale_shift_table: WeightHandle,
+    /// Self-attention head count for THIS block. Equals `cfg.num_heads` on every
+    /// standard Wan model; on mobilewan (`cfg.rehyat`) it is the block's pruned
+    /// count `h_i` (11..=24), read from the loaded `attn1.base_attention.to_q`
+    /// row count. The driver's untiled mobilewan self-attention reads it to size
+    /// the per-block q/k/v projection width (`h_i * head_dim`) and the SDPA head
+    /// count.
+    pub n_heads: usize,
 }
 
 pub struct WanAttnViews<'a> {
@@ -347,9 +534,22 @@ pub struct WanAttnViews<'a> {
     norm_k: GpuView<'a>,
 }
 
+pub struct QkEmbedViews<'a> {
+    conv1_w: GpuView<'a>,
+    conv1_b: GpuView<'a>,
+    conv2_w: GpuView<'a>,
+    conv2_b: GpuView<'a>,
+}
+
+pub struct RehyatViews<'a> {
+    q_embed: QkEmbedViews<'a>,
+    k_embed: QkEmbedViews<'a>,
+}
+
 pub struct WanDitBlockViews<'a> {
     self_attn: WanAttnViews<'a>,
     cross_attn: WanAttnViews<'a>,
+    rehyat: Option<RehyatViews<'a>>,
     norm2_w: GpuView<'a>,
     norm2_b: GpuView<'a>,
     ffn_up_w: GpuView<'a>,
@@ -419,15 +619,89 @@ impl WanAttnViews<'_> {
     }
 }
 
+impl QkEmbedHandles {
+    async fn acquire<'a, S: WeightSource>(
+        &self,
+        residency: &'a WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<QkEmbedViews<'a>, ResidencyError<S::Error, WgpuError>> {
+        Ok(QkEmbedViews {
+            conv1_w: residency.acquire(self.conv1_w, backend).await?,
+            conv1_b: residency.acquire(self.conv1_b, backend).await?,
+            conv2_w: residency.acquire(self.conv2_w, backend).await?,
+            conv2_b: residency.acquire(self.conv2_b, backend).await?,
+        })
+    }
+
+    async fn prefetch<S: WeightSource>(
+        &self,
+        residency: &WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<(), ResidencyError<S::Error, WgpuError>> {
+        for h in [self.conv1_w, self.conv1_b, self.conv2_w, self.conv2_b] {
+            residency.prefetch(h, backend).await?;
+        }
+        Ok(())
+    }
+}
+
+impl RehyatHandles {
+    async fn acquire<'a, S: WeightSource>(
+        &self,
+        residency: &'a WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<RehyatViews<'a>, ResidencyError<S::Error, WgpuError>> {
+        Ok(RehyatViews {
+            q_embed: self.q_embed.acquire(residency, backend).await?,
+            k_embed: self.k_embed.acquire(residency, backend).await?,
+        })
+    }
+
+    async fn prefetch<S: WeightSource>(
+        &self,
+        residency: &WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<(), ResidencyError<S::Error, WgpuError>> {
+        self.q_embed.prefetch(residency, backend).await?;
+        self.k_embed.prefetch(residency, backend).await?;
+        Ok(())
+    }
+}
+
+impl QkEmbedViews<'_> {
+    fn bufs(&self) -> QkEmbedBufs {
+        QkEmbedBufs {
+            conv1_w: self.conv1_w.buf(),
+            conv1_b: self.conv1_b.buf(),
+            conv2_w: self.conv2_w.buf(),
+            conv2_b: self.conv2_b.buf(),
+        }
+    }
+}
+
+impl RehyatViews<'_> {
+    fn bufs(&self) -> RehyatBufs {
+        RehyatBufs {
+            q_embed: self.q_embed.bufs(),
+            k_embed: self.k_embed.bufs(),
+        }
+    }
+}
+
 impl WanDitBlockHandles {
     pub async fn acquire<'a, S: WeightSource>(
         &self,
         residency: &'a WeightResidency<S>,
         backend: &WgpuBackend,
     ) -> Result<WanDitBlockViews<'a>, ResidencyError<S::Error, WgpuError>> {
+        let rehyat = match &self.rehyat {
+            Some(r) => Some(r.acquire(residency, backend).await?),
+            None => None,
+        };
         Ok(WanDitBlockViews {
             self_attn: self.self_attn.acquire(residency, backend).await?,
             cross_attn: self.cross_attn.acquire(residency, backend).await?,
+            rehyat,
             norm2_w: residency.acquire(self.norm2_w, backend).await?,
             norm2_b: residency.acquire(self.norm2_b, backend).await?,
             ffn_up_w: residency.acquire(self.ffn_up_w, backend).await?,
@@ -446,6 +720,9 @@ impl WanDitBlockHandles {
     ) -> Result<(), ResidencyError<S::Error, WgpuError>> {
         self.self_attn.prefetch(residency, backend).await?;
         self.cross_attn.prefetch(residency, backend).await?;
+        if let Some(r) = &self.rehyat {
+            r.prefetch(residency, backend).await?;
+        }
         for h in [
             self.norm2_w,
             self.norm2_b,
@@ -466,6 +743,7 @@ impl<'a> WanDitBlockViews<'a> {
         WanDitBlockBufs {
             self_attn: self.self_attn.bufs(),
             cross_attn: self.cross_attn.bufs(),
+            rehyat: self.rehyat.as_ref().map(|r| r.bufs()),
             norm2_w: self.norm2_w.buf(),
             norm2_b: self.norm2_b.buf(),
             ffn_up_w: self.ffn_up_w.buf(),
@@ -643,6 +921,17 @@ enum QkvSite {
     SelfAttn,
     CrossQ,
     Cross,
+}
+
+/// Which compiled matmul site a mobilewan pruned-head projection runs on. The
+/// q/k/v projections share the self-attn qkv site (normed A-side, `[inner_i,
+/// dim]`); the out-projection shares the proj site (`[dim, inner_i]`). Both are
+/// forced onto the DENSE bf16 matmul (mobilewan runs bf16 acts, and the pruned
+/// per-block N/K would not match the i8/coopmat prepared-weight shapes).
+#[derive(Clone, Copy)]
+enum MobileProjSite {
+    Qkv,
+    Out,
 }
 
 /// One DP4A site's persistent dequant triple (see [`PreparedTileWeights`]).
@@ -1913,6 +2202,403 @@ impl WanDitBlock {
         let u = scope.u32x4_uniform(rows, nh, pairs, 0)?;
         scope.rope::<RopeF32>(&bp.rope, src.data, freqs, u, dst.data, rows, nh, pairs)
     }
+
+    // -----------------------------------------------------------------------
+    // mobilewan: per-block pruned-head self-attention (untiled, full softmax)
+    // -----------------------------------------------------------------------
+    //
+    // The block is driven across TWO submits by `WanDit::forward_block_mobilewan`
+    // so the F32 island's heavy per-head conv scratch (the `w1`/`w2` weight casts
+    // and the four `n_phi` conv intermediates) frees at the first submit, before
+    // the recurrent attention + cross-attn/FFN tail runs in the second. Phase 1 is
+    // [`Self::mobilewan_phi`] (norm/mod/qkv/qk-norm/RoPE + phi feature maps ->
+    // five persistent survivors), phase 2 is [`Self::mobilewan_attn_post`]
+    // (recurrent chunk attention + out-proj + gated residual + cross-attn/FFN).
+    // Byte-identical to the old single-scope path: same ops in the same order, the
+    // only change is the submit boundary between the two phases (the survivors are
+    // written to caller-owned persistent buffers verbatim). No diag taps
+    // (mobilewan has no parity gate).
+
+    /// mobilewan phase 1: norm1 + (scale_msa, shift_msa) modulation, then this
+    /// block's PRUNED-head q/k/v projection (`h_i * head_dim`), qk-norm, RoPE
+    /// (all bf16), then the F32 island's cast/scale and the polynomial feature
+    /// maps `phi_q = q_embed(q)`, `phi_k = k_embed(k)`. Writes the five survivors
+    /// the recurrent attention needs into caller-owned persistent buffers: the
+    /// scaled q `qfs`, the cast k `kf`, the cast v `vf`, and `phi_q`/`phi_k`. All
+    /// the conv-weight casts and conv intermediates stay scope-local so they free
+    /// when phase 1 submits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mobilewan_phi<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        x_in: ActBuf<'wsp>,
+        freqs: BatchBuf<'wsp>,
+        m: &WanMod<'wsp>,
+        bufs: &WanDitBlockBufs,
+        rows: u32,
+        scale: f32,
+        h_i: u32,
+        qfs_out: BatchBuf<'wsp>,
+        kf_out: BatchBuf<'wsp>,
+        vf_out: BatchBuf<'wsp>,
+        phiq_out: BatchBuf<'wsp>,
+        phik_out: BatchBuf<'wsp>,
+    ) -> Result<(), WgpuError> {
+        use thinfer_core::ops::{Bf16ToF32, GeluF32, PolyExpandF32, ReluF32, ScaleF32};
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let rp = pipelines
+            .rehyat
+            .as_ref()
+            .expect("mobilewan requires rehyat pipelines");
+        let w = &bufs.self_attn;
+        let rehyat = bufs
+            .rehyat
+            .as_ref()
+            .expect("mobilewan block missing rehyat weights");
+        let dim = s.dim as u32;
+        let hd = s.head_dim as u32; // 128
+        let eps = s.norm_eps;
+        let inner_i = h_i * hd;
+        const DEG: u32 = 3;
+        let pdim = DEG * hd; // phi feature dim per head = 384
+
+        // norm1 (no affine) -> modulate by (scale_msa, shift_msa).
+        let n1 = alloc_act(scope, bp, rows, dim)?;
+        op_layernorm(scope, bp, x_in, n1, rows, dim, eps)?;
+        let n1m = alloc_act(scope, bp, rows, dim)?;
+        op_modulate(scope, bp, n1, m.scale_msa, m.shift_msa, n1m, rows, dim)?;
+
+        // --- q/k/v proj + qk-norm + RoPE, all bf16 (reused plain-path ops) ---
+        let q = self.dense_attn_proj(
+            scope,
+            bp,
+            n1m,
+            w.q_w,
+            w.q_b,
+            rows,
+            inner_i,
+            dim,
+            MobileProjSite::Qkv,
+        )?;
+        let k = self.dense_attn_proj(
+            scope,
+            bp,
+            n1m,
+            w.k_w,
+            w.k_b,
+            rows,
+            inner_i,
+            dim,
+            MobileProjSite::Qkv,
+        )?;
+        let v = self.dense_attn_proj(
+            scope,
+            bp,
+            n1m,
+            w.v_w,
+            w.v_b,
+            rows,
+            inner_i,
+            dim,
+            MobileProjSite::Qkv,
+        )?;
+        let qn = alloc_act(scope, bp, rows, inner_i)?;
+        op_rmsnorm(
+            scope,
+            bp,
+            q,
+            scope.import_copy(w.norm_q),
+            qn,
+            rows,
+            inner_i,
+            eps,
+        )?;
+        let kn = alloc_act(scope, bp, rows, inner_i)?;
+        op_rmsnorm(
+            scope,
+            bp,
+            k,
+            scope.import_copy(w.norm_k),
+            kn,
+            rows,
+            inner_i,
+            eps,
+        )?;
+        let pairs = hd / 2;
+        let qr = alloc_act(scope, bp, rows, inner_i)?;
+        let kr = alloc_act(scope, bp, rows, inner_i)?;
+        let uq = scope.u32x4_uniform(rows, h_i, pairs, 0)?;
+        scope.rope::<RopeF32>(&bp.rope, qn.data, freqs, uq, qr.data, rows, h_i, pairs)?;
+        let uk = scope.u32x4_uniform(rows, h_i, pairs, 0)?;
+        scope.rope::<RopeF32>(&bp.rope, kn.data, freqs, uk, kr.data, rows, h_i, pairs)?;
+
+        // --- F32 island: cast q/k/v (kf/vf land in the persistent survivors),
+        // scale q into the persistent `qfs`, compute phi_q/phi_k ---
+        let n_qkv = rows * inner_i;
+        let f32_buf = |n: u32| scope.alloc(n as u64 * 4);
+        let cast_to_f32 = |src: BatchBuf<'wsp>, dst: BatchBuf<'wsp>| -> Result<(), WgpuError> {
+            scope.dispatch_op::<Bf16ToF32>(&rp.bf16_to_f32, &[src], dst)
+        };
+        let qf = f32_buf(n_qkv)?;
+        cast_to_f32(qr.data, qf)?;
+        cast_to_f32(kr.data, kf_out)?;
+        cast_to_f32(v.data, vf_out)?;
+        // q *= 1/sqrt(head_dim) (reference pre-scales q before phi_q AND attention).
+        let su = scope.write_uniform(&thinfer_core::ops::scale_uniform_bytes(n_qkv, scale))?;
+        scope.scale::<ScaleF32>(&rp.scale, qf, su, qfs_out, n_qkv)?;
+
+        // phi = poly(relu(conv2(gelu(conv1(x))))); conv{1,2} are grouped per-head
+        // 1x1 convs = grouped matmuls. Conv weights are bf16 on GPU -> cast to f32.
+        let n_phi = rows * h_i * pdim;
+        let cast_w = |src: BufRef, n: u32| -> Result<BatchBuf<'wsp>, WgpuError> {
+            let dst = f32_buf(n)?;
+            scope.dispatch_op::<Bf16ToF32>(&rp.bf16_to_f32, &[scope.import_copy(src)], dst)?;
+            Ok(dst)
+        };
+        let feature_embed =
+            |xin: BatchBuf<'wsp>, e: &QkEmbedBufs, out: BatchBuf<'wsp>| -> Result<(), WgpuError> {
+                // conv1: per-head [hd -> pdim] grouped matmul + bias, then GELU.
+                let w1 = cast_w(e.conv1_w, h_i * pdim * hd)?;
+                let b1 = cast_w(e.conv1_b, h_i * pdim)?;
+                let c1 = f32_buf(n_phi)?;
+                let u1 = scope.u32x4_uniform(rows, h_i, pdim, hd)?;
+                scope.grouped_matmul(&rp.grouped_matmul, xin, w1, b1, u1, c1, rows, h_i, pdim)?;
+                let g1 = f32_buf(n_phi)?;
+                scope.dispatch_op::<GeluF32>(&rp.gelu_f32, &[c1], g1)?;
+                // conv2: per-head [pdim -> pdim] grouped matmul + bias, then ReLU.
+                let w2 = cast_w(e.conv2_w, h_i * pdim * pdim)?;
+                let b2 = cast_w(e.conv2_b, h_i * pdim)?;
+                let c2 = f32_buf(n_phi)?;
+                let u2 = scope.u32x4_uniform(rows, h_i, pdim, pdim)?;
+                scope.grouped_matmul(&rp.grouped_matmul, g1, w2, b2, u2, c2, rows, h_i, pdim)?;
+                let r2 = f32_buf(n_phi)?;
+                scope.dispatch_op::<ReluF32>(&rp.relu_f32, &[c2], r2)?;
+                // polynomial expansion: split per-head [pdim] into DEG chunks of hd,
+                // raise chunk c to power c (c=1..DEG), concat.
+                let up = scope.u32x4_uniform(pdim, hd, 0, 0)?;
+                scope.poly_expand::<PolyExpandF32>(&rp.poly_expand, r2, up, out, n_phi)?;
+                Ok(())
+            };
+        feature_embed(qfs_out, &rehyat.q_embed, phiq_out)?;
+        feature_embed(kf_out, &rehyat.k_embed, phik_out)?;
+        Ok(())
+    }
+
+    /// mobilewan phase 2: the chunk-major recurrent attention over the five
+    /// survivors from [`Self::mobilewan_phi`], the bf16 out-projection back to
+    /// `dim`, the gated residual, and the shared cross-attn + FFN tail into
+    /// `y_out`. `qfs`/`kf`/`vf`/`phi_q`/`phi_k` are the caller-owned persistent
+    /// buffers imported into this (second) scope.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mobilewan_attn_post<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        x_in: ActBuf<'wsp>,
+        qfs: BatchBuf<'wsp>,
+        kf: BatchBuf<'wsp>,
+        vf: BatchBuf<'wsp>,
+        phi_q: BatchBuf<'wsp>,
+        phi_k: BatchBuf<'wsp>,
+        m: &WanMod<'wsp>,
+        y_out: ActBuf<'wsp>,
+        text: BatchBuf<'wsp>,
+        bufs: &WanDitBlockBufs,
+        taps: &WanDitBlockTaps,
+        rows: u32,
+        trows: u32,
+        h_i: u32,
+        tpf: u32,
+    ) -> Result<(), WgpuError> {
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let dim = s.dim as u32;
+        let sa = self.mobilewan_attn(
+            scope,
+            pipelines,
+            qfs,
+            kf,
+            vf,
+            phi_q,
+            phi_k,
+            &bufs.self_attn,
+            rows,
+            h_i,
+            tpf,
+        )?;
+        let x1 = alloc_act(scope, bp, rows, dim)?;
+        op_gate_residual(scope, bp, x_in, m.gate_msa, sa, x1, rows, dim)?;
+
+        // cross-attention + FFN: the exact shared FastWan tail (full 24-head
+        // cross-attn under attn2, unchanged).
+        self.cross_ffn(
+            scope, pipelines, x1, text, m, y_out, bufs, taps, rows, trows, None,
+        )
+    }
+
+    /// mobilewan chunk-major recurrent attention + out-projection. The F32
+    /// island's tail: from the persistent `qfs`/`kf`/`vf`/`phi_q`/`phi_k` it runs
+    /// the per-block-recurrent CHUNK loop over temporal chunks of 4 patched-frames
+    /// (overlap 2) - each chunk does local windowed softmax fused with a linear
+    /// recurrent-memory read (`phi_q . S`), then folds its non-overlap prefix into
+    /// the recurrent state (`S += phi_k^T v`, `z += sum phi_k`) - casts the f32
+    /// output back to bf16, and out-projects `[rows, inner_i] -> [rows, dim]`.
+    /// Reference: `third-party/mobilewan/mobilewan/attention.py`
+    /// (`rnn_overlap_step`) run chunk-major (`chunk_major_transformer_forward`).
+    #[allow(clippy::too_many_arguments)]
+    fn mobilewan_attn<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        pipelines: &WanDitPipelines,
+        qfs: BatchBuf<'wsp>,
+        kf: BatchBuf<'wsp>,
+        vf: BatchBuf<'wsp>,
+        phi_q: BatchBuf<'wsp>,
+        phi_k: BatchBuf<'wsp>,
+        w: &WanAttnBufs,
+        rows: u32,
+        h_i: u32,
+        tpf: u32,
+    ) -> Result<ActBuf<'wsp>, WgpuError> {
+        use thinfer_core::ops::{F32ToBf16, RehyatAttnF32, RehyatStateUpdateF32};
+        let s = &self.shape;
+        let bp = &pipelines.block;
+        let rp = pipelines
+            .rehyat
+            .as_ref()
+            .expect("mobilewan requires rehyat pipelines");
+        let dim = s.dim as u32;
+        let hd = s.head_dim as u32; // 128
+        let inner_i = h_i * hd;
+        const DEG: u32 = 3;
+        let pdim = DEG * hd; // phi feature dim per head = 384
+        let n_qkv = rows * inner_i;
+        let f32_buf = |n: u32| scope.alloc(n as u64 * 4);
+
+        // --- chunk-major recurrent attention over temporal chunks ---
+        // S [h_i, pdim, hd], z [h_i, pdim]; zeroed per block (fresh recurrent state).
+        let s_state = f32_buf(h_i * pdim * hd)?;
+        let z_state = f32_buf(h_i * pdim)?;
+        scope.write_bytes(s_state, 0, &vec![0u8; (h_i * pdim * hd) as usize * 4])?;
+        scope.write_bytes(z_state, 0, &vec![0u8; (h_i * pdim) as usize * 4])?;
+        let sa_f32 = f32_buf(n_qkv)?;
+        let ilen = inner_i as u64 * 4; // bytes per token row (f32)
+        let plen = (h_i * pdim) as u64 * 4; // bytes per phi token row (f32)
+        // `tpf` = tokens per patched-frame (pph*ppw); temporal chunks are
+        // contiguous T-major spans of CHUNK_FRAMES frames.
+        let f_lat = rows / tpf;
+        const CHUNK_FRAMES: u32 = 4;
+        const OVERLAP_FRAMES: u32 = 2;
+        let mut prev_overlap = 0u32; // tokens carried from the previous chunk
+        let mut f0 = 0u32;
+        while f0 < f_lat {
+            let f1 = (f0 + CHUNK_FRAMES).min(f_lat);
+            let frames_c = f1 - f0;
+            let c_start = f0 * tpf;
+            let c_end = f1 * tpf;
+            let c_tokens = c_end - c_start;
+            let win_start = c_start - prev_overlap;
+            let win = c_end - win_start;
+            // slices (contiguous, T-major; offsets are 256B-aligned).
+            let q_c = scope.subview(&qfs, c_start as u64 * ilen, c_tokens as u64 * ilen);
+            let kwin = scope.subview(&kf, win_start as u64 * ilen, win as u64 * ilen);
+            let vwin = scope.subview(&vf, win_start as u64 * ilen, win as u64 * ilen);
+            let phiq_c = scope.subview(&phi_q, c_start as u64 * plen, c_tokens as u64 * plen);
+            let out_c = scope.subview(&sa_f32, c_start as u64 * ilen, c_tokens as u64 * ilen);
+            let mut au = [0u8; 32];
+            for (i, val) in [c_tokens, win, h_i, hd, pdim].iter().enumerate() {
+                au[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+            }
+            let au = scope.write_uniform(&au)?;
+            scope.rehyat_attn::<RehyatAttnF32>(
+                &rp.attn,
+                q_c,
+                kwin,
+                vwin,
+                phiq_c,
+                scope.subview(&s_state, 0, s_state.len()),
+                scope.subview(&z_state, 0, z_state.len()),
+                au,
+                out_c,
+                c_tokens * h_i,
+            )?;
+            // fold this chunk's non-overlap prefix into the recurrent state.
+            let cur_overlap = OVERLAP_FRAMES.min(frames_c) * tpf;
+            let update_tokens = c_tokens - cur_overlap;
+            if update_tokens > 0 {
+                let phik_p =
+                    scope.subview(&phi_k, c_start as u64 * plen, update_tokens as u64 * plen);
+                let v_p = scope.subview(&vf, c_start as u64 * ilen, update_tokens as u64 * ilen);
+                let su2 = scope.u32x4_uniform(update_tokens, h_i, pdim, hd)?;
+                scope.rehyat_state_update::<RehyatStateUpdateF32>(
+                    &rp.state_update,
+                    phik_p,
+                    v_p,
+                    scope.subview(&s_state, 0, s_state.len()),
+                    scope.subview(&z_state, 0, z_state.len()),
+                    su2,
+                    h_i * pdim,
+                )?;
+            }
+            prev_overlap = cur_overlap;
+            f0 = f1;
+        }
+
+        // cast the f32 attention output back to bf16 for the out-projection.
+        let sa = alloc_act(scope, bp, rows, inner_i)?;
+        scope.dispatch_op::<F32ToBf16>(&rp.f32_to_bf16, &[sa_f32], sa.data)?;
+
+        // out-proj: [rows, inner_i] @ [dim, inner_i]ᵀ + bias -> [rows, dim].
+        self.dense_attn_proj(
+            scope,
+            bp,
+            sa,
+            w.o_w,
+            w.o_b,
+            rows,
+            dim,
+            inner_i,
+            MobileProjSite::Out,
+        )
+    }
+
+    /// mobilewan dense linear at an attention site: `out = x @ wᵀ + b`, forced
+    /// onto the compiled site's DENSE matmul (never i8/coopmat) so the per-block
+    /// pruned `n`/`k` ride the bf16 path. `k` is the projection's input width
+    /// (`dim` for q/k/v, `inner_i` for the out-proj).
+    #[allow(clippy::too_many_arguments)]
+    fn dense_attn_proj<'wsp>(
+        &self,
+        scope: &BatchScope<'wsp, WgpuBackend>,
+        bp: &BlockPipelines,
+        x: ActBuf<'wsp>,
+        w: BufRef,
+        b: BufRef,
+        rows: u32,
+        n: u32,
+        k: u32,
+        site: MobileProjSite,
+    ) -> Result<ActBuf<'wsp>, WgpuError> {
+        let out = alloc_matmul_out_buf(scope, bp, rows * n)?;
+        let wv = scope.import_copy(w);
+        let (pipe, inst, dq) = match site {
+            MobileProjSite::Qkv => (
+                &bp.matmul_qkv_self,
+                &bp.matmuls.qkv_self,
+                bp.dequant_qkv_self.as_ref(),
+            ),
+            MobileProjSite::Out => (&bp.matmul_proj, &bp.matmuls.proj, bp.dequant_proj.as_ref()),
+        };
+        lin(
+            scope, bp, x, wv, out, rows, n, k, None, None, None, None, dq, pipe, inst,
+        )?;
+        let bv = scope.import_copy(b);
+        let biased = alloc_act(scope, bp, rows, n)?;
+        op_bias_add(scope, bp, ActBuf::dense(out), bv, biased, rows, n)?;
+        Ok(biased)
+    }
 }
 
 #[cfg(test)]
@@ -1931,5 +2617,23 @@ mod tests {
         let sh = WanDitBlockShape::new(&WanDitConfig::fastwan_ti2v_5b(), 1024, config::TEXT_SEQ);
         assert_eq!(sh.inner, 3072);
         assert!((sh.sdpa_scale() - 1.0 / (128f32).sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mobilewan_is_fastwan_backbone_with_rehyat() {
+        let cfg = WanDitConfig::mobilewan();
+        assert!(
+            cfg.rehyat,
+            "mobilewan forces the pruned-head self-attn path"
+        );
+        // Full-count backbone geometry is FastWan (dim/ffn/layers/channels); only
+        // the per-block self-attn head count is pruned (read from the weights).
+        assert_eq!(cfg.num_heads, 24);
+        assert_eq!(cfg.inner(), 3072);
+        assert_eq!(cfg.ffn_dim, 14336);
+        assert_eq!(cfg.num_layers, 30);
+        assert_eq!(cfg.in_channels, 48);
+        assert!(!WanDitConfig::fastwan_ti2v_5b().rehyat);
+        assert!(!cfg.ref_conv && !cfg.delta_embedder);
     }
 }

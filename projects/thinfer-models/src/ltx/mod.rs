@@ -23,6 +23,7 @@ pub mod lora;
 pub mod manifest;
 pub mod patchify;
 pub mod pipeline;
+pub mod rapid_vocoder;
 pub mod sampler;
 pub mod text_encoder;
 pub mod upsampler;

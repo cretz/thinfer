@@ -21,8 +21,8 @@ use thinfer_core::backend::{BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::cache::KernelKey;
 use thinfer_core::ops::{
     ActDtype, AddF32, BcastAddF32, BcastAddOp, BcastAffineF32, BcastAffineOp, BcastFmaF32,
-    BcastFmaOp, BcastModulateF32, BcastModulateOp, BcastMulF32, Bf16ToF16, F16ToBf16, GeluF32,
-    LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, QkvSplitF32,
+    BcastFmaOp, BcastModulateF32, BcastModulateOp, BcastMulF32, Bf16ToF16, F16ToBf16, F32ToBf16,
+    GeluF32, LayerNormF32, LayerNormOp, MatMulConfig, MatMulF32, MatmulOp, MulF32, Op, QkvSplitF32,
     QkvSplitOp, RmsNormF32, RmsNormOp, RopeF32, RopeF32HalfRot, RopeOp, ScatterPadRowsF32,
     ScatterPadRowsOp, SdpaDecode, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32, TanhF32,
     WeightDtype, WgslConfig,
@@ -239,6 +239,62 @@ pub struct CoopmatStep {
     pub cfg: thinfer_core::ops::matmul_coopmat::CoopmatMatmulConfig,
 }
 
+/// Build one coopmat step for an explicit quant scheme.
+///
+/// [`BlockPipelines::compile`] bakes ONE scheme per site, taken from the site's
+/// `WeightDtype`. That is wrong for a mixed `_K_M` checkpoint, where the scheme
+/// varies per TENSOR (attn_v / ffn_down bump to Q6_K in only some layers), so a
+/// model with such weights builds a step per kind instead and routes each
+/// matmul by its catalog kind. Returns `None` when the device cannot run the
+/// tensor-core path at all.
+///
+/// `fast_mixed` must be true for the caller's block (bf16 acts + the f16 casts);
+/// dispatch needs those casts to feed the f16 kernel.
+pub(crate) async fn build_coopmat_step(
+    backend: &WgpuBackend,
+    label: &str,
+    scheme: thinfer_core::quant::QuantKind,
+    out: thinfer_core::ops::matmul_coopmat::CoopmatOut,
+) -> Result<Option<CoopmatStep>, WgpuError> {
+    use thinfer_core::backend::Backend;
+    let (sg_min, sg_max) = backend.subgroup_size_range();
+    if backend.coopmat().is_none() || sg_min != sg_max || !backend.supports_shader_f16() {
+        return Ok(None);
+    }
+    let dq_wgsl = thinfer_core::ops::dequant::build_wgsl(
+        scheme,
+        thinfer_core::ops::dequant::DequantTarget::F16,
+    );
+    let dq_pipe = backend
+        .create_pipeline(
+            &format!("dequant_f16_{label}"),
+            &dq_wgsl,
+            "main",
+            thinfer_core::ops::dequant::layout(),
+        )
+        .await?;
+    let cm = backend.coopmat().expect("checked above");
+    let mut cfg = thinfer_core::ops::matmul_coopmat::CoopmatMatmulConfig::new(cm.tile, sg_min, out);
+    cfg.b_col_major = true;
+    let mm_wgsl = thinfer_core::ops::matmul_coopmat::build_wgsl(&cfg);
+    let matmul = backend
+        .create_pipeline(
+            &format!("matmul_coopmat_{label}"),
+            &mm_wgsl,
+            "main",
+            thinfer_core::ops::matmul_coopmat::layout(),
+        )
+        .await?;
+    Ok(Some(CoopmatStep {
+        dequant_f16: DequantStep {
+            pipeline: dq_pipe,
+            scheme,
+        },
+        matmul,
+        cfg,
+    }))
+}
+
 pub struct BlockPipelines {
     pub matmuls: BlockMatmuls,
     pub matmul_qkv: WgpuPipeline,
@@ -374,6 +430,10 @@ pub struct BlockPipelines {
     /// `None` and feeds f16 Q/K/V to `sdpa_sg` directly.
     pub cast_to_f16: Option<WgpuPipeline>,
     pub cast_to_bf16: Option<WgpuPipeline>,
+    /// f32 -> bf16, for a coopmat site that writes an f32 output because its
+    /// values can leave the f16 range. Built alongside the other fast_mixed
+    /// casts.
+    pub cast_f32_to_bf16: Option<WgpuPipeline>,
     /// Opt-in coopmat (tensor-core) matmul on the outlier-bound bf16 sites that
     /// i8 can't touch (proj = attn-out, ffn_down = gelu product, qkv = cross
     /// from un-normed text). `Some` only when the device exposes a usable
@@ -1207,6 +1267,20 @@ impl BlockPipelines {
                             <Bf16ToF16 as Op>::wgsl(&cfgs.ops),
                             "main",
                             <Bf16ToF16 as Op>::layout(),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            },
+            cast_f32_to_bf16: if fast_mixed {
+                Some(
+                    backend
+                        .create_pipeline(
+                            "cast_f32_bf16",
+                            <F32ToBf16 as Op>::wgsl(&cfgs.ops),
+                            "main",
+                            <F32ToBf16 as Op>::layout(),
                         )
                         .await?,
                 )
@@ -2572,15 +2646,36 @@ impl Block {
                 .as_ref()
                 .expect("cast_to_f16 built whenever a coopmat step exists (fast_mixed)");
             scope.dispatch_op::<Bf16ToF16>(to_f16, &[a.data], a_f16)?;
-            // (3) coopmat f16 matmul -> f16 out.
-            let mm_out = scope.alloc(pipelines.act_bytes(m * n))?;
+            // (3) coopmat matmul. The accumulator is f32 either way; the OUTPUT
+            // encoding is the site's choice. F16 is the compact default, but a
+            // site whose output can leave the f16 range (a wide pre-activation
+            // carrying outlier channels) must land in f32 -- one value past
+            // 65504 becomes an inf, and a following SwiGLU turns that into a
+            // NaN that no range check downstream can attribute.
+            let f32_out = matches!(
+                cm.cfg.out,
+                thinfer_core::ops::matmul_coopmat::CoopmatOut::F32
+            );
+            let mm_out = scope.alloc(if f32_out {
+                m as u64 * n as u64 * 4
+            } else {
+                pipelines.act_bytes(m * n)
+            })?;
             scope.coopmat(&cm.matmul, &cm.cfg, a_f16, b_f16, mm_out, dims, m, n)?;
-            // (4) cast f16 output back to the bf16 residual.
-            let to_bf16 = pipelines
-                .cast_to_bf16
-                .as_ref()
-                .expect("cast_to_bf16 built whenever a coopmat step exists (fast_mixed)");
-            scope.dispatch_op::<F16ToBf16>(to_bf16, &[mm_out], out_scratch)?;
+            // (4) cast the output back to the bf16 residual.
+            if f32_out {
+                let to_bf16 = pipelines
+                    .cast_f32_to_bf16
+                    .as_ref()
+                    .expect("cast_f32_to_bf16 built whenever an f32-out coopmat step exists");
+                scope.dispatch_op::<F32ToBf16>(to_bf16, &[mm_out], out_scratch)?;
+            } else {
+                let to_bf16 = pipelines
+                    .cast_to_bf16
+                    .as_ref()
+                    .expect("cast_to_bf16 built whenever a coopmat step exists (fast_mixed)");
+                scope.dispatch_op::<F16ToBf16>(to_bf16, &[mm_out], out_scratch)?;
+            }
             return Ok(());
         }
         Self::dispatch_matmul_site_diag(

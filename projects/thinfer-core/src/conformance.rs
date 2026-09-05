@@ -15,14 +15,16 @@ use crate::ops::{
     BcastMulF32, Conv2dBufs, Conv2dF32, Conv2dOp, Conv3dBufs, Conv3dF32, Conv3dOp,
     DepthToSpace3dBufs, DepthToSpace3dF32, DepthToSpace3dOp, GatedHeadMulF32, GeluMulF32,
     LayerNormBufs, LayerNormF32, LayerNormOp, MatMulF32, MatmulBufs, MatmulOp, MemCatBufs,
-    MemCatOp, MulF32, Op, PixelNorm3dBufs, PixelNorm3dF32, PixelNorm3dOp, ReluF32, RmsNorm3dBufs,
-    RmsNorm3dF32, RmsNorm3dOp, RmsNormBufs, RmsNormF32, RmsNormOp, RopeBufs, RopeF32,
-    RopeF32HalfRot, RopeOp, SdpaBufs, SdpaDecode, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32,
-    SiluMulF32, SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32, Transpose12Bufs, Transpose12F32,
-    Transpose12Op, WgslConfig, dispatch_bcast_add, dispatch_bcast_affine, dispatch_bcast_fma,
-    dispatch_bcast_modulate, dispatch_conv2d, dispatch_conv3d, dispatch_depth_to_space3d,
-    dispatch_layernorm, dispatch_matmul, dispatch_memcat, dispatch_op, dispatch_pixel_norm3d,
-    dispatch_rmsnorm, dispatch_rmsnorm3d, dispatch_rope, dispatch_sdpa, dispatch_softmax,
+    MemCatOp, MulF32, Op, PixelNorm3dBufs, PixelNorm3dF32, PixelNorm3dOp, QkvSplitBufs,
+    QkvSplitHeadwiseF32, QkvSplitOp, ReluF32, RmsNorm3dBufs, RmsNorm3dF32, RmsNorm3dOp,
+    RmsNormBufs, RmsNormF32, RmsNormOp, RopeBufs, RopeF32, RopeF32HalfRot, RopeF32HalfRotPartial,
+    RopeOp, SdpaBufs, SdpaDecode, SdpaF32, SdpaF32LargeD, SdpaOp, SiluF32, SiluMulF32,
+    SiluMulFusedBufs, SiluMulFusedF32, SiluMulFusedOp, SoftmaxBufs, SoftmaxF32, SoftmaxOp, TanhF32,
+    Transpose12Bufs, Transpose12F32, Transpose12Op, WgslConfig, dispatch_bcast_add,
+    dispatch_bcast_affine, dispatch_bcast_fma, dispatch_bcast_modulate, dispatch_conv2d,
+    dispatch_conv3d, dispatch_depth_to_space3d, dispatch_layernorm, dispatch_matmul,
+    dispatch_memcat, dispatch_op, dispatch_pixel_norm3d, dispatch_qkv_split, dispatch_rmsnorm,
+    dispatch_rmsnorm3d, dispatch_rope, dispatch_sdpa, dispatch_silu_mul_fused, dispatch_softmax,
     dispatch_transpose12,
 };
 use crate::tensor::ComputeDtype;
@@ -112,6 +114,22 @@ pub enum OpSpec {
     Rope,
     #[serde(rename = "rope_halfrot")]
     RopeHalfRot,
+    /// Half-rot over the leading channels only; the rest pass through. The
+    /// rotary width is inferred from the `freqs` row width, which is narrower
+    /// than the head dim.
+    #[serde(rename = "rope_halfrot_partial")]
+    RopeHalfRotPartial,
+    /// MiniMax-H3 `attn.qkv_proj`: the fused output is PER-HEAD interleaved
+    /// `(rows, heads, 3, head_dim)`, so q/k/v index axis -2 rather than being
+    /// three contiguous blocks. Getting it wrong mixes heads across q/k/v with
+    /// no NaN to catch it.
+    #[serde(rename = "qkv_split_headwise")]
+    QkvSplitHeadwise,
+    /// MiniMax-H3 `mlp.fc1`: a fused `[gate; value]` row, so SwiGLU reads both
+    /// halves as a STRIDED per-row slice of one buffer (they cannot be two
+    /// buffer views). `out = silu(gate) * value`.
+    #[serde(rename = "silu_mul_fused")]
+    SiluMulFused,
     Sdpa {
         scale: f32,
     },
@@ -602,6 +620,123 @@ impl<'a> OpTestContext<'a> {
                     rows,
                     heads,
                     pairs,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Partial half-rot: `freqs` is NARROWER than the head dim and its width
+    /// sets how many leading channels rotate. `rot_pairs` rides in the uniform's
+    /// fourth slot, which the full-width kernels leave as padding.
+    pub async fn run_rope_partial<O: RopeOp>(&self) -> Vec<u8> {
+        let x_shape = &self.case.inputs[0].shape;
+        let f_shape = &self.case.inputs[1].shape;
+        let (rows, heads, dim) = (x_shape[0] as u32, x_shape[1] as u32, x_shape[2] as u32);
+        let rotary_dim = f_shape[1] as u32;
+        debug_assert_eq!(dim % 2, 0, "rope dim must be even");
+        debug_assert_eq!(f_shape[0] as u32, rows);
+        debug_assert!(
+            rotary_dim <= dim && rotary_dim.is_multiple_of(4),
+            "rotary width {rotary_dim} must be <= {dim} and a multiple of 4 so the \
+             packed kernels stay word-aligned"
+        );
+        let pairs = dim / 2;
+        let rot_pairs = rotary_dim / 2;
+        let out_len = self.input_bytes(self.case.inputs[0].name).len() as u64;
+        let u = pack_u32x4(rows, heads, pairs, rot_pairs);
+        self.run_op(
+            O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |b, e, p, ins, uf, out| {
+                dispatch_rope::<O, _>(
+                    b,
+                    e,
+                    p,
+                    &RopeBufs {
+                        x: &ins[0],
+                        freqs: &ins[1],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    rows,
+                    heads,
+                    pairs,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Per-head interleaved qkv split.
+    ///
+    /// `x` is `[rows, heads, 3, head_dim]`. The kernel writes three separate
+    /// buffers; the fixture is one tensor, so q/k/v land in thirds of a single
+    /// output (q ++ k ++ v). Each third must start on a 256-byte
+    /// storage-binding boundary, which the test shapes ensure.
+    pub async fn run_qkv_split_headwise<O: QkvSplitOp>(&self) -> Vec<u8> {
+        let sh = &self.case.inputs[0].shape;
+        assert_eq!(sh.len(), 4, "qkv_split x is [rows, heads, 3, head_dim]");
+        let (rows, heads, head_dim) = (sh[0] as u32, sh[1] as u32, sh[3] as u32);
+        assert_eq!(sh[2], 3, "the fused axis is q/k/v");
+        let inner = heads * head_dim;
+        // q ++ k ++ v is exactly the input width, so the output is input-sized.
+        let out_len = self.input_bytes(self.case.inputs[0].name).len() as u64;
+        let slab = out_len / 3;
+        assert_eq!(slab % 256, 0, "each q/k/v third must be 256B aligned");
+
+        let u = pack_u32x4(rows, inner, head_dim, 0);
+        self.run_op(
+            O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |b, e, p, ins, uf, out| {
+                let third = |i: u64| BufRef::view(out.id, out.offset + i * slab, slab);
+                dispatch_qkv_split::<O, _>(
+                    b,
+                    e,
+                    p,
+                    &QkvSplitBufs {
+                        input: &ins[0],
+                        q: &third(0),
+                        k: &third(1),
+                        v: &third(2),
+                        uniform: uf.as_ref().unwrap(),
+                    },
+                    rows * inner,
+                )
+            },
+        )
+        .await
+    }
+
+    /// SwiGLU over a fused `[gate; value]` row: `out = silu(gate) * value`.
+    pub async fn run_silu_mul_fused<O: SiluMulFusedOp>(&self) -> Vec<u8> {
+        let sh = &self.case.inputs[0].shape;
+        let (rows, fused) = (sh[0] as u32, sh[1] as u32);
+        assert_eq!(fused % 2, 0, "the fused row is [gate; value]");
+        let h = fused / 2;
+        let out_len = self.input_bytes(self.case.inputs[0].name).len() as u64 / 2;
+        let u = pack_u32x4(rows, h, 0, 0);
+        self.run_op(
+            O::wgsl(self.dtype.wgsl_config()),
+            O::layout,
+            Some(&u),
+            out_len,
+            |b, e, p, ins, uf, out| {
+                dispatch_silu_mul_fused::<O, _>(
+                    b,
+                    e,
+                    p,
+                    &SiluMulFusedBufs {
+                        input: &ins[0],
+                        uniform: uf.as_ref().unwrap(),
+                        out: &out,
+                    },
+                    rows * h,
                 )
             },
         )
@@ -1282,6 +1417,9 @@ pub fn registry() -> Vec<Box<dyn OpTest>> {
         Box::new(SoftmaxF32),
         Box::new(RopeF32),
         Box::new(RopeF32HalfRot),
+        Box::new(RopeF32HalfRotPartial),
+        Box::new(QkvSplitHeadwiseF32),
+        Box::new(SiluMulFusedF32),
         Box::new(SdpaF32),
         Box::new(SdpaF32LargeD),
         Box::new(SdpaDecode),

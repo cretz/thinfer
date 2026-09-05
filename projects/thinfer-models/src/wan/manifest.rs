@@ -49,6 +49,12 @@ const REPO_ANYFLOW: &str = "nvidia/AnyFlow-Wan2.1-T2V-14B-Diffusers";
 /// Wan2.2-A14B diffusers `Wan2.1_VAE` (`VAE_WAN21`). License Apache-2.0. No umT5
 /// encoder / tokenizer (baked context).
 const REPO_DREAMIDV: &str = "XuGuo699/DreamID-V";
+/// Qualcomm-AI-Research/mobilewan: the efficient T2V DiT (5 bf16 safetensors
+/// shards + index at the repo root; `WanTransformer3DModel` with per-block
+/// pruned self-attention heads + ReHyAt embed maps we skip). umT5 + VAE +
+/// tokenizer reuse the FastVideo base bundle (same TI2V-5B backbone), so only
+/// the DiT is mobilewan-specific.
+const REPO_MOBILEWAN: &str = "Qualcomm-AI-Research/mobilewan";
 
 pub mod role {
     /// DMD-distilled Wan2.2-TI2V-5B DiT (`WanTransformer3DModel`), single file.
@@ -97,6 +103,13 @@ pub mod role {
     /// keypoints. Both at the DreamID-V HF repo root; download-as-needed.
     pub const YOLOX_ONNX: &str = "dwpose/yolox";
     pub const DWPOSE_ONNX: &str = "dwpose/pose";
+    /// mobilewan DiT, 5 bf16 safetensors shards (repo root). umT5 + VAE +
+    /// tokenizer reuse the FastVideo base roles.
+    pub const DIT_MOBILEWAN_1: &str = "dit/mobilewan1";
+    pub const DIT_MOBILEWAN_2: &str = "dit/mobilewan2";
+    pub const DIT_MOBILEWAN_3: &str = "dit/mobilewan3";
+    pub const DIT_MOBILEWAN_4: &str = "dit/mobilewan4";
+    pub const DIT_MOBILEWAN_5: &str = "dit/mobilewan5";
 }
 
 /// One loadable variant: the file set `WanModel::load` needs. Mirrors
@@ -169,6 +182,20 @@ const ANYFLOW_WEIGHT_ROLES: &[&str] = &[
 const DREAMIDV_WEIGHT_ROLES: &[&str] = &[role::VAE_WAN21];
 const DREAMIDV_AUX_ROLES: &[&str] = &[role::YOLOX_ONNX, role::DWPOSE_ONNX];
 
+/// mobilewan: 5 DiT shards lead (ShardedSafetensorsSource order: DiT first),
+/// then the FastVideo umT5 shards + the Wan2.2 TI2V VAE (shared backbone).
+const MOBILEWAN_WEIGHT_ROLES: &[&str] = &[
+    role::DIT_MOBILEWAN_1,
+    role::DIT_MOBILEWAN_2,
+    role::DIT_MOBILEWAN_3,
+    role::DIT_MOBILEWAN_4,
+    role::DIT_MOBILEWAN_5,
+    role::TEXT_ENCODER_SHARD_1,
+    role::TEXT_ENCODER_SHARD_2,
+    role::TEXT_ENCODER_SHARD_3,
+    role::VAE,
+];
+
 pub static VARIANTS: &[VariantFiles] = &[
     VariantFiles {
         id: "fastwan-ti2v-5b",
@@ -209,6 +236,16 @@ pub static VARIANTS: &[VariantFiles] = &[
         gguf_low_role: Some(role::DIT_LOW_NOISE),
         lora_high_role: Some(role::LORA_HIGH_NOISE),
         lora_low_role: Some(role::LORA_LOW_NOISE),
+    },
+    VariantFiles {
+        id: "mobilewan",
+        weight_roles: MOBILEWAN_WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_pt_role: None,
+        gguf_high_role: None,
+        gguf_low_role: None,
+        lora_high_role: None,
+        lora_low_role: None,
     },
     VariantFiles {
         id: "dreamid-v",
@@ -297,6 +334,41 @@ pub static MANIFEST: ModelManifest = ModelManifest {
             FileRef::new(
                 REPO_ANYFLOW,
                 "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+            ),
+        ),
+        (
+            role::DIT_MOBILEWAN_1,
+            FileRef::new(
+                REPO_MOBILEWAN,
+                "diffusion_pytorch_model-00001-of-00005.safetensors",
+            ),
+        ),
+        (
+            role::DIT_MOBILEWAN_2,
+            FileRef::new(
+                REPO_MOBILEWAN,
+                "diffusion_pytorch_model-00002-of-00005.safetensors",
+            ),
+        ),
+        (
+            role::DIT_MOBILEWAN_3,
+            FileRef::new(
+                REPO_MOBILEWAN,
+                "diffusion_pytorch_model-00003-of-00005.safetensors",
+            ),
+        ),
+        (
+            role::DIT_MOBILEWAN_4,
+            FileRef::new(
+                REPO_MOBILEWAN,
+                "diffusion_pytorch_model-00004-of-00005.safetensors",
+            ),
+        ),
+        (
+            role::DIT_MOBILEWAN_5,
+            FileRef::new(
+                REPO_MOBILEWAN,
+                "diffusion_pytorch_model-00005-of-00005.safetensors",
             ),
         ),
         (
@@ -437,6 +509,20 @@ mod tests {
         // 1 DiT + 3 TE + 1 VAE.
         assert_eq!(v.weight_roles.len(), 5);
         assert!(v.dit_pt_role.is_none());
+    }
+
+    #[test]
+    fn mobilewan_variant_bundles_dit_shards_with_fastwan_tail() {
+        let v = variant("mobilewan").expect("mobilewan variant");
+        // 5 DiT shards + 3 umT5 + 1 VAE; no .pt / gguf.
+        assert_eq!(v.weight_roles.len(), 9);
+        assert!(v.dit_pt_role.is_none());
+        assert!(v.gguf_high_role.is_none());
+        // DiT shards come from the mobilewan repo; the tail reuses FastVideo.
+        let dit1 = MANIFEST.get(role::DIT_MOBILEWAN_1).expect("mobilewan dit1");
+        assert_eq!(dit1.repo, REPO_MOBILEWAN);
+        let vae = MANIFEST.get(role::VAE).expect("vae");
+        assert_eq!(vae.repo, REPO_DIFFUSERS);
     }
 
     #[test]

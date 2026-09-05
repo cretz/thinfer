@@ -595,6 +595,13 @@ impl VecReader {
     fn new(bytes: Arc<[u8]>) -> Self {
         Self { bytes }
     }
+
+    /// Reader over caller-owned bytes (synthesized adapter tensors).
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        }
+    }
 }
 
 impl WeightReader for VecReader {

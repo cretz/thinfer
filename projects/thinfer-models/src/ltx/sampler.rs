@@ -31,6 +31,46 @@ pub const STAGE1_SIGMAS: [f32; 9] = [
 /// Stage 2: 3-step refine (tail subset) after the latent is upscaled x2 and
 /// re-noised to sigma 0.909375.
 pub const STAGE2_SIGMAS: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
+
+/// Max per-step sigma decrement for the opt-in HQ-audio schedule refinement
+/// ([`refine_sigmas`]). The distilled 8-step table takes very coarse late steps
+/// (`0.725 -> 0.421875 -> 0`), where Euler discretization error is largest; the
+/// joint audio stream (a delicate bf16 residual) under-resolves there and drifts
+/// to gibberish. Capping each substep to this decrement subdivides only the
+/// coarse jumps (the tiny early micro-steps stay single), which roughly doubles
+/// the single-stage denoise for a finer audio-video trajectory.
+pub const AUDIO_HQ_MAX_DSIGMA: f32 = 0.1;
+
+/// Refine a monotone-decreasing sigma schedule by inserting linearly-spaced
+/// intermediate sigmas so no adjacent pair decreases by more than `max_dsigma`.
+/// The original anchors are reproduced EXACTLY (the distilled model was trained
+/// to land on them); only extra Euler substeps are added inside the coarse
+/// intervals, so the trajectory endpoints are unchanged and just more finely
+/// integrated. `max_dsigma` must be `> 0`; an interval already within the cap is
+/// left single. A schedule of fewer than two points is returned unchanged.
+pub fn refine_sigmas(base: &[f32], max_dsigma: f32) -> Vec<f32> {
+    assert!(max_dsigma > 0.0, "refine_sigmas: max_dsigma must be > 0");
+    if base.len() < 2 {
+        return base.to_vec();
+    }
+    let mut out = Vec::with_capacity(base.len());
+    out.push(base[0]);
+    for pair in base.windows(2) {
+        let (hi, lo) = (pair[0], pair[1]);
+        let span = hi - lo;
+        // Only decreasing jumps wider than the cap get subdivided; the exact `lo`
+        // anchor is reproduced at `k == sub` (fraction 1.0), so anchors are kept.
+        let sub = if span > max_dsigma {
+            (span / max_dsigma).ceil() as usize
+        } else {
+            1
+        };
+        for k in 1..=sub {
+            out.push(hi + (lo - hi) * (k as f32 / sub as f32));
+        }
+    }
+    out
+}
 /// Two-stage: H,W divisible by 64; frames = 8k+1. Default render target.
 pub const DEFAULT_WIDTH: usize = 1536;
 pub const DEFAULT_HEIGHT: usize = 1024;
@@ -327,6 +367,39 @@ mod tests {
         blend_clean(&mut x, &clean, &mask, c);
         // token 0 -> clean; token 1 -> unchanged; token 2 -> midpoint.
         assert_eq!(x, vec![10.0, 20.0, 3.0, 4.0, 5.0, 9.0]);
+    }
+
+    #[test]
+    fn refine_sigmas_keeps_anchors_and_caps_steps() {
+        let r = refine_sigmas(&STAGE1_SIGMAS, 0.1);
+        // Endpoints preserved; strictly decreasing; every cap respected.
+        assert_eq!(r.first(), Some(&1.0));
+        assert_eq!(r.last(), Some(&0.0));
+        for w in r.windows(2) {
+            assert!(w[0] > w[1], "not decreasing: {} -> {}", w[0], w[1]);
+            assert!(
+                w[0] - w[1] <= 0.1 + 1e-6,
+                "step {} -> {} exceeds cap",
+                w[0],
+                w[1]
+            );
+        }
+        // Each original distilled anchor still appears exactly.
+        for &a in &STAGE1_SIGMAS {
+            assert!(
+                r.iter().any(|&x| (x - a).abs() < 1e-6),
+                "anchor {a} dropped from refined schedule"
+            );
+        }
+        // The coarse 8-step (9-point) table refines to a 16-step (17-point) one.
+        assert_eq!(r.len(), 17);
+    }
+
+    #[test]
+    fn refine_sigmas_leaves_fine_schedule_untouched() {
+        // A schedule already within the cap gains no substeps.
+        let fine = [1.0, 0.95, 0.9, 0.0];
+        assert_eq!(refine_sigmas(&fine, 1.0), fine.to_vec());
     }
 
     #[test]

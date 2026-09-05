@@ -711,19 +711,21 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
         weight_dtype: WeightDtype::Quant(QuantKind::Q8_0),
         ..ops
     };
-    // `dp4a` BUILDS the i8 pipelines for the qkv + ffn_up sites; the per-call
-    // routing (`I8Site` in `biased_proj`, driven by `attention`/`feed_forward`)
-    // decides which projections actually use them -- the VIDEO-stream qkv/ffn_up
-    // (all normed A-sides), with proj (post-gate) + ffn_down (post-gelu) + the
-    // whole AUDIO stream kept dense by default (`THINFER_LTX_I8_EXTRA=1` opts
-    // the audio qkv/ffn_up + v2a, also normed A-sides, into i8; see
-    // `DitPipelines::i8_extra`).
+    // `dp4a` BUILDS the i8 pipelines for every site; the per-call routing
+    // (`I8Site` in `biased_proj`, driven by `attention`/`feed_forward`) decides
+    // which projections actually use them. The VIDEO-stream qkv/ffn_up (all normed
+    // A-sides) route i8 for every variant; proj (post-gate) + ffn_down (post-gelu)
+    // route i8 ONLY on the UNGATED rapid variant (no gate -> no concentrated
+    // outliers), staying dense on the 22B via the per-call gate. The whole AUDIO
+    // stream stays dense by default (`THINFER_LTX_I8_EXTRA=1` opts the audio
+    // qkv/ffn_up + v2a in). Building the proj/ffn_down i8 pipelines on the 22B is
+    // harmless -- routing keeps `I8Site::None` there.
     let dense_acts = DenseActSites {
         qkv: !dp4a,
         qkv_self: !dp4a,
-        proj: true,
+        proj: !dp4a,
         ffn_up: !dp4a,
-        ffn_down: true,
+        ffn_down: !dp4a,
     };
     BlockWgslConfigs {
         matmul_qkv: mm,
@@ -1105,6 +1107,12 @@ enum I8Site {
     None,
     Qkv,
     FfnUp,
+    /// attn out-proj (`to_out`). Dense on the 22B (post-gate outliers); i8 only on
+    /// the UNGATED rapid variant, where the SDPA output has no gate to concentrate
+    /// outliers into a few channels.
+    Proj,
+    /// FFN down. Same story: post-gelu A-side, dense on 22B, i8 on ungated rapid.
+    FfnDown,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1132,6 +1140,8 @@ fn biased_proj<'wsp>(
         I8Site::None => None,
         I8Site::Qkv => bp.matmul_i8_qkv.as_ref(),
         I8Site::FfnUp => bp.matmul_i8_ffn_up.as_ref(),
+        I8Site::Proj => bp.matmul_i8_proj.as_ref(),
+        I8Site::FfnDown => bp.matmul_i8_ffn_down.as_ref(),
     };
     let di8 = match i8 {
         I8Site::None => None,
@@ -1358,6 +1368,7 @@ fn attention<'wsp>(
     kv_rows: u32,
     eps: f32,
     qkv_i8: bool,
+    proj_i8: bool,
     gated: bool,
     dq: AttnDequant<'_>,
 ) -> Result<ActBuf<'wsp>, WgpuError> {
@@ -1496,18 +1507,15 @@ fn attention<'wsp>(
         sa
     };
 
-    // to_out projection + bias -> [q_rows, q_dim].
+    // to_out projection + bias -> [q_rows, q_dim]. i8 only when the caller marks
+    // this (ungated) site safe AND an i8 prep exists for the weight's kind.
+    let o_site = if proj_i8 && dq.o.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
+        I8Site::Proj
+    } else {
+        I8Site::None
+    };
     biased_proj(
-        scope,
-        pipes,
-        attn_out,
-        w.o_w,
-        w.o_b,
-        q_rows,
-        q_dim,
-        inner,
-        I8Site::None,
-        dq.o,
+        scope, pipes, attn_out, w.o_w, w.o_b, q_rows, q_dim, inner, o_site, dq.o,
     )
 }
 
@@ -1521,6 +1529,7 @@ fn feed_forward<'wsp>(
     rows: u32,
     inner: u32,
     up_i8: bool,
+    down_i8: bool,
     dq: FfDequant<'_>,
 ) -> Result<ActBuf<'wsp>, WgpuError> {
     let bp = &pipes.block;
@@ -1542,17 +1551,19 @@ fn feed_forward<'wsp>(
     )?;
     let g = alloc_act(scope, bp, rows, ff_hidden)?;
     scope.dispatch_op::<GeluF32>(&pipes.gelu, &[h1.data], g.data)?;
+    // ffn_down i8 only on the ungated (rapid) path, and only where an i8 prep
+    // exists for the weight's on-disk kind.
+    let down = if down_i8
+        && dq
+            .down
+            .is_some_and(|s| pipes.i8_dequant(s.scheme).is_some())
+    {
+        I8Site::FfnDown
+    } else {
+        I8Site::None
+    };
     biased_proj(
-        scope,
-        pipes,
-        g,
-        w.down_w,
-        w.down_b,
-        rows,
-        inner,
-        ff_hidden,
-        I8Site::None,
-        dq.down,
+        scope, pipes, g, w.down_w, w.down_b, rows, inner, ff_hidden, down, dq.down,
     )
 }
 
@@ -1613,6 +1624,11 @@ fn block_forward<'wsp>(
     // 19B (ltx2-rapid): ungated attention + raw (un-modulated) text cross-attn.
     let gated = variant.gated_attn;
     let cross_adaln = variant.cross_adaln;
+    // Audio-stream i8 stays OFF by default for BOTH variants (opt in with
+    // `THINFER_LTX_I8_EXTRA=1`). Routing rapid's audio to i8 was measured to blow
+    // the rapid parity gate (audio rel 1.57% > 1.2%): the audio block residual is
+    // genuinely i8-sensitive even ungated, so the audio qkv/proj/ffn stay dense.
+    let audio_i8 = pipes.i8_extra;
 
     // Resolve the dense dequant step for each matmul weight from its probed
     // on-disk quant kind. Uniform across attn types (q/k/o/gate one kind, v
@@ -1659,6 +1675,7 @@ fn block_forward<'wsp>(
         sv,
         eps,
         true,
+        !gated,
         gated,
         adq,
     )?;
@@ -1719,6 +1736,7 @@ fn block_forward<'wsp>(
         s.video_text as u32,
         eps,
         true,
+        !gated,
         gated,
         adq,
     )?;
@@ -1763,7 +1781,8 @@ fn block_forward<'wsp>(
         sa,
         sa,
         eps,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         gated,
         adq,
     )?;
@@ -1820,7 +1839,8 @@ fn block_forward<'wsp>(
         sa,
         s.audio_text as u32,
         eps,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         gated,
         adq,
     )?;
@@ -1879,6 +1899,7 @@ fn block_forward<'wsp>(
         sa,
         eps,
         true,
+        !gated,
         gated,
         adq,
     )?;
@@ -1929,7 +1950,8 @@ fn block_forward<'wsp>(
         sa,
         sv,
         eps,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         gated,
         adq,
     )?;
@@ -1957,7 +1979,9 @@ fn block_forward<'wsp>(
         vd,
         eps,
     )?;
-    let vx_ff = feed_forward(scope, pipes, vx_ff_in, &bufs.ff, sv, vd, true, vff_dq)?;
+    let vx_ff = feed_forward(
+        scope, pipes, vx_ff_in, &bufs.ff, sv, vd, true, !gated, vff_dq,
+    )?;
     op_gate_residual(
         scope,
         bp,
@@ -1987,7 +2011,8 @@ fn block_forward<'wsp>(
         &bufs.audio_ff,
         sa,
         ad,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         aff_dq,
     )?;
     op_gate_residual(

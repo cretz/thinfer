@@ -112,6 +112,7 @@ fn spec_into_request(
                 steps: s.steps.unwrap_or(d.steps),
                 seed: s.seed,
                 i8_matmul: s.i8_matmul.unwrap_or(true),
+                full_precision: s.full_precision.unwrap_or(false),
                 input_image,
                 lora: s
                     .lora
@@ -180,6 +181,7 @@ fn spec_into_request(
                 i8_matmul: s.i8_matmul.unwrap_or(true),
                 audio: s.audio.unwrap_or(true),
                 upscale: s.upscale.unwrap_or(model.two_stage_default()),
+                audio_hq: s.audio_hq.unwrap_or(false),
                 rewrite: s.rewrite.unwrap_or(true),
                 rewrite_quality: s.rewrite_quality.unwrap_or_default(),
                 lora: s

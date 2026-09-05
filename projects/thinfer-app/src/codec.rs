@@ -161,12 +161,14 @@ pub fn encode_aac_stereo(wav_planar: &[f32], sample_rate: u32) -> Result<AudioPa
     })
 }
 
-/// Map a sample rate to the MP4/AAC `SampleFreqIndex`. Only the rates the LTX
-/// vocoder emits are needed (48kHz); extend if other rates appear.
+/// Map a sample rate to the MP4/AAC `SampleFreqIndex`. Covers every rate the
+/// shipped vocoders emit: 48kHz (LTX-2.3), 24kHz (ltx2-rapid), 32kHz
+/// (MiniMax-H3). Extend if other rates appear.
 fn freq_index_for(sample_rate: u32) -> Result<mp4::SampleFreqIndex, String> {
     match sample_rate {
         48000 => Ok(mp4::SampleFreqIndex::Freq48000),
         44100 => Ok(mp4::SampleFreqIndex::Freq44100),
+        32000 => Ok(mp4::SampleFreqIndex::Freq32000),
         24000 => Ok(mp4::SampleFreqIndex::Freq24000),
         16000 => Ok(mp4::SampleFreqIndex::Freq16000),
         other => Err(format!("unsupported audio sample rate {other}")),

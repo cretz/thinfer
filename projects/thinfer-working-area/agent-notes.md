@@ -20,7 +20,8 @@
 - `worklog.md` - START HERE. Forward-looking state + what's next. Points to the active per-model plan. Keep it slim.
 - `orig-plan.md` - user's source-of-truth plan. Don't edit.
 - `plan-details.md` - engine-wide design + current kernel/runtime/web/operational reference (the "how" beyond orig-plan, reused across models). Per-model porting details go in their own file, not here.
-- `ltx2-rapid-plan.md` - ACTIVE per-model port (LTX-2 19B Phr00t merge, distilled + native I2V). START HERE for current work.
+- `minimax-h3-plan.md` - ACTIVE per-model port (MiniMax-H3, 33B joint audio-video). START HERE for current work.
+- `ltx2-rapid-plan.md` - per-model port (LTX-2 19B Phr00t merge, distilled + native I2V). Parked mid-flight: see the HOT adherence item in `worklog.md`.
 - `ltx-plan.md` - shipped per-model port (LTX-2.3 distilled-1.1; 22B joint audio-video). The ltx2-rapid base to reuse.
 - `hy15-causal-plan.md` - HunyuanVideo 1.5 causal I2V (minWM dmd); parked.
 - `wan-plan.md`, `qwen-image-plan.md`, `zimage-plan.md` - shipped/archived per-model references. Read only if touching that model.

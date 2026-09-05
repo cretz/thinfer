@@ -35,7 +35,11 @@ const log = (line) => {
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"],
-  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4", "ltx2-rapid", "dreamid-v"],
+  // NB the LTX/Sulphur Q4_K_M DiT variants (ltx-2.3-distilled-q4, sulphur-2-q4)
+  // are intentionally omitted here: Q4_K_M is footprint-only and produces broken
+  // output on this pipeline (validated garbage), so they stay CLI-only for
+  // experiments rather than shipping a busted choice in the UI.
+  video: ["fastwan-ti2v-5b", "mobilewan", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "sulphur-2", "ltx2-rapid", "minimax-h3", "dreamid-v"],
   // HyperSwap ONNX face-swap: a source face pasted into every frame of a video.
   // Its own JobSpec (FaceSwapSpec); no prompt / size / steps.
   "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c"],
@@ -56,6 +60,13 @@ const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.sta
 // in-distribution at its own low res, so it takes its own preset list + toggle
 // defaults instead of the 22B two-stage LTX ones.
 const isLtxRapid = (model) => model === "ltx2-rapid";
+// MiniMax-H3: a 33B single-stream joint-AV model on its own /32 grid with a
+// fixed 24 fps and a 17n+5 frame grid. It shares the LTX audio surface (an Audio
+// toggle) but none of the LTX encoder/upscale knobs. Its packed sequence puts
+// text, audio and video in ONE self-attention stream, so resolution and clip
+// length trade against each other against a hard row cap -- hence its own
+// preset ladder rather than a generic one.
+const isMinimaxModel = (model) => model === "minimax-h3";
 // Wan2.2-T2V-A14B (MoE 14B): a heavier Wan-family tier with its own surface. It
 // runs a fixed 4-step LightX2V distill schedule (the steps/sampler knobs do not
 // apply) and only the full Wan2.1 VAE (no tiny-VAE path), so the Steps + Quality
@@ -88,6 +99,12 @@ const isMultiShotModel = (model) => model === "longlive-2.0-5b";
 // REQUIRE an uploaded input image (mirrors the server's QwenImageEdit kind).
 const EDIT_MODELS = new Set(["qwen-image-edit-rapid"]);
 const isEditModel = (model) => EDIT_MODELS.has(model);
+
+// Z-Image variants whose DiT source is bf16 safetensors: they take the
+// "Full precision" toggle (default off = load-time Q8 transcode, fast; on = bf16,
+// slow, max precision). The GGUF variants are already quantized and ignore it.
+const BF16_MODELS = new Set(["zimage-turbo-bf16"]);
+const isBf16Model = (model) => BF16_MODELS.has(model);
 // Image models that accept request-time user adapters (the encrypted LoRA
 // vault), mirroring the server's `ImageModelId::supports_adapters`. Adapters are
 // per-model, so the UI only lists/uses adapters stored for the selected model.
@@ -142,6 +159,17 @@ const PRESETS = {
     { label: "480p portrait (480x832)", width: 480, height: 832 },
   ],
 };
+// Image models authored at 1024 (resolution-aware schedules): Ideogram-4, both
+// Qwen-Image-Rapid variants, and Krea 2 Turbo default to 1024x1024 (mirrors the
+// server `ImageModelId::defaults`). Z-Image stays on the 768-led PRESETS.image.
+const IMAGE_1024_MODELS = new Set(["ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"]);
+const IMAGE_1024_PRESETS = [
+  { label: "1024x1024 (default)", width: 1024, height: 1024 },
+  { label: "768x768 (faster)", width: 768, height: 768 },
+  { label: "512x512 (fastest)", width: 512, height: 512 },
+  { label: "768x1024 portrait", width: 768, height: 1024 },
+  { label: "1024x768 landscape", width: 1024, height: 768 },
+];
 // LTX-2.3 has its own grid: dims must be a multiple of 64 and at least 256 (the
 // server rejects below 256). The decode tiles to the VRAM budget so larger dims
 // are allowed. Default first = 1280x704 (16:9 widescreen), the regime the
@@ -167,6 +195,19 @@ const RAPID_PRESETS = [
   { label: "512x320 landscape (fastest, clean)", width: 512, height: 320 },
   { label: "960x544 landscape (slower)", width: 960, height: 544 },
   { label: "1280x704 landscape (slowest, near VRAM cap)", width: 1280, height: 704 },
+];
+// MiniMax-H3 size ladder (/32 grid: 16x VAE spatial compression x the (1,2,2)
+// DiT patch). NONE of these is the model's native canvas -- H3 is authored at
+// 1344x768, but every modality shares one packed self-attention sequence and at
+// 768p that is ~37.8k rows, which does not fit an 8GB card at any streaming
+// setting. These are the resolutions that fit, and they are off-distribution:
+// expect weaker prompt adherence than the model is capable of. Larger dims cost
+// rows quadratically in attention AND leave fewer rows for clip length.
+const MINIMAX_PRESETS = [
+  { label: "512x320 landscape (default)", width: 512, height: 320 },
+  { label: "384x256 landscape (fastest, longer clips)", width: 384, height: 256 },
+  { label: "640x384 landscape (slower, short clips only)", width: 640, height: 384 },
+  { label: "320x512 portrait", width: 320, height: 512 },
 ];
 // Wan2.2-T2V-A14B size ladder (/16 grid, the Wan2.1 VAE 8x + patch 2). The
 // default is 832x480, the industry-norm 480p distill regime. (The earlier
@@ -199,6 +240,13 @@ function sizeSpec(kind, model) {
   if (kind === "video" && isLtxRapid(model)) return { presets: RAPID_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isLtxModel(model)) return { presets: LTX_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isWan22Model(model)) return { presets: WAN22_PRESETS, step: 16, min: 16 };
+  if (kind === "video" && isMinimaxModel(model)) return { presets: MINIMAX_PRESETS, step: 32, min: 32 };
+  // AnyFlow (Wan2.1 14B) and mobilewan (Wan2.2 5B) both run the /16 Wan grid led
+  // by the industry-norm 832x480; the generic 960x544 /32 video ladder is wrong
+  // for them (wrong default + a /32 step that rejects legal /16 dims).
+  if (kind === "video" && (isAnyflowModel(model) || model === "mobilewan"))
+    return { presets: WAN22_PRESETS, step: 16, min: 16 };
+  if (kind === "image" && IMAGE_1024_MODELS.has(model)) return { presets: IMAGE_1024_PRESETS, step: 16, min: 16 };
   if (kind === "video" && isHunyuanModel(model)) return { presets: HUNYUAN_PRESETS, step: 16, min: 16 };
   // DreamID-V: the /16 Wan2.1-VAE grid led by its 832x480 default (the target
   // clip is downsampled toward this area).
@@ -242,16 +290,23 @@ const MODEL_STEPS = {
 // it runs progressively slower (the 14B self-attention is O(rows^2)).
 const VIDEO_DURATION = {
   "fastwan-ti2v-5b": 5,
+  "mobilewan": 5,
   "wan2.2-t2v-a14b": 2.1,
-  "anyflow-t2v-14b": 2.1,
+  // AnyFlow is NOT special-cased in the server's default_frames, so a blank field
+  // yields snap_frames(5s*16fps)=81f ~= 5s at its 832x480 default (not 2.1s).
+  "anyflow-t2v-14b": 5,
   "longlive-2.0-5b": 5,
   "ltx-2.3-distilled": 2,
   "ltx-2.3-distilled-q4": 2,
   "sulphur-2": 2,
   "sulphur-2-q4": 2,
-  "ltx2-rapid": 3,
+  // rapid's blank default is 121f (LTX_DEFAULT_FRAMES, uncapped at its 768x512
+  // default res) ~= 5s @ 24fps.
+  "ltx2-rapid": 5,
   "hunyuan-video-1.5-t2v": 5,
   "hunyuan-video-1.5-ti2v": 5,
+  // 56 frames on the 17n+5 grid at a fixed 24 fps.
+  "minimax-h3": 2.3,
 };
 
 const subtle = globalThis.crypto?.subtle;
@@ -419,6 +474,9 @@ function applyModel() {
   $("occlusion-mask-row").hidden = !faceSwap;
   $("hyperswap-mask-row").hidden = !faceSwap;
   $("enhance-row").hidden = !faceSwap;
+  // Full-precision (bf16 vs default Q8) toggle: only the bf16-source Z-Image
+  // variant. GGUF variants are already quantized.
+  $("full-precision-row").hidden = !(kind === "image" && isBf16Model(model));
   $("detect-stride-row").hidden = !faceSwap;
   $("bitrate-scale-row").hidden = !faceSwap;
   $("trim-start-row").hidden = !faceSwap;
@@ -437,10 +495,17 @@ function applyModel() {
   // no two-stage upscale path).
   const isLtxVideo = kind === "video" && isLtxModel(model);
   const rapid = isLtxRapid(model);
-  // rapid is video-only + single-stage: no audio, no upscaler. The other LTX
-  // models expose both.
-  $("audio-row").hidden = !isLtxVideo || rapid;
+  // Audio is joint-AV for ALL LTX lines now, incl. rapid: its 19B DiT denoises the
+  // audio stream too, decoded by the shared audio VAE + a plain-HiFiGAN vocoder
+  // (16kHz). Upscale (two-stage) is 22B-only -- rapid ships no spatial upscaler.
+  // MiniMax-H3 is joint-AV too, so it takes the Audio toggle -- but none of the
+  // LTX-specific upscale / HQ-audio / encoder-quant knobs apply to it.
+  const isMinimax = kind === "video" && isMinimaxModel(model);
+  $("audio-row").hidden = !isLtxVideo && !isMinimax;
   $("upscale-row").hidden = !isLtxVideo || rapid;
+  // HQ audio (finer single-stage denoise) is a rapid-only lever -- it is the
+  // single-stage model whose distilled schedule under-resolves the audio stream.
+  $("audio-hq-row").hidden = !rapid;
   // Text-encoder quant (q8/q4) is an LTX knob (shared Gemma encoder); rapid uses
   // the same encoder, so keep it for rapid too.
   $("encoder-row").hidden = !isLtxVideo;
@@ -458,7 +523,7 @@ function applyModel() {
   const isHunyuan = kind === "video" && isHunyuanModel(model);
   // AnyFlow keeps the dropdown: tiny = taew2_1 (Wan2.1 z16), full = the real
   // Wan2.1 VAE (parity path).
-  $("vae-row").hidden = isLtxVideo || isWan22 || dreamid || faceSwap;
+  $("vae-row").hidden = isLtxVideo || isWan22 || dreamid || faceSwap || isMinimax;
   // The Hunyuan-tuned tiny VAE is a Hunyuan-only checkpoint; only offer it there.
   // If a non-Hunyuan model is selected while it was chosen, fall back to tiny.
   $("vae-opt-tiny-ft").hidden = !isHunyuan;
@@ -467,10 +532,14 @@ function applyModel() {
   // upscaling), Wan2.2-A14B a fixed 4-step LightX2V distill, and Hunyuan 1.5 a
   // fixed lightx2v 4-step flow-match schedule; all ignore the steps/sampler knobs,
   // so hide the field for them.
-  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan || faceSwap;
-  // AnyFlow is ANY-step: lift the FastWan 1..=8 cap for it (default 4; 2 is the
-  // fast play; quality keeps improving with more).
-  if (isAnyflow) {
+  // MiniMax-H3 runs the lightx2v 4-step turbo distillation, which is a REQUIRED
+  // part of its run path (the base checkpoint needs ~50 steps), so its step
+  // count is fixed too.
+  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan || faceSwap || isMinimax;
+  // AnyFlow is ANY-step; DreamID-V runs a 16-step distill. Both exceed the FastWan
+  // 1..=8 cap, so lift the max for them (else the pre-filled default is invalid and
+  // the browser blocks Generate).
+  if (isAnyflow || dreamid) {
     $("steps").max = "";
   }
   // Temporal attention window is a video-DiT perf knob: Wan2.2-14B long clips,
@@ -498,6 +567,13 @@ function applyModel() {
     $("adapters-list").replaceChildren();
     $("adapters-status").textContent = "";
   }
+  // Coopmat (tensor-core) only accelerates the Wan-family video DiT hot path; it
+  // is inert for image, face-swap, LTX (own pipeline), and Hunyuan. Hide the
+  // toggle where it does nothing rather than show a dead control. (The
+  // /capabilities probe separately disables it on GPUs without support.)
+  const usesCoopmat = kind === "video" && !isLtxModel(model) && !isHunyuanModel(model);
+  const coopRow = $("coopmat-row");
+  if (coopRow) coopRow.hidden = !usesCoopmat;
   populateSize(kind, model);
   // Steps default is per-model (mirrors the server): the 4-step distilled image
   // models start at 4, everything else at the kind default. LTX ignores steps
@@ -506,11 +582,35 @@ function applyModel() {
   // Show the real per-model default in the duration PLACEHOLDER (blank field ->
   // the server uses this default; typing overrides). Clear any value carried
   // over from a previous model so blank truly means "use the shown default".
-  const dur = VIDEO_DURATION[model];
   $("duration").value = "";
-  $("duration").placeholder = kind === "video" && dur != null ? `${dur}s (default)` : "(seconds)";
+  refreshDurationPlaceholder();
 }
 $("model").addEventListener("change", applyModel);
+
+// The LTX default clip length is resolution-derived on the server
+// (min(121, ltx_max_frames(w,h))): the 8GB activation envelope caps frames at
+// high res, but low res (e.g. 512x320) fits the full 121f/~5s. Mirror that here
+// so the blank-field placeholder tracks the SELECTED dims, not a static figure
+// (a static "2s" was only right at the 1280x704 widescreen default). fps 24,
+// VAE temporal factor 8, /32 latent grid, LTX_MAX_LATENT_CELLS 6300.
+const ltxDefaultSeconds = (w, h) => {
+  const cellsPerFrame = Math.max(1, Math.floor(h / 32)) * Math.max(1, Math.floor(w / 32));
+  const maxFLat = Math.max(1, Math.floor(6300 / cellsPerFrame));
+  const framesCap = 8 * (maxFLat - 1) + 1;
+  const frames = Math.min(121, framesCap);
+  return Math.round((frames / 24) * 10) / 10;
+};
+function refreshDurationPlaceholder() {
+  const model = $("model").value;
+  if ($("kind").value !== "video") {
+    $("duration").placeholder = "(seconds)";
+    return;
+  }
+  const dur = isLtxModel(model)
+    ? ltxDefaultSeconds(Number($("width").value), Number($("height").value))
+    : VIDEO_DURATION[model];
+  $("duration").placeholder = dur != null ? `${dur}s (default)` : "(seconds)";
+}
 
 // Picking a preset fills the dims; typing dims that match no preset flips the
 // dropdown to "Custom" (hand-typed dims are always honored).
@@ -528,6 +628,11 @@ const syncPresetToDims = () => {
 };
 $("width").addEventListener("input", syncPresetToDims);
 $("height").addEventListener("input", syncPresetToDims);
+// LTX's default clip length depends on the selected dims -> refresh the
+// duration placeholder when either the preset or a typed dim changes.
+$("preset").addEventListener("change", refreshDurationPlaceholder);
+$("width").addEventListener("input", refreshDurationPlaceholder);
+$("height").addEventListener("input", refreshDurationPlaceholder);
 
 applyKind();
 
@@ -737,6 +842,8 @@ async function buildSpec() {
       if (!file) throw new Error(`${model} requires a reference image; choose one first`);
       spec.inputImage = await fileToBase64(file);
     }
+    // bf16 Z-Image variants: opt into full bf16 precision (default off = Q8).
+    if (isBf16Model(model) && $("full-precision").checked) spec.fullPrecision = true;
     // Fold any checked vault adapters into the DiT (per-adapter weight).
     attachAdapters(spec, "image", model);
     return spec;
@@ -778,6 +885,23 @@ async function buildSpec() {
   // server splits it evenly across shots. Blank = the model default (5s). fps
   // is the model's native rate, so it is not exposed.
   const duration = floatOrNull($("duration").value);
+  // MiniMax-H3 honors dims (its /32 grid), duration (the server snaps to the
+  // 17n+5 frame grid) and the Audio toggle. Its step count is fixed by the
+  // required 4-step turbo distillation, its fps is fixed at 24, and it has no
+  // upscale / encoder-quant / sampler / vae knobs.
+  if (isMinimaxModel(model)) {
+    const spec = {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      audio: $("audio").checked,
+      seed,
+    };
+    return spec;
+  }
   // LTX honors dims (its /64 grid, from the LTX presets), duration (server snaps
   // to 8k+1 frames then caps to the per-resolution 8GB frame budget), the Audio
   // toggle, and Upscale (two-stage, default-on). It ignores the Wan sampler/vae/
@@ -791,10 +915,12 @@ async function buildSpec() {
       width,
       height,
       durations: duration === null ? null : [duration],
-      // rapid is video-only + single-stage; force both off regardless of any
-      // stale checkbox state.
-      audio: isLtxRapid(model) ? false : $("audio").checked,
+      // Audio is available for every LTX line (incl. rapid). Upscale is 22B-only
+      // (rapid is single-stage); force it off for rapid regardless of stale state.
+      audio: $("audio").checked,
       upscale: isLtxRapid(model) ? false : $("upscale").checked,
+      // HQ audio is rapid-only (single-stage); force off for the 22B two-stage line.
+      audioHq: isLtxRapid(model) ? $("audio-hq").checked : false,
       encoder: $("encoder").value,
       // Prompt rewrite: rapid only (the 22B path ignores it server-side and its
       // rewriter files are not in the LTX-2.3 fetch set).

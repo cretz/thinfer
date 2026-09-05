@@ -70,6 +70,11 @@ pub struct ImageSpec {
     pub seed: Option<u64>,
     /// DP4A i8 matmul on the DP4A-safe DiT sites (Ideogram-4 only). Default true.
     pub i8_matmul: Option<bool>,
+    /// Run a bf16-source Z-Image DiT (`zimage-turbo-bf16`) at full bf16
+    /// precision instead of the default load-time Q8 transcode (~6x slower, max
+    /// precision). Default false. No effect on GGUF variants / other models.
+    #[serde(default)]
+    pub full_precision: Option<bool>,
     /// Base64-encoded reference image bytes (PNG/JPEG). REQUIRED for
     /// qwen-image-edit, ignored otherwise. The server decodes it to a temp file
     /// under the job dir and feeds it to the image-edit path.
@@ -173,14 +178,21 @@ pub struct VideoSpec {
     /// to all LTX/Sulphur models; ignored by Wan.
     pub encoder: Option<EncoderQuant>,
     pub i8_matmul: Option<bool>,
-    /// Decode + mux an audio track. LTX joint-AV only (silent Wan models ignore
-    /// it). Defaults to `true`; `false` skips the audio tail for a video-only,
-    /// faster MP4.
+    /// Decode + mux an audio track. Joint-AV models only (LTX and MiniMax-H3;
+    /// the silent Wan models ignore it). Defaults to `true`; `false` skips the
+    /// audio tail for a video-only, faster MP4.
     pub audio: Option<bool>,
     /// LTX-2.3 distilled only: opt in to the 2x spatial-upscale refine path
     /// (half-res denoise -> latent upscale -> refine). Defaults to `false` =
     /// single-stage denoise at the target res. Ignored by the Wan models.
     pub upscale: Option<bool>,
+    /// LTX single-stage joint-AV only: opt in to a finer denoise schedule for
+    /// better audio (subdivides the coarse distilled sigma jumps into more Euler
+    /// substeps, ~2x the denoise cost). Honored on the single-stage path
+    /// (ltx2-rapid always; the 22B line with `upscale` off); the two-stage and
+    /// Wan models ignore it. Defaults to `false`.
+    #[serde(default)]
+    pub audio_hq: Option<bool>,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed caption via
     /// the rewrite endpoint before encoding. Defaults to `true` (the model needs
     /// detailed captions); `false` sends the raw prompt. Other models ignore it.

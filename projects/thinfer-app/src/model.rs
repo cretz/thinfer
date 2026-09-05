@@ -9,6 +9,7 @@ use thinfer_models::hunyuan::manifest as hunmf;
 use thinfer_models::ideogram4::manifest as idmf;
 use thinfer_models::krea::manifest as kreamf;
 use thinfer_models::ltx::manifest as ltxmf;
+use thinfer_models::minimax::manifest as mmmf;
 use thinfer_models::qwen_image::manifest as qimf;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::z_image::manifest as zmf;
@@ -241,6 +242,14 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "anyflow-t2v-14b"))]
     #[cfg_attr(feature = "serde", serde(rename = "anyflow-t2v-14b"))]
     AnyflowT2v14b,
+    /// Qualcomm-AI-Research/mobilewan: efficient T2V on the FastWan2.2-TI2V-5B
+    /// backbone with per-block PRUNED self-attention heads. Full softmax over the
+    /// pruned heads (the ReHyAt linear-attention maps are skipped: no public
+    /// reference). Shares the FastWan umT5 + Wan2.2 TI2V VAE + tokenizer. 480p,
+    /// 16fps. No parity reference (eyeball-only).
+    #[cfg_attr(feature = "cli", value(name = "mobilewan"))]
+    #[cfg_attr(feature = "serde", serde(rename = "mobilewan"))]
+    Mobilewan,
     /// LTX-2.3 distilled-1.1: a 22B joint audio-video DiT (two-stage distilled).
     /// Its own pipeline (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder);
     /// ignores the FastWan sampler/vae/shot knobs. Output MP4 carries an AAC
@@ -322,6 +331,21 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "dreamid-v"))]
     #[cfg_attr(feature = "serde", serde(rename = "dreamid-v"))]
     DreamIdV,
+    /// MiniMax-H3 (FL2VA): a 33B dense SINGLE-STREAM joint audio-video DiT. One
+    /// packed 1-D sequence carries text, audio and video rows under full
+    /// self-attention, so there is no cross-attention and no conditioning tail.
+    /// Its own pipeline: a Qwen3-VL-32B conditioner truncated to layers 0..49, a
+    /// 36-layer ViT video VAE (16x spatial / 4x temporal, NOT a conv tower) and a
+    /// BigVGAN audio VAE at 32 kHz. Two things make it fit an 8GB card: the
+    /// per-block AdaLN projections (~13B of the 33B) are precomputed into a
+    /// ~78 MB modulation table at load, and the required lightx2v 4-step turbo
+    /// distillation is applied as a RUNTIME adapter rather than folded (folding
+    /// would re-encode every Q4_K site to Q8_0 and nearly double the streaming).
+    /// 24 fps fixed. The native 1344x768 canvas does NOT fit yet: the packed
+    /// sequence is capped, so this renders at reduced resolution.
+    #[cfg_attr(feature = "cli", value(name = "minimax-h3"))]
+    #[cfg_attr(feature = "serde", serde(rename = "minimax-h3"))]
+    MinimaxH3,
 }
 
 impl VideoModelId {
@@ -333,6 +357,7 @@ impl VideoModelId {
             VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4 => &ltxmf::SULPHUR_MANIFEST,
             VideoModelId::Ltx2Rapid => &ltxmf::LTX2_RAPID_MANIFEST,
             VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v => &hunmf::MANIFEST,
+            VideoModelId::MinimaxH3 => &mmmf::MANIFEST,
             _ => &wanmf::MANIFEST,
         }
     }
@@ -434,6 +459,12 @@ impl VideoModelId {
         matches!(self, VideoModelId::DreamIdV)
     }
 
+    /// MiniMax-H3: its own single-stream packed-sequence pipeline + audio tail.
+    /// None of the Wan/LTX machinery applies.
+    pub fn is_minimax(self) -> bool {
+        matches!(self, VideoModelId::MinimaxH3)
+    }
+
     /// LTX-2.3 joint audio-video path: its own two-stage pipeline + audio tail,
     /// none of the FastWan/LongLive (Wan-base) machinery applies.
     pub fn is_ltx(self) -> bool {
@@ -493,6 +524,15 @@ impl VideoModelId {
             (768, 512)
         } else if self.is_ltx() {
             (1280, 704)
+        } else if self.is_minimax() {
+            // NOT the model's native canvas. H3 is authored at 1344x768, but the
+            // packed sequence puts every modality in ONE self-attention stream,
+            // and at 768p that is ~37.8k rows -- the fused SwiGLU intermediate
+            // alone is 4.3 GiB, which no weight streaming can help. Until the
+            // row-independent sites are chunked over rows, 512x320 is what fits
+            // the 8GB card at a usable clip length. This is off-distribution and
+            // a known quality caveat, not a shipping resolution.
+            (512, 320)
         } else if self.is_dreamidv() {
             // 832x480: DreamID-V's default face-swap resolution (the reference
             // `size = (832, 480)`; the NaResize downsamples the target clip toward
@@ -501,6 +541,11 @@ impl VideoModelId {
         } else if self.is_hunyuan() {
             // 832x480: HunyuanVideo 1.5's native 480p T2V regime (the res the
             // lightx2v 4-step distill was trained for). 16:9, /16-divisible.
+            (832, 480)
+        } else if matches!(self, VideoModelId::Mobilewan) {
+            // 832x480: mobilewan's 480p regime (Wan2.2-TI2V-5B backbone, /16
+            // grid). Landscape to match the rest of the Wan 480p family and stay
+            // inside the activation envelope; override with --width/--height.
             (832, 480)
         } else if matches!(
             self,
@@ -567,15 +612,28 @@ impl VideoModelId {
     /// multiple). Wan narrows by 16; LTX's two-stage halving + /32 latent grid
     /// needs a multiple of 64 (stage 1 runs at half res, /32-divisible).
     pub fn dim_multiple(self) -> u32 {
-        if self.is_ltx() { 64 } else { 16 }
+        if self.is_ltx() {
+            64
+        } else if self.is_minimax() {
+            // 16x VAE spatial compression x the (1, 2, 2) DiT patch.
+            32
+        } else {
+            16
+        }
     }
+
+    /// MiniMax-H3 default clip length. Frames snap to `17n + 5`; `n = 3` is
+    /// 56 frames (~2.3 s at 24 fps), which at the 512x320 default packs ~3.0k
+    /// rows -- comfortably inside the packed-sequence cap with room for a
+    /// longer clip or a larger canvas via explicit flags.
+    pub const MINIMAX_DEFAULT_FRAMES: u32 = 56;
 
     /// Model-preferred playback fps: default for fps and the `--duration`
     /// divisor. The Wan TI2V line is authored at 24; Wan2.2-A14B at 16 (upstream).
     pub fn fps(self) -> u32 {
         if matches!(
             self,
-            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
+            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b | VideoModelId::Mobilewan
         ) || self.is_hunyuan()
             || self.is_dreamidv()
         {
@@ -630,6 +688,8 @@ impl VideoModelId {
     pub fn default_frames(self) -> u32 {
         if self.is_ltx() {
             Self::LTX_DEFAULT_FRAMES
+        } else if self.is_minimax() {
+            Self::MINIMAX_DEFAULT_FRAMES
         } else if matches!(self, VideoModelId::Wan22T2vA14b) {
             Self::WAN22_DEFAULT_FRAMES
         } else if self.is_dreamidv() {
@@ -818,6 +878,7 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::FastwanTi2v5b => "fastwan-ti2v-5b",
             VideoModelId::Longlive205b => "longlive-2.0-5b",
             VideoModelId::AnyflowT2v14b => "anyflow-t2v-14b",
+            VideoModelId::Mobilewan => "mobilewan",
             VideoModelId::Ltx23Distilled => "ltx-2.3-distilled",
             VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
             VideoModelId::Sulphur2 => "sulphur-2",
@@ -827,6 +888,7 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",
             VideoModelId::Hunyuan15I2v => "hunyuan-video-1.5-ti2v",
             VideoModelId::DreamIdV => "dreamid-v",
+            VideoModelId::MinimaxH3 => "minimax-h3",
         })
     }
 }

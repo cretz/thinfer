@@ -350,6 +350,183 @@ impl RopeOp for RopeF32HalfRot {
 }
 
 // ---------------------------------------------------------------------------
+// PARTIAL half-rot (MiniMax-H3): rotate only the leading `rot_pairs * 2` head
+// channels and pass the rest through unchanged.
+//
+// H3 shares one 16-frequency `inv_freq` across three position axes, concatenates
+// them to 48 and then concatenates that with itself, so 96 of each 128-dim head
+// rotates and 32 channels pass through. The pairing is `(k, k + rot_pairs)`
+// WITHIN the rotary block, i.e. `(k, k + 48)`, NOT `(k, k + head_dim/2)` --
+// `RopeF32HalfRot` would pair `(k, k + 64)` and silently mix a rotated channel
+// with a pass-through one.
+//
+// The alternative, permuting the qkv projection rows at load so the standard
+// half-rot pairing lines up, is deliberately NOT taken: weight surgery of that
+// shape scrambles silently when it is wrong (no NaN, just structured artifacts).
+//
+// Uniform reuses the `_pad` slot for `rot_pairs`, so `pairs` stays `head_dim/2`
+// and `freqs` carries `rot_pairs` (cos, sin) entries per row.
+wgsl_with_bf16_variant!(
+    WGSL_F32_HALFROT_PARTIAL,
+    WGSL_F32_HALFROT_PARTIAL_BF16 = r#"
+struct U { rows: u32, heads: u32, pairs: u32, rot_pairs: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> freqs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let dim = u.pairs * 2u;
+    let total = u.rows * u.heads * dim;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
+    if (idx >= total) { return; }
+    let c   = idx % dim;
+    let rh  = idx / dim;
+    let row = rh / u.heads;
+    let base = rh * dim;
+    let rot = u.rot_pairs * 2u;
+    if (c >= rot) {
+        out[base + c] = act_store(x[base + c]);
+        return;
+    }
+    // cos/sin repeat across the two halves of the rotary block.
+    let k = c % u.rot_pairs;
+    let f_off = row * rot + k * 2u;
+    let cr = freqs[f_off];
+    let ci = freqs[f_off + 1u];
+    if (c < u.rot_pairs) {
+        out[base + c] = act_store(x[base + c] * cr - x[base + c + u.rot_pairs] * ci);
+    } else {
+        out[base + c] = act_store(x[base + c] * cr + x[base + c - u.rot_pairs] * ci);
+    }
+}
+"#
+);
+
+// Packed variants: one thread per vec2 WORD. `rot_pairs` is even for H3 (48),
+// so the rotary block ends on a word boundary and the halves stay word-aligned:
+// word j covers elements (2j, 2j+1) and pairs with word `j + rot_pairs/2`.
+// Threads in `[rot_pairs/2, rot_pairs)` are covered by their partner and return.
+const WGSL_BF16_PACKED_HALFROT_PARTIAL: &str = concat!(
+    act_bf16_prelude!(),
+    r#"
+struct U { rows: u32, heads: u32, pairs: u32, rot_pairs: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read> freqs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let total = u.rows * u.heads * u.pairs;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
+    if (idx >= total) { return; }
+    let j  = idx % u.pairs;
+    let rh = idx / u.pairs;
+    let row = rh / u.heads;
+    let base = rh * u.pairs;
+    if (j >= u.rot_pairs) {
+        out[base + j] = x[base + j];
+        return;
+    }
+    let half_w = u.rot_pairs >> 1u;
+    if (j >= half_w) { return; }
+    let frow = row * u.rot_pairs;
+    let f0 = unpack_bf16x2(freqs[frow + 2u * j]);
+    let f1 = unpack_bf16x2(freqs[frow + 2u * j + 1u]);
+    let xr = unpack_bf16x2(x[base + j]);
+    let xi = unpack_bf16x2(x[base + j + half_w]);
+    out[base + j] = pack_bf16x2(
+        xr.x * f0.x - xi.x * f0.y,
+        xr.y * f1.x - xi.y * f1.y);
+    out[base + j + half_w] = pack_bf16x2(
+        xr.x * f0.y + xi.x * f0.x,
+        xr.y * f1.y + xi.y * f1.x);
+}
+"#
+);
+
+const WGSL_F16_PACKED_HALFROT_PARTIAL: &str = concat!(
+    act_f16_prelude!(),
+    r#"
+struct U { rows: u32, heads: u32, pairs: u32, rot_pairs: u32 };
+
+@group(0) @binding(0) var<storage, read> x: array<vec2<f16>>;
+@group(0) @binding(1) var<storage, read> freqs: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read_write> out: array<vec2<f16>>;
+@group(0) @binding(3) var<uniform> u: U;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let total = u.rows * u.heads * u.pairs;
+    let idx = gid.y * (ng.x * 64u) + gid.x;
+    if (idx >= total) { return; }
+    let j  = idx % u.pairs;
+    let rh = idx / u.pairs;
+    let row = rh / u.heads;
+    let base = rh * u.pairs;
+    if (j >= u.rot_pairs) {
+        out[base + j] = x[base + j];
+        return;
+    }
+    let half_w = u.rot_pairs >> 1u;
+    if (j >= half_w) { return; }
+    let frow = row * u.rot_pairs;
+    let f0: vec2<f16> = freqs[frow + 2u * j];
+    let f1: vec2<f16> = freqs[frow + 2u * j + 1u];
+    let xr: vec2<f16> = x[base + j];
+    let xi: vec2<f16> = x[base + j + half_w];
+    out[base + j] = vec2<f16>(
+        xr.x * f0.x - xi.x * f0.y,
+        xr.y * f1.x - xi.y * f1.y);
+    out[base + j + half_w] = vec2<f16>(
+        xr.x * f0.y + xi.x * f0.x,
+        xr.y * f1.y + xi.y * f1.x);
+}
+"#
+);
+
+/// Half-rot rope over the leading `rot_pairs * 2` channels of each head, with
+/// the remaining channels copied through. See the section comment above.
+pub struct RopeF32HalfRotPartial;
+
+impl RopeOp for RopeF32HalfRotPartial {
+    const KERNEL_ID: &'static str = "rope.f32.halfrot.partial";
+    type Dtype = F32;
+    const X: &'static str = "rope_halfrot_partial/x";
+    const FREQS: &'static str = "rope_halfrot_partial/freqs";
+    const DIMS: &'static str = "rope_halfrot_partial/dims";
+    const OUTPUT: &'static str = "rope_halfrot_partial/out";
+
+    fn wgsl(cfg: &WgslConfig) -> &'static str {
+        match (cfg.act_dtype, cfg.bf16_quant_writes) {
+            (ActDtype::F32, false) => WGSL_F32_HALFROT_PARTIAL,
+            (ActDtype::F32, true) => WGSL_F32_HALFROT_PARTIAL_BF16,
+            (ActDtype::Bf16, _) => WGSL_BF16_PACKED_HALFROT_PARTIAL,
+            (ActDtype::F16, _) => WGSL_F16_PACKED_HALFROT_PARTIAL,
+            (ActDtype::I8, _) => unreachable!(
+                "ActDtype::I8 partial halfrot is not implemented - MiniMax-H3 (the only consumer) runs f16/bf16 acts"
+            ),
+        }
+    }
+
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+
+    /// The F32 variant runs one thread per ELEMENT (it must also copy the
+    /// pass-through tail), so it needs `dim = pairs * 2` threads per head. The
+    /// packed variants are one thread per word and over-dispatch 2x, returning
+    /// early; that is cheaper than branching the launch on act dtype.
+    fn workgroups(rows: u32, heads: u32, pairs: u32) -> [u32; 3] {
+        super::linear_workgroups(rows * heads * pairs * 2, 64)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 3-axis MRoPE (Qwen2.5-VL LM): half-rot pairing, but each pair k draws its
 // cos/sin for the real element (x[k]) and the imag element (x[k+pairs]) from
 // DIFFERENT position axes (the [32,48,48] mrope_section split over the 128 dims
@@ -509,5 +686,50 @@ impl OpTest for RopeF32HalfRot {
         ctx: &'a OpTestContext<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
         Box::pin(ctx.run_rope::<RopeF32HalfRot>())
+    }
+}
+
+#[cfg(feature = "conformance")]
+impl OpTest for RopeF32HalfRotPartial {
+    fn dtypes(&self) -> &'static [Dtype] {
+        DTYPES_ACT_BF16
+    }
+    fn test_cases(&self) -> Vec<TestCase> {
+        vec![
+            // head_dim 16, rotary 8: half the channels rotate, half pass through.
+            TestCase {
+                name: "rope_halfrot_partial_basic",
+                op: OpSpec::RopeHalfRotPartial,
+                inputs: vec![
+                    t("x", [3, 2, 16], linspace(-1.0, 1.0, false)),
+                    t("freqs", [3, 8], linspace(-0.75, 0.75, false)),
+                ],
+            },
+            // The H3 ratio: 96 of 128 rotate. Catches word-alignment mistakes in
+            // the packed kernels that the tiny case is too small to expose.
+            TestCase {
+                name: "rope_halfrot_partial_h3_ratio",
+                op: OpSpec::RopeHalfRotPartial,
+                inputs: vec![
+                    t("x", [2, 2, 128], linspace(-1.0, 1.0, false)),
+                    t("freqs", [2, 96], linspace(-0.75, 0.75, false)),
+                ],
+            },
+            // Fully rotated: must agree with the plain half-rot kernel.
+            TestCase {
+                name: "rope_halfrot_partial_full_width",
+                op: OpSpec::RopeHalfRotPartial,
+                inputs: vec![
+                    t("x", [3, 2, 8], linspace(-1.0, 1.0, false)),
+                    t("freqs", [3, 8], linspace(-0.75, 0.75, false)),
+                ],
+            },
+        ]
+    }
+    fn run_test<'a>(
+        &self,
+        ctx: &'a OpTestContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
+        Box::pin(ctx.run_rope_partial::<RopeF32HalfRotPartial>())
     }
 }

@@ -207,6 +207,45 @@ def compute_output(op: str, case: dict, inputs: dict[str, torch.Tensor]) -> torc
         out_re = x_re * cos - x_im * sin
         out_im = x_re * sin + x_im * cos
         return torch.cat((out_re, out_im), dim=-1).contiguous()
+    if op == "rope_halfrot_partial":
+        # MiniMax-H3: rotate only the leading `rotary_dim` channels of every
+        # head and pass the rest through. Pairing is (k, k + rotary_dim//2)
+        # WITHIN the rotary block, not (k, k + dim//2).
+        x = inputs["x"]  # [rows, heads, dim]
+        f = inputs["freqs"]  # [rows, rotary_dim], cos/sin interleaved per pair
+        rows, heads, dim = x.shape
+        rotary_dim = f.shape[1]
+        half = rotary_dim // 2
+        cos = f.reshape(rows, half, 2)[..., 0].unsqueeze(1)  # [rows, 1, half]
+        sin = f.reshape(rows, half, 2)[..., 1].unsqueeze(1)
+        x_re = x[..., :half]
+        x_im = x[..., half:rotary_dim]
+        out_re = x_re * cos - x_im * sin
+        out_im = x_re * sin + x_im * cos
+        tail = x[..., rotary_dim:]
+        return torch.cat((out_re, out_im, tail), dim=-1).contiguous()
+    if op == "qkv_split_headwise":
+        # MiniMax-H3 fused qkv, per-head interleaved: x is
+        # [rows, heads, 3, head_dim], so q/k/v index axis -2. Each output is
+        # [rows, heads * head_dim]; the kernel writes three buffers, which the
+        # harness packs as q ++ k ++ v into one.
+        x = inputs["x"]
+        rows, heads, three, head_dim = x.shape
+        assert three == 3, "the fused axis is q/k/v"
+        q = x[:, :, 0, :].reshape(rows, heads * head_dim)
+        k = x[:, :, 1, :].reshape(rows, heads * head_dim)
+        v = x[:, :, 2, :].reshape(rows, heads * head_dim)
+        # Concatenated along ROWS, not channels: the three are separate output
+        # buffers on the GPU and the harness packs them as whole slabs
+        # (all of q, then all of k, then all of v).
+        return torch.cat((q, k, v), dim=0).contiguous()
+    if op == "silu_mul_fused":
+        # SwiGLU over a fused [gate; value] row: out = silu(gate) * value.
+        x = inputs["x"]
+        half = x.shape[-1] // 2
+        gate = x[..., :half]
+        value = x[..., half:]
+        return (torch.nn.functional.silu(gate) * value).contiguous()
     if op == "gated_head_mul":
         # out[i] = x[i] * 2*sigmoid(gate[i // head_dim]); head_dim = len(x)/len(gate).
         x = inputs["x"].reshape(-1)

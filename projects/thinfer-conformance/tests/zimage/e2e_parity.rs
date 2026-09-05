@@ -584,7 +584,11 @@ async fn run_pipeline_and_compare<S: WeightSource>(
     tokenizer: HfTokenizer,
     ctx: CompareCtx,
 ) {
-    let model = ZImageModel::load(Arc::clone(&backend), residency, tokenizer)
+    // `false`: no load-time Q8 transcode -- the Safetensors variant must stay
+    // bf16 to hold bit-clean parity against the bf16 pyref (a Q8 transcode would
+    // flip its `dit_matmul_weight` to Quant and blow the tolerance bands). GGUF
+    // variants are already quant, so the flag is a no-op for them regardless.
+    let model = ZImageModel::load(Arc::clone(&backend), residency, tokenizer, false)
         .await
         .expect("ZImageModel::load");
 

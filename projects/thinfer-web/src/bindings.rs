@@ -170,7 +170,9 @@ async fn load_model_impl(
     let tokenizer = WebTokenizer::load(&file_for(manifest::role::TOKENIZER_JSON)?).await?;
 
     let residency = WeightResidency::new(source, engine.budget);
-    ZImageModel::load(Arc::clone(&engine.backend), residency, tokenizer)
+    // Default Q8 transcode (a no-op for the web's GGUF DiT source; would speed a
+    // bf16 source). Full-bf16 opt-in is a native serve/CLI knob, not wired here.
+    ZImageModel::load(Arc::clone(&engine.backend), residency, tokenizer, true)
         .await
         .map_err(|e| js_err("model load", e))
 }

@@ -443,6 +443,23 @@ impl<'s> BatchBuf<'s> {
     pub fn is_empty(&self) -> bool {
         self.buf.len == 0
     }
+
+    /// A BYTE sub-range of this buffer as a raw [`BufRef`], to be re-imported
+    /// into the same scope.
+    ///
+    /// For kernels that address a slice of an activation rather than the whole
+    /// thing: MiniMax-H3 modulates each contiguous run of packed rows against a
+    /// different row of its AdaLN table, which is a per-segment binding rather
+    /// than a gather. `offset` must satisfy the backend's storage-binding
+    /// alignment (256 bytes on WebGPU); callers pick row-aligned offsets.
+    pub fn sub(&self, offset: u64, len: u64) -> BufRef {
+        debug_assert!(
+            offset + len <= self.buf.len,
+            "sub-range {offset}+{len} exceeds buffer length {}",
+            self.buf.len
+        );
+        BufRef::view(self.buf.id, self.buf.offset + offset, len)
+    }
 }
 
 impl<'wsp, B: Backend> BatchScope<'wsp, B> {
@@ -1652,6 +1669,31 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    pub fn leaky_relu<O: crate::ops::LeakyReluOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::LeakyReluBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_leaky_relu::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n,
+        )
+    }
+
     pub fn replicate_pad1d<O: crate::ops::ReplicatePad1dOp>(
         &self,
         pipeline: &B::Pipeline,
@@ -1878,6 +1920,33 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    /// SwiGLU over a fused `[gate; value]` projection. `n_elems` is the OUTPUT
+    /// element count (`rows * h`), half the input's.
+    pub fn silu_mul_fused<O: crate::ops::SiluMulFusedOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        input: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_elems: u32,
+    ) -> Result<(), B::Error> {
+        let input = self.resolve(input);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::SiluMulFusedBufs {
+            input: &input,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::silu_mul_fused::dispatch_silu_mul_fused::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_elems,
+        )
+    }
+
     pub fn upsample2d_nearest<O: crate::ops::Upsample2dNearestOp>(
         &self,
         pipeline: &B::Pipeline,
@@ -2006,6 +2075,152 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             pipeline,
             &input_refs,
             output_ref,
+        )
+    }
+
+    /// Per-head grouped linear (MobileWan ReHyAt q/k embed). `n_out` is the
+    /// output element count `rows * H * Npg`. See [`crate::ops::GroupedMatmulF32`].
+    #[allow(clippy::too_many_arguments)]
+    /// Tiled per-head grouped matmul. `rows`/`h`/`npg` drive the launch grid and
+    /// must match the uniform's fields (`kpg` rides in the uniform). See
+    /// [`crate::ops::GroupedMatmulF32`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn grouped_matmul(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        rows: u32,
+        h: u32,
+        npg: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let w = self.resolve(w);
+        let bias = self.resolve(bias);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::GroupedMatmulBufs {
+            x: &x,
+            w: &w,
+            bias: &bias,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_grouped_matmul(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            rows,
+            h,
+            npg,
+        )
+    }
+
+    /// Polynomial feature expansion. `n_elems` is the element count
+    /// `rows * H * P`. See [`crate::ops::PolyExpandF32`].
+    pub fn poly_expand<O: crate::ops::PolyExpandOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        x: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_elems: u32,
+    ) -> Result<(), B::Error> {
+        let x = self.resolve(x);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::PolyExpandBufs {
+            x: &x,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_poly_expand::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_elems,
+        )
+    }
+
+    /// Fused local-windowed softmax + linear-recurrent read. `n_threads` is
+    /// `ct * H`. See [`crate::ops::RehyatAttnF32`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehyat_attn<O: crate::ops::RehyatAttnOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        q: BatchBuf<'wsp>,
+        kwin: BatchBuf<'wsp>,
+        vwin: BatchBuf<'wsp>,
+        phiq: BatchBuf<'wsp>,
+        s: BatchBuf<'wsp>,
+        z: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        n_threads: u32,
+    ) -> Result<(), B::Error> {
+        let q = self.resolve(q);
+        let kwin = self.resolve(kwin);
+        let vwin = self.resolve(vwin);
+        let phiq = self.resolve(phiq);
+        let s = self.resolve(s);
+        let z = self.resolve(z);
+        let uniform = self.resolve(uniform);
+        let out = self.resolve(out);
+        let bufs = crate::ops::RehyatAttnBufs {
+            q: &q,
+            kwin: &kwin,
+            vwin: &vwin,
+            phiq: &phiq,
+            s: &s,
+            z: &z,
+            uniform: &uniform,
+            out: &out,
+        };
+        crate::ops::dispatch_rehyat_attn::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_threads,
+        )
+    }
+
+    /// Recurrent-state accumulate (`S`/`z` in-place `+=`). `n_threads` is
+    /// `H * P`. See [`crate::ops::RehyatStateUpdateF32`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehyat_state_update<O: crate::ops::RehyatStateUpdateOp>(
+        &self,
+        pipeline: &B::Pipeline,
+        phik: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        s: BatchBuf<'wsp>,
+        z: BatchBuf<'wsp>,
+        uniform: BatchBuf<'wsp>,
+        n_threads: u32,
+    ) -> Result<(), B::Error> {
+        let phik = self.resolve(phik);
+        let v = self.resolve(v);
+        let s = self.resolve(s);
+        let z = self.resolve(z);
+        let uniform = self.resolve(uniform);
+        let bufs = crate::ops::RehyatStateUpdateBufs {
+            phik: &phik,
+            v: &v,
+            s: &s,
+            z: &z,
+            uniform: &uniform,
+        };
+        crate::ops::dispatch_rehyat_state_update::<O, _>(
+            self.backend,
+            &mut self.encoder_mut(),
+            pipeline,
+            &bufs,
+            n_threads,
         )
     }
 

@@ -28,6 +28,16 @@ use thinfer_app::{JobSummary, LocalExecutor};
 
 use crate::job::{JobHandle, JobStore};
 
+/// Worker thread stack. The default spawned-thread stack (2 MiB) is NOT enough:
+/// model load builds a pipeline set inside one deep async fn, so the whole
+/// generate future (every nested await's locals, live at once) sits in this
+/// thread's frame. Overflowing it kills the PROCESS with no panic message and no
+/// log line, which reads as a silent server crash mid-load. The CLI never hit
+/// this because it generates on the main thread (8 MiB from the exe header).
+/// Sized well past the current high-water mark so adding pipelines/awaits to a
+/// model does not resurrect the crash.
+const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 /// Spawn a worker on a dedicated OS thread. It builds its own backend +
 /// executor inside a current-thread runtime, then loops over the queue forever.
 pub fn spawn_worker(
@@ -38,6 +48,7 @@ pub fn spawn_worker(
 ) {
     std::thread::Builder::new()
         .name(format!("thinfer-worker-{index}"))
+        .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

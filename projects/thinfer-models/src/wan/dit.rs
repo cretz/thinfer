@@ -489,7 +489,10 @@ impl WanDit {
         // (rows, self-attn period) from `self.shape.n_tok`, which excludes the
         // ref prefix. Parity first; the prefix-aware tiled path is a perf
         // follow-up. Plain Wan models are unaffected (`ref_conv` is false).
-        let n_tiles = if taps.block0.is_some() || self.cfg.ref_conv {
+        // mobilewan (`rehyat`) runs the untiled per-block variable-head self-
+        // attention path (the tiled path bakes one fixed self-attn head count /
+        // site shape across all blocks); parity-first, like DreamID-V's ref_conv.
+        let n_tiles = if taps.block0.is_some() || self.cfg.ref_conv || self.cfg.rehyat {
             1
         } else {
             rows.div_ceil(dit_tile_rows()).max(1)
@@ -613,6 +616,37 @@ impl WanDit {
                         Some(t) => t.await?,
                         None => {}
                     }
+                } else if self.cfg.rehyat {
+                    // mobilewan: two-submit block (F32 island frees mid-block).
+                    // Owns its own submits; overlap the next block(s)' weight
+                    // streaming with the whole movement (as the tiled path does).
+                    let h_i = self.handles.blocks[idx].n_heads as u32;
+                    let block_bufs = views.bufs();
+                    let sst = views.scale_shift_table();
+                    let compute = self
+                        .forward_block_mobilewan(
+                            pipelines,
+                            scratch,
+                            &block_bufs,
+                            sst,
+                            tproj.as_buf_ref(),
+                            freqs.as_buf_ref(),
+                            text.as_act_ref(),
+                            x_cur.as_act_ref(),
+                            nxt.as_act_ref(),
+                            h_i,
+                            // tokens per patched-frame (pph*ppw); the ReHyAt chunk
+                            // loop groups CHUNK_FRAMES of these contiguous T-major
+                            // token blocks. NB: `ppf` above is the frame COUNT.
+                            (s.grid.pph * s.grid.ppw) as u32,
+                        )
+                        .instrument(tracing::debug_span!(target: PHASE, "wan.mobilewan", idx));
+                    let (c_res, n_res, p_res) =
+                        futures::join!(compute, next_acquire, prefetch_after);
+                    c_res?;
+                    p_res?;
+                    pending = n_res?;
+                    x_cur = nxt;
                 } else {
                     let scope = scratch.batch();
                     // Build the six modulation vectors: scale_shift_table[k] +
@@ -1278,6 +1312,121 @@ impl WanDit {
             );
         }
         Ok(pending_tile)
+    }
+
+    /// mobilewan (ReHyAt) block forward, driven across TWO submits so the F32
+    /// island's heavy per-head conv scratch frees mid-block instead of coexisting
+    /// with the recurrent-attention state and the cross-attn/FFN tail (the
+    /// single-scope peak overshot the 8GB card and stalled the GPU after ~step 2).
+    /// Phase 1 ([`WanDitBlock::mobilewan_phi`]) writes the five persistent
+    /// survivors and submits (freeing the `w1`/`w2` casts + conv intermediates);
+    /// phase 2 ([`WanDitBlock::mobilewan_attn_post`]) runs the chunk attention +
+    /// out-proj + gated residual + cross-attn/FFN on the re-imported survivors.
+    /// Byte-identical to the old single-scope path (same ops/order; the boundary
+    /// is verbatim persistent-buffer writes). The driver forces `n_tiles == 1` for
+    /// mobilewan, so this replaces the untiled path for the rehyat config; no diag
+    /// taps (mobilewan has no parity gate).
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_block_mobilewan(
+        &self,
+        pipelines: &WanDitPipelines,
+        scratch: &Workspace<WgpuBackend>,
+        bufs: &WanDitBlockBufs,
+        sst: BufRef,
+        tproj: BufRef,
+        freqs: BufRef,
+        text: BufRef,
+        x_in: BufRef,
+        y_out: BufRef,
+        h_i: u32,
+        tpf: u32,
+    ) -> Result<(), WgpuError> {
+        let bp = &pipelines.block;
+        let inner = self.cfg.inner() as u32; // residual-stream / modulation dim
+        let rows = self.shape.n_tok as u32;
+        let trows = self.shape.text_seq as u32;
+        let hd = config::HEAD_DIM as u32;
+        let inner_i = h_i * hd;
+        const DEG: u32 = 3;
+        let pdim = DEG * hd;
+        let scale = self.block.shape.sdpa_scale();
+
+        // Persistent inter-submit buffers (held across both scopes; the pool
+        // won't recycle them while these guards live). The six modulation vectors
+        // are act-dtype; the five F32-island survivors are f32.
+        let mb = |n: u32| scratch.alloc(bp.act_bytes(n));
+        let m = [
+            mb(inner)?,
+            mb(inner)?,
+            mb(inner)?,
+            mb(inner)?,
+            mb(inner)?,
+            mb(inner)?,
+        ];
+        let fb = |n: u32| scratch.alloc(n as u64 * 4);
+        let qfs = fb(rows * inner_i)?;
+        let kf = fb(rows * inner_i)?;
+        let vf = fb(rows * inner_i)?;
+        let phi_q = fb(rows * h_i * pdim)?;
+        let phi_k = fb(rows * h_i * pdim)?;
+
+        // Phase 1: mod + qkv + qk-norm + RoPE + F32 island phi maps -> survivors.
+        {
+            let scope = scratch.batch();
+            self.fill_mod(&scope, bp, sst, tproj, inner, &m)?;
+            let mm = mk_mod(&scope, &m);
+            let x_h = ActBuf::dense(scope.import_copy(x_in));
+            let f_h = scope.import_copy(freqs);
+            self.block.mobilewan_phi(
+                &scope,
+                pipelines,
+                x_h,
+                f_h,
+                &mm,
+                bufs,
+                rows,
+                scale,
+                h_i,
+                scope.import_copy(qfs.as_buf_ref()),
+                scope.import_copy(kf.as_buf_ref()),
+                scope.import_copy(vf.as_buf_ref()),
+                scope.import_copy(phi_q.as_buf_ref()),
+                scope.import_copy(phi_k.as_buf_ref()),
+            )?;
+            scope.submit_void().await?;
+        }
+
+        // Phase 2: recurrent chunk attention + out-proj + gated residual +
+        // cross-attn/FFN, reading the re-imported survivors, writing y_out.
+        {
+            let taps = WanDitBlockTaps::default();
+            let scope = scratch.batch();
+            let mm = mk_mod(&scope, &m);
+            let x_h = ActBuf::dense(scope.import_copy(x_in));
+            let y_h = ActBuf::dense(scope.import_copy(y_out));
+            let text_h = scope.import_copy(text);
+            self.block.mobilewan_attn_post(
+                &scope,
+                pipelines,
+                x_h,
+                scope.import_copy(qfs.as_buf_ref()),
+                scope.import_copy(kf.as_buf_ref()),
+                scope.import_copy(vf.as_buf_ref()),
+                scope.import_copy(phi_q.as_buf_ref()),
+                scope.import_copy(phi_k.as_buf_ref()),
+                &mm,
+                y_h,
+                text_h,
+                bufs,
+                &taps,
+                rows,
+                trows,
+                h_i,
+                tpf,
+            )?;
+            scope.submit_void().await?;
+        }
+        Ok(())
     }
 
     /// Encode the six modulation vectors for one block into the persistent

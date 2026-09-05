@@ -55,6 +55,12 @@ pub struct GenerateImage {
     /// forces the bf16 reference path). No effect on Z-Image.
     #[arg(long)]
     pub no_i8_matmul: bool,
+    /// Run a bf16-source Z-Image DiT (`zimage-turbo-bf16`) at FULL bf16
+    /// precision instead of the default load-time Q8 transcode. Max precision but
+    /// ~6x slower per step; the default Q8 path matches the `zimage-turbo-q8`
+    /// quality. No effect on the GGUF variants or other models.
+    #[arg(long)]
+    pub full_precision: bool,
     /// Fold a stored adapter into the DiT, as `NAME_OR_ID[:WEIGHT]` (repeatable,
     /// applied in order). Resolved against the vault for `--model`; needs the
     /// vault password (hidden prompt, or `THINFER_VAULT_PASSWORD`). Local runs
@@ -103,6 +109,7 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
             // Edit-over-remote is guarded above (returns early), so no image here.
             input_image: None,
             i8_matmul: Some(!args.no_i8_matmul),
+            full_precision: Some(args.full_precision),
             public_key: None,
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
@@ -135,6 +142,7 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         steps: args.steps.unwrap_or(defaults.steps),
         seed: args.seed,
         i8_matmul: !args.no_i8_matmul,
+        full_precision: args.full_precision,
         input_image: match &args.input_image {
             Some(p) => Some(ImageBytes(
                 std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,

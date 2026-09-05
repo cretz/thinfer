@@ -192,6 +192,12 @@ pub struct ImageRequest {
     /// `false` forces the bf16/dequant-once reference path. Ideogram-4 only
     /// (Z-Image ignores it).
     pub i8_matmul: bool,
+    /// Run a bf16-source Z-Image DiT (the `zimage-turbo-bf16` variant)
+    /// at FULL bf16 precision instead of the default load-time Q8 transcode.
+    /// Default false (Q8: ~6x faster matmul, quality == the Q8 GGUF variant);
+    /// `true` = max precision, ~6x slower. No effect on the GGUF variants
+    /// (already quant) or non-Z-Image models.
+    pub full_precision: bool,
     /// Reference image for the image-EDIT path (Qwen-Image-Edit). REQUIRED for
     /// the `QwenImageEdit` kind; rejected for the t2i kinds (Z-Image, Ideogram).
     /// Held in RAM ([`ImageBytes`]); a decrypted image never touches disk.
@@ -329,6 +335,15 @@ pub struct VideoRequest {
     /// upscaler model swap. Two-stage is only the cheaper route to HIGH res.
     /// Ignored by the Wan/LongLive models.
     pub upscale: bool,
+    /// LTX single-stage joint-AV only: opt in to a finer denoise schedule for
+    /// better audio. The distilled 8-step sigma table takes very coarse late
+    /// steps, where the delicate audio residual under-resolves and drifts to
+    /// gibberish; this subdivides the coarse jumps into more Euler substeps
+    /// (keeping the distilled anchors), roughly doubling the denoise cost. Only
+    /// the single-stage path honors it (ltx2-rapid always; the 22B line when
+    /// `upscale` is off); the two-stage and Wan models ignore it. Default
+    /// `false`.
+    pub audio_hq: bool,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed, structured
     /// caption via the rewrite endpoint before encoding (the model is trained on
     /// long captions; short raw prompts are out-of-distribution). Default `true`;
@@ -375,6 +390,19 @@ impl VideoRequest {
         // the two DWPose ONNX nets (aux_roles). No special-casing needed.
         if self.model.is_dreamidv() {
             return Ok(self.model.variant().files().map(|(_, f)| *f).collect());
+        }
+        // MiniMax-H3 sources by role (conditioner + tokenizer + DiT + the
+        // required turbo adapter + both VAEs), not via the Wan variant registry.
+        if self.model.is_minimax() {
+            let m = self.model.manifest();
+            return thinfer_models::minimax::manifest::RUNTIME_ROLES_T2VA_Q4
+                .iter()
+                .map(|r| {
+                    m.get(r)
+                        .copied()
+                        .ok_or_else(|| format!("MiniMax-H3 manifest missing role {r}"))
+                })
+                .collect();
         }
         // LTX sources by role (joint-AV: encoder + tokenizer + connector + DiT +
         // both VAEs + upscaler), not via the Wan variant registry.
@@ -544,6 +572,11 @@ impl VideoRequest {
         if self.model.is_ltx() {
             return self.resolve_ltx(fps);
         }
+        // MiniMax-H3: its own grid (dims /32, frames 17n+5), single prompt, and
+        // none of the FastWan sampler/vae/shot machinery.
+        if self.model.is_minimax() {
+            return self.resolve_minimax();
+        }
         validate_dim("height", self.height)?;
         validate_dim("width", self.width)?;
         if self.steps == 0 {
@@ -617,6 +650,60 @@ impl VideoRequest {
             shots: Vec::new(),
             fps: self.fps.unwrap_or_else(|| self.model.fps()),
             warnings: Vec::new(),
+        })
+    }
+
+    /// MiniMax-H3 plan resolution: single-prompt t2va on the H3 grid (dims a
+    /// multiple of 32, frames `17n + 5`). Fixed 24 fps: the video and audio rows
+    /// share one 40-units-per-second rotary clock and that shared clock IS the
+    /// a/v alignment, so fps is not a user knob here. No shots, no sampler/vae
+    /// knobs.
+    ///
+    /// The packed-row ceiling is NOT enforced here: it depends on the tokenized
+    /// prompt length, which resolve does not have. The driver checks it before
+    /// loading any weights.
+    fn resolve_minimax(&self) -> Result<VideoPlan, String> {
+        if self.prompts.len() > 1 {
+            return Err(format!("{} takes a single prompt", self.model));
+        }
+        let mult = self.model.dim_multiple();
+        for (name, v) in [("height", self.height), ("width", self.width)] {
+            if !v.is_multiple_of(mult) || v == 0 {
+                return Err(format!(
+                    "--{name} for {} must be a positive multiple of {mult} (got {v})",
+                    self.model
+                ));
+            }
+        }
+        let fps = crate::minimax::FPS;
+        if self.fps.is_some_and(|f| f != fps) {
+            return Err(format!(
+                "{} renders at a fixed {fps} fps (the audio and video rows share one \
+                 rotary clock); --fps is not supported",
+                self.model
+            ));
+        }
+        let requested = match (self.frames.first(), self.durations.first()) {
+            (Some(&f), _) => f,
+            (None, Some(&d)) => ((d * fps as f32).round() as u32).max(1),
+            (None, None) => self.model.default_frames(),
+        };
+        let mut warnings = Vec::new();
+        let frames = thinfer_models::minimax::packing::align_num_frames(requested as usize)
+            .map_err(|e| format!("frame count {requested}: {e:?}"))? as u32;
+        if frames != requested {
+            warnings.push(format!(
+                "{} renders {frames} frames (~{:.1}s): its clip length grid is 17n+5, \
+                 so the requested {requested} was rounded up.",
+                self.model,
+                frames as f32 / fps as f32,
+            ));
+        }
+        Ok(VideoPlan {
+            frames,
+            shots: Vec::new(),
+            fps,
+            warnings,
         })
     }
 
@@ -1047,6 +1134,7 @@ mod tests {
             i8_matmul: true,
             audio: true,
             upscale: true,
+            audio_hq: false,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
             lora: vec![],
@@ -1125,6 +1213,7 @@ mod tests {
             i8_matmul: true,
             audio: false,
             upscale: false,
+            audio_hq: false,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
             lora: vec![],

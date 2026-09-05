@@ -78,7 +78,7 @@ async fn vocoder_parity() {
         .expect("wgpu adapter unavailable for tests"),
     );
 
-    let pipelines = VocoderPipelines::compile(&backend)
+    let pipelines = VocoderPipelines::compile(&backend, "ltx_vocoder")
         .await
         .expect("compile vocoder pipelines");
 

@@ -6,6 +6,7 @@ pub mod hunyuan;
 pub mod ideogram4;
 pub mod krea;
 pub mod ltx;
+pub mod minimax;
 pub mod qwen3_lm;
 pub mod qwen_image;
 pub mod wan;
