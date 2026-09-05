@@ -48,6 +48,14 @@ const REPO_SULPHUR: &str = "vantagewithai/Sulphur-2-Base-GGUF";
 /// SulphurAI source repo: ships the distill LoRA (the GGUF repo carries only the
 /// dev DiT). The LoRA is folded into the dev DiT at load (see `ltx::lora`).
 const REPO_SULPHUR_SRC: &str = "SulphurAI/Sulphur-2-base";
+/// Sulphur-2 with the distill LoRA ALREADY BAKED, published as GGUF. Same `ltxv`
+/// arch / 4444 tensors / `config` KV / diffusers names as every other LTX-2.3
+/// DiT (header-verified), so it loads through the identical path -- it just skips
+/// the fold, which on the `sulphur-2` dev path costs ~60s of CPU over 676 sites
+/// and parks a 12.8GB host cache for the model's lifetime. Only a Q4_K_M build is
+/// published (mixed Q4_K + Q6_K per block), which is why this is its own model id
+/// and not a drop-in for `sulphur-2`: Q8_0-plus-fold stays the quality baseline.
+const REPO_SULPHUR_DISTIL: &str = "coolthor/Sulphur-2-distilled-Q4_K_M-GGUF";
 
 /// ltx2-rapid: an LTX-2 19B community merge (Phr00t v62; distilled + native I2V),
 /// GGUF-converted by 3ndetz. Same `ltxv` DiT topology as LTX-2.3 (48 layers) but
@@ -250,6 +258,51 @@ pub static SULPHUR_MANIFEST: ModelManifest = ModelManifest {
         (
             role::DISTILL_LORA_384,
             FileRef::new(REPO_UPSCALER, "ltx-2.3-22b-distilled-lora-384.safetensors"),
+        ),
+        (
+            role::ENCODER_GGUF,
+            FileRef::new(REPO_GEMMA, "gemma-3-12b-it-Q8_0.gguf"),
+        ),
+        (
+            role::ENCODER_GGUF_Q4,
+            FileRef::new(REPO_GEMMA, "gemma-3-12b-it-Q4_K_M.gguf"),
+        ),
+        (
+            role::CONNECTOR,
+            FileRef::new(
+                REPO_GGUF,
+                "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+            ),
+        ),
+        (
+            role::VIDEO_VAE,
+            FileRef::new(REPO_GGUF, "vae/ltx-2.3-22b-distilled_video_vae.safetensors"),
+        ),
+        (
+            role::AUDIO_VAE,
+            FileRef::new(REPO_GGUF, "vae/ltx-2.3-22b-distilled_audio_vae.safetensors"),
+        ),
+        (
+            role::UPSCALER,
+            FileRef::new(REPO_UPSCALER, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+        ),
+        (
+            role::TOKENIZER,
+            FileRef::new(REPO_TOKENIZER, "tokenizer.json"),
+        ),
+    ],
+};
+
+/// Sulphur-2 distilled: the same chain as [`SULPHUR_MANIFEST`] with the
+/// pre-distilled Q4_K_M DiT and NO distill LoRA (it is already baked in). The
+/// encoder / connector / VAEs / upscaler / tokenizer are the unchanged LTX-2.3
+/// components, so only the DiT role differs.
+pub static SULPHUR_DISTIL_MANIFEST: ModelManifest = ModelManifest {
+    id: "sulphur-2-distilled",
+    files: &[
+        (
+            role::DIT_GGUF_Q4_K_M,
+            FileRef::new(REPO_SULPHUR_DISTIL, "sulphur-distil-ltx23av-Q4_K_M.gguf"),
         ),
         (
             role::ENCODER_GGUF,

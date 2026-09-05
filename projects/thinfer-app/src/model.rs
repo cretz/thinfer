@@ -284,6 +284,16 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "sulphur-2-q4"))]
     #[cfg_attr(feature = "serde", serde(rename = "sulphur-2-q4"))]
     Sulphur2Q4,
+    /// Sulphur-2 with the distill LoRA ALREADY BAKED into the published GGUF, so
+    /// the load skips the fold entirely: on [`Self::Sulphur2`] that fold is ~60s
+    /// of CPU across 676 sites plus a 12.8GB host cache held for the model's
+    /// lifetime. The DiT is also 14.2GB instead of 22.8GB, cutting what every
+    /// denoise step re-streams. Its own id rather than a replacement because only
+    /// a Q4_K_M build is published: Q8_0-plus-fold ([`Self::Sulphur2`]) remains
+    /// the quality baseline, and this is the fast tier.
+    #[cfg_attr(feature = "cli", value(name = "sulphur-2-distilled"))]
+    #[cfg_attr(feature = "serde", serde(rename = "sulphur-2-distilled"))]
+    Sulphur2Distilled,
     /// ltx2-rapid: an LTX-2 19B community merge (distilled + native I2V). Same
     /// dual-stream AV DiT backbone as LTX-2.3, but the 19B conditioning line
     /// (FeatureExtractor V1 + in-transformer caption projection, 2-layer ungated
@@ -355,6 +365,7 @@ impl VideoModelId {
         match self {
             VideoModelId::Ltx23Distilled | VideoModelId::Ltx23DistilledQ4 => &ltxmf::MANIFEST,
             VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4 => &ltxmf::SULPHUR_MANIFEST,
+            VideoModelId::Sulphur2Distilled => &ltxmf::SULPHUR_DISTIL_MANIFEST,
             VideoModelId::Ltx2Rapid => &ltxmf::LTX2_RAPID_MANIFEST,
             VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v => &hunmf::MANIFEST,
             VideoModelId::MinimaxH3 => &mmmf::MANIFEST,
@@ -366,9 +377,9 @@ impl VideoModelId {
     /// (footprint). Panics for non-LTX -- guard with [`Self::is_ltx`].
     pub fn ltx_dit_role(self) -> &'static str {
         match self {
-            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Sulphur2Q4 => {
-                ltxmf::role::DIT_GGUF_Q4_K_M
-            }
+            VideoModelId::Ltx23DistilledQ4
+            | VideoModelId::Sulphur2Q4
+            | VideoModelId::Sulphur2Distilled => ltxmf::role::DIT_GGUF_Q4_K_M,
             VideoModelId::Ltx23Distilled | VideoModelId::Sulphur2 => ltxmf::role::DIT_GGUF_Q8_0,
             VideoModelId::Ltx2Rapid => ltxmf::role::DIT_GGUF_Q5_K_M,
             other => panic!("ltx_dit_role on non-LTX model {other}"),
@@ -414,7 +425,9 @@ impl VideoModelId {
     /// LTX joint-AV runtime role list for this variant (Q8_0 vs Q4_K_M DiT).
     pub fn ltx_runtime_roles(self) -> &'static [&'static str] {
         match self {
-            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Sulphur2Q4 => ltxmf::RUNTIME_ROLES_AV_Q4,
+            VideoModelId::Ltx23DistilledQ4
+            | VideoModelId::Sulphur2Q4
+            | VideoModelId::Sulphur2Distilled => ltxmf::RUNTIME_ROLES_AV_Q4,
             VideoModelId::Ltx2Rapid => ltxmf::RUNTIME_ROLES_RAPID,
             _ => ltxmf::RUNTIME_ROLES_AV_Q8,
         }
@@ -474,6 +487,7 @@ impl VideoModelId {
                 | VideoModelId::Ltx23DistilledQ4
                 | VideoModelId::Sulphur2
                 | VideoModelId::Sulphur2Q4
+                | VideoModelId::Sulphur2Distilled
                 | VideoModelId::Ltx2Rapid
         )
     }
@@ -495,9 +509,11 @@ impl VideoModelId {
         self.is_ltx_rapid()
     }
 
-    /// Sulphur-2 variants: the published GGUF is the BASE (`dev`) checkpoint, so
-    /// the distill LoRA is folded into the DiT at load (see `ltx::lora`). The LTX
-    /// distilled models ship pre-distilled DiTs and need no fold.
+    /// Whether this variant needs the distill LoRA folded into its DiT at load
+    /// (see `ltx::lora`): true only for the Sulphur ids whose published GGUF is
+    /// the BASE (`dev`) checkpoint. The LTX distilled models -- and
+    /// [`Self::Sulphur2Distilled`], whose GGUF has the LoRA already baked --
+    /// ship pre-distilled DiTs, so folding again would apply it twice.
     pub fn is_sulphur(self) -> bool {
         matches!(self, VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4)
     }
@@ -883,6 +899,7 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
             VideoModelId::Sulphur2 => "sulphur-2",
             VideoModelId::Sulphur2Q4 => "sulphur-2-q4",
+            VideoModelId::Sulphur2Distilled => "sulphur-2-distilled",
             VideoModelId::Ltx2Rapid => "ltx2-rapid",
             VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
             VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",

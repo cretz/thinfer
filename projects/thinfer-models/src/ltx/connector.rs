@@ -47,6 +47,7 @@ use thinfer_core::ops::{
     BcastAddF32, GatedHeadMulF32, GeluF32, MatMulConfig, MatMulF32, MatmulOp, Op, WeightDtype,
     WgslConfig,
 };
+use thinfer_core::quant::QuantKind;
 use thinfer_core::residency::{
     GpuView, ResidencyError, TransposePolicy, WeightHandle, WeightResidency,
 };
@@ -329,6 +330,24 @@ pub struct BlockHandles {
     ff0_b: WeightHandle,
     ff2_w: WeightHandle,
     ff2_b: WeightHandle,
+    /// On-disk quant kind of each matmul weight IN THIS LAYER. The 22B connector
+    /// reads from the DiT GGUF, and the `_K_M` builds vary the kind by layer as
+    /// well as by site, so a single baked scheme decodes most layers as garbage
+    /// (this is what broke every Q4_K_M LTX variant downstream of a correct DiT).
+    /// `None` for a non-quant (bf16 safetensors) source.
+    quant: BlockQuant,
+}
+
+/// Per-matmul on-disk quant kind for one connector layer.
+#[derive(Clone, Copy, Debug, Default)]
+struct BlockQuant {
+    q: Option<QuantKind>,
+    k: Option<QuantKind>,
+    v: Option<QuantKind>,
+    o: Option<QuantKind>,
+    gate: Option<QuantKind>,
+    ff0: Option<QuantKind>,
+    ff2: Option<QuantKind>,
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +374,19 @@ pub fn register_connector<S: WeightSource>(
     };
     let lin = |id: &WeightId| register_one(residency, id, TransposePolicy::Linear2D, q8);
     let dense = |id: &WeightId| register_one(residency, id, TransposePolicy::None, None);
+    // Read each matmul's ACTUAL encoding from the catalog rather than assuming
+    // the cfg's scheme; see `BlockQuant`.
+    let kind = |id: &WeightId| -> Option<QuantKind> {
+        match residency
+            .source()
+            .catalog()
+            .get(id)
+            .and_then(|e| e.encoding)
+        {
+            Some(thinfer_core::tensor::StorageEncoding::Quant(k)) => Some(k),
+            _ => None,
+        }
+    };
     let mut layers = Vec::with_capacity(m.n_layers);
     for b in (0..m.n_layers).map(|i| BlockWeightIds::new(m.prefix, i)) {
         layers.push(BlockHandles {
@@ -378,6 +410,15 @@ pub fn register_connector<S: WeightSource>(
             ff0_b: dense(&b.ff0_b)?,
             ff2_w: lin(&b.ff2_w)?,
             ff2_b: dense(&b.ff2_b)?,
+            quant: BlockQuant {
+                q: kind(&b.q_w),
+                k: kind(&b.k_w),
+                v: kind(&b.v_w),
+                o: kind(&b.o_w),
+                gate: if m.gated { kind(&b.gate_w) } else { None },
+                ff0: kind(&b.ff0_w),
+                ff2: kind(&b.ff2_w),
+            },
         });
     }
     let registers = dense(&WeightId(format!("{}.learnable_registers", m.prefix)))?;
@@ -429,6 +470,11 @@ fn connector_block_cfgs(mm_weight: WeightDtype) -> BlockWgslConfigs {
 
 pub struct ConnectorPipelines {
     pub block: BlockPipelines,
+    /// Dense dequant step per on-disk quant kind, for the same reason the DiT
+    /// keeps one: the 22B connector's weights come from the DiT GGUF, whose
+    /// `_K_M` builds mix Q4_K/Q5_K/Q6_K across layers. Empty for the bf16 (19B)
+    /// connector, whose matmuls are not quantized at all.
+    dequant: std::collections::HashMap<QuantKind, DequantStep>,
     /// Bf16-weight matmul for the FE V2 aggregate embeds (K = 188160).
     fe_matmul: WgpuPipeline,
     fe_matmul_op: MatMulF32,
@@ -446,6 +492,12 @@ impl ConnectorPipelines {
         .await
     }
 
+    /// Dense dequant step for `kind`, or `None` when this weight is not
+    /// quantized (bf16 connector) -- the site then runs the plain dense matmul.
+    fn dequant(&self, kind: Option<QuantKind>) -> Option<&DequantStep> {
+        self.dequant.get(&kind?)
+    }
+
     /// 19B (ltx2-rapid) connector pipelines (bf16 block matmuls, from safetensors).
     pub async fn compile_rapid(backend: &WgpuBackend) -> Result<Self, WgpuError> {
         Self::compile_with(backend, WeightDtype::Bf16).await
@@ -457,6 +509,30 @@ impl ConnectorPipelines {
     ) -> Result<Self, WgpuError> {
         let cfgs = connector_block_cfgs(mm_weight);
         let block = BlockPipelines::compile(backend, &cfgs).await?;
+        let mut dequant = std::collections::HashMap::new();
+        if matches!(mm_weight, WeightDtype::Quant(_)) {
+            let dq_layout = thinfer_core::ops::dequant::layout();
+            for scheme in [
+                QuantKind::Q8_0,
+                QuantKind::Q4_K,
+                QuantKind::Q5_K,
+                QuantKind::Q6_K,
+            ] {
+                let wgsl = thinfer_core::ops::dequant::build_wgsl(
+                    scheme,
+                    thinfer_core::ops::dequant::DequantTarget::Bf16,
+                );
+                let pipeline = backend
+                    .create_pipeline(
+                        &format!("ltx_conn_dequant_{}", scheme.hint()),
+                        &wgsl,
+                        "main",
+                        dq_layout,
+                    )
+                    .await?;
+                dequant.insert(scheme, DequantStep { pipeline, scheme });
+            }
+        }
         let fe_cfg = WgslConfig {
             weight_dtype: WeightDtype::Bf16,
             ..cfgs.ops
@@ -489,6 +565,7 @@ impl ConnectorPipelines {
             .await?;
         Ok(Self {
             block,
+            dequant,
             fe_matmul,
             fe_matmul_op,
             gelu,
@@ -721,6 +798,8 @@ struct ConnBufs {
     ff0_b: BufRef,
     ff2_w: BufRef,
     ff2_b: BufRef,
+    /// On-disk quant kind per matmul weight in this layer (see `BlockQuant`).
+    quant: BlockQuant,
 }
 
 /// Run the 8-layer gated connector for one modality. `aggregate` is the FE V2
@@ -882,7 +961,7 @@ fn conn_block_forward<'wsp>(
         b.q_w,
         dimu,
         dimu,
-        bp.dequant_qkv.as_ref(),
+        pipelines.dequant(b.quant.q),
         &bp.matmul_qkv,
         &bp.matmuls.qkv,
     )?;
@@ -892,7 +971,7 @@ fn conn_block_forward<'wsp>(
         b.k_w,
         dimu,
         dimu,
-        bp.dequant_qkv.as_ref(),
+        pipelines.dequant(b.quant.k),
         &bp.matmul_qkv,
         &bp.matmuls.qkv,
     )?;
@@ -902,7 +981,7 @@ fn conn_block_forward<'wsp>(
         b.v_w,
         dimu,
         dimu,
-        bp.dequant_qkv.as_ref(),
+        pipelines.dequant(b.quant.v),
         &bp.matmul_qkv,
         &bp.matmuls.qkv,
     )?;
@@ -968,7 +1047,7 @@ fn conn_block_forward<'wsp>(
                 gate_w,
                 hq,
                 dimu,
-                bp.dequant_qkv.as_ref(),
+                pipelines.dequant(b.quant.gate),
                 &bp.matmul_qkv,
                 &bp.matmuls.qkv,
             )?;
@@ -985,7 +1064,7 @@ fn conn_block_forward<'wsp>(
         b.o_w,
         dimu,
         dimu,
-        bp.dequant_proj.as_ref(),
+        pipelines.dequant(b.quant.o),
         &bp.matmul_proj,
         &bp.matmuls.proj,
     )?;
@@ -1001,7 +1080,7 @@ fn conn_block_forward<'wsp>(
         b.ff0_w,
         ff_hidden,
         dimu,
-        bp.dequant_ffn_up.as_ref(),
+        pipelines.dequant(b.quant.ff0),
         &bp.matmul_ffn_up,
         &bp.matmuls.ffn_up,
     )?;
@@ -1013,7 +1092,7 @@ fn conn_block_forward<'wsp>(
         b.ff2_w,
         dimu,
         ff_hidden,
-        bp.dequant_ffn_down.as_ref(),
+        pipelines.dequant(b.quant.ff2),
         &bp.matmul_ffn_down,
         &bp.matmuls.ffn_down,
     )?;
@@ -1039,6 +1118,7 @@ struct LayerViews<'a> {
     ff0_b: GpuView<'a>,
     ff2_w: GpuView<'a>,
     ff2_b: GpuView<'a>,
+    quant: BlockQuant,
 }
 
 impl<'a> LayerViews<'a> {
@@ -1072,6 +1152,7 @@ impl<'a> LayerViews<'a> {
             ff0_b: residency.acquire(h.ff0_b, backend).await?,
             ff2_w: residency.acquire(h.ff2_w, backend).await?,
             ff2_b: residency.acquire(h.ff2_b, backend).await?,
+            quant: h.quant,
         })
     }
     fn bufs(&self) -> ConnBufs {
@@ -1092,6 +1173,7 @@ impl<'a> LayerViews<'a> {
             ff0_b: self.ff0_b.buf(),
             ff2_w: self.ff2_w.buf(),
             ff2_b: self.ff2_b.buf(),
+            quant: self.quant,
         }
     }
 }

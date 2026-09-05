@@ -432,6 +432,17 @@ Opt-in web levers already exist: `#encoder` Q4 (~-25s), `#rewrite` off (~-22s).
   (B=1 forward is ~13x over compute-ideal because each dispatch underfills the GPU).
   Remaining levers are all system-level (batch detection -- BLOCKED by an executor
   batch>1 correctness bug in SCRFD; f16 acts; codec), none conv-kernel.
+- **`_K_M` quant kind varies BY LAYER, not just by site.** Two separate places
+  baked a single scheme and decoded 42 of 48 blocks wrong, which is the whole of
+  the long-standing "Q4_K_M produces broken output": (1) `BlockQuantKinds::probe`
+  read block 0 and reused it for every block; (2) the 22B connector hardcoded
+  Q8_0 (`ConnectorPipelines::compile`, `register_connector`) even though it reads
+  its weights from the SAME DiT GGUF. Both now route by the weight's catalog kind.
+  In `sulphur_dev-Q4_K_M` the first 6 blocks are Q5_K throughout and the other 42
+  are Q4_K + Q6_K. Fixing the DiT alone was NOT enough -- the DiT passed parity
+  while the pipeline still produced noise, because the connector was still wrong.
+  When a quant variant is "garbage", gate the DiT ALONE against a pyref built from
+  that same file (`dit_full_parity_q4_k_m`) before suspecting the DiT.
 - **Coopmat DOES apply to a native f16-act DiT, and is a precision GAIN there.**
   The gate was `fast_mixed` (a bf16-acts concept: it exists to build the bf16<->f16
   casts), which locked out exactly the blocks that need no casts at all. On the

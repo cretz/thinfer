@@ -43,8 +43,9 @@ use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 use super::LtxVariant;
 use super::config as dit;
 use crate::common::block::{
-    ActBuf, Block, BlockPipelines, BlockWgslConfigs, DenseActSites, DequantStep, alloc_act,
-    alloc_matmul_out_buf, op_add, op_rmsnorm, op_rope_halfrot, op_sdpa, quantize_act_paired,
+    ActBuf, Block, BlockPipelines, BlockWgslConfigs, CoopmatStep, DenseActSites, DequantStep,
+    alloc_act, alloc_matmul_out_buf, build_coopmat_step, op_add, op_rmsnorm, op_rope_halfrot,
+    op_sdpa, quantize_act_paired,
 };
 use crate::common::embedders::bcast_add_uniform;
 use crate::z_image::text_encoder::{LoadError, register_one};
@@ -737,24 +738,11 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
         ops,
         i8_sdpa: false,
         dense_acts,
-        // Coopmat (tensor cores) on every main matmul. `matmul_qkv` carries all
-        // of them and was 148s of ~270s GPU on a 3s clip, more than every other
-        // pipeline combined; on tensor cores that site runs at 5.48ms per
-        // dispatch instead of 11.33ms and the whole 3s clip goes 486s -> 334s.
-        //
-        // The H3 blocker does NOT apply: there, coopmat cost ~9% divergence
-        // because the f32 A-sides had to be cast down to f16. This block is
-        // ALREADY `F16Dp4a`, so the A-side, the residual and the coopmat operand
-        // are the same f16 values the dense path uses -- no new rounding, no new
-        // range exposure. Measured, it is a precision GAIN (f32 accumulator):
-        // see `dit_full_parity_large_m`, the gate that actually reaches this path
-        // (the 4-token `dit_full_parity` is below WM and cannot).
-        coopmat_acts: crate::common::block::CoopmatSites {
-            proj: true,
-            ffn_down: true,
-            qkv: true,
-            ffn_up: true,
-        },
+        // Coopmat rides `DitPipelines::coopmat`, a per-quant-kind map, NOT these
+        // per-site flags: the flags bake one scheme from the cfg, which cannot
+        // serve a mixed `_K_M` DiT. Left off so `BlockPipelines` does not compile
+        // four unused single-scheme copies. See `biased_proj`.
+        coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: false,
         fast_sdpa: false,
         decode_sdpa: false,
@@ -782,6 +770,11 @@ pub struct DitPipelines {
     /// pipeline consuming the triple is kind-agnostic, so only this prep step
     /// varies. Empty unless the DP4A path is active (`F16Dp4a`).
     i8_dequant: std::collections::HashMap<QuantKind, DequantStep>,
+    /// Per-scheme coopmat (tensor-core) matmul + its f16 weight dequant. Keyed by
+    /// the weight's on-disk kind so a mixed `_K_M` DiT routes each tensor to a
+    /// step that can actually decode it. Empty when the device exposes no usable
+    /// coopmat config; every site then falls back to i8/dense.
+    coopmat: std::collections::HashMap<QuantKind, CoopmatStep>,
     /// `THINFER_LTX_I8_EXTRA=1`: also route the audio-stream qkv/ffn_up and the
     /// v2a cross through DP4A i8. Their A-sides are all normed/modulated
     /// (ada_zero or connector norm_out + modulate), so the i8 act contract
@@ -801,6 +794,12 @@ impl DitPipelines {
     /// this kind was not built (site then falls back to the dense per-kind path).
     fn i8_dequant(&self, kind: QuantKind) -> Option<&DequantStep> {
         self.i8_dequant.get(&kind)
+    }
+
+    /// Coopmat (tensor-core) step for `kind`, or `None` when the device has no
+    /// usable coopmat config (site then falls back to i8/dense).
+    fn coopmat(&self, kind: QuantKind) -> Option<&CoopmatStep> {
+        self.coopmat.get(&kind)
     }
 
     pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
@@ -858,6 +857,30 @@ impl DitPipelines {
                 .await?;
             dense_dequant.insert(scheme, DequantStep { pipeline, scheme });
         }
+        // Per-scheme coopmat (tensor-core) steps, for the same reason the two
+        // dequant maps above are per-scheme: `BlockPipelines` bakes ONE scheme per
+        // site from the cfg, which is right for the uniform Q8_0 file and wrong
+        // for every mixed `_K_M` build (Q4_K + Q6_K within a block). Routing by
+        // the weight's catalog kind is what lets the Q4_K_M DiTs reach the tensor
+        // cores at all instead of silently falling back to dense.
+        let mut coopmat = std::collections::HashMap::new();
+        for scheme in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_K,
+            QuantKind::Q5_K,
+            QuantKind::Q6_K,
+        ] {
+            if let Some(step) = build_coopmat_step(
+                backend,
+                &format!("ltx_{}", scheme.hint()),
+                scheme,
+                thinfer_core::ops::matmul_coopmat::CoopmatOut::F16,
+            )
+            .await?
+            {
+                coopmat.insert(scheme, step);
+            }
+        }
         let gelu = backend
             .create_pipeline(
                 "ltx_dit_gelu",
@@ -889,6 +912,7 @@ impl DitPipelines {
             silu,
             dense_dequant,
             i8_dequant,
+            coopmat,
             i8_extra,
         })
     }
@@ -911,13 +935,19 @@ pub struct BlockQuantKinds {
 }
 
 impl BlockQuantKinds {
-    /// Probe each matmul weight's on-disk quant kind from block 0 of the source
-    /// catalog. The Q8_0 file reports Q8_0 everywhere (behaviour unchanged); the
-    /// Q4_K_M variant reports the mixed per-site kinds. Non-quant sites (none in
-    /// practice for these matmul weights) fall back to Q8_0.
-    fn probe<S: WeightSource>(residency: &WeightResidency<S>) -> Self {
+    /// Probe each matmul weight's on-disk quant kind from block `idx` of the
+    /// source catalog. The Q8_0 file reports Q8_0 everywhere (behaviour
+    /// unchanged). Non-quant sites (none in practice for these matmul weights)
+    /// fall back to Q8_0.
+    ///
+    /// MUST be per block. `_K_M` recipes vary the kind BY LAYER, not just by
+    /// site: in `sulphur_dev-Q4_K_M` the first 6 blocks are Q5_K throughout while
+    /// the other 42 are Q4_K (q/k/o/gate) + Q6_K (v/ffn_down). Probing block 0
+    /// and reusing it decoded 42 of 48 blocks with the wrong scheme, which is
+    /// what made every Q4_K_M LTX variant produce garbage.
+    fn probe<S: WeightSource>(residency: &WeightResidency<S>, idx: usize) -> Self {
         let probe = |suffix: &str| -> QuantKind {
-            let id = WeightId(format!("transformer_blocks.0.{suffix}"));
+            let id = WeightId(format!("transformer_blocks.{idx}.{suffix}"));
             match residency
                 .source()
                 .catalog()
@@ -1174,15 +1204,10 @@ fn biased_proj<'wsp>(
     // 0.088% vs 0.123%) because the coopmat accumulator is f32. Sub-WM
     // dispatches still fall back to dense inside the dispatch.
     //
-    // A step's dequant is compiled for ONE quant kind, so only take it when this
-    // weight's on-disk kind matches: the Q4_K_M variant ships each block MIXED
-    // (Q4_K + Q6_K), and forcing one scheme across both would decode garbage.
-    // All four site steps are the same config here (every LTX matmul cfg is the
-    // same `mm`), so `qkv` stands for the set.
-    let cm = bp
-        .coopmat_qkv
-        .as_ref()
-        .filter(|cm| dq_dense.is_some_and(|d| d.scheme == cm.dequant_f16.scheme));
+    // Routed by THIS weight's on-disk kind, like the two dequant maps: a step's
+    // dequant decodes one scheme, and the `_K_M` DiTs ship each block MIXED
+    // (Q4_K + Q6_K), so a single baked scheme would decode garbage.
+    let cm = dq_dense.and_then(|d| pipes.coopmat(d.scheme));
     Block::dispatch_matmul_site_coopmat(
         scope,
         bp,
@@ -2279,7 +2304,7 @@ pub async fn forward_block_dumped<S: WeightSource>(
             imp(&ones_v_b),
             imp(&ones_a_b),
             &bufs,
-            BlockQuantKinds::probe(residency),
+            BlockQuantKinds::probe(residency, 0),
             variant,
             ActBuf::dense(imp(&vx_out_b)),
             ActBuf::dense(imp(&ax_out_b)),
@@ -2501,9 +2526,10 @@ pub struct DitModel {
     pub blocks: Vec<BlockHandles>,
     pub tables: Vec<BlockTables>,
     pub io: IoHandles,
-    /// On-disk quant kind per matmul site (probed from block 0; uniform across
-    /// blocks). Q8_0 for the baseline file; mixed Q4_K/Q6_K for the Q4_K_M variant.
-    quant: BlockQuantKinds,
+    /// On-disk quant kind per matmul site, PER BLOCK. Q8_0 everywhere for the
+    /// baseline file; the `_K_M` builds vary the kind by layer as well as by
+    /// site, so this is indexed alongside `blocks` (see [`BlockQuantKinds::probe`]).
+    quant: Vec<BlockQuantKinds>,
     /// Output-stage `scale_shift_table` rows (`[2*DIM]` / `[2*AUDIO_DIM]`),
     /// host-cached at register like the block tables: constant across steps, so
     /// reading them back per forward would stall the queue twice per step.
@@ -2539,12 +2565,13 @@ impl DitModel {
         let io = register_io(residency)?;
         let mut blocks = Vec::with_capacity(num_layers);
         let mut tables = Vec::with_capacity(num_layers);
+        let mut quant = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let h = register_block(residency, i, variant)?;
             tables.push(cond::read_block_tables(backend, residency, &h, variant).await?);
             blocks.push(h);
+            quant.push(BlockQuantKinds::probe(residency, i));
         }
-        let quant = BlockQuantKinds::probe(residency);
         let sst_out_v = read_weight_bf16(backend, residency, io.sst_out_v, 2 * dit::DIM).await?;
         let sst_out_a =
             read_weight_bf16(backend, residency, io.sst_out_a, 2 * dit::AUDIO_DIM).await?;
@@ -2740,7 +2767,7 @@ impl DitModel {
                 scope.import_copy(ones_v_b.as_buf_ref()),
                 scope.import_copy(ones_a_b.as_buf_ref()),
                 &bufs,
-                self.quant,
+                self.quant[i],
                 self.variant,
                 ActBuf::dense(scope.import_copy(vx_out.as_buf_ref())),
                 ActBuf::dense(scope.import_copy(ax_out.as_buf_ref())),

@@ -370,6 +370,24 @@ async fn dit_full_parity_large_m() {
     run_full_parity(&dit_path, &tmp).await;
 }
 
+/// The same gate against the MIXED `_K_M` DiT, with its own pyref generated from
+/// that same file. Isolates the DiT from the rest of the pipeline: the Q4_K_M
+/// variants have produced garbage end to end, and this says whether the DiT
+/// itself decodes a per-layer-varying quant recipe correctly or whether the fault
+/// is downstream (the connector reads its weights from this same GGUF).
+#[tokio::test(flavor = "current_thread")]
+async fn dit_full_parity_q4_k_m() {
+    let dit_fr = manifest::MANIFEST
+        .get(role::DIT_GGUF_Q4_K_M)
+        .expect("q4 dit role");
+    let Some(dit_path) = cache::resolve(dit_fr) else {
+        eprintln!("skipped[ltx dit_full_parity_q4_k_m]: Q4_K_M DiT GGUF not in HF cache");
+        return;
+    };
+    let tmp = ensure_pyref_named(&dit_path, "ltx_dit_parity_q4km", Some(64));
+    run_full_parity(&dit_path, &tmp).await;
+}
+
 /// Resolve the Q8_0 DiT, or `None` (with a skip note) when it is not cached.
 fn full_parity_dit(test: &str) -> Option<PathBuf> {
     let dit_fr = manifest::MANIFEST
@@ -627,20 +645,23 @@ fn ensure_pyref(dit_path: &Path) -> PathBuf {
 /// and the coopmat matmul is exercised. Own tmp dir: the token count changes
 /// every dumped tensor's shape, so it must not share the tiny cache.
 fn ensure_pyref_large_m(dit_path: &Path) -> PathBuf {
-    const TOKENS: u32 = 64;
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ltx_dit_parity_large_m");
+    ensure_pyref_named(dit_path, "ltx_dit_parity_large_m", Some(64))
+}
+
+/// Run (or reuse) a 22B 1-block pyref in its own tmp dir. Each (weights, token
+/// count) pair needs its own cache: the token count changes every dumped
+/// tensor's shape, and a different GGUF has different weights entirely.
+fn ensure_pyref_named(dit_path: &Path, dir: &str, tokens: Option<u32>) -> PathBuf {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(dir);
     std::fs::create_dir_all(&tmp).expect("tmpdir");
     let marker = tmp.join("done.txt");
     if tmp.join("v_vel.bin").exists() && marker.exists() {
-        eprintln!(
-            "ltx dit-parity(large M): reusing cached pyref dumps ({})",
-            tmp.display()
-        );
+        eprintln!("ltx dit-parity({dir}): reusing cached pyref dumps");
     } else {
         for ent in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
             let _ = std::fs::remove_file(ent.path());
         }
-        run_python_ref_tokens(dit_path, &tmp, "22b", Some(TOKENS));
+        run_python_ref_tokens(dit_path, &tmp, "22b", tokens);
         std::fs::write(&marker, "ok").expect("write marker");
     }
     tmp

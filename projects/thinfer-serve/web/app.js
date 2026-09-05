@@ -35,11 +35,13 @@ const log = (line) => {
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"],
-  // NB the LTX/Sulphur Q4_K_M DiT variants (ltx-2.3-distilled-q4, sulphur-2-q4)
-  // are intentionally omitted here: Q4_K_M is footprint-only and produces broken
-  // output on this pipeline (validated garbage), so they stay CLI-only for
-  // experiments rather than shipping a busted choice in the UI.
-  video: ["fastwan-ti2v-5b", "mobilewan", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "sulphur-2", "ltx2-rapid", "minimax-h3", "dreamid-v"],
+  // The raw Q4_K_M DiT variants (ltx-2.3-distilled-q4, sulphur-2-q4) stay
+  // CLI-only as a QUALITY call, not a correctness one: they decoded garbage until
+  // the per-layer quant-kind fixes (DiT block probe + connector dequant) landed,
+  // and now render correctly but visibly more stylized than Q8_0. sulphur-2-distilled
+  // is the shipped fast tier -- same Q4_K_M footprint, but its GGUF has the distill
+  // LoRA baked in, so it also skips the ~60s fold that sulphur-2 pays.
+  video: ["fastwan-ti2v-5b", "mobilewan", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "sulphur-2", "sulphur-2-distilled", "ltx2-rapid", "minimax-h3", "dreamid-v"],
   // HyperSwap ONNX face-swap: a source face pasted into every frame of a video.
   // Its own JobSpec (FaceSwapSpec); no prompt / size / steps.
   "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c"],
@@ -300,6 +302,7 @@ const VIDEO_DURATION = {
   "ltx-2.3-distilled-q4": 2,
   "sulphur-2": 2,
   "sulphur-2-q4": 2,
+  "sulphur-2-distilled": 2,
   // rapid's blank default is 121f (LTX_DEFAULT_FRAMES, uncapped at its 768x512
   // default res) ~= 5s @ 24fps.
   "ltx2-rapid": 5,

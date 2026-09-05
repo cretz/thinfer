@@ -248,8 +248,10 @@ pub struct CoopmatStep {
 /// matmul by its catalog kind. Returns `None` when the device cannot run the
 /// tensor-core path at all.
 ///
-/// `fast_mixed` must be true for the caller's block (bf16 acts + the f16 casts);
-/// dispatch needs those casts to feed the f16 kernel.
+/// The caller's block must be able to feed an f16 kernel: either bf16 acts with
+/// the `fast_mixed` casts built, or native f16 acts (which need no casts at all
+/// -- the dispatch then just pads the A-side and writes the result straight into
+/// the residual).
 pub(crate) async fn build_coopmat_step(
     backend: &WgpuBackend,
     label: &str,
