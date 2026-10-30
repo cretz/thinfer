@@ -1,7 +1,7 @@
 //! Ideogram-4 file manifest. All weights are sourced UNGATED (the official
 //! `ideogram-ai/ideogram-4-fp8` repo is gated): the DiT and text encoder come
 //! from community GGUFs, the VAE from FLUX.2-VAE safetensors, and the
-//! turbotime LoRA from ostris. See `ideogram-plan.md` "RESOLVED".
+//! turbotime LoRA from ostris.
 //!
 //! Parity discipline: the pyref dequantizes the SAME GGUF the engine loads
 //! (no bf16 download), so kernel correctness is isolated from quantization

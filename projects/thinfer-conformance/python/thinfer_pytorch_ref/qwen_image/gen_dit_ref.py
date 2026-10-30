@@ -20,7 +20,7 @@ Seeds img latent tokens + text embeds, runs the 1-block forward, dumps:
 Usage:
 
     uv run --with gguf python -m thinfer_pytorch_ref.qwen_image.gen_dit_ref \\
-        --gguf <qwen-rapid-...-Q8_0.gguf> --out <dir> --width 64 --height 64 \\
+        --gguf <qwen-image-dit-Q8_0.gguf> --out <dir> --width 64 --height 64 \\
         --txt-seq 8 --timestep 500
 """
 

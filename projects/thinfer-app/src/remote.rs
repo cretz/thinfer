@@ -5,17 +5,22 @@
 //! event stream into the caller's [`ProgressSink`] (so the CLI renders the exact
 //! same stderr lines as a local run), and downloads the finished artifact.
 //!
+//! Every job is end-to-end encrypted (`crate::jobkey`): the spec is sealed under
+//! a fresh per-job key, the key is sent only when the server's worker asks for
+//! it (`keyRequired`), and the returned artifact is ciphertext decrypted here.
+//!
 //! Behind the `remote` feature so non-client consumers (thinfer-serve itself)
 //! never pull reqwest.
 
 use std::path::Path;
 
+use base64::Engine;
 use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
 
+use crate::jobkey::JobKey;
 use crate::progress::ProgressSink;
 use crate::request::JobSummary;
-use crate::wire::{CreateResponse, JobEvent, JobResult, JobSpec};
+use crate::wire::{CreateResponse, JobEvent, JobKeyDelivery, JobResult, JobSpec, SealedJob};
 
 /// HTTP client to a `thinfer-serve` deployment. Construct once with the base URL
 /// (and an optional bearer token); reuse across jobs.
@@ -56,11 +61,22 @@ impl RemoteExecutor {
         output: &Path,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
-        let created: CreateResponse = self.post_json(&format!("{}/jobs", self.base), spec).await?;
+        let key = JobKey::generate();
+        let spec_json = zeroize::Zeroizing::new(
+            serde_json::to_vec(spec).map_err(|e| format!("encode job spec: {e}"))?,
+        );
+        let sealed = SealedJob {
+            sealed: base64::engine::general_purpose::STANDARD.encode(key.seal(&spec_json)),
+            large_input: spec.is_large_input(),
+        };
+        drop(spec_json);
+        let created: CreateResponse = self
+            .post_json(&format!("{}/jobs", self.base), &sealed)
+            .await?;
         sink.note(&format!("Submitted job {}", created.id));
 
-        let result = self.stream_events(&created.id, sink).await?;
-        self.download(&result.result_url, output).await?;
+        let result = self.stream_events(&created.id, &key, sink).await?;
+        self.download(&result.result_url, &key, output).await?;
 
         Ok(JobSummary {
             output: output.to_path_buf(),
@@ -93,7 +109,12 @@ impl RemoteExecutor {
     /// Tail `GET /jobs/{id}/events`, mapping each SSE payload onto `sink` until a
     /// terminal event. Returns the `done` result, or an error for a failed /
     /// cancelled job.
-    async fn stream_events(&self, id: &str, sink: &dyn ProgressSink) -> Result<JobResult, String> {
+    async fn stream_events(
+        &self,
+        id: &str,
+        key: &JobKey,
+        sink: &dyn ProgressSink,
+    ) -> Result<JobResult, String> {
         let url = format!("{}/jobs/{id}/events", self.base);
         let resp = self
             .authed(self.client.get(&url))
@@ -115,6 +136,7 @@ impl RemoteExecutor {
                 if let Some(event) = parse_frame(&frame)? {
                     match apply(event, sink) {
                         Flow::Continue => {}
+                        Flow::KeyRequired => self.deliver_key(id, key).await?,
                         Flow::Done(result) => return Ok(result),
                         Flow::Err(msg) => return Err(msg),
                     }
@@ -124,11 +146,27 @@ impl RemoteExecutor {
         Err("event stream ended before the job finished".into())
     }
 
-    /// Download the artifact at `result_url` (server-relative) to `output`.
-    async fn download(&self, result_url: &str, output: &Path) -> Result<(), String> {
-        let url = format!("{}{result_url}", self.base);
+    /// Answer the worker's `keyRequired` with the job key.
+    async fn deliver_key(&self, id: &str, key: &JobKey) -> Result<(), String> {
+        let url = format!("{}/jobs/{id}/key", self.base);
+        let body = JobKeyDelivery {
+            key: key.to_b64().to_string(),
+        };
         let resp = self
-            .authed(self.client.get(&url))
+            .authed(self.client.post(&url).json(&body))
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        error_for_status(resp).await.map(|_| ())
+    }
+
+    /// Download the (sealed) artifact at `result_url` (server-relative), open it
+    /// with the job key, and write the plaintext to `output`.
+    async fn download(&self, result_url: &str, key: &JobKey, output: &Path) -> Result<(), String> {
+        let url = format!("{}{result_url}", self.base);
+        let proof = base64::engine::general_purpose::STANDARD.encode(key.proof());
+        let resp = self
+            .authed(self.client.get(&url).header("x-job-key-sha256", proof))
             .send()
             .await
             .map_err(|e| format!("GET {url}: {e}"))?;
@@ -139,25 +177,20 @@ impl RemoteExecutor {
                 .await
                 .map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
-        let mut file = tokio::fs::File::create(output)
+        let sealed = resp
+            .bytes()
             .await
-            .map_err(|e| format!("create {}: {e}", output.display()))?;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("download {url}: {e}"))?;
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| format!("write {}: {e}", output.display()))?;
-        }
-        file.flush()
+            .map_err(|e| format!("download {url}: {e}"))?;
+        let plain = key.open(&sealed)?;
+        tokio::fs::write(output, &*plain)
             .await
-            .map_err(|e| format!("flush {}: {e}", output.display()))?;
-        Ok(())
+            .map_err(|e| format!("write {}: {e}", output.display()))
     }
 }
 
 enum Flow {
     Continue,
+    KeyRequired,
     Done(JobResult),
     Err(String),
 }
@@ -169,6 +202,7 @@ fn apply(event: JobEvent, sink: &dyn ProgressSink) -> Flow {
             sink.note(&format!("Queued at position {position}"));
             Flow::Continue
         }
+        JobEvent::KeyRequired => Flow::KeyRequired,
         JobEvent::Started => {
             sink.note("Started");
             Flow::Continue

@@ -1,11 +1,8 @@
 //! HunyuanVideo 1.5 T2V file manifest (480p lightx2v 4-step distill). Four
 //! roles: the DiT (lightx2v fp16 safetensors, the whole transformer), the Comfy
 //! repackaged fp16 VAE, and the text encoder + tokenizer REUSED verbatim from
-//! `qwen_image` (the same cached abliterated Qwen2.5-VL-7B Q8_0 GGUF + clean
-//! tokenizer.json -- zero new download; see the ENCODER DECISION note in the
-//! worklog). The encoder is embedding-only, so abliteration drift on benign
-//! prompt embeddings is moot; swap to a clean Instruct Q8_0 GGUF here (one-line)
-//! if a serve eyeball ever shows adherence drift.
+//! `qwen_image` (the same Qwen2.5-VL-7B Q8_0 GGUF weight slot + tokenizer.json,
+//! so one cached encoder serves both). The encoder is embedding-only.
 //!
 //! Roles are open-set strings to keep `ModelManifest` model-agnostic; the
 //! `role::*` consts are the typed accessors for callers.
@@ -17,9 +14,6 @@ use thinfer_core::manifest::{FileRef, ModelManifest};
 const REPO_DIT: &str = "lightx2v/Hy1.5-Distill-Models";
 /// Comfy-Org repackaged HunyuanVideo 1.5 bundle; we take only the fp16 VAE.
 const REPO_VAE: &str = "Comfy-Org/HunyuanVideo_1.5_repackaged";
-/// Qwen2.5-VL-7B encoder GGUF lives in the Qwen-Image AIO repo (same file the
-/// qwen_image port already caches). Embedding-only use -> abliteration is moot.
-const REPO_ENCODER: &str = "Phil2Sat/Qwen-Image-Edit-Rapid-AIO-GGUF";
 /// Clean Qwen2.5-VL tokenizer (vocab + chat template). Already cached by
 /// qwen_image; the Hunyuan host-side video prompt template wraps these tokens.
 const REPO_TOKENIZER: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
@@ -122,10 +116,7 @@ pub static MANIFEST: ModelManifest = ModelManifest {
         ),
         (
             role::ENCODER_GGUF_Q8_0,
-            FileRef::new(
-                REPO_ENCODER,
-                "Qwen2.5-VL-7B-Instruct-abliterated/Qwen2.5-VL-7B-Instruct-abliterated.Q8_0.gguf",
-            ),
+            crate::qwen_image::manifest::ENCODER_Q8_0,
         ),
         (
             role::TOKENIZER,

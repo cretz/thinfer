@@ -12,7 +12,11 @@
 //! Both key conventions are understood -- ai-toolkit (`lora_A`/`lora_B`) and
 //! LightX2V (`lora_down`/`lora_up`); `A == down == [rank, K]`, `B == up ==
 //! [N, rank]`. The rank is read per-tensor from `lora_A.shape[0]`, never assumed
-//! (rank-reduced checkpoints vary it per site). Auto-discovery keeps a fold
+//! (rank-reduced checkpoints vary it per site). A site's optional scalar
+//! `diffusion_model.{X}.alpha` (kohya-trained LoRAs carry one per site) scales its
+//! delta by `alpha / rank`, as ComfyUI does; absent = 1.0. Extracted LoRAs also
+//! carry full deltas, `{X}.diff` onto `{X}.weight` and `{X}.diff_b` onto `{X}.bias`
+//! (biases, norms, embeddings); those fold as dense adds. Auto-discovery keeps a fold
 //! honest across checkpoint revisions that touch a different set of sites.
 //!
 //! LoRAs STACK: the ComfyUI workflows apply several at different strengths, so
@@ -37,16 +41,31 @@ use thinfer_core::weight::{
     DecodeError, WeightCatalog, WeightId, WeightReader, WeightSource, decode_into,
 };
 
-/// One fold target: the base tensor, its LoRA `A`/`B` ids, `[N, K]` dims, and the
-/// per-tensor rank (read from `lora_A.shape[0]`, not assumed).
+/// One fold target: the base tensor, its `[N, K]` dims (a 1-D base is `[1, N]`,
+/// a >2-D one `[shape[0], rest]`), and the delta the LoRA adds there.
 #[derive(Clone, Debug)]
 pub struct FoldSpec {
     base: WeightId,
-    a: WeightId,
-    b: WeightId,
     n: usize,
     k: usize,
-    rank: usize,
+    delta: Delta,
+}
+
+#[derive(Clone, Debug)]
+enum Delta {
+    /// `scale · (B @ A)`: A `[rank, K]`, B `[N, rank]`; the rank is read per
+    /// tensor (`lora_A.shape[0]`), `scale` is the site's `alpha / rank` (1.0
+    /// without an `.alpha`).
+    LowRank {
+        a: WeightId,
+        b: WeightId,
+        rank: usize,
+        scale: f32,
+    },
+    /// A full delta of the base's shape: `{X}.diff` onto `{X}.weight`,
+    /// `{X}.diff_b` onto `{X}.bias` (extracted LoRAs carry these for biases,
+    /// norms and embeddings).
+    Dense(WeightId),
 }
 
 #[derive(Debug)]
@@ -155,35 +174,106 @@ pub async fn discover_specs<B: WeightSource, L: WeightSource>(
         }
 
         // Skip a zeroed site (no contribution): read the small B tensor and test.
-        let b_bytes = {
-            let mut r = lora.open(&b_id).await.map_err(FoldError::Lora)?;
-            let len = r.len() as usize;
-            let mut buf = vec![0u8; len];
-            r.read_at(0, &mut buf)
-                .await
-                .map_err(|e| FoldError::Read(format!("lora {b_id:?}: {e:?}")))?;
-            buf
-        };
-        let mut b_f32 = vec![0f32; n * rank];
-        let benc = be
-            .encoding
-            .ok_or_else(|| FoldError::Shape(format!("lora {b_id:?} has no encoding")))?;
-        decode_into(benc, &b_bytes, bytemuck::cast_slice_mut(&mut b_f32))
-            .map_err(FoldError::Decode)?;
+        let b_f32 = read_f32(lora, &b_id, n * rank).await?;
         if b_f32.iter().all(|&v| v == 0.0) {
             continue;
         }
+        let alpha_id = id(format!("diffusion_model.{x}.alpha"));
+        let scale = if lora.catalog().get(&alpha_id).is_some() {
+            read_f32(lora, &alpha_id, 1).await?[0] / rank as f32
+        } else {
+            1.0
+        };
 
         specs.push(FoldSpec {
             base: base_id,
-            a: a_id,
-            b: b_id,
             n,
             k,
-            rank,
+            delta: Delta::LowRank {
+                a: a_id,
+                b: b_id,
+                rank,
+                scale,
+            },
+        });
+    }
+
+    // Dense deltas: `diffusion_model.{X}.diff` -> `{X}.weight`, `.diff_b` ->
+    // `{X}.bias`, element counts must match the base.
+    let mut d_keys: Vec<(&String, &str, &str)> = lora
+        .catalog()
+        .entries
+        .keys()
+        .filter_map(|k| {
+            let x = k.0.strip_prefix("diffusion_model.")?;
+            DENSE_SUFFIXES
+                .iter()
+                .find_map(|&(d, b)| Some((&k.0, x.strip_suffix(d)?, b)))
+        })
+        .collect();
+    d_keys.sort();
+    for (d_key, x, base_suf) in d_keys {
+        let d_id = id(d_key.clone());
+        let base_id = id(format!("{x}{base_suf}"));
+        let (Some(de), Some(base_e)) = (lora.catalog().get(&d_id), base.catalog().get(&base_id))
+        else {
+            continue;
+        };
+        let shape = &base_e.shape.0;
+        let elems: usize = shape.iter().product();
+        if de.shape.0.iter().product::<usize>() != elems {
+            return Err(FoldError::Shape(format!(
+                "lora site {d_key}: {:?} vs base {shape:?}",
+                de.shape.0
+            )));
+        }
+        if read_f32(lora, &d_id, elems)
+            .await?
+            .iter()
+            .all(|&v| v == 0.0)
+        {
+            continue;
+        }
+        let n = if shape.len() >= 2 { shape[0] } else { 1 };
+        specs.push(FoldSpec {
+            base: base_id,
+            n,
+            k: elems / n,
+            delta: Delta::Dense(d_id),
         });
     }
     Ok(specs)
+}
+
+/// Dense-delta key suffixes: `(lora suffix, base suffix)`.
+const DENSE_SUFFIXES: [(&str, &str); 2] = [(".diff", ".weight"), (".diff_b", ".bias")];
+
+/// Read and decode a whole LoRA tensor of `expect` elements to f32.
+async fn read_f32<BE: core::fmt::Debug, L: WeightSource>(
+    lora: &L,
+    id: &WeightId,
+    expect: usize,
+) -> Result<Vec<f32>, FoldError<BE, L::Error>> {
+    let mut r = lora.open(id).await.map_err(FoldError::Lora)?;
+    let mut bytes = vec![0u8; r.len() as usize];
+    r.read_at(0, &mut bytes)
+        .await
+        .map_err(|e| FoldError::Read(format!("lora {id:?}: {e:?}")))?;
+    let enc = lora
+        .catalog()
+        .get(id)
+        .and_then(|e| e.encoding)
+        .ok_or_else(|| FoldError::Shape(format!("lora {id:?} has no encoding")))?;
+    let mut out = vec![0f32; expect];
+    let written =
+        decode_into(enc, &bytes, bytemuck::cast_slice_mut(&mut out)).map_err(FoldError::Decode)?;
+    if written != expect * 4 {
+        return Err(FoldError::Shape(format!(
+            "lora {id:?}: decoded {written} bytes, expected {}",
+            expect * 4
+        )));
+    }
+    Ok(out)
 }
 
 /// Wraps the base weight source + one or more LoRAs, serving `re-encode(dequant(
@@ -269,35 +359,6 @@ impl<B: WeightSource, L: WeightSource> LoraFoldSource<B, L> {
 }
 
 impl<B: WeightSource, L: WeightSource> FoldState<B, L> {
-    async fn lora_to_f32(
-        &self,
-        lora: &L,
-        id: &WeightId,
-        expect: usize,
-    ) -> Result<Vec<f32>, FoldError<B::Error, L::Error>> {
-        let mut r = lora.open(id).await.map_err(FoldError::Lora)?;
-        let len = r.len() as usize;
-        let mut bytes = vec![0u8; len];
-        r.read_at(0, &mut bytes)
-            .await
-            .map_err(|e| FoldError::Read(format!("lora {id:?}: {e:?}")))?;
-        let enc = lora
-            .catalog()
-            .get(id)
-            .and_then(|e| e.encoding)
-            .ok_or_else(|| FoldError::Shape(format!("lora {id:?} has no encoding")))?;
-        let mut out = vec![0f32; expect];
-        let written = decode_into(enc, &bytes, bytemuck::cast_slice_mut(&mut out))
-            .map_err(FoldError::Decode)?;
-        if written != expect * 4 {
-            return Err(FoldError::Shape(format!(
-                "lora {id:?}: decoded {written} bytes, expected {}",
-                expect * 4
-            )));
-        }
-        Ok(out)
-    }
-
     /// `re-encode(dequant(base) + Σ_i strength_i · (B_i @ A_i))` for one base
     /// site, accumulating every stacked LoRA that touches it, in the base's
     /// encoding. `specs` are the `(lora index, spec)` pairs for this base.
@@ -340,8 +401,8 @@ impl<B: WeightSource, L: WeightSource> FoldState<B, L> {
             }
         }
 
-        // Each stacked LoRA: A [rank, K], B [N, rank] -> f32, then
-        // acc += strength · (B @ A).
+        // Each stacked LoRA: acc += strength · (alpha / rank) · (B @ A), or
+        // strength · D for a dense delta.
         for (idx, spec) in specs {
             debug_assert_eq!(
                 (spec.n, spec.k),
@@ -349,9 +410,18 @@ impl<B: WeightSource, L: WeightSource> FoldState<B, L> {
                 "stacked fold dims must match base"
             );
             let lora = &self.loras[*idx];
-            let a = self.lora_to_f32(lora, &spec.a, spec.rank * k).await?;
-            let b = self.lora_to_f32(lora, &spec.b, n * spec.rank).await?;
-            fold_add(&mut acc, &b, &a, k, spec.rank, self.strengths[*idx]);
+            match &spec.delta {
+                Delta::LowRank { a, b, rank, scale } => {
+                    let a = read_f32(lora, a, rank * k).await?;
+                    let b = read_f32(lora, b, n * rank).await?;
+                    fold_add(&mut acc, &b, &a, k, *rank, self.strengths[*idx] * scale);
+                }
+                Delta::Dense(d) => {
+                    let s = self.strengths[*idx];
+                    let d = read_f32(lora, d, n * k).await?;
+                    acc.iter_mut().zip(&d).for_each(|(o, v)| *o += s * v);
+                }
+            }
         }
 
         // f32 -> fold output encoding (quant sites -> Q8_0, bf16 sites preserved).
@@ -664,6 +734,10 @@ mod tests {
             .collect()
     }
 
+    fn f32_bytes(vals: &[f32]) -> Vec<u8> {
+        bytemuck::cast_slice(vals).to_vec()
+    }
+
     #[test]
     fn fold_add_is_b_times_a() {
         // acc[2,3] += B[2,1] @ A[1,3]; rank 1, scale 1.
@@ -831,6 +905,126 @@ mod tests {
         assert_eq!(specs.len(), 1, "only x folds");
         let s = &specs[0];
         assert_eq!(s.base.0, "x.weight");
-        assert_eq!((s.n, s.k, s.rank), (2, 3, 2));
+        assert_eq!((s.n, s.k), (2, 3));
+        assert_eq!(low_rank(s), (2, 1.0), "no alpha -> unscaled");
+    }
+
+    fn low_rank(s: &FoldSpec) -> (usize, f32) {
+        match s.delta {
+            Delta::LowRank { rank, scale, .. } => (rank, scale),
+            Delta::Dense(_) => panic!("expected a low-rank site"),
+        }
+    }
+
+    #[test]
+    fn dense_diffs_fold_onto_weight_and_bias() {
+        use futures::FutureExt;
+        let mut base = MemSource::new();
+        base.put(
+            "x.weight",
+            vec![2, 3],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[1.0; 6]),
+        );
+        base.put(
+            "x.bias",
+            vec![2],
+            StorageEncoding::F32,
+            f32_bytes(&[0.5, 0.5]),
+        );
+        base.put(
+            "y.bias",
+            vec![2],
+            StorageEncoding::F32,
+            f32_bytes(&[0.0, 0.0]),
+        );
+        let mut lora = MemSource::new();
+        let d = [0.25, 0.5, -1.0, 2.0, 0.0, -0.5];
+        lora.put(
+            "diffusion_model.x.diff",
+            vec![2, 3],
+            StorageEncoding::Bf16,
+            bf16_bytes(&d),
+        );
+        lora.put(
+            "diffusion_model.x.diff_b",
+            vec![2],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[1.0, -1.0]),
+        );
+        // All-zero delta: skipped. No base: skipped.
+        lora.put(
+            "diffusion_model.y.diff_b",
+            vec![2],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[0.0, 0.0]),
+        );
+        lora.put(
+            "diffusion_model.z.diff_b",
+            vec![2],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[1.0, 1.0]),
+        );
+        let specs = discover_specs(&base, &lora)
+            .now_or_never()
+            .unwrap()
+            .expect("discover");
+        let mut bases: Vec<_> = specs
+            .iter()
+            .map(|s| (s.base.0.as_str(), s.n, s.k))
+            .collect();
+        bases.sort();
+        assert_eq!(bases, [("x.bias", 1, 2), ("x.weight", 2, 3)]);
+
+        let fold = LoraFoldSource::new(base, vec![(lora, 2.0, specs)]).unwrap();
+        let read = |name: &str, n: usize, enc: StorageEncoding| {
+            let mut r = fold.open(&id(name)).now_or_never().unwrap().unwrap();
+            let mut bytes = vec![0u8; r.len() as usize];
+            r.read_at(0, &mut bytes).now_or_never().unwrap().unwrap();
+            let mut out = vec![0f32; n];
+            decode_into(enc, &bytes, bytemuck::cast_slice_mut(&mut out)).unwrap();
+            out
+        };
+        assert_eq!(read("x.bias", 2, StorageEncoding::F32), [2.5, -1.5]);
+        let want: Vec<f32> = d.iter().map(|v| 1.0 + 2.0 * v).collect();
+        assert_eq!(read("x.weight", 6, StorageEncoding::Bf16), want);
+    }
+
+    #[test]
+    fn discover_specs_scales_by_alpha_over_rank() {
+        use futures::FutureExt;
+        let mut base = MemSource::new();
+        base.put(
+            "x.weight",
+            vec![2, 3],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[0.0; 6]),
+        );
+        let mut lora = MemSource::new();
+        lora.put(
+            "diffusion_model.x.lora_down.weight",
+            vec![2, 3],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[0.0; 6]),
+        );
+        lora.put(
+            "diffusion_model.x.lora_up.weight",
+            vec![2, 2],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[1.0, 0.0, 0.0, 0.0]),
+        );
+        // kohya-style 0-dim alpha: 4 at rank 2 -> delta scale 2.
+        lora.put(
+            "diffusion_model.x.alpha",
+            vec![],
+            StorageEncoding::Bf16,
+            bf16_bytes(&[4.0]),
+        );
+        let specs = discover_specs(&base, &lora)
+            .now_or_never()
+            .unwrap()
+            .expect("discover");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(low_rank(&specs[0]).1, 2.0);
     }
 }

@@ -33,6 +33,10 @@ const REPO_UPSTREAM: &str = "MiniMaxAI/MiniMax-H3";
 /// against the full checkpoint unchanged. v0.1 is a PREVIEW: lightx2v flags
 /// soft image detail, and an improved release is in development.
 const REPO_TURBO_LORA: &str = "lightx2v/Minimax-h3-Turbo";
+/// FastVideo FastH3-Trim: 8-step DMD distillation of H3, 42 of 50 blocks kept,
+/// rank-16 AdaLN, block linears in calibrated NVFP4 (served as composites by
+/// `minimax::fasth3`). Two files: NVFP4 linears + the bf16/f32 rest.
+const REPO_FASTH3_TRIM: &str = "FastVideo/FastVideo-FastH3-Trim-8-Step-NVFP4";
 /// Fallback 4-step distillation if the lightx2v preview does not hold up.
 /// Native `blocks.*` naming, 259 pairs (51 of them AdaLN, which we ignore since
 /// the modulation table is precomputed). ckpt850-EMA is the author's pick.
@@ -66,7 +70,29 @@ pub mod role {
     pub const TURBO_LORA: &str = "dit/turbo-lora";
     /// larryvrh ckpt850-EMA 4-step turbo LoRA (fallback distillation).
     pub const TURBO_LORA_ALT: &str = "dit/turbo-lora-alt";
+    /// FastH3-Trim block linears, NVFP4 (10.0G).
+    pub const FASTH3_TRIM_NVFP4: &str = "dit/fasth3-trim-nvfp4";
+    /// FastH3-Trim norms, embedders, refiner, rank-16 AdaLN (1.9G).
+    pub const FASTH3_TRIM_REST: &str = "dit/fasth3-trim-rest";
 }
+
+/// FastH3's trained DMD rungs (`fastvideo_inference.json`
+/// `dmd_denoising_steps`): 8 forwards, Euler on `shift(rung / 1000)`.
+pub const FASTH3_RUNGS: [u32; 8] = [999, 874, 749, 624, 500, 375, 250, 125];
+/// FastH3's per-modality sigma shifts (`video_/audio_scheduler_shift`).
+pub const FASTH3_SHIFT_VIDEO: f32 = 10.0;
+pub const FASTH3_SHIFT_AUDIO: f32 = 3.0;
+
+/// Roles a FastH3-Trim t2va generate needs: the H3 conditioner, tokenizer and
+/// VAEs, with the distilled DiT in place of the base GGUF + turbo LoRA.
+pub const RUNTIME_ROLES_T2VA_FASTH3_TRIM: &[&str] = &[
+    role::ENCODER_GGUF,
+    role::TOKENIZER,
+    role::FASTH3_TRIM_NVFP4,
+    role::FASTH3_TRIM_REST,
+    role::VIDEO_VAE,
+    role::AUDIO_VAE,
+];
 
 /// Roles a t2va (text -> video + audio) generate needs at the Q4 default.
 /// Everything here is required: the base checkpoint is not distilled, so the
@@ -142,6 +168,17 @@ pub static MANIFEST: ModelManifest = ModelManifest {
             ),
         ),
         (
+            role::FASTH3_TRIM_NVFP4,
+            FileRef::new(REPO_FASTH3_TRIM, "transformer/nvfp4_weights.safetensors"),
+        ),
+        (
+            role::FASTH3_TRIM_REST,
+            FileRef::new(
+                REPO_FASTH3_TRIM,
+                "transformer/diffusion_pytorch_model-00001-of-00001.safetensors",
+            ),
+        ),
+        (
             role::TURBO_LORA_ALT,
             FileRef::new(
                 REPO_TURBO_LORA_ALT,
@@ -157,7 +194,11 @@ mod tests {
 
     #[test]
     fn roles_resolve() {
-        for r in RUNTIME_ROLES_T2VA_Q4.iter().chain(RUNTIME_ROLES_T2VA_Q8) {
+        for r in RUNTIME_ROLES_T2VA_Q4
+            .iter()
+            .chain(RUNTIME_ROLES_T2VA_Q8)
+            .chain(RUNTIME_ROLES_T2VA_FASTH3_TRIM)
+        {
             assert!(MANIFEST.get(r).is_some(), "missing role {r}");
         }
         assert!(MANIFEST.get("no-such-role").is_none());

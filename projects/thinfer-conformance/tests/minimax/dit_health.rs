@@ -28,7 +28,7 @@ use thinfer_models::common::merge::MergedSource;
 use thinfer_models::minimax::DitConfig;
 use thinfer_models::minimax::dit::{COOPMAT_SITES, DitPipelines, dit_cfgs, register_handles};
 use thinfer_models::minimax::loader::{build_modulation_tables, register_video_patch_proj};
-use thinfer_models::minimax::lora::TurboLoraSource;
+use thinfer_models::minimax::lora::LoraSource;
 use thinfer_models::minimax::manifest::{self, role};
 use thinfer_models::minimax::pipeline::{
     DenoisePlan, forward, initial_noise, upload_modulation_tables,
@@ -51,7 +51,7 @@ const STEPS: usize = 4;
 /// hidden states are unnormalized and land at roughly unit scale.
 fn synthetic_rows(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
-        .map(|i| ((i as f32 * 0.6180339887 + seed).fract() * 2.0 - 1.0) * 1.2)
+        .map(|i| ((i as f32 * 0.618_034 + seed).fract() * 2.0 - 1.0) * 1.2)
         .collect()
 }
 
@@ -121,7 +121,12 @@ async fn dit_health() {
     let lora = SafetensorsSource::open(lora_opener)
         .await
         .expect("parse turbo lora safetensors");
-    let src = MergedSource::new(base, TurboLoraSource::new(&cfg, lora));
+    let src = MergedSource::new(
+        base,
+        LoraSource::turbo(&cfg, lora)
+            .await
+            .expect("stack turbo lora"),
+    );
     eprintln!("turbo lora: {} synthetic tensors", src.overlay_len());
 
     // The table is built over exactly the plan's distinct timesteps, in the

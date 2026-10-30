@@ -35,35 +35,20 @@ const REPO_UPSCALER: &str = "Lightricks/LTX-2.3";
 /// loaded by the Rust `tokenizers` crate, matches upstream's HF tokenizer.
 const REPO_TOKENIZER: &str = "unsloth/gemma-3-12b-it";
 
-/// Sulphur-2 (SulphurAI) is an LTX-2.3 DiT finetune: the GGUF is byte-layout
-/// identical to the unsloth LTX-2.3 DiT (same `ltxv` arch, same 4444 tensors,
-/// same `config` KV), so it loads through the exact same DiT path. Only the DiT
-/// weights differ; the encoder/connector/VAEs/upscaler/tokenizer are the
-/// unchanged LTX-2.3 components (the Sulphur repo ships no encoder/VAE). This is
-/// the `sulphur_dev` checkpoint (the only one published as GGUF). Run through the
-/// existing distilled 8-step CFG-free sampler -- it is the same base model; the
-/// distilled-vs-dev step/CFG regime is a quality knob to eyeball, not an
-/// architecture difference.
-const REPO_SULPHUR: &str = "vantagewithai/Sulphur-2-Base-GGUF";
-/// SulphurAI source repo: ships the distill LoRA (the GGUF repo carries only the
-/// dev DiT). The LoRA is folded into the dev DiT at load (see `ltx::lora`).
-const REPO_SULPHUR_SRC: &str = "SulphurAI/Sulphur-2-base";
-/// Sulphur-2 with the distill LoRA ALREADY BAKED, published as GGUF. Same `ltxv`
-/// arch / 4444 tensors / `config` KV / diffusers names as every other LTX-2.3
-/// DiT (header-verified), so it loads through the identical path -- it just skips
-/// the fold, which on the `sulphur-2` dev path costs ~60s of CPU over 676 sites
-/// and parks a 12.8GB host cache for the model's lifetime. Only a Q4_K_M build is
-/// published (mixed Q4_K + Q6_K per block), which is why this is its own model id
-/// and not a drop-in for `sulphur-2`: Q8_0-plus-fold stays the quality baseline.
-const REPO_SULPHUR_DISTIL: &str = "coolthor/Sulphur-2-distilled-Q4_K_M-GGUF";
+/// LTX-2.3 22B `dev` (base, non-distilled) DiT GGUFs, same unsloth repo as the
+/// distilled ones. Same `ltxv` arch / tensors / `config` KV as the distilled
+/// DiT, so it loads through the identical path; the distill LoRA is folded in at
+/// load so the 8-step CFG-free distilled sampler converges (see `ltx::lora`).
+/// Any byte-layout-identical LTX-2.3 finetune can fill the dev slots.
+const DEV_DIT_Q8_0: &str = "ltx-2.3-22b-dev-Q8_0.gguf";
+const DEV_DIT_Q4_K_M: &str = "ltx-2.3-22b-dev-Q4_K_M.gguf";
 
-/// ltx2-rapid: an LTX-2 19B community merge (Phr00t v62; distilled + native I2V),
-/// GGUF-converted by 3ndetz. Same `ltxv` DiT topology as LTX-2.3 (48 layers) but
+/// ltx2-rapid: an LTX-2 19B distilled + native-I2V merge (user weight slot, no
+/// default; see [`slot`]). Same `ltxv` DiT topology as LTX-2.3 (48 layers) but
 /// the 19B conditioning line: FeatureExtractor V1 + in-transformer caption
 /// projection, 2-layer/30-head/3840 ungated connector, 6-way block modulation, no
-/// gated attention, no prompt-AdaLN. See `ltx2-rapid-plan.md`. Merge, so no
+/// gated attention, no prompt-AdaLN. Merge, so no
 /// upstream pyref: validated component-wise + against ComfyUI on the same GGUF.
-const REPO_RAPID_DIT: &str = "3ndetz/LTX2-Rapid-Merges-GGUF";
 /// 19B embeddings connector (+ FE V1 aggregate embed) and both VAEs (bf16
 /// safetensors, comfy-converted). The connector file holds the 2-layer video +
 /// audio connectors, their learnable registers, and `text_embedding_projection.
@@ -112,26 +97,33 @@ pub mod role {
     pub const UPSCALER: &str = "upscaler/x2";
     /// Gemma-3 tokenizer.json (HF fast tokenizer) for the text-encoder prompt.
     pub const TOKENIZER: &str = "encoder/tokenizer";
-    /// Sulphur distill LoRA (safetensors). Folded into the `sulphur_dev` DiT at
-    /// load so the 8-step CFG-free distilled sampler converges (the GGUF is the
-    /// BASE checkpoint, not the distilled one). Sulphur-only role. Default = the
-    /// rank-reduced `condsafe` LoRA (662M, rank ~36-72).
+    /// Distill LoRA (safetensors) folded into a `dev` DiT at load so the 8-step
+    /// CFG-free distilled sampler converges (the dev GGUF is the BASE
+    /// checkpoint). Dev-only role. Default = the official Lightricks rank-384
+    /// distill 1.1; a user slot, so a finetune's own distill LoRA can fill it.
     pub const DISTILL_LORA: &str = "dit/distill-lora";
-    /// `sulphur_lora_rank_768.safetensors` (10.3G). NOT a step-distillation LoRA
-    /// -- a CONTENT LoRA for the standard CFG workflow; folding it standalone into
-    /// the 8-step CFG-free path produces undercooked mush (verified 2026-06-27, do
-    /// not use it as the distill). Kept only behind `THINFER_SULPHUR_DISTILL=rank768`
-    /// for reproducibility. Sulphur-only role.
-    pub const DISTILL_LORA_R768: &str = "dit/distill-lora-r768";
     /// Official Lightricks rank-384 distill LoRA (`ltx-2.3-22b-distilled-lora-384
-    /// .safetensors`, 7.6G). The Sulphur distilled ComfyUI workflow STACKS this at
-    /// 0.5 with `condsafe` at 0.7 (not 1.0). Available via `THINFER_SULPHUR_DISTILL
-    /// =stack`. From the LTX-2.3 fp repo. Sulphur-only role.
+    /// .safetensors`, 7.6G), the second half of the ComfyUI stack recipe
+    /// (`THINFER_LTX_DISTILL=stack`: [`DISTILL_LORA`] at 0.7 + this at 0.5).
+    /// From the LTX-2.3 fp repo. Dev-only role.
     pub const DISTILL_LORA_384: &str = "dit/distill-lora-384";
 }
 
 /// Roles a silent-video (t2v) generate needs: DiT + encoder + connector + video
 /// VAE. Q8_0 DiT baseline. (Audio adds AUDIO_VAE; see `RUNTIME_ROLES_AV_Q8`.)
+/// User weight slots (see `thinfer_core::manifest::FileRef::slot`).
+pub mod slot {
+    pub const DISTILLED_DIT_Q8_0: &str = "ltx-2.3-distilled/dit-q8_0";
+    pub const DISTILLED_DIT_Q4_K_M: &str = "ltx-2.3-distilled/dit-q4_k_m";
+    pub const DEV_DIT_Q8_0: &str = "ltx-2.3-dev/dit-q8_0";
+    pub const DEV_DIT_Q4_K_M: &str = "ltx-2.3-dev/dit-q4_k_m";
+    pub const DEV_DISTILL_LORA: &str = "ltx-2.3-dev/distill-lora";
+    /// ltx2-rapid (LTX-2 19B merge) DiT GGUFs. No default.
+    pub const RAPID_DIT_Q5_K_M: &str = "ltx2-rapid/dit-q5_k_m";
+    pub const RAPID_DIT_Q4_K_M: &str = "ltx2-rapid/dit-q4_k_m";
+    pub const RAPID_DIT_F16: &str = "ltx2-rapid/dit-f16";
+}
+
 pub const RUNTIME_ROLES_T2V_Q8: &[&str] = &[
     role::ENCODER_GGUF,
     role::CONNECTOR,
@@ -178,14 +170,16 @@ pub static MANIFEST: ModelManifest = ModelManifest {
             FileRef::new(
                 REPO_GGUF,
                 "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q8_0.gguf",
-            ),
+            )
+            .in_slot(slot::DISTILLED_DIT_Q8_0),
         ),
         (
             role::DIT_GGUF_Q4_K_M,
             FileRef::new(
                 REPO_GGUF,
                 "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf",
-            ),
+            )
+            .in_slot(slot::DISTILLED_DIT_Q4_K_M),
         ),
         (
             role::DIT_GGUF_Q2_K,
@@ -228,81 +222,33 @@ pub static MANIFEST: ModelManifest = ModelManifest {
     ],
 };
 
-/// Sulphur-2: same component chain as [`MANIFEST`] but the DiT GGUF comes from
-/// the Sulphur repo (`sulphur_dev`, Q8_0 baseline + Q4_K_M footprint). Every
-/// other role reuses the LTX-2.3 file (same repos/paths). The runtime-role lists
+/// LTX-2.3 dev: same component chain as [`MANIFEST`] but the BASE (`dev`) DiT
+/// plus the distill LoRA folded over it at load (Q8_0 baseline + Q4_K_M
+/// footprint). Every other role reuses the LTX-2.3 file. The runtime-role lists
 /// and `role::*` keys are shared, so the same `RUNTIME_ROLES_AV_{Q8,Q4}` resolve
 /// against this manifest unchanged.
-pub static SULPHUR_MANIFEST: ModelManifest = ModelManifest {
-    id: "sulphur-2",
+pub static DEV_MANIFEST: ModelManifest = ModelManifest {
+    id: "ltx-2.3-dev",
     files: &[
         (
             role::DIT_GGUF_Q8_0,
-            FileRef::new(REPO_SULPHUR, "sulphur_dev-Q8_0.gguf"),
+            FileRef::new(REPO_GGUF, DEV_DIT_Q8_0).in_slot(slot::DEV_DIT_Q8_0),
         ),
         (
             role::DIT_GGUF_Q4_K_M,
-            FileRef::new(REPO_SULPHUR, "sulphur_dev-Q4_K_M.gguf"),
+            FileRef::new(REPO_GGUF, DEV_DIT_Q4_K_M).in_slot(slot::DEV_DIT_Q4_K_M),
         ),
         (
             role::DISTILL_LORA,
             FileRef::new(
-                REPO_SULPHUR_SRC,
-                "distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors",
-            ),
-        ),
-        (
-            role::DISTILL_LORA_R768,
-            FileRef::new(REPO_SULPHUR_SRC, "sulphur_lora_rank_768.safetensors"),
+                REPO_UPSCALER,
+                "ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+            )
+            .in_slot(slot::DEV_DISTILL_LORA),
         ),
         (
             role::DISTILL_LORA_384,
             FileRef::new(REPO_UPSCALER, "ltx-2.3-22b-distilled-lora-384.safetensors"),
-        ),
-        (
-            role::ENCODER_GGUF,
-            FileRef::new(REPO_GEMMA, "gemma-3-12b-it-Q8_0.gguf"),
-        ),
-        (
-            role::ENCODER_GGUF_Q4,
-            FileRef::new(REPO_GEMMA, "gemma-3-12b-it-Q4_K_M.gguf"),
-        ),
-        (
-            role::CONNECTOR,
-            FileRef::new(
-                REPO_GGUF,
-                "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
-            ),
-        ),
-        (
-            role::VIDEO_VAE,
-            FileRef::new(REPO_GGUF, "vae/ltx-2.3-22b-distilled_video_vae.safetensors"),
-        ),
-        (
-            role::AUDIO_VAE,
-            FileRef::new(REPO_GGUF, "vae/ltx-2.3-22b-distilled_audio_vae.safetensors"),
-        ),
-        (
-            role::UPSCALER,
-            FileRef::new(REPO_UPSCALER, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
-        ),
-        (
-            role::TOKENIZER,
-            FileRef::new(REPO_TOKENIZER, "tokenizer.json"),
-        ),
-    ],
-};
-
-/// Sulphur-2 distilled: the same chain as [`SULPHUR_MANIFEST`] with the
-/// pre-distilled Q4_K_M DiT and NO distill LoRA (it is already baked in). The
-/// encoder / connector / VAEs / upscaler / tokenizer are the unchanged LTX-2.3
-/// components, so only the DiT role differs.
-pub static SULPHUR_DISTIL_MANIFEST: ModelManifest = ModelManifest {
-    id: "sulphur-2-distilled",
-    files: &[
-        (
-            role::DIT_GGUF_Q4_K_M,
-            FileRef::new(REPO_SULPHUR_DISTIL, "sulphur-distil-ltx23av-Q4_K_M.gguf"),
         ),
         (
             role::ENCODER_GGUF,
@@ -356,27 +302,9 @@ pub const RUNTIME_ROLES_RAPID: &[&str] = &[
 pub static LTX2_RAPID_MANIFEST: ModelManifest = ModelManifest {
     id: "ltx2-rapid",
     files: &[
-        (
-            role::DIT_GGUF_Q5_K_M,
-            FileRef::new(
-                REPO_RAPID_DIT,
-                "nsfw/ltx2-phr00tmerge-nsfw-v62/ltx2-phr00tmerge-nsfw-v62-Q5_K_M.gguf",
-            ),
-        ),
-        (
-            role::DIT_GGUF_Q4_K_M,
-            FileRef::new(
-                REPO_RAPID_DIT,
-                "nsfw/ltx2-phr00tmerge-nsfw-v62/ltx2-phr00tmerge-nsfw-v62-Q4_K_M.gguf",
-            ),
-        ),
-        (
-            role::DIT_GGUF_F16,
-            FileRef::new(
-                REPO_RAPID_DIT,
-                "nsfw/ltx2-phr00tmerge-nsfw-v62/ltx2-phr00tmerge-nsfw-v62-F16.gguf",
-            ),
-        ),
+        (role::DIT_GGUF_Q5_K_M, FileRef::user(slot::RAPID_DIT_Q5_K_M)),
+        (role::DIT_GGUF_Q4_K_M, FileRef::user(slot::RAPID_DIT_Q4_K_M)),
+        (role::DIT_GGUF_F16, FileRef::user(slot::RAPID_DIT_F16)),
         (
             role::ENCODER_GGUF,
             FileRef::new(REPO_GEMMA, "gemma-3-12b-it-Q8_0.gguf"),
@@ -430,10 +358,12 @@ mod tests {
         for r in RUNTIME_ROLES_RAPID {
             assert!(LTX2_RAPID_MANIFEST.get(r).is_some(), "missing role {r}");
         }
-        // DiT from the merge repo; connector/VAE from the 19B comfy repo.
-        assert_eq!(
-            LTX2_RAPID_MANIFEST.get(role::DIT_GGUF_Q5_K_M).unwrap().repo,
-            REPO_RAPID_DIT
+        // DiT is a default-less user slot; connector/VAE from the 19B comfy repo.
+        assert!(
+            LTX2_RAPID_MANIFEST
+                .get(role::DIT_GGUF_Q5_K_M)
+                .unwrap()
+                .is_unfilled()
         );
         assert_eq!(
             LTX2_RAPID_MANIFEST.get(role::CONNECTOR).unwrap().repo,
@@ -452,20 +382,21 @@ mod tests {
     }
 
     #[test]
-    fn sulphur_roles_resolve() {
-        // Sulphur reuses the AV runtime-role lists; all must resolve, and the
-        // DiT must come from the Sulphur repo while shared roles stay on LTX.
+    fn dev_roles_resolve() {
+        // Dev reuses the AV runtime-role lists; all must resolve, the DiT is the
+        // dev checkpoint, and shared roles stay on the LTX-2.3 files.
         for r in RUNTIME_ROLES_AV_Q8.iter().chain(RUNTIME_ROLES_AV_Q4) {
-            assert!(SULPHUR_MANIFEST.get(r).is_some(), "missing role {r}");
+            assert!(DEV_MANIFEST.get(r).is_some(), "missing role {r}");
         }
         assert_eq!(
-            SULPHUR_MANIFEST.get(role::DIT_GGUF_Q8_0).unwrap().repo,
-            REPO_SULPHUR
+            DEV_MANIFEST.get(role::DIT_GGUF_Q8_0).unwrap().path,
+            DEV_DIT_Q8_0
         );
         assert_eq!(
-            SULPHUR_MANIFEST.get(role::VIDEO_VAE).unwrap().repo,
-            REPO_GGUF
+            DEV_MANIFEST.get(role::VIDEO_VAE).unwrap(),
+            MANIFEST.get(role::VIDEO_VAE).unwrap()
         );
+        assert!(DEV_MANIFEST.get(role::DISTILL_LORA).unwrap().slot.is_some());
     }
 
     #[test]

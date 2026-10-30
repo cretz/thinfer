@@ -13,8 +13,9 @@ use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 
 #[derive(Args)]
 pub struct GenerateImage {
-    /// Model identifier. Defaults to `qwen-image-rapid` (a 4-step distilled,
-    /// CFG-free MMDiT with strong prompt adherence).
+    /// Model identifier. Defaults to `zimage-turbo-q4` (8-step Turbo, CFG-free,
+    /// upstream weights). `qwen-image-rapid` needs its DiT weight slot filled in
+    /// the user's weight sources.
     #[arg(long, default_value_t = ImageModelId::DEFAULT, value_enum)]
     pub model: ImageModelId,
     #[arg(long)]
@@ -110,7 +111,6 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
             input_image: None,
             i8_matmul: Some(!args.no_i8_matmul),
             full_precision: Some(args.full_precision),
-            public_key: None,
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
             disable_coopmat: None,

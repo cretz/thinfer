@@ -1,7 +1,6 @@
 //! HunyuanVideo 1.5 config constants. First target: 480p T2V, lightx2v 4-step
 //! distill (`lightx2v/Hy1.5-Distill-Models/hy1.5_t2v_480p_lightx2v_4step
-//! .safetensors`, fp16, loaded direct as the WHOLE DiT). See
-//! `projects/thinfer-working-area/hunyuan-plan.md`.
+//! .safetensors`, fp16, loaded direct as the WHOLE DiT).
 //!
 //! Architecture = dual-stream MMDiT (Flux/HV1.0 lineage). All dims verified
 //! against the base `480p_t2v/config.json` + the lightx2v checkpoint tensor

@@ -22,6 +22,17 @@ body {
   opacity: 0.6;
 }
 
+/* Inline caveat under a field (e.g. the LTX adherence floor). Spans both columns
+   of the #fields grid so it reads as a note on the row above, not a new field. */
+.warn {
+  grid-column: 1 / -1;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #c98a1b;
+  background: rgba(201, 138, 27, 0.1);
+}
+
 #fields {
   display: grid;
   grid-template-columns: max-content 1fr;

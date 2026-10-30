@@ -17,10 +17,35 @@ use crate::model::{
 };
 use crate::progress::Stage;
 
-/// A job request from a client. Internally tagged by `kind`. Carries only what a
+/// What a client submits to `POST /jobs`: a [`JobSpec`] JSON sealed under a
+/// per-job key the server does not have yet (`crate::jobkey` layout, base64).
+/// The server queues only this ciphertext; when a worker is ready it emits
+/// [`JobEvent::KeyRequired`] and the client answers with [`JobKeyDelivery`].
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SealedJob {
+    pub sealed: String,
+    /// The one scheduling hint the server needs before it can decrypt: a
+    /// large-input job (face-swap video) runs now-or-rejects instead of
+    /// queuing. See [`JobSpec::is_large_input`].
+    #[serde(default)]
+    pub large_input: bool,
+}
+
+/// `POST /jobs/{id}/key` body: the base64 job key, sent only in answer to
+/// [`JobEvent::KeyRequired`]. Never logged (no `Debug`).
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct JobKeyDelivery {
+    pub key: String,
+}
+
+/// A job request from a client, as sealed inside [`SealedJob`]. Internally tagged by `kind`. Carries only what a
 /// caller chooses; the server assigns the artifact path and pulls budgets from
 /// its config.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum JobSpec {
@@ -36,15 +61,6 @@ impl JobSpec {
         matches!(self, JobSpec::FaceSwap(_))
     }
 
-    /// The client's result-encryption public key, if it asked for encryption.
-    pub fn public_key(&self) -> Option<&str> {
-        match self {
-            JobSpec::Image(s) => s.public_key.as_deref(),
-            JobSpec::Video(s) => s.public_key.as_deref(),
-            JobSpec::FaceSwap(s) => s.public_key.as_deref(),
-        }
-    }
-
     /// Per-request opt-out of the cooperative-matrix (tensor-core) path. `None`
     /// = use the server default. `Some(true)` forces the dense/i8 kernels even
     /// on a coopmat-capable GPU (A/B, debugging). A no-op when the GPU lacks
@@ -58,7 +74,7 @@ impl JobSpec {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ImageSpec {
@@ -80,11 +96,6 @@ pub struct ImageSpec {
     /// under the job dir and feeds it to the image-edit path.
     #[serde(default)]
     pub input_image: Option<String>,
-    /// Base64 SPKI RSA-OAEP public key. When present, the server encrypts the
-    /// result so only the holder of the matching private key can read it; absent
-    /// = plaintext. See [`crate::wire`] / `thinfer-serve` crypto.
-    #[serde(default)]
-    pub public_key: Option<String>,
     /// Opt out of the cooperative-matrix (tensor-core) path; see
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
@@ -112,7 +123,7 @@ pub struct LoraSpec {
     pub weight: Option<f32>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct VideoSpec {
@@ -127,8 +138,9 @@ pub struct VideoSpec {
     pub durations: Option<Vec<f32>>,
     pub fps: Option<u32>,
     pub seed: Option<u64>,
-    /// FastWan denoise sampler. Defaults to UniPC (matches the public Spaces);
-    /// DMD is the byte-parity reference path. Ignored on the AR (LongLive) path.
+    /// FastWan denoise sampler. Unset -> the model default (UniPC, matching the
+    /// public Spaces; DMD for FastWan2.1-1.3B, its card's 3-step regime). DMD is
+    /// also the byte-parity reference path. Ignored on the AR (LongLive) path.
     pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8, default 4). DMD ignores it.
     pub steps: Option<u32>,
@@ -175,7 +187,7 @@ pub struct VideoSpec {
     pub guide_scale: Option<f32>,
     /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
     /// baseline) or `q4` (Q4_K_M, ~2.8x faster encode, lower precision). Applies
-    /// to all LTX/Sulphur models; ignored by Wan.
+    /// to all LTX models; ignored by Wan.
     pub encoder: Option<EncoderQuant>,
     pub i8_matmul: Option<bool>,
     /// Decode + mux an audio track. Joint-AV models only (LTX and MiniMax-H3;
@@ -186,11 +198,12 @@ pub struct VideoSpec {
     /// (half-res denoise -> latent upscale -> refine). Defaults to `false` =
     /// single-stage denoise at the target res. Ignored by the Wan models.
     pub upscale: Option<bool>,
-    /// LTX single-stage joint-AV only: opt in to a finer denoise schedule for
-    /// better audio (subdivides the coarse distilled sigma jumps into more Euler
-    /// substeps, ~2x the denoise cost). Honored on the single-stage path
-    /// (ltx2-rapid always; the 22B line with `upscale` off); the two-stage and
-    /// Wan models ignore it. Defaults to `false`.
+    /// LTX joint-AV: opt in to a finer denoise schedule for better audio
+    /// (subdivides the coarse distilled sigma jumps into more Euler substeps).
+    /// Honored on every LTX path: the single-stage schedule (ltx2-rapid always,
+    /// the 22B line with `upscale` off) and both stage schedules on the two-stage
+    /// 22B line (8+3 -> 16+11 steps, ~2.5x denoise). Wan ignores it. Defaults to
+    /// `false`.
     #[serde(default)]
     pub audio_hq: Option<bool>,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed caption via
@@ -203,17 +216,14 @@ pub struct VideoSpec {
     /// ~5.85GB Qwen3-VL-8B. Ignored when `rewrite` is false or by other models.
     #[serde(default)]
     pub rewrite_quality: Option<RewriteQuality>,
-    /// Base64 SPKI RSA-OAEP public key for result encryption (see [`ImageSpec`]).
-    #[serde(default)]
-    pub public_key: Option<String>,
     /// Opt out of the cooperative-matrix (tensor-core) path; see
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
     pub disable_coopmat: Option<bool>,
     /// User adapters (vault LoRAs) to fold into the DiT for this generation, in
     /// fold order. Each `id` is a `vault list` entry for THIS model. Empty/absent
-    /// = the plain base model. Only models that support adapters (AnyFlow) accept a
-    /// non-empty list; requires `password`.
+    /// = the plain base model. Only models that support adapters (AnyFlow,
+    /// FastWan2.1-1.3B) accept a non-empty list; requires `password`.
     #[serde(default)]
     pub lora: Vec<LoraSpec>,
     /// Vault password, required when `lora` is non-empty. Transient: used to
@@ -222,7 +232,7 @@ pub struct VideoSpec {
     pub password: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct FaceSwapSpec {
@@ -252,9 +262,6 @@ pub struct FaceSwapSpec {
     /// Takes precedence over `source_image` when both are set.
     #[serde(default)]
     pub source_image_b64: Option<String>,
-    /// Base64 SPKI RSA-OAEP public key for result encryption (see [`ImageSpec`]).
-    #[serde(default)]
-    pub public_key: Option<String>,
     /// Opt out of the cooperative-matrix (tensor-core) path; see
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
@@ -424,12 +431,25 @@ pub struct JobStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum JobEvent {
-    Queued { position: usize },
+    Queued {
+        position: usize,
+    },
+    /// A worker is ready: deliver the job key now (`POST /jobs/{id}/key`).
+    /// The job decrypts and runs only after it arrives.
+    KeyRequired,
     Started,
-    Progress { stage: ProgressStage },
-    Log { message: String },
-    Done { result: JobResult },
-    Error { message: String },
+    Progress {
+        stage: ProgressStage,
+    },
+    Log {
+        message: String,
+    },
+    Done {
+        result: JobResult,
+    },
+    Error {
+        message: String,
+    },
     Cancelled,
 }
 
@@ -437,6 +457,7 @@ impl JobEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             JobEvent::Queued { .. } => "queued",
+            JobEvent::KeyRequired => "keyRequired",
             JobEvent::Started => "started",
             JobEvent::Progress { .. } => "progress",
             JobEvent::Log { .. } => "log",

@@ -6,4 +6,8 @@
 mod adaln_precompute;
 mod audio_vae_health;
 mod dit_health;
+mod dit_parity;
+mod encoder_parity;
+mod parity_util;
+mod vae_parity;
 mod video_vae_health;

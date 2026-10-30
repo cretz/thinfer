@@ -36,9 +36,10 @@ pub fn load_image_bytes(bytes: &[u8]) -> Result<Image, String> {
 
 // --- t2v MP4 encode ----------------------------------------------------------
 
-/// Encode CTHW f32 `[-1, 1]` frames to an H.264 MP4 at `fps`.
-pub fn encode_mp4(video: &WanVideo, fps: u32, out: &Path) -> Result<(), String> {
-    encode_mp4_with_audio(video, fps, None, out)
+/// Encode CTHW f32 `[-1, 1]` frames to H.264 MP4 bytes at `fps` (in memory;
+/// the caller delivers them, see `progress::write_artifact`).
+pub fn encode_mp4(video: &WanVideo, fps: u32) -> Result<Vec<u8>, String> {
+    encode_mp4_with_audio(video, fps, None)
 }
 
 /// Encode CTHW f32 `[-1, 1]` frames to an H.264 MP4 at `fps`, optionally muxing
@@ -48,8 +49,7 @@ pub fn encode_mp4_with_audio(
     video: &WanVideo,
     fps: u32,
     audio: Option<AudioPassthrough>,
-    out: &Path,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     use openh264::OpenH264API;
     use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
     use openh264::formats::{RgbSliceU8, YUVBuffer};
@@ -84,7 +84,7 @@ pub fn encode_mp4_with_audio(
 
     let sps = sps.ok_or("openh264 produced no SPS")?;
     let pps = pps.ok_or("openh264 produced no PPS")?;
-    mux_mp4(out, w, h, fps, &sps, &pps, &samples, audio)
+    mux_mp4(w, h, fps, &sps, &pps, &samples, audio)
 }
 
 /// Encode planar stereo f32 PCM `[2, n]` (channel-major, `[-1, 1]`) to AAC-LC
@@ -225,10 +225,9 @@ pub struct AudioPassthrough {
     pub samples: Vec<mp4::Mp4Sample>,
 }
 
-/// Mux length-prefixed (AVCC) H.264 video samples into an MP4 file, optionally
-/// adding a verbatim audio track.
+/// Mux length-prefixed (AVCC) H.264 video samples into MP4 bytes (in memory),
+/// optionally adding a verbatim audio track.
 pub fn mux_mp4(
-    out: &Path,
     w: usize,
     h: usize,
     fps: u32,
@@ -236,7 +235,7 @@ pub fn mux_mp4(
     pps: &[u8],
     samples: &[(bool, Vec<u8>)],
     audio: Option<AudioPassthrough>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     use mp4::{
         AvcConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType,
     };
@@ -302,8 +301,7 @@ pub fn mux_mp4(
         }
     }
     writer.write_end().map_err(|e| format!("mp4 end: {e}"))?;
-    let data = faststart(writer.into_writer().into_inner());
-    std::fs::write(out, &data).map_err(|e| format!("write {}: {e}", out.display()))
+    Ok(faststart(writer.into_writer().into_inner()))
 }
 
 /// Relocate the `moov` box ahead of `mdat` ("faststart") so the file plays
@@ -1446,9 +1444,8 @@ pub async fn swap_video_streaming(
         "Encoding MP4 (H.264){}",
         if audio.is_some() { " + audio" } else { "" }
     ));
-    mux_mp4(
-        output, out_w, out_h, fps, &enc_sps, &enc_pps, &samples, audio,
-    )?;
+    let mp4 = mux_mp4(out_w, out_h, fps, &enc_sps, &enc_pps, &samples, audio)?;
+    crate::progress::write_artifact(sink, output, &mp4)?;
     Ok((out_w, out_h, fps, n))
 }
 
@@ -1770,11 +1767,7 @@ mod tests {
         }
         let (ow, oh, cnt, sps, pps, samples) = sink.finish().expect("finish encode");
         assert_eq!(cnt, n);
-        let tmp =
-            std::env::temp_dir().join(format!("thinfer_dec_roundtrip_{}.mp4", std::process::id()));
-        mux_mp4(&tmp, ow, oh, fps, &sps, &pps, &samples, None).expect("mux");
-        let bytes = std::fs::read(&tmp).unwrap();
-        let _ = std::fs::remove_file(&tmp);
+        let bytes = mux_mp4(ow, oh, fps, &sps, &pps, &samples, None).expect("mux");
         let (frames, got_fps) = decode_mp4_frames(&bytes).expect("decode");
         assert_eq!(got_fps, fps);
         assert_eq!(frames.len(), n, "all encoded frames decode back (no drops)");
@@ -2068,11 +2061,7 @@ mod tests {
                 .collect(),
         };
 
-        let tmp =
-            std::env::temp_dir().join(format!("thinfer_mux_faststart_{}.mp4", std::process::id()));
-        mux_mp4(&tmp, 16, 16, 24, &sps, &pps, &samples, Some(audio)).unwrap();
-        let data = std::fs::read(&tmp).unwrap();
-        let _ = std::fs::remove_file(&tmp);
+        let data = mux_mp4(16, 16, 24, &sps, &pps, &samples, Some(audio)).unwrap();
 
         let moov = box_offset(&data, b"moov");
         let mdat = box_offset(&data, b"mdat");

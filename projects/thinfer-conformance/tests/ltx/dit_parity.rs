@@ -64,6 +64,9 @@ async fn dit_parity() {
         audio_tokens: m[1],
         video_text: m[2],
         audio_text: m[3],
+        // Parity runs FULL attention: the sliding window is an opt-in perf
+        // trade, and the pyref reference it is measured against has no window.
+        video_period: 0,
     };
 
     let vx = read_f32(&tmp.join("vx_in.bin"));
@@ -183,6 +186,9 @@ async fn rapid_dit_parity() {
         audio_tokens: m[1],
         video_text: m[2],
         audio_text: m[3],
+        // Parity runs FULL attention: the sliding window is an opt-in perf
+        // trade, and the pyref reference it is measured against has no window.
+        video_period: 0,
     };
 
     let vx = read_f32(&tmp.join("vx_in.bin"));
@@ -414,6 +420,9 @@ async fn run_full_parity(dit_path: &Path, tmp: &Path) {
         audio_tokens: m[1],
         video_text: m[2],
         audio_text: m[3],
+        // Parity runs FULL attention: the sliding window is an opt-in perf
+        // trade, and the pyref reference it is measured against has no window.
+        video_period: 0,
     };
 
     let latent_v = read_f32(&tmp.join("v_latent.bin"));
@@ -437,6 +446,14 @@ async fn run_full_parity(dit_path: &Path, tmp: &Path) {
         .await
         .expect("wgpu adapter unavailable for tests"),
     );
+    // Opt-in CUDA hot ops (`THINFER_CUDA=on`): the same gate then measures the
+    // CUDA kernels against the same pyref.
+    if std::env::var("THINFER_CUDA").is_ok_and(|v| v == "on") {
+        match thinfer_cuda::install(&backend) {
+            Ok((name, sm)) => eprintln!("cuda hot ops ON: {name} sm_{}{}", sm.0, sm.1),
+            Err(e) => eprintln!("cuda hot ops requested but unavailable: {e}"),
+        }
+    }
     let pipelines = DitPipelines::compile(&backend)
         .await
         .expect("compile dit pipelines");

@@ -156,6 +156,12 @@
         <label for="height">Height</label>
         <input id="height" type="number" value="768" min="16" step="16" />
 
+        <!-- LTX only (app.js): warns when the chosen dims are under the measured
+             prompt-adherence floor. Below it the clip still looks clean but
+             quietly drops requested content, so it must not read as a plain
+             "faster" option. Spans both grid columns. -->
+        <div id="dims-warning" class="warn" hidden></div>
+
         <!-- Hidden for LTX (app.js): the distilled two-stage schedule is fixed
              (8 + 3 = 11 steps), so the steps field does not apply there. -->
         <div id="steps-row">
@@ -212,7 +218,7 @@
           <input id="audio-hq" type="checkbox" />
         </div>
 
-        <!-- LTX-2.3 only (all LTX/Sulphur models share the Gemma encoder).
+        <!-- LTX-2.3 only (all LTX models share the Gemma encoder).
              app.js reveals this for LTX and hides it otherwise. q4 is ~2.8x
              faster to encode the prompt (~16s -> ~6s) at lower-precision
              conditioning; q8 is the quality baseline. -->

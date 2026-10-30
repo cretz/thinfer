@@ -69,10 +69,31 @@ import torch
 REPO = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
 
-# Fixed by the model; must match `wan/pipeline.rs` + `tests/wan/video_e2e.rs`.
-Z_DIM = 48
-VAE_SCALE = 16
+# Per-variant latent geometry `(z_dim, vae spatial scale)`; must match the
+# engine `WanVariant` + `tests/wan/video_e2e.rs`. FastWan2.2-TI2V-5B runs the
+# z48 16x high-compression VAE; FastWan2.1-1.3B the Wan2.1 z16 8x VAE.
+GEOMETRY = {"fastwan-ti2v-5b": (48, 16), "fastwan2.1-t2v-1.3b": (16, 8)}
 TEMPORAL_SCALE = 4
+# FastWan2.1-T2V-1.3B transformer + Wan2.1 VAE configs (the repos'
+# `transformer/config.json` / `vae/config.json`), built explicitly so only the
+# DiT + VAE weight files the engine loads need to be cached.
+FASTWAN21_TRANSFORMER = dict(
+    patch_size=(1, 2, 2), num_attention_heads=12, attention_head_dim=128, in_channels=16,
+    out_channels=16, text_dim=4096, freq_dim=256, ffn_dim=8960, num_layers=30,
+    cross_attn_norm=True, qk_norm="rms_norm_across_heads", eps=1e-6, image_dim=None,
+    added_kv_proj_dim=None, rope_max_seq_len=1024,
+)
+WAN21_VAE = dict(
+    base_dim=96, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[],
+    temperal_downsample=[False, True, True], dropout=0.0,
+    latents_mean=[-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+                  0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921],
+    latents_std=[2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+                 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916],
+)
+# Sparse-attention-only DiT tensors (the VSA gate): unused by dense attention,
+# absent from `WanTransformer3DModel`, so dropped by name before the strict load.
+SPARSE_ONLY_KEY = "to_gate_compress"
 DENOISING_STEPS = [1000.0, 757.0, 522.0]
 NUM_TRAIN_TIMESTEPS = 1000.0
 TEXT_SEQ = 512
@@ -123,9 +144,16 @@ def main() -> int:
     p.add_argument("--frames", required=True, type=int)
     p.add_argument("--seed", required=True, type=int)
     p.add_argument("--dtype", choices=list(DTYPES.keys()), default="bf16")
+    p.add_argument("--variant", choices=list(GEOMETRY), default="fastwan-ti2v-5b")
+    p.add_argument(
+        "--vae-weights",
+        type=Path,
+        help="Wan2.1 VAE safetensors (diffusers names); required for fastwan2.1-t2v-1.3b.",
+    )
     args = p.parse_args()
+    z_dim, vae_scale = GEOMETRY[args.variant]
 
-    div = VAE_SCALE * 2  # VAE 16x spatial * DiT patch 2 -> 32px granularity.
+    div = vae_scale * 2  # VAE spatial scale * DiT patch 2.
     if args.height % div or args.width % div:
         raise SystemExit(f"height/width must be multiples of {div}; got {args.height}x{args.width}")
     if args.frames % TEMPORAL_SCALE != 1:
@@ -133,9 +161,9 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
 
     f_lat = (args.frames - 1) // TEMPORAL_SCALE + 1
-    h_lat = args.height // VAE_SCALE
-    w_lat = args.width // VAE_SCALE
-    n_lat = Z_DIM * f_lat * h_lat * w_lat
+    h_lat = args.height // vae_scale
+    w_lat = args.width // vae_scale
+    n_lat = z_dim * f_lat * h_lat * w_lat
     n_steps = len(DENOISING_STEPS)
     if len(args.renoise) != n_steps - 1:
         raise SystemExit(f"expected {n_steps - 1} --renoise tensors, got {len(args.renoise)}")
@@ -148,17 +176,29 @@ def main() -> int:
         flush=True,
     )
 
-    shape = (1, Z_DIM, f_lat, h_lat, w_lat)
+    shape = (1, z_dim, f_lat, h_lat, w_lat)
     noise = torch.from_numpy(_load(args.initial_noise, n_lat, "initial-noise").copy()).reshape(shape)
     renoise = [
         torch.from_numpy(_load(r, n_lat, "renoise").copy()).reshape(shape) for r in args.renoise
     ]
 
-    from diffusers import WanPipeline
+    from diffusers import AutoencoderKLWan, WanPipeline, WanTransformer3DModel
     from safetensors.torch import load_file as load_safetensors
 
     t0 = time.time()
-    pipe = WanPipeline.from_pretrained(REPO, torch_dtype=dtype, local_files_only=True)
+    overrides = {}
+    if args.variant == "fastwan2.1-t2v-1.3b":
+        # umT5 + tokenizer + scheduler from the 5B bundle (identical umT5-XXL);
+        # the 1.3B DiT + Wan2.1 VAE are built from config and loaded below.
+        if args.vae_weights is None:
+            raise SystemExit("--vae-weights is required for fastwan2.1-t2v-1.3b")
+        overrides["transformer"] = WanTransformer3DModel(**FASTWAN21_TRANSFORMER).to(dtype)
+        vae = AutoencoderKLWan(**WAN21_VAE)
+        missing, unexpected = vae.load_state_dict(load_safetensors(str(args.vae_weights)), strict=False)
+        if missing or unexpected:
+            raise SystemExit(f"VAE key mismatch: missing={len(missing)} unexpected={len(unexpected)}")
+        overrides["vae"] = vae
+    pipe = WanPipeline.from_pretrained(REPO, torch_dtype=dtype, local_files_only=True, **overrides)
     print(f"loaded pipeline in {time.time() - t0:.1f}s (class={type(pipe).__name__})", flush=True)
 
     # Override transformer weights from the exact shard the engine loads; refuse
@@ -170,7 +210,7 @@ def main() -> int:
             if k in merged:
                 raise SystemExit(f"duplicate key {k!r} across shards")
             merged[k] = v
-    merged = {k: v.to(dtype) for k, v in merged.items()}
+    merged = {k: v.to(dtype) for k, v in merged.items() if SPARSE_ONLY_KEY not in k}
     missing, unexpected = pipe.transformer.load_state_dict(merged, strict=False)
     if missing or unexpected:
         print(f"  missing={len(missing)} unexpected={len(unexpected)}", flush=True)
@@ -356,8 +396,8 @@ def main() -> int:
     # clamped to [-1, 1]. ---
     vae = pipe.vae.to(dtype=torch.float32, device=device)
     vae.eval()
-    mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, Z_DIM, 1, 1, 1)
-    std = torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device).view(1, Z_DIM, 1, 1, 1)
+    mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, z_dim, 1, 1, 1)
+    std = torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device).view(1, z_dim, 1, 1, 1)
     z = pre_vae.float().to(device) * std + mean
     with torch.no_grad():
         video = vae.decode(z, return_dict=False)[0]  # [1, 3, frames, H, W]

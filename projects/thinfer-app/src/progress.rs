@@ -44,6 +44,27 @@ pub trait ProgressSink {
     fn cancelled(&self) -> bool {
         false
     }
+    /// Take ownership of the finished artifact's bytes (encoded PNG / MP4)
+    /// before anything is written to `path`. `Ok(true)` = the sink stored it
+    /// (a server seals it under the job key in RAM and writes only
+    /// ciphertext); `Ok(false)` (the default, the CLI) = the caller writes the
+    /// plaintext file itself.
+    fn artifact(&self, _path: &std::path::Path, _bytes: &[u8]) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+/// Deliver a finished artifact: through the sink when it takes it, else as a
+/// plain file at `path`.
+pub fn write_artifact(
+    sink: &dyn ProgressSink,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if sink.artifact(path, bytes)? {
+        return Ok(());
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// A sink that drops everything. Useful for non-interactive callers and tests.

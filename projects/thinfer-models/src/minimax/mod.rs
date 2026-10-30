@@ -22,6 +22,7 @@
 pub mod adaln;
 pub mod audio_vae;
 pub mod dit;
+pub mod fasth3;
 pub mod loader;
 pub mod lora;
 pub mod manifest;
@@ -31,6 +32,7 @@ pub mod rope3d;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod video_vae;
+pub mod vsa;
 
 /// DiT architecture constants, from the upstream checkpoint `config.json`
 /// (`MiniMaxH3DiTModel`). Field names follow the ORIGINAL checkpoint, not the
@@ -59,6 +61,17 @@ pub struct DitConfig {
     pub adaln_out: usize,
     /// `2 * hidden` = the final layer's `shift`/`scale`.
     pub final_adaln_out: usize,
+    /// Rank-reduced AdaLN (FastH3 Trim): every projection reads the shared
+    /// `adaln_basis(silu(temb))` (`rank` wide, no further silu) instead of
+    /// `silu(temb)`. `None` = the released full-width projections.
+    pub adaln_rank: Option<usize>,
+    /// Video sparse attention: the fraction of video key tiles each video
+    /// query tile drops (FastH3's `vsa_sparsity`, trained with 64-row tiles
+    /// and a learned compression gate). `None` = dense attention.
+    pub vsa_sparsity: Option<f64>,
+    /// Blocks of the released 50-block H3 that a trimmed checkpoint removed
+    /// (the rest are renumbered densely). Maps base-H3 adapters onto it.
+    pub dropped_blocks: &'static [usize],
     /// Frequencies per rotary axis. Three axes share one `inv_freq` buffer.
     pub rope_inv_freq_len: usize,
     pub rope_theta: f32,
@@ -87,12 +100,38 @@ impl DitConfig {
             time_embed_dim: 2688,
             adaln_out: 96768,
             final_adaln_out: 10752,
+            adaln_rank: None,
+            vsa_sparsity: None,
+            dropped_blocks: &[],
             rope_inv_freq_len: 16,
             rope_theta: 10_000.0,
             norm_eps: 1e-5,
             qk_norm_eps: 1e-5,
             final_norm_eps: 1e-5,
         }
+    }
+
+    /// FastVideo FastH3-Trim: the H3 topology with 8 blocks pruned (42 kept,
+    /// renumbered) and the per-block AdaLN projections reduced to rank 16 over a
+    /// shared basis.
+    pub const fn fasth3_trim() -> Self {
+        let mut c = Self::h3_33b();
+        c.n_layers = 42;
+        c.adaln_rank = Some(16);
+        // `fastvideo_inference.json`: VIDEO_SPARSE_ATTN_H3, tile 64.
+        c.vsa_sparsity = Some(0.8);
+        // `transformer/config.json` keeps every block but these.
+        c.dropped_blocks = &[6, 7, 9, 13, 15, 16, 22, 23];
+        c
+    }
+
+    /// This checkpoint's index for block `i` of the released 50-block H3, or
+    /// `None` when the trim removed it.
+    pub fn block_for_base(&self, i: usize) -> Option<usize> {
+        if self.dropped_blocks.contains(&i) || i >= self.n_layers + self.dropped_blocks.len() {
+            return None;
+        }
+        Some(i - self.dropped_blocks.iter().filter(|&&d| d < i).count())
     }
 
     /// Attention inner width (`n_heads * head_dim`). NB this is 7168, which is

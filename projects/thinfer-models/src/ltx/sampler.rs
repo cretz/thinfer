@@ -396,6 +396,34 @@ mod tests {
     }
 
     #[test]
+    fn refine_sigmas_covers_the_two_stage_tail() {
+        // Stage 2 is the schedule HQ audio most needs: it renoises the audio back
+        // to 0.909375 and has only 3 coarse steps to resolve it. Refining takes it
+        // to 11, so a two-stage HQ run is 16+11 = 27 steps against an 8+3 = 11
+        // baseline (~2.45x denoise). Pinned so the cost and the user-facing note
+        // cannot drift silently.
+        let r = refine_sigmas(&STAGE2_SIGMAS, AUDIO_HQ_MAX_DSIGMA);
+        assert_eq!(r.len() - 1, 11);
+        assert_eq!(r.first(), Some(&STAGE2_SIGMAS[0]));
+        assert_eq!(r.last(), Some(&0.0));
+        for w in r.windows(2) {
+            assert!(w[0] > w[1], "not decreasing: {} -> {}", w[0], w[1]);
+            assert!(w[0] - w[1] <= AUDIO_HQ_MAX_DSIGMA + 1e-6);
+        }
+        for &a in &STAGE2_SIGMAS {
+            assert!(
+                r.iter().any(|&x| (x - a).abs() < 1e-6),
+                "anchor {a} dropped from refined stage-2 schedule"
+            );
+        }
+        // Stage 1 under the shipped cap, for the other half of the note.
+        assert_eq!(
+            refine_sigmas(&STAGE1_SIGMAS, AUDIO_HQ_MAX_DSIGMA).len() - 1,
+            16
+        );
+    }
+
+    #[test]
     fn refine_sigmas_leaves_fine_schedule_untouched() {
         // A schedule already within the cap gains no substeps.
         let fine = [1.0, 0.95, 0.9, 0.0];

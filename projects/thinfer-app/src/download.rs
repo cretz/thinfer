@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use thinfer_core::manifest::{FileRef, ModelManifest};
 use thinfer_native::cache::{self, DownloadProgress};
+use thinfer_native::sources;
 
 /// Supplies a per-file [`DownloadProgress`] sink. Returning `None` for a file
 /// downloads it without progress.
@@ -26,15 +27,19 @@ impl DownloadReporter for NullReporter {
     }
 }
 
-/// Which of `files` are not yet in the HF cache (no network touched).
-pub fn missing(files: &[FileRef]) -> Vec<FileRef> {
-    cache::resolve_all(files.iter()).1
+/// Which of `files` are not yet in the HF cache (no network touched). Errors
+/// first, with the fix, on a weight slot the user's sources leave unfilled.
+pub fn missing(files: &[FileRef]) -> Result<Vec<FileRef>, String> {
+    for f in files {
+        sources::require(f)?;
+    }
+    Ok(cache::resolve_all(files.iter()).1)
 }
 
 /// Download every file in `files` that is missing, reporting per-file progress
 /// through `reporter`. Already-cached files are skipped.
 pub async fn ensure(files: &[FileRef], reporter: &dyn DownloadReporter) -> Result<(), String> {
-    for f in missing(files) {
+    for f in missing(files)? {
         cache::download_with_progress(&f, reporter.for_file(&f))
             .await
             .map_err(|e| format!("{e:?}"))?;

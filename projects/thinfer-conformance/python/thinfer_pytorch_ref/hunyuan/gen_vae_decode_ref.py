@@ -9,7 +9,7 @@ applies the same host-side scalar before its decode, so both consume the same
 latent.bin and run the identical conv network.
 
 The Hunyuan decoder DIVERGES from the engine's Wan decoder in two ways the engine
-fork must reproduce (see hunyuan-plan.md): mid.attn_1 is CAUSAL spatio-temporal
+fork must reproduce: mid.attn_1 is CAUSAL spatio-temporal
 (frame i attends 0..i over f*h*w tokens), and Upsample = one causal conv ->
 out*factor then pixelshuffle (first latent frame spatial-only). Those taps are
 dumped per-stage for bisection.

@@ -35,12 +35,12 @@ use thinfer_core::residency::{
 use thinfer_core::tensor::Shape;
 use thinfer_core::trace::{self, PHASE};
 use thinfer_core::weight::{WeightId, WeightSource};
-use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
+use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace, WsBuf};
 use tracing::Instrument;
 
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, BlockWgslConfigs, alloc_act, alloc_matmul_out_buf, op_rmsnorm,
-    op_sdpa,
+    op_sdpa_f16,
 };
 use crate::common::seq;
 use crate::z_image::text_encoder::{LoadError, register_one};
@@ -286,8 +286,6 @@ pub struct BlockHandles {
 pub struct BlockViews<'a> {
     norm1: GpuView<'a>,
     norm2: GpuView<'a>,
-    scale1: GpuView<'a>,
-    scale2: GpuView<'a>,
     to_qkv: GpuView<'a>,
     to_qkv_bias: GpuView<'a>,
     to_out: GpuView<'a>,
@@ -302,8 +300,6 @@ pub struct BlockViews<'a> {
 pub struct BlockBufs {
     pub norm1: BufRef,
     pub norm2: BufRef,
-    pub scale1: BufRef,
-    pub scale2: BufRef,
     pub to_qkv: BufRef,
     pub to_qkv_bias: BufRef,
     pub to_out: BufRef,
@@ -315,6 +311,18 @@ pub struct BlockBufs {
 }
 
 impl BlockHandles {
+    /// OS readahead for this block's matmul weights (see
+    /// [`WeightResidency::hint_read`]), issued ahead of its acquire.
+    pub async fn hint_read<S: WeightSource>(
+        &self,
+        residency: &WeightResidency<S>,
+    ) -> Result<(), S::Error> {
+        for h in [self.to_qkv, self.to_out, self.w1, self.w2] {
+            residency.hint_read(h).await?;
+        }
+        Ok(())
+    }
+
     pub async fn acquire<'a, S: WeightSource>(
         &self,
         residency: &'a WeightResidency<S>,
@@ -323,8 +331,6 @@ impl BlockHandles {
         Ok(BlockViews {
             norm1: residency.acquire(self.norm1, backend).await?,
             norm2: residency.acquire(self.norm2, backend).await?,
-            scale1: residency.acquire(self.scale1, backend).await?,
-            scale2: residency.acquire(self.scale2, backend).await?,
             to_qkv: residency.acquire(self.to_qkv, backend).await?,
             to_qkv_bias: residency.acquire(self.to_qkv_bias, backend).await?,
             to_out: residency.acquire(self.to_out, backend).await?,
@@ -342,8 +348,6 @@ impl BlockViews<'_> {
         BlockBufs {
             norm1: self.norm1.buf(),
             norm2: self.norm2.buf(),
-            scale1: self.scale1.buf(),
-            scale2: self.scale2.buf(),
             to_qkv: self.to_qkv.buf(),
             to_qkv_bias: self.to_qkv_bias.buf(),
             to_out: self.to_out.buf(),
@@ -469,15 +473,16 @@ pub struct DecoderPipelines {
     pub silu_mul_fused: WgpuPipeline,
 }
 
-/// Pipeline cfgs for the decoder. The reference runs both block norms and the
-/// Q/K norm in f32 whatever the compute dtype, and this is a 36-layer stack
-/// whose output IS the picture, so the whole decoder runs f32 acts against
-/// bf16 weights (the fp16 file uploads as bf16 like every other float source).
+/// Pipeline cfgs for the decoder: bf16 acts against bf16 weights (the fp16
+/// file uploads as bf16 like every other float source), the mixed-precision
+/// SDPA (normed Q/K/V cast to f16). FastVideo itself decodes under fp16
+/// autocast; f32 acts kept every matmul and the attention off the CUDA fast
+/// paths (~40x slower than the FLOP count warrants), with no parity gain.
 pub fn decoder_cfgs() -> BlockWgslConfigs {
     use thinfer_core::ops::{ActDtype, WeightDtype, WgslConfig};
     let ops = WgslConfig {
         bf16_quant_writes: false,
-        act_dtype: ActDtype::F32,
+        act_dtype: ActDtype::Bf16,
         weight_dtype: WeightDtype::Bf16,
     };
     BlockWgslConfigs {
@@ -498,7 +503,7 @@ pub fn decoder_cfgs() -> BlockWgslConfigs {
         },
         coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: false,
-        fast_sdpa: false,
+        fast_sdpa: true,
         decode_sdpa: false,
     }
 }
@@ -563,37 +568,61 @@ impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for DecodeError<S
     }
 }
 
-/// Read the learned register tokens and the `mask_token` back to the host once.
+/// Decoder parameters the kernels read as ACTIVATIONS, held on the host in f32
+/// and uploaded per pass in the act dtype.
 ///
-/// They are `suffix_tokens() * dim` values total and are identical for every
-/// tile and every pass, so they ride in the uploaded token buffer rather than
-/// costing a per-pass GPU scatter. `mask_token` is all-zero in the shipped file
-/// but is read rather than assumed: it is a trained parameter slot.
-pub async fn load_suffix_tokens<S: WeightSource>(
+/// `bcast_fma` / `bcast_modulate` read their broadcast vectors in the pipeline's
+/// act dtype, not as weights. The decoder runs f32 acts over bf16 weights, so
+/// binding the residency's bf16 `scale1`/`scale2`/`norm_out` buffers directly
+/// would reinterpret bf16 pairs as f32 (that bug turned every decode to noise).
+pub struct DecoderConsts {
+    /// Register tokens then `mask_token`, `suffix_tokens() * dim`. They ride in
+    /// the uploaded token buffer rather than costing a per-pass GPU scatter.
+    /// `mask_token` is all-zero in the shipped file but is read rather than
+    /// assumed: it is a trained parameter slot.
+    pub suffix: Vec<f32>,
+    /// Per block: the attention and feed-forward residual scales.
+    scales: Vec<[Vec<f32>; 2]>,
+    /// The output LayerNorm's gain and bias.
+    norm_out: [Vec<f32>; 2],
+}
+
+/// Read every [`DecoderConsts`] parameter back to the host once.
+pub async fn load_consts<S: WeightSource>(
     cfg: &VideoVaeConfig,
     backend: &WgpuBackend,
     residency: &WeightResidency<S>,
     handles: &DecoderHandles,
-) -> Result<Vec<f32>, DecodeError<S::Error>> {
+) -> Result<DecoderConsts, DecodeError<S::Error>> {
     let dim = cfg.dim();
-    let mut out = Vec::with_capacity(cfg.suffix_tokens() * dim);
-    for (handle, rows) in [
-        (handles.register_tokens, cfg.decoder_register_tokens),
-        (handles.mask_token, 1),
-    ] {
-        let view = residency.acquire(handle, backend).await?;
-        let buf = view.buf();
-        let bytes = backend
-            .read_buffer(buf.id, buf.offset, (rows * dim * 2) as u64)
-            .await?;
-        out.extend(
-            bytes
+    let read =
+        async |handle: WeightHandle, len: usize| -> Result<Vec<f32>, DecodeError<S::Error>> {
+            let view = residency.acquire(handle, backend).await?;
+            let buf = view.buf();
+            let bytes = backend
+                .read_buffer(buf.id, buf.offset, (len * 2) as u64)
+                .await?;
+            Ok(bytes
                 .chunks_exact(2)
-                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()),
-        );
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect())
+        };
+    let mut suffix = read(handles.register_tokens, cfg.decoder_register_tokens * dim).await?;
+    suffix.extend(read(handles.mask_token, dim).await?);
+    debug_assert_eq!(suffix.len(), cfg.suffix_tokens() * dim);
+    let mut scales = Vec::with_capacity(handles.blocks.len());
+    for b in &handles.blocks {
+        scales.push([read(b.scale1, dim).await?, read(b.scale2, dim).await?]);
     }
-    debug_assert_eq!(out.len(), cfg.suffix_tokens() * dim);
-    Ok(out)
+    let norm_out = [
+        read(handles.norm_out, dim).await?,
+        read(handles.norm_out_bias, dim).await?,
+    ];
+    Ok(DecoderConsts {
+        suffix,
+        scales,
+        norm_out,
+    })
 }
 
 /// Matmul then broadcast the layer's bias over the output rows.
@@ -662,6 +691,7 @@ fn block_forward<'wsp>(
     ones: BatchBuf<'wsp>,
     y_out: BatchBuf<'wsp>,
     bufs: &BlockBufs,
+    [scale1_w, scale2_w]: [BatchBuf<'wsp>; 2],
     batch: u32,
     tokens: u32,
 ) -> Result<(), WgpuError> {
@@ -676,8 +706,6 @@ fn block_forward<'wsp>(
     let x_in = ActBuf::dense(x_in);
     let norm1_w = scope.import_copy(bufs.norm1);
     let norm2_w = scope.import_copy(bufs.norm2);
-    let scale1_w = scope.import_copy(bufs.scale1);
-    let scale2_w = scope.import_copy(bufs.scale2);
 
     // `x + scale * y`, the learned per-channel residual weighting.
     let scaled_residual = |x: BatchBuf<'wsp>,
@@ -754,7 +782,7 @@ fn block_forward<'wsp>(
     let sa = alloc_act(scope, p, rows, dim)?;
     // Every tile is the same length and carries no padding, so no mask.
     let dummy_mask = scope.alloc(4)?;
-    op_sdpa(
+    op_sdpa_f16(
         scope,
         p,
         qr,
@@ -795,6 +823,235 @@ fn block_forward<'wsp>(
     scaled_residual(after_attn.data, scale2_w, down, y_out)
 }
 
+/// Batched within-tile attention as block-sparse 64-row tiles: every tile
+/// of a pass is chunked into its own 64-row tiles, and each query tile lists
+/// exactly its own tile's key tiles (block-diagonal), which is the batched
+/// SDPA's contract (attention never crosses tiles, no mask).
+struct TilePlan {
+    geometry: WsBuf<WgpuBackend>,
+    lists: WsBuf<WgpuBackend>,
+    n_tiles: u32,
+}
+
+impl TilePlan {
+    fn new(
+        backend: &WgpuBackend,
+        scratch: &Workspace<WgpuBackend>,
+        batch: usize,
+        tokens: usize,
+        heads: usize,
+    ) -> Result<Self, WgpuError> {
+        let items: Vec<(usize, usize)> = (0..batch).map(|b| (b * tokens, tokens)).collect();
+        let g = super::vsa::VsaGeometry::new(&items, 0, [0, 0, 0]);
+        let (t, per) = (g.n_tiles(), tokens.div_ceil(super::vsa::TILE));
+        let mut lists = vec![0u32; heads * t * t + heads * t];
+        for h in 0..heads {
+            for i in 0..t {
+                let first = i / per * per;
+                for j in 0..per {
+                    lists[(h * t + i) * t + j] = (first + j) as u32;
+                }
+                lists[heads * t * t + h * t + i] = per as u32;
+            }
+        }
+        let upload = |bytes: &[u8]| -> Result<WsBuf<WgpuBackend>, WgpuError> {
+            let buf = scratch.alloc(bytes.len() as u64)?;
+            backend.write_buffer(buf.id(), 0, bytes)?;
+            Ok(buf)
+        };
+        let lists: Vec<u8> = lists.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Ok(Self {
+            geometry: upload(&g.bytes())?,
+            lists: upload(&lists)?,
+            n_tiles: t as u32,
+        })
+    }
+}
+
+/// [`block_forward`] as ONE deferred accelerator sequence: no backend round
+/// trips between ops, and the caller streams the next block's weights before
+/// the scope's submit waits. Same ops and bf16 rounding points (RMSNorm is
+/// `NormModulate` with a zero scale and shift, the learned residual scales are
+/// `GateAdd`); attention runs as [`TilePlan`]'s block-diagonal tiles. Buffers
+/// enter by value so the scope can outlive this pass's locals. `false` =
+/// nothing enqueued: run [`block_forward`].
+#[allow(clippy::too_many_arguments)]
+fn block_forward_accel<'s>(
+    scope: &BatchScope<'s, WgpuBackend>,
+    cfg: &VideoVaeConfig,
+    pipelines: &DecoderPipelines,
+    [x_in, freqs, zeros, y_out, scale1, scale2]: [BufRef; 6],
+    bufs: &BlockBufs,
+    plan: &TilePlan,
+    batch: u32,
+    tokens: u32,
+) -> Result<bool, WgpuError> {
+    use thinfer_core::backend::{ElementwiseOp, RowSegments, TileAttnShape};
+    let p = &pipelines.block;
+    let rows = batch * tokens;
+    let dim = cfg.dim() as u32;
+    let hd = cfg.decoder_head_dim as u32;
+    let heads = cfg.decoder_heads as u32;
+    let ffn = cfg.ffn_inner() as u32;
+    let eps = cfg.decoder_norm_eps;
+    let mm = &p.matmul_qkv;
+    let Some(acc) = scope.accelerator() else {
+        return Ok(false);
+    };
+    if p.act_dtype != thinfer_core::ops::ActDtype::Bf16
+        || !acc.accepts_elementwise()
+        || !acc.accepts_tile_attention(hd)
+        || [3 * dim, dim, 2 * ffn]
+            .iter()
+            .any(|&n| !scope.accepts_gemm(mm, rows, n))
+        || !scope.accel_begin()?
+    {
+        return Ok(false);
+    }
+
+    // Past this point work is enqueued, so a decline is a broken accept
+    // contract, not a fallback.
+    let ran = |ok: bool, what: &str| assert!(ok, "accelerator declined {what} after accepting it");
+    let addr = |b: BatchBuf<'s>| {
+        scope
+            .accel_addr(b)
+            .expect("workspace and weights are accelerator-addressable")
+    };
+    let at = |r: BufRef| addr(scope.import_copy(r));
+    let act = |elems: u32| scope.alloc(elems as u64 * p.act_bytes(1));
+    let one = |a: BufRef, b: Option<BufRef>| RowSegments {
+        n: 1,
+        end: [rows, 0, 0, 0],
+        a: [at(a), 0, 0, 0],
+        b: [b.map_or(0, at), 0, 0, 0],
+    };
+    let mm_bias = |src: BatchBuf<'s>, w: BufRef, bias: BufRef, n: u32, k: u32| {
+        let raw = act(rows * n)?;
+        ran(
+            scope.try_gemm(mm, src, scope.import_copy(w), raw, rows, n, k)?,
+            "gemm",
+        );
+        let out = act(rows * n)?;
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::AddBias {
+                x: addr(raw),
+                bias: at(bias),
+                out: addr(out),
+                rows,
+                dim: n,
+            }),
+            "bias",
+        );
+        Ok::<_, WgpuError>(out)
+    };
+
+    // --- attention ---
+    let n1 = act(rows * dim)?;
+    ran(
+        scope.accel_elementwise(&ElementwiseOp::NormModulate {
+            x: at(x_in),
+            w: at(bufs.norm1),
+            out: addr(n1),
+            rows,
+            dim,
+            eps,
+            seg: one(zeros, Some(zeros)),
+        }),
+        "norm1",
+    );
+    let qkv = mm_bias(n1, bufs.to_qkv, bufs.to_qkv_bias, 3 * dim, dim)?;
+    let (q, k, v) = (act(rows * dim)?, act(rows * dim)?, act(rows * dim)?);
+    ran(
+        scope.accel_elementwise(&ElementwiseOp::QkNormRope {
+            headwise: true,
+            qkv: addr(qkv),
+            q_norm: 0,
+            k_norm: 0,
+            freqs: at(freqs),
+            q: addr(q),
+            k: addr(k),
+            v: addr(v),
+            rows,
+            heads,
+            head_dim: hd,
+            rot_pairs: (cfg.rotary_dim() / 2) as u32,
+            eps,
+        }),
+        "qk norm + rope",
+    );
+    let sa = act(rows * dim)?;
+    ran(
+        scope.try_tile_attention(
+            &TileAttnShape {
+                rows,
+                heads,
+                head_dim: hd,
+                n_tiles: plan.n_tiles,
+                scale: 1.0 / (cfg.decoder_head_dim as f32).sqrt(),
+            },
+            q,
+            k,
+            v,
+            sa,
+            scope.import_copy(plan.geometry.as_buf_ref()),
+            scope.import_copy(plan.lists.as_buf_ref()),
+        )?,
+        "tile attention",
+    );
+    let proj = mm_bias(sa, bufs.to_out, bufs.to_out_bias, dim, dim)?;
+    let after_attn = act(rows * dim)?;
+    ran(
+        scope.accel_elementwise(&ElementwiseOp::GateAdd {
+            x: at(x_in),
+            y: addr(proj),
+            out: addr(after_attn),
+            rows,
+            dim,
+            seg: one(scale1, None),
+        }),
+        "scale1 residual",
+    );
+
+    // --- feed-forward ---
+    let n2 = act(rows * dim)?;
+    ran(
+        scope.accel_elementwise(&ElementwiseOp::NormModulate {
+            x: addr(after_attn),
+            w: at(bufs.norm2),
+            out: addr(n2),
+            rows,
+            dim,
+            eps,
+            seg: one(zeros, Some(zeros)),
+        }),
+        "norm2",
+    );
+    let fused = mm_bias(n2, bufs.w1, bufs.w1_bias, 2 * ffn, dim)?;
+    let gu = act(rows * ffn)?;
+    ran(
+        scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
+            x: addr(fused),
+            out: addr(gu),
+            rows,
+            h: ffn,
+        }),
+        "swiglu",
+    );
+    let down = mm_bias(gu, bufs.w2, bufs.w2_bias, dim, ffn)?;
+    ran(
+        scope.accel_elementwise(&ElementwiseOp::GateAdd {
+            x: addr(after_attn),
+            y: addr(down),
+            out: at(y_out),
+            rows,
+            dim,
+            seg: one(scale2, None),
+        }),
+        "scale2 residual",
+    );
+    Ok(true)
+}
+
 /// Decode `batch` equally-shaped latent tiles in one batched ViT pass.
 ///
 /// Batching is what makes this affordable: the 36-layer stack is ~4.8 GiB of
@@ -814,36 +1071,67 @@ pub async fn decode_tiles<S: WeightSource>(
     residency: &WeightResidency<S>,
     scratch: &Workspace<WgpuBackend>,
     handles: &DecoderHandles,
-    suffix: &[f32],
+    consts: &DecoderConsts,
     latents: &[f32],
     batch: usize,
     frames: usize,
     height: usize,
     width: usize,
 ) -> Result<Vec<f32>, DecodeError<S::Error>> {
+    let passes = [TilePass { latents, batch }];
+    let mut out = decode_passes(
+        cfg, backend, pipelines, residency, scratch, handles, consts, &passes, frames, height,
+        width,
+    )
+    .await?;
+    Ok(out.pop().expect("one pass in, one out"))
+}
+
+/// One batched ViT pass: `batch` tiles' latents, `[batch, patches, channels]`.
+pub struct TilePass<'a> {
+    pub latents: &'a [f32],
+    pub batch: usize,
+}
+
+/// [`decode_tiles`] over several passes of equally-shaped tiles, LAYER-MAJOR:
+/// each block's weights stream once and every pass runs through it before the
+/// next block, instead of re-streaming the ~4.8 GiB stack per pass. Passes are
+/// independent (attention stays within a tile), so this is exactly the
+/// pass-by-pass result; it only costs keeping every pass's activations live.
+#[allow(clippy::too_many_arguments)]
+pub async fn decode_passes<S: WeightSource>(
+    cfg: &VideoVaeConfig,
+    backend: &WgpuBackend,
+    pipelines: &DecoderPipelines,
+    residency: &WeightResidency<S>,
+    scratch: &Workspace<WgpuBackend>,
+    handles: &DecoderHandles,
+    consts: &DecoderConsts,
+    passes: &[TilePass<'_>],
+    frames: usize,
+    height: usize,
+    width: usize,
+) -> Result<Vec<Vec<f32>>, DecodeError<S::Error>> {
     let p = &pipelines.block;
     let act = p.act_dtype;
     let dim = cfg.dim();
     let lat_c = cfg.latent_channels;
     let n_patches = frames * height * width;
     let tokens = n_patches + cfg.suffix_tokens();
-    let rows = batch * tokens;
-    debug_assert_eq!(latents.len(), batch * n_patches * lat_c);
 
-    // Rotary frequencies are per-token and identical across tiles, so the
-    // per-pass buffer is the one grid repeated `batch` times.
+    // Rotary frequencies are per-token and identical across tiles, so a
+    // pass's buffer is the one grid repeated `batch` times.
     let positions = build_positions(cfg, frames, height, width);
     let one_tile = build_freqs(cfg, &positions);
-    let mut freqs = Vec::with_capacity(batch * one_tile.len());
-    for _ in 0..batch {
-        freqs.extend_from_slice(&one_tile);
-    }
-    let freqs_buf = scratch.alloc(seq::freqs_upload_bytes(act, &freqs).len() as u64)?;
-    backend.write_buffer(freqs_buf.id(), 0, &seq::freqs_upload_bytes(act, &freqs))?;
 
-    let ones_host = vec![1.0f32; cfg.decoder_head_dim];
-    let ones_buf = scratch.alloc(seq::act_upload_bytes(act, &ones_host).len() as u64)?;
-    backend.write_buffer(ones_buf.id(), 0, &seq::act_upload_bytes(act, &ones_host))?;
+    // The unaffine Q/K norm's gain. `rmsnorm` reads its gain as a WEIGHT (the
+    // decoder's bf16 weight dtype), not as an act: f32 bytes here would read
+    // back as alternating 0 / 1 and zero half of every head.
+    let ones_bytes: Vec<u8> = (0..cfg.decoder_head_dim)
+        .flat_map(|_| half::bf16::ONE.to_le_bytes())
+        .collect();
+    let ones_buf = scratch.alloc(ones_bytes.len() as u64)?;
+    backend.write_buffer(ones_buf.id(), 0, &ones_bytes)?;
 
     // Zero vector: `bcast_add` against it is an aligned row-block copy, which
     // is how the compact embedder output lands in each tile's token slice.
@@ -851,21 +1139,45 @@ pub async fn decode_tiles<S: WeightSource>(
     let zeros_buf = scratch.alloc(seq::act_upload_bytes(act, &zeros_host).len() as u64)?;
     backend.write_buffer(zeros_buf.id(), 0, &seq::act_upload_bytes(act, &zeros_host))?;
 
-    let latent_buf = scratch.alloc(p.act_bytes((batch * n_patches * lat_c) as u32))?;
-    backend.write_buffer(latent_buf.id(), 0, &seq::act_upload_bytes(act, latents))?;
+    // --- per pass: upload, then embed (post_quant_conv -> x_embedder ->
+    // scatter into token slices). The suffix rows are written once and never
+    // touched by the embedder, which only fills each tile's leading rows. ---
+    let x_bytes_of = |batch: usize| p.act_bytes((batch * tokens * dim) as u32);
+    let mut freqs_bufs = Vec::with_capacity(passes.len());
+    let mut plans = Vec::with_capacity(passes.len());
+    let mut curs = Vec::with_capacity(passes.len());
+    for pass in passes {
+        let batch = pass.batch;
+        debug_assert_eq!(pass.latents.len(), batch * n_patches * lat_c);
+        let mut freqs = Vec::with_capacity(batch * one_tile.len());
+        for _ in 0..batch {
+            freqs.extend_from_slice(&one_tile);
+        }
+        let freqs_bytes = seq::freqs_upload_bytes(act, &freqs);
+        let freqs_buf = scratch.alloc(freqs_bytes.len() as u64)?;
+        backend.write_buffer(freqs_buf.id(), 0, &freqs_bytes)?;
+        freqs_bufs.push(freqs_buf);
+        plans.push(TilePlan::new(
+            backend,
+            scratch,
+            batch,
+            tokens,
+            cfg.decoder_heads,
+        )?);
 
-    // Token buffer. The suffix rows are written once here and never touched by
-    // the embedder, which only fills each tile's leading `n_patches` rows.
-    let x_bytes = p.act_bytes((rows * dim) as u32);
-    let x_buf = scratch.alloc(x_bytes)?;
-    let suffix_bytes = seq::act_upload_bytes(act, suffix);
-    for i in 0..batch {
-        let off = ((i * tokens + n_patches) * dim) as u64 * p.act_bytes(1);
-        backend.write_buffer(x_buf.id(), off, &suffix_bytes)?;
-    }
+        let latent_buf = scratch.alloc(p.act_bytes((batch * n_patches * lat_c) as u32))?;
+        backend.write_buffer(
+            latent_buf.id(),
+            0,
+            &seq::act_upload_bytes(act, pass.latents),
+        )?;
+        let x_buf = scratch.alloc(x_bytes_of(batch))?;
+        let suffix_bytes = seq::act_upload_bytes(act, &consts.suffix);
+        for i in 0..batch {
+            let off = ((i * tokens + n_patches) * dim) as u64 * p.act_bytes(1);
+            backend.write_buffer(x_buf.id(), off, &suffix_bytes)?;
+        }
 
-    // --- embed: post_quant_conv -> x_embedder -> scatter into token slices ---
-    {
         let pq = residency.acquire(handles.post_quant_conv, backend).await?;
         let pq_b = residency
             .acquire(handles.post_quant_conv_bias, backend)
@@ -927,12 +1239,12 @@ pub async fn decode_tiles<S: WeightSource>(
             )?;
         }
         scope.submit_void().await?;
+        curs.push(x_buf);
     }
 
-    // --- 36 ViT blocks, weights streamed with one block of lookahead ---
-    let freqs_ref = freqs_buf.as_buf_ref();
+    // --- 36 ViT blocks, weights streamed ONCE with one block of lookahead,
+    // every pass through each block before the next ---
     let ones_ref = ones_buf.as_buf_ref();
-    let mut cur = x_buf;
     let mut pending = match handles.blocks.first() {
         Some(h) => Some(h.acquire(residency, backend).await?),
         None => None,
@@ -940,24 +1252,75 @@ pub async fn decode_tiles<S: WeightSource>(
     for idx in 0..handles.blocks.len() {
         let _guard = trace::scope!(format!("minimax.vae.block.{idx}")).entered();
         let views = pending.take().expect("pending acquire missing");
+        // Block idx+1 is acquired during this block's passes; start the OS
+        // reading idx+2 now so cold reads keep the disk queue full.
+        if let Some(h) = handles.blocks.get(idx + 2) {
+            h.hint_read(residency)
+                .await
+                .map_err(ResidencyError::<_, WgpuError>::Source)?;
+        }
         let bufs = views.bufs();
-        let cur_ref = cur.as_buf_ref();
-        let nxt = scratch.alloc(x_bytes)?;
-        let nxt_ref = nxt.as_buf_ref();
-        let scope = scratch.batch();
-        block_forward(
-            &scope,
-            cfg,
-            pipelines,
-            scope.import(&cur_ref),
-            scope.import(&freqs_ref),
-            scope.import(&ones_ref),
-            scope.import(&nxt_ref),
-            &bufs,
-            batch as u32,
-            tokens as u32,
-        )?;
-
+        let scale_bufs = upload_acts(backend, scratch, act, &consts.scales[idx])?;
+        let scale_refs = scale_bufs.each_ref().map(|b| b.as_buf_ref());
+        // Passes run as deferred accelerator sequences (one wait per pass, no
+        // per-op drains); the last pass's wait comes after the next block's
+        // weights have streamed, overlapping the two.
+        let run = async {
+            let mut nxts = Vec::with_capacity(passes.len());
+            let mut deferred = Vec::new();
+            for (((pass, cur), freqs_buf), plan) in
+                passes.iter().zip(&curs).zip(&freqs_bufs).zip(&plans)
+            {
+                let nxt = scratch.alloc(x_bytes_of(pass.batch))?;
+                let scope = scratch.batch();
+                let refs = [
+                    cur.as_buf_ref(),
+                    freqs_buf.as_buf_ref(),
+                    zeros_buf.as_buf_ref(),
+                    nxt.as_buf_ref(),
+                    scale_refs[0],
+                    scale_refs[1],
+                ];
+                let accel = block_forward_accel(
+                    &scope,
+                    cfg,
+                    pipelines,
+                    refs,
+                    &bufs,
+                    plan,
+                    pass.batch as u32,
+                    tokens as u32,
+                )?;
+                // Only the block's last pass stays in flight across the next
+                // acquire: holding every pass's intermediates at once does not
+                // fit (~0.9 GB each at 8192 tokens).
+                if accel && nxts.len() + 1 == passes.len() {
+                    deferred.push(scope);
+                } else if accel {
+                    scope.submit_void().await?;
+                } else {
+                    block_forward(
+                        &scope,
+                        cfg,
+                        pipelines,
+                        scope.import_copy(refs[0]),
+                        scope.import_copy(refs[1]),
+                        scope.import_copy(ones_ref),
+                        scope.import_copy(refs[3]),
+                        &bufs,
+                        scale_refs.map(|r| scope.import_copy(r)),
+                        pass.batch as u32,
+                        tokens as u32,
+                    )?;
+                    scope
+                        .submit_void()
+                        .instrument(tracing::debug_span!(target: PHASE, "minimax.vae.submit", idx))
+                        .await?;
+                }
+                nxts.push(nxt);
+            }
+            Ok::<_, WgpuError>((nxts, deferred))
+        };
         let next_acquire = async {
             match handles.blocks.get(idx + 1) {
                 Some(h) => Ok::<_, ResidencyError<S::Error, WgpuError>>(Some(
@@ -966,102 +1329,126 @@ pub async fn decode_tiles<S: WeightSource>(
                 None => Ok(None),
             }
         };
-        let submit = scope
-            .submit_void()
-            .instrument(tracing::debug_span!(target: PHASE, "minimax.vae.submit", idx));
-        let (submit_res, next_res) = futures::join!(submit, next_acquire);
-        submit_res?;
+        let (run_res, next_res) = futures::join!(run, next_acquire);
+        let (nxts, deferred) = run_res?;
+        for scope in deferred {
+            scope.submit_void().await?;
+        }
+        curs = nxts;
         pending = next_res?;
         drop(views);
-        cur = nxt;
     }
 
-    // --- norm_out (affine LayerNorm) -> proj_out ---
+    // --- per pass: norm_out (affine LayerNorm) -> proj_out, then read back ---
     let out_w = cfg.proj_out_dim();
-    let out_buf = scratch.alloc(p.act_bytes((rows * out_w) as u32))?;
-    {
-        let no = residency.acquire(handles.norm_out, backend).await?;
-        let no_b = residency.acquire(handles.norm_out_bias, backend).await?;
-        let po = residency.acquire(handles.proj_out, backend).await?;
-        let po_b = residency.acquire(handles.proj_out_bias, backend).await?;
+    let affine_bufs = upload_acts(backend, scratch, act, &consts.norm_out)?;
+    let [no, no_b] = affine_bufs.each_ref().map(|b| b.as_buf_ref());
+    let po = residency.acquire(handles.proj_out, backend).await?;
+    let po_b = residency.acquire(handles.proj_out_bias, backend).await?;
+    let mut outs = Vec::with_capacity(passes.len());
+    for (pass, cur) in passes.iter().zip(&curs) {
+        let batch = pass.batch;
+        let rows = batch * tokens;
+        let out_buf = scratch.alloc(p.act_bytes((rows * out_w) as u32))?;
+        {
+            let cur_ref = cur.as_buf_ref();
+            let out_ref = out_buf.as_buf_ref();
+            let scope = scratch.batch();
+            let x = scope.import(&cur_ref);
+            let normed = alloc_act(&scope, p, rows as u32, dim as u32)?;
+            let lu = {
+                let mut bytes = [0u8; 16];
+                bytes[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
+                bytes[4..8].copy_from_slice(&(dim as u32).to_le_bytes());
+                bytes[8..12].copy_from_slice(&cfg.decoder_norm_eps.to_le_bytes());
+                scope.write_uniform(&bytes)?
+            };
+            scope.layernorm::<LayerNormF32>(&p.layernorm, x, lu, normed.data, rows as u32)?;
 
-        let cur_ref = cur.as_buf_ref();
-        let out_ref = out_buf.as_buf_ref();
-        let scope = scratch.batch();
-        let x = scope.import(&cur_ref);
-        let normed = alloc_act(&scope, p, rows as u32, dim as u32)?;
-        let lu = {
-            let mut bytes = [0u8; 16];
-            bytes[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
-            bytes[4..8].copy_from_slice(&(dim as u32).to_le_bytes());
-            bytes[8..12].copy_from_slice(&cfg.decoder_norm_eps.to_le_bytes());
-            scope.write_uniform(&bytes)?
-        };
-        scope.layernorm::<LayerNormF32>(&p.layernorm, x, lu, normed.data, rows as u32)?;
+            // The file's LayerNorm is affine, and the engine's is not: apply the
+            // gain and bias as the standard broadcast modulate (bias term 0, so
+            // this is a plain `x * w + b`, not AdaLN's `1 + w`).
+            let affine = alloc_act(&scope, p, rows as u32, dim as u32)?;
+            let mu = scope.u32x4_uniform(dim as u32, 0, 0, 0)?;
+            scope.bcast_modulate::<BcastModulateF32>(
+                &p.bcast_modulate,
+                normed.data,
+                scope.import(&no),
+                scope.import(&no_b),
+                mu,
+                affine.data,
+                (rows * dim) as u32,
+            )?;
 
-        // The file's LayerNorm is affine, and the engine's is not: apply the
-        // gain and bias as the standard broadcast modulate (bias term 0, so
-        // this is a plain `x * w + b`, not AdaLN's `1 + w`).
-        let affine = alloc_act(&scope, p, rows as u32, dim as u32)?;
-        let mu = scope.u32x4_uniform(dim as u32, 0, 0, 0)?;
-        scope.bcast_modulate::<BcastModulateF32>(
-            &p.bcast_modulate,
-            normed.data,
-            scope.import_copy(no.buf()),
-            scope.import_copy(no_b.buf()),
-            mu,
-            affine.data,
-            (rows * dim) as u32,
-        )?;
+            // Matmul into scratch, then bias into the readback buffer: one buffer
+            // cannot be both operands of a single dispatch.
+            let mm_out = alloc_matmul_out_buf(&scope, p, (rows * out_w) as u32)?;
+            let dims = scope.u32x4_uniform(rows as u32, out_w as u32, dim as u32, 0)?;
+            Block::dispatch_matmul_site(
+                &scope,
+                p,
+                affine,
+                scope.import_copy(po.buf()),
+                mm_out,
+                dims,
+                p.matmul_i8_qkv.as_ref(),
+                p.dequant_i8_qkv.as_ref(),
+                None,
+                &p.matmul_qkv,
+                &p.matmuls.qkv,
+                rows as u32,
+                out_w as u32,
+                dim as u32,
+            )?;
+            let bu = scope.u32x4_uniform(out_w as u32, 0, 0, 0)?;
+            scope.bcast_add::<BcastAddF32>(
+                &p.bcast_add,
+                mm_out,
+                scope.import_copy(po_b.buf()),
+                bu,
+                scope.import(&out_ref),
+                (rows * out_w) as u32,
+            )?;
+            scope.submit_void().await?;
+        }
 
-        // Matmul into scratch, then bias into the readback buffer: one buffer
-        // cannot be both operands of a single dispatch.
-        let scratch = alloc_matmul_out_buf(&scope, p, (rows * out_w) as u32)?;
-        let dims = scope.u32x4_uniform(rows as u32, out_w as u32, dim as u32, 0)?;
-        Block::dispatch_matmul_site(
-            &scope,
-            p,
-            affine,
-            scope.import_copy(po.buf()),
-            scratch,
-            dims,
-            p.matmul_i8_qkv.as_ref(),
-            p.dequant_i8_qkv.as_ref(),
-            None,
-            &p.matmul_qkv,
-            &p.matmuls.qkv,
-            rows as u32,
-            out_w as u32,
-            dim as u32,
-        )?;
-        let bu = scope.u32x4_uniform(out_w as u32, 0, 0, 0)?;
-        scope.bcast_add::<BcastAddF32>(
-            &p.bcast_add,
-            scratch,
-            scope.import_copy(po_b.buf()),
-            bu,
-            scope.import(&out_ref),
-            (rows * out_w) as u32,
-        )?;
-        scope.submit_void().await?;
+        // Drop the suffix rows: they exist only to be attended to.
+        let bytes = backend
+            .read_buffer(out_buf.id(), 0, p.act_bytes((rows * out_w) as u32))
+            .await?;
+        let all = seq::act_readback_to_f32(act, &bytes, rows * out_w);
+        let mut kept = Vec::with_capacity(batch * n_patches * out_w);
+        for i in 0..batch {
+            let base = i * tokens * out_w;
+            kept.extend_from_slice(&all[base..base + n_patches * out_w]);
+        }
+        outs.push(kept);
     }
-
-    // Drop the suffix rows: they exist only to be attended to.
-    let bytes = backend
-        .read_buffer(out_buf.id(), 0, p.act_bytes((rows * out_w) as u32))
-        .await?;
-    let all = seq::act_readback_to_f32(act, &bytes, rows * out_w);
-    let mut kept = Vec::with_capacity(batch * n_patches * out_w);
-    for i in 0..batch {
-        let base = i * tokens * out_w;
-        kept.extend_from_slice(&all[base..base + n_patches * out_w]);
-    }
-    Ok(kept)
+    Ok(outs)
 }
 
-/// Token budget for one batched ViT pass. The stack is ~4.8 GiB of weights, so
-/// bigger passes amortize streaming better, but every block holds a
-/// `rows x 2 * ffn_inner` intermediate, which is what actually caps this.
+/// Upload host vectors as act-dtype scratch buffers (see [`DecoderConsts`]).
+fn upload_acts<const N: usize>(
+    backend: &WgpuBackend,
+    scratch: &Workspace<WgpuBackend>,
+    act: thinfer_core::ops::ActDtype,
+    host: &[Vec<f32>; N],
+) -> Result<[WsBuf<WgpuBackend>; N], WgpuError> {
+    let mut out = Vec::with_capacity(N);
+    for v in host {
+        let bytes = seq::act_upload_bytes(act, v);
+        let buf = scratch.alloc(bytes.len() as u64)?;
+        backend.write_buffer(buf.id(), 0, &bytes)?;
+        out.push(buf);
+    }
+    Ok(out.try_into().unwrap_or_else(|_| unreachable!()))
+}
+
+/// Token budget for one batched ViT pass. Weights stream once per decode
+/// whatever the pass size ([`decode_passes`] is layer-major), so this only
+/// bounds the `rows x 2 * ffn_inner` intermediate every pass holds. Measured:
+/// 16384 decodes ~3s SLOWER than 8192 at 640x352x124 (fewer, bigger passes
+/// do not beat the per-pass overhead they save).
 pub const MAX_TOKENS_PER_PASS: usize = 8192;
 
 /// Tiles per pass at this tile shape, at least one.
@@ -1069,12 +1456,174 @@ fn tiles_per_pass(tokens_per_tile: usize) -> usize {
     (MAX_TOKENS_PER_PASS / tokens_per_tile.max(1)).max(1)
 }
 
+/// A temporal chunk's spatial tiling: tile origins, lengths' shared latent
+/// extent and the blend overlaps. Every tile in the grid shares one latent
+/// extent, which is what lets a pass batch them against one set of rotary
+/// frequencies, and every chunk of one decode shares the grid.
+struct ClipTiles {
+    ys: Vec<usize>,
+    xs: Vec<usize>,
+    y_ov: Vec<usize>,
+    x_ov: Vec<usize>,
+    th: usize,
+    tw: usize,
+}
+
+impl ClipTiles {
+    fn new(cfg: &VideoVaeConfig, policy: TilePolicy, lat_height: usize, lat_width: usize) -> Self {
+        let ratio = cfg.spatial_compression;
+        let (ys, y_lens, y_ov) = split_tiles(
+            lat_height * ratio,
+            policy.tile_pixels,
+            policy.overlap_pixels,
+            ratio,
+        );
+        let (xs, x_lens, x_ov) = split_tiles(
+            lat_width * ratio,
+            policy.tile_pixels,
+            policy.overlap_pixels,
+            ratio,
+        );
+        Self {
+            th: y_lens[0] / ratio,
+            tw: x_lens[0] / ratio,
+            ys,
+            xs,
+            y_ov,
+            x_ov,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.ys.len() * self.xs.len()
+    }
+
+    /// Every tile's latents of `z` (`[frames, lat_height, lat_width, C]`),
+    /// tile-major.
+    fn gather(
+        &self,
+        cfg: &VideoVaeConfig,
+        z: &[f32],
+        frames: usize,
+        lat_height: usize,
+        lat_width: usize,
+    ) -> Vec<f32> {
+        let ratio = cfg.spatial_compression;
+        let lat_c = cfg.latent_channels;
+        let mut gathered = Vec::with_capacity(self.count() * frames * self.th * self.tw * lat_c);
+        for &y0 in &self.ys {
+            for &x0 in &self.xs {
+                let (ly, lx) = (y0 / ratio, x0 / ratio);
+                for t in 0..frames {
+                    for h in ly..ly + self.th {
+                        let base = ((t * lat_height + h) * lat_width + lx) * lat_c;
+                        gathered.extend_from_slice(&z[base..base + self.tw * lat_c]);
+                    }
+                }
+            }
+        }
+        gathered
+    }
+
+    /// Un-patchify each tile's decoded tokens, then blend-and-trim into one
+    /// chunk. The blend reads the ORIGINAL neighbour rather than an
+    /// already-stitched one, as the reference does.
+    fn stitch(&self, cfg: &VideoVaeConfig, tokens: &[f32], frames: usize) -> PixelBlock {
+        let ratio = cfg.spatial_compression;
+        let tile_tokens = frames * self.th * self.tw * cfg.proj_out_dim();
+        let grid: Vec<Vec<PixelBlock>> = (0..self.ys.len())
+            .map(|i| {
+                (0..self.xs.len())
+                    .map(|j| {
+                        let idx = i * self.xs.len() + j;
+                        let data = unpatchify(
+                            cfg,
+                            &tokens[idx * tile_tokens..(idx + 1) * tile_tokens],
+                            frames,
+                            self.th,
+                            self.tw,
+                        );
+                        PixelBlock {
+                            data,
+                            frames: frames * cfg.temporal_compression,
+                            height: self.th * ratio,
+                            width: self.tw * ratio,
+                            channels: cfg.out_channels,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let rows: Vec<PixelBlock> = (0..self.ys.len())
+            .map(|i| {
+                let parts: Vec<PixelBlock> = (0..self.xs.len())
+                    .map(|j| {
+                        let mut tile = grid[i][j].clone();
+                        if i > 0 {
+                            tile.blend_head_from(&grid[i - 1][j], self.y_ov[i - 1], 1);
+                        }
+                        if j > 0 {
+                            tile.blend_head_from(&grid[i][j - 1], self.x_ov[j - 1], 2);
+                        }
+                        if i + 1 < self.ys.len() {
+                            tile.truncate_axis(tile.height - self.y_ov[i], 1);
+                        }
+                        if j + 1 < self.xs.len() {
+                            tile.truncate_axis(tile.width - self.x_ov[j], 2);
+                        }
+                        tile
+                    })
+                    .collect();
+                PixelBlock::concat(parts, 2)
+            })
+            .collect();
+        PixelBlock::concat(rows, 1)
+    }
+}
+
+/// Decode `n_tiles` equally-shaped tiles' latents (`gathered`, tile-major) in
+/// batched passes of [`MAX_TOKENS_PER_PASS`], layer-major across all of them
+/// ([`decode_passes`]); returns the tiles' tokens, tile-major.
+#[allow(clippy::too_many_arguments)]
+async fn decode_gathered<S: WeightSource>(
+    cfg: &VideoVaeConfig,
+    backend: &WgpuBackend,
+    pipelines: &DecoderPipelines,
+    residency: &WeightResidency<S>,
+    scratch: &Workspace<WgpuBackend>,
+    handles: &DecoderHandles,
+    consts: &DecoderConsts,
+    gathered: &[f32],
+    n_tiles: usize,
+    frames: usize,
+    th: usize,
+    tw: usize,
+) -> Result<Vec<f32>, DecodeError<S::Error>> {
+    let tile_lat = frames * th * tw * cfg.latent_channels;
+    let per_pass = tiles_per_pass(frames * th * tw + cfg.suffix_tokens());
+    let passes: Vec<TilePass<'_>> = (0..n_tiles)
+        .step_by(per_pass)
+        .map(|start| {
+            let batch = per_pass.min(n_tiles - start);
+            TilePass {
+                latents: &gathered[start * tile_lat..(start + batch) * tile_lat],
+                batch,
+            }
+        })
+        .collect();
+    let outs = decode_passes(
+        cfg, backend, pipelines, residency, scratch, handles, consts, &passes, frames, th, tw,
+    )
+    .await?;
+    Ok(outs.concat())
+}
+
 /// Decode one temporal chunk of latents, tiled over height and width.
 ///
 /// `z` is `[frames, lat_height, lat_width, latent_channels]`, channels-last and
 /// already denormalized. Tiles are decoded in batched passes and stitched with
-/// the reference's blend-then-trim, which is why the blend reads the ORIGINAL
-/// neighbour rather than an already-stitched one.
+/// the reference's blend-then-trim.
 #[allow(clippy::too_many_arguments)]
 pub async fn decode_clip<S: WeightSource>(
     cfg: &VideoVaeConfig,
@@ -1083,112 +1632,31 @@ pub async fn decode_clip<S: WeightSource>(
     residency: &WeightResidency<S>,
     scratch: &Workspace<WgpuBackend>,
     handles: &DecoderHandles,
-    suffix: &[f32],
+    consts: &DecoderConsts,
     policy: TilePolicy,
     z: &[f32],
     frames: usize,
     lat_height: usize,
     lat_width: usize,
 ) -> Result<PixelBlock, DecodeError<S::Error>> {
-    let ratio = cfg.spatial_compression;
-    let lat_c = cfg.latent_channels;
-    let (ys, y_lens, y_ov) = split_tiles(
-        lat_height * ratio,
-        policy.tile_pixels,
-        policy.overlap_pixels,
-        ratio,
-    );
-    let (xs, x_lens, x_ov) = split_tiles(
-        lat_width * ratio,
-        policy.tile_pixels,
-        policy.overlap_pixels,
-        ratio,
-    );
-    // Every tile in the grid shares one latent extent, which is what lets a
-    // pass batch them against one set of rotary frequencies.
-    let th = y_lens[0] / ratio;
-    let tw = x_lens[0] / ratio;
-
-    // Gather every tile's latents, then run them in batched passes.
-    let mut gathered = Vec::with_capacity(ys.len() * xs.len() * frames * th * tw * lat_c);
-    for &y0 in &ys {
-        for &x0 in &xs {
-            let (ly, lx) = (y0 / ratio, x0 / ratio);
-            for t in 0..frames {
-                for h in ly..ly + th {
-                    let base = ((t * lat_height + h) * lat_width + lx) * lat_c;
-                    gathered.extend_from_slice(&z[base..base + tw * lat_c]);
-                }
-            }
-        }
-    }
-
-    let n_tiles = ys.len() * xs.len();
-    let tile_lat = frames * th * tw * lat_c;
-    let per_pass = tiles_per_pass(frames * th * tw + cfg.suffix_tokens());
-    let out_w = cfg.proj_out_dim();
-    let mut tokens = Vec::with_capacity(n_tiles * frames * th * tw * out_w);
-    for start in (0..n_tiles).step_by(per_pass) {
-        let batch = per_pass.min(n_tiles - start);
-        let slice = &gathered[start * tile_lat..(start + batch) * tile_lat];
-        let got = decode_tiles(
-            cfg, backend, pipelines, residency, scratch, handles, suffix, slice, batch, frames, th,
-            tw,
-        )
-        .await?;
-        tokens.extend_from_slice(&got);
-    }
-
-    // Un-patchify each tile, then blend-and-trim into rows.
-    let tile_tokens = frames * th * tw * out_w;
-    let grid: Vec<Vec<PixelBlock>> = (0..ys.len())
-        .map(|i| {
-            (0..xs.len())
-                .map(|j| {
-                    let idx = i * xs.len() + j;
-                    let data = unpatchify(
-                        cfg,
-                        &tokens[idx * tile_tokens..(idx + 1) * tile_tokens],
-                        frames,
-                        th,
-                        tw,
-                    );
-                    PixelBlock {
-                        data,
-                        frames: frames * cfg.temporal_compression,
-                        height: th * ratio,
-                        width: tw * ratio,
-                        channels: cfg.out_channels,
-                    }
-                })
-                .collect()
-        })
-        .collect();
-
-    let rows: Vec<PixelBlock> = (0..ys.len())
-        .map(|i| {
-            let parts: Vec<PixelBlock> = (0..xs.len())
-                .map(|j| {
-                    let mut tile = grid[i][j].clone();
-                    if i > 0 {
-                        tile.blend_head_from(&grid[i - 1][j], y_ov[i - 1], 1);
-                    }
-                    if j > 0 {
-                        tile.blend_head_from(&grid[i][j - 1], x_ov[j - 1], 2);
-                    }
-                    if i + 1 < ys.len() {
-                        tile.truncate_axis(tile.height - y_ov[i], 1);
-                    }
-                    if j + 1 < xs.len() {
-                        tile.truncate_axis(tile.width - x_ov[j], 2);
-                    }
-                    tile
-                })
-                .collect();
-            PixelBlock::concat(parts, 2)
-        })
-        .collect();
-    Ok(PixelBlock::concat(rows, 1))
+    let tiles = ClipTiles::new(cfg, policy, lat_height, lat_width);
+    let gathered = tiles.gather(cfg, z, frames, lat_height, lat_width);
+    let tokens = decode_gathered(
+        cfg,
+        backend,
+        pipelines,
+        residency,
+        scratch,
+        handles,
+        consts,
+        &gathered,
+        tiles.count(),
+        frames,
+        tiles.th,
+        tiles.tw,
+    )
+    .await?;
+    Ok(tiles.stitch(cfg, &tokens, frames))
 }
 
 /// Decode a whole latent video into pixels.
@@ -1201,6 +1669,9 @@ pub async fn decode_clip<S: WeightSource>(
 /// `frame_overlap` pixel frames and are cross-faded. Latent frames are repeated
 /// at the tail when the length is not a whole number of chunks and the extra
 /// pixel frames are cut off again at the end.
+///
+/// Every chunk's tiles share one shape, so they decode together: the ViT
+/// stack streams once for the whole video, not once per chunk.
 #[allow(clippy::too_many_arguments)]
 pub async fn decode<S: WeightSource>(
     cfg: &VideoVaeConfig,
@@ -1209,7 +1680,7 @@ pub async fn decode<S: WeightSource>(
     residency: &WeightResidency<S>,
     scratch: &Workspace<WgpuBackend>,
     handles: &DecoderHandles,
-    suffix: &[f32],
+    consts: &DecoderConsts,
     policy: TilePolicy,
     z: &[f32],
     latent_frames: usize,
@@ -1227,27 +1698,40 @@ pub async fn decode<S: WeightSource>(
         padded.extend_from_slice(&last);
     }
 
-    let mut decoded: Vec<PixelBlock> = Vec::new();
-    let mut overlap: Option<PixelBlock> = None;
+    let tiles = ClipTiles::new(cfg, policy, lat_height, lat_width);
+    let len = plan.chunk_tokens + plan.token_overlap;
+    let mut gathered = Vec::new();
     for i in 0..plan.num_chunks {
-        let _guard = trace::scope!(format!("minimax.vae.chunk.{i}")).entered();
         let start = i * plan.chunk_tokens;
-        let len = plan.chunk_tokens + plan.token_overlap;
-        let clip = decode_clip(
+        gathered.extend(tiles.gather(
             cfg,
-            backend,
-            pipelines,
-            residency,
-            scratch,
-            handles,
-            suffix,
-            policy,
             &padded[start * frame_stride..(start + len) * frame_stride],
             len,
             lat_height,
             lat_width,
-        )
-        .await?;
+        ));
+    }
+    let tokens = decode_gathered(
+        cfg,
+        backend,
+        pipelines,
+        residency,
+        scratch,
+        handles,
+        consts,
+        &gathered,
+        plan.num_chunks * tiles.count(),
+        len,
+        tiles.th,
+        tiles.tw,
+    )
+    .await?;
+    let chunk_tokens = tokens.len() / plan.num_chunks;
+
+    let mut decoded: Vec<PixelBlock> = Vec::new();
+    let mut overlap: Option<PixelBlock> = None;
+    for i in 0..plan.num_chunks {
+        let clip = tiles.stitch(cfg, &tokens[i * chunk_tokens..(i + 1) * chunk_tokens], len);
 
         // Pass 0 is the chunk itself; pass 1 (present only when the encoder
         // dropped a tail) is the lead-in that the NEXT chunk blends over.

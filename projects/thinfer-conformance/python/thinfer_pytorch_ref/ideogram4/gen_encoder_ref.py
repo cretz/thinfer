@@ -2,7 +2,7 @@
 
 Loads the Qwen3-VL-8B language model FROM THE SAME GGUF the engine loads
 (dequantized Q8_0 -> bf16, so parity isolates kernel correctness from
-quantization loss, per `ideogram-plan.md` "QUANT DECISION"), runs the prompt
+quantization loss), runs the prompt
 through the 36 decoder layers, captures the 13 tapped layer outputs
 (`QWEN3_VL_ACTIVATION_LAYERS = [0,3,..,33,35]`, the output AFTER each tapped
 layer, pre-final-norm), and dumps:

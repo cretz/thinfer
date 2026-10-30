@@ -13,6 +13,12 @@ pub struct WgpuBackend {
     queue: Arc<wgpu::Queue>,
     next_id: Mutex<u64>,
     buffers: Mutex<HashMap<GpuBufferId, BufferEntry>>,
+    /// Optional exportable-memory allocator (see [`ExternalAllocator`]).
+    external: std::sync::OnceLock<Arc<dyn ExternalAllocator>>,
+    /// Live [`PlainAllocGuard`]s; while > 0 `external` is bypassed.
+    external_suspended: AtomicU64,
+    /// Optional hot-op executor over those buffers (see `Accelerator`).
+    accelerator: std::sync::OnceLock<Arc<dyn super::Accelerator>>,
     poll: WgpuPoll,
     /// Monotonic submit ordinal. Used to tag validation errors and buffer
     /// lifecycle traces so failures can be attributed to a specific submit.
@@ -107,6 +113,9 @@ impl Drop for WgpuBackend {
 /// `free` can release bytes to the counter that originally charged them,
 /// without the caller having to thread category through every drop path.
 struct BufferEntry {
+    /// Set when the buffer came from the [`ExternalAllocator`]. Declared before
+    /// `buf` so the external mapping is released before the wgpu buffer drops.
+    external: Option<ExternalMapping>,
     buf: Arc<wgpu::Buffer>,
     cat: VramCategory,
     bytes: u64,
@@ -156,6 +165,27 @@ pub enum WgpuError {
         label: String,
         source: wgpu::Error,
     },
+    /// `write_buffer_with` refused the staged write (out of bounds, or the
+    /// staging allocation failed).
+    StageWrite {
+        dst: GpuBufferId,
+        offset: u64,
+        bytes: u64,
+    },
+}
+
+/// A mapped staging chunk from `queue.write_buffer_with`.
+pub struct WgpuStagedWrite(wgpu::QueueWriteBufferView);
+
+impl super::StagedWrite for WgpuStagedWrite {
+    fn bytes(&mut self) -> &mut [u8] {
+        let mut w = self.0.slice(..);
+        let p = w.as_raw_ptr();
+        // SAFETY: a live, writable mapping of exactly this length, exclusively
+        // borrowed through `&mut self`. u8 has no invalid bit patterns; the
+        // caller only writes (staging reads are slow, never wrong).
+        unsafe { &mut *p.as_ptr() }
+    }
 }
 
 #[derive(Clone)]
@@ -257,6 +287,36 @@ pub enum PowerPreference {
     None,
 }
 
+/// Allocates wgpu buffers whose memory another GPU API can also address (the
+/// native CUDA fast path, `thinfer-cuda`). Installed on a [`WgpuBackend`] after
+/// construction; when present every allocation goes through it, and any error
+/// falls back to a plain wgpu buffer (an optimization, never a requirement).
+pub trait ExternalAllocator: Send + Sync {
+    fn allocate(&self, device: &wgpu::Device, bytes: u64) -> Result<ExternalBuffer, String>;
+}
+
+/// A buffer from an [`ExternalAllocator`]: the wgpu buffer, the other API's
+/// address of the same memory, and the guard that keeps that mapping alive.
+pub struct ExternalBuffer {
+    pub buffer: wgpu::Buffer,
+    pub address: u64,
+    pub mapping: Box<dyn Send + Sync>,
+}
+
+/// See [`WgpuBackend::plain_allocations`].
+pub struct PlainAllocGuard<'a>(&'a WgpuBackend);
+
+impl Drop for PlainAllocGuard<'_> {
+    fn drop(&mut self) {
+        self.0.external_suspended.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ExternalMapping {
+    address: u64,
+    _mapping: Box<dyn Send + Sync>,
+}
+
 /// Construction-time options for `WgpuBackend`. Read at the binary edge
 /// (CLI, tests) and passed in - thinfer-core stays env-var-free for wasm.
 #[derive(Clone, Debug, Default)]
@@ -297,6 +357,8 @@ pub struct WgpuPipeline {
     /// `trace::DISPATCH` event so the rollup can bucket time by op kind
     /// (matmul / sdpa / rmsnorm / etc) without callers passing extra labels.
     name: String,
+    /// Dense-matmul contract parsed from the WGSL marker (accelerator offload).
+    gemm: Option<crate::ops::GemmDesc>,
 }
 
 impl WgpuBackend {
@@ -428,6 +490,16 @@ impl WgpuBackend {
         if coopmat.is_some() {
             required_features |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
         }
+        // Exportable VRAM for an optional [`ExternalAllocator`] (native CUDA).
+        // Windows needs this feature for `VK_KHR_external_memory_win32`; on
+        // Linux wgpu-hal enables `VK_KHR_external_memory_fd` by itself. Costs
+        // nothing; nothing is exported unless an allocator is installed.
+        let external_memory = adapter
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32);
+        if external_memory {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("thinfer"),
@@ -508,6 +580,9 @@ impl WgpuBackend {
             queue: Arc::new(queue),
             next_id: Mutex::new(1),
             buffers: Mutex::new(HashMap::new()),
+            external: std::sync::OnceLock::new(),
+            external_suspended: AtomicU64::new(0),
+            accelerator: std::sync::OnceLock::new(),
             poll,
             submit_ordinal: AtomicU64::new(0),
             rbe_ordinal: AtomicU64::new(0),
@@ -606,6 +681,92 @@ impl WgpuBackend {
     /// know better (residency) call this with `Weights`, internal staging
     /// uses `Staging`.
     pub fn allocate_in(&self, bytes: u64, cat: VramCategory) -> Result<GpuBufferId, WgpuError> {
+        let external = self
+            .external
+            .get()
+            .filter(|_| self.external_suspended.load(Ordering::Relaxed) == 0);
+        let (buf, external) = match external.map(|a| a.allocate(&self.device, bytes)) {
+            Some(Ok(eb)) => (
+                eb.buffer,
+                Some(ExternalMapping {
+                    address: eb.address,
+                    _mapping: eb.mapping,
+                }),
+            ),
+            Some(Err(e)) => {
+                tracing::warn!(target: trace::ADAPTER, bytes, error = %e, "external alloc failed; plain wgpu buffer");
+                (self.create_plain_buffer(bytes, cat)?, None)
+            }
+            None => (self.create_plain_buffer(bytes, cat)?, None),
+        };
+        let id = {
+            let mut n = self.next_id.lock().unwrap();
+            let id = GpuBufferId(*n);
+            *n += 1;
+            id
+        };
+        self.mem.charge_vram(cat, bytes);
+        self.buffers.lock().unwrap().insert(
+            id,
+            BufferEntry {
+                external,
+                buf: Arc::new(buf),
+                cat,
+                bytes,
+            },
+        );
+        tracing::trace!(
+            target: trace::BUF,
+            op = "alloc",
+            id = id.0,
+            bytes = bytes,
+            cat = cat.label(),
+        );
+        Ok(id)
+    }
+
+    /// Install the exportable-memory allocator. Later allocations go through
+    /// it; existing buffers are unaffected. The allocator owns the platform
+    /// capability check (and any allocation error falls back to a plain
+    /// buffer). Returns false if one is already installed.
+    pub fn set_external_allocator(&self, alloc: Arc<dyn ExternalAllocator>) -> bool {
+        self.external.set(alloc).is_ok()
+    }
+
+    /// Allocate plain (non-exportable) buffers while the guard lives, for a
+    /// phase that runs no accelerator op. Buffers it allocates simply decline
+    /// accelerator offload if one is ever offered.
+    pub fn plain_allocations(&self) -> PlainAllocGuard<'_> {
+        self.external_suspended.fetch_add(1, Ordering::Relaxed);
+        PlainAllocGuard(self)
+    }
+
+    /// The external API's address of buffer `id`, if it was allocated through
+    /// the [`ExternalAllocator`].
+    pub fn external_address(&self, id: GpuBufferId) -> Option<u64> {
+        self.buffers
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|e| e.external.as_ref().map(|m| m.address))
+    }
+
+    /// Install the hot-op accelerator. Only useful with an [`ExternalAllocator`]
+    /// installed (ops need device addresses). Returns false if already set.
+    pub fn set_accelerator(&self, acc: Arc<dyn super::Accelerator>) -> bool {
+        self.accelerator.set(acc).is_ok()
+    }
+
+    /// The wgpu device (for an [`ExternalAllocator`] or interop probe).
+    pub fn wgpu_device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    fn create_plain_buffer(
+        &self,
+        bytes: u64,
+        cat: VramCategory,
+    ) -> Result<wgpu::Buffer, WgpuError> {
         let _ = self.uncaptured.lock().unwrap().take();
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -626,29 +787,7 @@ impl WgpuBackend {
             );
             return Err(WgpuError::Allocate { bytes, source: err });
         }
-        let id = {
-            let mut n = self.next_id.lock().unwrap();
-            let id = GpuBufferId(*n);
-            *n += 1;
-            id
-        };
-        self.mem.charge_vram(cat, bytes);
-        self.buffers.lock().unwrap().insert(
-            id,
-            BufferEntry {
-                buf: Arc::new(buf),
-                cat,
-                bytes,
-            },
-        );
-        tracing::trace!(
-            target: trace::BUF,
-            op = "alloc",
-            id = id.0,
-            bytes = bytes,
-            cat = cat.label(),
-        );
-        Ok(id)
+        Ok(buf)
     }
 
     /// Stage a readback inside the caller's encoder. The caller submits that
@@ -742,6 +881,7 @@ impl Backend for WgpuBackend {
     type Error = WgpuError;
     type CommandEncoder = CommandEncoderState;
     type Pipeline = WgpuPipeline;
+    type StagedWrite = WgpuStagedWrite;
 
     fn allocate(&self, bytes: u64) -> Result<GpuBufferId, Self::Error> {
         // Trait blanket charges Workspace. Residency calls `allocate_in`
@@ -777,6 +917,25 @@ impl Backend for WgpuBackend {
             bytes = bytes,
             cat = cat.map(|c| c.label()).unwrap_or("unknown"),
         );
+    }
+
+    fn stage_write(
+        &self,
+        dst: GpuBufferId,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<WgpuStagedWrite, Self::Error> {
+        let buf = self.get_buffer(dst)?;
+        let refused = || WgpuError::StageWrite {
+            dst,
+            offset: dst_offset,
+            bytes: len,
+        };
+        let size = wgpu::BufferSize::new(len).ok_or_else(refused)?;
+        self.queue
+            .write_buffer_with(&buf, dst_offset, size)
+            .map(WgpuStagedWrite)
+            .ok_or_else(refused)
     }
 
     fn write_buffer(
@@ -1070,6 +1229,22 @@ impl Backend for WgpuBackend {
         }
     }
 
+    fn accelerator(&self) -> Option<&dyn super::Accelerator> {
+        self.accelerator.get().map(|a| a.as_ref())
+    }
+
+    fn device_address(&self, buf: &super::BufRef) -> Option<u64> {
+        self.external_address(buf.id).map(|base| base + buf.offset)
+    }
+
+    fn wait_idle(&self) {
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    fn pipeline_gemm(&self, p: &Self::Pipeline) -> Option<crate::ops::GemmDesc> {
+        p.gemm
+    }
+
     fn flush_encoder(&self, encoder: Self::CommandEncoder) -> Result<(), Self::Error> {
         // Fire-and-forget: finish + queue.submit, no await, no error-scope, no
         // timestamp resolve. This splits one logical scope into multiple command
@@ -1093,6 +1268,7 @@ impl Backend for WgpuBackend {
     ) -> impl Future<Output = Result<Self::Pipeline, Self::Error>> {
         let device = self.device.clone();
         let label = label.to_owned();
+        let gemm = crate::ops::GemmDesc::parse(wgsl);
         let wgsl = wgsl.to_owned();
         let entry = entry.to_owned();
         let layout: Vec<BindingLayout> = layout.to_vec();
@@ -1159,6 +1335,7 @@ impl Backend for WgpuBackend {
                 pipeline,
                 bind_group_layout: bgl,
                 name: label,
+                gemm,
             })
         }
     }
@@ -1229,6 +1406,7 @@ impl Backend for WgpuBackend {
                     ("q8_0_from_bf16", [pairs, 0, 0, 0])
                 }
                 WeightPrep::TransposeBf16 { n, k } => ("transpose_bf16_2d", [n, k, 0, 0]),
+                WeightPrep::TransposeF16 { n, k } => ("transpose_f16_2d", [n, k, 0, 0]),
                 WeightPrep::NarrowTransposeF32 { n, k, n0, band_n } => {
                     ("narrow_transpose_f32", [n, k, n0, band_n])
                 }
@@ -1244,6 +1422,9 @@ impl Backend for WgpuBackend {
                             }
                             WeightPrep::TransposeBf16 { .. } => {
                                 crate::ops::weight_prep::build_transpose_bf16_wgsl()
+                            }
+                            WeightPrep::TransposeF16 { .. } => {
+                                crate::ops::weight_prep::build_transpose_f16_wgsl()
                             }
                             WeightPrep::NarrowTransposeF32 { .. } => {
                                 crate::ops::weight_prep::build_narrow_transpose_f32_wgsl()
@@ -1282,7 +1463,7 @@ impl Backend for WgpuBackend {
                             self, &mut enc, &pipeline, &bufs, dims[0],
                         )?
                     }
-                    WeightPrep::TransposeBf16 { n, k } => {
+                    WeightPrep::TransposeBf16 { n, k } | WeightPrep::TransposeF16 { n, k } => {
                         crate::ops::weight_prep::dispatch_transpose_bf16(
                             self, &mut enc, &pipeline, &bufs, n, k,
                         )?

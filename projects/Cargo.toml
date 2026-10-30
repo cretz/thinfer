@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "thinfer-core",
     "thinfer-native",
+    "thinfer-cuda",
     "thinfer-web",
     "thinfer-app",
     "thinfer-serve",

@@ -23,6 +23,7 @@ safetensors = "0.4"
 tempfile = "3"
 thinfer-models = { path = "../thinfer-models" }
 thinfer-native = { path = "../thinfer-native" }
+thinfer-cuda = { path = "../thinfer-cuda" }
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing = { workspace = true }
 

@@ -24,6 +24,12 @@ pub struct BackendConfig {
     /// Opt OUT of the cooperative-matrix (tensor-core) path. Default false
     /// (ON when the GPU supports it). CLI maps `THINFER_NO_COOPMAT` here.
     pub disable_coopmat: bool,
+    /// Make engine buffers CUDA-addressable so native CUDA hot ops can run in
+    /// place (`thinfer-cuda`). An optimization: when the GPU is not NVIDIA or
+    /// the driver is missing, the wgpu path runs unchanged. Default true: the
+    /// CUDA attention path is a net win end to end (FastWan 1.3B 280s -> 158s)
+    /// despite exportable allocations costing ~0.6ms each.
+    pub cuda: bool,
 }
 
 impl Default for BackendConfig {
@@ -35,6 +41,7 @@ impl Default for BackendConfig {
             power_preference: PowerPreference::HighPerformance,
             timestamps: false,
             disable_coopmat: false,
+            cuda: true,
         }
     }
 }
@@ -47,11 +54,32 @@ pub async fn init_backend(cfg: BackendConfig) -> Result<Arc<WgpuBackend>, String
         timestamps: cfg.timestamps,
         disable_coopmat: cfg.disable_coopmat,
     };
-    Ok(Arc::new(
+    let backend = Arc::new(
         WgpuBackend::new_with_config(wcfg)
             .await
             .map_err(|e| format!("wgpu init: {e:?}"))?,
-    ))
+    );
+    if cfg.cuda {
+        install_cuda(&backend);
+    }
+    Ok(backend)
+}
+
+/// Route allocations through the CUDA interop allocator and install the CUDA
+/// hot-op accelerator when the adapter is an NVIDIA GPU with a working driver;
+/// otherwise log why and keep the plain wgpu path.
+fn install_cuda(backend: &WgpuBackend) {
+    match thinfer_cuda::install(backend) {
+        Ok((name, sm)) => tracing::info!(
+            target: thinfer_core::trace::ADAPTER,
+            device = %name, sm = format!("{}.{}", sm.0, sm.1),
+            "cuda interop installed",
+        ),
+        Err(e) => tracing::info!(
+            target: thinfer_core::trace::ADAPTER,
+            reason = %e, "cuda unavailable; wgpu path only",
+        ),
+    }
 }
 
 /// Parse a budget string (`8G`, `512M`, raw bytes), defaulting to

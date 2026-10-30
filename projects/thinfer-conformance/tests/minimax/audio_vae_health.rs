@@ -76,7 +76,7 @@ async fn audio_vae_health() {
     // Deterministic stand-in latents, `[channels, latent_channels, frames]`.
     let n = cfg.channels * cfg.latent_channels * FRAMES;
     let z: Vec<f32> = (0..n)
-        .map(|i| (i as f32 * 0.6180339887).fract() * 2.0 - 1.0)
+        .map(|i| (i as f32 * 0.618_034).fract() * 2.0 - 1.0)
         .collect();
 
     let wav = vae

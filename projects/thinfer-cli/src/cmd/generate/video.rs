@@ -69,10 +69,11 @@ pub struct GenerateVideo {
     /// Seed. Omit for a randomized seed.
     #[arg(long)]
     pub seed: Option<u64>,
-    /// Denoise sampler: `unipc` (default, multistep, `--steps` configurable) or
-    /// `dmd` (fixed 3-step byte-parity path). Ignored on the AR (LongLive) path.
-    #[arg(long, value_enum, default_value_t = VideoSampler::default())]
-    pub sampler: VideoSampler,
+    /// Denoise sampler: `unipc` (multistep, `--steps` configurable) or `dmd`
+    /// (fixed 3-step byte-parity path). Unset -> the model default (`dmd` for
+    /// fastwan2.1-t2v-1.3b, else `unipc`). Ignored on the AR (LongLive) path.
+    #[arg(long, value_enum)]
+    pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8; dreamid-v defaults to 16). Ignored when
     /// `--sampler dmd`. Unset -> the model default.
     #[arg(long)]
@@ -108,7 +109,7 @@ pub struct GenerateVideo {
     /// near-identical quality. `full` is the bit-clean parity path.
     #[arg(long, value_enum, default_value_t = VaeChoice::Tiny)]
     pub vae: VaeChoice,
-    /// LTX-2.3 text encoder (all LTX/Sulphur models). `q8` (default) is the
+    /// LTX-2.3 text encoder (all LTX models). `q8` (default) is the
     /// conditioning-quality baseline; `q4` is Q4_K_M -- ~2.8x faster encode
     /// (~16s -> ~6s) for lower-precision conditioning. Ignored by Wan.
     #[arg(long, value_enum, default_value_t = EncoderQuant::Q8)]
@@ -126,12 +127,12 @@ pub struct GenerateVideo {
     /// res. Default off = single-stage denoise at the target res. Ignored by Wan.
     #[arg(long)]
     pub upscale: bool,
-    /// LTX single-stage joint-AV only: refine the denoise schedule for better
-    /// audio. The distilled 8-step table under-resolves the delicate audio
-    /// residual (speech drifts to gibberish); this subdivides the coarse sigma
-    /// jumps into more Euler substeps (~2x slower denoise). Applies to ltx2-rapid
-    /// (always single-stage) and the 22B line when `--upscale` is off. Ignored by
-    /// the two-stage and Wan models.
+    /// LTX joint-AV: refine the denoise schedule for better audio. The distilled
+    /// 8-step table under-resolves the delicate audio residual (speech drifts to
+    /// gibberish); this subdivides the coarse sigma jumps into more Euler
+    /// substeps, keeping the distilled anchors exactly. Applies to every LTX
+    /// line: the single-stage schedule on ltx2-rapid, and BOTH stage schedules on
+    /// the two-stage 22B line (8+3 -> 16+11 steps, ~2.5x denoise). Ignored by Wan.
     #[arg(long)]
     pub audio_hq: bool,
     /// HunyuanVideo 1.5 only: skip prompt rewriting and send the raw prompt. By
@@ -149,7 +150,8 @@ pub struct GenerateVideo {
     /// Fold a stored adapter into the DiT, as `NAME_OR_ID[:WEIGHT]` (repeatable,
     /// applied in order). Resolved against the vault for `--model`; needs the
     /// vault password (hidden prompt, or `THINFER_VAULT_PASSWORD`). Local runs
-    /// only (not `--remote`); only AnyFlow accepts adapters today.
+    /// only (not `--remote`). AnyFlow, FastWan2.1-1.3B, Wan2.1-1.3B, MiniMax-H3
+    /// and FastH3-Trim accept adapters (H3: applied at runtime, any layout).
     #[arg(long = "lora", value_name = "NAME[:WEIGHT]")]
     pub lora: Vec<String>,
     /// Vault directory for `--lora`. Defaults to the shared location
@@ -202,7 +204,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             durations: (!args.duration.is_empty()).then_some(args.duration),
             fps: args.fps,
             seed: args.seed,
-            sampler: Some(args.sampler),
+            sampler: args.sampler,
             steps: args.steps,
             attn_window: args.attn_window,
             vae: Some(args.vae),
@@ -221,7 +223,6 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             audio_hq: Some(args.audio_hq),
             rewrite: Some(!args.no_rewrite),
             rewrite_quality: Some(args.rewrite_quality),
-            public_key: None,
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
             disable_coopmat: None,
@@ -273,7 +274,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             None => None,
         },
         guide_scale: args.guide_scale,
-        sampler: args.sampler,
+        sampler: args.sampler.unwrap_or(args.model.default_sampler()),
         steps: args.steps.unwrap_or(args.model.default_steps()),
         attn_window: args.attn_window,
         vae: args.vae,

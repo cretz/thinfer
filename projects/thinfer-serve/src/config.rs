@@ -21,10 +21,11 @@ pub struct ServeConfig {
     /// doc) must carry `Authorization: Bearer <token>`; the static web UI loads
     /// unauthenticated so it can prompt for the token. `None` = open access.
     pub auth_token: Option<String>,
-    /// Serve HTTPS with a self-signed cert generated at startup. Needed for the
-    /// browser's WebCrypto (result encryption) over a LAN IP: WebCrypto only
-    /// runs in a secure context (https or localhost). Clients see a one-time
-    /// cert warning to accept. Ignored when `tls_cert`/`tls_key` are set.
+    /// Serve HTTPS with a self-signed cert generated at startup. Default true:
+    /// plain HTTP is refused on any non-loopback bind (job keys and sealed media
+    /// must not cross a network in the clear, and the browser's WebCrypto needs
+    /// a secure context). Clients see a one-time cert warning to accept.
+    /// Ignored when `tls_cert`/`tls_key` are set.
     pub tls_self_signed: bool,
     /// Extra Subject Alternative Names (DNS names or IPs) to put in the
     /// self-signed cert, on top of `localhost`, `127.0.0.1`, and the
@@ -49,8 +50,13 @@ pub struct ServeConfig {
     /// (`THINFER_VAULT_DIR` env, else `<hf-cache>/vault`) so an adapter added via
     /// the CLI on this box is usable from the web UI. Set it to pin a location.
     pub vault_dir: Option<PathBuf>,
-    /// Artifact retention in seconds (informational sweep target in v1).
+    /// Finished jobs (and any unfetched sealed result) are reaped this many
+    /// seconds after they end. Default 24h.
     pub retention_secs: u64,
+    /// How long a worker waits for the client to deliver a job's key (after
+    /// the `keyRequired` event) before failing the job without running it.
+    /// Default 600s.
+    pub key_wait_secs: u64,
     /// Max bytes accepted on `POST /jobs` (the JSON spec, which still carries the
     /// small base64 source/reference image). Large videos go through `/uploads`
     /// instead, so this stays modest. Default 32 MiB.
@@ -69,6 +75,9 @@ pub struct ServeConfig {
     /// Residency budgets (e.g. `5G`, `512M`, raw bytes).
     pub ram_budget: String,
     pub vram_budget: String,
+    /// Native CUDA hot-op interop on NVIDIA (see `BackendConfig::cuda`).
+    /// Falls back to the wgpu path when unavailable. Default true.
+    pub cuda: bool,
 }
 
 impl Default for ServeConfig {
@@ -76,7 +85,7 @@ impl Default for ServeConfig {
         Self {
             bind: "0.0.0.0:8080".into(),
             auth_token: None,
-            tls_self_signed: false,
+            tls_self_signed: true,
             tls_sans: Vec::new(),
             tls_cert: None,
             tls_key: None,
@@ -85,6 +94,7 @@ impl Default for ServeConfig {
             artifact_dir: PathBuf::from("thinfer-artifacts"),
             vault_dir: None,
             retention_secs: 24 * 60 * 60,
+            key_wait_secs: 600,
             max_json_bytes: 32 << 20,
             max_upload_bytes: 2 << 30,
             upload_ttl_secs: 30 * 60,
@@ -92,6 +102,7 @@ impl Default for ServeConfig {
             power_preference: "high".into(),
             ram_budget: "5G".into(),
             vram_budget: "5G".into(),
+            cuda: true,
         }
     }
 }
@@ -119,6 +130,7 @@ impl ServeConfig {
             timestamps: false,
             // Coopmat (tensor-core) path stays ON when the GPU supports it.
             disable_coopmat: false,
+            cuda: self.cuda,
         }
     }
 

@@ -162,9 +162,26 @@ impl WanDitConfig {
         }
     }
 
-    /// DreamID-V-Wan-1.3B-Faster: the stock Wan2.1-1.3B T2V backbone (num_heads
-    /// 12 * head_dim 128 -> dim 1536; ffn_dim 8960; num_layers 30; Wan2.1 VAE
-    /// z_dim 16) modified for diffusion video face swap. Two deltas vs stock:
+    /// Stock Wan2.1-T2V-1.3B backbone (num_heads 12 * head_dim 128 -> dim 1536;
+    /// ffn_dim 8960; num_layers 30; Wan2.1 VAE z_dim 16 in/out). Audited against
+    /// `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` `transformer/config.json`. Its
+    /// `to_gate_compress` (sparse-attention gate) is unused by dense attention.
+    pub fn wan21_t2v_1_3b() -> Self {
+        Self {
+            num_heads: 12,
+            ffn_dim: 8960,
+            num_layers: 30,
+            in_channels: 16,
+            out_channels: 16,
+            delta_embedder: false,
+            ref_conv: false,
+            rehyat: false,
+        }
+    }
+
+    /// DreamID-V-Wan-1.3B-Faster: the stock Wan2.1-1.3B T2V backbone
+    /// ([`Self::wan21_t2v_1_3b`]) modified for diffusion video face swap. Two
+    /// deltas vs stock:
     /// `in_channels 48` (the patch-embed sees noise[16] concatenated with the
     /// target-video[16] and face-mask[16] conditioning latents on the channel
     /// axis) and `ref_conv true` (a Conv2d that patchifies the source-face
@@ -172,14 +189,9 @@ impl WanDitConfig {
     /// latent). Audited against `dreamidv_wan_faster/configs/wan_swapface.py`.
     pub fn dreamid_v() -> Self {
         Self {
-            num_heads: 12,
-            ffn_dim: 8960,
-            num_layers: 30,
             in_channels: 48,
-            out_channels: 16,
-            delta_embedder: false,
             ref_conv: true,
-            rehyat: false,
+            ..Self::wan21_t2v_1_3b()
         }
     }
 

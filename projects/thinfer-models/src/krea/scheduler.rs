@@ -6,7 +6,7 @@
 //! computes `mu` from the image sequence length via `calculate_shift`). One
 //! Euler step is `z += (sigma_next - sigma) * velocity`.
 //!
-//! FLAG (worklog): confirm `mu`/step-count against the shipped
+//! FLAG: confirm `mu`/step-count against the shipped
 //! `scheduler_config.json` when the safetensors bundle is available; the value
 //! here matches the stable-diffusion.cpp reference for Turbo.
 

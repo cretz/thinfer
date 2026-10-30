@@ -349,7 +349,7 @@ async fn run_dequant_once(m: u32, n: u32, k: u32, seed: u64) -> (Vec<f32>, Vec<f
         &backend,
         &mut enc,
         &dq_pipe,
-        QuantKind::Q8_0,
+        thinfer_core::ops::DequantScheme::Block(QuantKind::Q8_0),
         &DequantBufs {
             b_quant: &b_q_buf,
             b_dense: &dense_buf,
@@ -479,7 +479,7 @@ async fn run_dequant_once_data(a: &[f32], b_q: &[u8], m: u32, n: u32, k: u32) ->
         &backend,
         &mut enc,
         &dq_pipe,
-        QuantKind::Q8_0,
+        thinfer_core::ops::DequantScheme::Block(QuantKind::Q8_0),
         &DequantBufs {
             b_quant: &b_q_buf,
             b_dense: &dense_buf,

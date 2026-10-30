@@ -264,9 +264,22 @@ pub async fn build_modulation_tables<S: WeightSource>(
         )
     };
 
-    // Every AdaLN projection reads silu(temb), not temb.
+    // Every AdaLN projection reads silu(temb), not temb; a rank-reduced
+    // checkpoint first maps that through the shared basis (no further silu).
     let a: Vec<f32> = temb.iter().map(|&v| silu(v)).collect();
-    let k = cfg.time_embed_dim;
+    let (a, k) = match cfg.adaln_rank {
+        None => (a, cfg.time_embed_dim),
+        Some(r) => {
+            let basis = read_tensor_f32(
+                source,
+                &WeightId("adaln_basis.weight".into()),
+                r * cfg.time_embed_dim,
+            )
+            .await?;
+            let a = linear_f32(&a, &basis, &vec![0.0; r], t, cfg.time_embed_dim, r);
+            (a, r)
+        }
+    };
 
     let mut blocks = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {

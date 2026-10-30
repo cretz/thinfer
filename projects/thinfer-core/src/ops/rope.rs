@@ -340,7 +340,7 @@ impl RopeOp for RopeF32HalfRot {
             (ActDtype::Bf16, _) => WGSL_BF16_PACKED_HALFROT,
             (ActDtype::F16, _) => WGSL_F16_PACKED_HALFROT,
             (ActDtype::I8, _) => unreachable!(
-                "ActDtype::I8 halfrot is not implemented - Qwen3 (the only halfrot consumer) is not an I8 target per worklog"
+                "ActDtype::I8 halfrot is not implemented - Qwen3 (the only halfrot consumer) is not an I8 target"
             ),
         }
     }

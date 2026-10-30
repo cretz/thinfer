@@ -8,7 +8,6 @@
 //! `third-party/diffusers` (`transformer_ltx2`, `autoencoder_kl_ltx2{,_audio}`).
 //! All architecture consts below are the GGUF `config` KV (authoritative; the DiT
 //! GGUF embeds the full transformer/vae/scheduler/audio_vae/vocoder config JSON).
-//! Port plan + non-negotiables: `projects/thinfer-working-area/ltx-plan.md`.
 //!
 //! RoPE is `split` = HALF-ROT (Qwen3-style, reuse `op_rope`), NOT Wan
 //! interleaved-pair. The residual stream MUST stay bf16 (large-outlier channels

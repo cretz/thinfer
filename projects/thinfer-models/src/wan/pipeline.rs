@@ -11,8 +11,7 @@
 //! DMD distillation: a fixed handful of timesteps (3 for FastWan), CFG-free, one
 //! DiT forward per step over the whole `[48, f_lat, h, w]` latent with a single
 //! scalar timestep, renoised between steps. LongLive (4-step, autoregressive)
-//! reuses this backbone with its own `DmdConfig` and an AR path (see
-//! `wan-plan.md`).
+//! reuses this backbone with its own `DmdConfig` and an AR path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -150,12 +149,25 @@ fn step_attn_window(requested: Option<u32>, step: usize, default_from: usize) ->
 /// first (mirrors upstream `MultiTextConcatDataset._apply_shot_durations`), and
 /// in the cache by advancing the RoPE phase + pinning the new shot's sink. A
 /// single-shot long video is the empty-shots path ([`WanModel::denoise_ar`]).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Shot {
     pub prompt: String,
     /// Length of this shot in AR chunks (>= 1). The sum across shots must equal
     /// the run's total chunk count (`f_lat / num_frame_per_block`).
     pub chunks: usize,
+}
+
+// The prompt is user content: never rendered by `Debug`.
+impl std::fmt::Debug for Shot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shot")
+            .field(
+                "prompt",
+                &format_args!("<{} chars redacted>", self.prompt.len()),
+            )
+            .field("chunks", &self.chunks)
+            .finish()
+    }
 }
 
 /// In-band scene-cut marker prepended to the first chunk's prompt of every shot
@@ -391,6 +403,12 @@ pub struct WanVariant {
     /// `lighttae*` retrains (lighttaew2_2), which are trained on denormalized
     /// latents (upstream gates this on "lighttae" in the checkpoint name).
     pub tiny_vae_normed_latents: bool,
+    /// Whether the opt-in DP4A i8 activation sites (self-attn qkv + ffn_up)
+    /// hold quality on this checkpoint. False for FastWan2.1-1.3B: with them its
+    /// output collapses to an off-prompt blob (CLI A/B, 448x256x61, same seed)
+    /// while the dense path renders the prompt; it runs dense regardless of the
+    /// request's `i8_matmul`.
+    pub i8_act_sites: bool,
 }
 
 impl WanVariant {
@@ -408,6 +426,7 @@ impl WanVariant {
             block_transcode: Some(thinfer_core::quant::QuantKind::Q8_0),
             act_pref: None,
             tiny_vae_normed_latents: false,
+            i8_act_sites: true,
         }
     }
 
@@ -450,6 +469,24 @@ impl WanVariant {
             block_transcode: Some(thinfer_core::quant::QuantKind::Q8_0),
             act_pref: Some(ActDtype::Bf16),
             tiny_vae_normed_latents: true,
+            i8_act_sites: true,
+        }
+    }
+
+    /// FastVideo FastWan2.1-T2V-1.3B: the stock Wan2.1-1.3B backbone, DMD
+    /// 3-step distilled (CFG-free), the Wan2.1 z16 VAE. The fp32 DiT narrows to
+    /// bf16 at upload (~2.8GB, resident on the 8GB card), so no block transcode;
+    /// the 1536-dim residual fits f16 acts (probe). taew2_1 is its tiny decoder.
+    /// Dense on every matmul site: the i8 act sites collapse its output.
+    pub fn fastwan21_t2v_1_3b() -> Self {
+        Self {
+            dit: WanDitConfig::wan21_t2v_1_3b(),
+            vae: WanVaeConfig::wan2_1(),
+            moe: false,
+            block_transcode: None,
+            act_pref: None,
+            tiny_vae_normed_latents: true,
+            i8_act_sites: false,
         }
     }
 
@@ -465,6 +502,7 @@ impl WanVariant {
             act_pref: Some(ActDtype::Bf16),
             // No tiny path today; taew2_1 (normed) would be the one if added.
             tiny_vae_normed_latents: true,
+            i8_act_sites: true,
         }
     }
 
@@ -487,6 +525,7 @@ impl WanVariant {
             block_transcode: None,
             act_pref: None,
             tiny_vae_normed_latents: true,
+            i8_act_sites: true,
         }
     }
 }
@@ -562,7 +601,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // (dot4I8Packed) path. Those A-sides are norm-conditioned (no massive
         // outliers), so it holds parity while cutting their matmul ~6x. o-proj /
         // ffn_down stay bf16 (outlier-prone A-side). Off => bf16 byte-identical.
-        let q8 = i8_matmul.then_some(thinfer_core::quant::QuantKind::Q8_0);
+        let q8 =
+            (i8_matmul && variant.i8_act_sites).then_some(thinfer_core::quant::QuantKind::Q8_0);
         // qkv is split into two sites so only the SAFE half goes i8: self-attn
         // qkv has a normed A-side (DP4A-safe), so it takes Q8_0 + the i8 matmul;
         // cross-attn qkv stays bf16 because its K/V project from the un-normed

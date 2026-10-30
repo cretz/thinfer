@@ -48,13 +48,36 @@ struct WorkspaceInner<B: Backend> {
     /// the dispatch layer to exclude reusable pool bytes from the "live
     /// workspace" term in the packer budget.
     pool_bytes: u64,
+    /// Sum of size classes currently rented out, and its high-water mark.
+    rented_bytes: u64,
+    rented_peak: u64,
+    /// Strict (hard-ceiling) budget mode. When set, a pool-miss alloc that the
+    /// arbiter can't fit under the budget (reclaim ran dry) FAILS with
+    /// `budget_oom_error` instead of overshooting into `backend.allocate` (a
+    /// real device OOM), and the pool spills down to nothing on demand. Default
+    /// off (soft budget = overshoot + trace). The LTX VAE turns it on so its
+    /// adaptive tiler shrinks at the budget boundary rather than after a device
+    /// OOM (which can poison a long-lived device).
+    strict: bool,
 }
 
 /// Pop free-list entries up to `at_least` bytes; entries drop, releasing the
 /// underlying GPU buffer (and the MemAccount charge) via `OwnedBuffer::Drop`.
 /// Smallest size class first: preserves the largest reusable buffers, since
 /// re-allocating those is the expensive case.
+///
+/// A soft-budget pool never spills below its own rented high-water mark: the
+/// working set comes back on the next pass (every DiT block rents the same
+/// buffers), so spilling it cannot lower peak VRAM and only turns each pass
+/// into fresh allocations (exportable + CUDA-imported ones are costly).
+/// Activations are not budget-bounded; only the surplus above the peak goes.
 fn spill_pool_locked<B: Backend>(inner: &mut WorkspaceInner<B>, at_least: u64) -> u64 {
+    let at_least = if inner.strict {
+        at_least
+    } else {
+        let surplus = (inner.pool_bytes + inner.rented_bytes).saturating_sub(inner.rented_peak);
+        at_least.min(surplus)
+    };
     if at_least == 0 {
         return 0;
     }
@@ -137,13 +160,6 @@ pub struct Workspace<B: Backend> {
     /// runs. [`MemArbiter::unlimited`] disables the gate (unit tests that
     /// don't care about VRAM accounting).
     arbiter: Arc<MemArbiter>,
-    /// Strict (hard-ceiling) budget mode. When set, a pool-miss alloc that the
-    /// arbiter can't fit under the budget (reclaim ran dry) FAILS with
-    /// `budget_oom_error` instead of overshooting into `backend.allocate` (a
-    /// real device OOM). Default off (soft budget = overshoot + trace). The LTX
-    /// VAE turns it on so its adaptive tiler shrinks at the budget boundary
-    /// rather than after a device OOM (which can poison a long-lived device).
-    strict: std::sync::atomic::AtomicBool,
 }
 
 impl<B: Backend> Workspace<B> {
@@ -154,6 +170,9 @@ impl<B: Backend> Workspace<B> {
         let inner = Arc::new(Mutex::new(WorkspaceInner {
             free: HashMap::new(),
             pool_bytes: 0,
+            rented_bytes: 0,
+            rented_peak: 0,
+            strict: false,
         }));
         arbiter.register(
             RECLAIM_IDLE_POOL,
@@ -165,16 +184,14 @@ impl<B: Backend> Workspace<B> {
             backend,
             inner,
             arbiter,
-            strict: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Enable/disable strict (hard-ceiling) budget allocation. See the `strict`
-    /// field. Idempotent; cheap interior mutability so callers holding `&self`
-    /// (e.g. inside `decode`) can scope it.
+    /// Enable/disable strict (hard-ceiling) budget allocation. See
+    /// `WorkspaceInner::strict`. Idempotent; interior mutability so callers
+    /// holding `&self` (e.g. inside `decode`) can scope it.
     pub fn set_strict_budget(&self, strict: bool) {
-        self.strict
-            .store(strict, std::sync::atomic::Ordering::Relaxed);
+        self.inner.lock().unwrap().strict = strict;
     }
 
     /// Current sum of idle pool bytes. Cheap. Used by dispatch-layer
@@ -202,13 +219,13 @@ impl<B: Backend> Workspace<B> {
         // Pop outside the arbiter call: the reclaim chain re-enters this
         // pool via `PoolReclaimer`, so the inner lock must not be held when
         // `ensure_headroom` runs (lock order is arbiter -> client).
-        let popped = {
+        let (popped, strict) = {
             let mut inner = self.inner.lock().unwrap();
             let popped = inner.free.get_mut(&class).and_then(|v| v.pop());
             if popped.is_some() {
                 inner.pool_bytes = inner.pool_bytes.saturating_sub(class);
             }
-            popped
+            (popped, inner.strict)
         };
         let (owned, reused) = match popped {
             Some(owned) => (owned, true),
@@ -220,7 +237,7 @@ impl<B: Backend> Workspace<B> {
                 // test budget assert surfaces the true working-set overrun. In
                 // STRICT mode, a dry reclaim FAILS here (budget = hard ceiling)
                 // so the caller shrinks + retries before any device OOM.
-                if self.strict.load(std::sync::atomic::Ordering::Relaxed) {
+                if strict {
                     if !self
                         .arbiter
                         .reclaim_until_fits(self.backend.mem_account(), class)
@@ -242,6 +259,11 @@ impl<B: Backend> Workspace<B> {
                 )
             }
         };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.rented_bytes += class;
+            inner.rented_peak = inner.rented_peak.max(inner.rented_bytes);
+        }
         tracing::trace!(
             target: trace::WS,
             op = "alloc",
@@ -266,7 +288,7 @@ impl<B: Backend> Workspace<B> {
     /// holds every `WsBuf` allocated through `scope.alloc` / `write_uniform`
     /// until the scope is consumed by `submit`. Guarantees no pool reuse of
     /// any in-scope buffer during the lifetime of the encoder being built,
-    /// which is what makes the bug class in the worklog unconstructible:
+    /// which is what makes the scope-escape bug class unconstructible:
     /// uniforms allocated for one dispatch cannot be recycled into another
     /// dispatch in the same submit.
     pub fn batch(&self) -> BatchScope<'_, B> {
@@ -277,6 +299,7 @@ impl<B: Backend> Workspace<B> {
             encoder: RefCell::new(Some(encoder)),
             guards: RefCell::new(Vec::new()),
             scope_id: NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+            deferred: std::cell::Cell::new(false),
             _life: PhantomData,
         }
     }
@@ -363,6 +386,7 @@ impl<B: Backend> Drop for WsBuf<B> {
         if let Some(pool) = self.pool.upgrade() {
             let class = owned.class;
             let mut inner = pool.lock().unwrap();
+            inner.rented_bytes = inner.rented_bytes.saturating_sub(class);
             inner.pool_bytes = inner.pool_bytes.saturating_add(class);
             inner.free.entry(class).or_default().push(owned);
         }
@@ -411,6 +435,9 @@ pub struct BatchScope<'wsp, B: Backend> {
     encoder: RefCell<Option<B::CommandEncoder>>,
     guards: RefCell<Vec<WsBuf<B>>>,
     scope_id: u64,
+    /// Accelerator ops enqueue without per-op drains or syncs (see
+    /// [`Self::accel_begin`]); [`Self::accel_end`] or submit waits for them.
+    deferred: std::cell::Cell<bool>,
     /// Marker to make `BatchScope<'wsp, B>` carry its lifetime even when the
     /// `'wsp` shows up only behind references; not load-bearing for safety.
     _life: PhantomData<&'wsp ()>,
@@ -426,7 +453,7 @@ pub struct BatchScope<'wsp, B: Backend> {
 ///
 /// The `'s` lifetime is **invariant** (via `PhantomData<*mut &'s ()>`) so the
 /// borrow checker can't silently shrink it — that would let a `BatchBuf` outlive
-/// the scope that minted it (worklog risk: covariant would re-enable the leak).
+/// the scope that minted it (covariant would re-enable the leak).
 /// Compile-fail test in `tests/batchbuf_invariance.rs` proves this.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchBuf<'s> {
@@ -639,7 +666,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// `WsBuf` is moved out and returned to the caller — it survives the
     /// scope. (Imported buffers are unaffected; they're caller-owned.)
     ///
-    /// Async-cancellation hazard (worklog risk (B)): if this future is
+    /// Async-cancellation hazard: if this future is
     /// dropped between `backend.submit(enc)` queuing and the `await`
     /// resolving, guards drop while GPU work is still pending → next batch
     /// reuses those buffer ids → write_buffer overwrites them before the GPU
@@ -648,6 +675,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// guards live until GPU completion regardless of future state. v1
     /// callers don't cancel submit futures; tracked as a follow-up.
     pub async fn submit(self, out: BatchBuf<'wsp>) -> Result<WsBuf<B>, B::Error> {
+        self.accel_end();
         debug_assert_eq!(
             out.scope_id, self.scope_id,
             "submit output BatchBuf came from a different scope"
@@ -737,6 +765,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// completion. Use when the scope's effect is a side-effect on an
     /// imported (caller-owned) destination buffer.
     pub async fn submit_void(self) -> Result<(), B::Error> {
+        self.accel_end();
         let enc = self
             .encoder
             .into_inner()
@@ -803,6 +832,11 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let b = self.resolve(b);
         let dims = self.resolve(dims);
         let out = self.resolve(out);
+        if let Some(desc) = self.backend.pipeline_gemm(pipeline)
+            && self.try_accel_gemm(&desc, &a, &b, Some(&dims), &out, m, n, 0)?
+        {
+            return Ok(());
+        }
         let bufs = crate::ops::MatmulBufs {
             a: &a,
             b: &b,
@@ -838,6 +872,9 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let b = self.resolve(b);
         let out = self.resolve(out);
         let dims = self.resolve(dims);
+        if self.try_accel_gemm(&cfg.gemm_desc(), &a, &b, Some(&dims), &out, m, n, 0)? {
+            return Ok(());
+        }
         let bufs = crate::ops::matmul_coopmat::CoopmatBufs {
             a: &a,
             b: &b,
@@ -863,7 +900,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     pub fn dequant(
         &self,
         pipeline: &B::Pipeline,
-        scheme: crate::quant::QuantKind,
+        scheme: crate::ops::DequantScheme,
         b_quant: BatchBuf<'wsp>,
         b_dense: BatchBuf<'wsp>,
         dims: BatchBuf<'wsp>,
@@ -1153,6 +1190,9 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let mask = self.resolve(mask);
         let uniform = self.resolve(uniform);
         let out = self.resolve(out);
+        if self.try_accel_sdpa(&q, &k, &v, &mask, &uniform, &out)? {
+            return Ok(());
+        }
         let bufs = crate::ops::SdpaBufs {
             q: &q,
             k: &k,
@@ -1172,6 +1212,426 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             s_q,
             h_q,
         )
+    }
+
+    /// Run an `sdpa_sg` call on the backend's [`crate::backend::Accelerator`]
+    /// when one is installed, every buffer is accelerator-addressable, and it
+    /// accepts the call. The work encoded so far is flushed and drained first
+    /// (the accelerator reads its results from VRAM); on return the output is
+    /// complete, so later encoded work sees it. `false` = run the wgpu op.
+    #[allow(clippy::too_many_arguments)]
+    fn try_accel_sdpa(
+        &self,
+        q: &crate::backend::BufRef,
+        k: &crate::backend::BufRef,
+        v: &crate::backend::BufRef,
+        mask: &crate::backend::BufRef,
+        uniform: &crate::backend::BufRef,
+        out: &crate::backend::BufRef,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        if !acc.accepts_sdpa_f16(uniform.len) {
+            return Ok(false);
+        }
+        let addr = |b: &crate::backend::BufRef| self.backend.device_address(b);
+        let (Some(q), Some(k), Some(v), Some(mask), Some(out), Some(uniform)) = (
+            addr(q),
+            addr(k),
+            addr(v),
+            addr(mask),
+            addr(out),
+            addr(uniform),
+        ) else {
+            return Ok(false);
+        };
+        let t0 = crate::trace::Instant::now();
+        self.flush()?;
+        self.backend.wait_idle();
+        let addrs = crate::backend::SdpaAddrs {
+            q,
+            k,
+            v,
+            mask,
+            out,
+            uniform,
+        };
+        let t1 = crate::trace::Instant::now();
+        let res = acc.sdpa_f16(&addrs);
+        tracing::debug!(
+            target: crate::trace::DIAG,
+            op = "sdpa",
+            drain_us = (t1 - t0).as_micros() as u64,
+            run_us = t1.elapsed().as_micros() as u64,
+            "accel call",
+        );
+        match res {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator sdpa failed; wgpu op");
+                Ok(false)
+            }
+        }
+    }
+
+    /// `out[M,N] = a[M,K] @ b` with `pipeline`'s dense-matmul contract on the
+    /// accelerator, `k` from the host (no uniform). Deferred-aware like
+    /// [`Self::try_gemm_nvfp4`]. `false` = not covered: run the backend op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm(
+        &self,
+        pipeline: &B::Pipeline,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<bool, B::Error> {
+        let Some(desc) = self.backend.pipeline_gemm(pipeline) else {
+            return Ok(false);
+        };
+        let (a, b, out) = (self.resolve(a), self.resolve(b), self.resolve(out));
+        self.try_accel_gemm(&desc, &a, &b, None, &out, m, n, k)
+    }
+
+    /// Whether [`Self::try_gemm`] would take this shape (cheap, host-side).
+    pub fn accepts_gemm(&self, pipeline: &B::Pipeline, m: u32, n: u32) -> bool {
+        match (
+            self.backend.accelerator(),
+            self.backend.pipeline_gemm(pipeline),
+        ) {
+            (Some(acc), Some(desc)) => acc.accepts_gemm(&desc, m, n),
+            _ => false,
+        }
+    }
+
+    /// Block-sparse tile attention with caller-built key lists on the
+    /// accelerator (see [`crate::backend::TileAttnShape`]). Deferred-aware.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_tile_attention(
+        &self,
+        shape: &crate::backend::TileAttnShape,
+        q: BatchBuf<'wsp>,
+        k: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        geometry: BatchBuf<'wsp>,
+        lists: BatchBuf<'wsp>,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        if !acc.accepts_tile_attention(shape.head_dim) {
+            return Ok(false);
+        }
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let (Some(q), Some(k), Some(v), Some(out), Some(geometry), Some(lists)) = (
+            addr(q),
+            addr(k),
+            addr(v),
+            addr(out),
+            addr(geometry),
+            addr(lists),
+        ) else {
+            return Ok(false);
+        };
+        if !self.deferred.get() {
+            self.flush()?;
+            self.backend.wait_idle();
+        }
+        let addrs = crate::backend::TileAttnAddrs {
+            q,
+            k,
+            v,
+            out,
+            geometry,
+            lists,
+        };
+        match acc
+            .tile_attention(shape, &addrs)
+            .and_then(|ran| self.accel_settle(acc).map(|()| ran))
+        {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator tile attention failed");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Enter deferred mode: drain the GPU once (so every input produced or
+    /// uploaded through the backend is complete), then let accelerator ops
+    /// ([`Self::try_gemm_nvfp4`], [`Self::try_vsa`], [`Self::accel_elementwise`])
+    /// enqueue back to back with no per-op drain or sync. The caller must not
+    /// encode backend work that reads their outputs before [`Self::accel_end`]
+    /// (submit ends deferred mode itself). `false` = no accelerator.
+    pub fn accel_begin(&self) -> Result<bool, B::Error> {
+        if self.backend.accelerator().is_none() {
+            return Ok(false);
+        }
+        self.flush()?;
+        self.backend.wait_idle();
+        self.deferred.set(true);
+        Ok(true)
+    }
+
+    /// Leave deferred mode, waiting for everything the accelerator enqueued.
+    /// A failed wait is a lost device: there is no backend path to fall back
+    /// to for work already enqueued.
+    pub fn accel_end(&self) {
+        if self.deferred.replace(false)
+            && let Some(acc) = self.backend.accelerator()
+            && let Err(e) = acc.sync()
+        {
+            panic!("accelerator sync failed: {e}");
+        }
+    }
+
+    /// Outside deferred mode an accelerator op completes before returning.
+    fn accel_settle(&self, acc: &dyn crate::backend::Accelerator) -> Result<(), String> {
+        if self.deferred.get() {
+            Ok(())
+        } else {
+            acc.sync()
+        }
+    }
+
+    /// The backend's accelerator, for up-front `accepts_*` checks.
+    pub fn accelerator(&self) -> Option<&dyn crate::backend::Accelerator> {
+        self.backend.accelerator()
+    }
+
+    pub fn is_deferred(&self) -> bool {
+        self.deferred.get()
+    }
+
+    /// Device address of `b` for an [`crate::backend::ElementwiseOp`].
+    pub fn accel_addr(&self, b: BatchBuf<'wsp>) -> Option<u64> {
+        self.backend.device_address(&self.resolve(b))
+    }
+
+    /// Enqueue `op` (deferred mode only). `false` = declined; work already
+    /// enqueued stays valid.
+    pub fn accel_elementwise(&self, op: &crate::backend::ElementwiseOp) -> bool {
+        debug_assert!(
+            self.deferred.get(),
+            "accel_elementwise outside deferred mode"
+        );
+        let Some(acc) = self.backend.accelerator() else {
+            return false;
+        };
+        match acc.elementwise(op) {
+            Ok(ran) => ran,
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator elementwise failed");
+                false
+            }
+        }
+    }
+
+    /// `out[M,N] = a[M,K] @ W^T` for an NVFP4 composite `w` on the backend's
+    /// [`crate::backend::Accelerator`] (native W4A4, no dequant pass), with a
+    /// scope-owned scratch for the quantized activations. Same flush/drain
+    /// ordering as [`Self::try_accel_sdpa`]. `false` = no accelerator, a
+    /// declined shape, or a buffer it cannot address: the caller dequantizes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_nvfp4(
+        &self,
+        a: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        let Some(scratch_bytes) = acc.accepts_gemm_nvfp4(m, n, k) else {
+            return Ok(false);
+        };
+        let scratch = self.alloc(scratch_bytes)?;
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let (Some(a), Some(w), Some(out), Some(scratch)) =
+            (addr(a), addr(w), addr(out), addr(scratch))
+        else {
+            return Ok(false);
+        };
+        let t0 = crate::trace::Instant::now();
+        if !self.deferred.get() {
+            self.flush()?;
+            self.backend.wait_idle();
+        }
+        let t1 = crate::trace::Instant::now();
+        let res = acc.gemm_nvfp4(&crate::backend::GemmNvfp4Addrs {
+            a,
+            w,
+            out,
+            scratch,
+            m,
+            n,
+            k,
+        });
+        let res = res.and_then(|ran| self.accel_settle(acc).map(|()| ran));
+        tracing::debug!(
+            target: crate::trace::DIAG,
+            op = "gemm_nvfp4",
+            m,
+            n,
+            drain_us = (t1 - t0).as_micros() as u64,
+            run_us = t1.elapsed().as_micros() as u64,
+            "accel call",
+        );
+        match res {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator nvfp4 gemm failed; dequant path");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Tile-sparse attention with the gated compression branch on the
+    /// backend's [`crate::backend::Accelerator`] (see
+    /// [`crate::backend::VsaShape`]), with a scope-owned scratch. Same
+    /// flush/drain ordering as [`Self::try_accel_sdpa`]. `false` = no
+    /// accelerator, a declined shape, or an unaddressable buffer: the caller
+    /// runs dense attention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_vsa(
+        &self,
+        shape: &crate::backend::VsaShape,
+        q: BatchBuf<'wsp>,
+        k: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        gate: Option<BatchBuf<'wsp>>,
+        out: BatchBuf<'wsp>,
+        geometry: BatchBuf<'wsp>,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        let Some(scratch_bytes) = acc.accepts_vsa(shape) else {
+            return Ok(false);
+        };
+        let scratch = self.alloc(scratch_bytes)?;
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let gate = match gate {
+            None => Some(0),
+            Some(g) => addr(g),
+        };
+        let (Some(q), Some(k), Some(v), Some(gate), Some(out), Some(geometry), Some(scratch)) = (
+            addr(q),
+            addr(k),
+            addr(v),
+            gate,
+            addr(out),
+            addr(geometry),
+            addr(scratch),
+        ) else {
+            return Ok(false);
+        };
+        let t0 = crate::trace::Instant::now();
+        if !self.deferred.get() {
+            self.flush()?;
+            self.backend.wait_idle();
+        }
+        let t1 = crate::trace::Instant::now();
+        let res = acc.vsa(
+            shape,
+            &crate::backend::VsaAddrs {
+                q,
+                k,
+                v,
+                gate,
+                out,
+                geometry,
+                scratch,
+            },
+        );
+        let res = res.and_then(|ran| self.accel_settle(acc).map(|()| ran));
+        tracing::debug!(
+            target: crate::trace::DIAG,
+            op = "vsa",
+            drain_us = (t1 - t0).as_micros() as u64,
+            run_us = t1.elapsed().as_micros() as u64,
+            "accel call",
+        );
+        match res {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator vsa failed; dense attention");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Run a dense matmul with contract `desc` on the backend's
+    /// [`crate::backend::Accelerator`] when every buffer is
+    /// accelerator-addressable and it accepts the shape. Same flush/drain
+    /// ordering as [`Self::try_accel_sdpa`]. `false` = run the wgpu op.
+    #[allow(clippy::too_many_arguments)]
+    fn try_accel_gemm(
+        &self,
+        desc: &crate::ops::GemmDesc,
+        a: &crate::backend::BufRef,
+        b: &crate::backend::BufRef,
+        dims: Option<&crate::backend::BufRef>,
+        out: &crate::backend::BufRef,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        if !acc.accepts_gemm(desc, m, n) {
+            return Ok(false);
+        }
+        let addr = |b: &crate::backend::BufRef| self.backend.device_address(b);
+        let dims = match dims {
+            Some(d) => addr(d),
+            None => Some(0),
+        };
+        let (Some(a), Some(b), Some(out), Some(dims)) = (addr(a), addr(b), addr(out), dims) else {
+            return Ok(false);
+        };
+        let t0 = crate::trace::Instant::now();
+        if !self.deferred.get() {
+            self.flush()?;
+            self.backend.wait_idle();
+        }
+        let addrs = crate::backend::GemmAddrs {
+            a,
+            b,
+            out,
+            dims,
+            m,
+            n,
+            k,
+        };
+        let t1 = crate::trace::Instant::now();
+        let res = acc
+            .gemm(desc, &addrs)
+            .and_then(|ran| self.accel_settle(acc).map(|()| ran));
+        tracing::debug!(
+            target: crate::trace::DIAG,
+            op = "gemm",
+            m,
+            n,
+            drain_us = (t1 - t0).as_micros() as u64,
+            run_us = t1.elapsed().as_micros() as u64,
+            "accel call",
+        );
+        match res {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator gemm failed; wgpu op");
+                Ok(false)
+            }
+        }
     }
 
     pub fn rmsnorm<O: crate::ops::RmsNormOp>(
@@ -2406,6 +2866,7 @@ where
             encoder,
             guards,
             scope_id: _,
+            deferred: _,
             _life: _,
         } = scope;
         let enc = encoder
@@ -2552,6 +3013,10 @@ mod tests {
         type Error = ();
         type CommandEncoder = ();
         type Pipeline = ();
+        type StagedWrite = Vec<u8>;
+        fn stage_write(&self, _: GpuBufferId, _: u64, len: u64) -> Result<Vec<u8>, ()> {
+            Ok(vec![0; len as usize])
+        }
         fn allocate(&self, _bytes: u64) -> Result<GpuBufferId, ()> {
             let id = GpuBufferId(self.next.fetch_add(1, Ordering::Relaxed));
             self.allocated.lock().unwrap().insert(id);

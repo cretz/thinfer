@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::arbiter::{MemArbiter, MemReclaimer, MemTier};
-use crate::backend::{Backend, BufRef, WeightPrep};
+use crate::backend::{Backend, BufRef, StagedWrite, WeightPrep};
 use crate::mem::{RamCategory, RamCharge, VramCategory};
 use crate::policy::ResidencyBudget;
 use crate::quant::QuantKind;
@@ -65,16 +65,10 @@ const UPLOAD_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 /// back-to-back, so the read pipe stays full while the engine thread is busy
 /// encoding GPU work — without this lead the worker idles between chunks
 /// waiting for the next request and read throughput sags below GPU compute
-/// rate (GPU then stalls). No-op on mmap readers (`will_read` is a no-op).
-/// In-flight bytes live in the reader's own buffers (JS heap on web), not
-/// the wasm scratch below, which still holds one chunk.
+/// rate (GPU then stalls). On mmap readers the hint is OS readahead. In-flight
+/// bytes live in the reader's own buffers (JS heap on web), not the backend's
+/// staging chunk, which holds one chunk at a time.
 const READ_PREFETCH_CHUNKS: u64 = 4;
-
-/// Cap on retired upload scratch buffers kept for reuse. Streaming acquires
-/// borrow a chunk-sized host buffer and return it here instead of
-/// re-allocating (and re-zeroing) per weight; two can be live at once
-/// (`join!` of next-acquire + prefetch), so a small cap covers steady state.
-const SCRATCH_POOL_CAP: usize = 4;
 
 /// Single-wake cooperative yield: returns `Pending` once (waking itself
 /// immediately) so a `join!` sibling gets polled, then completes. Executor-
@@ -169,6 +163,11 @@ impl WeightMeta {
             StorageEncoding::Bf16 => self.elements().div_ceil(2) * 4,
             StorageEncoding::F32 => self.elements() * 4,
             StorageEncoding::Quant(k) => k.bytes_for_elements(self.elements()),
+            // The composite's size depends on its 2-D shape (scale tiles pad).
+            StorageEncoding::Nvfp4 => match self.shape.0[..] {
+                [n, k] => crate::ops::nvfp4::Nvfp4Layout::new(n, k).total_len() as u64,
+                _ => 0,
+            },
             _ => 0,
         }
     }
@@ -295,9 +294,6 @@ pub struct WeightResidency<S: WeightSource> {
     /// `vram_bytes` ceiling enters the system; handed out via
     /// [`Self::arbiter`].
     arbiter: Arc<MemArbiter>,
-    /// Reuse pool for chunk-sized upload scratch (see `SCRATCH_POOL_CAP`).
-    /// Avoids a per-weight alloc + full zero of `UPLOAD_CHUNK_BYTES`.
-    scratch_pool: Mutex<Vec<Vec<u8>>>,
     /// Persistent VRAM staging band for `NarrowTransposeF32` prep, lazily
     /// allocated on first use (when VRAM is still empty) and reused for every
     /// band. Allocating it once - rather than per-acquire - keeps it from being
@@ -325,7 +321,6 @@ impl<S: WeightSource> WeightResidency<S> {
             source,
             arbiter: MemArbiter::new(MemTier::Vram, budget.vram_bytes),
             budget,
-            scratch_pool: Mutex::new(Vec::new()),
             prep_staging: Mutex::new(None),
             transient_reserve: AtomicU64::new(0),
             inner: Arc::new(Mutex::new(Inner {
@@ -508,9 +503,11 @@ impl<S: WeightSource> WeightResidency<S> {
     /// headroom call so that call stays a no-op.
     fn vram_staging_bytes(meta: &WeightMeta, prep: Option<WeightPrep>) -> u64 {
         match prep {
-            Some(WeightPrep::Q8_0FromBf16 { .. } | WeightPrep::TransposeBf16 { .. }) => {
-                meta.on_disk_bytes.next_multiple_of(4) + 16
-            }
+            Some(
+                WeightPrep::Q8_0FromBf16 { .. }
+                | WeightPrep::TransposeBf16 { .. }
+                | WeightPrep::TransposeF16 { .. },
+            ) => meta.on_disk_bytes.next_multiple_of(4) + 16,
             Some(WeightPrep::NarrowTransposeF32 { .. }) | None => 0,
         }
     }
@@ -1209,13 +1206,17 @@ impl<S: WeightSource> WeightResidency<S> {
         // band at a time so the staging buffer stays bounded; the whole-tensor
         // callers pass `src_offset = 0`, `total = on_disk_bytes`.
         //
-        // F32 is allowed here only as raw staging bytes for a GPU prep kernel
-        // (NarrowTransposeF32); F32 is never `is_passthrough`, so the only
-        // caller streaming f32 is the prep staging path above. Bf16/Quant
+        // F32/F16 are allowed here only as raw staging bytes for a GPU prep
+        // kernel (NarrowTransposeF32 / TransposeF16); neither is `is_passthrough`, so the only
+        // caller streaming f32 is the prep staging path above. Bf16/Quant/NVFP4
         // stream straight into their final buffer.
         if !matches!(
             meta.encoding,
-            StorageEncoding::Bf16 | StorageEncoding::Quant(_) | StorageEncoding::F32
+            StorageEncoding::Bf16
+                | StorageEncoding::Quant(_)
+                | StorageEncoding::Nvfp4
+                | StorageEncoding::F32
+                | StorageEncoding::F16
         ) {
             return Err(ResidencyError::Decode(DecodeError::UnsupportedEncoding(
                 meta.encoding,
@@ -1234,22 +1235,12 @@ impl<S: WeightSource> WeightResidency<S> {
                 got: reader.len(),
             });
         }
-        let scratch_len = padded_len.min(UPLOAD_CHUNK_BYTES) as usize;
+        // One chunk of staging memory is live at a time.
         let _upload_charge = RamCharge::new(
             backend.mem_account().clone(),
             RamCategory::Upload,
-            scratch_len as u64,
+            padded_len.min(UPLOAD_CHUNK_BYTES),
         );
-        let mut scratch = {
-            let mut pool = self.scratch_pool.lock().unwrap();
-            pool.pop().unwrap_or_default()
-        };
-        // Reused buffers are at least chunk-sized; grow a smaller/empty one.
-        // Contents are stale but every chunk fully overwrites `[..n_write]`
-        // below, so no up-front zeroing is needed.
-        if scratch.len() < scratch_len {
-            scratch.resize(scratch_len, 0);
-        }
         // Prime the read pipeline: issue the first `READ_PREFETCH_CHUNKS`
         // chunk reads up front so the async reader's IO worker stays
         // saturated and never idles between chunks waiting for the engine
@@ -1274,9 +1265,19 @@ impl<S: WeightSource> WeightResidency<S> {
         while off < padded_len {
             let n_write = (padded_len - off).min(UPLOAD_CHUNK_BYTES) as usize;
             let n_read = (total.saturating_sub(off)).min(n_write as u64) as usize;
+            // The reader fills the backend's staging chunk directly: one copy
+            // per byte rather than reader -> host scratch -> staging.
+            let t_w = diag.then(crate::trace::Instant::now);
+            let mut staged = backend
+                .stage_write(dst, off, n_write as u64)
+                .map_err(ResidencyError::Backend)?;
+            if let Some(t) = t_w {
+                write_acc += t.elapsed();
+            }
+            let chunk = staged.bytes();
             let t_r = diag.then(crate::trace::Instant::now);
             reader
-                .read_at(src_offset + off, &mut scratch[..n_read])
+                .read_at(src_offset + off, &mut chunk[..n_read])
                 .await
                 .map_err(|e| ResidencyError::Reader(format!("{e:?}")))?;
             if let Some(t) = t_r {
@@ -1291,14 +1292,8 @@ impl<S: WeightSource> WeightResidency<S> {
             if ahead_read > 0 {
                 reader.will_read(src_offset + ahead_off, ahead_read);
             }
-            scratch[n_read..n_write].fill(0);
-            let t_w = diag.then(crate::trace::Instant::now);
-            backend
-                .write_buffer(dst, off, &scratch[..n_write])
-                .map_err(ResidencyError::Backend)?;
-            if let Some(t) = t_w {
-                write_acc += t.elapsed();
-            }
+            chunk[n_read..].fill(0);
+            drop(staged);
             off += n_write as u64;
             // Cooperative yield between chunks: on a single-threaded executor
             // a `join!`ed prefetch leg would otherwise run this whole loop
@@ -1322,12 +1317,6 @@ impl<S: WeightSource> WeightResidency<S> {
             backend
                 .flush_encoder(enc)
                 .map_err(ResidencyError::Backend)?;
-        }
-        {
-            let mut pool = self.scratch_pool.lock().unwrap();
-            if pool.len() < SCRATCH_POOL_CAP {
-                pool.push(scratch);
-            }
         }
         tracing::debug!(
             target: "thinfer::diag",
@@ -1367,6 +1356,11 @@ impl<S: WeightSource> WeightResidency<S> {
             (StorageEncoding::Bf16, None, TransposePolicy::Linear2D) if transpose_ok => {
                 Some(WeightPrep::TransposeBf16 { n, k })
             }
+            // f16 linear (the H3 video VAE): decode + narrow + transpose on the
+            // GPU; the source streams raw at its own (same) width.
+            (StorageEncoding::F16, None, TransposePolicy::Linear2D) if transpose_ok => {
+                Some(WeightPrep::TransposeF16 { n, k })
+            }
             // f32 (safetensors) linear: fuse the RNE narrow with the upload
             // transpose on the GPU so the source streams raw and the CPU stays
             // off the critical path (the whole-tensor `read_for_gpu` narrow is
@@ -1404,6 +1398,24 @@ impl<S: WeightSource> WeightResidency<S> {
         // is in Gpu state with pin_count=0 at MRU.
         let view = self.acquire(handle, backend).await?;
         drop(view);
+        Ok(())
+    }
+
+    /// OS readahead over `handle`'s whole source range, no upload: a cold
+    /// (disk-backed) weight pages in while the GPU works on something else,
+    /// so the later `acquire` copies from memory instead of faulting page by
+    /// page. Best effort and executor-neutral (the hint itself is asynchronous
+    /// in the OS); a GPU-resident weight is skipped.
+    pub async fn hint_read(&self, handle: WeightHandle) -> Result<(), S::Error> {
+        let (id, bytes) = {
+            let g = self.inner.lock().unwrap();
+            if g.gpu.contains_key(&handle) {
+                return Ok(());
+            }
+            let meta = &g.metas[handle.0 as usize];
+            (meta.id.clone(), meta.on_disk_bytes)
+        };
+        self.source.open(&id).await?.will_read(0, bytes);
         Ok(())
     }
 

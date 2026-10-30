@@ -530,7 +530,13 @@ impl ConnectorPipelines {
                         dq_layout,
                     )
                     .await?;
-                dequant.insert(scheme, DequantStep { pipeline, scheme });
+                dequant.insert(
+                    scheme,
+                    DequantStep {
+                        pipeline,
+                        scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                    },
+                );
             }
         }
         let fe_cfg = WgslConfig {

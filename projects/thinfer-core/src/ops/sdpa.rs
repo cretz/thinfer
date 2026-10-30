@@ -1403,7 +1403,7 @@ impl SdpaOp for SdpaF32LargeD {
                 panic!("sdpa_large_d: bf16-packed acts variant not implemented (VAE is f32)")
             }
             ActDtype::I8 => {
-                // VAE never gets I8 acts (per worklog: VAE I8 explicitly out of
+                // VAE never gets I8 acts (VAE I8 explicitly out of
                 // scope - different shape regime, tile-bounded working set).
                 unreachable!("sdpa_large_d: ActDtype::I8 not supported (VAE stays F32)")
             }

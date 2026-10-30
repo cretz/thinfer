@@ -1,0 +1,29 @@
+[package]
+name = "thinfer-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Optional native CUDA fast path for hot ops on NVIDIA. Everything here is an
+# optimization over the wgpu engine: missing driver/libs or a non-NVIDIA
+# adapter means the wgpu op runs unchanged.
+[dependencies]
+thinfer-core = { path = "../thinfer-core" }
+tracing = { workspace = true }
+wgpu = "29"
+# Same ash as wgpu-hal 29 (raw Vulkan handles for external-memory interop).
+ash = "0.38"
+# Driver API loaded at runtime (no CUDA toolkit needed to build or run).
+cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13020"] }
+# Preloading the CUDA DLLs by full path (see `libs.rs`); already in the graph via cudarc.
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# CloseHandle for the exported Vulkan memory handle (version already in the graph).
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
+[dev-dependencies]
+pollster = "0.4"
+half = "2"

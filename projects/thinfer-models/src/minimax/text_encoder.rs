@@ -119,6 +119,26 @@ pub struct BlockViews<'a> {
 }
 
 impl BlockHandles {
+    /// OS readahead for this layer's matmul weights (see
+    /// [`WeightResidency::hint_read`]), issued ahead of its acquire.
+    async fn hint_read<S: WeightSource>(
+        &self,
+        residency: &WeightResidency<S>,
+    ) -> Result<(), S::Error> {
+        for h in [
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+            self.mlp_gate,
+            self.mlp_up,
+            self.mlp_down,
+        ] {
+            residency.hint_read(h).await?;
+        }
+        Ok(())
+    }
+
     async fn acquire<'a, S: WeightSource>(
         &self,
         residency: &'a WeightResidency<S>,
@@ -168,6 +188,12 @@ pub struct EncoderHandles {
 impl EncoderHandles {
     pub fn n_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Keep only the first `n` layers, so `forward` returns `hidden_states[n]`
+    /// (parity bisection by depth).
+    pub fn truncate(&mut self, n: usize) {
+        self.layers.truncate(n);
     }
 }
 
@@ -247,15 +273,21 @@ pub fn register_handles<S: WeightSource>(
 /// Encoder pipeline cfgs. F32 acts: this is a conditioning tower and the
 /// residual carries the outlier channels that make f16 unsafe (the umT5 /
 /// large-residual encoder lesson).
-pub fn encoder_cfgs(weight_dtype: thinfer_core::ops::WeightDtype) -> BlockWgslConfigs {
-    use thinfer_core::ops::{ActDtype, WgslConfig};
+///
+/// The matmul `weight_dtype` selects the B-operand CONVENTION, not what the
+/// kernel reads: every site pre-dequants its own kind (Q4_K, Q6_K v_proj) into a
+/// dense N-major workspace, which is what a `Quant` config declares. `Bf16`
+/// would select K-major and silently transpose every weight (the H3 DiT bug,
+/// which also turned this tower's output to noise).
+pub fn encoder_cfgs() -> BlockWgslConfigs {
+    use thinfer_core::ops::{ActDtype, WeightDtype, WgslConfig};
     let ops = WgslConfig {
         bf16_quant_writes: false,
         act_dtype: ActDtype::F32,
-        weight_dtype: thinfer_core::ops::WeightDtype::Bf16,
+        weight_dtype: WeightDtype::Bf16,
     };
     let mm = WgslConfig {
-        weight_dtype,
+        weight_dtype: WeightDtype::Quant(QuantKind::Q4_K),
         ..ops
     };
     BlockWgslConfigs {
@@ -316,7 +348,13 @@ impl EncoderPipelines {
                     dq_layout,
                 )
                 .await?;
-            dense_dequant.insert(scheme, DequantStep { pipeline, scheme });
+            dense_dequant.insert(
+                scheme,
+                DequantStep {
+                    pipeline,
+                    scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                },
+            );
         }
         Ok(Self {
             block,
@@ -552,6 +590,13 @@ impl MiniMaxTextEncoder {
         for idx in 0..handles.layers.len() {
             let _guard = trace::scope!(format!("minimax.encoder.layer.{idx}")).entered();
             let views = pending.take().expect("pending acquire missing");
+            // Layer idx+1 is acquired during this layer's submit; start the
+            // OS reading idx+2 now so cold reads keep the disk queue full.
+            if let Some(h) = handles.layers.get(idx + 2) {
+                h.hint_read(residency)
+                    .await
+                    .map_err(ResidencyError::<_, WgpuError>::Source)?;
+            }
             let bufs = views.bufs();
             let cur_ref = cur.as_buf_ref();
             let nxt = scratch.alloc(act_bytes)?;

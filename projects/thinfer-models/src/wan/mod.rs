@@ -1,8 +1,7 @@
 //! Wan-family video models. First target: SkyReels-V2-DF-1.3B-540P.
 //!
 //! Shared text encoder is umT5-XXL (`umt5`); the Wan DiT block and 3D causal
-//! VAE land alongside it as the port proceeds. See
-//! `projects/thinfer-working-area/wan-plan.md`.
+//! VAE land alongside it as the port proceeds.
 
 pub mod condition_embedder;
 pub mod dit;

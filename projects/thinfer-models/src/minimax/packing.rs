@@ -485,10 +485,52 @@ pub fn sequence_rows(
     num_text + num_latent_frames * rows_per_frame + num_audio_latents * AUDIO_CHANNELS
 }
 
+/// Longest `17n + 5` clip of at most `frames` frames whose packed sequence
+/// (with `num_text` prompt rows) fits `limit` rows, or `None` when not even the
+/// shortest clip does. Larger canvases trade clip length for resolution.
+pub fn max_fitting_frames(
+    cfg: &DitConfig,
+    num_text: usize,
+    latent_height: usize,
+    latent_width: usize,
+    frames: usize,
+    limit: usize,
+) -> Option<usize> {
+    let mut best = None;
+    let mut n = LATENTS_PER_CHUNK;
+    while n <= frames.max(LATENTS_PER_CHUNK) {
+        let latents = video_latent_num_frames(n).ok()?;
+        let rows = sequence_rows(
+            cfg,
+            num_text,
+            latents,
+            latent_height,
+            latent_width,
+            audio_latent_num_frames(n),
+        );
+        if rows > limit {
+            break;
+        }
+        best = Some(n);
+        n += FRAMES_PER_CHUNK;
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::minimax::TAG_TEXT;
+
+    /// 5s at 832x480 fits the cap; 768p only fits a short clip.
+    #[test]
+    fn max_fitting_frames_trades_length_for_canvas() {
+        let cfg = DitConfig::fasth3_trim();
+        let fit = |h: usize, w: usize| max_fitting_frames(&cfg, 256, h / 16, w / 16, 124, 16384);
+        assert_eq!(fit(480, 832), Some(124));
+        let hd = fit(768, 1344).unwrap();
+        assert!(hd < 124 && hd >= 22, "1344x768 fits {hd} frames");
+    }
 
     #[test]
     fn canvas_16_9_is_1344x768() {

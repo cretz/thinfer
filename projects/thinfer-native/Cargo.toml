@@ -15,6 +15,9 @@ bytemuck = { version = "1", features = ["derive"] }
 safetensors = "0.4"
 tokio = { version = "1", features = ["fs", "io-util", "rt"] }
 memmap2 = "0.9"
+# User weight sources file (`sources.rs`).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
 # Tokenizer: skip onig (Windows-hostile native dep) and progress bars;
 # fancy-regex handles GPT-style byte-level BPE (Qwen3, Llama, etc.).

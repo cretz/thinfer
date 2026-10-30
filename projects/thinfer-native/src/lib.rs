@@ -1,6 +1,7 @@
 // thinfer-native: desktop/native impls of thinfer-core IO traits.
 
 pub mod cache;
+pub mod sources;
 pub mod tokenizer;
 
 use std::io;

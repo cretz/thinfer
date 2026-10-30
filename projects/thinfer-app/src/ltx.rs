@@ -176,7 +176,7 @@ pub async fn run(
     //     raw prompt is out-of-distribution and collapses to the model's portrait
     //     prior. Expand it via the on-device Qwen3-VL rewriter (phase-scoped,
     //     evicted before the encoder); fall back to the original on any failure.
-    //     The 22B distilled/Sulphur path is unchanged. Prompt text is never logged.
+    //     The 22B distilled/dev path is unchanged. Prompt text is never logged.
     let raw_prompt = req.prompts[0].trim();
     if raw_prompt.is_empty() {
         return Err("empty prompt produced no tokens".into());
@@ -237,9 +237,9 @@ pub async fn run(
 
     sink.stage(Stage::TextEncode);
 
-    // === DiT weight source, built FIRST so the Sulphur fold runs in background ===
+    // === DiT weight source, built FIRST so the dev distill fold runs in background ===
     // Opening the GGUF and building the fold allocates no VRAM (the residency is
-    // created later, at phase C), so this can sit ahead of the encoder. On Sulphur
+    // created later, at phase C), so this can sit ahead of the encoder. On dev
     // that matters: the fold is ~46s of CPU over 676 sites, and folding lazily on
     // the streaming path put every second of it on the critical path. Prefolding
     // from here hides it behind the latent stats, the encoder, and the connector.
@@ -289,7 +289,7 @@ pub async fn run(
         out.states
     };
 
-    // Which LTX-2 line: 22B (LTX-2.3 / Sulphur) or the 19B (ltx2-rapid) merge.
+    // Which LTX-2 line: 22B (LTX-2.3) or the 19B (ltx2-rapid) merge.
     let variant = if rapid {
         LtxVariant::ltx2_rapid_19b()
     } else {
@@ -373,7 +373,7 @@ pub async fn run(
             (v, a)
         };
         // === Phase C (19B): DiT GGUF resident: caption projection (3840 -> 4096/
-        // 2048) + register the 19B variant. No Sulphur fold (rapid is pre-distilled). ===
+        // 2048) + register the 19B variant. No distill fold (rapid is pre-distilled). ===
         let dit_res = WeightResidency::new(dit_src, budget);
         let dit_pipes = DitPipelines::compile(backend)
             .await
@@ -568,9 +568,36 @@ pub async fn run(
     let (lat_v_final, lat_a_final) = if req.upscale && !rapid {
         let upscaler_path = resolve_role(manifest, role::UPSCALER)?;
         let vd_s1 = VideoLatentDims::from_pixels(frames, height / 2, width / 2);
-        let s1_steps = STAGE1_SIGMAS.len() - 1;
-        let s2_steps = STAGE2_SIGMAS.len() - 1;
+        // Opt-in HQ audio, same lever as the single-stage branch: subdivide the
+        // coarse distilled sigma jumps into finer Euler substeps (the distilled
+        // anchors are preserved) so the delicate joint audio residual stops
+        // under-resolving into gibberish.
+        //
+        // This used to be single-stage ONLY, which meant it never ran for the 22B
+        // line at all -- `two_stage_default()` forces `upscale` on there, so the
+        // flag was silently dead for exactly the models whose speech drifts. BOTH
+        // schedules are refined: stage 2 matters most (it renoises the audio back
+        // to ~0.91 and had only 3 steps to resolve it), but stage 1 sets what
+        // stage 2 refines.
+        let s1_sigmas: Vec<f32> = if req.audio_hq {
+            sampler::refine_sigmas(&STAGE1_SIGMAS, sampler::AUDIO_HQ_MAX_DSIGMA)
+        } else {
+            STAGE1_SIGMAS.to_vec()
+        };
+        let s2_sigmas: Vec<f32> = if req.audio_hq {
+            sampler::refine_sigmas(&STAGE2_SIGMAS, sampler::AUDIO_HQ_MAX_DSIGMA)
+        } else {
+            STAGE2_SIGMAS.to_vec()
+        };
+        let s1_steps = s1_sigmas.len() - 1;
+        let s2_steps = s2_sigmas.len() - 1;
         let total_steps = (s1_steps + s2_steps) as u32;
+        if req.audio_hq {
+            sink.note(&format!(
+                "HQ audio: refined two-stage schedule to {s1_steps}+{s2_steps} \
+                 = {total_steps} steps (slower)"
+            ));
+        }
 
         // --- Stage 1: pure-noise init, denoise at half res ---
         let s1 = streams_for(vd_s1, ad);
@@ -590,7 +617,7 @@ pub async fn run(
             &dit_ws,
             &dit_model,
             s1,
-            &STAGE1_SIGMAS,
+            &s1_sigmas,
             lat_v,
             lat_a,
             &vtext,
@@ -645,7 +672,7 @@ pub async fn run(
         let lat_v_full = sampler::video_cthw_to_tokens(&upscaled, vd_full);
 
         // --- Stage 2: renoise to STAGE2_SIGMAS[0], refine at full res ---
-        let renoise = STAGE2_SIGMAS[0];
+        let renoise = s2_sigmas[0];
         let noise_v = sampler::gaussian_noise(lat_v_full.len(), sampler::substream_seed(seed, 2));
         let lat_v2 = sampler::renoise(&lat_v_full, &noise_v, renoise);
         let noise_a = sampler::gaussian_noise(lat_a.len(), sampler::substream_seed(seed, 3));
@@ -665,7 +692,7 @@ pub async fn run(
             &dit_ws,
             &dit_model,
             s2,
-            &STAGE2_SIGMAS,
+            &s2_sigmas,
             lat_v2,
             lat_a2,
             &vtext,
@@ -746,11 +773,43 @@ pub async fn run(
     // OOMed down to 2 latent cells -> hundreds of overlapping tiles, ~320s at
     // 768x512x49). The cap exists only to leave device slack while the 22.8G DiT
     // streams per-block; it has no reason to throttle the standalone VAE phase.
+    //
+    // ...but the REQUEST budget is itself small by default (`DEFAULT_BUDGET_BYTES`
+    // is 2 GiB, laptop-safe), so escaping the cap alone still left the decode
+    // tiling against 2 GiB on an idle 8 GiB card. That is expensive: the tile plan
+    // drives overlap RECOMPUTE, and `ltx_vae_conv3d` is the largest single GPU
+    // consumer of a render. Measured 768x512 / 49f, same seed:
+    //
+    //   4 GiB -> tf=2 tile=8, conv3d 57.9s, wall 231s
+    //   6 GiB -> tf=4 tile=6, conv3d 29.3s, wall 198s   (-49% conv3d, -14% wall)
+    //
+    // (The earlier "tile budget is a DEAD END" note A/B'd 6G vs 7G -- the
+    // saturated end of the curve, where the integer tile no longer moves. The
+    // default end is where the win is.)
+    //
+    // Rather than guess a constant that would over-promise a 4 GiB card, floor the
+    // decode at the peak THIS DEVICE has already sustained during the denoise. The
+    // DiT phase just allocated that much and survived, so it is measured evidence
+    // from the actual hardware, not an assumption -- on a thin card the observed
+    // peak is correspondingly small and the floor stays low. The tiler still
+    // treats it as a strict ceiling and shrinks the plan if the estimate is rich,
+    // so a high floor cannot device-OOM the decode.
+    let observed_peak = thinfer_core::backend::Backend::mem_account(&**backend)
+        .snapshot()
+        .vram_total_peak;
     let vae_budget = ResidencyBudget {
-        vram_bytes: req.budget.vram_bytes,
+        vram_bytes: req.budget.vram_bytes.max(observed_peak),
         ..budget
     };
+    tracing::info!(
+        target: thinfer_core::trace::DIAG,
+        requested = req.budget.vram_bytes, observed_peak,
+        chosen = vae_budget.vram_bytes, "ltx vae decode budget",
+    );
     let cthw_final = sampler::video_tokens_to_cthw(&lat_v_final, vd_full);
+    // The decoders run no accelerator op, and each VAE tile reallocates its
+    // workspace: keep those buffers plain.
+    let _plain = backend.plain_allocations();
     let mut video = {
         let src = open_st(&vae_path).await?;
         let residency = WeightResidency::new(src, vae_budget);
@@ -888,7 +947,11 @@ pub async fn run(
                     None
                 }
             };
-            crate::codec::encode_mp4_with_audio(&wan_video, plan.fps, audio, &req.output)?;
+            crate::progress::write_artifact(
+                sink,
+                &req.output,
+                &crate::codec::encode_mp4_with_audio(&wan_video, plan.fps, audio)?,
+            )?;
         }
         VideoFormat::PngFrames => {
             // Codec-free debug view: silent frames; the audio is dropped.
@@ -922,12 +985,12 @@ async fn open_st(path: &std::path::Path) -> Result<SafetensorsSource<MmapFileOpe
 }
 
 /// The DiT weight source: the plain GGUF (LTX distilled) or the GGUF with the
-/// Sulphur distill LoRA folded in. One concrete type so the DiT-resident phase
+/// dev distill LoRA folded in. One concrete type so the DiT-resident phase
 /// (connector + denoise) stays monomorphic over `WeightResidency<DitSource>`.
 type Gguf = GgufSource<MmapFileOpener>;
 type LoraFold = lora::LoraFoldSource<Gguf, SafetensorsSource<MmapFileOpener>>;
 
-/// Open the DiT GGUF and, on Sulphur, fold the distill LoRA over it. Sulphur
+/// Open the DiT GGUF and, on dev, fold the distill LoRA over it. Dev
 /// ships the BASE (`dev`) checkpoint; the 8-step CFG-free distilled sampler only
 /// converges with the distill LoRA folded on top (ComfyUI `t2v distilled` loads
 /// dev + the LoRA at strength 1.0). LTX distilled DiTs are already distilled, so
@@ -948,11 +1011,11 @@ async fn build_dit_source(
     let gguf = GgufSource::open(opener)
         .await
         .map_err(|e| format!("parse dit gguf: {e:?}"))?;
-    if !req.model.is_sulphur() {
+    if !req.model.folds_distill_lora() {
         return Ok(DitSource::Plain(gguf));
     }
     let mut stack = Vec::new();
-    for (role_name, strength) in req.model.sulphur_distill_stack() {
+    for (role_name, strength) in req.model.distill_stack() {
         let lora_path = resolve_role(manifest, role_name)?;
         let lora = open_st(&lora_path).await?;
         let specs = lora::discover_specs(&gguf, &lora)
@@ -961,7 +1024,7 @@ async fn build_dit_source(
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             lora = role_name, strength, sites = specs.len(),
-            "sulphur distill lora in stack",
+            "distill lora in stack",
         );
         stack.push((lora, strength, specs));
     }
@@ -970,7 +1033,7 @@ async fn build_dit_source(
     folded.spawn_prefold();
     tracing::info!(
         target: thinfer_core::trace::DIAG,
-        sites = folded.fold_count(), "sulphur distill lora prefold started",
+        sites = folded.fold_count(), "distill lora prefold started",
     );
     Ok(DitSource::Folded(Box::new(folded)))
 }

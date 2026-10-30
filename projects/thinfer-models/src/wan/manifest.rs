@@ -55,6 +55,20 @@ const REPO_DREAMIDV: &str = "XuGuo699/DreamID-V";
 /// tokenizer reuse the FastVideo base bundle (same TI2V-5B backbone), so only
 /// the DiT is mobilewan-specific.
 const REPO_MOBILEWAN: &str = "Qualcomm-AI-Research/mobilewan";
+/// FastVideo FastWan2.1-T2V-1.3B (Diffusers): DMD 3-step distill of the stock
+/// Wan2.1-T2V-1.3B. Only the single fp32 DiT file is taken (a user weight slot,
+/// so any layout-identical Wan2.1-1.3B finetune can fill it); umT5 + tokenizer
+/// reuse the FastVideo base bundle and the VAE is the shared Wan2.1 one.
+/// License Apache-2.0.
+const REPO_FASTWAN21: &str = "FastVideo/FastWan2.1-T2V-1.3B-Diffusers";
+/// Comfy-Org Wan2.1 repack: the stock Wan2.1-T2V-1.3B DiT as one bf16 file
+/// (original-Wan names, the layout community 1.3B finetunes ship in). License
+/// Apache-2.0.
+const REPO_COMFY_WAN21: &str = "Comfy-Org/Wan-2.1";
+/// Kijai's ComfyUI mirror: the CausVid bidirectional DMD distill of
+/// Wan2.1-T2V-1.3B extracted as a rank-32 LoRA (+ bias/norm diffs). Same 3-step
+/// `[1000, 757, 522]` unwarped schedule as FastWan2.1.
+const REPO_KIJAI_WAN: &str = "Kijai/WanVideo_comfy";
 
 pub mod role {
     /// DMD-distilled Wan2.2-TI2V-5B DiT (`WanTransformer3DModel`), single file.
@@ -110,6 +124,24 @@ pub mod role {
     pub const DIT_MOBILEWAN_3: &str = "dit/mobilewan3";
     pub const DIT_MOBILEWAN_4: &str = "dit/mobilewan4";
     pub const DIT_MOBILEWAN_5: &str = "dit/mobilewan5";
+    /// FastWan2.1-T2V-1.3B DiT (`WanTransformer3DModel`, fp32), single file.
+    pub const DIT_FASTWAN21: &str = "dit/fastwan21-1.3b";
+    /// Stock (or finetuned) Wan2.1-T2V-1.3B DiT, single file.
+    pub const DIT_WAN21_1_3B: &str = "dit/wan21-1.3b";
+    /// Step-distill LoRA folded onto [`DIT_WAN21_1_3B`].
+    pub const DISTILL_LORA_WAN21_1_3B: &str = "lora/wan21-1.3b-distill";
+}
+
+/// User weight slots (see `thinfer_core::manifest::FileRef::slot`). Wan DiT
+/// slots take diffusers or original-Wan names.
+pub mod slot {
+    /// Wan2.1-T2V-1.3B DiT. Default: FastWan2.1 3-step.
+    pub const FASTWAN21_DIT: &str = "fastwan2.1-t2v-1.3b/dit";
+    /// Wan2.1-T2V-1.3B DiT under the distill LoRA. Default: stock Wan2.1 bf16;
+    /// a full finetune of the stock model fills it.
+    pub const WAN21_1_3B_DIT: &str = "wan2.1-t2v-1.3b/dit";
+    /// The step-distill LoRA for [`WAN21_1_3B_DIT`]. Default: CausVid 3-step.
+    pub const WAN21_1_3B_DISTILL_LORA: &str = "wan2.1-t2v-1.3b/distill-lora";
 }
 
 /// One loadable variant: the file set `WanModel::load` needs. Mirrors
@@ -196,6 +228,26 @@ const MOBILEWAN_WEIGHT_ROLES: &[&str] = &[
     role::VAE,
 ];
 
+/// FastWan2.1-1.3B: the DiT leads (ShardedSafetensorsSource order: DiT first),
+/// then the FastVideo umT5 shards + the Wan2.1 VAE.
+const FASTWAN21_WEIGHT_ROLES: &[&str] = &[
+    role::DIT_FASTWAN21,
+    role::TEXT_ENCODER_SHARD_1,
+    role::TEXT_ENCODER_SHARD_2,
+    role::TEXT_ENCODER_SHARD_3,
+    role::VAE_WAN21,
+];
+
+/// Wan2.1-1.3B + distill LoRA: same layout as FastWan2.1 (DiT first); the LoRA
+/// rides `lora_low_role` (single expert).
+const WAN21_1_3B_WEIGHT_ROLES: &[&str] = &[
+    role::DIT_WAN21_1_3B,
+    role::TEXT_ENCODER_SHARD_1,
+    role::TEXT_ENCODER_SHARD_2,
+    role::TEXT_ENCODER_SHARD_3,
+    role::VAE_WAN21,
+];
+
 pub static VARIANTS: &[VariantFiles] = &[
     VariantFiles {
         id: "fastwan-ti2v-5b",
@@ -236,6 +288,26 @@ pub static VARIANTS: &[VariantFiles] = &[
         gguf_low_role: Some(role::DIT_LOW_NOISE),
         lora_high_role: Some(role::LORA_HIGH_NOISE),
         lora_low_role: Some(role::LORA_LOW_NOISE),
+    },
+    VariantFiles {
+        id: "fastwan2.1-t2v-1.3b",
+        weight_roles: FASTWAN21_WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_pt_role: None,
+        gguf_high_role: None,
+        gguf_low_role: None,
+        lora_high_role: None,
+        lora_low_role: None,
+    },
+    VariantFiles {
+        id: "wan2.1-t2v-1.3b",
+        weight_roles: WAN21_1_3B_WEIGHT_ROLES,
+        aux_roles: AUX_ROLES,
+        dit_pt_role: None,
+        gguf_high_role: None,
+        gguf_low_role: None,
+        lora_high_role: None,
+        lora_low_role: Some(role::DISTILL_LORA_WAN21_1_3B),
     },
     VariantFiles {
         id: "mobilewan",
@@ -370,6 +442,30 @@ pub static MANIFEST: ModelManifest = ModelManifest {
                 REPO_MOBILEWAN,
                 "diffusion_pytorch_model-00005-of-00005.safetensors",
             ),
+        ),
+        (
+            role::DIT_FASTWAN21,
+            FileRef::new(
+                REPO_FASTWAN21,
+                "transformer/diffusion_pytorch_model.safetensors",
+            )
+            .in_slot(slot::FASTWAN21_DIT),
+        ),
+        (
+            role::DIT_WAN21_1_3B,
+            FileRef::new(
+                REPO_COMFY_WAN21,
+                "split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors",
+            )
+            .in_slot(slot::WAN21_1_3B_DIT),
+        ),
+        (
+            role::DISTILL_LORA_WAN21_1_3B,
+            FileRef::new(
+                REPO_KIJAI_WAN,
+                "Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors",
+            )
+            .in_slot(slot::WAN21_1_3B_DISTILL_LORA),
         ),
         (
             role::TEXT_ENCODER_INDEX,

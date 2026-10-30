@@ -382,6 +382,56 @@ impl LtxVaePipelines {
         Self::compile_with(backend, act).await
     }
 
+    /// Tile config for the decoder's conv3d stack. This one kernel is the single
+    /// largest GPU consumer of an LTX render (measured 169.3s of ~410s GPU busy
+    /// on a 1280x704 / 49f clip, ahead of ALL DiT matmul combined at 168.6s), so
+    /// its blocking is worth picking deliberately rather than inheriting
+    /// `Conv3dConfig::DEFAULT`.
+    ///
+    /// `LTX_VAE_CONV3D_CFG=bm,bn,bk,tm,tn` overrides it. The knob exists because
+    /// the right blocking is device-specific and only settleable by sweeping on
+    /// the actual card; it keeps that sweep a no-rebuild loop. Anything
+    /// unparseable falls back to the baked default rather than failing a render.
+    fn vae_conv3d_config() -> Conv3dConfig {
+        const DEFAULT: Conv3dConfig = Conv3dConfig::DEFAULT;
+        let Ok(raw) = std::env::var("LTX_VAE_CONV3D_CFG") else {
+            return DEFAULT;
+        };
+        let f: Vec<u32> = raw
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let [bm, bn, bk, tm, tn] = f[..] else {
+            tracing::warn!(
+                target: thinfer_core::trace::DIAG,
+                "LTX_VAE_CONV3D_CFG={raw} is not bm,bn,bk,tm,tn; using the default",
+            );
+            return DEFAULT;
+        };
+        let cfg = Conv3dConfig { bm, bn, bk, tm, tn };
+        // The kernel asserts these at build time; a bad sweep value should not
+        // panic a render mid-decode.
+        let threads = cfg.threads();
+        if !bm.is_multiple_of(tm)
+            || !bn.is_multiple_of(tn)
+            || threads == 0
+            || threads > 256
+            || (bm * bk + bk * bn) * 4 > 32768
+        {
+            tracing::warn!(
+                target: thinfer_core::trace::DIAG,
+                "LTX_VAE_CONV3D_CFG={raw} is not a legal tiling ({threads} threads); \
+                 using the default",
+            );
+            return DEFAULT;
+        }
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            bm, bn, bk, tm, tn, threads, "ltx vae conv3d config overridden",
+        );
+        cfg
+    }
+
     pub async fn compile_with(backend: &WgpuBackend, act: ActDtype) -> Result<Self, WgpuError> {
         use thinfer_core::backend::Backend;
         // bf16 safetensors weights; acts f32 (parity) or f16 (production perf).
@@ -390,7 +440,7 @@ impl LtxVaePipelines {
             act_dtype: act,
             weight_dtype: WeightDtype::Bf16,
         };
-        let conv3d = Conv3dF32::new(Conv3dConfig::DEFAULT);
+        let conv3d = Conv3dF32::new(Self::vae_conv3d_config());
         Ok(Self {
             act,
             conv3d_pipeline: backend

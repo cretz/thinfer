@@ -49,6 +49,31 @@ pub enum DequantTarget {
     F16,
 }
 
+/// What one dequant pass decodes: a GGUF-style block scheme, or an NVFP4
+/// composite ([`super::nvfp4`]). Both emit the same dense N-major workspace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DequantScheme {
+    Block(QuantKind),
+    Nvfp4,
+}
+
+impl DequantScheme {
+    /// The block scheme, for the paths only block quants have (DP4A i8, coopmat).
+    pub fn block(self) -> Option<QuantKind> {
+        match self {
+            Self::Block(k) => Some(k),
+            Self::Nvfp4 => None,
+        }
+    }
+
+    pub fn wgsl(self, target: DequantTarget) -> String {
+        match self {
+            Self::Block(k) => build_wgsl(k, target),
+            Self::Nvfp4 => super::nvfp4::build_wgsl(target),
+        }
+    }
+}
+
 /// Pipeline-cache discriminator. One pipeline per (quant scheme, target).
 pub fn hint(scheme: QuantKind, target: DequantTarget) -> String {
     let t = match target {
@@ -145,11 +170,17 @@ pub fn dispatch_dequant<B: Backend>(
     backend: &B,
     encoder: &mut B::CommandEncoder,
     pipeline: &B::Pipeline,
-    scheme: QuantKind,
+    scheme: DequantScheme,
     bufs: &DequantBufs<'_>,
     n: u32,
     k: u32,
 ) -> Result<(), B::Error> {
+    let scheme = match scheme {
+        DequantScheme::Block(k) => k,
+        DequantScheme::Nvfp4 => {
+            return super::nvfp4::dispatch(backend, encoder, pipeline, bufs, n, k);
+        }
+    };
     let bs = scheme.block_size();
     assert!(
         k.is_multiple_of(bs),

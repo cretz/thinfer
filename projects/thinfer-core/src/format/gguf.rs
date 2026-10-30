@@ -257,6 +257,8 @@ fn bytes_for(shape: &Shape, enc: StorageEncoding) -> Option<u64> {
         StorageEncoding::Quant(k) => Some(k.bytes_for_elements(elements)),
         StorageEncoding::I8 => Some(elements),
         StorageEncoding::I4 => Some(elements.div_ceil(2)),
+        // A composite's size depends on its 2-D shape, not its element count.
+        StorageEncoding::Nvfp4 => None,
     }
 }
 

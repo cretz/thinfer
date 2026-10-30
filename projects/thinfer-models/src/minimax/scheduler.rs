@@ -134,6 +134,31 @@ impl Scheduler {
         })
     }
 
+    /// A distilled checkpoint's fixed rungs (FastH3 `dmd_denoising_steps`,
+    /// integers in `(0, 1000]`, strictly decreasing): the same Euler sampler on
+    /// the explicit grid `shift(rungs / 1000) ++ [0]`, each modality with its own
+    /// shift (FastVideo `MiniMaxH3DenoisingStage._set_dmd_schedule`).
+    pub fn from_rungs(rungs: &[u32], shift: f32) -> Result<Self, SchedulerError> {
+        if shift <= 0.0 {
+            return Err(SchedulerError::NonPositiveShift(shift));
+        }
+        let sigmas = rungs
+            .iter()
+            .map(|&r| r as f32 / 1000.0)
+            .chain([0.0])
+            .map(|b| shift * b / (1.0 + (shift - 1.0) * b))
+            .collect();
+        let mut s = Self::from_sigmas(sigmas)?;
+        s.shift = shift;
+        Ok(s)
+    }
+
+    /// The first sigma: the initial noise is scaled by it (the rung grid does
+    /// not start at exactly 1).
+    pub fn initial_sigma(&self) -> f32 {
+        self.sigmas[0]
+    }
+
     pub fn shift(&self) -> f32 {
         self.shift
     }
@@ -194,6 +219,19 @@ impl JointSchedule {
         Ok(Self {
             video: Scheduler::new(super::SIGMA_SHIFT_VIDEO, num_inference_steps)?,
             audio: Scheduler::new(super::SIGMA_SHIFT_AUDIO, num_inference_steps)?,
+        })
+    }
+
+    /// A distilled checkpoint's rungs on both modalities, each with its own
+    /// shift (see [`Scheduler::from_rungs`]).
+    pub fn from_rungs(
+        rungs: &[u32],
+        video_shift: f32,
+        audio_shift: f32,
+    ) -> Result<Self, SchedulerError> {
+        Ok(Self {
+            video: Scheduler::from_rungs(rungs, video_shift)?,
+            audio: Scheduler::from_rungs(rungs, audio_shift)?,
         })
     }
 

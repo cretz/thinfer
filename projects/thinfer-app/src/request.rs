@@ -17,6 +17,10 @@ use crate::model::{
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
 const VAE_SCALE: u32 = 16;
 
+/// Prompt rows a MiniMax-H3 default clip length budgets for (tokens are not
+/// known at resolve time). Generous for a typical prompt.
+const MINIMAX_TEXT_ROW_RESERVE: usize = 256;
+
 /// Validate a pixel dimension: positive and a multiple of the VAE scale.
 pub fn validate_dim(name: &str, v: u32) -> Result<(), String> {
     if v == 0 {
@@ -178,8 +182,23 @@ impl std::fmt::Debug for ImageBytes {
     }
 }
 
+impl Drop for ImageBytes {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Drop for VideoInput {
+    fn drop(&mut self) {
+        match self {
+            VideoInput::Ram(b) => zeroize::Zeroize::zeroize(b),
+            VideoInput::Encrypted { key, .. } => zeroize::Zeroize::zeroize(key),
+        }
+    }
+}
+
 /// Generate an image from a prompt (Z-Image t2i).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ImageRequest {
     pub model: ImageModelId,
     pub prompt: String,
@@ -274,7 +293,7 @@ impl ImageRequest {
 
 /// Generate a video from one or more prompts (t2v; multi-prompt = multi-shot,
 /// LongLive only).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VideoRequest {
     pub model: VideoModelId,
     pub prompts: Vec<String>,
@@ -320,7 +339,7 @@ pub struct VideoRequest {
     pub attn_window: Option<u32>,
     pub vae: VaeChoice,
     /// LTX-2.3 text-encoder quantization (Q8 baseline or Q4_K_M fast). Applies to
-    /// every LTX/Sulphur model (shared Gemma encoder); ignored by Wan.
+    /// every LTX model (shared Gemma encoder); ignored by Wan.
     pub encoder: EncoderQuant,
     pub i8_matmul: bool,
     /// Decode + mux an audio track (LTX joint-AV only; ignored by the silent Wan
@@ -335,14 +354,14 @@ pub struct VideoRequest {
     /// upscaler model swap. Two-stage is only the cheaper route to HIGH res.
     /// Ignored by the Wan/LongLive models.
     pub upscale: bool,
-    /// LTX single-stage joint-AV only: opt in to a finer denoise schedule for
-    /// better audio. The distilled 8-step sigma table takes very coarse late
-    /// steps, where the delicate audio residual under-resolves and drifts to
-    /// gibberish; this subdivides the coarse jumps into more Euler substeps
-    /// (keeping the distilled anchors), roughly doubling the denoise cost. Only
-    /// the single-stage path honors it (ltx2-rapid always; the 22B line when
-    /// `upscale` is off); the two-stage and Wan models ignore it. Default
-    /// `false`.
+    /// LTX joint-AV: opt in to a finer denoise schedule for better audio. The
+    /// distilled 8-step sigma table takes very coarse late steps, where the
+    /// delicate audio residual under-resolves and drifts to gibberish; this
+    /// subdivides the coarse jumps into more Euler substeps (keeping the
+    /// distilled anchors exactly). Every LTX path honors it: the single-stage
+    /// schedule (ltx2-rapid always; the 22B line when `upscale` is off) and BOTH
+    /// stage schedules on the two-stage 22B line, 8+3 -> 16+11 steps (~2.5x
+    /// denoise). Wan ignores it. Default `false`.
     pub audio_hq: bool,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed, structured
     /// caption via the rewrite endpoint before encoding (the model is trained on
@@ -395,7 +414,9 @@ impl VideoRequest {
         // required turbo adapter + both VAEs), not via the Wan variant registry.
         if self.model.is_minimax() {
             let m = self.model.manifest();
-            return thinfer_models::minimax::manifest::RUNTIME_ROLES_T2VA_Q4
+            return self
+                .model
+                .minimax_roles()
                 .iter()
                 .map(|r| {
                     m.get(r)
@@ -426,14 +447,14 @@ impl VideoRequest {
                         .ok_or_else(|| format!("LTX manifest missing role {r}"))
                 })
                 .collect::<Result<_, _>>()?;
-            // Sulphur folds a distill-LoRA stack into the dev DiT at load; fetch
+            // Dev folds a distill-LoRA stack into the dev DiT at load; fetch
             // every LoRA in the env-selected stack (default = condsafe alone).
-            if self.model.is_sulphur() {
-                for (role, _strength) in self.model.sulphur_distill_stack() {
+            if self.model.folds_distill_lora() {
+                for (role, _strength) in self.model.distill_stack() {
                     files.push(
-                        m.get(role).copied().ok_or_else(|| {
-                            format!("Sulphur manifest missing distill role {role}")
-                        })?,
+                        m.get(role)
+                            .copied()
+                            .ok_or_else(|| format!("dev manifest missing distill role {role}"))?,
                     );
                 }
             }
@@ -683,12 +704,43 @@ impl VideoRequest {
                 self.model
             ));
         }
+        let mut warnings = Vec::new();
         let requested = match (self.frames.first(), self.durations.first()) {
             (Some(&f), _) => f,
             (None, Some(&d)) => ((d * fps as f32).round() as u32).max(1),
-            (None, None) => self.model.default_frames(),
+            (None, None) => {
+                // A blank length is the model default, shortened to what the
+                // canvas fits (the prompt's rows are not known yet: reserve a
+                // typical prompt). An explicit length over the cap still fails
+                // in the driver, with the exact row count.
+                use thinfer_models::minimax::{packing, pipeline::MAX_PACKED_ROWS};
+                let default = self.model.default_frames();
+                let fit = packing::max_fitting_frames(
+                    &self.model.minimax_dit_config(),
+                    MINIMAX_TEXT_ROW_RESERVE,
+                    (self.height / 16) as usize,
+                    (self.width / 16) as usize,
+                    default as usize,
+                    MAX_PACKED_ROWS,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "{}x{} is too large for {}: not even the shortest clip fits",
+                        self.width, self.height, self.model
+                    )
+                })? as u32;
+                if fit < default {
+                    warnings.push(format!(
+                        "{}x{} fits at most {fit} frames (~{:.1}s) on this model; \
+                         the default clip was shortened.",
+                        self.width,
+                        self.height,
+                        fit as f32 / fps as f32,
+                    ));
+                }
+                fit
+            }
         };
-        let mut warnings = Vec::new();
         let frames = thinfer_models::minimax::packing::align_num_frames(requested as usize)
             .map_err(|e| format!("frame count {requested}: {e:?}"))? as u32;
         if frames != requested {
@@ -715,9 +767,10 @@ impl VideoRequest {
         let min = VideoModelId::LTX_MIN_DIM;
         for (name, v) in [("height", self.height), ("width", self.width)] {
             if !v.is_multiple_of(mult) || v < min {
+                let (dw, dh) = self.model.video_defaults();
                 return Err(format!(
                     "--{name} for {} must be a multiple of {mult} and at least {min} \
-                     (got {v}); 256 is the fastest tier, the default is 768x512",
+                     (got {v}); the default is {dw}x{dh}",
                     self.model
                 ));
             }
@@ -776,6 +829,28 @@ impl VideoRequest {
                 self.height,
                 frames as f32 / fps as f32,
                 requested as f32 / fps as f32,
+            ));
+        }
+        // Below the adherence floor the model still produces a clean-looking clip
+        // that quietly drops requested content, so say so rather than let it pass
+        // as a plain "faster" option.
+        if !self.model.ltx_dims_hold_adherence(self.width, self.height) {
+            let side = VideoModelId::LTX_ADHERENCE_MIN_SIDE;
+            warnings.push(format!(
+                "{w}x{h} is below the 768x512 prompt-adherence floor (needs both \
+                 >={floor} pixels and a short side >={side}; this is {px} px with a \
+                 short side of {short}). The clip will still look clean, but the \
+                 SCENE is what degrades: backgrounds thin out, then dissolve, then \
+                 get replaced by an unrelated setting, while the subject survives. \
+                 It also drifts off photoreal toward cartoon. Going lower is a way \
+                 to get a LONGER clip, not a materially faster one -- the frame cap \
+                 grows as dims shrink, so the default clip lengthens and eats most \
+                 of the saving. Prefer 768x512 or above.",
+                w = self.width,
+                h = self.height,
+                floor = VideoModelId::LTX_ADHERENCE_FLOOR_PX,
+                px = self.width * self.height,
+                short = self.width.min(self.height),
             ));
         }
         Ok(VideoPlan {
@@ -1038,6 +1113,54 @@ pub fn even_chunk_split(total: usize, num_shots: usize) -> Result<Vec<usize>, St
         .collect())
 }
 
+// Prompts are user content: never rendered by `Debug` (structural fields only)
+// and wiped when the request drops (the job ended).
+impl std::fmt::Debug for ImageRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageRequest")
+            .field("model", &self.model)
+            .field(
+                "prompt",
+                &format_args!("<{} chars redacted>", self.prompt.len()),
+            )
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("steps", &self.steps)
+            .field("seed", &self.seed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ImageRequest {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.prompt);
+    }
+}
+
+impl std::fmt::Debug for VideoRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoRequest")
+            .field("model", &self.model)
+            .field(
+                "prompts",
+                &format_args!("<{} redacted>", self.prompts.len()),
+            )
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("frames", &self.frames)
+            .field("seed", &self.seed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for VideoRequest {
+    fn drop(&mut self) {
+        for p in &mut self.prompts {
+            zeroize::Zeroize::zeroize(p);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{VideoFormat, VideoRequest, even_chunk_split, resolve_shot_plan};
@@ -1164,13 +1287,59 @@ mod tests {
         assert_eq!(plan.frames, 49);
         assert_eq!(plan.warnings.len(), 1);
 
-        // A duration that fits leaves no warning.
+        // A duration that fits leaves no LENGTH warning. 512x320 is under the
+        // adherence floor, so the one warning it does carry is that one.
         let plan = ltx_req(512, 320, vec![], vec![2.0]).resolve().unwrap();
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(!plan.warnings[0].contains("capped"), "{:?}", plan.warnings);
 
         // An explicit over-budget --frames stays a hard error (fail fast), not a
         // silent cap.
         assert!(ltx_req(1280, 704, vec![121], vec![]).resolve().is_err());
+    }
+
+    #[test]
+    fn ltx_warns_below_the_adherence_floor() {
+        use crate::model::VideoModelId::{Ltx23Distilled as Ltx, Wan22T2vA14b as Wan};
+        // The floor is a PIXEL COUNT, not a short side: 512x512 has the same 512
+        // short side as the in-regime 768x512 but far fewer pixels, and measures
+        // off-regime. Pin that it is judged on area.
+        assert!(Ltx.ltx_dims_hold_adherence(768, 512));
+        assert!(Ltx.ltx_dims_hold_adherence(1280, 704));
+        assert!(Ltx.ltx_dims_hold_adherence(896, 512));
+        // Both conditions bind, and each one alone would mis-classify a measured
+        // rung: 896x448 has MORE pixels than the in-regime 768x512 yet goes
+        // cartoon (short side 448), and 640x512 has the 512 short side yet
+        // collapses (only 328k px). A pure-area or pure-short-side rule passes
+        // one of these two.
+        assert!(!Ltx.ltx_dims_hold_adherence(896, 448));
+        assert!(!Ltx.ltx_dims_hold_adherence(640, 512));
+        assert!(!Ltx.ltx_dims_hold_adherence(512, 512));
+        // Portrait is the same rule transposed.
+        assert!(Ltx.ltx_dims_hold_adherence(512, 768));
+        assert!(!Ltx.ltx_dims_hold_adherence(448, 896));
+        // Non-LTX models have their own regimes; the floor must not leak onto them.
+        assert!(Wan.ltx_dims_hold_adherence(512, 320));
+
+        // At the floor exactly: no adherence warning (49f fits, so no cap either).
+        let plan = ltx_req(768, 512, vec![49], vec![]).resolve().unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+
+        // Below it: warns, and says what the user actually loses. Critically it
+        // must NOT read as a speed tradeoff -- lower dims buy clip length, not
+        // time, and selling them as "faster" is what sent a user off-regime.
+        let plan = ltx_req(640, 384, vec![49], vec![]).resolve().unwrap();
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let w = &plan.warnings[0];
+        assert!(w.contains("adherence floor"), "{w}");
+        // It must name the SCENE as what degrades: the subject survives, so a
+        // warning about generic "quality" would not match what the user sees.
+        assert!(w.contains("SCENE"), "{w}");
+        // And it must not sell low dims as a speed win.
+        assert!(
+            w.contains("LONGER clip, not a materially faster one"),
+            "{w}"
+        );
     }
 
     #[test]

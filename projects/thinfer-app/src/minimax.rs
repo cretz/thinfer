@@ -16,9 +16,11 @@
 //!   and reads only the timestep embedding, so the whole modulation table for
 //!   the run is built once (~78 MB) and those weights are never streamed. That
 //!   is what takes the streamed DiT from ~18.5 GiB to ~10.8 GiB per step.
-//! - **The turbo distillation is applied at RUNTIME**, not folded. Folding
-//!   would re-encode every Q4_K site to Q8_0 and nearly double both the
-//!   streaming and the host cache; see `minimax::dit::BlockLoraHandles`.
+//! - **Adapters are applied at RUNTIME**, not folded: the turbo distillation
+//!   and any user (vault) LoRAs, stacked into one low-rank pair per site.
+//!   Folding would re-encode every Q4_K site to Q8_0 and nearly double both the
+//!   streaming and the host cache, and cannot touch an NVFP4 site at all; see
+//!   `minimax::dit::BlockLora`.
 //!
 //! Each weight file gets its own scoped residency (built -> used -> dropped) so
 //! only one large set is VRAM-resident at a time: the 13.6 GiB conditioner,
@@ -29,10 +31,12 @@ use std::sync::Arc;
 use thinfer_core::backend::WgpuBackend;
 use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::format::safetensors::SafetensorsSource;
+use thinfer_core::format::union::UnionSource;
 use thinfer_core::ops::{ActDtype, WeightDtype};
 use thinfer_core::quant::QuantKind;
 use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
+use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 use thinfer_models::common::bigvgan::read_weight_f32;
 use thinfer_models::common::merge::MergedSource;
@@ -41,20 +45,23 @@ use thinfer_models::minimax::audio_vae::{AudioVae, AudioVaeConfig};
 use thinfer_models::minimax::dit::{
     COOPMAT_SITES, DitPipelines, dit_cfgs, register_handles as register_dit,
 };
+use thinfer_models::minimax::fasth3::FastH3Source;
 use thinfer_models::minimax::loader::{build_modulation_tables, register_video_patch_proj};
-use thinfer_models::minimax::lora::TurboLoraSource;
+use thinfer_models::minimax::lora::{Adapter, LoraSource, TURBO_ALPHA};
+use thinfer_models::minimax::manifest as mmf;
 use thinfer_models::minimax::manifest::role;
 use thinfer_models::minimax::packing;
 use thinfer_models::minimax::pipeline::{
-    DenoisePlan, MAX_PACKED_ROWS, audio_rows_to_latents, denoise, upload_modulation_tables,
-    video_rows_to_latents,
+    DenoisePlan, Latents, MAX_PACKED_ROWS, audio_rows_to_latents, denoise,
+    upload_modulation_tables, video_rows_to_latents,
 };
+use thinfer_models::minimax::scheduler::JointSchedule;
 use thinfer_models::minimax::text_encoder::{
     EncoderPipelines, MiniMaxTextEncoder, config as enc_config, encoder_cfgs,
     register_handles as register_encoder,
 };
 use thinfer_models::minimax::video_vae::{
-    DecoderPipelines, TilePolicy, VideoVaeConfig, decode, load_suffix_tokens,
+    DecoderPipelines, TilePolicy, VideoVaeConfig, decode, load_consts,
     register_handles as register_vae,
 };
 use thinfer_models::wan::pipeline::WanVideo;
@@ -63,6 +70,8 @@ use thinfer_native::tokenizer::HfTokenizer;
 
 use crate::config::{ResidencyBudget, random_seed};
 use crate::download::resolve_role;
+use crate::executor::BytesOpener;
+use crate::model::VideoModelId;
 use crate::progress::{ProgressSink, Stage};
 use crate::request::{JobSummary, VideoFormat, VideoRequest};
 
@@ -94,7 +103,8 @@ pub async fn run(
         sink.note(w);
     }
     let manifest = req.model.manifest();
-    let cfg = DitConfig::h3_33b();
+    let fasth3 = req.model == VideoModelId::Fasth3Trim;
+    let cfg = req.model.minimax_dit_config();
     let vae_cfg = VideoVaeConfig::h3();
 
     // --- geometry ---
@@ -124,8 +134,6 @@ pub async fn run(
     // --- resolve every weight file (caller ensured they are cached) ---
     let enc_path = resolve_role(manifest, role::ENCODER_GGUF)?;
     let tok_path = resolve_role(manifest, role::TOKENIZER)?;
-    let dit_path = resolve_role(manifest, role::DIT_GGUF_Q4_K_M)?;
-    let lora_path = resolve_role(manifest, role::TURBO_LORA)?;
     let vae_path = resolve_role(manifest, role::VIDEO_VAE)?;
     let audio_vae_path = resolve_role(manifest, role::AUDIO_VAE)?;
 
@@ -152,7 +160,12 @@ pub async fn run(
         ));
     }
 
-    let steps = req.steps.max(1) as usize;
+    // FastH3 runs its trained rungs; the base runs `steps` turbo evaluations.
+    let steps = if fasth3 {
+        mmf::FASTH3_RUNGS.len()
+    } else {
+        req.steps.max(1) as usize
+    };
     let seed = req.seed.unwrap_or_else(random_seed);
     let budget = ResidencyBudget {
         vram_bytes: req.budget.vram_bytes.min(VRAM_BUDGET_CAP),
@@ -181,7 +194,7 @@ pub async fn run(
         let residency = WeightResidency::new(src, budget);
         let handles =
             register_encoder(&residency, None).map_err(|e| format!("register encoder: {e:?}"))?;
-        let cfgs = encoder_cfgs(WeightDtype::Bf16);
+        let cfgs = encoder_cfgs();
         let pipelines = EncoderPipelines::compile(backend, &cfgs)
             .await
             .map_err(|e| format!("compile encoder pipelines: {e:?}"))?;
@@ -204,88 +217,79 @@ pub async fn run(
     };
 
     // === Phase B: the DiT ===
-    let latents = {
-        let opener = open_mmap(&dit_path).await?;
+    let dims = PlanDims {
+        num_text,
+        latent_frames,
+        lat_h,
+        lat_w,
+        audio_latents,
+    };
+    let latents = if fasth3 {
+        let nvfp4 = open_st(&resolve_role(manifest, role::FASTH3_TRIM_NVFP4)?).await?;
+        let rest = open_st(&resolve_role(manifest, role::FASTH3_TRIM_REST)?).await?;
+        let src = FastH3Source::new(&cfg, UnionSource::new(nvfp4, rest))
+            .map_err(|e| format!("map fasth3 checkpoint: {e:?}"))?;
+        let schedule = JointSchedule::from_rungs(
+            &mmf::FASTH3_RUNGS,
+            mmf::FASTH3_SHIFT_VIDEO,
+            mmf::FASTH3_SHIFT_AUDIO,
+        )
+        .map_err(|e| format!("fasth3 schedule: {e}"))?;
+        let users = user_adapters(req).await?;
+        if users.is_empty() {
+            run_dit(
+                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, false,
+            )
+            .await?
+        } else {
+            let lora = lora_source(&cfg, users, sink).await?;
+            let src = MergedSource::new(src, lora);
+            run_dit(
+                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, false,
+            )
+            .await?
+        }
+    } else {
+        let opener = open_mmap(&resolve_role(manifest, role::DIT_GGUF_Q4_K_M)?).await?;
         let base = GgufSource::open(opener)
             .await
             .map_err(|e| format!("parse dit gguf: {e:?}"))?;
-        let lora_opener = open_mmap(&lora_path).await?;
-        let lora = SafetensorsSource::open(lora_opener)
-            .await
-            .map_err(|e| format!("parse turbo lora: {e:?}"))?;
-        let src = MergedSource::new(base, TurboLoraSource::new(&cfg, lora));
-
-        let plan = DenoisePlan::build::<String>(
-            &cfg,
-            num_text,
-            latent_frames,
-            lat_h,
-            lat_w,
-            audio_latents,
-            steps,
-        )
-        .map_err(|e| format!("build denoise plan: {e:?}"))?;
-
-        // The modulation table is built over exactly the plan's distinct
-        // timesteps, in the plan's order: the block stack indexes it by that
-        // position. Host-side, streaming the Q4 projections once.
-        sink.note("Precomputing the AdaLN modulation table (replaces ~7 GiB of weights)");
-        let tables = build_modulation_tables(&cfg, &src, &plan.modulation.timesteps)
-            .await
-            .map_err(|e| format!("build modulation tables: {e:?}"))?;
-
-        let residency = WeightResidency::new(src, budget);
-        let mut handles =
-            register_dit(&cfg, &residency, None).map_err(|e| format!("register dit: {e:?}"))?;
-        // The comfy converter reshapes any tensor whose row length is not a
-        // multiple of the 256-element superblock, and the upload transpose
-        // reads the SHAPE: left alone this scrambles every video row with no
-        // NaN to catch it.
-        handles.video_patch_proj = register_video_patch_proj(&cfg, &residency)
-            .map_err(|e| format!("register video_patch_proj: {e:?}"))?;
-        if handles.lora_block_count() != cfg.n_layers + cfg.token_refiner_layers {
-            return Err(format!(
-                "turbo adapter covers {} of {} blocks; the checkpoint and the adapter disagree",
-                handles.lora_block_count(),
-                cfg.n_layers + cfg.token_refiner_layers
-            ));
+        let turbo_path = resolve_role(manifest, role::TURBO_LORA)?;
+        // `steps` is model evaluations; the grid adds the terminal sigma.
+        let schedule = JointSchedule::new(steps + 1).map_err(|e| format!("schedule: {e}"))?;
+        let users = user_adapters(req).await?;
+        if users.is_empty() {
+            let turbo = SafetensorsSource::open(open_mmap(&turbo_path).await?)
+                .await
+                .map_err(|e| format!("parse turbo lora: {e:?}"))?;
+            let lora = LoraSource::turbo(&cfg, turbo)
+                .await
+                .map_err(|e| format!("turbo lora: {e:?}"))?;
+            let src = MergedSource::new(base, lora);
+            run_dit(
+                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, true,
+            )
+            .await?
+        } else {
+            // Stacked with user adapters, the turbo shares their in-RAM type.
+            let bytes = std::fs::read(&turbo_path)
+                .map_err(|e| format!("read {}: {e}", turbo_path.display()))?;
+            let turbo = SafetensorsSource::open(BytesOpener::new(bytes))
+                .await
+                .map_err(|e| format!("parse turbo lora: {e:?}"))?;
+            let adapters = std::iter::once(Adapter {
+                source: turbo,
+                strength: 1.0,
+                alpha: Some(TURBO_ALPHA),
+            })
+            .chain(users)
+            .collect();
+            let src = MergedSource::new(base, lora_source(&cfg, adapters, sink).await?);
+            run_dit(
+                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, true,
+            )
+            .await?
         }
-
-        let cfgs = dit_cfgs(
-            WeightDtype::Quant(QuantKind::Q4_K),
-            ActDtype::Bf16,
-            COOPMAT_SITES,
-        );
-        let pipelines = DitPipelines::compile(backend, &cfgs)
-            .await
-            .map_err(|e| format!("compile dit pipelines: {e:?}"))?;
-        let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
-        let (table, _held) = upload_modulation_tables(backend, &ws, &tables, ActDtype::Bf16)
-            .map_err(|e| format!("upload modulation table: {e:?}"))?;
-        drop(tables);
-
-        let out = denoise(
-            &cfg,
-            backend,
-            &pipelines,
-            &residency,
-            &ws,
-            &handles,
-            &table,
-            &plan,
-            &text,
-            seed,
-            |step, total| {
-                sink.stage(Stage::Step {
-                    i: step as u32,
-                    n: total as u32,
-                })
-            },
-        )
-        .await
-        .map_err(|e| format!("denoise: {e:?}"))?;
-        residency.evict_all_and_free(&**backend);
-        out
     };
     drop(text);
 
@@ -313,6 +317,12 @@ pub async fn run(
                     .map_err(|e| format!("read latents_std: {e:?}"))?,
             )
         };
+        tracing::debug!(
+            target: thinfer_core::trace::DIAG,
+            mean = ?&mean[..4],
+            std = ?&std[..4],
+            "minimax video latent stats",
+        );
         let z = video_rows_to_latents(
             &cfg,
             &latents.video,
@@ -322,7 +332,7 @@ pub async fn run(
             &mean,
             &std,
         );
-        let suffix = load_suffix_tokens(&vae_cfg, backend, &residency, &handles)
+        let consts = load_consts(&vae_cfg, backend, &residency, &handles)
             .await
             .map_err(|e| format!("read register/mask tokens: {e:?}"))?;
         let out = decode(
@@ -332,7 +342,7 @@ pub async fn run(
             &residency,
             &ws,
             &handles,
-            &suffix,
+            &consts,
             TilePolicy::default(),
             &z,
             latent_frames,
@@ -404,7 +414,11 @@ pub async fn run(
                     None
                 }
             };
-            crate::codec::encode_mp4_with_audio(&wan_video, FPS, audio, &req.output)?;
+            crate::progress::write_artifact(
+                sink,
+                &req.output,
+                &crate::codec::encode_mp4_with_audio(&wan_video, FPS, audio)?,
+            )?;
         }
         VideoFormat::PngFrames => {
             sink.note("Writing PNG frames (audio dropped for png-frames output)");
@@ -421,6 +435,175 @@ pub async fn run(
         fps: Some(FPS),
         seed: Some(seed),
     })
+}
+
+/// The latent grid of one t2va request, as the denoise plan needs it.
+#[derive(Clone, Copy)]
+struct PlanDims {
+    num_text: usize,
+    latent_frames: usize,
+    lat_h: usize,
+    lat_w: usize,
+    audio_latents: usize,
+}
+
+/// Phase B, the DiT, over any source carrying the H3 tensor names: the base
+/// GGUF with its turbo adapter merged in (`turbo`, required on every block),
+/// or a distillation presented under the same names, either with any user
+/// adapters stacked in.
+#[allow(clippy::too_many_arguments)]
+async fn run_dit<S: WeightSource>(
+    backend: &Arc<WgpuBackend>,
+    cfg: &DitConfig,
+    src: S,
+    schedule: JointSchedule,
+    d: PlanDims,
+    text: &[f32],
+    seed: u64,
+    budget: ResidencyBudget,
+    sink: &dyn ProgressSink,
+    turbo: bool,
+) -> Result<Latents, String>
+where
+    S::Error: core::fmt::Debug,
+{
+    let plan = DenoisePlan::build_with::<String>(
+        cfg,
+        d.num_text,
+        d.latent_frames,
+        d.lat_h,
+        d.lat_w,
+        d.audio_latents,
+        schedule,
+    )
+    .map_err(|e| format!("build denoise plan: {e:?}"))?;
+
+    // The modulation table is built over exactly the plan's distinct
+    // timesteps, in the plan's order: the block stack indexes it by that
+    // position. Host-side, streaming the projections once.
+    sink.note("Precomputing the AdaLN modulation table");
+    let tables = build_modulation_tables(cfg, &src, &plan.modulation.timesteps)
+        .await
+        .map_err(|e| format!("build modulation tables: {e:?}"))?;
+
+    let residency = WeightResidency::new(src, budget);
+    let mut handles =
+        register_dit(cfg, &residency, None).map_err(|e| format!("register dit: {e:?}"))?;
+    // The comfy converter reshapes any tensor whose row length is not a
+    // multiple of the 256-element superblock, and the upload transpose reads
+    // the SHAPE: left alone this scrambles every video row with no NaN to
+    // catch it. Registering at the true shape is a no-op for other sources.
+    handles.video_patch_proj = register_video_patch_proj(cfg, &residency)
+        .map_err(|e| format!("register video_patch_proj: {e:?}"))?;
+    let want = cfg.n_layers + cfg.token_refiner_layers;
+    if turbo && handles.lora_block_count() != want {
+        return Err(format!(
+            "turbo adapter covers {} blocks, expected {want}; the checkpoint and the adapter disagree",
+            handles.lora_block_count(),
+        ));
+    }
+
+    let cfgs = dit_cfgs(
+        WeightDtype::Quant(QuantKind::Q4_K),
+        ActDtype::Bf16,
+        COOPMAT_SITES,
+    );
+    let pipelines = DitPipelines::compile(backend, &cfgs)
+        .await
+        .map_err(|e| format!("compile dit pipelines: {e:?}"))?;
+    let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+    let (table, _held) = upload_modulation_tables(backend, &ws, &tables, ActDtype::Bf16)
+        .map_err(|e| format!("upload modulation table: {e:?}"))?;
+    drop(tables);
+
+    let out = denoise(
+        cfg,
+        backend,
+        &pipelines,
+        &residency,
+        &ws,
+        &handles,
+        &table,
+        &plan,
+        text,
+        seed,
+        |step, total| {
+            sink.stage(Stage::Step {
+                i: step as u32,
+                n: total as u32,
+            })
+        },
+    )
+    .await
+    .map_err(|e| format!("denoise: {e:?}"))?;
+    residency.evict_all_and_free(&**backend);
+    Ok(out)
+}
+
+/// The request's vault adapters, decrypted to RAM here, at the DiT phase that
+/// uses them (never earlier), and dropped with the DiT source.
+async fn user_adapters(
+    req: &VideoRequest,
+) -> Result<Vec<Adapter<SafetensorsSource<BytesOpener>>>, String> {
+    if req.lora.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(feature = "vault")]
+    {
+        let password = req
+            .vault_password
+            .as_ref()
+            .ok_or("a vault password is required to use adapters")?;
+        let vault = crate::vault::Vault::new(&req.vault_dir);
+        let mut out = Vec::with_capacity(req.lora.len());
+        for l in &req.lora {
+            let bytes = vault
+                .open(password.expose(), &req.model.to_string(), &l.id)
+                .map_err(|e| e.to_string())?;
+            let source = SafetensorsSource::open(BytesOpener::new(bytes))
+                .await
+                .map_err(|e| format!("parse adapter {}: {e:?}", l.id))?;
+            out.push(Adapter {
+                source,
+                strength: l.weight,
+                alpha: None,
+            });
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "vault"))]
+    Err("this build has no adapter (vault) support".into())
+}
+
+/// Stack `adapters` onto the DiT's sites, refusing a set that touches none.
+async fn lora_source<L: WeightSource>(
+    cfg: &DitConfig,
+    adapters: Vec<Adapter<L>>,
+    sink: &dyn ProgressSink,
+) -> Result<LoraSource<L>, String> {
+    let n = adapters.len();
+    let src = LoraSource::new(cfg, adapters)
+        .await
+        .map_err(|e| format!("adapters: {e:?}"))?;
+    if src.site_count() == 0 {
+        return Err(
+            "the adapter(s) match no MiniMax-H3 DiT site (is this a LoRA for a different model?)"
+                .into(),
+        );
+    }
+    if !src.skipped().is_empty() {
+        tracing::debug!(target: thinfer_core::trace::DIAG, skipped = ?src.skipped(), "adapter modules skipped");
+        sink.note(&format!(
+            "{} adapter module(s) have no runtime site here and were skipped \
+             (AdaLN / boundary projections, or blocks this checkpoint removed)",
+            src.skipped().len(),
+        ));
+    }
+    sink.note(&format!(
+        "Applying {n} adapter(s) at runtime on {} sites",
+        src.site_count()
+    ));
+    Ok(src)
 }
 
 async fn open_mmap(path: &std::path::Path) -> Result<MmapFileOpener, String> {

@@ -1,238 +1,431 @@
-//! The MiniMax-H3 turbo LoRA, re-presented so the shared fold machinery can
-//! consume it unchanged.
+//! Runtime LoRAs for the H3 DiT (the lightx2v turbo distillation and user
+//! adapters), stacked and re-presented under the checkpoint's own names so
+//! [`super::dit::register_handles`] finds ONE `lora_A`/`lora_B` pair per site.
 //!
-//! The lightx2v distillation is diffusers/PEFT-named and split per projection
-//! (`transformer_blocks.N.attn.to_q/to_k/to_v`), while the checkpoint keeps ONE
-//! fused, per-head interleaved `blocks.N.attn.qkv_proj`. Three separate rank-128
-//! pairs therefore have to become one delta on a fused tensor.
+//! **Layouts.** H3 adapters come in three spellings, all accepted:
 //!
-//! That is exactly representable without ever materializing the dense delta.
-//! For a scatter `P_x` placing projection `x`'s rows into the fused layout,
+//! - original/ComfyUI: `blocks.N.attn.qkv_proj`, `attn.out_proj`, `mlp.fc1`,
+//!   `mlp.fc2` (`diffusion_model.` prefixed). The checkpoint's own layout.
+//! - diffusers/PEFT (the turbo, FastVideo-native): `transformer_blocks.N.attn.
+//!   to_q|to_k|to_v`, `attn.to_out(.0)`, `ff.net.0.proj`/`ff.fc_in`,
+//!   `ff.net.2`/`ff.fc_out`. Separate q/k/v land on the fused `qkv_proj`, which
+//!   is CONTIGUOUS `[q; k; v]` rows (measured against the official FL2VA
+//!   checkpoint 2026-10-29: corr 0.997 contiguous vs 0.014 interleaved). The
+//!   diffusers SwiGLU reads `[value; gate]` where the checkpoint's `mlp.fc1` is
+//!   `[gate; value]`, so its `B` rows swap halves.
+//! - kohya: the same names flattened to `_` under `lora_unet_`.
+//!
+//! Keys may carry `lora_A/lora_B` or `lora_down/lora_up`, an adapter name
+//! (`.default`) and a `.alpha`. AdaLN and boundary-projection pairs are
+//! reported as skipped: the runtime path covers the four block linears.
+//!
+//! **Stacking.** Every pair is a block-diagonal piece of one stacked pair:
 //!
 //! ```text
-//! delta = P_q B_q A_q + P_k B_k A_k + P_v B_v A_v
-//!       = [P_q B_q | P_k B_k | P_v B_v] @ [A_q ; A_k ; A_v]
+//! delta = sum_j P_j s_j B_j A_j = [P_1 s_1 B_1 | P_2 s_2 B_2 | ...] @ [A_1; A_2; ...]
 //! ```
 //!
-//! which is a single rank-384 pair. So this module presents a synthetic LoRA
-//! source whose `qkv_proj` entries are that concatenation, and
-//! [`crate::common::lora`] folds it like any other adapter.
+//! where `P_j` places piece `j`'s rows (all `N` of them, or one third of a
+//! fused qkv) and `s_j = strength * alpha / rank`. One fused qkv pair is one
+//! piece; separate q/k/v are three; more adapters are more pieces. The dense
+//! delta is never materialized, and tensors are synthesized on demand.
 //!
-//! The feed-forward needs no such work: `ff.net.0.proj` already emits the FUSED
-//! 28672-wide `[gate; value]` delta, matching `mlp.fc1` directly.
+//! **Layout.** Both stacked factors are emitted PRE-TRANSPOSED into the dense
+//! matmul's `[K, N]` operand layout (`A^T` `[k, R]`, `B^T` `[R, n]`), so they
+//! upload as-is: a per-upload GPU transpose (8 per block, every step) cost
+//! more than the adapter's own GEMMs.
 //!
-//! Tensors are synthesized ON DEMAND rather than up front: the full set is
-//! ~1 GiB, one tensor is ~17 MiB.
+//! **Trimmed checkpoints.** Adapters are trained on the released 50-block H3;
+//! on a trim (FastH3) each block index maps through
+//! [`DitConfig::block_for_base`] and pairs on removed blocks are skipped.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use half::bf16;
+use half::{bf16, f16};
 
 use thinfer_core::tensor::{Shape, StorageEncoding};
 use thinfer_core::weight::{WeightCatalog, WeightEntry, WeightId, WeightReader, WeightSource};
 
 use super::DitConfig;
+use crate::common::lora::VecReader;
 
-/// Per-projection LoRA rank of the released adapter. Read from the tensors
-/// rather than trusted, but pinned here for the fused-rank arithmetic.
-pub const LORA_RANK: usize = 128;
+/// PEFT `lora_alpha` the turbo adapter was trained with (lightx2v
+/// `inference_minimax_h3.py`, `DEFAULT_LORA_ALPHA`). Not stored in the file.
+pub const TURBO_ALPHA: f32 = 8.0;
 
-/// One fused-`qkv_proj` site: the three source pairs feeding it.
-struct QkvSite {
+/// One adapter to stack.
+pub struct Adapter<L> {
+    pub source: L,
+    /// User blend weight (1.0 = as trained).
+    pub strength: f32,
+    /// Overrides the file's `alpha` (the turbo ships none). With neither, the
+    /// pair runs unscaled (`alpha = rank`), the ComfyUI convention.
+    pub alpha: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Site {
+    Qkv,
+    Out,
+    Fc1,
+    Fc2,
+}
+
+impl Site {
+    fn name(self) -> &'static str {
+        match self {
+            Site::Qkv => "attn.qkv_proj",
+            Site::Out => "attn.out_proj",
+            Site::Fc1 => "mlp.fc1",
+            Site::Fc2 => "mlp.fc2",
+        }
+    }
+
+    /// `(N, K)` of the site's base linear.
+    fn dims(self, cfg: &DitConfig) -> (usize, usize) {
+        match self {
+            Site::Qkv => (3 * cfg.inner_dim(), cfg.hidden),
+            Site::Out => (cfg.hidden, cfg.inner_dim()),
+            Site::Fc1 => (2 * cfg.ffn_hidden, cfg.hidden),
+            Site::Fc2 => (cfg.hidden, cfg.ffn_hidden),
+        }
+    }
+}
+
+/// Where a source module's `B` rows land in its site.
+#[derive(Clone, Copy)]
+enum Part {
+    /// All `N` rows; `swap` = exchange the two row halves (diffusers SwiGLU).
+    Whole { swap: bool },
+    /// One third of the contiguous fused qkv: 0 = q, 1 = k, 2 = v.
+    QkvThird(usize),
+}
+
+/// A source module resolved to a site of the checkpoint.
+struct Target {
+    refiner: bool,
     block: usize,
-    /// `transformer_blocks` or `token_refiner.refiner_blocks`.
-    lora_prefix: String,
-    /// `blocks.{i}` or `token_refiner.blocks.{i}`.
-    base_prefix: String,
+    site: Site,
+    part: Part,
 }
 
-/// A synthetic view of the turbo LoRA in the checkpoint's own tensor naming.
-///
-/// Entries are keyed `diffusion_model.{base}.lora_{A,B}.weight`, which is what
-/// [`crate::common::lora::discover_specs`] looks for.
-pub struct TurboLoraSource<L: WeightSource> {
-    inner: L,
-    catalog: WeightCatalog,
-    /// Synthetic id -> how to build it.
-    plan: HashMap<WeightId, Synth>,
+/// Map a module name (any layout, trainer prefixes already stripped) to its
+/// site, or `None` for a module the runtime path does not cover.
+fn classify(module: &str) -> Option<Target> {
+    // Separator-free, so `attn.to_q`, `attn_to_q` (kohya) resolve alike.
+    let flat: String = module.chars().filter(|c| *c != '.' && *c != '_').collect();
+    let (refiner, rest) = [
+        ("tokenrefinerrefinerblocks", true),
+        ("tokenrefinerblocks", true),
+        ("transformerblocks", false),
+        ("blocks", false),
+    ]
+    .iter()
+    .find_map(|(p, r)| flat.strip_prefix(p).map(|rest| (*r, rest)))?;
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let block = rest[..digits].parse().ok()?;
+    let (site, part) = match &rest[digits..] {
+        "attnqkvproj" => (Site::Qkv, Part::Whole { swap: false }),
+        "attntoq" => (Site::Qkv, Part::QkvThird(0)),
+        "attntok" => (Site::Qkv, Part::QkvThird(1)),
+        "attntov" => (Site::Qkv, Part::QkvThird(2)),
+        "attnoutproj" | "attntoout" | "attntoout0" => (Site::Out, Part::Whole { swap: false }),
+        "mlpfc1" => (Site::Fc1, Part::Whole { swap: false }),
+        "ffnet0proj" | "fffcin" => (Site::Fc1, Part::Whole { swap: true }),
+        "mlpfc2" | "ffnet2" | "fffcout" => (Site::Fc2, Part::Whole { swap: false }),
+        _ => return None,
+    };
+    Some(Target {
+        refiner,
+        block,
+        site,
+        part,
+    })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    A,
+    B,
+    Alpha,
+}
+
+const STRIP_PREFIXES: [&str; 6] = [
+    "model.diffusion_model.",
+    "diffusion_model.",
+    "base_model.model.",
+    "transformer.",
+    "lora_unet_",
+    "lora_transformer_",
+];
+
+/// Split a tensor key into `(module, kind)`:
+/// `<prefixes><module>.<kind>[.<adapter name>][.weight]`.
+fn parse_key(key: &str) -> Option<(String, Kind)> {
+    let mut k = key;
+    while let Some(rest) = STRIP_PREFIXES.iter().find_map(|p| k.strip_prefix(p)) {
+        k = rest;
+    }
+    let segs: Vec<&str> = k.split('.').collect();
+    let at = segs.iter().position(|s| {
+        matches!(
+            *s,
+            "lora_A" | "lora_B" | "lora_down" | "lora_up" | "alpha" | "lora_alpha"
+        )
+    })?;
+    if at == 0 || segs.len() - at > 3 {
+        return None;
+    }
+    let kind = match segs[at] {
+        "lora_A" | "lora_down" => Kind::A,
+        "lora_B" | "lora_up" => Kind::B,
+        _ => Kind::Alpha,
+    };
+    Some((segs[..at].join("."), kind))
+}
+
+/// One pair's contribution to a stacked site.
 #[derive(Clone)]
-enum Synth {
-    /// Pass the inner tensor through under a new name.
-    Rename(WeightId),
-    /// Stack `[A_q; A_k; A_v]` into `[3 * rank, K]`.
-    QkvA {
-        parts: [WeightId; 3],
-        rank: usize,
-        k: usize,
-    },
-    /// Scatter `B_q|B_k|B_v` columns into the per-head interleaved row layout.
-    QkvB {
-        parts: [WeightId; 3],
-        rank: usize,
-        heads: usize,
-        head_dim: usize,
-    },
+struct Piece {
+    adapter: usize,
+    a: WeightId,
+    b: WeightId,
+    rank: usize,
+    /// First row of the site this piece's `B` covers, and how many.
+    row: usize,
+    rows: usize,
+    swap: bool,
+    scale: f32,
+}
+
+/// Every piece stacked onto one site: `A` `[R, k]`, `B` `[n, R]`.
+#[derive(Clone)]
+struct Stack {
+    n: usize,
+    k: usize,
+    pieces: Vec<Piece>,
+}
+
+impl Stack {
+    fn rank(&self) -> usize {
+        self.pieces.iter().map(|p| p.rank).sum()
+    }
 }
 
 #[derive(Debug)]
 pub enum LoraError<LE: core::fmt::Debug> {
-    Lora(LE),
+    Source(LE),
     Read(String),
+    /// A pair that cannot belong to this checkpoint (wrong model).
+    Shape(String),
+    Encoding(String),
     Missing(String),
 }
 
-fn ids(prefix: &str, site: &str) -> [WeightId; 2] {
-    [
-        WeightId(format!("{prefix}.{site}.lora_A.default.weight")),
-        WeightId(format!("{prefix}.{site}.lora_B.default.weight")),
-    ]
+/// The stacked adapters in the checkpoint's own tensor naming:
+/// `diffusion_model.{blocks.N|token_refiner.blocks.N}.{site}.lora_{A,B}.weight`,
+/// holding `A^T` `[k, R]` and `B^T` `[R, n]` (see the module docs).
+pub struct LoraSource<L: WeightSource> {
+    adapters: Vec<L>,
+    catalog: WeightCatalog,
+    /// Synthetic id -> (stack, is `B`).
+    plan: HashMap<WeightId, (String, bool)>,
+    stacks: BTreeMap<String, Stack>,
+    skipped: Vec<String>,
 }
 
-impl<L: WeightSource> TurboLoraSource<L> {
-    /// Build the synthetic catalog. Blocks whose LoRA tensors are absent are
-    /// skipped rather than erroring: the adapter need not cover every site.
-    pub fn new(cfg: &DitConfig, inner: L) -> Self {
-        let mut catalog = WeightCatalog::new();
-        let mut plan = HashMap::new();
+impl<L: WeightSource> LoraSource<L> {
+    /// The lightx2v turbo adapter alone.
+    pub async fn turbo(cfg: &DitConfig, source: L) -> Result<Self, LoraError<L::Error>> {
+        Self::new(
+            cfg,
+            vec![Adapter {
+                source,
+                strength: 1.0,
+                alpha: Some(TURBO_ALPHA),
+            }],
+        )
+        .await
+    }
 
-        let sites: Vec<QkvSite> = (0..cfg.n_layers)
-            .map(|i| QkvSite {
-                block: i,
-                lora_prefix: format!("transformer_blocks.{i}"),
-                base_prefix: format!("blocks.{i}"),
-            })
-            .chain((0..cfg.token_refiner_layers).map(|i| QkvSite {
-                block: i,
-                lora_prefix: format!("token_refiner.refiner_blocks.{i}"),
-                base_prefix: format!("token_refiner.blocks.{i}"),
-            }))
-            .collect();
-
-        for site in &sites {
-            let _ = site.block;
-            // --- fused qkv ---
-            let qkv: Vec<[WeightId; 2]> = ["to_q", "to_k", "to_v"]
-                .iter()
-                .map(|p| ids(&site.lora_prefix, &format!("attn.{p}")))
-                .collect();
-            let have_qkv = qkv
-                .iter()
-                .all(|[a, b]| inner.catalog().get(a).is_some() && inner.catalog().get(b).is_some());
-            if have_qkv {
-                let rank = inner
-                    .catalog()
-                    .get(&qkv[0][0])
-                    .and_then(|e| e.shape.0.first().copied())
-                    .unwrap_or(LORA_RANK);
-                let fused_rank = 3 * rank;
-                let a_id = WeightId(format!(
-                    "diffusion_model.{}.attn.qkv_proj.lora_A.weight",
-                    site.base_prefix
-                ));
-                let b_id = WeightId(format!(
-                    "diffusion_model.{}.attn.qkv_proj.lora_B.weight",
-                    site.base_prefix
-                ));
-                catalog.entries.insert(
-                    a_id.clone(),
-                    entry(vec![fused_rank, cfg.hidden], fused_rank * cfg.hidden),
-                );
-                catalog.entries.insert(
-                    b_id.clone(),
-                    entry(
-                        vec![3 * cfg.inner_dim(), fused_rank],
-                        3 * cfg.inner_dim() * fused_rank,
-                    ),
-                );
-                plan.insert(
-                    a_id,
-                    Synth::QkvA {
-                        parts: [qkv[0][0].clone(), qkv[1][0].clone(), qkv[2][0].clone()],
-                        rank,
-                        k: cfg.hidden,
-                    },
-                );
-                plan.insert(
-                    b_id,
-                    Synth::QkvB {
-                        parts: [qkv[0][1].clone(), qkv[1][1].clone(), qkv[2][1].clone()],
-                        rank,
-                        heads: cfg.n_heads,
-                        head_dim: cfg.head_dim,
-                    },
-                );
-            }
-
-            // --- straight renames ---
-            for (lora_site, base_site) in [
-                ("attn.to_out.0", "attn.out_proj"),
-                ("ff.net.0.proj", "mlp.fc1"),
-                ("ff.net.2", "mlp.fc2"),
-            ] {
-                let [a, b] = ids(&site.lora_prefix, lora_site);
-                let (Some(ae), Some(be)) = (inner.catalog().get(&a), inner.catalog().get(&b))
-                else {
-                    continue;
-                };
-                for (src, e, suffix) in [(a, ae, "lora_A"), (b, be, "lora_B")] {
-                    let dst = WeightId(format!(
-                        "diffusion_model.{}.{base_site}.{suffix}.weight",
-                        site.base_prefix
-                    ));
-                    catalog.entries.insert(
-                        dst.clone(),
-                        entry(e.shape.0.clone(), e.shape.0.iter().product()),
-                    );
-                    plan.insert(dst, Synth::Rename(src));
+    /// Resolve and validate every pair; tensors are synthesized on `open`.
+    pub async fn new(
+        cfg: &DitConfig,
+        adapters: Vec<Adapter<L>>,
+    ) -> Result<Self, LoraError<L::Error>> {
+        let mut stacks: BTreeMap<String, Stack> = BTreeMap::new();
+        let mut skipped = Vec::new();
+        let mut sources = Vec::with_capacity(adapters.len());
+        for (ai, adapter) in adapters.into_iter().enumerate() {
+            // module -> [A, B, alpha]
+            let mut pairs: BTreeMap<String, [Option<WeightId>; 3]> = BTreeMap::new();
+            for id in adapter.source.catalog().entries.keys() {
+                // Dense payloads (`.diff`, `.diff_b`) are not low-rank.
+                if let Some((module, kind)) = parse_key(&id.0) {
+                    pairs.entry(module).or_default()[kind as usize] = Some(id.clone());
+                } else if !id.0.ends_with(".diff") && !id.0.ends_with(".diff_b") {
+                    skipped.push(id.0.clone());
                 }
             }
+            for (module, [a, b, alpha]) in pairs {
+                let target = classify(&module).and_then(|t| {
+                    let block = if t.refiner {
+                        (t.block < cfg.token_refiner_layers).then_some(t.block)
+                    } else {
+                        cfg.block_for_base(t.block)
+                    }?;
+                    Some(Target { block, ..t })
+                });
+                let (Some(t), Some(a), Some(b)) = (target, a, b) else {
+                    skipped.push(module);
+                    continue;
+                };
+                let cat = adapter.source.catalog();
+                let shape = |id: &WeightId| cat.get(id).map(|e| e.shape.0.clone());
+                let (Some(sa), Some(sb)) = (shape(&a), shape(&b)) else {
+                    skipped.push(module);
+                    continue;
+                };
+                let (n, k) = t.site.dims(cfg);
+                let (row, rows, swap) = match t.part {
+                    Part::Whole { swap } => (0, n, swap),
+                    Part::QkvThird(x) => (x * n / 3, n / 3, false),
+                };
+                let [rank, a_k] = sa[..] else {
+                    return Err(LoraError::Shape(format!("{module}: lora_A is {sa:?}")));
+                };
+                if a_k != k || sb[..] != [rows, rank] {
+                    return Err(LoraError::Shape(format!(
+                        "{module}: lora_A {sa:?} / lora_B {sb:?} do not fit {} [{n}, {k}] \
+                         (is this an adapter for a different model?)",
+                        t.site.name(),
+                    )));
+                }
+                let alpha = match (adapter.alpha, alpha) {
+                    (Some(v), _) => v,
+                    (None, Some(id)) => {
+                        let v = read_f32(&adapter.source, &id).await?;
+                        *v.first()
+                            .ok_or_else(|| LoraError::Read(format!("{} empty", id.0)))?
+                    }
+                    (None, None) => rank as f32,
+                };
+                let base = if t.refiner {
+                    format!("token_refiner.blocks.{}", t.block)
+                } else {
+                    format!("blocks.{}", t.block)
+                };
+                stacks
+                    .entry(format!("{base}.{}", t.site.name()))
+                    .or_insert_with(|| Stack {
+                        n,
+                        k,
+                        pieces: Vec::new(),
+                    })
+                    .pieces
+                    .push(Piece {
+                        adapter: ai,
+                        a,
+                        b,
+                        rank,
+                        row,
+                        rows,
+                        swap,
+                        scale: adapter.strength * alpha / rank as f32,
+                    });
+            }
+            sources.push(adapter.source);
         }
 
-        Self {
-            inner,
+        let mut catalog = WeightCatalog::new();
+        let mut plan = HashMap::new();
+        for (key, stack) in &stacks {
+            let r = stack.rank();
+            for (suffix, shape, is_b) in [
+                ("lora_A", vec![stack.k, r], false),
+                ("lora_B", vec![r, stack.n], true),
+            ] {
+                let id = WeightId(format!("diffusion_model.{key}.{suffix}.weight"));
+                catalog.entries.insert(id.clone(), entry(shape));
+                plan.insert(id, (key.clone(), is_b));
+            }
+        }
+        Ok(Self {
+            adapters: sources,
             catalog,
             plan,
-        }
+            stacks,
+            skipped,
+        })
     }
 
+    /// Sites carrying a stacked adapter.
     pub fn site_count(&self) -> usize {
-        self.plan.len() / 2
+        self.stacks.len()
     }
 
-    async fn read_bf16(&self, id: &WeightId) -> Result<Vec<bf16>, LoraError<L::Error>> {
-        let entry = self
-            .inner
-            .catalog()
-            .get(id)
-            .ok_or_else(|| LoraError::Missing(id.0.clone()))?;
-        let elems: usize = entry.shape.0.iter().product();
-        let mut bytes = vec![0u8; entry.size as usize];
-        let mut reader = self.inner.open(id).await.map_err(LoraError::Lora)?;
-        reader
-            .read_at(0, &mut bytes)
-            .await
-            .map_err(|e| LoraError::Read(format!("{}: {e:?}", id.0)))?;
-        Ok(bytes[..elems * 2]
-            .chunks_exact(2)
-            .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
-            .collect())
+    /// Modules (or stray keys) no site covers: AdaLN and boundary
+    /// projections, blocks a trim removed, incomplete pairs.
+    pub fn skipped(&self) -> &[String] {
+        &self.skipped
     }
 }
 
-fn entry(shape: Vec<usize>, elems: usize) -> WeightEntry {
+/// Decode a float tensor (f32 / f16 / bf16) to f32.
+async fn read_f32<L: WeightSource>(
+    src: &L,
+    id: &WeightId,
+) -> Result<Vec<f32>, LoraError<L::Error>> {
+    let e = src
+        .catalog()
+        .get(id)
+        .ok_or_else(|| LoraError::Missing(id.0.clone()))?;
+    let mut bytes = vec![0u8; e.size as usize];
+    let mut reader = src.open(id).await.map_err(LoraError::Source)?;
+    reader
+        .read_at(0, &mut bytes)
+        .await
+        .map_err(|err| LoraError::Read(format!("{}: {err:?}", id.0)))?;
+    let elems: usize = e.shape.0.iter().product::<usize>().max(1);
+    let le2 = |c: &[u8]| u16::from_le_bytes([c[0], c[1]]);
+    let out: Vec<f32> = match e.encoding {
+        Some(StorageEncoding::F32) => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        Some(StorageEncoding::F16) => bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_bits(le2(c)).to_f32())
+            .collect(),
+        Some(StorageEncoding::Bf16) => bytes
+            .chunks_exact(2)
+            .map(|c| bf16::from_bits(le2(c)).to_f32())
+            .collect(),
+        other => {
+            return Err(LoraError::Encoding(format!(
+                "{}: {other:?} (adapters must be f32, f16 or bf16)",
+                id.0
+            )));
+        }
+    };
+    if out.len() < elems {
+        return Err(LoraError::Read(format!("{}: short tensor", id.0)));
+    }
+    Ok(out)
+}
+
+fn entry(shape: Vec<usize>) -> WeightEntry {
     WeightEntry {
         offset: 0,
-        size: (elems * 2) as u64,
+        size: (shape.iter().product::<usize>() * 2) as u64,
         encoding: Some(StorageEncoding::Bf16),
         encoding_label: "BF16".to_string(),
         shape: Shape(shape),
     }
 }
 
-impl<L: WeightSource> WeightSource for TurboLoraSource<L> {
-    type Reader = super::super::common::lora::VecReader;
+impl<L: WeightSource> WeightSource for LoraSource<L> {
+    type Reader = VecReader;
     type Error = LoraError<L::Error>;
 
     fn catalog(&self) -> &WeightCatalog {
@@ -240,50 +433,42 @@ impl<L: WeightSource> WeightSource for TurboLoraSource<L> {
     }
 
     async fn open(&self, id: &WeightId) -> Result<Self::Reader, Self::Error> {
-        let synth = self
+        let (key, is_b) = self
             .plan
             .get(id)
-            .ok_or_else(|| LoraError::Missing(id.0.clone()))?
-            .clone();
-        let values: Vec<bf16> = match synth {
-            Synth::Rename(src) => self.read_bf16(&src).await?,
-            Synth::QkvA { parts, rank, k } => {
-                let mut out = Vec::with_capacity(3 * rank * k);
-                for p in &parts {
-                    out.extend_from_slice(&self.read_bf16(p).await?);
-                }
-                out
-            }
-            Synth::QkvB {
-                parts,
-                rank,
-                heads,
-                head_dim,
-            } => {
-                // Fused B is [heads * 3 * head_dim, 3 * rank]. Projection `x`'s
-                // rows land at `h * 3 * head_dim + x * head_dim`, and its
-                // columns occupy the `x`-th rank block; everything else is 0.
-                let fused_rank = 3 * rank;
-                let rows = heads * 3 * head_dim;
-                let mut out = vec![bf16::ZERO; rows * fused_rank];
-                for (x, p) in parts.iter().enumerate() {
-                    let b = self.read_bf16(p).await?;
-                    for h in 0..heads {
-                        for d in 0..head_dim {
-                            let src = (h * head_dim + d) * rank;
-                            let dst = (h * 3 * head_dim + x * head_dim + d) * fused_rank + x * rank;
-                            out[dst..dst + rank].copy_from_slice(&b[src..src + rank]);
-                        }
+            .ok_or_else(|| LoraError::Missing(id.0.clone()))?;
+        let stack = &self.stacks[key];
+        let r = stack.rank();
+        let mut out = vec![0f32; if *is_b { r * stack.n } else { stack.k * r }];
+        let mut col = 0;
+        for p in &stack.pieces {
+            let src = &self.adapters[p.adapter];
+            if *is_b {
+                // `B` `[rows, rank]` -> `B^T` rows `col..`, columns `row..`.
+                let b = read_f32(src, &p.b).await?;
+                let half = p.rows / 2;
+                for r_in in 0..p.rows {
+                    let r_src = if p.swap { (r_in + half) % p.rows } else { r_in };
+                    for j in 0..p.rank {
+                        out[(col + j) * stack.n + p.row + r_in] = b[r_src * p.rank + j] * p.scale;
                     }
                 }
-                out
+            } else {
+                // `A` `[rank, k]` -> `A^T` columns `col..`.
+                let a = read_f32(src, &p.a).await?;
+                for j in 0..p.rank {
+                    for kk in 0..stack.k {
+                        out[kk * r + col + j] = a[j * stack.k + kk];
+                    }
+                }
             }
-        };
-        let bytes: Vec<u8> = values
+            col += p.rank;
+        }
+        let bytes: Vec<u8> = out
             .iter()
-            .flat_map(|v| v.to_bits().to_le_bytes())
+            .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
             .collect();
-        Ok(super::super::common::lora::VecReader::from_vec(bytes))
+        Ok(VecReader::from_vec(bytes))
     }
 }
 
@@ -291,80 +476,116 @@ impl<L: WeightSource> WeightSource for TurboLoraSource<L> {
 mod tests {
     use super::*;
 
-    /// The fused pair must reproduce the same delta the three separate pairs
-    /// would, scattered per head. This is the whole point of the module, and a
-    /// wrong scatter is silent: it produces a plausible but wrong model.
+    /// Every layout spelling of a site resolves to the same target; the
+    /// diffusers SwiGLU swaps halves, the checkpoint's own `mlp.fc1` does not.
     #[test]
-    fn fused_pair_reproduces_the_per_head_scatter() {
-        // Tiny stand-in: 2 heads x head_dim 2, k = 3, rank 1.
-        let (heads, head_dim, k, rank) = (2usize, 2usize, 3usize, 1usize);
-        let inner = heads * head_dim; // 4
-        // A_x [rank, k], B_x [inner, rank] for x in q,k,v.
-        let a = [
-            vec![1.0f32, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
-        ];
-        let b = [
-            vec![1.0f32, 2.0, 3.0, 4.0],
-            vec![5.0, 6.0, 7.0, 8.0],
-            vec![9.0, 10.0, 11.0, 12.0],
-        ];
-
-        // Reference: scatter each projection's delta into the fused layout.
-        let rows = heads * 3 * head_dim;
-        let mut want = vec![0.0f32; rows * k];
-        for (x, (ax, bx)) in a.iter().zip(&b).enumerate() {
-            for h in 0..heads {
-                for d in 0..head_dim {
-                    let r = h * 3 * head_dim + x * head_dim + d;
-                    for kk in 0..k {
-                        want[r * k + kk] += bx[h * head_dim + d] * ax[kk];
-                    }
-                }
-            }
-        }
-
-        // Fused: A_cat [3 * rank, k], B_cat [rows, 3 * rank].
-        let fused_rank = 3 * rank;
-        let mut a_cat = Vec::new();
-        for ax in &a {
-            a_cat.extend_from_slice(ax);
-        }
-        let mut b_cat = vec![0.0f32; rows * fused_rank];
-        for (x, bx) in b.iter().enumerate() {
-            for h in 0..heads {
-                for d in 0..head_dim {
-                    let src = (h * head_dim + d) * rank;
-                    let dst = (h * 3 * head_dim + x * head_dim + d) * fused_rank + x * rank;
-                    b_cat[dst..dst + rank].copy_from_slice(&bx[src..src + rank]);
-                }
-            }
-        }
-        let mut got = vec![0.0f32; rows * k];
-        for r in 0..rows {
-            for kk in 0..k {
-                let mut acc = 0.0;
-                for j in 0..fused_rank {
-                    acc += b_cat[r * fused_rank + j] * a_cat[j * k + kk];
-                }
-                got[r * k + kk] = acc;
-            }
-        }
-        assert_eq!(got, want);
-        assert_eq!(inner, 4);
+    fn layouts_resolve_to_the_checkpoint_sites() {
+        let site = |key: &str| {
+            let (module, _) = parse_key(key).expect(key);
+            let t = classify(&module).expect(key);
+            let part = match t.part {
+                Part::Whole { swap } => (9, swap),
+                Part::QkvThird(x) => (x, false),
+            };
+            (t.refiner, t.block, t.site, part)
+        };
+        let fused = (false, 3, Site::Qkv, (9, false));
+        assert_eq!(
+            site("diffusion_model.blocks.3.attn.qkv_proj.lora_A.weight"),
+            fused
+        );
+        assert_eq!(
+            site("lora_unet_blocks_3_attn_qkv_proj.lora_down.weight"),
+            fused
+        );
+        assert_eq!(
+            site("transformer_blocks.3.attn.to_k.lora_B.default.weight"),
+            (false, 3, Site::Qkv, (1, false))
+        );
+        assert_eq!(
+            site("transformer.transformer_blocks.3.ff.net.0.proj.lora_A.weight"),
+            (false, 3, Site::Fc1, (9, true))
+        );
+        assert_eq!(
+            site("diffusion_model.blocks.3.mlp.fc1.lora_up.weight"),
+            (false, 3, Site::Fc1, (9, false))
+        );
+        assert_eq!(
+            site("token_refiner.refiner_blocks.1.attn.to_out.0.lora_A.weight"),
+            (true, 1, Site::Out, (9, false))
+        );
+        assert_eq!(
+            site("diffusion_model.token_refiner.blocks.1.mlp.fc2.alpha"),
+            (true, 1, Site::Fc2, (9, false))
+        );
+        assert!(classify("blocks.3.adaln_proj.linear").is_none());
+        assert!(classify("video_patch_proj").is_none());
     }
 
-    /// The fused layout is per-head interleaved, NOT three contiguous blocks.
-    /// Head 0's k rows must sit at rows 2..4, not at `inner`.
+    /// FastH3-Trim's kept-block renumbering.
     #[test]
-    fn scatter_is_per_head_interleaved_not_block_contiguous() {
-        let (heads, head_dim) = (2usize, 2usize);
-        let row_of = |h: usize, x: usize, d: usize| h * 3 * head_dim + x * head_dim + d;
-        assert_eq!(row_of(0, 0, 0), 0); // h0 q
-        assert_eq!(row_of(0, 1, 0), 2); // h0 k
-        assert_eq!(row_of(0, 2, 0), 4); // h0 v
-        assert_eq!(row_of(1, 0, 0), 6); // h1 q
-        assert_eq!(heads * 3 * head_dim, 12);
+    fn trim_maps_base_blocks() {
+        let c = DitConfig::fasth3_trim();
+        assert_eq!(c.block_for_base(5), Some(5));
+        assert_eq!(c.block_for_base(6), None);
+        assert_eq!(c.block_for_base(8), Some(6));
+        assert_eq!(c.block_for_base(49), Some(41));
+        assert_eq!(c.block_for_base(50), None);
+        assert_eq!(DitConfig::h3_33b().block_for_base(6), Some(6));
+    }
+
+    /// The stacked pair reproduces the sum of the pieces' scaled deltas, each
+    /// in its own rows: a wrong placement is silent (a plausible wrong model).
+    #[test]
+    fn stacked_pair_reproduces_the_piece_sum() {
+        // Site n = 6 (three thirds of 2), k = 3. Piece 0: whole, rank 1, scale 2.
+        // Piece 1: third 1 (rows 2..4), rank 2, scale 0.5.
+        let (n, k) = (6usize, 3usize);
+        let a0 = [1.0f32, 2.0, 3.0];
+        let b0 = [1.0f32, -1.0, 2.0, 0.5, 3.0, 1.0];
+        let a1 = [0.0f32, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let b1 = [1.0f32, 2.0, 3.0, 4.0];
+        let mut want = vec![0f32; n * k];
+        for r in 0..n {
+            for c in 0..k {
+                want[r * k + c] += 2.0 * b0[r] * a0[c];
+            }
+        }
+        for r in 0..2 {
+            for c in 0..k {
+                for j in 0..2 {
+                    want[(2 + r) * k + c] += 0.5 * b1[r * 2 + j] * a1[j * k + c];
+                }
+            }
+        }
+        // Stacked as `open` builds it: A_cat [3, k], B_cat [n, 3].
+        let rr = 3;
+        let a_cat: Vec<f32> = a0.iter().chain(&a1).copied().collect();
+        let mut b_cat = vec![0f32; n * rr];
+        for r in 0..n {
+            b_cat[r * rr] = 2.0 * b0[r];
+        }
+        for r in 0..2 {
+            for j in 0..2 {
+                b_cat[(2 + r) * rr + 1 + j] = 0.5 * b1[r * 2 + j];
+            }
+        }
+        let got: Vec<f32> = (0..n * k)
+            .map(|i| {
+                let (r, c) = (i / k, i % k);
+                (0..rr).map(|j| b_cat[r * rr + j] * a_cat[j * k + c]).sum()
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// PEFT scaling for the turbo is alpha 8 / rank 128 = 1/16, exactly
+    /// representable in bf16 (so baking it into `B` is lossless). Left at 1.0
+    /// the adapter runs 16x too strong.
+    #[test]
+    fn turbo_scale_is_exact() {
+        let s = TURBO_ALPHA / 128.0;
+        assert_eq!(s, 1.0 / 16.0);
+        assert_eq!(bf16::from_f32(s).to_f32(), s);
     }
 }

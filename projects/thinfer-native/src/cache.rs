@@ -23,6 +23,9 @@ pub trait DownloadProgress: Send + Sync + 'static {
 #[derive(Debug)]
 pub enum CacheError {
     Api(ApiError),
+    /// A default-less weight slot the user's sources do not fill (or a broken
+    /// sources file); the message carries the fix (see `crate::sources`).
+    Sources(String),
 }
 
 impl From<ApiError> for CacheError {
@@ -35,6 +38,7 @@ impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Api(e) => write!(f, "hf-hub: {e}"),
+            Self::Sources(e) => f.write_str(e),
         }
     }
 }
@@ -49,10 +53,16 @@ fn repo_of(file: &FileRef) -> Repo {
 }
 
 /// Look up `file` in the HF cache without touching the network. `None` if the
-/// file isn't already cached. Used by integration tests so they can skip when
-/// the file isn't present rather than triggering a multi-GB download.
+/// file isn't already cached (or is an unfilled weight slot). Used by
+/// integration tests so they can skip when the file isn't present rather than
+/// triggering a multi-GB download. Slotted refs resolve through the user's
+/// sources (`crate::sources::effective`).
 pub fn resolve(file: &FileRef) -> Option<PathBuf> {
-    Cache::from_env().repo(repo_of(file)).get(file.path)
+    let file = crate::sources::effective(file);
+    if file.is_unfilled() {
+        return None;
+    }
+    Cache::from_env().repo(repo_of(&file)).get(file.path)
 }
 
 /// Cache lookup, downloading from HF if missing. Single file only; never pulls
@@ -69,8 +79,9 @@ pub async fn download_with_progress(
     file: &FileRef,
     sink: Option<Arc<dyn DownloadProgress>>,
 ) -> Result<PathBuf, CacheError> {
+    let file = crate::sources::require(file).map_err(CacheError::Sources)?;
     let api = ApiBuilder::from_env().build()?;
-    let repo = api.repo(repo_of(file));
+    let repo = api.repo(repo_of(&file));
     match sink {
         None => repo.download(file.path).await.map_err(Into::into),
         Some(sink) => repo
@@ -96,16 +107,20 @@ impl Progress for ProgressAdapter {
 }
 
 /// Resolve every file in `files`. Returns `(resolved, missing)` partition so
-/// the CLI can show one consent prompt covering all missing files.
+/// the CLI can show one consent prompt covering all missing files. Both halves
+/// carry the effective ref (the user's source for a filled slot), so prompts
+/// name what will actually be fetched; it keeps its slot, so re-resolving it is
+/// idempotent.
 pub fn resolve_all<'a>(
     files: impl IntoIterator<Item = &'a FileRef>,
 ) -> (Vec<(FileRef, PathBuf)>, Vec<FileRef>) {
     let mut hit = Vec::new();
     let mut miss = Vec::new();
     for f in files {
-        match resolve(f) {
-            Some(p) => hit.push((*f, p)),
-            None => miss.push(*f),
+        let f = crate::sources::effective(f);
+        match resolve(&f) {
+            Some(p) => hit.push((f, p)),
+            None => miss.push(f),
         }
     }
     (hit, miss)

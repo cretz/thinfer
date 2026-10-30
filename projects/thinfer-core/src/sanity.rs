@@ -145,7 +145,10 @@ impl ValidateState {
         let expected = match encoding {
             StorageEncoding::F32 => elements * 4,
             StorageEncoding::F16 | StorageEncoding::Bf16 => elements * 2,
-            enc @ (StorageEncoding::I8 | StorageEncoding::I4 | StorageEncoding::Quant(_)) => {
+            enc @ (StorageEncoding::I8
+            | StorageEncoding::I4
+            | StorageEncoding::Quant(_)
+            | StorageEncoding::Nvfp4) => {
                 return Err(FailReason::NoDecoder(enc));
             }
         };
@@ -205,7 +208,8 @@ impl ValidateState {
             StorageEncoding::F16
             | StorageEncoding::I8
             | StorageEncoding::I4
-            | StorageEncoding::Quant(_) => unreachable!(),
+            | StorageEncoding::Quant(_)
+            | StorageEncoding::Nvfp4 => unreachable!(),
         };
         Ok(decoded)
     }

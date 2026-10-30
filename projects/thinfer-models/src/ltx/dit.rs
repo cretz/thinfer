@@ -45,7 +45,7 @@ use super::config as dit;
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, BlockWgslConfigs, CoopmatStep, DenseActSites, DequantStep,
     alloc_act, alloc_matmul_out_buf, build_coopmat_step, op_add, op_rmsnorm, op_rope_halfrot,
-    op_sdpa, quantize_act_paired,
+    op_sdpa_win, quantize_act_paired,
 };
 use crate::common::embedders::bcast_add_uniform;
 use crate::z_image::text_encoder::{LoadError, register_one};
@@ -655,7 +655,7 @@ pub async fn caption_project<S: WeightSource>(
 ///   bandwidth-trivial A-sides and are never i8, even with the opt-in.
 ///
 /// f16 acts put the residual stream in f16 (5-bit exponent, max 65504); the
-/// worklog flags this as a dead-end for the big WAN/Qwen DiTs (residual outliers
+/// this is a known dead-end for the big WAN/Qwen DiTs (residual outliers
 /// overflow). LTX-2.3 distilled does NOT overflow -- validated against the
 /// upstream pyref (`dit_full_parity`: f16 slope 1.0006, rel 0.093%; bit-clean to
 /// the f32 path). **`f16dp4a` is the DEFAULT** (env unset): F16 acts + DP4A i8 on
@@ -663,6 +663,8 @@ pub async fn caption_project<S: WeightSource>(
 /// quality-clean (block rel <=0.37%, eyeballed on a real browser gen). `f16` opts
 /// out of the i8 (dense f16 matmuls, the bit-cleaner perf path); `f32` is the
 /// bit-exact parity reference. Without shader-f16 the default falls back to f32.
+/// With an accelerator installed (CUDA) the default is `f16`: tensor-core dense
+/// matmuls match DP4A's speed, so the i8 quality cost buys nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DitActs {
     F32,
@@ -678,6 +680,10 @@ impl DitActs {
             "f32" => Self::F32,
             // Explicit dense f16 (opt OUT of DP4A i8 on the video-stream matmuls).
             "f16" if f16_ok => Self::F16,
+            // With an accelerator (CUDA) the dense matmuls run on tensor cores and
+            // DP4A buys nothing (paired 768x512 5s: denoise 229.7s i8 vs 229.8s
+            // dense), so the default takes the bit-cleaner dense path.
+            "" if f16_ok && backend.accelerator().is_some() => Self::F16,
             // Default (env unset) + "f16dp4a"/"dp4a": DP4A is the default perf path.
             "" | "f16dp4a" | "dp4a" if f16_ok => Self::F16Dp4a,
             _ => {
@@ -827,7 +833,13 @@ impl DitPipelines {
                         dq_i8_layout,
                     )
                     .await?;
-                i8_dequant.insert(scheme, DequantStep { pipeline, scheme });
+                i8_dequant.insert(
+                    scheme,
+                    DequantStep {
+                        pipeline,
+                        scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                    },
+                );
             }
         }
         // Dense dequant steps keyed by quant kind. Target matches the block's
@@ -855,7 +867,13 @@ impl DitPipelines {
                     dq_layout,
                 )
                 .await?;
-            dense_dequant.insert(scheme, DequantStep { pipeline, scheme });
+            dense_dequant.insert(
+                scheme,
+                DequantStep {
+                    pipeline,
+                    scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                },
+            );
         }
         // Per-scheme coopmat (tensor-core) steps, for the same reason the two
         // dequant maps above are per-scheme: `BlockPipelines` bakes ONE scheme per
@@ -941,7 +959,7 @@ impl BlockQuantKinds {
     /// fall back to Q8_0.
     ///
     /// MUST be per block. `_K_M` recipes vary the kind BY LAYER, not just by
-    /// site: in `sulphur_dev-Q4_K_M` the first 6 blocks are Q5_K throughout while
+    /// site: in one published LTX-2.3 dev-finetune Q4_K_M the first 6 blocks are Q5_K throughout while
     /// the other 42 are Q4_K (q/k/o/gate) + Q6_K (v/ffn_down). Probing block 0
     /// and reusing it decoded 42 of 48 blocks with the wrong scheme, which is
     /// what made every Q4_K_M LTX variant produce garbage.
@@ -1192,7 +1210,7 @@ fn biased_proj<'wsp>(
     };
     let di8 = match i8 {
         I8Site::None => None,
-        _ => dq_dense.and_then(|d| pipes.i8_dequant(d.scheme)),
+        _ => dq_dense.and_then(|d| d.scheme.block().and_then(|k| pipes.i8_dequant(k))),
     };
     // Tensor cores. This takes over BOTH the dense sites (proj, ffn_down, the
     // audio stream, the text cross -- the bulk of DiT matmul time on the gated
@@ -1207,7 +1225,7 @@ fn biased_proj<'wsp>(
     // Routed by THIS weight's on-disk kind, like the two dequant maps: a step's
     // dequant decodes one scheme, and the `_K_M` DiTs ship each block MIXED
     // (Q4_K + Q6_K), so a single baked scheme would decode garbage.
-    let cm = dq_dense.and_then(|d| pipes.coopmat(d.scheme));
+    let cm = dq_dense.and_then(|d| d.scheme.block().and_then(|k| pipes.coopmat(k)));
     Block::dispatch_matmul_site_coopmat(
         scope,
         bp,
@@ -1417,6 +1435,22 @@ impl<'a> BlockViewsAll<'a> {
 /// applies it at the residual). `kv_src = None` means self-attention (K/V read
 /// `q_src`), which also lets the shared-A-side act-quant below cover Q.
 #[allow(clippy::too_many_arguments)]
+/// Temporal sliding-window radius for the VIDEO self-attention, in latent
+/// frames (`LTX_ATTN_WINDOW`, default 0 = full attention). Each query attends
+/// only to keys within `+-W` latent frames, which breaks the O(frames^2) cost
+/// of the one all-to-all op in the block. It CHANGES the output (the model was
+/// trained on full attention), so it stays opt-in until eyeballed per model.
+fn attn_window() -> u32 {
+    static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("LTX_ATTN_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attention<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipes: &DitPipelines,
@@ -1434,6 +1468,9 @@ fn attention<'wsp>(
     proj_i8: bool,
     gated: bool,
     dq: AttnDequant<'_>,
+    // `(period, window)` for the temporal sliding window; `(0, 0)` = full
+    // attention. Only the video self-attention site passes a real pair.
+    win: (u32, u32),
 ) -> Result<ActBuf<'wsp>, WgpuError> {
     let bp = &pipes.block;
     let inner = g.inner() as u32;
@@ -1454,7 +1491,8 @@ fn attention<'wsp>(
     // its on-disk kind (mixed Q5_K/Q6_K here); a kind with no built prep falls
     // to the dense per-kind path.
     let qkv_site = |d: Option<&DequantStep>| {
-        if qkv_i8 && d.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
+        if qkv_i8 && d.is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
+        {
             I8Site::Qkv
         } else {
             I8Site::None
@@ -1524,10 +1562,13 @@ fn attention<'wsp>(
         None => kn,
     };
 
-    // non-causal SDPA (no mask; dummy 16-byte slot, has_mask=0).
+    // non-causal SDPA (no mask; dummy 16-byte slot, has_mask=0). `win` routes
+    // the video self-attention to the temporal sliding-window twin when a run
+    // opts in; every other site passes (0, 0) and takes the full attention.
     let sa = alloc_act(scope, bp, q_rows, inner)?;
     let no_mask = scope.alloc(16)?;
-    op_sdpa(
+    let (period, window) = win;
+    op_sdpa_win(
         scope,
         bp,
         qx,
@@ -1543,6 +1584,11 @@ fn attention<'wsp>(
         hd,
         g.scale(),
         0,
+        period,
+        window,
+        // Pure-video self-attention: no text rows in this sequence, so
+        // `txt_start = kv_rows` leaves the joint-windowing branches dead.
+        kv_rows,
     )?;
 
     // per-head gate: out = sa * 2*sigmoid(to_gate_logits(gate_src)). Skipped on
@@ -1572,7 +1618,11 @@ fn attention<'wsp>(
 
     // to_out projection + bias -> [q_rows, q_dim]. i8 only when the caller marks
     // this (ungated) site safe AND an i8 prep exists for the weight's kind.
-    let o_site = if proj_i8 && dq.o.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
+    let o_site = if proj_i8
+        && dq
+            .o
+            .is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
+    {
         I8Site::Proj
     } else {
         I8Site::None
@@ -1604,7 +1654,11 @@ fn feed_forward<'wsp>(
     // unless `THINFER_LTX_I8_EXTRA=1` opts it in (its A-side is equally normed).
     // i8 covers every kind with a built prep pipeline (Q8_0/Q5_K/Q6_K); a kind
     // without one runs the dense per-kind path.
-    let up = if up_i8 && dq.up.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
+    let up = if up_i8
+        && dq
+            .up
+            .is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
+    {
         I8Site::FfnUp
     } else {
         I8Site::None
@@ -1619,7 +1673,7 @@ fn feed_forward<'wsp>(
     let down = if down_i8
         && dq
             .down
-            .is_some_and(|s| pipes.i8_dequant(s.scheme).is_some())
+            .is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
     {
         I8Site::FfnDown
     } else {
@@ -1642,6 +1696,10 @@ pub struct Streams {
     pub audio_tokens: usize,
     pub video_text: usize,
     pub audio_text: usize,
+    /// Video tokens per LATENT FRAME (`lat_h * lat_w`), i.e. the period of the
+    /// frame-major `(f, h, w)` token order. Only the temporal sliding-window
+    /// self-attention reads it; 0 disables windowing for this run.
+    pub video_period: usize,
 }
 
 /// RoPE freq buffers for one block (already on GPU, `[seq*heads, head_dim]`
@@ -1741,6 +1799,7 @@ fn block_forward<'wsp>(
         !gated,
         gated,
         adq,
+        (s.video_period as u32, attn_window()),
     )?;
     let vx1 = alloc_act(scope, bp, sv, vd)?;
     op_gate_residual(
@@ -1802,6 +1861,7 @@ fn block_forward<'wsp>(
         !gated,
         gated,
         adq,
+        (0, 0),
     )?;
     let vx2 = alloc_act(scope, bp, sv, vd)?;
     if cross_adaln {
@@ -1848,6 +1908,7 @@ fn block_forward<'wsp>(
         audio_i8,
         gated,
         adq,
+        (0, 0),
     )?;
     let ax1 = alloc_act(scope, bp, sa, ad)?;
     op_gate_residual(
@@ -1906,6 +1967,7 @@ fn block_forward<'wsp>(
         audio_i8,
         gated,
         adq,
+        (0, 0),
     )?;
     let ax2 = alloc_act(scope, bp, sa, ad)?;
     if cross_adaln {
@@ -1965,6 +2027,7 @@ fn block_forward<'wsp>(
         !gated,
         gated,
         adq,
+        (0, 0),
     )?;
     let vx3 = alloc_act(scope, bp, sv, vd)?;
     op_gate_residual(
@@ -2017,6 +2080,7 @@ fn block_forward<'wsp>(
         audio_i8,
         gated,
         adq,
+        (0, 0),
     )?;
     let ax3 = alloc_act(scope, bp, sa, ad)?;
     op_gate_residual(

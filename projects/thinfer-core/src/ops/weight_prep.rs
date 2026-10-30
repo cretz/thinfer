@@ -193,6 +193,39 @@ fn transpose_bf16_2d(
     .to_string()
 }
 
+/// Build the f16 `[N, K]` -> bf16 `[K, N]` decode+narrow+transpose WGSL. Same
+/// thread geometry as [`build_transpose_bf16_wgsl`] (dispatch with
+/// [`dispatch_transpose_bf16`]); each f16 decodes exactly to f32, then narrows
+/// RNE like the CPU path (`half::f16::to_f32` -> `bf16::from_f32`).
+pub fn build_transpose_f16_wgsl() -> String {
+    format!(
+        r#"struct Dims {{ n: u32, k: u32, _p0: u32, _p1: u32 }};
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> dims: Dims;
+{F32_TO_BF16_RNE}
+fn elem_bf16(i: u32) -> u32 {{
+    let pair = unpack2x16float(src[i >> 1u]);
+    let f = select(pair.x, pair.y, (i & 1u) == 1u);
+    return bf16_bits_rne(bitcast<u32>(f));
+}}
+
+@compute @workgroup_size(64, 1, 1)
+fn transpose_f16_2d(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let kk = wid.y;
+    let nn = (wid.x * 64u + lid.x) * 2u;
+    if (nn >= dims.n) {{ return; }}
+    let i0 = nn * dims.k + kk;
+    dst[(kk * dims.n + nn) >> 1u] = elem_bf16(i0) | (elem_bf16(i0 + dims.k) << 16u);
+}}
+"#
+    )
+}
+
 /// f32 -> bf16 bits with round-to-nearest-even, bit-exact vs
 /// `half::bf16::from_f32` (truncate the low 16 bits, round on the discarded
 /// MSB with ties-to-even; NaN keeps its high mantissa plus the quiet bit).

@@ -1,15 +1,22 @@
-//! In-memory job metadata + the per-job event log. Artifacts live on disk
-//! (under the configured artifact dir); everything here is RAM and is lost on
-//! restart (accepted for a single-user host -- orphaned artifacts are swept by
-//! TTL). Each job has a replayable event log plus a broadcast channel so an SSE
-//! client gets caught up (replay) then tails live.
+//! In-memory job registry + the per-job event log. A job here is CIPHERTEXT
+//! until a worker runs it: the client's sealed spec (see `thinfer_app::jobkey`)
+//! is all the server holds while it queues. When a worker is ready it asks for
+//! the key (`keyRequired` event), the client answers (`POST /jobs/{id}/key`),
+//! and only then is anything decrypted, right before it feeds the model. The
+//! artifact is sealed under the same key in RAM before it touches disk. After
+//! the job, the key is dropped (zeroed); only its SHA-256 remains, so the
+//! client can prove ownership when fetching the sealed result.
+//!
+//! Everything here is RAM and is lost on restart. Finished jobs and their
+//! artifact dirs are reaped after `retention_secs` (see [`JobStore::reap`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use thinfer_app::request::JobRequest;
+use thinfer_app::jobkey::JobKey;
 use thinfer_app::wire::{JobEvent, JobResult, JobStateKind, JobStatus, ProgressStage};
 use tokio::sync::{Notify, broadcast};
 
@@ -28,46 +35,48 @@ struct Inner {
     error: Option<String>,
     log: Vec<SeqEvent>,
     seq: u64,
+    /// When the job reached a terminal state (reaping clock).
+    finished: Option<Instant>,
 }
 
-/// Live state for one job. The `request` and `output_path` are immutable; the
-/// rest is behind a mutex. Cloned `Arc`s are shared between the API handlers and
-/// the worker that runs it.
+/// Where a job is in the key handshake.
+struct KeySlot {
+    /// True only between `keyRequired` and the key's arrival.
+    awaiting: bool,
+    key: Option<JobKey>,
+    /// SHA-256 of the delivered key: the fetch capability for the result.
+    /// Kept after the key itself is dropped; reveals nothing about it.
+    key_hash: Option<[u8; 32]>,
+}
+
+/// One job. Its spec is sealed; see the module docs.
 pub struct JobHandle {
     pub id: String,
-    pub request: JobRequest,
-    /// Absolute path of the produced artifact (file) or its directory (PNG
-    /// frames).
-    pub output_path: PathBuf,
-    /// Client RSA public key (base64 SPKI) for result encryption, if requested.
-    /// `Some` => the worker encrypts the artifact in place and the result is
-    /// served as opaque ciphertext; `None` => plaintext.
-    pub public_key: Option<String>,
-    /// Per-request coopmat opt-out (see `JobSpec::disable_coopmat`). `None` =
-    /// use the server default; `Some(true)` forces the dense/i8 path for this
-    /// job. The worker layers this over the server `BackendConfig` at device
-    /// creation.
-    pub disable_coopmat: Option<bool>,
+    /// This job's artifact dir (`<artifact_dir>/<id>`): uploads it consumes and
+    /// its sealed result live here, and the dir is removed on fetch or reap.
+    pub dir: PathBuf,
+    /// The sealed `JobSpec`. Taken (once) by the worker that runs the job.
+    sealed: Mutex<Option<Vec<u8>>>,
+    keys: Mutex<KeySlot>,
+    key_arrived: Notify,
     inner: Mutex<Inner>,
     tx: broadcast::Sender<SeqEvent>,
     cancel: AtomicBool,
 }
 
 impl JobHandle {
-    fn new(
-        id: String,
-        request: JobRequest,
-        output_path: PathBuf,
-        public_key: Option<String>,
-        disable_coopmat: Option<bool>,
-    ) -> Self {
+    fn new(id: String, dir: PathBuf, sealed: Vec<u8>) -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
             id,
-            request,
-            output_path,
-            public_key,
-            disable_coopmat,
+            dir,
+            sealed: Mutex::new(Some(sealed)),
+            keys: Mutex::new(KeySlot {
+                awaiting: false,
+                key: None,
+                key_hash: None,
+            }),
+            key_arrived: Notify::new(),
             inner: Mutex::new(Inner {
                 kind: JobStateKind::Queued,
                 last_progress: None,
@@ -75,6 +84,7 @@ impl JobHandle {
                 error: None,
                 log: Vec::new(),
                 seq: 0,
+                finished: None,
             }),
             tx,
             cancel: AtomicBool::new(false),
@@ -89,9 +99,9 @@ impl JobHandle {
         let seq = inner.seq;
         match &event {
             JobEvent::Queued { .. } => inner.kind = JobStateKind::Queued,
+            JobEvent::KeyRequired | JobEvent::Log { .. } => {}
             JobEvent::Started => inner.kind = JobStateKind::Running,
             JobEvent::Progress { stage } => inner.last_progress = Some(stage.clone()),
-            JobEvent::Log { .. } => {}
             JobEvent::Done { result } => {
                 inner.kind = JobStateKind::Done;
                 inner.result = Some(result.clone());
@@ -101,6 +111,9 @@ impl JobHandle {
                 inner.error = Some(message.clone());
             }
             JobEvent::Cancelled => inner.kind = JobStateKind::Cancelled,
+        }
+        if event.is_terminal() {
+            inner.finished = Some(Instant::now());
         }
         let se = SeqEvent { seq, event };
         inner.log.push(se.clone());
@@ -142,18 +155,77 @@ impl JobHandle {
 
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+        // A worker blocked waiting for the key should give up now.
+        self.key_arrived.notify_one();
     }
 
     pub fn is_cancel_requested(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
+
+    /// Take the sealed spec (once; the worker that runs the job).
+    pub fn take_sealed(&self) -> Option<Vec<u8>> {
+        self.sealed.lock().unwrap().take()
+    }
+
+    /// Ask the client for the key and wait up to `wait` for it. `None` on
+    /// timeout or cancel. The key is accepted only during this window.
+    pub async fn request_key(&self, wait: Duration) -> Option<JobKey> {
+        self.keys.lock().unwrap().awaiting = true;
+        self.push(JobEvent::KeyRequired);
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(key) = self.keys.lock().unwrap().key.take() {
+                return Some(key);
+            }
+            if self.is_cancel_requested()
+                || tokio::time::timeout_at(deadline, self.key_arrived.notified())
+                    .await
+                    .is_err()
+            {
+                self.keys.lock().unwrap().awaiting = false;
+                return None;
+            }
+        }
+    }
+
+    /// Accept the client's key, but only while the worker is waiting for it.
+    pub fn deliver_key(&self, key: JobKey) -> Result<(), &'static str> {
+        let mut slot = self.keys.lock().unwrap();
+        if !slot.awaiting {
+            return Err("job is not waiting for its key");
+        }
+        slot.awaiting = false;
+        slot.key_hash = Some(key.proof());
+        slot.key = Some(key);
+        drop(slot);
+        self.key_arrived.notify_one();
+        Ok(())
+    }
+
+    /// Whether `proof` (base64 SHA-256 of the job key) matches the delivered
+    /// key. Constant-time compare.
+    pub fn owns(&self, proof: &[u8]) -> bool {
+        let slot = self.keys.lock().unwrap();
+        slot.key_hash.is_some_and(|h| {
+            h.len() == proof.len()
+                && h.iter().zip(proof).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        })
+    }
+
+    fn finished_before(&self, cutoff: Instant) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .finished
+            .is_some_and(|t| t < cutoff)
+    }
 }
 
-/// All jobs + the pending queue. Sequential ids (single-user host; not secrets).
+/// All jobs + the pending queue.
 pub struct JobStore {
-    jobs: Mutex<HashMap<String, std::sync::Arc<JobHandle>>>,
-    queue: Mutex<VecDeque<std::sync::Arc<JobHandle>>>,
-    next_id: AtomicU64,
+    jobs: Mutex<HashMap<String, Arc<JobHandle>>>,
+    queue: Mutex<VecDeque<Arc<JobHandle>>>,
     active: AtomicUsize,
     /// Wakes idle workers when a job is enqueued.
     pub notify: Notify,
@@ -164,33 +236,29 @@ impl Default for JobStore {
         Self {
             jobs: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
-            next_id: AtomicU64::new(1),
             active: AtomicUsize::new(0),
             notify: Notify::new(),
         }
     }
 }
 
+/// 32 hex chars of randomness: an unguessable job id (and dir name).
+fn random_id() -> String {
+    let mut b = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 impl JobStore {
-    /// Allocate a job id, build the request via `make` (which can use the id to
-    /// place the artifact path), then register + enqueue. `make` runs before any
-    /// lock is held, so it may touch the filesystem (create the job dir). Returns
-    /// (handle, queue position).
-    #[allow(clippy::type_complexity)]
+    /// Register + enqueue a sealed job whose dir is `<artifact_dir>/<id>`.
+    /// Returns (handle, queue position).
     pub fn submit(
         &self,
-        make: impl FnOnce(&str) -> Result<(JobRequest, PathBuf, Option<String>, Option<bool>), String>,
-    ) -> Result<(std::sync::Arc<JobHandle>, usize), String> {
-        let n = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let id = format!("job-{n}");
-        let (request, output_path, public_key, disable_coopmat) = make(&id)?;
-        let handle = std::sync::Arc::new(JobHandle::new(
-            id.clone(),
-            request,
-            output_path,
-            public_key,
-            disable_coopmat,
-        ));
+        artifact_dir: &std::path::Path,
+        sealed: Vec<u8>,
+    ) -> (Arc<JobHandle>, usize) {
+        let id = random_id();
+        let handle = Arc::new(JobHandle::new(id.clone(), artifact_dir.join(&id), sealed));
         self.jobs.lock().unwrap().insert(id, handle.clone());
         let position = {
             let mut q = self.queue.lock().unwrap();
@@ -199,11 +267,18 @@ impl JobStore {
         };
         handle.push(JobEvent::Queued { position });
         self.notify.notify_one();
-        Ok((handle, position))
+        (handle, position)
     }
 
-    pub fn get(&self, id: &str) -> Option<std::sync::Arc<JobHandle>> {
+    pub fn get(&self, id: &str) -> Option<Arc<JobHandle>> {
         self.jobs.lock().unwrap().get(id).cloned()
+    }
+
+    /// Forget a job and delete its dir (after its result is fetched).
+    pub fn remove(&self, id: &str) {
+        if let Some(job) = self.jobs.lock().unwrap().remove(id) {
+            let _ = std::fs::remove_dir_all(&job.dir);
+        }
     }
 
     /// Index of `id` in the pending queue, if still queued.
@@ -220,7 +295,7 @@ impl JobStore {
     /// Pop the next job for a worker, skipping any that were cancelled while
     /// queued (those are marked cancelled and dropped). Increments the active
     /// count for the returned job.
-    pub fn take_next(&self) -> Option<std::sync::Arc<JobHandle>> {
+    pub fn take_next(&self) -> Option<Arc<JobHandle>> {
         let mut q = self.queue.lock().unwrap();
         while let Some(handle) = q.pop_front() {
             if handle.is_cancel_requested() {
@@ -237,4 +312,42 @@ impl JobStore {
     pub fn finish(&self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
     }
+
+    /// Drop every job that finished more than `retention` ago, deleting its
+    /// dir (an unfetched sealed result included). Returns the count reaped.
+    pub fn reap(&self, retention: Duration) -> usize {
+        let Some(cutoff) = Instant::now().checked_sub(retention) else {
+            return 0;
+        };
+        let expired: Vec<Arc<JobHandle>> = {
+            let mut jobs = self.jobs.lock().unwrap();
+            let ids: Vec<String> = jobs
+                .iter()
+                .filter(|(_, j)| j.finished_before(cutoff))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| jobs.remove(id)).collect()
+        };
+        for job in &expired {
+            let _ = std::fs::remove_dir_all(&job.dir);
+        }
+        expired.len()
+    }
+}
+
+/// Spawn the finished-job reaper (at most every 60s).
+pub fn spawn_reaper(store: Arc<JobStore>, retention: Duration) {
+    let period = retention
+        .min(Duration::from_secs(60))
+        .max(Duration::from_secs(1));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        loop {
+            tick.tick().await;
+            let n = store.reap(retention);
+            if n > 0 {
+                tracing::info!(reaped = n, "job reaper removed finished jobs");
+            }
+        }
+    });
 }

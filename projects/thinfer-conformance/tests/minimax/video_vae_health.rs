@@ -22,7 +22,7 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::workspace::Workspace;
 use thinfer_models::minimax::manifest::{self, role};
 use thinfer_models::minimax::video_vae::{
-    DecoderPipelines, TilePolicy, VideoVaeConfig, decode_clip, load_suffix_tokens, register_handles,
+    DecoderPipelines, TilePolicy, VideoVaeConfig, decode_clip, load_consts, register_handles,
 };
 use thinfer_native::MmapFileOpener;
 use thinfer_native::cache;
@@ -80,11 +80,11 @@ async fn video_vae_health() {
         .expect("compile decoder pipelines");
     let workspace = Workspace::new(Arc::clone(&backend), Arc::clone(residency.arbiter()));
 
-    let suffix = load_suffix_tokens(&cfg, &backend, &residency, &handles)
+    let consts = load_consts(&cfg, &backend, &residency, &handles)
         .await
         .expect("read register + mask tokens");
     assert_eq!(
-        suffix.len(),
+        consts.suffix.len(),
         cfg.suffix_tokens() * cfg.dim(),
         "suffix token count"
     );
@@ -94,7 +94,7 @@ async fn video_vae_health() {
     let n = LATENT_FRAMES * LATENT_H * LATENT_W * cfg.latent_channels;
     let z: Vec<f32> = (0..n)
         .map(|i| {
-            let x = (i as f32 * 0.6180339887).fract() * 2.0 - 1.0;
+            let x = (i as f32 * 0.618_034).fract() * 2.0 - 1.0;
             x * 1.5
         })
         .collect();
@@ -106,7 +106,7 @@ async fn video_vae_health() {
         &residency,
         &workspace,
         &handles,
-        &suffix,
+        &consts,
         TilePolicy::default(),
         &z,
         LATENT_FRAMES,

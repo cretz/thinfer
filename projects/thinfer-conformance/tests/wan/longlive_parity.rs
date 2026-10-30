@@ -60,7 +60,7 @@ const CHUNK_FRAMES: usize = 8;
 /// scatter.
 ///
 /// TWO TIERS, by design (diagnosed 2026-06-21, telemetry vs the authoritative
-/// pyref dumps; see worklog). The single-forward DiT is FAITHFUL: `vel_c0s0`
+/// pyref dumps). The single-forward DiT is FAITHFUL: `vel_c0s0`
 /// (chunk0/step0, identical pinned input on both sides) holds the TIGHT
 /// `TOL_LATENT` band -- it is the real per-forward regression catcher, and the
 /// engine AR path is bit-identical to the GREEN FastWan full-attn forward

@@ -6,7 +6,8 @@ use std::sync::Arc;
 mod poll;
 pub mod wgpu;
 pub use wgpu::{
-    CommandEncoderState, PowerPreference, WgpuBackend, WgpuConfig, WgpuError, WgpuPipeline,
+    CommandEncoderState, ExternalAllocator, ExternalBuffer, PowerPreference, WgpuBackend,
+    WgpuConfig, WgpuError, WgpuPipeline,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -69,6 +70,11 @@ pub enum WeightPrep {
     Q8_0FromBf16 { n: u32, k: u32 },
     /// bf16 `[n, k]` -> `[k, n]` (nn.Linear upload transpose).
     TransposeBf16 { n: u32, k: u32 },
+    /// f16 `[n, k]` -> bf16 `[k, n]`: exact f16 decode + RNE narrow fused with
+    /// the nn.Linear transpose. Replaces the CPU decode + transpose pair on f16
+    /// sources (the MiniMax-H3 video VAE: ~0.8s of host time per decoder block,
+    /// ~27s a decode, while the GPU idled). Same geometry as `TransposeBf16`.
+    TransposeF16 { n: u32, k: u32 },
     /// f32 `[n, k]` row-major -> bf16 `[k, n]`: fused RNE narrow + nn.Linear
     /// upload transpose. Replaces the CPU `narrow_f32_to_bf16` +
     /// `transpose_bf16_cpu` pair on the f32 (safetensors) weight path, which
@@ -95,6 +101,8 @@ pub trait Backend: 'static {
     type Error: core::fmt::Debug + Send + 'static;
     type CommandEncoder;
     type Pipeline;
+    /// Staging memory handed out by [`Self::stage_write`].
+    type StagedWrite: StagedWrite;
 
     fn allocate(&self, bytes: u64) -> Result<GpuBufferId, Self::Error>;
 
@@ -130,6 +138,18 @@ pub trait Backend: 'static {
         dst_offset: u64,
         src: &[u8],
     ) -> Result<(), Self::Error>;
+
+    /// [`Self::write_buffer`] filled in place: stage `len` bytes for
+    /// `dst[dst_offset..]` and hand back the staging memory. The caller writes
+    /// it through [`StagedWrite::bytes`] (one copy, instead of filling a host
+    /// buffer that `write_buffer` copies again); dropping the guard schedules
+    /// the transfer exactly as `write_buffer` would. Same alignment rules.
+    fn stage_write(
+        &self,
+        dst: GpuBufferId,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<Self::StagedWrite, Self::Error>;
 
     fn create_command_encoder(&self) -> Self::CommandEncoder;
 
@@ -203,4 +223,275 @@ pub trait Backend: 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> {
         async { unreachable!("weight_prep called without supports_weight_prep") }
     }
+
+    /// Optional out-of-band executor for hot ops (see [`Accelerator`]). `None`
+    /// (the default, and always on web) means every op runs on this backend.
+    fn accelerator(&self) -> Option<&dyn Accelerator> {
+        None
+    }
+
+    /// The accelerator's address of `buf` (external-memory buffers only).
+    fn device_address(&self, _buf: &BufRef) -> Option<u64> {
+        None
+    }
+
+    /// Block until all submitted GPU work has completed. Orders backend work
+    /// before an [`Accelerator`] op that reads its results.
+    fn wait_idle(&self) {}
+
+    /// The dense-matmul contract `p` was compiled with (from its WGSL), if it
+    /// is one an [`Accelerator`] may run in its place.
+    fn pipeline_gemm(&self, _p: &Self::Pipeline) -> Option<crate::ops::GemmDesc> {
+        None
+    }
+}
+
+/// Writable staging memory for one [`Backend::stage_write`]; dropping it
+/// schedules the transfer.
+pub trait StagedWrite {
+    fn bytes(&mut self) -> &mut [u8];
+}
+
+/// A host buffer stands in where the backend has no mapped staging path.
+impl StagedWrite for Vec<u8> {
+    fn bytes(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+/// An optional out-of-band executor (native CUDA) for hot ops on the same VRAM
+/// the backend owns, addressed by [`Backend::device_address`]. Purely an
+/// optimization: every method may decline (`Ok(false)`), and the caller then
+/// runs the backend's own op unchanged. Implementations run synchronously: the
+/// result is complete in VRAM when the call returns.
+pub trait Accelerator: Send + Sync {
+    /// Cheap host-side precheck for [`Self::sdpa_f16`], before the caller pays
+    /// to flush and drain the GPU. `uniform_len` distinguishes the plain `sdpa_sg`
+    /// uniform from the windowed one.
+    fn accepts_sdpa_f16(&self, uniform_len: u64) -> bool;
+
+    /// Fused f16 attention with exactly the `sdpa_sg` contract (BSHD f16 Q/K/V/
+    /// out, GQA, mask modes 0/1/2, f32 softmax; shapes read from the uniform).
+    /// Inputs must be complete in VRAM (the caller drained the GPU).
+    fn sdpa_f16(&self, a: &SdpaAddrs) -> Result<bool, String>;
+
+    /// Cheap host-side precheck for [`Self::gemm`] (before the flush + drain).
+    fn accepts_gemm(&self, desc: &crate::ops::GemmDesc, m: u32, n: u32) -> bool;
+
+    /// Dense 16-bit matmul with exactly the `desc` contract (see
+    /// [`crate::ops::GemmDesc`]); `k` is read from the dims uniform. Inputs
+    /// must be complete in VRAM (the caller drained the GPU).
+    fn gemm(&self, desc: &crate::ops::GemmDesc, a: &GemmAddrs) -> Result<bool, String>;
+
+    /// Cheap host-side precheck for [`Self::gemm_nvfp4`]; also sizes the
+    /// caller's scratch (`Some(bytes)` = accepted).
+    fn accepts_gemm_nvfp4(&self, _m: u32, _n: u32, _k: u32) -> Option<u64> {
+        None
+    }
+
+    /// W4A4 matmul against an NVFP4 composite weight (`crate::ops::nvfp4`):
+    /// bf16 A `[M,K]`, bf16 out `[M,N]`, activations quantized with the
+    /// composite's static input scale (the checkpoint's own numerics). Inputs
+    /// must be complete in VRAM (the caller drained the GPU).
+    fn gemm_nvfp4(&self, _a: &GemmNvfp4Addrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Cheap host-side precheck for [`Self::vsa`]; `Some(scratch bytes)` =
+    /// accepted.
+    fn accepts_vsa(&self, _s: &VsaShape) -> Option<u64> {
+        None
+    }
+
+    /// Tile-sparse attention with the gated compression branch (MiniMax-H3
+    /// VSA) over bf16 `[rows, H, D]` Q/K/V/gate/out; see [`VsaShape`]. Inputs
+    /// must be complete in VRAM (the caller drained the GPU).
+    fn vsa(&self, _s: &VsaShape, _a: &VsaAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Cheap host-side precheck for [`Self::tile_attention`].
+    fn accepts_tile_attention(&self, _head_dim: u32) -> bool {
+        false
+    }
+
+    /// Block-sparse attention over 64-row tiles with caller-built key-tile
+    /// lists (e.g. block-diagonal: batched attention within each item), bf16
+    /// `[rows, H, D]` q/k/v/out. Enqueued only, like [`Self::vsa`].
+    fn tile_attention(&self, _s: &TileAttnShape, _a: &TileAttnAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::elementwise`] is available at all (kernels compiled).
+    fn accepts_elementwise(&self) -> bool {
+        false
+    }
+
+    /// Enqueue one [`ElementwiseOp`]; complete after [`Self::sync`].
+    fn elementwise(&self, _op: &ElementwiseOp) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Wait for every op this accelerator has enqueued. [`Self::gemm_nvfp4`],
+    /// [`Self::vsa`] and [`Self::elementwise`] only ENQUEUE (in order, on one
+    /// stream); the caller syncs before anything else reads their outputs or
+    /// recycles their buffers.
+    fn sync(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TileAttnShape {
+    pub rows: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub n_tiles: u32,
+    pub scale: f32,
+}
+
+/// `geometry` as for [`VsaAddrs`]; `lists` = per (head, query tile) `n_tiles`
+/// u32 key-tile ids, then `heads * n_tiles` u32 counts.
+#[derive(Clone, Copy, Debug)]
+pub struct TileAttnAddrs {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub out: u64,
+    pub geometry: u64,
+    pub lists: u64,
+}
+
+/// Row segments for the per-segment ops in [`ElementwiseOp`]: rows
+/// `[end[i-1], end[i])` read the i-th `a` / `b` vectors.
+pub const MAX_SEGMENTS: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowSegments {
+    pub n: u32,
+    pub end: [u32; MAX_SEGMENTS],
+    pub a: [u64; MAX_SEGMENTS],
+    pub b: [u64; MAX_SEGMENTS],
+}
+
+/// The non-matmul ops of a MiniMax-H3 block, on bf16 activations (device
+/// addresses), each matching the wgpu op it replaces including its bf16
+/// rounding points.
+#[derive(Clone, Copy, Debug)]
+pub enum ElementwiseOp {
+    /// `out = bf16(bf16(rmsnorm(x) * w) * (1 + a[seg]) + b[seg])` over
+    /// `[rows, dim]`: RMSNorm then AdaLN modulation (`a` = scale, `b` = shift).
+    NormModulate {
+        x: u64,
+        w: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+        seg: RowSegments,
+    },
+    /// Fused `[rows, 3 * heads * head_dim]` qkv -> per-head RMSNorm of q and k
+    /// (gains `q_norm` / `k_norm`; address 0 = unaffine), partial half-rot
+    /// RoPE over the leading `2 * rot_pairs` channels (bf16 `(cos, sin)` pairs,
+    /// `rot_pairs` per row), and v copied out. Row layout `[q | k | v]` slabs,
+    /// or `headwise`: `[q_h | k_h | v_h]` per head.
+    QkNormRope {
+        headwise: bool,
+        qkv: u64,
+        q_norm: u64,
+        k_norm: u64,
+        freqs: u64,
+        q: u64,
+        k: u64,
+        v: u64,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+        rot_pairs: u32,
+        eps: f32,
+    },
+    /// `out = bf16(x + a[seg] * y)` over `[rows, dim]`.
+    GateAdd {
+        x: u64,
+        y: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        seg: RowSegments,
+    },
+    /// `out = bf16(x + bias[c])` over `[rows, dim]`. `out` may alias `x`.
+    AddBias {
+        x: u64,
+        bias: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `out[r, c] = silu(x[r, c]) * x[r, h + c]` for `x` `[rows, 2h]`.
+    SiluMulFused { x: u64, out: u64, rows: u32, h: u32 },
+}
+
+/// Shapes for [`Accelerator::vsa`]. Tiles are 64 rows: the first `n_prefix`
+/// are dense (their queries see every key), the rest are video tiles whose
+/// queries see every prefix tile plus their `topk` best video tiles.
+#[derive(Clone, Copy, Debug)]
+pub struct VsaShape {
+    pub rows: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub n_tiles: u32,
+    pub n_prefix: u32,
+    pub topk: u32,
+    pub scale: f32,
+}
+
+/// Device addresses for [`Accelerator::vsa`]. `gate == 0` = no compression
+/// branch. `geometry` = `n_tiles * 64` u32 row ids then `n_tiles` u32 sizes.
+#[derive(Clone, Copy, Debug)]
+pub struct VsaAddrs {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub gate: u64,
+    pub out: u64,
+    pub geometry: u64,
+    pub scratch: u64,
+}
+
+/// Device addresses + shape for [`Accelerator::gemm_nvfp4`].
+#[derive(Clone, Copy, Debug)]
+pub struct GemmNvfp4Addrs {
+    pub a: u64,
+    pub w: u64,
+    pub out: u64,
+    pub scratch: u64,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+}
+
+/// Device addresses + launch shape for [`Accelerator::gemm`] (same roles as
+/// `MatmulBufs`).
+#[derive(Clone, Copy, Debug)]
+pub struct GemmAddrs {
+    pub a: u64,
+    pub b: u64,
+    pub out: u64,
+    /// The `(m, n, k, _)` uniform, read for `k` when `k == 0`. A host `k`
+    /// avoids that device read, which would wait for every enqueued op.
+    pub dims: u64,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+}
+
+/// Device addresses for [`Accelerator::sdpa_f16`] (same roles as `SdpaBufs`).
+#[derive(Clone, Copy, Debug)]
+pub struct SdpaAddrs {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub mask: u64,
+    pub out: u64,
+    pub uniform: u64,
 }

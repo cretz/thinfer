@@ -40,6 +40,7 @@ pub mod matmul_i8;
 pub mod matmul_i8_bf16;
 pub mod memcat;
 pub mod mul;
+pub mod nvfp4;
 pub mod pixel_norm3d;
 pub mod qkv_split;
 pub mod rehyat;
@@ -90,7 +91,7 @@ pub(crate) use conv3d::dispatch_conv3d;
 pub use conv3d::{Conv3dBufs, Conv3dConfig, Conv3dF32, Conv3dOp};
 pub(crate) use depth_to_space3d::dispatch_depth_to_space3d;
 pub use depth_to_space3d::{DepthToSpace3dBufs, DepthToSpace3dF32, DepthToSpace3dOp};
-pub use dequant::{DequantBufs, dispatch_dequant};
+pub use dequant::{DequantBufs, DequantScheme, dispatch_dequant};
 pub(crate) use dupup3d::dispatch_dupup3d;
 pub use dupup3d::{DupUp3dBufs, DupUp3dF32, DupUp3dOp};
 pub use gated_head_mul::GatedHeadMulF32;
@@ -104,7 +105,9 @@ pub(crate) use layernorm::dispatch_layernorm;
 pub use layernorm::{LayerNormBufs, LayerNormF32, LayerNormOp};
 pub(crate) use leaky_relu::dispatch_leaky_relu;
 pub use leaky_relu::{LeakyReluBufs, LeakyReluF32, LeakyReluOp, leaky_relu_uniform_bytes};
-pub use matmul::{MatMulConfig, MatMulF32, MatmulBufs, MatmulOp, dispatch_matmul};
+pub use matmul::{
+    GemmDesc, GemmType, MatMulConfig, MatMulF32, MatmulBufs, MatmulOp, dispatch_matmul,
+};
 pub(crate) use memcat::dispatch_memcat;
 pub use memcat::{MemCatBufs, MemCatF32, MemCatOp};
 pub use mul::MulF32;
