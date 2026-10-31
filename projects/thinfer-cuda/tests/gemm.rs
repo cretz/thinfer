@@ -148,6 +148,10 @@ fn run(ctx: &Arc<CudaContext>, kernels: &GemmKernels, c: &Case, rng: &mut Rng) -
 
 #[test]
 fn cuda_gemm_matches_reference() {
+    if !thinfer_cuda::driver_present() {
+        eprintln!("skipped[cuda gemm]: no CUDA driver");
+        return;
+    }
     let ctx = match CudaContext::new(0) {
         Ok(c) => c,
         Err(e) => {
@@ -223,6 +227,10 @@ fn cuda_gemm_matches_reference() {
 /// declines it.
 #[test]
 fn cuda_gemm_fused_epilogue() {
+    if !thinfer_cuda::driver_present() {
+        eprintln!("skipped[cuda gemm epilogue]: no CUDA driver");
+        return;
+    }
     let Ok(ctx) = CudaContext::new(0) else {
         eprintln!("skipped[cuda gemm epilogue]: no device");
         return;

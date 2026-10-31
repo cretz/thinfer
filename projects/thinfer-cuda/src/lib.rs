@@ -30,7 +30,7 @@ pub mod vsa;
 #[cfg(not(target_os = "macos"))]
 pub use accel::CudaAccel;
 #[cfg(not(target_os = "macos"))]
-pub use device::{CudaDevice, probe};
+pub use device::{CudaDevice, driver_present, probe};
 #[cfg(not(target_os = "macos"))]
 pub use interop::{CudaAllocator, CudaMapping, SharedBuffer, alloc_shared};
 

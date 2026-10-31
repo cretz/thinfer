@@ -18,6 +18,13 @@ pub struct CudaDevice {
     pub sm: (i32, i32),
 }
 
+/// Whether the CUDA driver library loads. cudarc PANICS on the first driver
+/// call without it, so check this before any `CudaContext` or `result` call.
+pub fn driver_present() -> bool {
+    // SAFETY: only probes whether the shared library can be loaded.
+    unsafe { sys::is_culib_present() }
+}
+
 fn driver_err(e: result::DriverError) -> Unavailable {
     Unavailable::Driver(format!("{e:?}"))
 }
@@ -45,8 +52,7 @@ pub fn probe(device: &wgpu::Device) -> Result<CudaDevice, Unavailable> {
     if !crate::interop::export_supported(device) {
         return Err(Unavailable::NoExternalMemory);
     }
-    // SAFETY: only probes whether the shared library can be loaded.
-    if !unsafe { sys::is_culib_present() } {
+    if !driver_present() {
         return Err(Unavailable::NoDriver);
     }
     result::init().map_err(driver_err)?;

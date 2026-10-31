@@ -34,6 +34,9 @@ jobs:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      # fdk-aac needs C++23 `#warning` support under MSVC ARM64; see ci.yml.
+      CL: ${{ matrix.target == 'aarch64-pc-windows-msvc' && '/std:c++latest' || '' }}
     strategy:
       fail-fast: false
       matrix:

@@ -30,6 +30,12 @@ jobs:
   check:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      # fdk-aac (thinfer-app's AAC encoder) has no arch defines for MSVC ARM64 and
+      # falls through to a `#warning`, which cl rejects below C++23. `CL` reaches
+      # cl.exe alone: ring builds with clang on that target, and `CFLAGS` would
+      # hand clang a flag it reads as a file. Same in release.yml.
+      CL: ${{ matrix.os == 'windows-11-arm' && '/std:c++latest' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -134,10 +140,12 @@ jobs:
   # The op registry against the PyTorch reference (`--features conformance`): regenerate
   # the fixtures with the bundled pyref (`uv run`), run every op on wgpu, diff. The runner
   # has no GPU, so wgpu runs on Mesa's software Vulkan (lavapipe); these are small-shape
-  # accuracy checks, not perf. Then the regenerated fixtures must match the committed ones
-  # byte for byte: the web suite consumes the committed copies, and a stale fixture keeps
-  # passing while describing code that no longer exists. One Linux leg is enough to prove
-  # the fixtures current.
+  # accuracy checks, not perf. Then the regenerated fixtures must match the committed ones:
+  # the web suite consumes the committed copies, and a stale fixture keeps passing while
+  # describing code that no longer exists. Not byte for byte (torch's CPU kernels differ in
+  # the last ulps across machines) but every tensor present, same shape and dtype, values
+  # within a few ulps (`diff_fixtures.py`). The spec is Rust-written, so it IS byte-exact.
+  # One Linux leg is enough to prove the fixtures current.
   conformance:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -158,6 +166,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
 
+      # The test run regenerates the fixtures in place; keep the committed copies.
+      - name: snapshot committed fixtures
+        run: cp -r projects/thinfer-conformance/fixtures "$RUNNER_TEMP/committed-fixtures"
+
       - name: cargo test (conformance)
         working-directory: projects
         env:
@@ -169,4 +181,7 @@ jobs:
         run: cargo test -p thinfer-conformance --features conformance --locked --release --no-fail-fast
 
       - name: verify committed fixtures are up to date
-        run: git diff --exit-code projects/thinfer-conformance/fixtures/
+        run: |
+          git diff --exit-code projects/thinfer-conformance/fixtures/spec.json
+          uv run --directory projects/thinfer-conformance/python python -m thinfer_pytorch_ref.diff_fixtures \
+            "$RUNNER_TEMP/committed-fixtures" "$GITHUB_WORKSPACE/projects/thinfer-conformance/fixtures"

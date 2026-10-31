@@ -91,6 +91,10 @@ fn bytes<T>(v: &[T]) -> &[u8] {
 
 #[test]
 fn cuda_sdpa_matches_reference() {
+    if !thinfer_cuda::driver_present() {
+        eprintln!("skipped[cuda sdpa]: no CUDA driver");
+        return;
+    }
     let ctx = match CudaContext::new(0) {
         Ok(c) => c,
         Err(e) => {
