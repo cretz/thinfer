@@ -461,10 +461,18 @@ mod tests {
     // thinfer bug: naga emits valid MSL for this shader at every lang version
     // (1.2 through 3.1), and `dot4I8Packed` itself compiles and runs on that
     // Metal. The runner's paravirtual GPU chokes on the larger shader; real
-    // Apple Silicon does not. Runs normally on every other backend.
+    // Apple Silicon does not.
+    // Skipped on Windows ARM64: on the GitHub windows-11-arm runner (no GPU, so
+    // the WARP software adapter) the test process dies in this test with
+    // 0xc0000409, a native fastfail rather than a Rust panic; the same test
+    // passes on x64 WARP. Runs normally on every other backend.
     #[cfg_attr(
         target_os = "macos",
         ignore = "GH macOS runner's virtualized Metal rejects conv_i8 (CI-runner limitation, not real Apple Silicon)"
+    )]
+    #[cfg_attr(
+        all(windows, target_arch = "aarch64"),
+        ignore = "GH windows-11-arm runner's WARP adapter aborts the process in conv_i8 (CI-runner limitation)"
     )]
     #[test]
     fn conv_i8_matches_host_quant() {

@@ -2,7 +2,7 @@
 //! distill). Bundled into one test binary (cargo auto-discovers
 //! `tests/<dir>/main.rs`); submodules are the individual parity tests. Gated on
 //! the `hunyuan-e2e` feature (needs the Comfy-Org VAE + lightx2v DiT in the HF
-//! cache + `uv`). See `projects/thinfer-working-area/hunyuan-plan.md`.
+//! cache + `uv`).
 
 mod dit_parity;
 mod e2e;

@@ -12,7 +12,11 @@ pub mod config;
 pub mod download;
 pub mod executor;
 pub mod hunyuan;
+#[cfg(any(feature = "vault", feature = "remote"))]
+pub mod jobkey;
 pub mod ltx;
+pub mod minimax;
+mod minimax_ref;
 pub mod model;
 pub mod preprocess;
 pub mod progress;

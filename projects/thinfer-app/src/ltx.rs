@@ -45,6 +45,7 @@ use thinfer_models::ltx::pipeline::I2vCond;
 use thinfer_models::ltx::pipeline::{
     build_dit_freqs, denoise_loop, normalize_cthw, streams_for, un_normalize_cthw,
 };
+use thinfer_models::ltx::rapid_vocoder::{self, RapidVocoder, RapidVocoderPipelines};
 use thinfer_models::ltx::sampler::{
     self, AudioLatentDims, STAGE1_SIGMAS, STAGE2_SIGMAS, VideoLatentDims,
 };
@@ -69,15 +70,66 @@ use crate::request::{JobSummary, VideoFormat, VideoRequest};
 /// Audio sample rate the vocoder emits (48kHz stereo).
 const AUDIO_SR: u32 = 48_000;
 
-/// VRAM weight-residency cap for LTX on thin (8GB) hardware. The DiT is 22.8GB
-/// and always streams per-block regardless of budget, so a high budget does not
-/// reduce streaming -- it just pins more resident weight, stealing the device
-/// slack the stage-2 full-res denoise needs for its activation peak. At the
-/// in-distribution default (1280x704 two-stage), a 5G budget (serve's default)
-/// OOMs stage 2; ~2G leaves enough slack to fit while the per-step time is
-/// unchanged (streaming dominates either way). Callers requesting LESS keep it;
-/// the cap only lowers an over-large budget. Revisit for >8GB cards.
+/// VRAM weight-residency cap for the 22B TWO-STAGE LTX path on thin (8GB)
+/// hardware. That DiT is 22.8GB and the stage-2 full-res denoise has a large
+/// activation peak, so the cap leaves device slack: at the 1280x704 default a 5G
+/// budget OOMs stage 2; ~2G fits.
+///
+/// MEASURED 2026-09-05: raising this to 6G (matching rapid) buys NOTHING. A
+/// controlled interleaved A/B (2G, 6G, 2G at 256x256/9f, back to back on a
+/// heat-soaked card) ran 163.4s / 164.1s / 164.2s -- one run of spread, no signal.
+/// Sequential non-interleaved runs on this box swing 10%+ on page-cache state
+/// alone, so any residency-cap result from unpaired runs is noise; pair them.
+///
+/// It also cannot help much by construction: each `WeightResidency` builds its OWN
+/// `MemArbiter` over the full `vram_bytes`, so this is a PER-RESIDENCY ceiling,
+/// not a global one, and raising it just over-promises the device whenever two
+/// residencies overlap. 2G keeps the concurrent sum inside the card and keeps the
+/// eviction order (hence the GPU accumulation order, hence the exact output bits)
+/// stable. Real streaming wins need a resizable/global arbiter, not a bigger
+/// constant. `THINFER_LTX_VRAM_CAP` overrides it for re-measurement.
 const LTX_VRAM_BUDGET_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+/// VRAM residency cap for ltx2-rapid. Rapid is SINGLE-STAGE at low res (2560
+/// tokens): tiny activation footprint, no stage-2 peak. Its 14GB DiT is
+/// re-streamed per block EVERY one of the 8 steps (the dominant wall-cost:
+/// ~14GB*8 disk reads). A large residency budget lets the block LRU keep a big
+/// fraction of the DiT resident ACROSS steps, so later steps hit cache instead
+/// of re-reading disk. The arbiter reclaims cached blocks under activation
+/// pressure, so a high cache budget cannot OOM the forward -- it only lowers
+/// streaming. 6G leaves ~2G on the 8GB card for the (small) rapid activations.
+const RAPID_VRAM_BUDGET_CAP: u64 = 6 * 1024 * 1024 * 1024;
+
+/// The weight-residency cap for this LTX line. `THINFER_LTX_VRAM_CAP` (a size
+/// string, e.g. `4G`) overrides it: the right value is hardware- and
+/// resolution-dependent, and it is only settleable by measuring an A/B on the
+/// actual card, so the knob exists to make that measurement cheap.
+fn ltx_vram_cap(rapid: bool) -> u64 {
+    let default = if rapid {
+        RAPID_VRAM_BUDGET_CAP
+    } else {
+        LTX_VRAM_BUDGET_CAP
+    };
+    let Ok(raw) = std::env::var("THINFER_LTX_VRAM_CAP") else {
+        return default;
+    };
+    match crate::config::parse_budget("THINFER_LTX_VRAM_CAP", Some(&raw)) {
+        Ok(bytes) => {
+            tracing::info!(
+                target: thinfer_core::trace::DIAG,
+                cap_bytes = bytes, "ltx vram cap overridden",
+            );
+            bytes
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: thinfer_core::trace::DIAG,
+                "THINFER_LTX_VRAM_CAP={raw} is not a size ({e}); using the default",
+            );
+            default
+        }
+    }
+}
 
 /// Run an LTX-2.3 joint audio-video generate to completion. `req.model` must be
 /// the LTX id (the caller dispatches on [`crate::model::VideoModelId::is_ltx`]).
@@ -93,17 +145,20 @@ pub async fn run(
     }
     let manifest = req.model.manifest();
     // ltx2-rapid (LTX-2 19B merge): 19B conditioning tail + LTX-2 VAEs, single-stage
-    // only (no spatial upscaler ships), video-only for now (its audio VAE is
-    // comfy-prefixed -- a separate follow-up).
+    // only (no spatial upscaler ships). Joint AV: the 19B DiT denoises the audio
+    // stream too, decoded by the shared audio VAE + a plain-HiFiGAN vocoder (16kHz).
     let rapid = req.model.is_ltx_rapid();
     let frames = plan.frames as usize;
     let height = req.height as usize;
     let width = req.width as usize;
     let fps = plan.fps as f64;
-    // Cap the weight-residency budget so the stage-2 full-res denoise keeps the
-    // device slack it needs at the widescreen default (see LTX_VRAM_BUDGET_CAP).
+    // Cap the weight-residency budget. The 22B two-stage path keeps the low cap
+    // for stage-2 device slack; rapid (single-stage, low res) gets a much larger
+    // cap so its 14GB DiT LRU-caches across steps instead of re-streaming every
+    // step (see the two cap consts).
+    let vram_cap = ltx_vram_cap(rapid);
     let budget = ResidencyBudget {
-        vram_bytes: req.budget.vram_bytes.min(LTX_VRAM_BUDGET_CAP),
+        vram_bytes: req.budget.vram_bytes.min(vram_cap),
         ..req.budget
     };
 
@@ -121,7 +176,7 @@ pub async fn run(
     //     raw prompt is out-of-distribution and collapses to the model's portrait
     //     prior. Expand it via the on-device Qwen3-VL rewriter (phase-scoped,
     //     evicted before the encoder); fall back to the original on any failure.
-    //     The 22B distilled/Sulphur path is unchanged. Prompt text is never logged.
+    //     The 22B distilled/dev path is unchanged. Prompt text is never logged.
     let raw_prompt = req.prompts[0].trim();
     if raw_prompt.is_empty() {
         return Err("empty prompt produced no tokens".into());
@@ -182,6 +237,14 @@ pub async fn run(
 
     sink.stage(Stage::TextEncode);
 
+    // === DiT weight source, built FIRST so the dev distill fold runs in background ===
+    // Opening the GGUF and building the fold allocates no VRAM (the residency is
+    // created later, at phase C), so this can sit ahead of the encoder. On dev
+    // that matters: the fold is ~46s of CPU over 676 sites, and folding lazily on
+    // the streaming path put every second of it on the critical path. Prefolding
+    // from here hides it behind the latent stats, the encoder, and the connector.
+    let dit_src = build_dit_source(req, manifest, &dit_path).await?;
+
     // === Phase: video VAE per-channel latent stats (scoped; reopened to decode) ===
     let (mean, std) = {
         let src = open_st(&vae_path).await?;
@@ -195,6 +258,7 @@ pub async fn run(
 
     // === Phase A: Gemma-3 text encoder -> 49 hidden states (host) ===
     let states = {
+        let _g = thinfer_core::trace::scope!("ltx.setup.text_encoder").entered();
         let opener = open_mmap(&gemma_path).await?;
         let gguf = GgufSource::open(opener)
             .await
@@ -225,7 +289,7 @@ pub async fn run(
         out.states
     };
 
-    // Which LTX-2 line: 22B (LTX-2.3 / Sulphur) or the 19B (ltx2-rapid) merge.
+    // Which LTX-2 line: 22B (LTX-2.3) or the 19B (ltx2-rapid) merge.
     let variant = if rapid {
         LtxVariant::ltx2_rapid_19b()
     } else {
@@ -242,12 +306,15 @@ pub async fn run(
 
     // Connector pipelines: bf16 block matmuls (19B, from safetensors) vs Q8_0 (22B,
     // from the DiT GGUF).
-    let conn_pipes = if rapid {
-        ConnectorPipelines::compile_rapid(backend).await
-    } else {
-        ConnectorPipelines::compile(backend).await
-    }
-    .map_err(|e| format!("compile connector pipelines: {e:?}"))?;
+    let conn_pipes = {
+        let _g = thinfer_core::trace::scope!("ltx.setup.connector_pipelines").entered();
+        if rapid {
+            ConnectorPipelines::compile_rapid(backend).await
+        } else {
+            ConnectorPipelines::compile(backend).await
+        }
+        .map_err(|e| format!("compile connector pipelines: {e:?}"))?
+    };
 
     // Conditioning tail -> cross-attn caption KV (`vtext`/`atext`) + the resident
     // DiT (`dit_res`/`dit_model`/`dit_pipes`/`dit_ws`). The 19B and 22B lines differ
@@ -306,12 +373,8 @@ pub async fn run(
             (v, a)
         };
         // === Phase C (19B): DiT GGUF resident: caption projection (3840 -> 4096/
-        // 2048) + register the 19B variant. No Sulphur fold (rapid is pre-distilled). ===
-        let opener = open_mmap(&dit_path).await?;
-        let gguf = GgufSource::open(opener)
-            .await
-            .map_err(|e| format!("parse dit gguf: {e:?}"))?;
-        let dit_res = WeightResidency::new(DitSource::Plain(gguf), budget);
+        // 2048) + register the 19B variant. No distill fold (rapid is pre-distilled). ===
+        let dit_res = WeightResidency::new(dit_src, budget);
         let dit_pipes = DitPipelines::compile(backend)
             .await
             .map_err(|e| format!("compile dit: {e:?}"))?;
@@ -372,52 +435,27 @@ pub async fn run(
         };
 
         // === Phases C-F: DiT GGUF resident for connector blocks + denoise ===
-        let opener = open_mmap(&dit_path).await?;
-        let gguf = GgufSource::open(opener)
-            .await
-            .map_err(|e| format!("parse dit gguf: {e:?}"))?;
-        // Sulphur ships the BASE (`dev`) DiT; fold the distill LoRA in so the 8-step
-        // CFG-free distilled sampler converges (see `ltx::lora`). LTX distilled DiTs
-        // are already distilled -> plain passthrough.
-        let dit_src = if req.model.is_sulphur() {
-            let mut stack = Vec::new();
-            for (role_name, strength) in req.model.sulphur_distill_stack() {
-                let lora_path = resolve_role(manifest, role_name)?;
-                let lora = open_st(&lora_path).await?;
-                let specs = lora::discover_specs(&gguf, &lora)
-                    .await
-                    .map_err(|e| format!("discover distill lora {role_name} specs: {e:?}"))?;
-                tracing::info!(
-                    target: thinfer_core::trace::DIAG,
-                    lora = role_name, strength, sites = specs.len(),
-                    "sulphur distill lora in stack",
-                );
-                stack.push((lora, strength, specs));
-            }
-            let folded = lora::LoraFoldSource::new(gguf, stack)
-                .map_err(|e| format!("build distill lora fold: {e}"))?;
-            tracing::info!(
-                target: thinfer_core::trace::DIAG,
-                sites = folded.fold_count(), "sulphur distill lora folded",
-            );
-            DitSource::Folded(Box::new(folded))
-        } else {
-            DitSource::Plain(gguf)
-        };
         let dit_res = WeightResidency::new(dit_src, budget);
         let video_h = register_connector(&dit_res, VIDEO)
             .map_err(|e| format!("register video conn: {e:?}"))?;
         let audio_h = register_connector(&dit_res, AUDIO)
             .map_err(|e| format!("register audio conn: {e:?}"))?;
-        let dit_pipes = DitPipelines::compile(backend)
-            .await
-            .map_err(|e| format!("compile dit: {e:?}"))?;
-        let dit_model = DitModel::register(backend, &dit_res, config::NUM_LAYERS)
-            .await
-            .map_err(|e| format!("register dit model: {e:?}"))?;
+        let dit_pipes = {
+            let _g = thinfer_core::trace::scope!("ltx.setup.dit_pipelines").entered();
+            DitPipelines::compile(backend)
+                .await
+                .map_err(|e| format!("compile dit: {e:?}"))?
+        };
+        let dit_model = {
+            let _g = thinfer_core::trace::scope!("ltx.setup.dit_register").entered();
+            DitModel::register(backend, &dit_res, config::NUM_LAYERS)
+                .await
+                .map_err(|e| format!("register dit model: {e:?}"))?
+        };
         let dit_ws = Workspace::new(Arc::clone(backend), Arc::clone(dit_res.arbiter()));
 
         // Connector cross-attn KV (all 1024 positions valid; registers fill pads).
+        let _g = thinfer_core::trace::scope!("ltx.setup.connector_forward").entered();
         let vtext = connector_forward(
             backend,
             &conn_pipes,
@@ -442,6 +480,7 @@ pub async fn run(
         )
         .await
         .map_err(|e| format!("audio connector: {e:?}"))?;
+        drop(_g);
         (vtext, atext, dit_res, dit_pipes, dit_model, dit_ws)
     };
 
@@ -529,9 +568,36 @@ pub async fn run(
     let (lat_v_final, lat_a_final) = if req.upscale && !rapid {
         let upscaler_path = resolve_role(manifest, role::UPSCALER)?;
         let vd_s1 = VideoLatentDims::from_pixels(frames, height / 2, width / 2);
-        let s1_steps = STAGE1_SIGMAS.len() - 1;
-        let s2_steps = STAGE2_SIGMAS.len() - 1;
+        // Opt-in HQ audio, same lever as the single-stage branch: subdivide the
+        // coarse distilled sigma jumps into finer Euler substeps (the distilled
+        // anchors are preserved) so the delicate joint audio residual stops
+        // under-resolving into gibberish.
+        //
+        // This used to be single-stage ONLY, which meant it never ran for the 22B
+        // line at all -- `two_stage_default()` forces `upscale` on there, so the
+        // flag was silently dead for exactly the models whose speech drifts. BOTH
+        // schedules are refined: stage 2 matters most (it renoises the audio back
+        // to ~0.91 and had only 3 steps to resolve it), but stage 1 sets what
+        // stage 2 refines.
+        let s1_sigmas: Vec<f32> = if req.audio_hq {
+            sampler::refine_sigmas(&STAGE1_SIGMAS, sampler::AUDIO_HQ_MAX_DSIGMA)
+        } else {
+            STAGE1_SIGMAS.to_vec()
+        };
+        let s2_sigmas: Vec<f32> = if req.audio_hq {
+            sampler::refine_sigmas(&STAGE2_SIGMAS, sampler::AUDIO_HQ_MAX_DSIGMA)
+        } else {
+            STAGE2_SIGMAS.to_vec()
+        };
+        let s1_steps = s1_sigmas.len() - 1;
+        let s2_steps = s2_sigmas.len() - 1;
         let total_steps = (s1_steps + s2_steps) as u32;
+        if req.audio_hq {
+            sink.note(&format!(
+                "HQ audio: refined two-stage schedule to {s1_steps}+{s2_steps} \
+                 = {total_steps} steps (slower)"
+            ));
+        }
 
         // --- Stage 1: pure-noise init, denoise at half res ---
         let s1 = streams_for(vd_s1, ad);
@@ -551,7 +617,7 @@ pub async fn run(
             &dit_ws,
             &dit_model,
             s1,
-            &STAGE1_SIGMAS,
+            &s1_sigmas,
             lat_v,
             lat_a,
             &vtext,
@@ -606,7 +672,7 @@ pub async fn run(
         let lat_v_full = sampler::video_cthw_to_tokens(&upscaled, vd_full);
 
         // --- Stage 2: renoise to STAGE2_SIGMAS[0], refine at full res ---
-        let renoise = STAGE2_SIGMAS[0];
+        let renoise = s2_sigmas[0];
         let noise_v = sampler::gaussian_noise(lat_v_full.len(), sampler::substream_seed(seed, 2));
         let lat_v2 = sampler::renoise(&lat_v_full, &noise_v, renoise);
         let noise_a = sampler::gaussian_noise(lat_a.len(), sampler::substream_seed(seed, 3));
@@ -626,7 +692,7 @@ pub async fn run(
             &dit_ws,
             &dit_model,
             s2,
-            &STAGE2_SIGMAS,
+            &s2_sigmas,
             lat_v2,
             lat_a2,
             &vtext,
@@ -639,7 +705,21 @@ pub async fn run(
         .map_err(|e| format!("stage2 denoise: {e:?}"))?
     } else {
         // --- Single-stage distilled: 8-step denoise directly at the target res ---
-        let total_steps = (STAGE1_SIGMAS.len() - 1) as u32;
+        // Opt-in HQ audio: subdivide the coarse distilled sigma jumps into finer
+        // Euler substeps (distilled anchors preserved) so the delicate joint audio
+        // residual stops under-resolving into gibberish. ~2x the denoise cost, so
+        // it stays opt-in and the step-count bump is surfaced to the user.
+        let schedule: Vec<f32> = if req.audio_hq {
+            sampler::refine_sigmas(&STAGE1_SIGMAS, sampler::AUDIO_HQ_MAX_DSIGMA)
+        } else {
+            STAGE1_SIGMAS.to_vec()
+        };
+        let total_steps = (schedule.len() - 1) as u32;
+        if req.audio_hq {
+            sink.note(&format!(
+                "HQ audio: refined denoise schedule to {total_steps} steps (slower)"
+            ));
+        }
         let s = streams_for(vd_full, ad);
         let freqs = build_dit_freqs(vd_full, ad, fps);
         let mut lat_v = sampler::gaussian_noise(vd_full.elems(), sampler::substream_seed(seed, 0));
@@ -666,7 +746,7 @@ pub async fn run(
             &dit_ws,
             &dit_model,
             s,
-            &STAGE1_SIGMAS,
+            &schedule,
             lat_v,
             lat_a,
             &vtext,
@@ -693,11 +773,43 @@ pub async fn run(
     // OOMed down to 2 latent cells -> hundreds of overlapping tiles, ~320s at
     // 768x512x49). The cap exists only to leave device slack while the 22.8G DiT
     // streams per-block; it has no reason to throttle the standalone VAE phase.
+    //
+    // ...but the REQUEST budget is itself small by default (`DEFAULT_BUDGET_BYTES`
+    // is 2 GiB, laptop-safe), so escaping the cap alone still left the decode
+    // tiling against 2 GiB on an idle 8 GiB card. That is expensive: the tile plan
+    // drives overlap RECOMPUTE, and `ltx_vae_conv3d` is the largest single GPU
+    // consumer of a render. Measured 768x512 / 49f, same seed:
+    //
+    //   4 GiB -> tf=2 tile=8, conv3d 57.9s, wall 231s
+    //   6 GiB -> tf=4 tile=6, conv3d 29.3s, wall 198s   (-49% conv3d, -14% wall)
+    //
+    // (The earlier "tile budget is a DEAD END" note A/B'd 6G vs 7G -- the
+    // saturated end of the curve, where the integer tile no longer moves. The
+    // default end is where the win is.)
+    //
+    // Rather than guess a constant that would over-promise a 4 GiB card, floor the
+    // decode at the peak THIS DEVICE has already sustained during the denoise. The
+    // DiT phase just allocated that much and survived, so it is measured evidence
+    // from the actual hardware, not an assumption -- on a thin card the observed
+    // peak is correspondingly small and the floor stays low. The tiler still
+    // treats it as a strict ceiling and shrinks the plan if the estimate is rich,
+    // so a high floor cannot device-OOM the decode.
+    let observed_peak = thinfer_core::backend::Backend::mem_account(&**backend)
+        .snapshot()
+        .vram_total_peak;
     let vae_budget = ResidencyBudget {
-        vram_bytes: req.budget.vram_bytes,
+        vram_bytes: req.budget.vram_bytes.max(observed_peak),
         ..budget
     };
+    tracing::info!(
+        target: thinfer_core::trace::DIAG,
+        requested = req.budget.vram_bytes, observed_peak,
+        chosen = vae_budget.vram_bytes, "ltx vae decode budget",
+    );
     let cthw_final = sampler::video_tokens_to_cthw(&lat_v_final, vd_full);
+    // The decoders run no accelerator op, and each VAE tile reallocates its
+    // workspace: keep those buffers plain.
+    let _plain = backend.plain_allocations();
     let mut video = {
         let src = open_st(&vae_path).await?;
         let residency = WeightResidency::new(src, vae_budget);
@@ -754,12 +866,14 @@ pub async fn run(
 
     // === Phase H: audio decode tail (audio VAE -> vocoder) ===
     // Skipped entirely when audio is off (req.audio=false) -- the audio VAE +
-    // ~108-conv vocoder is a sizable chunk of the run, so a video-only request
-    // saves it. The DiT audio latent is token-major [Ta, IN_CHANNELS]; the 128
-    // features are (channel, mel) = c*16 + m. Reshape to the audio VAE's
-    // [8, Ta, 16] CTF layout. Audio VAE + vocoder share one residency.
-    // rapid: video-only (its audio VAE is comfy-prefixed; a follow-up).
-    let wav = if req.audio && !rapid {
+    // vocoder is a sizable chunk of the run, so a video-only request saves it. The
+    // DiT audio latent is token-major [Ta, IN_CHANNELS]; the 128 features are
+    // (channel, mel) = c*16 + m. Reshape to the audio VAE's [8, Ta, 16] CTF layout.
+    // Audio VAE + vocoder share one residency. The audio VAE decoder is IDENTICAL
+    // for both lines (`audio_vae.decoder.*` keys/shapes match byte-for-byte); only
+    // the vocoder tail differs: the 22B `VocoderWithBWE` (BigVGAN + BWE, 48kHz) vs
+    // the 19B `ltx2-rapid` plain HiFiGAN generator (16kHz, no BWE/resample).
+    let (wav, audio_sr) = if req.audio {
         let ta = ad.frames;
         const AC: usize = 8;
         const AM: usize = 16;
@@ -787,23 +901,37 @@ pub async fn run(
             .await
             .map_err(|e| format!("audio vae decode: {e:?}"))?;
         let mel_frames = 4 * ta - 3;
-        let voc_pipes = VocoderPipelines::compile(backend)
-            .await
-            .map_err(|e| format!("compile vocoder: {e:?}"))?;
-        let vocoder = Vocoder::new(voc_pipes, &residency, backend)
-            .await
-            .map_err(|e| format!("build vocoder: {e:?}"))?;
-        let wav = vocoder
-            .decode(backend, &residency, &ws, &mel, mel_frames)
-            .await
-            .map_err(|e| format!("vocoder decode: {e:?}"))?;
+        let (wav, sr) = if rapid {
+            let voc_pipes = RapidVocoderPipelines::compile(backend)
+                .await
+                .map_err(|e| format!("compile rapid vocoder: {e:?}"))?;
+            let vocoder = RapidVocoder::new(voc_pipes, &residency)
+                .map_err(|e| format!("build rapid vocoder: {e:?}"))?;
+            let wav = vocoder
+                .decode(backend, &residency, &ws, &mel, mel_frames)
+                .await
+                .map_err(|e| format!("rapid vocoder decode: {e:?}"))?;
+            (wav, rapid_vocoder::OUTPUT_SR)
+        } else {
+            let voc_pipes = VocoderPipelines::compile(backend, "ltx_vocoder")
+                .await
+                .map_err(|e| format!("compile vocoder: {e:?}"))?;
+            let vocoder = Vocoder::new(voc_pipes, &residency, backend)
+                .await
+                .map_err(|e| format!("build vocoder: {e:?}"))?;
+            let wav = vocoder
+                .decode(backend, &residency, &ws, &mel, mel_frames)
+                .await
+                .map_err(|e| format!("vocoder decode: {e:?}"))?;
+            (wav, AUDIO_SR)
+        };
         residency.evict_all_and_free(&**backend);
         if !wav.iter().all(|v| v.is_finite()) {
             return Err("audio decode produced non-finite output".into());
         }
-        Some(wav)
+        (Some(wav), sr)
     } else {
-        None
+        (None, AUDIO_SR)
     };
 
     // --- Encode: H.264 video (+ optional AAC audio) -> MP4 (or silent PNG frames) ---
@@ -812,14 +940,18 @@ pub async fn run(
             let audio = match &wav {
                 Some(wav) => {
                     sink.note("Encoding MP4 (H.264 + AAC)");
-                    Some(crate::codec::encode_aac_stereo(wav, AUDIO_SR)?)
+                    Some(crate::codec::encode_aac_stereo(wav, audio_sr)?)
                 }
                 None => {
                     sink.note("Encoding MP4 (H.264, no audio)");
                     None
                 }
             };
-            crate::codec::encode_mp4_with_audio(&wan_video, plan.fps, audio, &req.output)?;
+            crate::progress::write_artifact(
+                sink,
+                &req.output,
+                &crate::codec::encode_mp4_with_audio(&wan_video, plan.fps, audio)?,
+            )?;
         }
         VideoFormat::PngFrames => {
             // Codec-free debug view: silent frames; the audio is dropped.
@@ -853,10 +985,58 @@ async fn open_st(path: &std::path::Path) -> Result<SafetensorsSource<MmapFileOpe
 }
 
 /// The DiT weight source: the plain GGUF (LTX distilled) or the GGUF with the
-/// Sulphur distill LoRA folded in. One concrete type so the DiT-resident phase
+/// dev distill LoRA folded in. One concrete type so the DiT-resident phase
 /// (connector + denoise) stays monomorphic over `WeightResidency<DitSource>`.
 type Gguf = GgufSource<MmapFileOpener>;
 type LoraFold = lora::LoraFoldSource<Gguf, SafetensorsSource<MmapFileOpener>>;
+
+/// Open the DiT GGUF and, on dev, fold the distill LoRA over it. Dev
+/// ships the BASE (`dev`) checkpoint; the 8-step CFG-free distilled sampler only
+/// converges with the distill LoRA folded on top (ComfyUI `t2v distilled` loads
+/// dev + the LoRA at strength 1.0). LTX distilled DiTs are already distilled, so
+/// they pass straight through.
+///
+/// The fold is ~46s of CPU across 676 sites. Folding it lazily on the streaming
+/// path charged every second of that to the critical path, so the fold is kicked
+/// onto a background worker here and the caller builds this source BEFORE the
+/// encoder: the prefold then overlaps the latent stats, the text encoder, the
+/// pipeline compiles, and the connector forward. The lazy path stays correct --
+/// a site the worker has not reached yet is folded on demand, byte-identically.
+async fn build_dit_source(
+    req: &VideoRequest,
+    manifest: &thinfer_core::manifest::ModelManifest,
+    dit_path: &std::path::Path,
+) -> Result<DitSource, String> {
+    let opener = open_mmap(dit_path).await?;
+    let gguf = GgufSource::open(opener)
+        .await
+        .map_err(|e| format!("parse dit gguf: {e:?}"))?;
+    if !req.model.folds_distill_lora() {
+        return Ok(DitSource::Plain(gguf));
+    }
+    let mut stack = Vec::new();
+    for (role_name, strength) in req.model.distill_stack() {
+        let lora_path = resolve_role(manifest, role_name)?;
+        let lora = open_st(&lora_path).await?;
+        let specs = lora::discover_specs(&gguf, &lora)
+            .await
+            .map_err(|e| format!("discover distill lora {role_name} specs: {e:?}"))?;
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            lora = role_name, strength, sites = specs.len(),
+            "distill lora in stack",
+        );
+        stack.push((lora, strength, specs));
+    }
+    let folded = lora::LoraFoldSource::new(gguf, stack)
+        .map_err(|e| format!("build distill lora fold: {e}"))?;
+    folded.spawn_prefold();
+    tracing::info!(
+        target: thinfer_core::trace::DIAG,
+        sites = folded.fold_count(), "distill lora prefold started",
+    );
+    Ok(DitSource::Folded(Box::new(folded)))
+}
 
 enum DitSource {
     Plain(Gguf),

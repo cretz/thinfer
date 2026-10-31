@@ -180,7 +180,7 @@ impl Variant {
         // Safetensors values are the historical caps that established
         // bf16-clean parity (iGPU ~600, discrete ~4600). GGUF starts
         // generous and tightens after a first run lands real numbers -
-        // see `[Tighten e2e parity tol]` in the worklog backlog. The DiT
+        // a tighter e2e parity tol is a known follow-up. The DiT
         // stages (step.prev_sample, pre_vae) are expected to absorb
         // most of Q8_0's per-matmul quant error; budget is sized for
         // "broken-vs-noisy", not "tight":
@@ -584,7 +584,11 @@ async fn run_pipeline_and_compare<S: WeightSource>(
     tokenizer: HfTokenizer,
     ctx: CompareCtx,
 ) {
-    let model = ZImageModel::load(Arc::clone(&backend), residency, tokenizer)
+    // `false`: no load-time Q8 transcode -- the Safetensors variant must stay
+    // bf16 to hold bit-clean parity against the bf16 pyref (a Q8 transcode would
+    // flip its `dit_matmul_weight` to Quant and blow the tolerance bands). GGUF
+    // variants are already quant, so the flag is a no-op for them regardless.
+    let model = ZImageModel::load(Arc::clone(&backend), residency, tokenizer, false)
         .await
         .expect("ZImageModel::load");
 
@@ -2388,8 +2392,7 @@ fn diff_stats(got: &[f32], expected: &[f32], tol: f32) -> (f32, usize) {
     let mut over = 0usize;
     for (g, e) in got.iter().zip(expected.iter()) {
         // NaN / inf in either side counts as "over tol" — silently passing
-        // an all-NaN run is the bug behind `[e2e_parity NaN-loose
-        // assertion]` in the worklog backlog. NaN.abs() = NaN, and any
+        // an all-NaN run was a real NaN-loose assertion bug. NaN.abs() = NaN, and any
         // comparison with NaN is false, so the naive `d > tol` misses it.
         let nan_or_inf = !g.is_finite() || !e.is_finite();
         let d = (g - e).abs();

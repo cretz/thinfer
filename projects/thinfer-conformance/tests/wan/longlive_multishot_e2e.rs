@@ -9,7 +9,7 @@
 //!
 //! This is a health gate, not a pyref byte-compare: the single-forward parity is
 //! covered by `longlive_parity`, and the AR-depth precision compounding is
-//! tolerated by design (see worklog). Multi-shot adds no new ops, only cache
+//! tolerated by design. Multi-shot adds no new ops, only cache
 //! routing, so finite + variance across a scene cut is the right bar.
 //!
 //! Gated on `THINFER_LONGLIVE_PT` (skips when unset) AND the FastWan base bundle

@@ -211,11 +211,15 @@ fn depth_to_space_uniform_bytes(
     p: [u32; 3],
     cout: u32,
     out: Shape,
-) -> [u8; 48] {
-    let fields: [u32; 12] = [
-        cin, s.t, s.h, s.w, p[0], p[1], p[2], 0, cout, out.t, out.h, out.w,
+    base_cout: u32,
+) -> [u8; 64] {
+    // 16 u32 = 64 bytes, matching the core `DepthToSpace3d` shader's `struct U`
+    // (the `base_cout` field + 3 pads were added to the shared op; this local
+    // helper was stale at 48 bytes -> the shader read `base_cout=0` -> `co % 0`).
+    let fields: [u32; 16] = [
+        cin, s.t, s.h, s.w, p[0], p[1], p[2], 0, cout, out.t, out.h, out.w, base_cout, 0, 0, 0,
     ];
-    let mut bytes = [0u8; 48];
+    let mut bytes = [0u8; 64];
     for (i, v) in fields.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -445,6 +449,9 @@ fn pixel_shuffle2d<'w>(
         [1, 2, 2],
         cout,
         out_shape,
+        // Standard PixelShuffle: output channels co in [0, cout) map straight back
+        // to input, so base_cout = cout (shader `co % base_cout`).
+        cout,
     ))?;
     scope.depth_to_space3d::<DepthToSpace3dF32>(
         &pl.depth_to_space,

@@ -23,7 +23,9 @@ use thinfer_core::weight::{WeightId, WeightSource};
 use crate::common::embedders::LinearBiasHandles;
 use crate::wan::condition_embedder::ConditionEmbedderHandles;
 use crate::wan::dit::LoadedWanDitHandles;
-use crate::wan::dit_block::{WanAttnHandles, WanDitBlockHandles, WanDitConfig};
+use crate::wan::dit_block::{
+    QkEmbedHandles, RehyatHandles, WanAttnHandles, WanDitBlockHandles, WanDitConfig,
+};
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -157,10 +159,39 @@ impl AttnNames {
     }
 }
 
+/// mobilewan ReHyAt feature-embed names for one stage (q_embed / k_embed): the
+/// two grouped 1x1 convs, each weight + bias, under `<prefix>.embed.{0,2}`.
+struct QkEmbedNames {
+    conv1_w: WeightId,
+    conv1_b: WeightId,
+    conv2_w: WeightId,
+    conv2_b: WeightId,
+}
+
+impl QkEmbedNames {
+    fn new(prefix: &str) -> Self {
+        Self {
+            conv1_w: WeightId(format!("{prefix}.embed.0.weight")),
+            conv1_b: WeightId(format!("{prefix}.embed.0.bias")),
+            conv2_w: WeightId(format!("{prefix}.embed.2.weight")),
+            conv2_b: WeightId(format!("{prefix}.embed.2.bias")),
+        }
+    }
+}
+
+/// mobilewan ReHyAt embeds for one block: `attn1.{q,k}_embed.*` (siblings of
+/// `attn1.base_attention`, not nested under it).
+struct RehyatNames {
+    q_embed: QkEmbedNames,
+    k_embed: QkEmbedNames,
+}
+
 /// Per-block diffusers weight names (`blocks.{i}.*`).
 pub struct WanDitBlockWeights {
     self_attn: AttnNames,
     cross_attn: AttnNames,
+    /// mobilewan-only ReHyAt embeds (`Some` iff `rehyat`).
+    rehyat: Option<RehyatNames>,
     norm2: LinearNames,
     ffn_up: LinearNames,
     ffn_down: LinearNames,
@@ -168,11 +199,23 @@ pub struct WanDitBlockWeights {
 }
 
 impl WanDitBlockWeights {
-    pub fn new(pre: &str, idx: usize) -> Self {
+    /// `rehyat` (mobilewan) nests self-attention under `attn1.base_attention.*`
+    /// (the ReHyAt wrapper); every other Wan model has it flat under `attn1.*`.
+    /// Cross-attention (`attn2`) is unchanged.
+    pub fn new(pre: &str, idx: usize, rehyat: bool) -> Self {
         let p = format!("{pre}blocks.{idx}");
+        let attn1 = if rehyat {
+            format!("{p}.attn1.base_attention")
+        } else {
+            format!("{p}.attn1")
+        };
         Self {
-            self_attn: AttnNames::new(&format!("{p}.attn1")),
+            self_attn: AttnNames::new(&attn1),
             cross_attn: AttnNames::new(&format!("{p}.attn2")),
+            rehyat: rehyat.then(|| RehyatNames {
+                q_embed: QkEmbedNames::new(&format!("{p}.attn1.q_embed")),
+                k_embed: QkEmbedNames::new(&format!("{p}.attn1.k_embed")),
+            }),
             norm2: LinearNames {
                 weight: WeightId(format!("{p}.norm2.weight")),
                 bias: WeightId(format!("{p}.norm2.bias")),
@@ -231,9 +274,10 @@ pub fn register_wan_dit_handles<S: WeightSource>(
         .map(|i| {
             register_block(
                 residency,
-                &WanDitBlockWeights::new(prefix, i),
+                &WanDitBlockWeights::new(prefix, i, cfg.rehyat),
                 transcode,
                 i8,
+                cfg,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -268,12 +312,30 @@ fn register_block<S: WeightSource>(
     w: &WanDitBlockWeights,
     transcode: Option<thinfer_core::quant::QuantKind>,
     i8: WanI8Sites,
+    cfg: &WanDitConfig,
 ) -> Result<WanDitBlockHandles, LoadError> {
+    // mobilewan: this block's PRUNED self-attn head count, from the loaded
+    // `attn1.base_attention.to_q` row count (`h_i * head_dim`). The self-attn
+    // matmuls run the DENSE per-block-N path, so they never take the i8
+    // transcode (which prepares full-N weights); every other model keeps the
+    // opt-in i8 on qkv_self.
+    let (n_heads, qkv_self_i8) = if cfg.rehyat {
+        let entry = catalog_entry(residency, &w.self_attn.q.weight)?;
+        let rows = entry.shape.0[0];
+        (rows / crate::wan::dit_block::config::HEAD_DIM, None)
+    } else {
+        (cfg.num_heads, i8.qkv_self)
+    };
     Ok(WanDitBlockHandles {
         // Self-attn qkv takes the opt-in i8 transcode; cross-attn qkv never does
         // (its K/V project from un-normed text -> i8 acts overflow f16).
-        self_attn: register_attn(residency, &w.self_attn, transcode, i8.qkv_self)?,
+        self_attn: register_attn(residency, &w.self_attn, transcode, qkv_self_i8)?,
         cross_attn: register_attn(residency, &w.cross_attn, transcode, None)?,
+        rehyat: w
+            .rehyat
+            .as_ref()
+            .map(|r| register_rehyat(residency, r))
+            .transpose()?,
         norm2_w: register_passthrough(residency, &w.norm2.weight)?,
         norm2_b: register_passthrough(residency, &w.norm2.bias)?,
         ffn_up_w: register_linear(residency, &w.ffn_up.weight, i8.ffn_up.or(transcode))?,
@@ -281,6 +343,7 @@ fn register_block<S: WeightSource>(
         ffn_down_w: register_linear(residency, &w.ffn_down.weight, transcode)?,
         ffn_down_b: register_passthrough(residency, &w.ffn_down.bias)?,
         scale_shift_table: register_passthrough(residency, &w.scale_shift_table)?,
+        n_heads,
     })
 }
 
@@ -303,6 +366,33 @@ fn register_attn<S: WeightSource>(
         o_b: register_passthrough(residency, &w.o.bias)?,
         norm_q: register_passthrough(residency, &w.norm_q)?,
         norm_k: register_passthrough(residency, &w.norm_k)?,
+    })
+}
+
+/// Register one mobilewan ReHyAt feature embed (q_embed or k_embed). The two
+/// grouped 1x1 convs are read RAW by the driver's per-head grouped matmul (weight
+/// `[out_ch, in_ch/groups, 1, 1]`, interpreted as `[out_ch, in_ch/groups]`), so
+/// they pass through untransposed -- `register_linear`'s `[N,K]->[K,N]` transpose
+/// would scramble the per-head block layout.
+fn register_qk_embed<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &QkEmbedNames,
+) -> Result<QkEmbedHandles, LoadError> {
+    Ok(QkEmbedHandles {
+        conv1_w: register_passthrough(residency, &w.conv1_w)?,
+        conv1_b: register_passthrough(residency, &w.conv1_b)?,
+        conv2_w: register_passthrough(residency, &w.conv2_w)?,
+        conv2_b: register_passthrough(residency, &w.conv2_b)?,
+    })
+}
+
+fn register_rehyat<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    w: &RehyatNames,
+) -> Result<RehyatHandles, LoadError> {
+    Ok(RehyatHandles {
+        q_embed: register_qk_embed(residency, &w.q_embed)?,
+        k_embed: register_qk_embed(residency, &w.k_embed)?,
     })
 }
 

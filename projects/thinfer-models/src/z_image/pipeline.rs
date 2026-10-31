@@ -267,10 +267,17 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
     /// Build the model. Registers all DiT + Qwen3 + VAE handles with the
     /// shared residency, compiles every WGSL kernel once. No bytes flow until
     /// `generate` triggers `acquire`.
+    /// `q8_transcode`: when the DiT SOURCE is bf16 (the `zimage-turbo-bf16`
+    /// safetensors shards), requantize its main + refiner matmul weights to
+    /// Q8_0 at load so they run the fast i8 DP4A path (~6x the dense-bf16 matmul;
+    /// quality == the Q8 GGUF variant, near-lossless). `false` keeps full bf16
+    /// (max precision, the parity path). Ignored for a GGUF source (already
+    /// quant). Default `true` in production; the parity harness passes `false`.
     pub async fn load(
         backend: Arc<WgpuBackend>,
         residency: WeightResidency<S>,
         tokenizer: T,
+        q8_transcode: bool,
     ) -> Result<Self, ModelLoadError> {
         // Stage-timing clocks are gated on subscriber interest: the values
         // only surface via the info/debug events, and on wasm each enabled
@@ -286,11 +293,29 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             RECLAIM_EVICTABLE_WEIGHTS,
             residency.reclaimer(Arc::clone(&backend)),
         );
-        // Refiner matmuls ship bf16 in the unsloth GGUFs; when the main
-        // path is quant-flavored, requantize them to Q8_0 at upload so
-        // they ride the quant matmul path (see `refiner_transcode_target`).
-        let refiner_transcode = crate::z_image::loader::refiner_transcode_target(&residency);
-        let dit_handles = register_dit_handles(&residency, refiner_transcode)?;
+        // A bf16 SOURCE (bf16 safetensors) can run the fast i8 DP4A matmul
+        // by requantizing its main matmul weights to Q8_0 at upload; a GGUF
+        // source is already quant, so this never triggers (its layer-0 qkv probes
+        // as `Quant`). Gated on `q8_transcode` (the opt-in bf16 toggle is `false`;
+        // the parity harness passes `false` to hold bit-clean bf16 parity).
+        let dit_qkv_l0 =
+            crate::z_image::BlockWeights::new(crate::z_image::BlockKind::Main, 0).attn_qkv;
+        let source_is_bf16 = !matches!(
+            residency
+                .source()
+                .catalog()
+                .get(&dit_qkv_l0)
+                .and_then(|e| e.encoding),
+            Some(StorageEncoding::Quant(_))
+        );
+        let main_transcode =
+            (q8_transcode && source_is_bf16).then_some(thinfer_core::quant::QuantKind::Q8_0);
+        // Refiner matmuls ship bf16 in the unsloth GGUFs; when the main path is
+        // quant-flavored (a GGUF DiT, or a bf16 DiT being transcoded to Q8),
+        // requantize them to Q8_0 too so they ride the quant matmul path.
+        let refiner_transcode =
+            main_transcode.or_else(|| crate::z_image::loader::refiner_transcode_target(&residency));
+        let dit_handles = register_dit_handles(&residency, refiner_transcode, main_transcode)?;
         // Qwen3 encoder matmuls: GGUF TE checkpoints ship them quantized
         // in-file (registered natively); bf16 safetensors sources are
         // requantized to Q8_0 at upload (lossless-tier, ~half the upload
@@ -330,6 +355,13 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         let mut per_layer_weights: Vec<[WeightDtype; 4]> =
             Vec::with_capacity(crate::z_image::config::N_LAYERS);
         for li in 0..crate::z_image::config::N_LAYERS {
+            // A load-time transcode makes every main matmul Quant at UPLOAD even
+            // though the source catalog still reads bf16; compile the slots to
+            // match the transcode target (else the block matmul reads garbage).
+            if let Some(k) = main_transcode {
+                per_layer_weights.push([WeightDtype::Quant(k); 4]);
+                continue;
+            }
             let bw = crate::z_image::BlockWeights::new(crate::z_image::BlockKind::Main, li);
             per_layer_weights.push([
                 probe_slot(&bw.attn_qkv),

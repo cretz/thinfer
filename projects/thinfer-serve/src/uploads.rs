@@ -1,11 +1,13 @@
-//! In-memory registry of streamed video uploads, with a TTL reaper. A browser
-//! streams an mp4 to `POST /uploads` (raw body, no base64); this holds it
-//! RAM-first, or seals a large clip to an encrypted on-disk spill under a
-//! per-upload ephemeral key (RAM only) -- the same at-rest scheme the inline job
-//! path uses, so raw plaintext never touches disk. A job later consumes the
-//! upload by id (moving any spill into the job dir, where delete-on-fetch
-//! governs it); anything never consumed is reaped after `ttl` so no ciphertext
-//! lingers indefinitely.
+//! Registry of streamed video uploads, with a TTL reaper. The client seals the
+//! clip under its per-job key (`thinfer_app::jobkey` layout) BEFORE uploading,
+//! so the server only ever stores ciphertext and holds no key for it: the bytes
+//! are written to disk as-is. When the job runs (and its key has arrived), the
+//! upload is consumed into the job dir as a decrypt-on-read input, so the frames
+//! stay ciphertext until the decoder reads them. Anything never consumed is
+//! reaped after `ttl`.
+//!
+//! [`seal_video`] remains for the inline path: a base64 clip inside an already
+//! decrypted spec is held in RAM, or spilled under a fresh ephemeral key.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,22 +15,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
+use thinfer_app::jobkey::{self, JobKey};
 use thinfer_app::request::VideoInput;
 
-/// Above this size an upload spills to an encrypted on-disk blob rather than
-/// staying in RAM (mirrors the inline job-spill path). 512 MiB: typical clips
-/// are a few hundred MB, well under the RAM budget.
+/// Above this size an inline (base64-in-spec) clip spills to an encrypted
+/// on-disk blob rather than staying in RAM.
 pub const VIDEO_SPILL_THRESHOLD: usize = 512 << 20;
 
-/// Build a [`VideoInput`] from raw mp4 bytes: kept in RAM at or below
-/// `threshold`, else sealed to `<dir>/input_video.enc` under a fresh ephemeral
-/// AES-256-GCM key (held in the returned value, RAM only). The raw plaintext
-/// never lands on disk; `dir` is created only on the spill path.
+/// Build a [`VideoInput`] from raw mp4 bytes of a DECRYPTED spec: kept in RAM at
+/// or below `threshold`, else sealed to `<dir>/input_video.enc` under a fresh
+/// ephemeral AES-256-GCM key (held in the returned value, RAM only). The raw
+/// plaintext never lands on disk; `dir` is created only on the spill path.
 pub fn seal_video(bytes: Vec<u8>, dir: &Path, threshold: usize) -> Result<VideoInput, String> {
     if bytes.len() > threshold {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let (key, nonce, ct) = thinfer_app::vault::ephemeral_seal(&bytes);
-        drop(bytes); // wipe the plaintext copy; only ciphertext + the RAM key remain
+        drop(bytes); // only ciphertext + the RAM key remain
         let path = dir.join("input_video.enc");
         std::fs::write(&path, &ct).map_err(|e| format!("write {}: {e}", path.display()))?;
         Ok(VideoInput::Encrypted { path, key, nonce })
@@ -38,17 +40,18 @@ pub fn seal_video(bytes: Vec<u8>, dir: &Path, threshold: usize) -> Result<VideoI
 }
 
 struct Entry {
-    input: VideoInput,
-    /// The upload's own dir (holds the spill file, if any). Removed on reap.
+    /// The ciphertext file (`<base>/<id>/input_video.enc`, nonce stripped).
+    path: PathBuf,
+    /// The client's GCM nonce (base64), split off the sealed blob.
+    nonce: String,
+    /// The upload's own dir. Removed on consume or reap.
     dir: PathBuf,
     created: Instant,
 }
 
-/// Registry of pending uploads keyed by opaque id, reaped by TTL. Cheap to
-/// clone-share behind an `Arc`.
+/// Registry of pending sealed uploads keyed by opaque id, reaped by TTL.
 pub struct UploadStore {
     base: PathBuf,
-    spill_threshold: usize,
     entries: Mutex<HashMap<String, Entry>>,
 }
 
@@ -57,61 +60,56 @@ impl UploadStore {
     pub fn new(base: PathBuf) -> Self {
         Self {
             base,
-            spill_threshold: VIDEO_SPILL_THRESHOLD,
             entries: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Store raw upload bytes and return `(id, size)`. Large clips spill to an
-    /// encrypted file under `<base>/<id>/`; small ones stay in RAM.
-    pub fn put(&self, bytes: Vec<u8>) -> Result<(String, usize), String> {
-        let size = bytes.len();
+    /// Store a client-sealed upload (`[nonce][ciphertext+tag]`) and return
+    /// `(id, size)`. Written to disk as ciphertext; the server has no key.
+    pub fn put(&self, sealed: &[u8]) -> Result<(String, usize), String> {
+        let (nonce, ct) = jobkey::split_sealed(sealed)?;
         let id = random_id();
         let dir = self.base.join(&id);
-        let input = seal_video(bytes, &dir, self.spill_threshold)?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let path = dir.join("input_video.enc");
+        std::fs::write(&path, ct).map_err(|e| format!("write {}: {e}", path.display()))?;
         self.entries.lock().unwrap().insert(
             id.clone(),
             Entry {
-                input,
+                path,
+                nonce,
                 dir,
                 created: Instant::now(),
             },
         );
-        Ok((id, size))
+        Ok((id, sealed.len()))
     }
 
-    /// Consume upload `id` into a job whose artifact dir is `job_dir`: remove it
-    /// from the registry and, for a spilled upload, move the ciphertext into the
-    /// job dir so delete-on-fetch (not the reaper) governs its lifetime from
-    /// here on. Errors if the id is unknown or already expired/consumed.
-    pub fn consume(&self, id: &str, job_dir: &Path) -> Result<VideoInput, String> {
+    /// Consume upload `id` into a job whose dir is `job_dir`, under the job's
+    /// `key`: the ciphertext moves into the job dir (delete-on-fetch / the job
+    /// reaper govern it from here) and becomes a decrypt-on-read input. Errors
+    /// if the id is unknown or already expired/consumed.
+    pub fn consume(&self, id: &str, job_dir: &Path, key: &JobKey) -> Result<VideoInput, String> {
         let entry = self
             .entries
             .lock()
             .unwrap()
             .remove(id)
             .ok_or("upload not found (expired, already used, or never uploaded)")?;
-        let result = match entry.input {
-            VideoInput::Ram(b) => VideoInput::Ram(b),
-            VideoInput::Encrypted { path, key, nonce } => {
-                std::fs::create_dir_all(job_dir)
-                    .map_err(|e| format!("create {}: {e}", job_dir.display()))?;
-                let dest = job_dir.join("input_video.enc");
-                move_file(&path, &dest)?;
-                VideoInput::Encrypted {
-                    path: dest,
-                    key,
-                    nonce,
-                }
-            }
-        };
-        // The upload's own dir is now empty (spill moved out, or never existed).
+        std::fs::create_dir_all(job_dir)
+            .map_err(|e| format!("create {}: {e}", job_dir.display()))?;
+        let dest = job_dir.join("input_video.enc");
+        move_file(&entry.path, &dest)?;
         let _ = std::fs::remove_dir_all(&entry.dir);
-        Ok(result)
+        Ok(VideoInput::Encrypted {
+            path: dest,
+            key: *key.bytes(),
+            nonce: entry.nonce,
+        })
     }
 
-    /// Drop every entry older than `ttl`, deleting its spill dir. Returns the
-    /// count reaped. Cheap when nothing is expired (a single map scan).
+    /// Drop every entry older than `ttl`, deleting its dir. Returns the count
+    /// reaped. Cheap when nothing is expired (a single map scan).
     pub fn reap(&self, ttl: Duration) -> usize {
         let mut reaped = Vec::new();
         {
@@ -132,8 +130,8 @@ impl UploadStore {
 }
 
 /// Move a file, falling back to copy+remove if `rename` fails (e.g. across
-/// filesystems). Both the upload spill and the job dir live under the artifact
-/// dir, so the rename normally succeeds.
+/// filesystems). Both the upload and the job dir live under the artifact dir,
+/// so the rename normally succeeds.
 fn move_file(from: &Path, to: &Path) -> Result<(), String> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
@@ -171,77 +169,44 @@ pub fn spawn_reaper(store: Arc<UploadStore>, ttl: Duration) {
 mod tests {
     use super::*;
 
-    fn store_with(base: PathBuf, threshold: usize) -> UploadStore {
-        UploadStore {
-            base,
-            spill_threshold: threshold,
-            entries: Mutex::new(HashMap::new()),
-        }
-    }
-
     #[test]
-    fn small_upload_stays_in_ram_and_consumes_bytes_intact() {
-        let tmp = std::env::temp_dir().join(format!("thinfer_up_ram_{}", random_id()));
-        let store = store_with(tmp.clone(), 1 << 20); // 1 MiB threshold
-        let (id, size) = store.put(b"tiny-mp4-bytes".to_vec()).unwrap();
-        assert_eq!(size, 14);
-        // No spill dir for a RAM upload.
-        assert!(!tmp.join(&id).exists());
+    fn upload_is_stored_as_ciphertext_and_opens_with_the_job_key() {
+        let tmp = std::env::temp_dir().join(format!("thinfer_up_{}", random_id()));
+        let store = UploadStore::new(tmp.clone());
+        let key = JobKey::generate();
+        let plaintext = b"mp4 bytes that only the job key can read".to_vec();
+        let (id, _) = store.put(&key.seal(&plaintext)).unwrap();
+        let on_disk = std::fs::read(tmp.join(&id).join("input_video.enc")).unwrap();
+        assert!(
+            !on_disk.windows(8).any(|w| w == &plaintext[..8]),
+            "on-disk bytes must be ciphertext"
+        );
+
         let job_dir = tmp.join("job");
-        match store.consume(&id, &job_dir).unwrap() {
-            VideoInput::Ram(b) => assert_eq!(b, b"tiny-mp4-bytes"),
-            _ => panic!("expected RAM"),
-        }
-        // Second consume of the same id fails (removed from the registry).
-        assert!(store.consume(&id, &job_dir).is_err());
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn large_upload_spills_encrypted_then_consume_moves_it_and_decrypts() {
-        let tmp = std::env::temp_dir().join(format!("thinfer_up_spill_{}", random_id()));
-        let store = store_with(tmp.clone(), 8); // force spill for anything > 8 bytes
-        let plaintext = b"this is definitely more than eight bytes of mp4".to_vec();
-        let (id, _) = store.put(plaintext.clone()).unwrap();
-        // Ciphertext exists under the upload dir; it is NOT the plaintext.
-        let spill = tmp.join(&id).join("input_video.enc");
-        assert!(spill.exists(), "spill file should exist");
-        let ct = std::fs::read(&spill).unwrap();
-        assert_ne!(ct, plaintext, "on-disk bytes must be ciphertext");
-
-        let job_dir = tmp.join("job-7");
-        let input = store.consume(&id, &job_dir).unwrap();
-        // The upload dir is gone; the ciphertext now lives in the job dir.
-        assert!(!tmp.join(&id).exists(), "upload dir should be removed");
-        let (path, key, nonce) = match &input {
+        let input = store.consume(&id, &job_dir, &key).unwrap();
+        let (path, raw_key, nonce) = match &input {
             VideoInput::Encrypted { path, key, nonce } => (path.clone(), *key, nonce.clone()),
-            _ => panic!("expected Encrypted"),
+            VideoInput::Ram(_) => panic!("expected a decrypt-on-read input"),
         };
-        assert_eq!(path, job_dir.join("input_video.enc"));
-        // The moved ciphertext decrypts back to the original plaintext.
-        let moved_ct = std::fs::read(&path).unwrap();
-        let decrypted = thinfer_app::vault::ephemeral_unseal(&key, &nonce, &moved_ct).unwrap();
-        assert_eq!(decrypted, plaintext);
+        assert!(!tmp.join(&id).exists(), "upload dir should be removed");
+        let ct = std::fs::read(&path).unwrap();
+        let opened = thinfer_app::vault::ephemeral_unseal(&raw_key, &nonce, &ct).unwrap();
+        assert_eq!(opened, plaintext);
+        assert!(store.consume(&id, &job_dir, &key).is_err(), "consumed once");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn reaper_evicts_expired_entries_and_their_spill_dirs() {
+    fn reaper_evicts_expired_uploads_and_their_dirs() {
         let tmp = std::env::temp_dir().join(format!("thinfer_up_reap_{}", random_id()));
-        let store = store_with(tmp.clone(), 8); // force spill so a dir exists to delete
-        let (id, _) = store.put(b"more than eight bytes here".to_vec()).unwrap();
-        let spill_dir = tmp.join(&id);
-        assert!(spill_dir.exists());
-
-        // A generous TTL keeps it.
+        let store = UploadStore::new(tmp.clone());
+        let key = JobKey::generate();
+        let (id, _) = store.put(&key.seal(b"some clip bytes")).unwrap();
+        assert!(tmp.join(&id).exists());
         assert_eq!(store.reap(Duration::from_secs(3600)), 0);
-        assert!(spill_dir.exists());
-
-        // A zero TTL evicts it and removes the spill dir.
         assert_eq!(store.reap(Duration::ZERO), 1);
-        assert!(!spill_dir.exists(), "reaped spill dir should be gone");
-        // The id is no longer consumable.
-        assert!(store.consume(&id, &tmp.join("job")).is_err());
+        assert!(!tmp.join(&id).exists(), "reaped dir should be gone");
+        assert!(store.consume(&id, &tmp.join("job"), &key).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

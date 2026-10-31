@@ -47,6 +47,11 @@ pub enum StorageEncoding {
     /// GGUF-style block-quantized storage. Carries the scheme; layout
     /// constants live on [`crate::quant::QuantKind`].
     Quant(crate::quant::QuantKind),
+    /// NVIDIA block-scaled FP4: one `[N, K]` linear as the composite of its
+    /// packed codes, swizzled E4M3 block scales and f32 alpha (layout and
+    /// dequant: [`crate::ops::nvfp4`]). Dequantized to a dense workspace before
+    /// the matmul, never read inline.
+    Nvfp4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

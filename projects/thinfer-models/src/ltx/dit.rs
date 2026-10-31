@@ -43,8 +43,9 @@ use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 use super::LtxVariant;
 use super::config as dit;
 use crate::common::block::{
-    ActBuf, Block, BlockPipelines, BlockWgslConfigs, DenseActSites, DequantStep, alloc_act,
-    alloc_matmul_out_buf, op_add, op_rmsnorm, op_rope_halfrot, op_sdpa, quantize_act_paired,
+    ActBuf, Block, BlockPipelines, BlockWgslConfigs, CoopmatStep, DenseActSites, DequantStep,
+    alloc_act, alloc_matmul_out_buf, build_coopmat_step, op_add, op_rmsnorm, op_rope_halfrot,
+    op_sdpa_win, quantize_act_paired,
 };
 use crate::common::embedders::bcast_add_uniform;
 use crate::z_image::text_encoder::{LoadError, register_one};
@@ -654,7 +655,7 @@ pub async fn caption_project<S: WeightSource>(
 ///   bandwidth-trivial A-sides and are never i8, even with the opt-in.
 ///
 /// f16 acts put the residual stream in f16 (5-bit exponent, max 65504); the
-/// worklog flags this as a dead-end for the big WAN/Qwen DiTs (residual outliers
+/// this is a known dead-end for the big WAN/Qwen DiTs (residual outliers
 /// overflow). LTX-2.3 distilled does NOT overflow -- validated against the
 /// upstream pyref (`dit_full_parity`: f16 slope 1.0006, rel 0.093%; bit-clean to
 /// the f32 path). **`f16dp4a` is the DEFAULT** (env unset): F16 acts + DP4A i8 on
@@ -662,6 +663,8 @@ pub async fn caption_project<S: WeightSource>(
 /// quality-clean (block rel <=0.37%, eyeballed on a real browser gen). `f16` opts
 /// out of the i8 (dense f16 matmuls, the bit-cleaner perf path); `f32` is the
 /// bit-exact parity reference. Without shader-f16 the default falls back to f32.
+/// With an accelerator installed (CUDA) the default is `f16`: tensor-core dense
+/// matmuls match DP4A's speed, so the i8 quality cost buys nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DitActs {
     F32,
@@ -677,6 +680,10 @@ impl DitActs {
             "f32" => Self::F32,
             // Explicit dense f16 (opt OUT of DP4A i8 on the video-stream matmuls).
             "f16" if f16_ok => Self::F16,
+            // With an accelerator (CUDA) the dense matmuls run on tensor cores and
+            // DP4A buys nothing (paired 768x512 5s: denoise 229.7s i8 vs 229.8s
+            // dense), so the default takes the bit-cleaner dense path.
+            "" if f16_ok && backend.accelerator().is_some() => Self::F16,
             // Default (env unset) + "f16dp4a"/"dp4a": DP4A is the default perf path.
             "" | "f16dp4a" | "dp4a" if f16_ok => Self::F16Dp4a,
             _ => {
@@ -711,19 +718,21 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
         weight_dtype: WeightDtype::Quant(QuantKind::Q8_0),
         ..ops
     };
-    // `dp4a` BUILDS the i8 pipelines for the qkv + ffn_up sites; the per-call
-    // routing (`I8Site` in `biased_proj`, driven by `attention`/`feed_forward`)
-    // decides which projections actually use them -- the VIDEO-stream qkv/ffn_up
-    // (all normed A-sides), with proj (post-gate) + ffn_down (post-gelu) + the
-    // whole AUDIO stream kept dense by default (`THINFER_LTX_I8_EXTRA=1` opts
-    // the audio qkv/ffn_up + v2a, also normed A-sides, into i8; see
-    // `DitPipelines::i8_extra`).
+    // `dp4a` BUILDS the i8 pipelines for every site; the per-call routing
+    // (`I8Site` in `biased_proj`, driven by `attention`/`feed_forward`) decides
+    // which projections actually use them. The VIDEO-stream qkv/ffn_up (all normed
+    // A-sides) route i8 for every variant; proj (post-gate) + ffn_down (post-gelu)
+    // route i8 ONLY on the UNGATED rapid variant (no gate -> no concentrated
+    // outliers), staying dense on the 22B via the per-call gate. The whole AUDIO
+    // stream stays dense by default (`THINFER_LTX_I8_EXTRA=1` opts the audio
+    // qkv/ffn_up + v2a in). Building the proj/ffn_down i8 pipelines on the 22B is
+    // harmless -- routing keeps `I8Site::None` there.
     let dense_acts = DenseActSites {
         qkv: !dp4a,
         qkv_self: !dp4a,
-        proj: true,
+        proj: !dp4a,
         ffn_up: !dp4a,
-        ffn_down: true,
+        ffn_down: !dp4a,
     };
     BlockWgslConfigs {
         matmul_qkv: mm,
@@ -735,6 +744,10 @@ fn dit_block_cfgs(act: ActDtype, dp4a: bool) -> BlockWgslConfigs {
         ops,
         i8_sdpa: false,
         dense_acts,
+        // Coopmat rides `DitPipelines::coopmat`, a per-quant-kind map, NOT these
+        // per-site flags: the flags bake one scheme from the cfg, which cannot
+        // serve a mixed `_K_M` DiT. Left off so `BlockPipelines` does not compile
+        // four unused single-scheme copies. See `biased_proj`.
         coopmat_acts: crate::common::block::CoopmatSites::default(),
         large_d_sdpa: false,
         fast_sdpa: false,
@@ -763,6 +776,11 @@ pub struct DitPipelines {
     /// pipeline consuming the triple is kind-agnostic, so only this prep step
     /// varies. Empty unless the DP4A path is active (`F16Dp4a`).
     i8_dequant: std::collections::HashMap<QuantKind, DequantStep>,
+    /// Per-scheme coopmat (tensor-core) matmul + its f16 weight dequant. Keyed by
+    /// the weight's on-disk kind so a mixed `_K_M` DiT routes each tensor to a
+    /// step that can actually decode it. Empty when the device exposes no usable
+    /// coopmat config; every site then falls back to i8/dense.
+    coopmat: std::collections::HashMap<QuantKind, CoopmatStep>,
     /// `THINFER_LTX_I8_EXTRA=1`: also route the audio-stream qkv/ffn_up and the
     /// v2a cross through DP4A i8. Their A-sides are all normed/modulated
     /// (ada_zero or connector norm_out + modulate), so the i8 act contract
@@ -782,6 +800,12 @@ impl DitPipelines {
     /// this kind was not built (site then falls back to the dense per-kind path).
     fn i8_dequant(&self, kind: QuantKind) -> Option<&DequantStep> {
         self.i8_dequant.get(&kind)
+    }
+
+    /// Coopmat (tensor-core) step for `kind`, or `None` when the device has no
+    /// usable coopmat config (site then falls back to i8/dense).
+    fn coopmat(&self, kind: QuantKind) -> Option<&CoopmatStep> {
+        self.coopmat.get(&kind)
     }
 
     pub async fn compile(backend: &WgpuBackend) -> Result<Self, WgpuError> {
@@ -809,7 +833,13 @@ impl DitPipelines {
                         dq_i8_layout,
                     )
                     .await?;
-                i8_dequant.insert(scheme, DequantStep { pipeline, scheme });
+                i8_dequant.insert(
+                    scheme,
+                    DequantStep {
+                        pipeline,
+                        scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                    },
+                );
             }
         }
         // Dense dequant steps keyed by quant kind. Target matches the block's
@@ -837,7 +867,37 @@ impl DitPipelines {
                     dq_layout,
                 )
                 .await?;
-            dense_dequant.insert(scheme, DequantStep { pipeline, scheme });
+            dense_dequant.insert(
+                scheme,
+                DequantStep {
+                    pipeline,
+                    scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                },
+            );
+        }
+        // Per-scheme coopmat (tensor-core) steps, for the same reason the two
+        // dequant maps above are per-scheme: `BlockPipelines` bakes ONE scheme per
+        // site from the cfg, which is right for the uniform Q8_0 file and wrong
+        // for every mixed `_K_M` build (Q4_K + Q6_K within a block). Routing by
+        // the weight's catalog kind is what lets the Q4_K_M DiTs reach the tensor
+        // cores at all instead of silently falling back to dense.
+        let mut coopmat = std::collections::HashMap::new();
+        for scheme in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_K,
+            QuantKind::Q5_K,
+            QuantKind::Q6_K,
+        ] {
+            if let Some(step) = build_coopmat_step(
+                backend,
+                &format!("ltx_{}", scheme.hint()),
+                scheme,
+                thinfer_core::ops::matmul_coopmat::CoopmatOut::F16,
+            )
+            .await?
+            {
+                coopmat.insert(scheme, step);
+            }
         }
         let gelu = backend
             .create_pipeline(
@@ -870,6 +930,7 @@ impl DitPipelines {
             silu,
             dense_dequant,
             i8_dequant,
+            coopmat,
             i8_extra,
         })
     }
@@ -892,13 +953,19 @@ pub struct BlockQuantKinds {
 }
 
 impl BlockQuantKinds {
-    /// Probe each matmul weight's on-disk quant kind from block 0 of the source
-    /// catalog. The Q8_0 file reports Q8_0 everywhere (behaviour unchanged); the
-    /// Q4_K_M variant reports the mixed per-site kinds. Non-quant sites (none in
-    /// practice for these matmul weights) fall back to Q8_0.
-    fn probe<S: WeightSource>(residency: &WeightResidency<S>) -> Self {
+    /// Probe each matmul weight's on-disk quant kind from block `idx` of the
+    /// source catalog. The Q8_0 file reports Q8_0 everywhere (behaviour
+    /// unchanged). Non-quant sites (none in practice for these matmul weights)
+    /// fall back to Q8_0.
+    ///
+    /// MUST be per block. `_K_M` recipes vary the kind BY LAYER, not just by
+    /// site: in one published LTX-2.3 dev-finetune Q4_K_M the first 6 blocks are Q5_K throughout while
+    /// the other 42 are Q4_K (q/k/o/gate) + Q6_K (v/ffn_down). Probing block 0
+    /// and reusing it decoded 42 of 48 blocks with the wrong scheme, which is
+    /// what made every Q4_K_M LTX variant produce garbage.
+    fn probe<S: WeightSource>(residency: &WeightResidency<S>, idx: usize) -> Self {
         let probe = |suffix: &str| -> QuantKind {
-            let id = WeightId(format!("transformer_blocks.0.{suffix}"));
+            let id = WeightId(format!("transformer_blocks.{idx}.{suffix}"));
             match residency
                 .source()
                 .catalog()
@@ -1105,6 +1172,12 @@ enum I8Site {
     None,
     Qkv,
     FfnUp,
+    /// attn out-proj (`to_out`). Dense on the 22B (post-gate outliers); i8 only on
+    /// the UNGATED rapid variant, where the SDPA output has no gate to concentrate
+    /// outliers into a few channels.
+    Proj,
+    /// FFN down. Same story: post-gelu A-side, dense on 22B, i8 on ungated rapid.
+    FfnDown,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1132,18 +1205,36 @@ fn biased_proj<'wsp>(
         I8Site::None => None,
         I8Site::Qkv => bp.matmul_i8_qkv.as_ref(),
         I8Site::FfnUp => bp.matmul_i8_ffn_up.as_ref(),
+        I8Site::Proj => bp.matmul_i8_proj.as_ref(),
+        I8Site::FfnDown => bp.matmul_i8_ffn_down.as_ref(),
     };
     let di8 = match i8 {
         I8Site::None => None,
-        _ => dq_dense.and_then(|d| pipes.i8_dequant(d.scheme)),
+        _ => dq_dense.and_then(|d| d.scheme.block().and_then(|k| pipes.i8_dequant(k))),
     };
-    Block::dispatch_matmul_site(
+    // Tensor cores. This takes over BOTH the dense sites (proj, ffn_down, the
+    // audio stream, the text cross -- the bulk of DiT matmul time on the gated
+    // 22B) and the sites the i8 router would have taken, since the A-side is not
+    // pre-quantized at this point. That is the right outcome on both axes:
+    // measured at 768x512, `matmul_qkv` 148.1s/11.33ms per disp became
+    // `matmul_coopmat_qkv` 78.1s/5.48ms, and `dit_full_parity_large_m` puts
+    // coopmat CLOSER to the pyref than the dense path it replaces (video rel
+    // 0.088% vs 0.123%) because the coopmat accumulator is f32. Sub-WM
+    // dispatches still fall back to dense inside the dispatch.
+    //
+    // Routed by THIS weight's on-disk kind, like the two dequant maps: a step's
+    // dequant decodes one scheme, and the `_K_M` DiTs ship each block MIXED
+    // (Q4_K + Q6_K), so a single baked scheme would decode garbage.
+    let cm = dq_dense.and_then(|d| d.scheme.block().and_then(|k| pipes.coopmat(k)));
+    Block::dispatch_matmul_site_coopmat(
         scope,
         bp,
         src,
         w_h,
         pre,
         dims,
+        None,
+        cm,
         mi8,
         di8,
         dq_dense,
@@ -1344,6 +1435,22 @@ impl<'a> BlockViewsAll<'a> {
 /// applies it at the residual). `kv_src = None` means self-attention (K/V read
 /// `q_src`), which also lets the shared-A-side act-quant below cover Q.
 #[allow(clippy::too_many_arguments)]
+/// Temporal sliding-window radius for the VIDEO self-attention, in latent
+/// frames (`LTX_ATTN_WINDOW`, default 0 = full attention). Each query attends
+/// only to keys within `+-W` latent frames, which breaks the O(frames^2) cost
+/// of the one all-to-all op in the block. It CHANGES the output (the model was
+/// trained on full attention), so it stays opt-in until eyeballed per model.
+fn attn_window() -> u32 {
+    static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("LTX_ATTN_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attention<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     pipes: &DitPipelines,
@@ -1358,8 +1465,12 @@ fn attention<'wsp>(
     kv_rows: u32,
     eps: f32,
     qkv_i8: bool,
+    proj_i8: bool,
     gated: bool,
     dq: AttnDequant<'_>,
+    // `(period, window)` for the temporal sliding window; `(0, 0)` = full
+    // attention. Only the video self-attention site passes a real pair.
+    win: (u32, u32),
 ) -> Result<ActBuf<'wsp>, WgpuError> {
     let bp = &pipes.block;
     let inner = g.inner() as u32;
@@ -1380,7 +1491,8 @@ fn attention<'wsp>(
     // its on-disk kind (mixed Q5_K/Q6_K here); a kind with no built prep falls
     // to the dense per-kind path.
     let qkv_site = |d: Option<&DequantStep>| {
-        if qkv_i8 && d.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
+        if qkv_i8 && d.is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
+        {
             I8Site::Qkv
         } else {
             I8Site::None
@@ -1450,10 +1562,13 @@ fn attention<'wsp>(
         None => kn,
     };
 
-    // non-causal SDPA (no mask; dummy 16-byte slot, has_mask=0).
+    // non-causal SDPA (no mask; dummy 16-byte slot, has_mask=0). `win` routes
+    // the video self-attention to the temporal sliding-window twin when a run
+    // opts in; every other site passes (0, 0) and takes the full attention.
     let sa = alloc_act(scope, bp, q_rows, inner)?;
     let no_mask = scope.alloc(16)?;
-    op_sdpa(
+    let (period, window) = win;
+    op_sdpa_win(
         scope,
         bp,
         qx,
@@ -1469,6 +1584,11 @@ fn attention<'wsp>(
         hd,
         g.scale(),
         0,
+        period,
+        window,
+        // Pure-video self-attention: no text rows in this sequence, so
+        // `txt_start = kv_rows` leaves the joint-windowing branches dead.
+        kv_rows,
     )?;
 
     // per-head gate: out = sa * 2*sigmoid(to_gate_logits(gate_src)). Skipped on
@@ -1496,18 +1616,19 @@ fn attention<'wsp>(
         sa
     };
 
-    // to_out projection + bias -> [q_rows, q_dim].
+    // to_out projection + bias -> [q_rows, q_dim]. i8 only when the caller marks
+    // this (ungated) site safe AND an i8 prep exists for the weight's kind.
+    let o_site = if proj_i8
+        && dq
+            .o
+            .is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
+    {
+        I8Site::Proj
+    } else {
+        I8Site::None
+    };
     biased_proj(
-        scope,
-        pipes,
-        attn_out,
-        w.o_w,
-        w.o_b,
-        q_rows,
-        q_dim,
-        inner,
-        I8Site::None,
-        dq.o,
+        scope, pipes, attn_out, w.o_w, w.o_b, q_rows, q_dim, inner, o_site, dq.o,
     )
 }
 
@@ -1521,6 +1642,7 @@ fn feed_forward<'wsp>(
     rows: u32,
     inner: u32,
     up_i8: bool,
+    down_i8: bool,
     dq: FfDequant<'_>,
 ) -> Result<ActBuf<'wsp>, WgpuError> {
     let bp = &pipes.block;
@@ -1532,7 +1654,11 @@ fn feed_forward<'wsp>(
     // unless `THINFER_LTX_I8_EXTRA=1` opts it in (its A-side is equally normed).
     // i8 covers every kind with a built prep pipeline (Q8_0/Q5_K/Q6_K); a kind
     // without one runs the dense per-kind path.
-    let up = if up_i8 && dq.up.is_some_and(|s| pipes.i8_dequant(s.scheme).is_some()) {
+    let up = if up_i8
+        && dq
+            .up
+            .is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
+    {
         I8Site::FfnUp
     } else {
         I8Site::None
@@ -1542,17 +1668,19 @@ fn feed_forward<'wsp>(
     )?;
     let g = alloc_act(scope, bp, rows, ff_hidden)?;
     scope.dispatch_op::<GeluF32>(&pipes.gelu, &[h1.data], g.data)?;
+    // ffn_down i8 only on the ungated (rapid) path, and only where an i8 prep
+    // exists for the weight's on-disk kind.
+    let down = if down_i8
+        && dq
+            .down
+            .is_some_and(|s| s.scheme.block().and_then(|k| pipes.i8_dequant(k)).is_some())
+    {
+        I8Site::FfnDown
+    } else {
+        I8Site::None
+    };
     biased_proj(
-        scope,
-        pipes,
-        g,
-        w.down_w,
-        w.down_b,
-        rows,
-        inner,
-        ff_hidden,
-        I8Site::None,
-        dq.down,
+        scope, pipes, g, w.down_w, w.down_b, rows, inner, ff_hidden, down, dq.down,
     )
 }
 
@@ -1568,6 +1696,10 @@ pub struct Streams {
     pub audio_tokens: usize,
     pub video_text: usize,
     pub audio_text: usize,
+    /// Video tokens per LATENT FRAME (`lat_h * lat_w`), i.e. the period of the
+    /// frame-major `(f, h, w)` token order. Only the temporal sliding-window
+    /// self-attention reads it; 0 disables windowing for this run.
+    pub video_period: usize,
 }
 
 /// RoPE freq buffers for one block (already on GPU, `[seq*heads, head_dim]`
@@ -1613,6 +1745,11 @@ fn block_forward<'wsp>(
     // 19B (ltx2-rapid): ungated attention + raw (un-modulated) text cross-attn.
     let gated = variant.gated_attn;
     let cross_adaln = variant.cross_adaln;
+    // Audio-stream i8 stays OFF by default for BOTH variants (opt in with
+    // `THINFER_LTX_I8_EXTRA=1`). Routing rapid's audio to i8 was measured to blow
+    // the rapid parity gate (audio rel 1.57% > 1.2%): the audio block residual is
+    // genuinely i8-sensitive even ungated, so the audio qkv/proj/ffn stay dense.
+    let audio_i8 = pipes.i8_extra;
 
     // Resolve the dense dequant step for each matmul weight from its probed
     // on-disk quant kind. Uniform across attn types (q/k/o/gate one kind, v
@@ -1659,8 +1796,10 @@ fn block_forward<'wsp>(
         sv,
         eps,
         true,
+        !gated,
         gated,
         adq,
+        (s.video_period as u32, attn_window()),
     )?;
     let vx1 = alloc_act(scope, bp, sv, vd)?;
     op_gate_residual(
@@ -1719,8 +1858,10 @@ fn block_forward<'wsp>(
         s.video_text as u32,
         eps,
         true,
+        !gated,
         gated,
         adq,
+        (0, 0),
     )?;
     let vx2 = alloc_act(scope, bp, sv, vd)?;
     if cross_adaln {
@@ -1763,9 +1904,11 @@ fn block_forward<'wsp>(
         sa,
         sa,
         eps,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         gated,
         adq,
+        (0, 0),
     )?;
     let ax1 = alloc_act(scope, bp, sa, ad)?;
     op_gate_residual(
@@ -1820,9 +1963,11 @@ fn block_forward<'wsp>(
         sa,
         s.audio_text as u32,
         eps,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         gated,
         adq,
+        (0, 0),
     )?;
     let ax2 = alloc_act(scope, bp, sa, ad)?;
     if cross_adaln {
@@ -1879,8 +2024,10 @@ fn block_forward<'wsp>(
         sa,
         eps,
         true,
+        !gated,
         gated,
         adq,
+        (0, 0),
     )?;
     let vx3 = alloc_act(scope, bp, sv, vd)?;
     op_gate_residual(
@@ -1929,9 +2076,11 @@ fn block_forward<'wsp>(
         sa,
         sv,
         eps,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         gated,
         adq,
+        (0, 0),
     )?;
     let ax3 = alloc_act(scope, bp, sa, ad)?;
     op_gate_residual(
@@ -1957,7 +2106,9 @@ fn block_forward<'wsp>(
         vd,
         eps,
     )?;
-    let vx_ff = feed_forward(scope, pipes, vx_ff_in, &bufs.ff, sv, vd, true, vff_dq)?;
+    let vx_ff = feed_forward(
+        scope, pipes, vx_ff_in, &bufs.ff, sv, vd, true, !gated, vff_dq,
+    )?;
     op_gate_residual(
         scope,
         bp,
@@ -1987,7 +2138,8 @@ fn block_forward<'wsp>(
         &bufs.audio_ff,
         sa,
         ad,
-        pipes.i8_extra,
+        audio_i8,
+        audio_i8,
         aff_dq,
     )?;
     op_gate_residual(
@@ -2216,7 +2368,7 @@ pub async fn forward_block_dumped<S: WeightSource>(
             imp(&ones_v_b),
             imp(&ones_a_b),
             &bufs,
-            BlockQuantKinds::probe(residency),
+            BlockQuantKinds::probe(residency, 0),
             variant,
             ActBuf::dense(imp(&vx_out_b)),
             ActBuf::dense(imp(&ax_out_b)),
@@ -2438,9 +2590,10 @@ pub struct DitModel {
     pub blocks: Vec<BlockHandles>,
     pub tables: Vec<BlockTables>,
     pub io: IoHandles,
-    /// On-disk quant kind per matmul site (probed from block 0; uniform across
-    /// blocks). Q8_0 for the baseline file; mixed Q4_K/Q6_K for the Q4_K_M variant.
-    quant: BlockQuantKinds,
+    /// On-disk quant kind per matmul site, PER BLOCK. Q8_0 everywhere for the
+    /// baseline file; the `_K_M` builds vary the kind by layer as well as by
+    /// site, so this is indexed alongside `blocks` (see [`BlockQuantKinds::probe`]).
+    quant: Vec<BlockQuantKinds>,
     /// Output-stage `scale_shift_table` rows (`[2*DIM]` / `[2*AUDIO_DIM]`),
     /// host-cached at register like the block tables: constant across steps, so
     /// reading them back per forward would stall the queue twice per step.
@@ -2476,12 +2629,13 @@ impl DitModel {
         let io = register_io(residency)?;
         let mut blocks = Vec::with_capacity(num_layers);
         let mut tables = Vec::with_capacity(num_layers);
+        let mut quant = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let h = register_block(residency, i, variant)?;
             tables.push(cond::read_block_tables(backend, residency, &h, variant).await?);
             blocks.push(h);
+            quant.push(BlockQuantKinds::probe(residency, i));
         }
-        let quant = BlockQuantKinds::probe(residency);
         let sst_out_v = read_weight_bf16(backend, residency, io.sst_out_v, 2 * dit::DIM).await?;
         let sst_out_a =
             read_weight_bf16(backend, residency, io.sst_out_a, 2 * dit::AUDIO_DIM).await?;
@@ -2677,7 +2831,7 @@ impl DitModel {
                 scope.import_copy(ones_v_b.as_buf_ref()),
                 scope.import_copy(ones_a_b.as_buf_ref()),
                 &bufs,
-                self.quant,
+                self.quant[i],
                 self.variant,
                 ActBuf::dense(scope.import_copy(vx_out.as_buf_ref())),
                 ActBuf::dense(scope.import_copy(ax_out.as_buf_ref())),

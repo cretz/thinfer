@@ -9,6 +9,7 @@ use thinfer_models::hunyuan::manifest as hunmf;
 use thinfer_models::ideogram4::manifest as idmf;
 use thinfer_models::krea::manifest as kreamf;
 use thinfer_models::ltx::manifest as ltxmf;
+use thinfer_models::minimax::manifest as mmmf;
 use thinfer_models::qwen_image::manifest as qimf;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::z_image::manifest as zmf;
@@ -37,11 +38,16 @@ pub const VIDEO_MAX_STEPS: u32 = 8;
 /// string), so they take a plain model string and validate it against this set
 /// instead of a typed enum. Keep in sync with the typed
 /// `ImageModelId::supports_adapters` / `VideoModelId::supports_adapters` predicates.
-pub const ADAPTER_MODEL_IDS: [&str; 4] = [
+pub const ADAPTER_MODEL_IDS: [&str; 9] = [
     "krea-2-turbo",
     "qwen-image-rapid",
     "qwen-image-edit-rapid",
     "anyflow-t2v-14b",
+    "fastwan2.1-t2v-1.3b",
+    "wan2.1-t2v-1.3b",
+    "minimax-h3",
+    "fasth3-trim",
+    "fasth3-omni",
 ];
 
 /// Whether `id` names an adapter-supporting model (see [`ADAPTER_MODEL_IDS`]).
@@ -118,7 +124,22 @@ pub enum ImageKind {
 }
 
 impl ImageModelId {
-    pub const DEFAULT: ImageModelId = ImageModelId::QwenImageRapid;
+    /// Z-Image-Turbo Q4_K_M: upstream weights, the fastest image model, and the
+    /// web UI's first entry (keep the two in step).
+    pub const DEFAULT: ImageModelId = ImageModelId::ZImageTurboQ4;
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ZImageTurboQ8 => "Z-Image Turbo, 8-step (Q8)",
+            Self::ZImageTurboQ4 => "Z-Image Turbo, 8-step (Q4, smaller)",
+            Self::ZImageTurboBf16 => "Z-Image Turbo, 8-step (bf16, largest)",
+            Self::Ideogram4Q8 => "Ideogram 4 + turbotime LoRA",
+            Self::QwenImageEditRapid => "Qwen-Image Edit Rapid, 4-step (edits --input-image)",
+            Self::QwenImageRapid => "Qwen-Image Rapid, 4-step",
+            Self::Krea2Turbo => "Krea 2 Turbo, 8-step, aesthetic",
+        }
+    }
 
     /// Which engine pipeline this id drives.
     pub fn kind(self) -> ImageKind {
@@ -241,6 +262,27 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "anyflow-t2v-14b"))]
     #[cfg_attr(feature = "serde", serde(rename = "anyflow-t2v-14b"))]
     AnyflowT2v14b,
+    /// Qualcomm-AI-Research/mobilewan: efficient T2V on the FastWan2.2-TI2V-5B
+    /// backbone with per-block PRUNED self-attention heads. Full softmax over the
+    /// pruned heads (the ReHyAt linear-attention maps are skipped: no public
+    /// reference). Shares the FastWan umT5 + Wan2.2 TI2V VAE + tokenizer. 480p,
+    /// 16fps. No parity reference (eyeball-only).
+    #[cfg_attr(feature = "cli", value(name = "mobilewan"))]
+    #[cfg_attr(feature = "serde", serde(rename = "mobilewan"))]
+    Mobilewan,
+    /// FastVideo FastWan2.1-T2V-1.3B: DMD 3-step distill (CFG-free) of the stock
+    /// Wan2.1-T2V-1.3B; umT5 + Wan2.1 VAE. Trained at 448x832, 16fps. The DiT is
+    /// a user weight slot, and request-time vault adapters fold onto it. T2V only.
+    #[cfg_attr(feature = "cli", value(name = "fastwan2.1-t2v-1.3b"))]
+    #[cfg_attr(feature = "serde", serde(rename = "fastwan2.1-t2v-1.3b"))]
+    Fastwan21T2v13b,
+    /// Wan2.1-T2V-1.3B (stock, or a full finetune in its DiT slot) with a
+    /// step-distill LoRA folded in (default CausVid, the same DMD 3-step schedule
+    /// as FastWan2.1). For finetunes of the stock model, which FastWan's own
+    /// distill does not carry. Vault adapters stack on top. T2V only.
+    #[cfg_attr(feature = "cli", value(name = "wan2.1-t2v-1.3b"))]
+    #[cfg_attr(feature = "serde", serde(rename = "wan2.1-t2v-1.3b"))]
+    Wan21T2v13b,
     /// LTX-2.3 distilled-1.1: a 22B joint audio-video DiT (two-stage distilled).
     /// Its own pipeline (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder);
     /// ignores the FastWan sampler/vae/shot knobs. Output MP4 carries an AAC
@@ -261,20 +303,20 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "ltx-2.3-distilled-q4"))]
     #[cfg_attr(feature = "serde", serde(rename = "ltx-2.3-distilled-q4"))]
     Ltx23DistilledQ4,
-    /// Sulphur-2 (SulphurAI): an uncensored LTX-2.3 DiT finetune. Byte-identical
-    /// DiT layout to [`Self::Ltx23Distilled`], so it runs the exact same pipeline
-    /// (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder, two-stage distilled
-    /// sampler); only the DiT weights differ (Q8_0 baseline). The
-    /// encoder/connector/VAEs/upscaler are the unchanged LTX-2.3 components.
-    #[cfg_attr(feature = "cli", value(name = "sulphur-2"))]
-    #[cfg_attr(feature = "serde", serde(rename = "sulphur-2"))]
-    Sulphur2,
-    /// Sulphur-2 with the Q4_K_M DiT (footprint variant): same pipeline as
-    /// [`Self::Sulphur2`] with the smaller DiT GGUF (per-quant-kind dense dequant
-    /// path), mirroring the LTX Q8/Q4 pair. Q8_0 stays the quality baseline.
-    #[cfg_attr(feature = "cli", value(name = "sulphur-2-q4"))]
-    #[cfg_attr(feature = "serde", serde(rename = "sulphur-2-q4"))]
-    Sulphur2Q4,
+    /// LTX-2.3 `dev` (base) DiT with the distill LoRA folded in at load.
+    /// Byte-identical DiT layout to [`Self::Ltx23Distilled`], so it runs the exact
+    /// same pipeline (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder,
+    /// two-stage distilled sampler); only the DiT weights differ (Q8_0 baseline).
+    /// The DiT and distill LoRA are user weight slots (upstream dev + the official
+    /// distill LoRA by default), so any layout-identical dev finetune fills them.
+    #[cfg_attr(feature = "cli", value(name = "ltx-2.3-dev"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ltx-2.3-dev"))]
+    Ltx23Dev,
+    /// [`Self::Ltx23Dev`] with the Q4_K_M DiT (footprint variant), mirroring the
+    /// distilled Q8/Q4 pair. Q8_0 stays the quality baseline.
+    #[cfg_attr(feature = "cli", value(name = "ltx-2.3-dev-q4"))]
+    #[cfg_attr(feature = "serde", serde(rename = "ltx-2.3-dev-q4"))]
+    Ltx23DevQ4,
     /// ltx2-rapid: an LTX-2 19B community merge (distilled + native I2V). Same
     /// dual-stream AV DiT backbone as LTX-2.3, but the 19B conditioning line
     /// (FeatureExtractor V1 + in-transformer caption projection, 2-layer ungated
@@ -322,17 +364,93 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "dreamid-v"))]
     #[cfg_attr(feature = "serde", serde(rename = "dreamid-v"))]
     DreamIdV,
+    /// MiniMax-H3 (FL2VA): a 33B dense SINGLE-STREAM joint audio-video DiT. One
+    /// packed 1-D sequence carries text, audio and video rows under full
+    /// self-attention, so there is no cross-attention and no conditioning tail.
+    /// Its own pipeline: a Qwen3-VL-32B conditioner truncated to layers 0..49, a
+    /// 36-layer ViT video VAE (16x spatial / 4x temporal, NOT a conv tower) and a
+    /// BigVGAN audio VAE at 32 kHz. Two things make it fit an 8GB card: the
+    /// per-block AdaLN projections (~13B of the 33B) are precomputed into a
+    /// ~78 MB modulation table at load, and the required lightx2v 4-step turbo
+    /// distillation is applied as a RUNTIME adapter rather than folded (folding
+    /// would re-encode every Q4_K site to Q8_0 and nearly double the streaming).
+    /// 24 fps fixed. Defaults to 832x480; the packed sequence is row-capped, so
+    /// larger canvases (up to the native 1344x768) fit shorter clips.
+    #[cfg_attr(feature = "cli", value(name = "minimax-h3"))]
+    #[cfg_attr(feature = "serde", serde(rename = "minimax-h3"))]
+    MinimaxH3,
+    /// FastVideo FastH3-Trim: the 8-step DMD distillation of MiniMax-H3 (42
+    /// blocks, rank-16 AdaLN, NVFP4 block linears). Same conditioner, VAEs and
+    /// packed pipeline as `minimax-h3`; a fixed 8-step schedule, no turbo LoRA.
+    /// Defaults to 832x480 x 124 frames (~5.2s), FastVideo's 480p regime.
+    #[cfg_attr(feature = "cli", value(name = "fasth3-trim"))]
+    #[cfg_attr(feature = "serde", serde(rename = "fasth3-trim"))]
+    Fasth3Trim,
+    /// FastVideo FastH3-Omni: the 8-step distillation of the Ref2VA
+    /// checkpoint (all 50 blocks, PDD heads, Comfy NVFP4). Text to video+audio,
+    /// optionally conditioned on reference images the prompt can name.
+    #[cfg_attr(feature = "cli", value(name = "fasth3-omni"))]
+    #[cfg_attr(feature = "serde", serde(rename = "fasth3-omni"))]
+    Fasth3Omni,
 }
 
 impl VideoModelId {
     pub const DEFAULT: VideoModelId = VideoModelId::FastwanTi2v5b;
 
+    /// The attention precision a request gets without `--attn`: INT8 on the
+    /// FastH3 models (same quality, faster), bf16 elsewhere (no INT8 path).
+    pub fn default_attn(self) -> AttnPrecision {
+        if self.is_fasth3() {
+            AttnPrecision::Int8
+        } else {
+            AttnPrecision::Bf16
+        }
+    }
+
+    /// The decoder a request gets without `--vae`. MiniMax-H3 family: the
+    /// NVFP4 decoder (indistinguishable frames, ~2x faster decode), which the
+    /// driver swaps for the fp16 one on hardware without NVFP4. Others: tiny.
+    pub fn default_vae(self) -> VaeChoice {
+        if self.is_minimax() {
+            VaeChoice::Nvfp4
+        } else {
+            VaeChoice::Tiny
+        }
+    }
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::FastwanTi2v5b => "FastWan2.2 TI2V 5B, 3-step",
+            Self::Longlive205b => "LongLive 2.0 5B, long clips",
+            Self::AnyflowT2v14b => "AnyFlow Wan2.1 14B, any step count",
+            Self::Mobilewan => "MobileWan, pruned 5B",
+            Self::Fastwan21T2v13b => "FastWan2.1 1.3B, 3-step",
+            Self::Wan21T2v13b => "Wan2.1 1.3B + step-distill LoRA",
+            Self::Ltx23Distilled => "LTX-2.3 22B distilled, video + audio (Q8)",
+            Self::Ltx23DistilledQ4 => "LTX-2.3 22B distilled, video + audio (Q4)",
+            Self::Ltx23Dev => "LTX-2.3 22B dev + distill LoRA, video + audio (Q8)",
+            Self::Ltx23DevQ4 => "LTX-2.3 22B dev + distill LoRA, video + audio (Q4)",
+            Self::Ltx2Rapid => "LTX-2 19B rapid merge, video + audio",
+            Self::Wan22T2vA14b => "Wan2.2 A14B MoE, 4-step",
+            Self::Hunyuan15T2v => "HunyuanVideo 1.5, 4-step",
+            Self::Hunyuan15I2v => "HunyuanVideo 1.5 image-to-video (--input-image)",
+            Self::DreamIdV => "DreamID-V video face swap (--input-video, --source-image)",
+            Self::MinimaxH3 => "MiniMax-H3 33B + turbo LoRA, video + audio",
+            Self::Fasth3Trim => "FastH3-Trim, 8-step, video + audio",
+            Self::Fasth3Omni => "FastH3-Omni, 8-step, video + audio, --ref-image",
+        }
+    }
+
     pub fn manifest(self) -> &'static ModelManifest {
         match self {
             VideoModelId::Ltx23Distilled | VideoModelId::Ltx23DistilledQ4 => &ltxmf::MANIFEST,
-            VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4 => &ltxmf::SULPHUR_MANIFEST,
+            VideoModelId::Ltx23Dev | VideoModelId::Ltx23DevQ4 => &ltxmf::DEV_MANIFEST,
             VideoModelId::Ltx2Rapid => &ltxmf::LTX2_RAPID_MANIFEST,
             VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v => &hunmf::MANIFEST,
+            VideoModelId::MinimaxH3 | VideoModelId::Fasth3Trim | VideoModelId::Fasth3Omni => {
+                &mmmf::MANIFEST
+            }
             _ => &wanmf::MANIFEST,
         }
     }
@@ -341,10 +459,10 @@ impl VideoModelId {
     /// (footprint). Panics for non-LTX -- guard with [`Self::is_ltx`].
     pub fn ltx_dit_role(self) -> &'static str {
         match self {
-            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Sulphur2Q4 => {
+            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Ltx23DevQ4 => {
                 ltxmf::role::DIT_GGUF_Q4_K_M
             }
-            VideoModelId::Ltx23Distilled | VideoModelId::Sulphur2 => ltxmf::role::DIT_GGUF_Q8_0,
+            VideoModelId::Ltx23Distilled | VideoModelId::Ltx23Dev => ltxmf::role::DIT_GGUF_Q8_0,
             VideoModelId::Ltx2Rapid => ltxmf::role::DIT_GGUF_Q5_K_M,
             other => panic!("ltx_dit_role on non-LTX model {other}"),
         }
@@ -354,7 +472,7 @@ impl VideoModelId {
     /// baseline (uniform per-site, the conditioning-quality default) or the Q4_K_M
     /// variant (7.3G vs 12.5G; ~2.8x faster encode, lower-precision conditioning).
     /// The encoder's per-site dequant reads the Q4_K/Q6_K mix directly. Shared by
-    /// every LTX/Sulphur variant (the encoder is common to all).
+    /// every LTX variant (the encoder is common to all).
     pub fn ltx_encoder_role(self, encoder: EncoderQuant) -> &'static str {
         debug_assert!(self.is_ltx());
         match encoder {
@@ -363,25 +481,19 @@ impl VideoModelId {
         }
     }
 
-    /// The distill-LoRA stack to fold into the Sulphur `dev` DiT, as
-    /// `(role, strength)` pairs accumulated in order (see `ltx::lora`). Default =
-    /// the single rank-reduced `condsafe` distill at 1.0 (the shipped, eyeballed
-    /// path). `THINFER_SULPHUR_DISTILL`:
-    /// - `stack` -> the distilled ComfyUI workflow recipe: `condsafe @ 0.7` +
-    ///   official `distilled-lora-384 @ 0.5` (the distill applied at <1.0 may cut
-    ///   the illustrative skew of the 1.0 single-fold).
-    /// - `rank768` -> the `sulphur_lora_rank_768` content LoRA standalone
-    ///   (known-bad in the 8-step path: undercooked mush -- repro only).
-    ///
-    /// Sulphur-only.
-    pub fn sulphur_distill_stack(self) -> Vec<(&'static str, f32)> {
-        debug_assert!(self.is_sulphur());
-        match std::env::var("THINFER_SULPHUR_DISTILL").ok().as_deref() {
+    /// The distill-LoRA stack to fold into the `dev` DiT, as `(role, strength)`
+    /// pairs accumulated in order (see `ltx::lora`). Default = the single distill
+    /// slot at 1.0. `THINFER_LTX_DISTILL=stack` -> the distilled ComfyUI workflow
+    /// recipe: the distill slot @ 0.7 + official `distilled-lora-384 @ 0.5` (the
+    /// distill applied at <1.0 may cut the illustrative skew of the 1.0
+    /// single-fold). Dev-only.
+    pub fn distill_stack(self) -> Vec<(&'static str, f32)> {
+        debug_assert!(self.folds_distill_lora());
+        match std::env::var("THINFER_LTX_DISTILL").ok().as_deref() {
             Some("stack") => vec![
                 (ltxmf::role::DISTILL_LORA, 0.7),
                 (ltxmf::role::DISTILL_LORA_384, 0.5),
             ],
-            Some("rank768") | Some("r768") => vec![(ltxmf::role::DISTILL_LORA_R768, 1.0)],
             _ => vec![(ltxmf::role::DISTILL_LORA, 1.0)],
         }
     }
@@ -389,7 +501,7 @@ impl VideoModelId {
     /// LTX joint-AV runtime role list for this variant (Q8_0 vs Q4_K_M DiT).
     pub fn ltx_runtime_roles(self) -> &'static [&'static str] {
         match self {
-            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Sulphur2Q4 => ltxmf::RUNTIME_ROLES_AV_Q4,
+            VideoModelId::Ltx23DistilledQ4 | VideoModelId::Ltx23DevQ4 => ltxmf::RUNTIME_ROLES_AV_Q4,
             VideoModelId::Ltx2Rapid => ltxmf::RUNTIME_ROLES_RAPID,
             _ => ltxmf::RUNTIME_ROLES_AV_Q8,
         }
@@ -434,6 +546,38 @@ impl VideoModelId {
         matches!(self, VideoModelId::DreamIdV)
     }
 
+    /// MiniMax-H3 and its distillations: their own single-stream packed-sequence
+    /// pipeline + audio tail. None of the Wan/LTX machinery applies.
+    pub fn is_minimax(self) -> bool {
+        self == VideoModelId::MinimaxH3 || self.is_fasth3()
+    }
+
+    /// FastVideo's 8-step H3 distills: fixed schedules, NVFP4 block linears on
+    /// the accelerated row-chunked block.
+    pub fn is_fasth3(self) -> bool {
+        matches!(self, VideoModelId::Fasth3Trim | VideoModelId::Fasth3Omni)
+    }
+
+    /// The roles a MiniMax-family t2va generate downloads and opens.
+    pub fn minimax_roles(self) -> &'static [&'static str] {
+        use thinfer_models::minimax::manifest as m;
+        match self {
+            VideoModelId::Fasth3Trim => m::RUNTIME_ROLES_T2VA_FASTH3_TRIM,
+            VideoModelId::Fasth3Omni => m::RUNTIME_ROLES_REF2VA_FASTH3_OMNI,
+            _ => m::RUNTIME_ROLES_T2VA_Q4,
+        }
+    }
+
+    /// The DiT a MiniMax-family id runs.
+    pub fn minimax_dit_config(self) -> thinfer_models::minimax::DitConfig {
+        use thinfer_models::minimax::DitConfig;
+        match self {
+            VideoModelId::Fasth3Trim => DitConfig::fasth3_trim(),
+            VideoModelId::Fasth3Omni => DitConfig::fasth3_omni(),
+            _ => DitConfig::h3_33b(),
+        }
+    }
+
     /// LTX-2.3 joint audio-video path: its own two-stage pipeline + audio tail,
     /// none of the FastWan/LongLive (Wan-base) machinery applies.
     pub fn is_ltx(self) -> bool {
@@ -441,8 +585,8 @@ impl VideoModelId {
             self,
             VideoModelId::Ltx23Distilled
                 | VideoModelId::Ltx23DistilledQ4
-                | VideoModelId::Sulphur2
-                | VideoModelId::Sulphur2Q4
+                | VideoModelId::Ltx23Dev
+                | VideoModelId::Ltx23DevQ4
                 | VideoModelId::Ltx2Rapid
         )
     }
@@ -464,26 +608,26 @@ impl VideoModelId {
         self.is_ltx_rapid()
     }
 
-    /// Sulphur-2 variants: the published GGUF is the BASE (`dev`) checkpoint, so
-    /// the distill LoRA is folded into the DiT at load (see `ltx::lora`). The LTX
-    /// distilled models ship pre-distilled DiTs and need no fold.
-    pub fn is_sulphur(self) -> bool {
-        matches!(self, VideoModelId::Sulphur2 | VideoModelId::Sulphur2Q4)
+    /// Whether this variant needs the distill LoRA folded into its DiT at load
+    /// (see `ltx::lora`): true only for the `dev` ids, whose DiT is the BASE
+    /// checkpoint. The distilled ids ship pre-distilled DiTs, so folding again
+    /// would apply it twice.
+    pub fn folds_distill_lora(self) -> bool {
+        matches!(self, VideoModelId::Ltx23Dev | VideoModelId::Ltx23DevQ4)
     }
 
     /// Default frame dims for this model. FastWan/LongLive ship the 960x544
-    /// e2e baseline; LTX ships 1280x704 (16:9 widescreen), the regime the
-    /// distilled model is in-distribution for. Lower-res LTX (e.g. the old
-    /// 768x512 / 512x320 defaults) is OUT of distribution: the denoise stays
-    /// coherent but renders the wrong subject/action (eyeballed: a man instead
-    /// of the requested woman, off-script motion), because the distilled few-step
-    /// model was trained at widescreen high res. 1280x704 is reached via the
-    /// two-stage path (`upscale`, default-on for LTX): stage 1 denoises at half
-    /// res (640x352) then a 2x latent upscale + 3-step refine at full res, which
-    /// keeps the per-step DiT activation peak inside the 8GB card when paired
-    /// with the LTX vram-budget cap (see `ltx::LTX_VRAM_BUDGET_CAP`). The video
-    /// VAE decode tiles (spatial + temporal) to the residency budget. All callers
-    /// resolve unset `--width/--height` through this.
+    /// e2e baseline; LTX ships 768x512 (see the arm for the measurement behind
+    /// that number and the quality cliff just below it).
+    ///
+    /// LTX renders via the two-stage path (`upscale`, default-on): stage 1
+    /// denoises at HALF the target, then a 2x latent upscale + 3-step refine at
+    /// full res, which keeps the per-step DiT activation peak inside the 8GB card
+    /// when paired with the LTX vram-budget cap (see `ltx::LTX_VRAM_BUDGET_CAP`).
+    /// That halving is why the useful floor is a 512 short side: it sets stage 1
+    /// at the 256 `LTX_MIN_DIM`. The video VAE decode tiles (spatial + temporal)
+    /// to the residency budget. All callers resolve unset `--width/--height`
+    /// through this.
     pub fn video_defaults(self) -> (u32, u32) {
         if self.is_ltx_rapid() {
             // The res the v62 merge's ComfyUI workflow runs (EmptyLTXVLatentVideo
@@ -492,7 +636,33 @@ impl VideoModelId {
             // short on the 8GB card (~90s/step at 81f). /64-divisible.
             (768, 512)
         } else if self.is_ltx() {
+            // 1280x704, the model's native widescreen regime. DO NOT lower this
+            // for speed: it does not buy speed. Measured 2026-09-06, same prompt
+            // and seed, a distilled LTX-2.3 Q4_K_M DiT:
+            //
+            //   1280x704  caps at 49f (2.0s)  399.0s  PHOTOREAL, best adherence
+            //   1024x576  caps at 73f (3.0s)  392.1s  stylized 3D render
+            //   768x512   full   121f (5.0s)  418.5s  cartoon, weaker adherence
+            //
+            // Every rung costs ~400s because `ltx_max_frames` shrinks the clip as
+            // dims grow, so the token budget is roughly constant on an 8GB card.
+            // Resolution therefore trades QUALITY against CLIP LENGTH, not against
+            // time. Dropping to 768x512 gives up photorealism and prompt adherence
+            // for nothing except a longer clip.
+            //
+            // Adherence and photorealism BOTH track this regime, and they track it
+            // far more strongly than the quant tier does (Q8_0 and Q4_K_M are
+            // indistinguishable at matched dims). A user who needs the full 5s must
+            // opt into 768x512 and accept the stylized look.
             (1280, 704)
+        } else if self.is_minimax() {
+            // 832x480: the 480p tier FastVideo runs FastH3 at (its other tier is
+            // H3's native 1344x768). 768p does not fit: the packed sequence puts
+            // every modality in ONE self-attention stream, ~37.8k rows at 5s, past
+            // `MAX_PACKED_ROWS` until the row-independent sites are chunked over
+            // rows. Smaller canvases are off-distribution (faces and fine detail
+            // fall apart), so the ladder does not go below this by default.
+            (832, 480)
         } else if self.is_dreamidv() {
             // 832x480: DreamID-V's default face-swap resolution (the reference
             // `size = (832, 480)`; the NaResize downsamples the target clip toward
@@ -501,6 +671,17 @@ impl VideoModelId {
         } else if self.is_hunyuan() {
             // 832x480: HunyuanVideo 1.5's native 480p T2V regime (the res the
             // lightx2v 4-step distill was trained for). 16:9, /16-divisible.
+            (832, 480)
+        } else if matches!(
+            self,
+            VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b
+        ) {
+            // 832x448: the FastWan2.1-1.3B distill's training res (61x448x832).
+            (832, 448)
+        } else if matches!(self, VideoModelId::Mobilewan) {
+            // 832x480: mobilewan's 480p regime (Wan2.2-TI2V-5B backbone, /16
+            // grid). Landscape to match the rest of the Wan 480p family and stay
+            // inside the activation envelope; override with --width/--height.
             (832, 480)
         } else if matches!(
             self,
@@ -543,7 +724,9 @@ impl VideoModelId {
     pub fn wan_tiny_vae_role(self) -> &'static str {
         use thinfer_models::wan::manifest::role;
         match self {
-            VideoModelId::AnyflowT2v14b => role::TINY_VAE_WAN21,
+            VideoModelId::AnyflowT2v14b
+            | VideoModelId::Fastwan21T2v13b
+            | VideoModelId::Wan21T2v13b => role::TINY_VAE_WAN21,
             _ => role::TINY_VAE,
         }
     }
@@ -563,19 +746,86 @@ impl VideoModelId {
     /// incoherent, so dims under this are rejected rather than silently bad.
     pub const LTX_MIN_DIM: u32 = 256;
 
+    /// Adherence floor for the LTX family: BOTH a total pixel count and a short
+    /// side. Below it the denoise stays perfectly coherent but stops rendering
+    /// what was asked for -- and it is the SCENE that goes, not the subject. That
+    /// is the worst kind of failure, because the clip looks fine on its own and
+    /// is simply not the requested shot. Dims under the floor are allowed (a fast
+    /// preview is a legitimate thing to want) but always warn.
+    ///
+    /// MEASURED 2026-09-06, a distilled LTX-2.3 Q4_K_M DiT, one prompt with 4 subject and 3
+    /// scene attributes, every rung at a FIXED 49 frames so resolution is the
+    /// only variable (the earlier ladder let the frame cap grow as dims shrank,
+    /// which confounded resolution with clip length):
+    ///
+    /// | dims     |   px | short | result                                  |
+    /// |----------|------|-------|-----------------------------------------|
+    /// | 1280x704 | 901k |   704 | subject + pier, 3D-render look          |
+    /// | 1024x576 | 590k |   576 | subject + pier, 3D-render look          |
+    /// |  896x512 | 459k |   512 | photoreal, but lost the pier            |
+    /// |  768x512 | 393k |   512 | subject + pier + correct overcast sky   |
+    /// |  896x448 | 401k |   448 | CARTOON, scene gone                     |
+    /// |  640x512 | 328k |   512 | claymation, subject cropped             |
+    /// |  640x384 | 245k |   384 | scene dissolves to a blank void         |
+    /// |  512x320 | 164k |   320 | scene REPLACED (indoor shop, not a pier)|
+    ///
+    /// BOTH conditions bind, which is why this is not one number. 896x448 has
+    /// MORE pixels than 768x512 and still goes cartoon (short side 448), while
+    /// 640x512 has the 512 short side and still collapses (only 328k px). So
+    /// neither the pure-area rule nor the pure-short-side rule fits; the earlier
+    /// "512 short side" falsification was itself measured on 512x512, which fails
+    /// the AREA condition, so it never tested the short side in isolation.
+    /// 768x512 is the smallest point on the /64 grid meeting both, and it is also
+    /// the largest rung where a full 5s clip fits the frame cap.
+    ///
+    /// Caveat on granularity: adherence is NOT monotonic rung-to-rung at a single
+    /// seed (896x512 scored worse than the smaller 768x512 here, on composition
+    /// luck). These conditions separate the two GROUPS reliably; they are not
+    /// fine enough to rank neighbours.
+    pub const LTX_ADHERENCE_FLOOR_PX: u32 = 768 * 512;
+    pub const LTX_ADHERENCE_MIN_SIDE: u32 = 512;
+
+    /// Whether these dims clear the adherence floor (see
+    /// [`Self::LTX_ADHERENCE_FLOOR_PX`]).
+    pub fn ltx_dims_hold_adherence(self, width: u32, height: u32) -> bool {
+        !self.is_ltx()
+            || (width * height >= Self::LTX_ADHERENCE_FLOOR_PX
+                && width.min(height) >= Self::LTX_ADHERENCE_MIN_SIDE)
+    }
+
     /// Pixel-dim divisor this model requires (`--width`/`--height` must be a
     /// multiple). Wan narrows by 16; LTX's two-stage halving + /32 latent grid
     /// needs a multiple of 64 (stage 1 runs at half res, /32-divisible).
     pub fn dim_multiple(self) -> u32 {
-        if self.is_ltx() { 64 } else { 16 }
+        if self.is_ltx() {
+            64
+        } else if self.is_minimax() {
+            // 16x VAE spatial compression x the (1, 2, 2) DiT patch.
+            32
+        } else {
+            16
+        }
     }
+
+    /// MiniMax-H3 default clip length. Frames snap to `17n + 5`; `n = 3` is
+    /// 56 frames (~2.3 s at 24 fps): the base model runs the slow 4-step turbo
+    /// over the Q4_K DiT, so its default stays short.
+    pub const MINIMAX_DEFAULT_FRAMES: u32 = 56;
+
+    /// FastH3-Trim default clip length: 124 frames (`n = 7`, ~5.2 s), the
+    /// length FastVideo trains and runs it at. ~14.9k packed rows at 832x480.
+    pub const FASTH3_DEFAULT_FRAMES: u32 = 124;
 
     /// Model-preferred playback fps: default for fps and the `--duration`
     /// divisor. The Wan TI2V line is authored at 24; Wan2.2-A14B at 16 (upstream).
     pub fn fps(self) -> u32 {
         if matches!(
             self,
-            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
+            VideoModelId::Wan22T2vA14b
+                | VideoModelId::AnyflowT2v14b
+                | VideoModelId::Mobilewan
+                | VideoModelId::Fastwan21T2v13b
+                | VideoModelId::Wan21T2v13b
         ) || self.is_hunyuan()
             || self.is_dreamidv()
         {
@@ -601,6 +851,18 @@ impl VideoModelId {
         }
     }
 
+    /// Default denoise sampler when the caller leaves it unset. UniPC (the public
+    /// FastWan Spaces' solver) for the Wan line, except FastWan2.1-1.3B, whose
+    /// card documents only its DMD 3-step schedule (`1000,757,522`), the regime
+    /// the e2e parity gate pins, and Wan2.1-1.3B, whose distill LoRA is CausVid's
+    /// same DMD schedule.
+    pub fn default_sampler(self) -> VideoSampler {
+        match self {
+            VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b => VideoSampler::Dmd,
+            _ => VideoSampler::UniPc,
+        }
+    }
+
     /// DreamID-V image-CFG guidance scale on the source-face reference when the
     /// caller leaves `--guide-scale` unset (`wan::dreamidv::DEFAULT_GUIDE_SCALE`).
     pub fn default_guide_scale(self) -> f32 {
@@ -608,12 +870,17 @@ impl VideoModelId {
     }
 
     /// Whether request-time user adapters (the vault LoRA fold) apply to this
-    /// video model. Only AnyFlow: it is the sole video DiT stored as diffusers-named
-    /// safetensors (the `wan::lora` rename map targets those ids), and the ecosystem
-    /// base-Wan2.1 LoRAs fold onto it. The GGUF/MoE/LTX/causal paths are not wired
-    /// (different names, or the distill LoRA already occupies the fold).
+    /// video model. The single-file Wan2.1 DiTs (AnyFlow 14B, FastWan2.1 1.3B,
+    /// Wan2.1 1.3B, the last stacked over its distill LoRA): the `wan::lora`
+    /// rename map targets those ids, and the ecosystem base-Wan2.1 LoRAs fold onto
+    /// them. MiniMax-H3 and FastH3 apply them at RUNTIME (stacked low-rank
+    /// pairs, `minimax::lora`), so neither the Q4_K nor the NVFP4 DiT is
+    /// refolded. The other GGUF/MoE/LTX/causal paths are not wired.
     pub fn supports_adapters(self) -> bool {
-        matches!(self, VideoModelId::AnyflowT2v14b)
+        matches!(
+            self,
+            VideoModelId::AnyflowT2v14b | VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b
+        ) || self.is_minimax()
     }
 
     /// Default clip length in seconds when neither frames nor duration is
@@ -630,6 +897,10 @@ impl VideoModelId {
     pub fn default_frames(self) -> u32 {
         if self.is_ltx() {
             Self::LTX_DEFAULT_FRAMES
+        } else if self.is_fasth3() {
+            Self::FASTH3_DEFAULT_FRAMES
+        } else if self.is_minimax() {
+            Self::MINIMAX_DEFAULT_FRAMES
         } else if matches!(self, VideoModelId::Wan22T2vA14b) {
             Self::WAN22_DEFAULT_FRAMES
         } else if self.is_dreamidv() {
@@ -727,6 +998,14 @@ impl VideoModelId {
     /// count is on the model's temporal grid (`factor*k + 1`).
     pub fn max_frames(self, width: u32, height: u32) -> Option<u32> {
         let max_cells = self.max_latent_cells()?;
+        // Experiment-only override of the activation envelope
+        // (`THINFER_MAX_LATENT_CELLS`). The shipped constant was derived
+        // empirically; this exists to RE-MEASURE the device-loss boundary after
+        // changes that move the peak. Raising it can device-lose mid-denoise.
+        let max_cells = std::env::var("THINFER_MAX_LATENT_CELLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(max_cells);
         let div = self.latent_spatial_divisor();
         let cells_per_lat_frame = (height / div).max(1) * (width / div).max(1);
         let max_f_lat = (max_cells / cells_per_lat_frame).max(1);
@@ -818,15 +1097,46 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::FastwanTi2v5b => "fastwan-ti2v-5b",
             VideoModelId::Longlive205b => "longlive-2.0-5b",
             VideoModelId::AnyflowT2v14b => "anyflow-t2v-14b",
+            VideoModelId::Mobilewan => "mobilewan",
+            VideoModelId::Fastwan21T2v13b => "fastwan2.1-t2v-1.3b",
+            VideoModelId::Wan21T2v13b => "wan2.1-t2v-1.3b",
             VideoModelId::Ltx23Distilled => "ltx-2.3-distilled",
             VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
-            VideoModelId::Sulphur2 => "sulphur-2",
-            VideoModelId::Sulphur2Q4 => "sulphur-2-q4",
+            VideoModelId::Ltx23Dev => "ltx-2.3-dev",
+            VideoModelId::Ltx23DevQ4 => "ltx-2.3-dev-q4",
             VideoModelId::Ltx2Rapid => "ltx2-rapid",
             VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
             VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",
             VideoModelId::Hunyuan15I2v => "hunyuan-video-1.5-ti2v",
             VideoModelId::DreamIdV => "dreamid-v",
+            VideoModelId::MinimaxH3 => "minimax-h3",
+            VideoModelId::Fasth3Trim => "fasth3-trim",
+            VideoModelId::Fasth3Omni => "fasth3-omni",
+        })
+    }
+}
+
+/// Attention precision for the FastH3 models' sparse attention (VSA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum AttnPrecision {
+    /// bf16 Q/K/V (the reference path).
+    Bf16,
+    /// INT8 QK^T (SageAttention-style: K smoothed by its mean, per-tile
+    /// scales; P.V stays bf16). Same quality, but a different sample per seed
+    /// than bf16; ~1.2x faster attention (~1.35x with reference images). The
+    /// FastH3 default.
+    Int8,
+}
+
+impl std::fmt::Display for AttnPrecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AttnPrecision::Bf16 => "bf16",
+            AttnPrecision::Int8 => "int8",
         })
     }
 }
@@ -845,12 +1155,34 @@ pub enum VaeChoice {
     /// than the base tiny. Hunyuan-only; other models fall back to `Tiny`.
     #[cfg_attr(feature = "cli", value(name = "tiny-ft"))]
     TinyFt,
+    /// MiniMax-H3 family: FastVideo's NVFP4 video decoder, all 36 layers
+    /// (QAD; ~46 dB PSNR vs the original decoder). Opt-in: lossy, faster, needs
+    /// an NVIDIA Blackwell GPU (NVFP4).
+    Nvfp4,
+    /// MiniMax-H3 family: the 8-layer NVFP4 decoder (~36 dB). Opt-in, fastest.
+    #[cfg_attr(feature = "cli", value(name = "nvfp4-fast"))]
+    Nvfp4Fast,
+}
+
+impl VaeChoice {
+    /// The MiniMax-H3 NVFP4 decoder this selects, as (manifest role, decoder
+    /// layers). `None` = the H3 family's own fp16 decoder.
+    pub fn minimax_nvfp4(self) -> Option<(&'static str, usize)> {
+        use thinfer_models::minimax::manifest::role;
+        match self {
+            VaeChoice::Nvfp4 => Some((role::VAE_DECODER_NVFP4, 36)),
+            VaeChoice::Nvfp4Fast => Some((role::VAE_DECODER_NVFP4_FAST, 8)),
+            VaeChoice::Full | VaeChoice::Tiny | VaeChoice::TinyFt => None,
+        }
+    }
 }
 
 impl From<VaeChoice> for thinfer_models::wan::pipeline::VaeChoice {
     fn from(v: VaeChoice) -> Self {
         match v {
-            VaeChoice::Full => Self::Full,
+            // The NVFP4 decoders are MiniMax-H3 only and rejected for every
+            // other model at request validation.
+            VaeChoice::Full | VaeChoice::Nvfp4 | VaeChoice::Nvfp4Fast => Self::Full,
             // Wan has no fine-tuned tiny decoder; a `tiny-ft` request on a Wan
             // model degrades to its own tiny (the ft is a Hunyuan-only option,
             // and the web only offers it for Hunyuan).
@@ -865,12 +1197,14 @@ impl std::fmt::Display for VaeChoice {
             VaeChoice::Full => "full",
             VaeChoice::Tiny => "tiny",
             VaeChoice::TinyFt => "tiny-ft",
+            VaeChoice::Nvfp4 => "nvfp4",
+            VaeChoice::Nvfp4Fast => "nvfp4-fast",
         })
     }
 }
 
 /// LTX-2.3 text-encoder (Gemma-3-12B) quantization. Applies to ALL LTX models
-/// (the encoder is shared across `ltx-2.3-distilled{,-q4}` and `sulphur-2{,-q4}`).
+/// (the encoder is shared across `ltx-2.3-distilled{,-q4}` and `ltx-2.3-dev{,-q4}`).
 /// `Q8` is the conditioning-quality baseline (uniform Q8_0, 12.5G); `Q4` is the
 /// Q4_K_M variant (7.3G; mixed Q4_K/Q6_K) -- ~2.8x faster encode (~16s -> ~6s)
 /// for lower-precision conditioning. Ignored by the Wan models.
@@ -998,6 +1332,15 @@ pub enum SwapModel {
 
 impl SwapModel {
     pub const DEFAULT: SwapModel = SwapModel::Hyperswap1a;
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Hyperswap1a => "HyperSwap 1a",
+            Self::Hyperswap1b => "HyperSwap 1b",
+            Self::Hyperswap1c => "HyperSwap 1c",
+        }
+    }
 
     /// The HyperSwap weight file for this checkpoint.
     pub fn file(self) -> thinfer_core::manifest::FileRef {

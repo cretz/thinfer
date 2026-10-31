@@ -1,7 +1,6 @@
 //! Z-Image-Turbo. fp16 ema-only, M1 target.
 //!
 //! Source: github.com/Tongyi-MAI/Z-Image (`src/zimage/transformer.py`).
-//! Per-model details live in `projects/thinfer-working-area/zimage-plan.md`.
 //!
 //! Engine-wide rules (Module shape, residency, op trait) live in
 //! `thinfer-core`; this module is glue: shapes, weight-name maps, the per-block

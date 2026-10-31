@@ -70,6 +70,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+// bf16-packed words -> f32. Input `array<u32>` (each word = two packed bf16:
+// low half then high half); output `array<f32>` with twice as many elements.
+// One thread per INPUT word, guarded on the OUTPUT arrayLength (dst has 2x the
+// words, and dispatch counts by the F32 dispatch granularity = one thread per
+// output word, so half the threads exit early — cheap and keeps the standard
+// `dispatch_op` output-length guard).
+const WGSL_BF16_TO_F32: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let i = gid.y * (ng.x * 64u) + gid.x;
+    if (2u * i >= arrayLength(&dst)) { return; }
+    let w = src[i];
+    dst[2u * i] = bitcast<f32>((w & 0xFFFFu) << 16u);
+    dst[2u * i + 1u] = bitcast<f32>(w & 0xFFFF0000u);
+}
+"#;
+
+// f32 -> bf16-packed words. Input `array<f32>`; output `array<u32>` (each word
+// = two RNE-rounded bf16, low half then high half). One thread per OUTPUT word,
+// guarded on the OUTPUT arrayLength.
+const WGSL_F32_TO_BF16: &str = r#"
+fn round_bf16(x: f32) -> u32 {
+    let b = bitcast<u32>(x);
+    if ((b & 0x7F800000u) == 0x7F800000u) { return (b >> 16u) & 0xFFFFu; }
+    let l = (b >> 16u) & 1u;
+    return ((b + 0x7FFFu + l) >> 16u) & 0xFFFFu;
+}
+
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
+    let i = gid.y * (ng.x * 64u) + gid.x;
+    if (i >= arrayLength(&dst)) { return; }
+    dst[i] = round_bf16(src[2u * i]) | (round_bf16(src[2u * i + 1u]) << 16u);
+}
+"#;
+
 /// bf16-packed acts -> f16-packed acts (clamped to the f16 finite range). The
 /// `F32` dtype is the dispatch granularity only: it makes `dispatch_op` count
 /// `u32` words (one thread per packed pair), NOT a value type.
@@ -99,6 +141,43 @@ impl Op for F16ToBf16 {
     const OUTPUT: &'static str = "cast_act/dst";
     fn wgsl(_cfg: &WgslConfig) -> &'static str {
         WGSL_F16_TO_BF16
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+}
+
+/// bf16-packed words -> unpacked f32 (input `array<u32>`, output `array<f32>`
+/// with 2x the elements). `F32` dtype is the dispatch granularity: `dispatch_op`
+/// counts output f32 elements, so half the threads exit on the OUTPUT-length
+/// guard. See [`Bf16ToF16`] for the `F32`-dtype note.
+pub struct Bf16ToF32;
+
+impl Op for Bf16ToF32 {
+    const KERNEL_ID: &'static str = "cast_act.bf16_to_f32";
+    type Dtype = F32;
+    const INPUTS: &'static [&'static str] = &["cast_act/src"];
+    const OUTPUT: &'static str = "cast_act/dst";
+    fn wgsl(_cfg: &WgslConfig) -> &'static str {
+        WGSL_BF16_TO_F32
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+}
+
+/// f32 -> bf16-packed words (RNE rounding; input `array<f32>`, output
+/// `array<u32>` with two bf16 per word). See [`Bf16ToF16`] for the `F32`-dtype
+/// note.
+pub struct F32ToBf16;
+
+impl Op for F32ToBf16 {
+    const KERNEL_ID: &'static str = "cast_act.f32_to_bf16";
+    type Dtype = F32;
+    const INPUTS: &'static [&'static str] = &["cast_act/src"];
+    const OUTPUT: &'static str = "cast_act/dst";
+    fn wgsl(_cfg: &WgslConfig) -> &'static str {
+        WGSL_F32_TO_BF16
     }
     fn layout() -> &'static [BindingLayout] {
         LAYOUT

@@ -37,7 +37,7 @@ use thinfer_models::wan::pipeline::{
     self as wanpipe, GenerationParams as WanParams, Shot, VaeChoice, WanModel, WanVariant, WanVideo,
 };
 use thinfer_models::wan::source::{
-    WanSource, open_dreamidv_source, open_longlive_source, open_wan22_source,
+    dit_gguf_renames, open_dreamidv_source, open_longlive_source, open_wan22_source,
 };
 use thinfer_models::z_image::manifest::role as zrole;
 use thinfer_models::z_image::pipeline::{self as zpipe, GenerationParams as ZParams, ZImageModel};
@@ -177,17 +177,22 @@ impl LocalExecutor {
         let residency = WeightResidency::new(source, image_budget(req.budget));
         let model = {
             let _s = tracing::info_span!("model_load").entered();
-            ZImageModel::load(self.backend.clone(), residency, tokenizer)
-                .await
-                .map_err(|e| format!("model load: {e:?}"))?
+            // Default Q8: a bf16-source DiT (the bf16 variant) transcodes to Q8
+            // at load for the fast i8 matmul. `--full-precision` opts into bf16.
+            ZImageModel::load(
+                self.backend.clone(),
+                residency,
+                tokenizer,
+                !req.full_precision,
+            )
+            .await
+            .map_err(|e| format!("model load: {e:?}"))?
         };
         let png = model
             .generate(&params, Some(&progress))
             .await
             .map_err(|e| format!("generate: {e:?}"))?;
-        tokio::fs::write(&req.output, &png)
-            .await
-            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        crate::progress::write_artifact(sink, &req.output, &png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
 
         Ok(JobSummary {
@@ -273,9 +278,7 @@ impl LocalExecutor {
             .generate(&params, None, Some(&progress))
             .await
             .map_err(|e| format!("generate: {e:?}"))?;
-        tokio::fs::write(&req.output, &png)
-            .await
-            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        crate::progress::write_artifact(sink, &req.output, &png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
 
         Ok(JobSummary {
@@ -437,9 +440,7 @@ impl LocalExecutor {
             .map_err(|e| format!("generate: {e:?}"))?;
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
-        tokio::fs::write(&req.output, &png)
-            .await
-            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        crate::progress::write_artifact(sink, &req.output, &png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
 
         Ok(JobSummary {
@@ -567,9 +568,7 @@ impl LocalExecutor {
             .map_err(|e| format!("generate: {e:?}"))?;
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
-        tokio::fs::write(&req.output, &png)
-            .await
-            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        crate::progress::write_artifact(sink, &req.output, &png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
 
         Ok(JobSummary {
@@ -695,9 +694,7 @@ impl LocalExecutor {
             .map_err(|e| format!("generate: {e:?}"))?;
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
-        tokio::fs::write(&req.output, &png)
-            .await
-            .map_err(|e| format!("write {}: {e}", req.output.display()))?;
+        crate::progress::write_artifact(sink, &req.output, &png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
 
         Ok(JobSummary {
@@ -727,10 +724,36 @@ impl LocalExecutor {
         model_label: &str,
         lora_renames: HashMap<WeightId, WeightId>,
         sink: &dyn ProgressSink,
-    ) -> Result<
-        vault_lora::LoraFoldSource<B, RenamedSource<ShardedSafetensorsSource<BytesOpener>>>,
-        String,
-    > {
+    ) -> Result<vault_lora::LoraFoldSource<B, AdapterSource>, String> {
+        let stacks = self
+            .vault_stacks(
+                &base,
+                lora,
+                password,
+                vault_dir,
+                model_label,
+                lora_renames,
+                sink,
+            )
+            .await?;
+        vault_lora::LoraFoldSource::new(base, stacks)
+            .map_err(|e| format!("build adapter fold: {e}"))
+    }
+
+    /// The fold stacks of [`Self::fold_adapters`], for callers that stack them
+    /// over a model's own LoRA.
+    #[cfg(feature = "vault")]
+    #[allow(clippy::too_many_arguments)]
+    async fn vault_stacks<B: WeightSource>(
+        &self,
+        base: &B,
+        lora: &[crate::request::LoraRef],
+        password: Option<&crate::request::Secret>,
+        vault_dir: &Path,
+        model_label: &str,
+        lora_renames: HashMap<WeightId, WeightId>,
+        sink: &dyn ProgressSink,
+    ) -> Result<Vec<AdapterStack>, String> {
         let password = password.ok_or("a vault password is required to use adapters")?;
         let vault = crate::vault::Vault::new(vault_dir);
         let mut stacks = Vec::with_capacity(lora.len());
@@ -742,10 +765,7 @@ impl LocalExecutor {
                 .await
                 .map_err(|e| format!("parse adapter {}: {e:?}", l.id))?;
             let adapter = RenamedSource::with_passthrough(raw, lora_renames.clone());
-            let specs = vault_lora::discover_specs(&base, &adapter)
-                .await
-                .map_err(|e| format!("discover adapter {} sites: {e:?}", l.id))?;
-            stacks.push((adapter, l.weight, specs));
+            stacks.push(adapter_stack(base, adapter, l.weight, &l.id).await?);
         }
         let sites: usize = stacks.iter().map(|(_, _, s)| s.len()).sum();
         if sites == 0 {
@@ -758,8 +778,7 @@ impl LocalExecutor {
             "Folding {} adapter(s) into {model_label} ({sites} sites); first-touch quantizes each site",
             stacks.len(),
         ));
-        vault_lora::LoraFoldSource::new(base, stacks)
-            .map_err(|e| format!("build adapter fold: {e}"))
+        Ok(stacks)
     }
 
     async fn run_video(
@@ -772,6 +791,11 @@ impl LocalExecutor {
         // machinery, so it dispatches to its own driver before any Wan lookup.
         if req.model.is_ltx() {
             return crate::ltx::run(&self.backend, req, sink).await;
+        }
+        // MiniMax-H3: one packed sequence under full self-attention, its own
+        // conditioner and two VAEs. Dispatch before any Wan lookup.
+        if req.model.is_minimax() {
+            return crate::minimax::run(&self.backend, req, sink).await;
         }
         // HunyuanVideo 1.5: its own encoder/refiner/DiT/VAE pipeline, no Wan
         // variant/sampler/vae machinery. Dispatch before any Wan lookup; the
@@ -916,20 +940,40 @@ impl LocalExecutor {
                 &cancel,
             )
             .await?
-        } else if req.model.supports_adapters() && !req.lora.is_empty() {
-            // AnyFlow with request-time vault LoRAs: fold the adapters into its
-            // diffusers-named DiT (the fold only touches DiT matmul sites; umT5 +
-            // VAE pass through). `run_wan` is generic over the source, so the folded
-            // and plain paths share the denoise/decode tail.
-            #[cfg(feature = "vault")]
-            {
-                let sharded = ShardedSafetensorsSource::open(weight_openers)
+        } else {
+            // Single-file safetensors Wan (GGUF deferred: the union path in
+            // wan::source is retained for a published FastWan GGUF). DiT slots take
+            // diffusers or original-Wan (ComfyUI) names; the renames are no-ops on
+            // the former. The fold serves the model's own distill LoRA, then any
+            // request-time vault adapters on top (none = passthrough). `run_wan`
+            // is generic over the source.
+            let wan_variant = plain_wan_variant(req.model);
+            let n = wan_variant.dit.num_layers;
+            let base = RenamedSource::with_passthrough(
+                ShardedSafetensorsSource::open(weight_openers)
                     .await
-                    .map_err(|e| format!("parse weight files: {e:?}"))?;
-                let n = thinfer_models::wan::dit_block::WanDitConfig::anyflow_t2v_14b().num_layers;
-                let folded = self
-                    .fold_adapters(
-                        sharded,
+                    .map_err(|e| format!("parse weight files: {e:?}"))?,
+                dit_gguf_renames(n),
+            );
+            let mut stacks = Vec::new();
+            if let Some(role) = variant.lora_low_role {
+                let path = resolve_role(manifest, role)?;
+                let bytes =
+                    std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+                let raw = ShardedSafetensorsSource::open(vec![BytesOpener::new(bytes)])
+                    .await
+                    .map_err(|e| format!("parse distill LoRA: {e:?}"))?;
+                let lora = RenamedSource::with_passthrough(
+                    raw,
+                    thinfer_models::wan::lora::distill_lora_key_renames(n),
+                );
+                stacks.push(adapter_stack(&base, lora, 1.0, "distill").await?);
+            }
+            if req.model.supports_adapters() && !req.lora.is_empty() {
+                #[cfg(feature = "vault")]
+                stacks.extend(
+                    self.vault_stacks(
+                        &base,
                         &req.lora,
                         req.vault_password.as_ref(),
                         &req.vault_dir,
@@ -937,37 +981,13 @@ impl LocalExecutor {
                         thinfer_models::wan::lora::lora_key_renames(n),
                         sink,
                     )
-                    .await?;
-                self.run_wan(
-                    folded,
-                    req,
-                    tokenizer,
-                    &params,
-                    &plan.shots,
-                    vae,
-                    false,
-                    WanVariant::anyflow_t2v_14b(),
-                    &progress,
-                    &cancel,
-                )
-                .await?
+                    .await?,
+                );
+                #[cfg(not(feature = "vault"))]
+                return Err("this build has no adapter (vault) support".into());
             }
-            #[cfg(not(feature = "vault"))]
-            return Err("this build has no adapter (vault) support".into());
-        } else {
-            // GGUF deferred: bringup is safetensors-only (the union path in
-            // wan::source is retained for a published FastWan GGUF).
-            let source = WanSource::open(weight_openers, None)
-                .await
-                .map_err(|e| format!("parse weight files: {e:?}"))?;
-            let wan_variant = if matches!(req.model, VideoModelId::AnyflowT2v14b) {
-                // All-safetensors like FastWan (3 DiT shards lead the opener
-                // list); the variant flips the 14B geometry + delta embedder +
-                // Q8 block transcode + the any-step denoise.
-                WanVariant::anyflow_t2v_14b()
-            } else {
-                WanVariant::fastwan_ti2v_5b()
-            };
+            let source = vault_lora::LoraFoldSource::new(base, stacks)
+                .map_err(|e| format!("build adapter fold: {e}"))?;
             self.run_wan(
                 source,
                 req,
@@ -986,7 +1006,11 @@ impl LocalExecutor {
         match req.format {
             VideoFormat::Mp4 => {
                 sink.note("Encoding MP4 (H.264)");
-                codec::encode_mp4(&video, plan.fps, &req.output)?;
+                crate::progress::write_artifact(
+                    sink,
+                    &req.output,
+                    &codec::encode_mp4(&video, plan.fps)?,
+                )?;
             }
             VideoFormat::PngFrames => {
                 sink.note("Writing PNG frames");
@@ -1059,6 +1083,9 @@ impl LocalExecutor {
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         req.validate()?;
+        // The ONNX runtime runs no accelerator op and reallocates per frame:
+        // exportable (CUDA-shared) buffers would cost ~3x the whole swap.
+        let _plain = self.backend.plain_allocations();
         let scrfd = std::fs::read(resolve_file(&crate::model::SCRFD)?)
             .map_err(|e| format!("read scrfd: {e}"))?;
         let arcface = std::fs::read(resolve_file(&crate::model::ARCFACE)?)
@@ -1205,6 +1232,11 @@ impl LocalExecutor {
         )
         .await
         .map_err(|e| format!("face-mask (DWPose): {e:?}"))?;
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
+            "dreamid-v masks done",
+        );
 
         // --- 4. flatten to interleaved RGB [n, h, w, 3] the pipeline expects ---
         let mut video_rgb = Vec::with_capacity(cap * fh * fw * 3);
@@ -1291,10 +1323,14 @@ impl LocalExecutor {
             seed,
         };
         sink.stage(Stage::VaeDecode);
-        let out = pipeline
-            .generate(&inputs, None)
-            .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+        let out = pipeline.generate(&inputs, None).await.map_err(|e| {
+            tracing::warn!(
+                target: thinfer_core::trace::DIAG,
+                mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
+                "dreamid-v generate failed",
+            );
+            format!("generate: {e:?}")
+        })?;
 
         // --- 7. encode the swapped clip -> MP4 ---
         let video = WanVideo {
@@ -1305,7 +1341,7 @@ impl LocalExecutor {
         };
         let fps = plan.fps;
         sink.note("Encoding MP4 (H.264)");
-        codec::encode_mp4(&video, fps, &req.output)?;
+        crate::progress::write_artifact(sink, &req.output, &codec::encode_mp4(&video, fps)?)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
         Ok(JobSummary {
@@ -1354,22 +1390,29 @@ async fn open_mmap(path: &Path) -> Result<MmapFileOpener, String> {
         .map_err(|e| format!("open {}: {e}", path.display()))
 }
 
-/// A `FileOpener` over decrypted adapter bytes held in RAM: the vault decrypts a
-/// blob to a `Vec<u8>`, this wraps it so `ShardedSafetensorsSource` can parse it
-/// like a file. Cheap to reopen (an `Arc` clone per per-tensor reader). The
-/// plaintext lives only as long as the fold source that reads it.
-#[cfg(feature = "vault")]
+/// A `FileOpener` over adapter bytes held in RAM (vault-decrypted, or a
+/// manifest distill LoRA), so `ShardedSafetensorsSource` can parse it like a
+/// file and every fold stack shares one adapter type. Cheap to reopen (an `Arc`
+/// clone per per-tensor reader). Vault plaintext lives only as long as the fold
+/// source that reads it, and is zeroed when the last reader drops.
 #[derive(Clone)]
-struct BytesOpener(Arc<[u8]>);
+pub(crate) struct BytesOpener(Arc<PlainBytes>);
 
-#[cfg(feature = "vault")]
-impl BytesOpener {
-    fn new(bytes: Vec<u8>) -> Self {
-        Self(Arc::from(bytes.into_boxed_slice()))
+/// Decrypted adapter bytes, zeroed on drop (never merely freed).
+pub(crate) struct PlainBytes(Box<[u8]>);
+
+impl Drop for PlainBytes {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0[..]);
     }
 }
 
-#[cfg(feature = "vault")]
+impl BytesOpener {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(PlainBytes(bytes.into_boxed_slice())))
+    }
+}
+
 impl thinfer_core::weight::FileOpener for BytesOpener {
     type Reader = BytesReader;
     type Error = std::convert::Infallible;
@@ -1380,22 +1423,57 @@ impl thinfer_core::weight::FileOpener for BytesOpener {
     }
 }
 
-#[cfg(feature = "vault")]
-struct BytesReader {
-    bytes: Arc<[u8]>,
+pub(crate) struct BytesReader {
+    bytes: Arc<PlainBytes>,
 }
 
-#[cfg(feature = "vault")]
 impl thinfer_core::weight::WeightReader for BytesReader {
     type Error = std::convert::Infallible;
     fn len(&self) -> u64 {
-        self.bytes.len() as u64
+        self.bytes.0.len() as u64
     }
     async fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
         let off = offset as usize;
-        dst.copy_from_slice(&self.bytes[off..off + dst.len()]);
+        dst.copy_from_slice(&self.bytes.0[off..off + dst.len()]);
         Ok(())
     }
+}
+
+/// A parsed, renamed LoRA in RAM (vault adapter or manifest distill LoRA).
+type AdapterSource = RenamedSource<ShardedSafetensorsSource<BytesOpener>>;
+/// One fold stack: the adapter, its strength, and its discovered sites.
+type AdapterStack = (AdapterSource, f32, Vec<vault_lora::FoldSpec>);
+
+/// Discover `adapter`'s fold sites on `base` (logged under `label`).
+async fn adapter_stack<B: WeightSource>(
+    base: &B,
+    adapter: AdapterSource,
+    strength: f32,
+    label: &str,
+) -> Result<AdapterStack, String> {
+    let specs = vault_lora::discover_specs(base, &adapter)
+        .await
+        .map_err(|e| format!("discover adapter {label} sites: {e:?}"))?;
+    // Delta keys in the adapter vs sites that matched a base tensor: an
+    // unmatched remainder means keys the rename map does not cover.
+    let deltas = adapter
+        .catalog()
+        .entries
+        .keys()
+        .filter(|k| {
+            [".lora_A.weight", ".lora_down.weight", ".diff", ".diff_b"]
+                .iter()
+                .any(|s| k.0.ends_with(s))
+        })
+        .count();
+    tracing::info!(
+        target: thinfer_core::trace::DIAG,
+        matched = specs.len(),
+        unmatched = deltas.saturating_sub(specs.len()),
+        strength,
+        "adapter sites discovered",
+    );
+    Ok((adapter, strength, specs))
 }
 
 async fn load_tokenizer(path: &Path) -> Result<HfTokenizer, String> {
@@ -1433,6 +1511,21 @@ fn map_ideo(ev: idpipe::ProgressEvent) -> Stage {
         idpipe::ProgressEvent::TextEncode => Stage::TextEncode,
         idpipe::ProgressEvent::Step { i, n } => Stage::Step { i, n },
         idpipe::ProgressEvent::VaeDecode => Stage::VaeDecode,
+    }
+}
+
+/// The Wan variant for a single-expert, all-safetensors text-to-video model
+/// (the DiT shard(s) lead the opener list). AnyFlow flips the 14B geometry +
+/// delta embedder + Q8 block transcode + the any-step denoise; mobilewan the
+/// pruned self-attention heads; FastWan2.1 the stock 1.3B backbone + Wan2.1 VAE.
+fn plain_wan_variant(model: VideoModelId) -> WanVariant {
+    match model {
+        VideoModelId::AnyflowT2v14b => WanVariant::anyflow_t2v_14b(),
+        VideoModelId::Mobilewan => WanVariant::mobilewan(),
+        VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b => {
+            WanVariant::fastwan21_t2v_1_3b()
+        }
+        _ => WanVariant::fastwan_ti2v_5b(),
     }
 }
 

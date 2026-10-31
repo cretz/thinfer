@@ -13,8 +13,9 @@ use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 
 #[derive(Args)]
 pub struct GenerateImage {
-    /// Model identifier. Defaults to `qwen-image-rapid` (a 4-step distilled,
-    /// CFG-free MMDiT with strong prompt adherence).
+    /// Model identifier. Defaults to `zimage-turbo-q4` (8-step Turbo, CFG-free,
+    /// upstream weights). `qwen-image-rapid` needs its DiT weight slot filled in
+    /// the user's weight sources.
     #[arg(long, default_value_t = ImageModelId::DEFAULT, value_enum)]
     pub model: ImageModelId,
     #[arg(long)]
@@ -55,6 +56,12 @@ pub struct GenerateImage {
     /// forces the bf16 reference path). No effect on Z-Image.
     #[arg(long)]
     pub no_i8_matmul: bool,
+    /// Run a bf16-source Z-Image DiT (`zimage-turbo-bf16`) at FULL bf16
+    /// precision instead of the default load-time Q8 transcode. Max precision but
+    /// ~6x slower per step; the default Q8 path matches the `zimage-turbo-q8`
+    /// quality. No effect on the GGUF variants or other models.
+    #[arg(long)]
+    pub full_precision: bool,
     /// Fold a stored adapter into the DiT, as `NAME_OR_ID[:WEIGHT]` (repeatable,
     /// applied in order). Resolved against the vault for `--model`; needs the
     /// vault password (hidden prompt, or `THINFER_VAULT_PASSWORD`). Local runs
@@ -103,7 +110,7 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
             // Edit-over-remote is guarded above (returns early), so no image here.
             input_image: None,
             i8_matmul: Some(!args.no_i8_matmul),
-            public_key: None,
+            full_precision: Some(args.full_precision),
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
             disable_coopmat: None,
@@ -135,6 +142,7 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         steps: args.steps.unwrap_or(defaults.steps),
         seed: args.seed,
         i8_matmul: !args.no_i8_matmul,
+        full_precision: args.full_precision,
         input_image: match &args.input_image {
             Some(p) => Some(ImageBytes(
                 std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,

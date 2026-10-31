@@ -1,10 +1,9 @@
-//! HTTP surface: the conversion of client-facing job specs into `thinfer_app`
-//! requests and the axum handlers. The wire types (specs, responses, events)
-//! live in `thinfer_app::wire` so the `RemoteExecutor` client shares them; the
-//! server keeps what a client never sees -- artifact paths, budgets pulled from
-//! config, and the in-memory job store.
+//! HTTP surface: the axum handlers. Jobs arrive SEALED under a per-job key the
+//! server does not have (`thinfer_app::jobkey`); the key is delivered only when
+//! a worker is ready (`POST /jobs/{id}/key`), and results are served as
+//! ciphertext to the client that proves ownership of that key. The wire types
+//! live in `thinfer_app::wire` so the `RemoteExecutor` client shares them.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -15,18 +14,22 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
-use thinfer_app::JobRequest;
-use thinfer_app::model::{ImageModelId, SwapModel, VaeChoice, VideoModelId};
-use thinfer_app::request::{
-    FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, VideoFormat,
-    VideoInput, VideoRequest,
+use base64::Engine;
+use thinfer_app::jobkey::JobKey;
+use thinfer_app::wire::{
+    CreateResponse, JobKeyDelivery, JobStateKind, JobStatus, SealedJob, UploadResponse,
 };
-use thinfer_app::wire::{CreateResponse, JobSpec, JobStateKind, JobStatus, UploadResponse};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::config::ServeConfig;
 use crate::job::{JobStore, SeqEvent};
 use crate::uploads::UploadStore;
+
+/// Header carrying the result-fetch proof: base64 SHA-256 of the job key.
+const KEY_PROOF_HEADER: &str = "x-job-key-sha256";
+
+/// Never let a browser or proxy cache job data.
+const NO_STORE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-store");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,197 +61,6 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
     })
 }
 
-/// Base64-decode a required upload field, tagging errors with the field name.
-fn b64_decode(field: &str, b64: &str) -> Result<Vec<u8>, String> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .map_err(|e| format!("{field} is not valid base64: {e}"))
-}
-
-/// Turn decoded video bytes into a [`VideoInput`]: held in RAM under the spill
-/// threshold, else sealed to `<dir>/input_video.enc` under a fresh ephemeral key
-/// (held in the returned value, RAM only). The raw plaintext never touches disk.
-/// Shared with the streaming-upload path ([`crate::uploads`]).
-fn video_input(bytes: Vec<u8>, dir: &std::path::Path) -> Result<VideoInput, String> {
-    crate::uploads::seal_video(bytes, dir, crate::uploads::VIDEO_SPILL_THRESHOLD)
-}
-
-/// Build the executable request for `spec`, placing the artifact under
-/// `artifact_dir/<id>/`. Validates eagerly so a bad spec fails the POST. The
-/// spec is the client wire shape (`thinfer_app::wire`); this is where the server
-/// fills in what a client does not send (artifact path, budgets, output format).
-#[allow(clippy::type_complexity)]
-fn spec_into_request(
-    spec: JobSpec,
-    id: &str,
-    config: &ServeConfig,
-    uploads: &UploadStore,
-) -> Result<(JobRequest, PathBuf, Option<String>, Option<bool>), String> {
-    let budget = config.budget()?;
-    let dir = config.artifact_dir.join(id);
-    let mp4 = || dir.join("output.mp4");
-    let make_dir =
-        || std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()));
-    let public_key = spec.public_key().map(str::to_string);
-    let disable_coopmat = spec.disable_coopmat();
-    match spec {
-        JobSpec::Image(s) => {
-            let model = s.model.unwrap_or(ImageModelId::DEFAULT);
-            let d = model.defaults();
-            // Image-edit reference image: base64-decode and hold in RAM
-            // ([`ImageBytes`]); a decrypted image never touches disk.
-            // `ImageRequest::validate` enforces the present/required-by-kind
-            // rules (400 on mismatch).
-            let input_image = match s.input_image {
-                Some(b64) => Some(ImageBytes(b64_decode("input_image", &b64)?)),
-                None => None,
-            };
-            let req = ImageRequest {
-                model,
-                prompt: s.prompt,
-                width: s.width.unwrap_or(d.width),
-                height: s.height.unwrap_or(d.height),
-                steps: s.steps.unwrap_or(d.steps),
-                seed: s.seed,
-                i8_matmul: s.i8_matmul.unwrap_or(true),
-                input_image,
-                lora: s
-                    .lora
-                    .into_iter()
-                    .map(|l| LoraRef {
-                        id: l.id,
-                        weight: l.weight.unwrap_or(1.0),
-                    })
-                    .collect(),
-                vault_password: s.password.map(Secret::new),
-                vault_dir: config.resolved_vault_dir(),
-                budget,
-                output: dir.join("output.png"),
-                format: ImageFormat::Png,
-            };
-            req.validate()?;
-            make_dir()?;
-            let out = req.output.clone();
-            Ok((JobRequest::Image(req), out, public_key, disable_coopmat))
-        }
-        JobSpec::Video(s) => {
-            let model = s.model.unwrap_or(VideoModelId::DEFAULT);
-            let (def_w, def_h) = model.video_defaults();
-            // First-frame conditioning image (hunyuan-video-1.5-i2v): decode the
-            // base64 payload and hold in RAM ([`ImageBytes`]); a decrypted image
-            // never touches disk. `VideoRequest::resolve` enforces
-            // required/rejected per model.
-            let input_image = match s.input_image {
-                Some(b64) => Some(ImageBytes(b64_decode("input_image", &b64)?)),
-                None => None,
-            };
-            // DreamID-V source FACE image: small, held in RAM only (never on
-            // disk), matching the target video's RAM-first privacy.
-            let source_image = match s.source_image {
-                Some(b64) => Some(ImageBytes(b64_decode("source_image", &b64)?)),
-                None => None,
-            };
-            // DreamID-V target VIDEO: a streamed upload id (preferred) is
-            // consumed from the store into the job dir; else a base64 payload is
-            // decoded RAM-first with an encrypted spill for large clips. Either
-            // way, raw plaintext never lands on disk.
-            let input_video = match (s.input_video_upload, s.input_video) {
-                (Some(uid), _) => Some(uploads.consume(&uid, &dir)?),
-                (None, Some(b64)) => Some(video_input(b64_decode("input_video", &b64)?, &dir)?),
-                (None, None) => None,
-            };
-            let req = VideoRequest {
-                model,
-                prompts: s.prompts,
-                width: s.width.unwrap_or(def_w),
-                height: s.height.unwrap_or(def_h),
-                frames: s.frames.unwrap_or_default(),
-                durations: s.durations.unwrap_or_default(),
-                fps: s.fps,
-                seed: s.seed,
-                input_image,
-                strength: s.strength.unwrap_or(1.0),
-                source_image,
-                input_video,
-                guide_scale: s.guide_scale,
-                sampler: s.sampler.unwrap_or_default(),
-                steps: s.steps.unwrap_or(model.default_steps()),
-                attn_window: s.attn_window,
-                vae: s.vae.unwrap_or(VaeChoice::Tiny),
-                encoder: s.encoder.unwrap_or_default(),
-                i8_matmul: s.i8_matmul.unwrap_or(true),
-                audio: s.audio.unwrap_or(true),
-                upscale: s.upscale.unwrap_or(model.two_stage_default()),
-                rewrite: s.rewrite.unwrap_or(true),
-                rewrite_quality: s.rewrite_quality.unwrap_or_default(),
-                lora: s
-                    .lora
-                    .into_iter()
-                    .map(|l| LoraRef {
-                        id: l.id,
-                        weight: l.weight.unwrap_or(1.0),
-                    })
-                    .collect(),
-                vault_password: s.password.map(Secret::new),
-                vault_dir: config.resolved_vault_dir(),
-                budget,
-                // Server emits MP4 only (PNG-frames is a CLI debug format).
-                output: mp4(),
-                format: VideoFormat::Mp4,
-            };
-            req.resolve()?;
-            make_dir()?;
-            let out = req.output.clone();
-            Ok((JobRequest::Video(req), out, public_key, disable_coopmat))
-        }
-        JobSpec::FaceSwap(s) => {
-            // Target video, in precedence order: a streamed upload id (consumed
-            // from the store into the job dir), then base64-in-JSON bytes
-            // (RAM-first / encrypted spill), then a server-side path (localhost
-            // deployments) read into RAM. Exactly one must be present.
-            let input_video = match (s.input_video_upload, s.input_video_b64, s.input_video) {
-                (Some(uid), _, _) => uploads.consume(&uid, &dir)?,
-                (None, Some(b64), _) => video_input(b64_decode("input_video_b64", &b64)?, &dir)?,
-                (None, None, Some(path)) => {
-                    let bytes = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
-                    video_input(bytes, &dir)?
-                }
-                (None, None, None) => return Err("face-swap requires an input video".into()),
-            };
-            // Source face image: uploaded bytes, or a server-side path read into
-            // RAM. Held in RAM only (never written to the job dir).
-            let source_image = match (s.source_image_b64, s.source_image) {
-                (Some(b64), _) => ImageBytes(b64_decode("source_image_b64", &b64)?),
-                (None, Some(path)) => {
-                    ImageBytes(std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?)
-                }
-                (None, None) => return Err("face-swap requires a source image".into()),
-            };
-            let req = FaceSwapRequest {
-                model: s.model.unwrap_or(SwapModel::DEFAULT),
-                input_video,
-                source_image,
-                output: mp4(),
-                budget,
-                options: thinfer_app::request::FaceSwapOptions {
-                    hyperswap_mask: s.hyperswap_mask.unwrap_or(false),
-                    occlusion: s.occlusion_mask.unwrap_or(false),
-                    enhance: s.enhance.unwrap_or(false),
-                    detect_stride: s.detect_stride.unwrap_or(1),
-                    bitrate_scale: s.bitrate_scale.unwrap_or(1.15),
-                    start_secs: s.start_secs,
-                    end_secs: s.end_secs,
-                },
-            };
-            req.validate()?;
-            make_dir()?;
-            let out = req.output.clone();
-            Ok((JobRequest::FaceSwap(req), out, public_key, disable_coopmat))
-        }
-    }
-}
-
 /// The job API routes (everything under `/jobs` + the OpenAPI doc). When an
 /// `auth_token` is configured these sit behind the Bearer check; the static web
 /// UI is mounted separately so it can load and prompt for the token.
@@ -264,6 +76,7 @@ pub fn router(state: AppState) -> Router {
             post(upload_video).layer(DefaultBodyLimit::max(max_upload)),
         )
         .route("/jobs", post(create_job))
+        .route("/jobs/{id}/key", post(deliver_key))
         .route("/jobs/{id}", get(get_status))
         .route("/jobs/{id}/events", get(events))
         .route("/jobs/{id}/result", get(get_result))
@@ -294,7 +107,7 @@ async fn require_auth(token: Option<String>, req: Request, next: Next) -> Respon
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|got| got == token);
+        .is_some_and(|got| constant_time_eq(got.as_bytes(), token.as_bytes()));
     if ok {
         next.run(req).await
     } else {
@@ -302,11 +115,17 @@ async fn require_auth(token: Option<String>, req: Request, next: Next) -> Respon
     }
 }
 
-/// Submit a job. Large-input jobs (face-swap) are rejected with 409 when a
-/// worker is busy rather than queued.
+/// Constant-time byte compare (length is not secret).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Submit a sealed job. The server cannot read it; it queues the ciphertext.
+/// Large-input jobs (face-swap) are rejected with 409 when a worker is busy
+/// rather than queued.
 #[utoipa::path(
     post, path = "/jobs",
-    request_body = JobSpec,
+    request_body = SealedJob,
     responses(
         (status = 202, description = "Accepted", body = CreateResponse),
         (status = 400, description = "Invalid request"),
@@ -315,18 +134,23 @@ async fn require_auth(token: Option<String>, req: Request, next: Next) -> Respon
 )]
 async fn create_job(
     State(state): State<AppState>,
-    Json(spec): Json<JobSpec>,
+    Json(job): Json<SealedJob>,
 ) -> Result<(StatusCode, Json<CreateResponse>), ApiError> {
-    if spec.is_large_input() && state.store.is_busy() {
+    if job.large_input && state.store.is_busy() {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "worker busy; large-input jobs are not queued, retry when idle",
         ));
     }
-    let (handle, position) = state
-        .store
-        .submit(|id| spec_into_request(spec, id, &state.config, &state.uploads))
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    let sealed = base64::engine::general_purpose::STANDARD
+        .decode(job.sealed.as_bytes())
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("sealed is not base64: {e}"),
+            )
+        })?;
+    let (handle, position) = state.store.submit(&state.config.artifact_dir, sealed);
     Ok((
         StatusCode::ACCEPTED,
         Json(CreateResponse {
@@ -336,14 +160,37 @@ async fn create_job(
     ))
 }
 
-/// Stream a raw video (mp4) body into the upload store, returning an id a job
-/// spec then references via `input_video_upload`. The body is the raw bytes (no
-/// base64, no JSON) so a large clip does not inflate or hit the JSON size cap;
-/// the store holds it RAM-first or seals it to an encrypted spill. Uploads are
-/// reaped after `upload_ttl_secs` if never consumed by a job.
+/// Deliver the job key, only while a worker is waiting for it (the
+/// `keyRequired` event). The job decrypts and runs right after.
+#[utoipa::path(
+    post, path = "/jobs/{id}/key",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = JobKeyDelivery,
+    responses(
+        (status = 204, description = "Key accepted"),
+        (status = 404, description = "Unknown job"),
+        (status = 409, description = "Job is not waiting for its key"),
+    )
+)]
+async fn deliver_key(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<JobKeyDelivery>,
+) -> Result<StatusCode, ApiError> {
+    let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    let key = JobKey::from_b64(&body.key).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    job.deliver_key(key)
+        .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stream a client-sealed video (`[nonce][AES-GCM ciphertext]` under the job
+/// key) into the upload store, returning an id the sealed spec references via
+/// `input_video_upload`. Stored as ciphertext; the server has no key for it
+/// until the job runs. Reaped after `upload_ttl_secs` if never consumed.
 #[utoipa::path(
     post, path = "/uploads",
-    request_body(content = Vec<u8>, description = "Raw mp4 bytes", content_type = "application/octet-stream"),
+    request_body(content = Vec<u8>, description = "Sealed mp4 bytes", content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "Stored", body = UploadResponse),
         (status = 400, description = "Empty body"),
@@ -359,8 +206,8 @@ async fn upload_video(
     }
     let (id, size) = state
         .uploads
-        .put(body.to_vec())
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .put(&body)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(UploadResponse { id, size }))
 }
 
@@ -433,15 +280,15 @@ fn to_event(se: &SeqEvent) -> Event {
         .data(data)
 }
 
-/// Return the finished artifact bytes, then DELETE them. The artifact lives
-/// exactly until the client fetches it once (the browser holds the only lasting
-/// copy, in memory). When the job carried a public key the bytes are the
-/// encrypted blob (see [`crate::crypto`]); the client decrypts.
+/// Return the finished artifact (sealed under the job key), then forget the job
+/// and DELETE its dir. Requires the `x-job-key-sha256` proof so only the key
+/// holder can fetch (and thereby delete) it.
 #[utoipa::path(
     get, path = "/jobs/{id}/result",
     params(("id" = String, Path, description = "Job id")),
     responses(
         (status = 200, description = "Artifact bytes (deleted after this fetch)"),
+        (status = 403, description = "Missing or wrong key proof"),
         (status = 404, description = "Unknown job or already fetched"),
         (status = 409, description = "Job not finished"),
     )
@@ -449,36 +296,40 @@ fn to_event(se: &SeqEvent) -> Event {
 async fn get_result(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let job = state.store.get(&id).ok_or_else(ApiError::not_found)?;
+    let proof = headers
+        .get(KEY_PROOF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
+        .unwrap_or_default();
+    if !job.owns(&proof) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing or wrong job key proof",
+        ));
+    }
     if job.state_kind() != JobStateKind::Done {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "job has not finished successfully",
         ));
     }
-    let path = job.output_path.clone();
+    let path = job.dir.join(crate::worker::RESULT_FILE);
     let bytes = tokio::fs::read(&path).await.map_err(|e| {
         ApiError::new(
             StatusCode::NOT_FOUND,
             format!("artifact unavailable (already fetched?): {e}"),
         )
     })?;
-    // Delete-on-fetch: drop the whole job dir so nothing lingers on disk.
-    if let Some(dir) = path.parent() {
-        let _ = tokio::fs::remove_dir_all(dir).await;
-    }
-    // Encrypted results are opaque bytes; the client knows the real media type.
-    let content_type = if job.public_key.is_some() {
-        "application/octet-stream"
-    } else {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("mp4") => "video/mp4",
-            Some("png") => "image/png",
-            _ => "application/octet-stream",
-        }
-    };
-    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+    // Delete-on-fetch: forget the job and drop its dir so nothing lingers.
+    state.store.remove(&id);
+    Ok((
+        [(header::CONTENT_TYPE, "application/octet-stream"), NO_STORE],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Request cancellation. A queued job is dropped; a running job is flagged but
@@ -510,6 +361,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     ),
     paths(
         create_job,
+        deliver_key,
         upload_video,
         get_status,
         events,
@@ -520,7 +372,9 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         crate::vault::remove_adapter,
     ),
     components(schemas(
-        JobSpec,
+        SealedJob,
+        JobKeyDelivery,
+        thinfer_app::wire::JobSpec,
         thinfer_app::wire::ImageSpec,
         thinfer_app::wire::VideoSpec,
         thinfer_app::wire::FaceSwapSpec,
@@ -531,10 +385,10 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         JobStateKind,
         thinfer_app::wire::ProgressStage,
         thinfer_app::wire::JobResult,
-        ImageModelId,
-        VideoModelId,
-        SwapModel,
-        VaeChoice,
+        thinfer_app::model::ImageModelId,
+        thinfer_app::model::VideoModelId,
+        thinfer_app::model::SwapModel,
+        thinfer_app::model::VaeChoice,
         crate::vault::AddAdapterRequest,
         crate::vault::ListAdaptersRequest,
         crate::vault::RemoveAdapterRequest,

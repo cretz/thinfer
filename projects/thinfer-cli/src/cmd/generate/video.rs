@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
-use thinfer_app::model::{EncoderQuant, RewriteQuality, VaeChoice, VideoModelId, VideoSampler};
+use thinfer_app::model::{
+    AttnPrecision, EncoderQuant, RewriteQuality, VaeChoice, VideoModelId, VideoSampler,
+};
 use thinfer_app::request::{ImageBytes, VideoFormat, VideoInput, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
@@ -34,6 +36,11 @@ pub struct GenerateVideo {
     /// DreamID-V only: the source FACE image (PNG/JPEG) to swap in.
     #[arg(long)]
     pub source_image: Option<PathBuf>,
+    /// fasth3-omni only: a reference image (PNG/JPEG) the prompt can name as
+    /// `<Picture N>` (N = its position among the --ref-image flags, from 1).
+    /// Repeat for several, up to 9.
+    #[arg(long = "ref-image")]
+    pub ref_images: Vec<PathBuf>,
     /// DreamID-V only: image-CFG guidance scale on the source-face reference
     /// (default 4.0). Ignored by the other (CFG-free) video models.
     #[arg(long)]
@@ -69,10 +76,11 @@ pub struct GenerateVideo {
     /// Seed. Omit for a randomized seed.
     #[arg(long)]
     pub seed: Option<u64>,
-    /// Denoise sampler: `unipc` (default, multistep, `--steps` configurable) or
-    /// `dmd` (fixed 3-step byte-parity path). Ignored on the AR (LongLive) path.
-    #[arg(long, value_enum, default_value_t = VideoSampler::default())]
-    pub sampler: VideoSampler,
+    /// Denoise sampler: `unipc` (multistep, `--steps` configurable) or `dmd`
+    /// (fixed 3-step byte-parity path). Unset -> the model default (`dmd` for
+    /// fastwan2.1-t2v-1.3b, else `unipc`). Ignored on the AR (LongLive) path.
+    #[arg(long, value_enum)]
+    pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8; dreamid-v defaults to 16). Ignored when
     /// `--sampler dmd`. Unset -> the model default.
     #[arg(long)]
@@ -106,9 +114,18 @@ pub struct GenerateVideo {
     pub download_as_needed: bool,
     /// VAE decoder. Default `tiny` (LightTAE): ~0.4GB, ~50x faster decode at
     /// near-identical quality. `full` is the bit-clean parity path.
-    #[arg(long, value_enum, default_value_t = VaeChoice::Tiny)]
-    pub vae: VaeChoice,
-    /// LTX-2.3 text encoder (all LTX/Sulphur models). `q8` (default) is the
+    /// MiniMax-H3 / FastH3 default to `nvfp4` (FastVideo's NVFP4 decoder:
+    /// indistinguishable frames, ~2x faster decode; NVIDIA Blackwell, else the
+    /// fp16 decoder runs instead); `full` = the original fp16 decoder,
+    /// `nvfp4-fast` = 8 layers, fastest, softer.
+    #[arg(long, value_enum)]
+    pub vae: Option<VaeChoice>,
+    /// FastH3 sparse-attention precision. Default `int8` (SageAttention-style
+    /// INT8 QK^T: ~1.2x faster attention, ~1.35x with reference images, same
+    /// quality); `bf16` is the reference path (a different sample per seed).
+    #[arg(long, value_enum)]
+    pub attn: Option<AttnPrecision>,
+    /// LTX-2.3 text encoder (all LTX models). `q8` (default) is the
     /// conditioning-quality baseline; `q4` is Q4_K_M -- ~2.8x faster encode
     /// (~16s -> ~6s) for lower-precision conditioning. Ignored by Wan.
     #[arg(long, value_enum, default_value_t = EncoderQuant::Q8)]
@@ -126,6 +143,14 @@ pub struct GenerateVideo {
     /// res. Default off = single-stage denoise at the target res. Ignored by Wan.
     #[arg(long)]
     pub upscale: bool,
+    /// LTX joint-AV: refine the denoise schedule for better audio. The distilled
+    /// 8-step table under-resolves the delicate audio residual (speech drifts to
+    /// gibberish); this subdivides the coarse sigma jumps into more Euler
+    /// substeps, keeping the distilled anchors exactly. Applies to every LTX
+    /// line: the single-stage schedule on ltx2-rapid, and BOTH stage schedules on
+    /// the two-stage 22B line (8+3 -> 16+11 steps, ~2.5x denoise). Ignored by Wan.
+    #[arg(long)]
+    pub audio_hq: bool,
     /// HunyuanVideo 1.5 only: skip prompt rewriting and send the raw prompt. By
     /// default a short prompt is expanded into a detailed, structured caption by
     /// the on-device Qwen3-VL rewriter (the model is trained on long captions;
@@ -141,7 +166,8 @@ pub struct GenerateVideo {
     /// Fold a stored adapter into the DiT, as `NAME_OR_ID[:WEIGHT]` (repeatable,
     /// applied in order). Resolved against the vault for `--model`; needs the
     /// vault password (hidden prompt, or `THINFER_VAULT_PASSWORD`). Local runs
-    /// only (not `--remote`); only AnyFlow accepts adapters today.
+    /// only (not `--remote`). AnyFlow, FastWan2.1-1.3B, Wan2.1-1.3B, MiniMax-H3
+    /// and FastH3-Trim accept adapters (H3: applied at runtime, any layout).
     #[arg(long = "lora", value_name = "NAME[:WEIGHT]")]
     pub lora: Vec<String>,
     /// Vault directory for `--lora`. Defaults to the shared location
@@ -194,13 +220,21 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             durations: (!args.duration.is_empty()).then_some(args.duration),
             fps: args.fps,
             seed: args.seed,
-            sampler: Some(args.sampler),
+            sampler: args.sampler,
             steps: args.steps,
             attn_window: args.attn_window,
-            vae: Some(args.vae),
+            vae: args.vae,
+            attn: args.attn,
             input_image: base64_of(args.input_image.as_deref())?,
             strength: Some(args.strength),
             source_image: base64_of(args.source_image.as_deref())?,
+            ref_images: Some(
+                args.ref_images
+                    .iter()
+                    .map(|p| Ok(base64_of(Some(p))?.unwrap_or_default()))
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+            .filter(|v| !v.is_empty()),
             input_video: base64_of(args.input_video.as_deref())?,
             // The CLI reads local files inline; the raw-upload endpoint is a
             // serve-only path, so there is never an upload id here.
@@ -210,9 +244,9 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             i8_matmul: Some(!args.no_i8_matmul),
             audio: Some(!args.no_audio),
             upscale: Some(args.upscale || args.model.two_stage_default()),
+            audio_hq: Some(args.audio_hq),
             rewrite: Some(!args.no_rewrite),
             rewrite_quality: Some(args.rewrite_quality),
-            public_key: None,
             // Remote path defers coopmat to the server default; local runs read
             // THINFER_NO_COOPMAT via BackendConfig.
             disable_coopmat: None,
@@ -257,6 +291,15 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             )),
             None => None,
         },
+        ref_images: args
+            .ref_images
+            .iter()
+            .map(|p| {
+                std::fs::read(p)
+                    .map(ImageBytes)
+                    .map_err(|e| format!("read {}: {e}", p.display()))
+            })
+            .collect::<Result<_, _>>()?,
         input_video: match &args.input_video {
             Some(p) => Some(VideoInput::Ram(
                 std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,
@@ -264,10 +307,11 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             None => None,
         },
         guide_scale: args.guide_scale,
-        sampler: args.sampler,
+        sampler: args.sampler.unwrap_or(args.model.default_sampler()),
         steps: args.steps.unwrap_or(args.model.default_steps()),
         attn_window: args.attn_window,
-        vae: args.vae,
+        vae: args.vae.unwrap_or(args.model.default_vae()),
+        attn: args.attn.unwrap_or(args.model.default_attn()),
         encoder: args.encoder,
         i8_matmul: !args.no_i8_matmul,
         audio: !args.no_audio,
@@ -275,6 +319,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         // 8GB and low-res single-stage is OOD); `--upscale` is store-true, so OR
         // with the model default. Wan ignores upscale.
         upscale: args.upscale || args.model.two_stage_default(),
+        audio_hq: args.audio_hq,
         rewrite: !args.no_rewrite,
         rewrite_quality: args.rewrite_quality,
         lora,
@@ -291,7 +336,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
     req.resolve()?;
     let files = req.required_files()?;
     super::run_job(
-        JobRequest::Video(req),
+        JobRequest::Video(Box::new(req)),
         &files,
         args.download_as_needed,
         ram,

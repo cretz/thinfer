@@ -62,9 +62,19 @@ pub fn refiner_transcode_target<S: WeightSource>(
     any_quant.then_some(thinfer_core::quant::QuantKind::Q8_0)
 }
 
+/// `main_transcode`: optional load-time requantize target for the 30 MAIN block
+/// matmul weights (qkv/out/ffn). `None` keeps the source encoding (native bf16
+/// -> dense bf16 matmul, or a GGUF's own quant read as-is). `Some(Q8_0)` is set
+/// for a bf16-source DiT the caller wants to run on the fast i8 DP4A path (the
+/// bf16 variant under the default `q8_transcode`): each bf16 matmul is
+/// requantized to Q8_0 at upload. A GGUF (already-quant) source ignores it (the
+/// `Quant` linear-layout arm passes through). The pipeline compile MUST mirror
+/// this (compile the main slots `Quant(Q8_0)`) or every block matmul reads
+/// garbage. `refiner_transcode` is the same lever for the 4 refiner blocks.
 pub fn register_dit_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
     refiner_transcode: Option<thinfer_core::quant::QuantKind>,
+    main_transcode: Option<thinfer_core::quant::QuantKind>,
 ) -> Result<LoadedDitHandles, LoadError> {
     let mw = ModelWeights::new();
     Ok(LoadedDitHandles {
@@ -78,7 +88,7 @@ pub fn register_dit_handles<S: WeightSource>(
             BlockKind::ContextRefiner,
             refiner_transcode,
         )?,
-        layers: register_block_stack(residency, BlockKind::Main, None)?,
+        layers: register_block_stack(residency, BlockKind::Main, main_transcode)?,
         x_pad_token: register_passthrough(residency, &mw.x_pad_token)?,
         cap_pad_token: register_passthrough(residency, &mw.cap_pad_token)?,
     })

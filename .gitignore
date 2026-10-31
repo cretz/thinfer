@@ -9,3 +9,5 @@ projects/thinfer-web/webdriver.json
 # Build outputs of projects/thinfer-web (`pnpm build`): wasm-bindgen and tsc.
 projects/thinfer-web/pkg/
 projects/thinfer-web/dist/
+# Agent working notes live outside the repo (../notes).
+projects/thinfer-working-area/

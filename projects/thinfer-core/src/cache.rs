@@ -16,7 +16,7 @@ pub trait PipelineCache<B: Backend> {
 /// instead of the full `PipelineCache` to keep `forward()` immune to
 /// cache-mutation surface area: cold-path inserts happen at module *prepare*
 /// time so the first dispatch is never blocked on compile (per
-/// plan-details "Concurrency on the hot path").
+/// the hot-path concurrency design).
 pub trait PipelineLookup<B: Backend> {
     fn get(&self, key: &KernelKey) -> Option<&B::Pipeline>;
 }

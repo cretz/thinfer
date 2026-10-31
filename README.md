@@ -1,73 +1,84 @@
 # thinfer
 
-thinfer runs image, video, and face-swap generation models on consumer GPUs,
-streaming weights to stay inside tight RAM and VRAM budgets instead of requiring
-the whole model resident.
+Image, video and face-swap generation on consumer GPUs. Weights stream in, so
+models far bigger than your VRAM still run.
 
-Requires [Rust](https://rustup.rs/). Model weights download from Hugging Face on
-first use: you are asked to confirm, or pass `--download-as-needed` to skip the
-prompt.
+## Setup
 
-## CLI
-
-Install the `thinfer` binary (lands in `~/.cargo/bin`, already on PATH for Rust
-installs):
+Install [Rust](https://rustup.rs/), then:
 
     cargo install --path projects/thinfer-cli
 
-Each modality is a `thinfer generate` subcommand; run `--help` on any of them for
-the full option set.
+NVIDIA GPU: also install the [CUDA 13 toolkit](https://developer.nvidia.com/cuda-downloads)
+for the fast path (H3 video needs it to be practical).
 
-### Image
+Weights download from Hugging Face on first use. Add `--download-as-needed` to skip
+the confirmation.
 
-Defaults to `qwen-image-rapid`, a 4-step distilled model with strong prompt
-adherence. Its authored resolution is 1024x1024; 512x512 renders faster and still
-looks great:
+## Pick a model
 
-    thinfer generate image --prompt "a dragon made of stained glass" --width 512 --height 512 --output dragon.png
+    thinfer models
 
-_~2 min on a weak RTX 5070 laptop GPU (~5 min at the default 1024x1024)._
+lists every model. Pass one with `--model <id>`. Defaults: image `zimage-turbo-q4`,
+video `fastwan-ti2v-5b`.
 
-### Video
+`qwen-image-rapid`, `qwen-image-edit-rapid` and `ltx2-rapid` ship no default
+weights: name yours in `thinfer-sources.toml` in your Hugging Face cache dir (or
+point `THINFER_SOURCES` at it):
 
-Defaults to `fastwan-ti2v-5b`, a fast 5B distill at 960x544. `--duration` sets the
-clip length in seconds:
+    [slots."qwen-image-rapid/dit-q4_k_m"]
+    repo = "owner/repo"
+    path = "file.gguf"
 
-    thinfer generate video --prompt "a red fox trotting through falling snow at dawn" --duration 2 --output fox.mp4
+## Make an image
 
-_~2.5 min on a weak RTX 5070 laptop GPU._
+    thinfer generate image --prompt "a dragon made of stained glass" --output dragon.png
 
-### Face swap
+## Make a video
 
-Swaps the face from a source image into every frame of a video (HyperSwap):
+    thinfer generate video --prompt "a red fox trotting through falling snow" --output fox.mp4
+
+## Make a video with sound
+
+    thinfer generate video --model fasth3-trim --prompt "a woman by a window says: good morning" --output talk.mp4
+
+5s at 832x480. ~33 GB download. Fastest on RTX 50-series, which decode with a
+fast NVFP4 decoder by default (`--vae full`: original decoder; `--vae
+nvfp4-fast`: faster, softer).
+
+## Make a video from reference images
+
+    thinfer generate video --model fasth3-omni --ref-image me.png --prompt "the man from <Picture 1> walks on a beach" --output beach.mp4
+
+Name each `--ref-image` in the prompt as `<Picture 1>`, `<Picture 2>`, ... (up to 9).
+
+## Use a LoRA
+
+    thinfer vault add --model fasth3-trim --url <safetensors url>
+    thinfer generate video --model fasth3-trim --lora <name>:0.8 --prompt "..." --output out.mp4
+
+Adapters are stored encrypted, per model. `thinfer vault list --model <model>`
+shows them.
+
+## Swap a face into a video
 
     thinfer generate face-swap --input-video clip.mp4 --source-image face.png --output swapped.mp4
 
-_~10 s for a short 1080p clip on a weak RTX 5070 laptop GPU._
-
-### Memory budgets
-
-RAM and VRAM budgets both default to 2 GiB. The residency manager pages weights to
-stay within them, so a small budget means more streaming, not failure. Raise them on
-a card with more memory for less weight traffic (`--ram-budget` / `--vram-budget`
-accept `8G`, `512M`, or raw bytes):
-
-    thinfer generate image --prompt "..." --output out.png --vram-budget 6G --ram-budget 16G
-
 ## Web UI
 
-To drive image, video, and face-swap generation from a browser, run the server:
-
     cargo install --path projects/thinfer-serve
-    thinfer-serve
-
-Then open http://localhost:8080. To serve over HTTPS with a self-signed certificate
-(generated at startup), pass a config file containing `tls_self_signed = true`:
-
     thinfer-serve --config serve.toml
+
+`serve.toml` containing `tls_self_signed = true` gives HTTPS, required when opening
+it from another device. Open https://localhost:8080.
+
+## Options
+
+`--help` on any command lists everything. Common ones: `--model`, `--width`,
+`--height`, `--duration`, `--seed`, and `--vram-budget` / `--ram-budget` (default
+2G each; raise them on bigger machines, e.g. `--vram-budget 6G`).
 
 ## About
 
-thinfer was vibe coded: built largely through AI-assisted iteration. It works, but
-it is a personal project, not a polished product, and may not be stable or high
-quality. Expect rough edges.
+Vibe coded: built largely through AI-assisted iteration. A personal project, not a
+polished product. Expect rough edges.

@@ -413,6 +413,208 @@
       ]
     },
     {
+      "name": "rope_halfrot_partial_basic",
+      "op": "rope_halfrot_partial",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            3,
+            2,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "freqs",
+          "shape": [
+            3,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.75,
+            "hi": 0.75
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "rope_halfrot_partial_h3_ratio",
+      "op": "rope_halfrot_partial",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            2,
+            128
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "freqs",
+          "shape": [
+            2,
+            96
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.75,
+            "hi": 0.75
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "rope_halfrot_partial_full_width",
+      "op": "rope_halfrot_partial",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            3,
+            2,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        {
+          "name": "freqs",
+          "shape": [
+            3,
+            8
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -0.75,
+            "hi": 0.75
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "qkv_split_headwise_basic",
+      "op": "qkv_split_headwise",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            4,
+            3,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "qkv_split_headwise_h3_head_dim",
+      "op": "qkv_split_headwise",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            1,
+            3,
+            128
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -1.5,
+            "hi": 1.5
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "silu_mul_fused_basic",
+      "op": "silu_mul_fused",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            16
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -3.0,
+            "hi": 3.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
+      "name": "silu_mul_fused_wide",
+      "op": "silu_mul_fused",
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            3,
+            512
+          ],
+          "fill": {
+            "kind": "linspace",
+            "lo": -6.0,
+            "hi": 6.0
+          }
+        }
+      ],
+      "dtypes": [
+        "fp32",
+        "bf16w",
+        "bf16p"
+      ]
+    },
+    {
       "name": "sdpa_basic",
       "op": "sdpa",
       "scale": 0.35355338,

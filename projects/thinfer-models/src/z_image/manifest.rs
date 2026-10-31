@@ -6,13 +6,13 @@
 //! Earlier the DiT role pointed at `tsqn/Z-Image-Turbo_fp32-fp16-bf16_full_and_ema-only`
 //! `diffusion_pytorch_model-ema-only-bf16.safetensors`, which reddit/HF reports
 //! describe as a buggy EMA-only extraction. Symptom: gray / black-screen output.
-//! See worklog for the investigation that pinpointed weight provenance as the
+//! An investigation pinpointed weight provenance as the
 //! cause (engine VAE was already bit-exact vs PyTorch).
 //!
 //! M1 dtype: bf16 storage everywhere, expand-to-fp32 at GPU upload, fp32
 //! kernels. fp16 is intentionally avoided: Z-Image was trained in bf16 and
 //! the magnitude clamp from a bf16->fp16 cast produces broken weights (range
-//! exceeds fp16 max). See `plan-details.md`.
+//! exceeds fp16 max).
 //!
 //! Roles are open-set strings to keep `ModelManifest` model-agnostic; the
 //! `role::*` consts below are the typed accessors for callers.
@@ -162,7 +162,7 @@ pub struct ZImageRecipe {
     /// adapter exposes SHADER_F16 + the matmul path is Quant (Q8/Q4_K_M
     /// etc). Never touches the residual carry or elementwise ops: those
     /// stay dense F16 (per-32-block i8 of the carry is numerically unsound;
-    /// outlier channels, see worklog 2026-06-04).
+    /// outlier channels, found 2026-06-04).
     pub i8_sdpa: bool,
 }
 
@@ -222,7 +222,7 @@ pub fn current_recipe() -> ZImageRecipe {
 
 /// M1 manifest. DiT is the bf16 sharded transformer from `dimitribarbot`. Text
 /// encoder, tokenizer, VAE come from upstream `Tongyi-MAI`. Other roles get
-/// added as their loaders land (see `worklog.md`). All callers should resolve
+/// added as their loaders land. All callers should resolve
 /// via `MANIFEST.get()` so adding entries doesn't churn call sites.
 pub static MANIFEST: ModelManifest = ModelManifest {
     id: "zimage-turbo-m1",

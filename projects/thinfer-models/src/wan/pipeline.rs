@@ -11,8 +11,7 @@
 //! DMD distillation: a fixed handful of timesteps (3 for FastWan), CFG-free, one
 //! DiT forward per step over the whole `[48, f_lat, h, w]` latent with a single
 //! scalar timestep, renoised between steps. LongLive (4-step, autoregressive)
-//! reuses this backbone with its own `DmdConfig` and an AR path (see
-//! `wan-plan.md`).
+//! reuses this backbone with its own `DmdConfig` and an AR path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -150,12 +149,25 @@ fn step_attn_window(requested: Option<u32>, step: usize, default_from: usize) ->
 /// first (mirrors upstream `MultiTextConcatDataset._apply_shot_durations`), and
 /// in the cache by advancing the RoPE phase + pinning the new shot's sink. A
 /// single-shot long video is the empty-shots path ([`WanModel::denoise_ar`]).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Shot {
     pub prompt: String,
     /// Length of this shot in AR chunks (>= 1). The sum across shots must equal
     /// the run's total chunk count (`f_lat / num_frame_per_block`).
     pub chunks: usize,
+}
+
+// The prompt is user content: never rendered by `Debug`.
+impl std::fmt::Debug for Shot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shot")
+            .field(
+                "prompt",
+                &format_args!("<{} chars redacted>", self.prompt.len()),
+            )
+            .field("chunks", &self.chunks)
+            .finish()
+    }
 }
 
 /// In-band scene-cut marker prepended to the first chunk's prompt of every shot
@@ -220,11 +232,7 @@ pub enum ProgressEvent {
 
 pub type ProgressFn<'a> = Option<&'a dyn Fn(ProgressEvent)>;
 
-/// Cooperative cancellation hook. Returns `true` when the caller wants the
-/// in-flight generate to stop; the denoise loops poll it at each step boundary
-/// and bail with [`GenerateError::Cancelled`]. `None` (CLI default) never
-/// cancels. The server passes a closure backed by the job's cancel flag.
-pub type Cancel<'a> = Option<&'a dyn Fn() -> bool>;
+pub use crate::common::Cancel;
 
 /// Which VAE decoder a generate/decode uses. No `Default`: callers state intent
 /// explicitly (the real VAE is the parity path; the LightTAE tiny decoder is
@@ -391,6 +399,12 @@ pub struct WanVariant {
     /// `lighttae*` retrains (lighttaew2_2), which are trained on denormalized
     /// latents (upstream gates this on "lighttae" in the checkpoint name).
     pub tiny_vae_normed_latents: bool,
+    /// Whether the opt-in DP4A i8 activation sites (self-attn qkv + ffn_up)
+    /// hold quality on this checkpoint. False for FastWan2.1-1.3B: with them its
+    /// output collapses to an off-prompt blob (CLI A/B, 448x256x61, same seed)
+    /// while the dense path renders the prompt; it runs dense regardless of the
+    /// request's `i8_matmul`.
+    pub i8_act_sites: bool,
 }
 
 impl WanVariant {
@@ -408,6 +422,7 @@ impl WanVariant {
             block_transcode: Some(thinfer_core::quant::QuantKind::Q8_0),
             act_pref: None,
             tiny_vae_normed_latents: false,
+            i8_act_sites: true,
         }
     }
 
@@ -418,6 +433,22 @@ impl WanVariant {
     pub fn longlive_2_0_5b() -> Self {
         Self {
             block_transcode: None,
+            ..Self::fastwan_ti2v_5b()
+        }
+    }
+
+    /// Qualcomm-AI-Research/mobilewan: the FastWan2.2-TI2V-5B backbone with
+    /// per-block PRUNED self-attention heads (`cfg.rehyat`), FastWan VAE + umT5.
+    /// No block transcode (bf16, parity-first like LongLive): the pruned
+    /// self-attention runs the untiled DENSE per-block-N path, so its qkv/proj
+    /// weights must stay bf16 (the i8/coopmat prepared-weight shapes assume the
+    /// full N). Bf16 acts (f32 exponent range) keep the novel variable-head path
+    /// off the f16 edge. `ffn_up` still takes the opt-in i8 (standard FFN).
+    pub fn mobilewan() -> Self {
+        Self {
+            dit: WanDitConfig::mobilewan(),
+            block_transcode: None,
+            act_pref: Some(ActDtype::Bf16),
             ..Self::fastwan_ti2v_5b()
         }
     }
@@ -434,6 +465,24 @@ impl WanVariant {
             block_transcode: Some(thinfer_core::quant::QuantKind::Q8_0),
             act_pref: Some(ActDtype::Bf16),
             tiny_vae_normed_latents: true,
+            i8_act_sites: true,
+        }
+    }
+
+    /// FastVideo FastWan2.1-T2V-1.3B: the stock Wan2.1-1.3B backbone, DMD
+    /// 3-step distilled (CFG-free), the Wan2.1 z16 VAE. The fp32 DiT narrows to
+    /// bf16 at upload (~2.8GB, resident on the 8GB card), so no block transcode;
+    /// the 1536-dim residual fits f16 acts (probe). taew2_1 is its tiny decoder.
+    /// Dense on every matmul site: the i8 act sites collapse its output.
+    pub fn fastwan21_t2v_1_3b() -> Self {
+        Self {
+            dit: WanDitConfig::wan21_t2v_1_3b(),
+            vae: WanVaeConfig::wan2_1(),
+            moe: false,
+            block_transcode: None,
+            act_pref: None,
+            tiny_vae_normed_latents: true,
+            i8_act_sites: false,
         }
     }
 
@@ -449,6 +498,7 @@ impl WanVariant {
             act_pref: Some(ActDtype::Bf16),
             // No tiny path today; taew2_1 (normed) would be the one if added.
             tiny_vae_normed_latents: true,
+            i8_act_sites: true,
         }
     }
 
@@ -471,6 +521,7 @@ impl WanVariant {
             block_transcode: None,
             act_pref: None,
             tiny_vae_normed_latents: true,
+            i8_act_sites: true,
         }
     }
 }
@@ -546,7 +597,8 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // (dot4I8Packed) path. Those A-sides are norm-conditioned (no massive
         // outliers), so it holds parity while cutting their matmul ~6x. o-proj /
         // ffn_down stay bf16 (outlier-prone A-side). Off => bf16 byte-identical.
-        let q8 = i8_matmul.then_some(thinfer_core::quant::QuantKind::Q8_0);
+        let q8 =
+            (i8_matmul && variant.i8_act_sites).then_some(thinfer_core::quant::QuantKind::Q8_0);
         // qkv is split into two sites so only the SAFE half goes i8: self-attn
         // qkv has a normed A-side (DP4A-safe), so it takes Q8_0 + the i8 matmul;
         // cross-attn qkv stays bf16 because its K/V project from the un-normed
@@ -554,7 +606,12 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // to 65504). The split is the separate `matmul_qkv_self` pipeline +
         // `WanI8Sites.qkv_self` transcode. ffn_up's A-side is clean too.
         let i8_sites = WanI8Sites {
-            qkv_self: q8,
+            // mobilewan runs the pruned self-attention on the untiled DENSE
+            // per-block-N path, so its qkv weights stay bf16 (the i8 prepared
+            // triple assumes the full N). The qkv_self SITE must compile bf16 to
+            // match, or the block reads garbage. ffn_up (the standard shared FFN)
+            // still takes the opt-in i8.
+            qkv_self: if cfg.rehyat { None } else { q8 },
             ffn_up: q8,
         };
         let umt5_handles = register_umt5_handles(&residency, None)?;
@@ -683,6 +740,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 true,
                 i8_sdpa,
             ),
+            cfg.rehyat,
         )
         .await?;
         let umt5_pipelines = Umt5Pipelines::compile(
@@ -1693,6 +1751,16 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                             proj_out,
                         });
                     }
+                    // mobilewan (rehyat) allocates VARIABLE-size F32-island buffers
+                    // per block (per-block pruned head count h_i), so the workspace
+                    // pool accumulates many size classes across a step's blocks and,
+                    // undrained, keeps growing across steps -> the 8GB card overshoots
+                    // and wgpu stalls (the "hang after ~step 2"). Drain between steps
+                    // for the rehyat path so each step starts from a clean pool. Other
+                    // Wan models keep the cross-step pool reuse (uniform sizes).
+                    if self.cfg.rehyat {
+                        workspace.drain_pool();
+                    }
                 }
             }
             // --- UniPC multistep (flow_shift=8.0, CFG-free): feed each step's DiT
@@ -1731,6 +1799,12 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         )
                         .await?;
                     sample = unipc.step(&out.image, &sample);
+                    // See the DMD loop: drain the rehyat pool between steps so
+                    // mobilewan's variable-size F32-island buffers don't accumulate
+                    // across steps and overshoot the card.
+                    if self.cfg.rehyat {
+                        workspace.drain_pool();
+                    }
                 }
             }
         }

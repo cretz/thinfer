@@ -3,12 +3,15 @@
 // finished artifact. All three calls go through fetch (not EventSource) so the
 // optional bearer token rides an Authorization header the whole way.
 //
-// Privacy: the browser generates an RSA keypair and sends only the PUBLIC key
-// with each job. The server encrypts the result with it and cannot decrypt --
-// only this browser's private key (kept in memory, never sent) can. The result
-// is fetched as ciphertext, decrypted here, and shown from an in-memory blob;
-// nothing decrypted ever touches the server. WebCrypto needs a secure context
-// (https or localhost); over plain http we warn and fall back to plaintext.
+// Privacy: every job gets a fresh AES-256-GCM key generated here. The job spec
+// (prompts, images) and any uploaded video are sealed with it BEFORE they leave
+// the browser, so the server queues only ciphertext. The key itself is sent
+// only when the server's worker is ready to run the job (`keyRequired`); the
+// server decrypts right before the model uses the data, seals the result with
+// the same key, and forgets the key. The result is fetched as ciphertext (with
+// a SHA-256-of-key proof), opened here, and shown from an in-memory blob; the
+// raw key is wiped after the job. WebCrypto needs a secure context (https or
+// localhost); without one, generation is refused rather than sent in the clear.
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (text) => {
@@ -35,7 +38,11 @@ const log = (line) => {
 
 const MODELS = {
   image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"],
-  video: ["fastwan-ti2v-5b", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "sulphur-2", "sulphur-2-q4", "ltx2-rapid", "dreamid-v"],
+  // ltx-2.3-distilled-q4 is the fast tier: a pre-distilled Q4_K_M DiT skips the
+  // ~60s distill fold the dev ids pay and streams 14GB instead of 23GB per step.
+  // ltx-2.3-dev-q4 (Q4 dev + fold) stays CLI-only: it pays Q4 quality AND the
+  // fold. Which checkpoints back these ids is the user's weight-sources choice.
+  video: ["fastwan-ti2v-5b", "fastwan2.1-t2v-1.3b", "wan2.1-t2v-1.3b", "mobilewan", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "ltx-2.3-dev", "ltx2-rapid", "minimax-h3", "fasth3-trim", "fasth3-omni", "dreamid-v"],
   // HyperSwap ONNX face-swap: a source face pasted into every frame of a video.
   // Its own JobSpec (FaceSwapSpec); no prompt / size / steps.
   "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c"],
@@ -46,16 +53,26 @@ const MODELS = {
 // to upstream's distilled 768x512 (3:2 landscape, what the model was distilled
 // for); 256x256 is the explicit "fastest" floor -- below that the model is out of
 // distribution and output is incoherent. LTX also exposes an Audio toggle.
-// Sulphur-2 is an LTX-2.3 DiT finetune: byte-identical architecture, same grid +
-// audio path, so it shares the whole LTX UI surface.
+// ltx-2.3-dev (dev DiT + distill fold) is byte-identical architecture, same grid
+// + audio path, so it shares the whole LTX UI surface.
 // ltx2-rapid (LTX-2 19B merge) shares the LTX grid + audio/VAE surface but is
 // single-stage (no upscaler) and video-only for now; it matches neither existing
 // prefix, so list it explicitly.
-const isLtxModel = (model) => model.startsWith("ltx-2.3-distilled") || model.startsWith("sulphur-2") || model === "ltx2-rapid";
+const isLtxModel = (model) => model.startsWith("ltx-2.3-") || model === "ltx2-rapid";
 // ltx2-rapid is single-stage + video-only, and (post conditioning + VAE fixes) is
 // in-distribution at its own low res, so it takes its own preset list + toggle
 // defaults instead of the 22B two-stage LTX ones.
 const isLtxRapid = (model) => model === "ltx2-rapid";
+// MiniMax-H3: a 33B single-stream joint-AV model on its own /32 grid with a
+// fixed 24 fps and a 17n+5 frame grid. It shares the LTX audio surface (an Audio
+// toggle) but none of the LTX encoder/upscale knobs. Its packed sequence puts
+// text, audio and video in ONE self-attention stream, so resolution and clip
+// length trade against each other against a hard row cap -- hence its own
+// preset ladder rather than a generic one. FastH3-Trim (its 8-step DMD
+// distillation) rides the same pipeline and surface with a fixed schedule.
+// FastH3-Omni (the reference-image distill) rides it too, plus reference images.
+const isFastH3Model = (model) => model === "fasth3-trim" || model === "fasth3-omni";
+const isMinimaxModel = (model) => model === "minimax-h3" || isFastH3Model(model);
 // Wan2.2-T2V-A14B (MoE 14B): a heavier Wan-family tier with its own surface. It
 // runs a fixed 4-step LightX2V distill schedule (the steps/sampler knobs do not
 // apply) and only the full Wan2.1 VAE (no tiny-VAE path), so the Steps + Quality
@@ -70,6 +87,10 @@ const isWan22Model = (model) => model === "wan2.2-t2v-a14b";
 // picks it (2 = the fast play, more steps = steady quality gains), so the Steps
 // row stays visible with no upper cap.
 const isAnyflowModel = (model) => model === "anyflow-t2v-14b";
+// The Wan2.1-T2V-1.3B DMD 3-step family (Wan2.1 VAE, /16 grid, 16fps, 832x448):
+// FastWan2.1 (its own distill) and wan2.1-t2v-1.3b (stock or finetuned DiT + the
+// CausVid distill LoRA, same schedule). Both fold base-Wan2.1-1.3B vault LoRAs.
+const isFastwan21Model = (model) => model === "fastwan2.1-t2v-1.3b" || model === "wan2.1-t2v-1.3b";
 // HunyuanVideo 1.5 T2V: its own pipeline (Qwen2.5-VL encoder, dual-stream MMDiT,
 // causal-conv VAE). Fixed lightx2v 4-step flow-match schedule (the steps/sampler
 // knobs do not apply) and its own VAE (no tiny path), so those rows are hidden.
@@ -88,18 +109,31 @@ const isMultiShotModel = (model) => model === "longlive-2.0-5b";
 // REQUIRE an uploaded input image (mirrors the server's QwenImageEdit kind).
 const EDIT_MODELS = new Set(["qwen-image-edit-rapid"]);
 const isEditModel = (model) => EDIT_MODELS.has(model);
+
+// Z-Image variants whose DiT source is bf16 safetensors: they take the
+// "Full precision" toggle (default off = load-time Q8 transcode, fast; on = bf16,
+// slow, max precision). The GGUF variants are already quantized and ignore it.
+const BF16_MODELS = new Set(["zimage-turbo-bf16"]);
+const isBf16Model = (model) => BF16_MODELS.has(model);
 // Image models that accept request-time user adapters (the encrypted LoRA
 // vault), mirroring the server's `ImageModelId::supports_adapters`. Adapters are
 // per-model, so the UI only lists/uses adapters stored for the selected model.
 const ADAPTER_MODELS = new Set(["krea-2-turbo", "qwen-image-rapid", "qwen-image-edit-rapid"]);
-// AnyFlow is the one video model that folds vault LoRAs (diffusers-named Wan DiT;
-// the base-Wan2.1 LoRA ecosystem transfers). Mirrors the server's
+// Video models that fold vault LoRAs (diffusers-named Wan2.1 DiTs; the base-Wan2.1
+// LoRA ecosystem transfers). Mirrors the server's
 // `ImageModelId::supports_adapters` + `VideoModelId::supports_adapters`.
+const VIDEO_ADAPTER_MODELS = new Set([
+  "anyflow-t2v-14b",
+  "fastwan2.1-t2v-1.3b",
+  "wan2.1-t2v-1.3b",
+  "minimax-h3",
+  "fasth3-trim",
+  "fasth3-omni",
+]);
 const supportsAdapters = (kind, model) =>
-  (kind === "image" && ADAPTER_MODELS.has(model)) ||
-  (kind === "video" && model === "anyflow-t2v-14b");
+  (kind === "image" && ADAPTER_MODELS.has(model)) || (kind === "video" && VIDEO_ADAPTER_MODELS.has(model));
 // Fold any checked vault adapters into `spec` (mutated in place) plus the vault
-// password. Shared by the image and AnyFlow-video spec builders; a no-op when the
+// password. Shared by the image and adapter-video spec builders; a no-op when the
 // model takes no adapters or none are checked.
 function attachAdapters(spec, kind, model) {
   if (!supportsAdapters(kind, model)) return;
@@ -142,21 +176,73 @@ const PRESETS = {
     { label: "480p portrait (480x832)", width: 480, height: 832 },
   ],
 };
+// Image models authored at 1024 (resolution-aware schedules): Ideogram-4, both
+// Qwen-Image-Rapid variants, and Krea 2 Turbo default to 1024x1024 (mirrors the
+// server `ImageModelId::defaults`). Z-Image stays on the 768-led PRESETS.image.
+const IMAGE_1024_MODELS = new Set(["ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"]);
+const IMAGE_1024_PRESETS = [
+  { label: "1024x1024 (default)", width: 1024, height: 1024 },
+  { label: "768x768 (faster)", width: 768, height: 768 },
+  { label: "512x512 (fastest)", width: 512, height: 512 },
+  { label: "768x1024 portrait", width: 768, height: 1024 },
+  { label: "1024x768 landscape", width: 1024, height: 768 },
+];
 // LTX-2.3 has its own grid: dims must be a multiple of 64 and at least 256 (the
 // server rejects below 256). The decode tiles to the VRAM budget so larger dims
-// are allowed. Default first = 1280x704 (16:9 widescreen), the regime the
-// distilled model is in-distribution for: lower-res LTX stays coherent but
-// renders the wrong subject/action. The widescreen default is reached via the
-// two-stage upscale path (auto-enabled for LTX). The low-res entries are kept as
-// fast/preview options but are out of distribution -- expect off-prompt content.
-// All /64.
+// are allowed. All /64.
+//
+// MEASURED 2026-09-06 (same prompt + seed, a distilled LTX-2.3 Q4_K_M DiT). Resolution here
+// trades QUALITY against CLIP LENGTH, *not* against time -- every rung costs about
+// the same ~400s because `ltx_max_frames` shrinks the clip as dims grow, so the
+// token budget is roughly constant on an 8GB card:
+//
+//   1280x704  max 2.0s  399s  PHOTOREAL, best prompt adherence
+//   1024x576  max 3.0s  392s  stylized 3D render
+//   768x512   max 5.0s  418s  cartoon, weaker adherence
+//   768x448+  shorter still in quality: anatomy degrades, then prompt is ignored
+//
+// RE-MEASURED 2026-09-06 at a FIXED 49 frames, so resolution is the only variable
+// (the run above let the frame cap grow as dims shrank, which confounded
+// resolution with clip length). What degrades below the floor is the SCENE, not
+// the subject -- a bearded man with an umbrella renders at every rung, while the
+// pier/lighthouse/storm behind him thins out, dissolves, and is finally replaced
+// by an unrelated setting:
+//
+//   1280x704 901k px  513s  subject + pier
+//   1024x576 590k px  362s  subject + pier
+//    896x512 459k px  286s  photoreal, pier lost
+//    768x512 393k px  254s  subject + pier + correct overcast sky   <- FLOOR
+//    896x448 401k px  260s  CARTOON, scene gone (MORE px, short side 448)
+//    640x512 328k px  227s  claymation, subject cropped (512 short side, too few px)
+//    640x384 245k px  192s  scene dissolves to a blank void
+//    512x320 164k px  153s  scene REPLACED (indoor shop, not a pier)
+//
+// So the floor is TWO conditions, area AND short side: 896x448 out-pixels the
+// floor and still fails, 640x512 has the short side and still fails. 768x512 is
+// the smallest /64 point meeting both, and the largest where a full 5s fits.
+// NB adherence is not monotonic rung-to-rung at one seed (896x512 scored worse
+// than the smaller 768x512), so these labels separate GROUPS, not neighbours.
+// Labels state the LENGTH CAP, because that is the real cost of quality.
 const LTX_MIN_DIM = 256;
+// Adherence floor (mirrors `VideoModelId::LTX_ADHERENCE_FLOOR_PX` /
+// `_MIN_SIDE`). BOTH conditions bind: 896x448 has more pixels than 768x512 and
+// still goes cartoon (short side 448), while 640x512 has the 512 short side and
+// still collapses (only 328k px).
+const LTX_ADHERENCE_FLOOR_PX = 768 * 512;
+const LTX_ADHERENCE_MIN_SIDE = 512;
+const ltxDimsHoldAdherence = (w, h) =>
+  w * h >= LTX_ADHERENCE_FLOOR_PX && Math.min(w, h) >= LTX_ADHERENCE_MIN_SIDE;
 const LTX_PRESETS = [
-  { label: "720p landscape (1280x704, default)", width: 1280, height: 704 },
-  { label: "720p portrait (704x1280)", width: 704, height: 1280 },
-  { label: "960x576 landscape (faster)", width: 960, height: 576 },
-  { label: "768x512 landscape (fast, less faithful)", width: 768, height: 512 },
-  { label: "512x320 landscape (fastest, off-prompt / OOD)", width: 512, height: 320 },
+  { label: "720p landscape (1280x704, default, best adherence - max ~2s clip)", width: 1280, height: 704 },
+  { label: "1024x576 landscape (holds the scene - max ~3s clip)", width: 1024, height: 576 },
+  { label: "896x512 landscape (holds the scene - max ~4s clip)", width: 896, height: 512 },
+  { label: "768x512 landscape (adherence floor - full 5s clip)", width: 768, height: 512 },
+  { label: "720p portrait (704x1280, max ~2s clip)", width: 704, height: 1280 },
+  { label: "512x768 portrait (adherence floor, transposed)", width: 512, height: 768 },
+  { label: "896x448 landscape (BELOW FLOOR: goes cartoon, scene lost)", width: 896, height: 448 },
+  { label: "640x512 landscape (BELOW FLOOR: subject cropped, scene lost)", width: 640, height: 512 },
+  { label: "640x384 landscape (BELOW FLOOR: background dissolves)", width: 640, height: 384 },
+  { label: "512x320 landscape (BELOW FLOOR: wrong scene entirely)", width: 512, height: 320 },
 ];
 // ltx2-rapid single-stage presets. Default is 768x512 (the v62 workflow's native
 // res); 512x320 is the clean fast floor (in-distribution post the conditioning +
@@ -167,6 +253,22 @@ const RAPID_PRESETS = [
   { label: "512x320 landscape (fastest, clean)", width: 512, height: 320 },
   { label: "960x544 landscape (slower)", width: 960, height: 544 },
   { label: "1280x704 landscape (slowest, near VRAM cap)", width: 1280, height: 704 },
+];
+// MiniMax-H3 / FastH3 size ladder (/32 grid: 16x VAE spatial compression x the
+// (1,2,2) DiT patch). FastVideo runs FastH3 at 832x480 (480p) and H3's native
+// 1344x768; below 480p is off-distribution (faces and fine detail fall apart).
+// Every modality shares one packed self-attention sequence, capped per model
+// (`max_packed_rows`: FastH3's row-chunked CUDA block 73728 rows, base H3
+// 16384), so larger canvases fit shorter clips: a blank duration takes the
+// longest default clip that fits (see `h3Seconds`). First = default.
+const H3_PRESETS = [
+  { label: "480p landscape (832x480, default)", width: 832, height: 480 },
+  { label: "480p portrait (480x832)", width: 480, height: 832 },
+  { label: "1024x576 landscape", width: 1024, height: 576 },
+  { label: "1280x704 landscape", width: 1280, height: 704 },
+  { label: "768p landscape (1344x768, native)", width: 1344, height: 768 },
+  { label: "768p portrait (768x1344, native)", width: 768, height: 1344 },
+  { label: "640x352 landscape (below 480p: weaker faces/detail)", width: 640, height: 352 },
 ];
 // Wan2.2-T2V-A14B size ladder (/16 grid, the Wan2.1 VAE 8x + patch 2). The
 // default is 832x480, the industry-norm 480p distill regime. (The earlier
@@ -181,6 +283,13 @@ const WAN22_PRESETS = [
   { label: "small landscape (640x384, faster)", width: 640, height: 384 },
   { label: "288p landscape (512x288, fastest)", width: 512, height: 288 },
   { label: "288p portrait (288x512)", width: 288, height: 512 },
+];
+// FastWan2.1-1.3B size ladder (/16 Wan2.1 grid) led by its 832x448 training res.
+const FASTWAN21_PRESETS = [
+  { label: "448p landscape (832x448, default)", width: 832, height: 448 },
+  { label: "448p portrait (448x832)", width: 448, height: 832 },
+  { label: "480p landscape (848x480)", width: 848, height: 480 },
+  { label: "small landscape (640x352, faster)", width: 640, height: 352 },
 ];
 // HunyuanVideo 1.5 size ladder (/16 grid: 16x spatial VAE, patch 1). Default =
 // 832x480, the model's native 480p T2V regime. Smaller = fewer latent tokens =
@@ -199,6 +308,14 @@ function sizeSpec(kind, model) {
   if (kind === "video" && isLtxRapid(model)) return { presets: RAPID_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isLtxModel(model)) return { presets: LTX_PRESETS, step: 64, min: LTX_MIN_DIM };
   if (kind === "video" && isWan22Model(model)) return { presets: WAN22_PRESETS, step: 16, min: 16 };
+  if (kind === "video" && isMinimaxModel(model)) return { presets: H3_PRESETS, step: 32, min: 32 };
+  // AnyFlow (Wan2.1 14B) and mobilewan (Wan2.2 5B) both run the /16 Wan grid led
+  // by the industry-norm 832x480; the generic 960x544 /32 video ladder is wrong
+  // for them (wrong default + a /32 step that rejects legal /16 dims).
+  if (kind === "video" && (isAnyflowModel(model) || model === "mobilewan"))
+    return { presets: WAN22_PRESETS, step: 16, min: 16 };
+  if (kind === "video" && isFastwan21Model(model)) return { presets: FASTWAN21_PRESETS, step: 16, min: 16 };
+  if (kind === "image" && IMAGE_1024_MODELS.has(model)) return { presets: IMAGE_1024_PRESETS, step: 16, min: 16 };
   if (kind === "video" && isHunyuanModel(model)) return { presets: HUNYUAN_PRESETS, step: 16, min: 16 };
   // DreamID-V: the /16 Wan2.1-VAE grid led by its 832x480 default (the target
   // clip is downsampled toward this area).
@@ -242,26 +359,46 @@ const MODEL_STEPS = {
 // it runs progressively slower (the 14B self-attention is O(rows^2)).
 const VIDEO_DURATION = {
   "fastwan-ti2v-5b": 5,
+  "mobilewan": 5,
   "wan2.2-t2v-a14b": 2.1,
-  "anyflow-t2v-14b": 2.1,
+  // AnyFlow is NOT special-cased in the server's default_frames, so a blank field
+  // yields snap_frames(5s*16fps)=81f ~= 5s at its 832x480 default (not 2.1s).
+  "anyflow-t2v-14b": 5,
+  // snap_frames(5s*16fps) = 81f at its 832x448 default.
+  "fastwan2.1-t2v-1.3b": 5,
+  "wan2.1-t2v-1.3b": 5,
   "longlive-2.0-5b": 5,
   "ltx-2.3-distilled": 2,
   "ltx-2.3-distilled-q4": 2,
-  "sulphur-2": 2,
-  "sulphur-2-q4": 2,
-  "ltx2-rapid": 3,
+  "ltx-2.3-dev": 2,
+  "ltx-2.3-dev-q4": 2,
+  // rapid's blank default is 121f (LTX_DEFAULT_FRAMES, uncapped at its 768x512
+  // default res) ~= 5s @ 24fps.
+  "ltx2-rapid": 5,
   "hunyuan-video-1.5-t2v": 5,
   "hunyuan-video-1.5-ti2v": 5,
+  // Default frames on the 17n+5 grid at a fixed 24 fps (56f base, 124f FastH3),
+  // capped by the canvas: see `h3Seconds`.
+  "minimax-h3": 2.3,
+  "fasth3-trim": 5.2,
+  "fasth3-omni": 5.2,
 };
 
 const subtle = globalThis.crypto?.subtle;
 const SECURE = Boolean(subtle);
 if (!SECURE) {
-  log("WARNING: insecure context (http) - WebCrypto unavailable, results will NOT be encrypted. Use https or localhost to enable encryption.");
+  log("ERROR: insecure context (http) - WebCrypto unavailable, so jobs cannot be encrypted and will not be sent. Use https or localhost.");
 }
 
 // --- base64 <-> bytes ---------------------------------------------------------
-const bytesToBase64 = (bytes) => btoa(String.fromCharCode(...bytes));
+// Chunked: spreading a multi-MB array into fromCharCode overflows the stack.
+const bytesToBase64 = (bytes) => {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+};
 const base64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
 // Read a picked File as raw base64 (FileReader yields a `data:...;base64,XXXX`
@@ -274,72 +411,72 @@ const fileToBase64 = (file) =>
     r.readAsDataURL(file);
   });
 
-// Stream a video file to POST /uploads as a raw body (no base64, no JSON) and
-// return its opaque id. Keeps the large clip out of the job JSON body -- no
-// ~33% base64 inflation and no JSON size cap -- while the server holds it
-// RAM-first / encrypted-spill under a TTL until the job consumes it.
-async function uploadVideo(file) {
-  setStatus("Uploading video…");
+// Seal a video file under the job key and POST it to /uploads as a raw body
+// (no base64, no JSON); returns its opaque id. The server stores only this
+// ciphertext and cannot read it until the job's key arrives.
+async function uploadVideo(file, jobKey) {
+  setStatus("Encrypting + uploading video…");
+  const sealed = await seal(jobKey, new Uint8Array(await file.arrayBuffer()));
   const resp = await fetch("uploads", {
     method: "POST",
     headers: authHeaders({ "content-type": "application/octet-stream" }),
-    body: file,
+    body: sealed,
   });
   if (!resp.ok) throw new Error(await errorText(resp));
   const { id } = await resp.json();
   return id;
 }
 
-// --- token persistence (this browser only) ------------------------------------
+// --- token persistence (this tab's session only) ------------------------------
 const TOKEN_KEY = "thinfer_token";
-$("token").value = localStorage.getItem(TOKEN_KEY) ?? "";
+$("token").value = sessionStorage.getItem(TOKEN_KEY) ?? "";
 $("token").addEventListener("change", () => {
   const t = $("token").value.trim();
-  if (t) localStorage.setItem(TOKEN_KEY, t);
-  else localStorage.removeItem(TOKEN_KEY);
+  if (t) sessionStorage.setItem(TOKEN_KEY, t);
+  else sessionStorage.removeItem(TOKEN_KEY);
 });
 const authHeaders = (extra = {}) => {
   const t = $("token").value.trim();
   return t ? { ...extra, authorization: `Bearer ${t}` } : extra;
 };
 
-// --- result encryption keypair (in-browser, private key never leaves) ---------
-let keypairPromise = null;
-function ensureKeypair() {
-  if (!SECURE) return Promise.resolve(null);
-  if (!keypairPromise) {
-    keypairPromise = (async () => {
-      const kp = await subtle.generateKey(
-        {
-          name: "RSA-OAEP",
-          modulusLength: 2048,
-          publicExponent: new Uint8Array([1, 0, 1]),
-          hash: "SHA-256",
-        },
-        true,
-        ["encrypt", "decrypt"],
-      );
-      const spki = new Uint8Array(await subtle.exportKey("spki", kp.publicKey));
-      return { privateKey: kp.privateKey, publicKeyB64: bytesToBase64(spki) };
-    })();
-  }
-  return keypairPromise;
+// --- per-job key (in-browser; sent only when the worker asks) -----------------
+// `raw` is kept only to deliver the key and prove ownership of the result; it is
+// zero-filled when the job ends. `key` is a non-extractable WebCrypto handle.
+async function newJobKey() {
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const key = await subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+  return { raw, key };
 }
 
-// Decrypt the server blob: [u16 wrappedLen][RSA-wrapped AES key][12B nonce][AES-GCM body].
-async function decryptResult(privateKey, blob) {
-  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
-  const wlen = view.getUint16(0, false);
-  let off = 2;
-  const wrapped = blob.subarray(off, off + wlen);
-  off += wlen;
-  const nonce = blob.subarray(off, off + 12);
-  off += 12;
-  const body = blob.subarray(off);
-  const aesRaw = await subtle.decrypt({ name: "RSA-OAEP" }, privateKey, wrapped);
-  const aesKey = await subtle.importKey("raw", aesRaw, "AES-GCM", false, ["decrypt"]);
-  const plain = await subtle.decrypt({ name: "AES-GCM", iv: nonce }, aesKey, body);
+// `[12-byte nonce][AES-GCM ciphertext+tag]` (thinfer_app::jobkey layout).
+async function seal(jobKey, bytes) {
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const body = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv: nonce }, jobKey.key, bytes));
+  const out = new Uint8Array(12 + body.length);
+  out.set(nonce, 0);
+  out.set(body, 12);
+  return out;
+}
+
+async function openSealed(jobKey, blob) {
+  const plain = await subtle.decrypt({ name: "AES-GCM", iv: blob.subarray(0, 12) }, jobKey.key, blob.subarray(12));
   return new Uint8Array(plain);
+}
+
+// Base64 SHA-256 of the raw key: the result-fetch proof (reveals nothing of it).
+async function keyProof(jobKey) {
+  return bytesToBase64(new Uint8Array(await subtle.digest("SHA-256", jobKey.raw)));
+}
+
+async function deliverKey(id, jobKey) {
+  const resp = await fetch(`jobs/${id}/key`, {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ key: bytesToBase64(jobKey.raw) }),
+  });
+  if (!resp.ok) throw new Error(await errorText(resp));
+  log("Job key delivered; the server can now decrypt and run it");
 }
 
 // --- per-type form wiring -----------------------------------------------------
@@ -389,6 +526,33 @@ function applyKind() {
   applyModel();
 }
 $("kind").addEventListener("change", applyKind);
+// Reference images accumulate across picks (a file input replaces its
+// selection on every pick, and phone pickers often allow only one), in pick
+// order. The prompt names them by position, so the list shows which is which.
+const MAX_REF_IMAGES = 9;
+const refImages = [];
+function renderRefImages() {
+  $("ref-images-order").replaceChildren(
+    ...refImages.map((f, i) => {
+      const row = document.createElement("div");
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Remove";
+      remove.addEventListener("click", () => {
+        refImages.splice(i, 1);
+        renderRefImages();
+      });
+      row.append(`<Picture ${i + 1}> = ${f.name} `, remove);
+      return row;
+    }),
+  );
+}
+$("ref-images").addEventListener("change", () => {
+  const input = $("ref-images");
+  refImages.push(...[...input.files].slice(0, MAX_REF_IMAGES - refImages.length));
+  input.value = ""; // so re-picking the same file fires `change` again
+  renderRefImages();
+});
 
 // Re-grid the size controls + reference-image picker + steps for the selected
 // model. LTX switches to its /64 preset grid; edit models reveal the image
@@ -405,6 +569,8 @@ function applyModel() {
   // Frame-0 strength: ltx2-rapid I2V only (optional image, so always visible for
   // rapid; server ignores it when no image is sent).
   $("strength-row").hidden = !(kind === "video" && isLtxRapid(model));
+  // FastH3-Omni reference images (optional; the prompt names them).
+  $("ref-images-row").hidden = !(kind === "video" && model === "fasth3-omni");
   // DreamID-V (video kind) and the face-swap kind both consume a source FACE
   // image + a target VIDEO instead of a text prompt; reveal those uploaders and
   // drop the prompt / size / steps / seed rows that do not apply.
@@ -419,6 +585,9 @@ function applyModel() {
   $("occlusion-mask-row").hidden = !faceSwap;
   $("hyperswap-mask-row").hidden = !faceSwap;
   $("enhance-row").hidden = !faceSwap;
+  // Full-precision (bf16 vs default Q8) toggle: only the bf16-source Z-Image
+  // variant. GGUF variants are already quantized.
+  $("full-precision-row").hidden = !(kind === "image" && isBf16Model(model));
   $("detect-stride-row").hidden = !faceSwap;
   $("bitrate-scale-row").hidden = !faceSwap;
   $("trim-start-row").hidden = !faceSwap;
@@ -437,10 +606,20 @@ function applyModel() {
   // no two-stage upscale path).
   const isLtxVideo = kind === "video" && isLtxModel(model);
   const rapid = isLtxRapid(model);
-  // rapid is video-only + single-stage: no audio, no upscaler. The other LTX
-  // models expose both.
-  $("audio-row").hidden = !isLtxVideo || rapid;
+  // Audio is joint-AV for ALL LTX lines now, incl. rapid: its 19B DiT denoises the
+  // audio stream too, decoded by the shared audio VAE + a plain-HiFiGAN vocoder
+  // (16kHz). Upscale (two-stage) is 22B-only -- rapid ships no spatial upscaler.
+  // MiniMax-H3 is joint-AV too, so it takes the Audio toggle -- but none of the
+  // LTX-specific upscale / HQ-audio / encoder-quant knobs apply to it.
+  const isMinimax = kind === "video" && isMinimaxModel(model);
+  $("audio-row").hidden = !isLtxVideo && !isMinimax;
   $("upscale-row").hidden = !isLtxVideo || rapid;
+  // HQ audio (finer denoise) applies to EVERY LTX line: the coarse distilled
+  // sigma jumps under-resolve the joint audio residual on all of them. It refines
+  // the single-stage schedule for rapid and BOTH stage schedules for the 22B
+  // two-stage path. (It was rapid-only here, which made it dead for the 22B line
+  // -- the one place speech gibberish is worst.)
+  $("audio-hq-row").hidden = !isLtxVideo;
   // Text-encoder quant (q8/q4) is an LTX knob (shared Gemma encoder); rapid uses
   // the same encoder, so keep it for rapid too.
   $("encoder-row").hidden = !isLtxVideo;
@@ -463,14 +642,32 @@ function applyModel() {
   // If a non-Hunyuan model is selected while it was chosen, fall back to tiny.
   $("vae-opt-tiny-ft").hidden = !isHunyuan;
   if (!isHunyuan && $("vae").value === "tiny-ft") $("vae").value = "tiny";
+  // MiniMax-H3 / FastH3 decode with FastVideo's NVFP4 decoder by default (the
+  // server falls back to their fp16 VAE off Blackwell); "full" = that fp16 VAE,
+  // "nvfp4-fast" = the 8-layer one. The tiny VAEs do not apply to them.
+  $("vae-opt-tiny").hidden = isMinimax;
+  $("vae-opt-nvfp4").hidden = !isMinimax;
+  $("vae-opt-nvfp4-fast").hidden = !isMinimax;
+  const vae = $("vae").value;
+  if (isMinimax && (vae === "tiny" || vae === "tiny-ft")) $("vae").value = "nvfp4";
+  if (!isMinimax && vae.startsWith("nvfp4")) $("vae").value = "tiny";
+  // INT8 attention applies to the FastH3 models' sparse attention only.
+  $("attn-row").hidden = !(kind === "video" && isFastH3Model(model));
   // LTX runs a fixed distilled schedule (8 steps single-stage, or 8 + 3 = 11 when
   // upscaling), Wan2.2-A14B a fixed 4-step LightX2V distill, and Hunyuan 1.5 a
   // fixed lightx2v 4-step flow-match schedule; all ignore the steps/sampler knobs,
   // so hide the field for them.
-  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan || faceSwap;
-  // AnyFlow is ANY-step: lift the FastWan 1..=8 cap for it (default 4; 2 is the
-  // fast play; quality keeps improving with more).
-  if (isAnyflow) {
+  // MiniMax-H3 runs the lightx2v 4-step turbo distillation, which is a REQUIRED
+  // part of its run path (the base checkpoint needs ~50 steps), so its step
+  // count is fixed too.
+  // FastWan2.1-1.3B runs its fixed DMD 3-step schedule (the server default
+  // sampler for it), so steps do not apply either.
+  const isFastwan21 = kind === "video" && isFastwan21Model(model);
+  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan || faceSwap || isMinimax || isFastwan21;
+  // AnyFlow is ANY-step; DreamID-V runs a 16-step distill. Both exceed the FastWan
+  // 1..=8 cap, so lift the max for them (else the pre-filled default is invalid and
+  // the browser blocks Generate).
+  if (isAnyflow || dreamid) {
     $("steps").max = "";
   }
   // Temporal attention window is a video-DiT perf knob: Wan2.2-14B long clips,
@@ -498,6 +695,13 @@ function applyModel() {
     $("adapters-list").replaceChildren();
     $("adapters-status").textContent = "";
   }
+  // Coopmat (tensor-core) only accelerates the Wan-family video DiT hot path; it
+  // is inert for image, face-swap, LTX (own pipeline), and Hunyuan. Hide the
+  // toggle where it does nothing rather than show a dead control. (The
+  // /capabilities probe separately disables it on GPUs without support.)
+  const usesCoopmat = kind === "video" && !isLtxModel(model) && !isHunyuanModel(model);
+  const coopRow = $("coopmat-row");
+  if (coopRow) coopRow.hidden = !usesCoopmat;
   populateSize(kind, model);
   // Steps default is per-model (mirrors the server): the 4-step distilled image
   // models start at 4, everything else at the kind default. LTX ignores steps
@@ -506,11 +710,92 @@ function applyModel() {
   // Show the real per-model default in the duration PLACEHOLDER (blank field ->
   // the server uses this default; typing overrides). Clear any value carried
   // over from a previous model so blank truly means "use the shown default".
-  const dur = VIDEO_DURATION[model];
   $("duration").value = "";
-  $("duration").placeholder = kind === "video" && dur != null ? `${dur}s (default)` : "(seconds)";
+  refreshDurationPlaceholder();
+  refreshDimsWarning();
 }
 $("model").addEventListener("change", applyModel);
+
+// The LTX default clip length is resolution-derived on the server
+// (min(121, ltx_max_frames(w,h))): the 8GB activation envelope caps frames at
+// high res, but low res (e.g. 512x320) fits the full 121f/~5s. Mirror that here
+// so the blank-field placeholder tracks the SELECTED dims, not a static figure
+// (a static "2s" was only right at the 1280x704 widescreen default). fps 24,
+// VAE temporal factor 8, /32 latent grid, LTX_MAX_LATENT_CELLS 6300.
+const ltxDefaultSeconds = (w, h) => {
+  const cellsPerFrame = Math.max(1, Math.floor(h / 32)) * Math.max(1, Math.floor(w / 32));
+  const maxFLat = Math.max(1, Math.floor(6300 / cellsPerFrame));
+  const framesCap = 8 * (maxFLat - 1) + 1;
+  const frames = Math.min(121, framesCap);
+  return Math.round((frames / 24) * 10) / 10;
+};
+// MiniMax-H3 mirror of the server's row budget (`max_fitting_frames`): the
+// longest 17n+5 clip whose packed rows (a 256-row prompt reserve + video
+// (5n+2) x (h/32)(w/32) + 2 audio rows per 40 Hz latent) fit the model's row
+// limit. `def` caps at the model default (a blank field), `max` at H3's ~15s
+// design length as the server renders it (a 15s request rounds up the 17n+5
+// grid to 362 frames, 15.1s). Seconds, or null.
+const H3_MAX_FRAMES = 362;
+const h3Seconds = (model, w, h) => {
+  const fasth3 = isFastH3Model(model);
+  const rowLimit = fasth3 ? 73728 : 16384;
+  const perFrame = Math.floor(h / 32) * Math.floor(w / 32);
+  const fit = (cap) => {
+    let best = null;
+    for (let n = 0; 17 * n + 5 <= cap; n++) {
+      const frames = 17 * n + 5;
+      const audio = 2 * Math.round((frames / 24) * 40);
+      if (256 + (5 * n + 2) * perFrame + audio > rowLimit) break;
+      best = frames;
+    }
+    return best == null ? null : Math.round((best / 24) * 10) / 10;
+  };
+  return { def: fit(fasth3 ? 124 : 56), max: fit(H3_MAX_FRAMES) };
+};
+function refreshDurationPlaceholder() {
+  const model = $("model").value;
+  if ($("kind").value !== "video") {
+    $("duration").placeholder = "(seconds)";
+    return;
+  }
+  const [w, h] = [Number($("width").value), Number($("height").value)];
+  if (isMinimaxModel(model)) {
+    const { def, max } = h3Seconds(model, w, h);
+    $("duration").placeholder = def != null ? `${def}s (default, max ${max}s)` : "too large";
+    return;
+  }
+  const dur = isLtxModel(model) ? ltxDefaultSeconds(w, h) : VIDEO_DURATION[model];
+  $("duration").placeholder = dur != null ? `${dur}s (default)` : "(seconds)";
+}
+
+// Show the adherence caveat whenever the chosen LTX dims fall under the floor.
+// Mirrors the server-side warning in `request.rs::resolve_ltx` -- the server
+// still warns on the job itself, but by then the user has already committed to a
+// multi-minute run, so say it while the choice is still being made.
+function refreshDimsWarning() {
+  const el = $("dims-warning");
+  const model = $("model").value;
+  const w = Number($("width").value);
+  const h = Number($("height").value);
+  const under =
+    $("kind").value === "video" &&
+    isLtxModel(model) &&
+    !isLtxRapid(model) &&
+    w > 0 &&
+    h > 0 &&
+    !ltxDimsHoldAdherence(w, h);
+  el.hidden = !under;
+  if (under) {
+    el.textContent =
+      "Below the 768x512 prompt-adherence floor (needs both 393216+ pixels and " +
+      "a short side of 512+). The clip will still look clean, but the SCENE is " +
+      "what degrades: backgrounds thin out, then dissolve, then get replaced by " +
+      "an unrelated setting, while the subject survives. It also drifts from " +
+      "photoreal toward cartoon. Going lower gets you a LONGER clip, not a " +
+      "materially faster one - the frame cap grows as the dims shrink, so the " +
+      "clip lengthens and eats most of the saving.";
+  }
+}
 
 // Picking a preset fills the dims; typing dims that match no preset flips the
 // dropdown to "Custom" (hand-typed dims are always honored).
@@ -528,6 +813,14 @@ const syncPresetToDims = () => {
 };
 $("width").addEventListener("input", syncPresetToDims);
 $("height").addEventListener("input", syncPresetToDims);
+// LTX's default clip length depends on the selected dims -> refresh the
+// duration placeholder when either the preset or a typed dim changes.
+$("preset").addEventListener("change", refreshDurationPlaceholder);
+$("width").addEventListener("input", refreshDurationPlaceholder);
+$("height").addEventListener("input", refreshDurationPlaceholder);
+$("preset").addEventListener("change", refreshDimsWarning);
+$("width").addEventListener("input", refreshDimsWarning);
+$("height").addEventListener("input", refreshDimsWarning);
 
 applyKind();
 
@@ -676,8 +969,17 @@ async function removeAdapter(id, name) {
   }
 }
 
-$("adapters-refresh").addEventListener("click", () => void listAdapters());
-$("adapter-add-btn").addEventListener("click", () => void addAdapter());
+// The vault fields sit inside the generate form visually but belong to their
+// own forms (`form=` attributes; HTML forbids nesting), so Enter in them submits
+// the vault action, never a generation.
+$("vault-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  void listAdapters();
+});
+$("adapter-add-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  void addAdapter();
+});
 
 // --- spec building ------------------------------------------------------------
 const intOrNull = (v) => {
@@ -693,7 +995,7 @@ const floatOrNull = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-async function buildSpec() {
+async function buildSpec(jobKey) {
   const kind = $("kind").value;
   const seed = intOrNull($("seed").value);
   const width = intOrNull($("width").value);
@@ -710,7 +1012,7 @@ async function buildSpec() {
       kind: "faceSwap",
       model,
       sourceImageB64: await fileToBase64(face),
-      inputVideoUpload: await uploadVideo(vid),
+      inputVideoUpload: await uploadVideo(vid, jobKey),
       occlusionMask: $("occlusion-mask").checked,
       hyperswapMask: $("hyperswap-mask").checked,
       enhance: $("enhance").checked,
@@ -737,6 +1039,8 @@ async function buildSpec() {
       if (!file) throw new Error(`${model} requires a reference image; choose one first`);
       spec.inputImage = await fileToBase64(file);
     }
+    // bf16 Z-Image variants: opt into full bf16 precision (default off = Q8).
+    if (isBf16Model(model) && $("full-precision").checked) spec.fullPrecision = true;
     // Fold any checked vault adapters into the DiT (per-adapter weight).
     attachAdapters(spec, "image", model);
     return spec;
@@ -760,7 +1064,7 @@ async function buildSpec() {
       steps: intOrNull($("steps").value),
       guideScale: floatOrNull($("guide-scale").value),
       sourceImage: await fileToBase64(face),
-      inputVideoUpload: await uploadVideo(vid),
+      inputVideoUpload: await uploadVideo(vid, jobKey),
       seed,
     };
   }
@@ -778,6 +1082,31 @@ async function buildSpec() {
   // server splits it evenly across shots. Blank = the model default (5s). fps
   // is the model's native rate, so it is not exposed.
   const duration = floatOrNull($("duration").value);
+  // MiniMax-H3 honors dims (its /32 grid), duration (the server snaps to the
+  // 17n+5 frame grid), the Audio toggle and the decoder choice (its own fp16
+  // VAE = "full", or the opt-in NVFP4 decoders). Its step count is fixed by the
+  // required 4-step turbo distillation, its fps is fixed at 24, and it has no
+  // upscale / encoder-quant / sampler knobs.
+  if (isMinimaxModel(model)) {
+    const spec = {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      audio: $("audio").checked,
+      vae: $("vae").value,
+      seed,
+    };
+    if (isFastH3Model(model)) spec.attn = $("attn").value;
+    if (model === "fasth3-omni") {
+      if (refImages.length) spec.refImages = await Promise.all(refImages.map(fileToBase64));
+    }
+    // Vault LoRAs, applied at runtime (stacked low-rank pairs, no refold).
+    attachAdapters(spec, "video", model);
+    return spec;
+  }
   // LTX honors dims (its /64 grid, from the LTX presets), duration (server snaps
   // to 8k+1 frames then caps to the per-resolution 8GB frame budget), the Audio
   // toggle, and Upscale (two-stage, default-on). It ignores the Wan sampler/vae/
@@ -791,10 +1120,13 @@ async function buildSpec() {
       width,
       height,
       durations: duration === null ? null : [duration],
-      // rapid is video-only + single-stage; force both off regardless of any
-      // stale checkbox state.
-      audio: isLtxRapid(model) ? false : $("audio").checked,
+      // Audio is available for every LTX line (incl. rapid). Upscale is 22B-only
+      // (rapid is single-stage); force it off for rapid regardless of stale state.
+      audio: $("audio").checked,
       upscale: isLtxRapid(model) ? false : $("upscale").checked,
+      // HQ audio applies to every LTX line: single-stage for rapid, both stage
+      // schedules for the 22B two-stage path.
+      audioHq: isLtxModel(model) ? $("audio-hq").checked : false,
       encoder: $("encoder").value,
       // Prompt rewrite: rapid only (the 22B path ignores it server-side and its
       // rewriter files are not in the LTX-2.3 fetch set).
@@ -831,6 +1163,22 @@ async function buildSpec() {
       attnWindow: intOrNull($("attn-window").value),
       seed,
     };
+  }
+  // FastWan2.1-1.3B: fixed DMD 3-step (the server's default sampler for it, so
+  // no steps/sampler sent); VAE is the user's choice; folds vault LoRAs.
+  if (isFastwan21Model(model)) {
+    const spec = {
+      kind: "video",
+      model,
+      prompts,
+      width,
+      height,
+      durations: duration === null ? null : [duration],
+      vae: $("vae").value,
+      seed,
+    };
+    attachAdapters(spec, "video", model);
+    return spec;
   }
   // AnyFlow: any-step flow-map schedule -- steps is the primary knob. VAE is
   // the user's choice (tiny = taew2_1 fast decode, full = parity Wan2.1 VAE);
@@ -934,28 +1282,67 @@ function progressText(stage) {
 // --- SSE over fetch -----------------------------------------------------------
 // Reads the event body as a stream, splitting on blank-line frame boundaries and
 // JSON-parsing each frame's data: payload (one JobEvent). Resolves with the
-// `done` result, rejects on error/cancel or a dropped stream.
-async function streamEvents(id) {
-  const resp = await fetch(`jobs/${id}/events`, { headers: authHeaders() });
+// `done` result, rejects on error/cancel. Phones drop the stream whenever the
+// tab backgrounds or the screen locks while the job keeps running, so a dropped
+// stream reconnects with `Last-Event-ID` (the server replays what was missed)
+// instead of failing; only a run of failed reconnects gives up.
+const RECONNECT_TRIES = 30;
+async function streamEvents(id, jobKey) {
+  const cursor = { lastId: null, fails: 0 };
+  for (;;) {
+    try {
+      return await streamOnce(id, jobKey, cursor);
+    } catch (e) {
+      if (!(e instanceof StreamDropped) || ++cursor.fails > RECONNECT_TRIES) throw e;
+      setStatus("Connection lost, reconnecting…");
+      await new Promise((r) => setTimeout(r, Math.min(500 * 2 ** cursor.fails, 8000)));
+    }
+  }
+}
+
+// A network-level drop (fetch/read failed or the body ended early): retryable,
+// unlike a server error status or a terminal job event.
+class StreamDropped extends Error {}
+
+async function streamOnce(id, jobKey, cursor) {
+  const headers = cursor.lastId == null ? authHeaders() : authHeaders({ "last-event-id": cursor.lastId });
+  let resp;
+  try {
+    resp = await fetch(`jobs/${id}/events`, { headers });
+  } catch (e) {
+    throw new StreamDropped(e.message ?? String(e));
+  }
   if (!resp.ok) throw new Error(await errorText(resp));
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
   for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      throw new StreamDropped(e.message ?? String(e));
+    }
+    if (chunk.done) break;
+    buf += decoder.decode(chunk.value, { stream: true });
     let sep;
     while ((sep = firstSep(buf)) !== -1) {
       const frame = buf.slice(0, sep.at);
       buf = buf.slice(sep.at + sep.len);
-      const ev = parseFrame(frame);
-      if (!ev) continue;
+      const parsed = parseFrame(frame);
+      if (!parsed) continue;
+      cursor.lastId = parsed.id ?? cursor.lastId;
+      cursor.fails = 0;
+      const ev = parsed.event;
+      if (ev.type === "keyRequired") {
+        await deliverKey(id, jobKey);
+        continue;
+      }
       const result = handleEvent(ev);
       if (result !== undefined) return result;
     }
   }
-  throw new Error("event stream ended before the job finished");
+  throw new StreamDropped("event stream ended before the job finished");
 }
 
 function firstSep(buf) {
@@ -966,14 +1353,15 @@ function firstSep(buf) {
   return -1;
 }
 
+// One SSE frame -> `{ id, event }` (id = the frame's `id:` sequence, the
+// reconnect cursor), or null for keep-alive/comment frames.
 function parseFrame(frame) {
-  const data = frame
-    .split(/\r?\n/)
-    .filter((l) => l.startsWith("data:"))
-    .map((l) => l.slice(5).replace(/^ /, ""))
-    .join("\n");
+  const lines = frame.split(/\r?\n/);
+  const field = (name) =>
+    lines.filter((l) => l.startsWith(`${name}:`)).map((l) => l.slice(name.length + 1).replace(/^ /, ""));
+  const data = field("data").join("\n");
   if (!data) return null;
-  return JSON.parse(data);
+  return { id: field("id").at(-1) ?? null, event: JSON.parse(data) };
 }
 
 // Returns the `done` result to stop streaming, throws on terminal failure, or
@@ -1016,12 +1404,14 @@ async function errorText(resp) {
   return `server returned ${resp.status}: ${body || resp.statusText}`;
 }
 
-// --- result rendering (fetch ciphertext -> decrypt -> in-memory blob) ---------
-async function showResult(kind, result, privateKey) {
-  const resp = await fetch(result.resultUrl.replace(/^\//, ""), { headers: authHeaders() });
+// --- result rendering (fetch ciphertext -> open -> in-memory blob) ------------
+async function showResult(kind, result, jobKey) {
+  const resp = await fetch(result.resultUrl.replace(/^\//, ""), {
+    headers: authHeaders({ "x-job-key-sha256": await keyProof(jobKey) }),
+    cache: "no-store",
+  });
   if (!resp.ok) throw new Error(await errorText(resp));
-  let bytes = new Uint8Array(await resp.arrayBuffer());
-  if (privateKey) bytes = await decryptResult(privateKey, bytes);
+  const bytes = await openSealed(jobKey, new Uint8Array(await resp.arrayBuffer()));
   const mime = kind === "image" ? "image/png" : "video/mp4";
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   const img = $("image-out");
@@ -1070,24 +1460,89 @@ $("form").addEventListener("submit", (ev) => {
   void generate();
 });
 
-// Job id of the in-flight run, for the Cancel button. Null when idle.
+// Job id of the in-flight run, for the Cancel button. Null when idle. Also
+// remembered in localStorage so a reloaded page (phones discard backgrounded
+// tabs) can still cancel it; the result itself is lost with the old page's key.
 let currentJobId = null;
+// True while `generate()` owns a job: leaving the page then loses the result
+// (its key lives only here), so ask first. Browsers show their own wording,
+// and phones often skip the prompt; the orphan watcher below covers those.
+let ownJobRunning = false;
+window.addEventListener("beforeunload", (ev) => {
+  if (ownJobRunning) ev.preventDefault();
+});
+const ACTIVE_JOB_KEY = "thinfer.activeJob";
+function rememberJob(id) {
+  try {
+    if (id) localStorage.setItem(ACTIVE_JOB_KEY, id);
+    else localStorage.removeItem(ACTIVE_JOB_KEY);
+  } catch {
+    /* storage unavailable: cancel still works for this page's own job */
+  }
+}
+function showCancel(show) {
+  const btn = $("cancel");
+  btn.disabled = false;
+  btn.hidden = !show;
+}
+
 $("cancel").addEventListener("click", async () => {
   if (!currentJobId) return;
   $("cancel").disabled = true;
   setStatus("Cancelling…");
   try {
     // A queued job is dropped immediately; a running one is flagged and stops
-    // at the next denoise step boundary. The events stream then ends in
+    // at the next block or phase boundary. The events stream then ends in
     // `cancelled` and `generate()`'s catch reports it.
-    await fetch(`jobs/${currentJobId}/cancel`, {
+    const resp = await fetch(`jobs/${currentJobId}/cancel`, {
       method: "POST",
       headers: authHeaders(),
     });
+    if (!resp.ok) throw new Error(await errorText(resp));
   } catch (e) {
     log(`Cancel request failed: ${e.message ?? e}`);
+    setStatus(`Cancel failed: ${e.message ?? e}`);
+    $("cancel").disabled = false;
   }
 });
+
+// After a reload: offer Cancel for a job the previous page left running, and
+// watch it until it ends. Skipped while this page has its own job.
+async function resumeOrphanJob() {
+  let id = null;
+  try {
+    id = localStorage.getItem(ACTIVE_JOB_KEY);
+  } catch {
+    return;
+  }
+  if (!id) return;
+  for (;;) {
+    if (currentJobId && currentJobId !== id) return;
+    let state;
+    try {
+      const resp = await fetch(`jobs/${id}`, { headers: authHeaders() });
+      state = resp.ok ? (await resp.json()).state : "gone";
+    } catch {
+      state = "unreachable";
+    }
+    if (state !== "queued" && state !== "running") {
+      if (currentJobId === id) {
+        currentJobId = null;
+        showCancel(false);
+        setStatus(`Earlier job ended (${state}).`);
+      }
+      rememberJob(null);
+      return;
+    }
+    if (currentJobId !== id) {
+      currentJobId = id;
+      showCancel(true);
+      setStatus("A job from before this page loaded is still running (its result can't be shown here).");
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+resumeOrphanJob();
 
 async function generate() {
   const kind = $("kind").value;
@@ -1095,37 +1550,47 @@ async function generate() {
   const t0 = performance.now();
   genStart = t0; // stamp every log line with elapsed-from-submit (see `stamp`)
   setStatus("Submitting…");
+  let jobKey = null;
+  let streamGaveUp = false;
   try {
-    const keypair = await ensureKeypair();
-    const spec = await buildSpec();
-    if (keypair) spec.publicKey = keypair.publicKeyB64;
+    if (!SECURE) throw new Error("insecure context: open this page over https (or localhost) so jobs can be encrypted");
+    jobKey = await newJobKey();
+    const spec = await buildSpec(jobKey);
     // Coopmat is opt-OUT: only send the flag when the user unticked it (the
     // server treats absent as "use default"). A no-op on GPUs without support.
     if (!$("coopmat").checked) spec.disableCoopmat = true;
+    const sealed = await seal(jobKey, new TextEncoder().encode(JSON.stringify(spec)));
     const resp = await fetch("jobs", {
       method: "POST",
       headers: authHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify(spec),
+      body: JSON.stringify({ sealed: bytesToBase64(sealed), largeInput: kind === "face-swap" }),
     });
     if (!resp.ok) throw new Error(await errorText(resp));
     const { id } = await resp.json();
     currentJobId = id;
-    const cancelBtn = $("cancel");
-    cancelBtn.disabled = false;
-    cancelBtn.hidden = false;
-    log(`Submitted job ${id}${keypair ? " (encrypted)" : " (PLAINTEXT - insecure context)"}`);
-    const result = await streamEvents(id);
-    await showResult(kind, result, keypair?.privateKey ?? null);
+    ownJobRunning = true;
+    rememberJob(id);
+    showCancel(true);
+    log(`Submitted job ${id} (sealed)`);
+    const result = await streamEvents(id, jobKey);
+    await showResult(kind, result, jobKey);
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     const seed = result.seed != null ? `seed ${result.seed}, ` : "";
-    setStatus(`Done: ${seed}${secs}s.${keypair ? "" : " (not encrypted)"}`);
+    setStatus(`Done: ${seed}${secs}s.`);
   } catch (e) {
+    streamGaveUp = e instanceof StreamDropped;
     setStatus(`Failed: ${e.message ?? e}`);
     log(`Failed: ${e.message ?? e}`);
   } finally {
+    jobKey?.raw.fill(0); // wipe the raw key; the CryptoKey handle is dropped with it
     $("fields").disabled = false;
     genStart = null; // stop stamping; the next run re-arms it
+    ownJobRunning = false;
+    // Forget the job only once it reached a terminal state (or never got an
+    // id); a stream that gave up leaves it remembered so a reload can cancel.
+    if (currentJobId && !streamGaveUp) rememberJob(null);
     currentJobId = null;
-    $("cancel").hidden = true;
+    showCancel(false);
+    if (streamGaveUp) resumeOrphanJob();
   }
 }

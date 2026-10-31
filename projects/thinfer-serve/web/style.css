@@ -22,6 +22,17 @@ body {
   opacity: 0.6;
 }
 
+/* Inline caveat under a field (e.g. the LTX adherence floor). Spans both columns
+   of the #fields grid so it reads as a note on the row above, not a new field. */
+.warn {
+  grid-column: 1 / -1;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #c98a1b;
+  background: rgba(201, 138, 27, 0.1);
+}
+
 #fields {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -29,6 +40,14 @@ body {
   align-items: center;
   border: none;
   padding: 0;
+}
+
+/* The reference-image order list sits under its file input, not in the label
+   column of a new row. */
+#ref-images-order {
+  grid-column: 2;
+  font-size: 0.75rem;
+  opacity: 0.8;
 }
 
 #fields > button {
@@ -54,7 +73,18 @@ body {
 #coopmat-row:not([hidden]),
 #rewrite-row:not([hidden]),
 #rewrite-quality-row:not([hidden]),
-#attn-window-row:not([hidden]) {
+#full-precision-row:not([hidden]),
+#strength-row:not([hidden]),
+#occlusion-mask-row:not([hidden]),
+#hyperswap-mask-row:not([hidden]),
+#enhance-row:not([hidden]),
+#detect-stride-row:not([hidden]),
+#bitrate-scale-row:not([hidden]),
+#trim-start-row:not([hidden]),
+#trim-end-row:not([hidden]),
+#attn-window-row:not([hidden]),
+#attn-row:not([hidden]),
+#ref-images-row:not([hidden]) {
   display: contents;
 }
 /* The Quality (VAE) row is `.video-only` (hidden in image mode via the class, not
@@ -165,4 +195,24 @@ body.kind-video .video-only {
   font-family: monospace;
   font-size: 0.8rem;
   white-space: pre;
+}
+
+/* Cancel stays reachable on a phone: full-width, thumb-sized, and pinned to
+   the bottom of the viewport while the (long) form scrolls above it. */
+#cancel {
+  position: sticky;
+  bottom: 0.75rem;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  margin: 1rem 0 0;
+  padding: 0.9rem;
+  font-size: 1.1rem;
+}
+#cancel[hidden] {
+  display: none;
+}
+#ref-images-order button {
+  margin-left: 0.5rem;
+  font-size: 0.75rem;
 }

@@ -6,8 +6,7 @@
 //! Reuse map: Qwen2.5-VL text encoder = `crate::qwen_image`; RoPE3D / causal
 //! VAE primitives / flow-match stepping = `crate::wan`. T2V = the I2V port minus
 //! the image-conditioning channels, so the DiT/VAE/encoder/scheduler are shared
-//! and I2V (phase 2) adds onto this core. See
-//! `projects/thinfer-working-area/hunyuan-plan.md`.
+//! and I2V (phase 2) adds onto this core.
 
 pub mod config;
 pub mod dit;

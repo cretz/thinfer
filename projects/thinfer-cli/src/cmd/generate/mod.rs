@@ -100,7 +100,7 @@ pub(super) async fn run_job(
     ram: u64,
     vram: u64,
 ) -> Result<(), String> {
-    let missing = download::missing(files);
+    let missing = download::missing(files)?;
     if !missing.is_empty()
         && !confirm_download(&missing, download_as_needed).map_err(|e| e.to_string())?
     {
@@ -143,6 +143,8 @@ fn backend_config_from_env() -> BackendConfig {
         power_preference,
         timestamps: std::env::var("THINFER_TRACE").is_ok(),
         disable_coopmat: std::env::var("THINFER_NO_COOPMAT").is_ok(),
+        // Native CUDA hot ops when available; `THINFER_CUDA=off` forces wgpu.
+        cuda: std::env::var("THINFER_CUDA").map_or(true, |v| v != "off"),
     }
 }
 

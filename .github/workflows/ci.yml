@@ -1,28 +1,63 @@
 name: CI
 
+# Push is `main` only: branch work is covered by the PR event, so a branch with an open PR
+# does not build twice.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# One run per ref. A newer push supersedes an in-flight run instead of racing it for the
+# same rust-cache key (the loser discards everything it compiled).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Default is 3; a crates.io download blip should not fail a 45-minute matrix.
+  CARGO_NET_RETRY: 10
 
 jobs:
+  # Lint and test the workspace on every desktop host. Nothing here needs a GPU, model
+  # weights or the PyTorch reference: GPU tests skip without an adapter (or a CUDA device),
+  # and every test that reads weights from the HF cache is behind an opt-in `*-e2e` feature,
+  # so a plain `cargo test --workspace` is green for everyone.
   check:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      # fdk-aac (thinfer-app's AAC encoder) has no arch defines for MSVC ARM64 and
+      # falls through to a `#warning`, which cl rejects below C++23. `CL` reaches
+      # cl.exe alone: ring builds with clang on that target, and `CFLAGS` would
+      # hand clang a flag it reads as a file. Same in release.yml.
+      CL: ${{ matrix.os == 'windows-11-arm' && '/std:c++latest' || '' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        # The ARM legs are release.yml's arm64 targets: a target first compiled at release
+        # time is a release that can fail with nobody having seen it build.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest, windows-11-arm]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Same version as `projects/rust-toolchain.toml`: the lint set CI denies is the one a
+      # developer sees, and a new stable cannot turn CI red overnight.
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
+      # Save even when the job fails: a red run still compiled the dependency graph, and
+      # the next attempt at the fix should not pay for it again.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: projects
+          cache-on-failure: true
 
       - uses: astral-sh/setup-uv@v3
 
@@ -36,45 +71,70 @@ jobs:
           cache: pnpm
           cache-dependency-path: projects/thinfer-web/pnpm-lock.yaml
 
-      - name: install matching wasm-bindgen-cli
+      # The CLI must match the locked `wasm-bindgen` crate exactly. Cached per version so
+      # the install is paid once per bump, not per run.
+      - name: wasm-bindgen version
+        id: wbg
         working-directory: projects
         shell: bash
         run: |
           version=$(cargo metadata --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
           echo "wasm-bindgen version: $version"
-          cargo install --locked --version "$version" wasm-bindgen-cli
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache wasm-bindgen-cli
+        id: wbg-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen*
+          # Per ARCH too: the arm64 and x86_64 runners of one OS must not share a binary.
+          key: wasm-bindgen-cli-${{ steps.wbg.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install wasm-bindgen-cli
+        if: steps.wbg-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --version ${{ steps.wbg.outputs.version }} wasm-bindgen-cli
 
       - name: pnpm install
         working-directory: projects/thinfer-web
         run: pnpm install --frozen-lockfile
 
+      # Cheapest failures first: fmt and clippy never link.
       - name: cargo fmt --check
         working-directory: projects
         run: cargo fmt --all -- --check
 
+      # Every host lints its own `#[cfg]`-gated code (CUDA interop, Windows memory APIs,
+      # the macOS stub), which a lint pass on one OS cannot see.
       - name: cargo clippy (native)
         working-directory: projects
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo clippy (wasm32)
         working-directory: projects
-        run: cargo clippy -p thinfer-web --target wasm32-unknown-unknown --all-targets -- -D warnings
+        run: cargo clippy -p thinfer-web --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
 
-      - name: pnpm fmt:check / lint / typecheck
+      # One command per step: Windows runs `run:` in PowerShell, which reports only
+      # the LAST command's exit code, so a multi-line step there swallowed failures.
+      # Formatting is OS-independent and the Windows checkout has CRLF line endings
+      # (runner autocrlf), so it is checked off Windows only.
+      - name: pnpm fmt:check
+        if: runner.os != 'Windows'
         working-directory: projects/thinfer-web
-        run: |
-          pnpm fmt:check
-          pnpm lint
-          pnpm typecheck
+        run: pnpm fmt:check
 
+      - name: pnpm lint
+        working-directory: projects/thinfer-web
+        run: pnpm lint
+
+      - name: pnpm typecheck
+        working-directory: projects/thinfer-web
+        run: pnpm typecheck
+
+      # Every failing test binary in one run, not just the first.
       - name: cargo test (native)
         working-directory: projects
-        run: cargo test --workspace
-
-      - name: verify committed fixtures are up to date
-        shell: bash
-        run: git diff --exit-code projects/thinfer-conformance/fixtures/
+        run: cargo test --workspace --locked --no-fail-fast
 
       # TODO: re-enable. Hangs on GH-hosted runners: output stops right after
       # the Playwright chromium download, before cargo prints anything, on all
@@ -86,3 +146,52 @@ jobs:
       # - name: pnpm test:web
       #   working-directory: projects/thinfer-web
       #   run: pnpm test:web
+
+  # The op registry against the PyTorch reference (`--features conformance`): regenerate
+  # the fixtures with the bundled pyref (`uv run`), run every op on wgpu, diff. The runner
+  # has no GPU, so wgpu runs on Mesa's software Vulkan (lavapipe); these are small-shape
+  # accuracy checks, not perf. Then the regenerated fixtures must match the committed ones:
+  # the web suite consumes the committed copies, and a stale fixture keeps passing while
+  # describing code that no longer exists. Not byte for byte (torch's CPU kernels differ in
+  # the last ulps across machines) but every tensor present, same shape and dtype, values
+  # within a few ulps (`diff_fixtures.py`). The spec is Rust-written, so it IS byte-exact.
+  # One Linux leg is enough to prove the fixtures current.
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects
+          cache-on-failure: true
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Install software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+
+      # The test run regenerates the fixtures in place; keep the committed copies.
+      - name: snapshot committed fixtures
+        run: cp -r projects/thinfer-conformance/fixtures "$RUNNER_TEMP/committed-fixtures"
+
+      - name: cargo test (conformance)
+        working-directory: projects
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+          # Always run the generator: the mtime cache can call checked-out fixtures
+          # fresh, and the diff below would then compare the committed files to
+          # themselves.
+          THINFER_CONFORMANCE_REGEN: "1"
+        run: cargo test -p thinfer-conformance --features conformance --locked --release --no-fail-fast
+
+      - name: verify committed fixtures are up to date
+        run: |
+          git diff --exit-code projects/thinfer-conformance/fixtures/spec.json
+          uv run --directory projects/thinfer-conformance/python python -m thinfer_pytorch_ref.diff_fixtures \
+            "$RUNNER_TEMP/committed-fixtures" "$GITHUB_WORKSPACE/projects/thinfer-conformance/fixtures"

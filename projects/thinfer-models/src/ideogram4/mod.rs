@@ -5,8 +5,7 @@
 //!
 //! Ground truth is the official inference repo `third-party/ideogram4`
 //! (`src/ideogram4/{modeling_ideogram4,pipeline_ideogram4,autoencoder,
-//! scheduler,latent_norm,constants}.py`). Per-model porting notes live in
-//! `projects/thinfer-working-area/ideogram-plan.md`.
+//! scheduler,latent_norm,constants}.py`).
 //!
 //! Reuse: the per-block DiT recipe is the model-agnostic `common::block::Block`
 //! (sandwich-norm + tanh-gated AdaLN, QK-RMSNorm, SwiGLU) with half-rot RoPE;

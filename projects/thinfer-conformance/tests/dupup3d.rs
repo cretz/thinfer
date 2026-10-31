@@ -1,5 +1,5 @@
 //! `thinfer_core::ops::dupup3d::DupUp3dF32` (Wan2.2 residual VAE up-shortcut)
-//! vs an independently-written CPU gather reference. The worklog flagged the
+//! vs an independently-written CPU gather reference. Flagged risk: the
 //! op as built-but-unverified (the channel `repeat_interleave` + t/h/w
 //! duplicate-reshape + `first_chunk` temporal trim are the risk). No python
 //! fixture: the op is a parameter-free gather, so the reference is exact.

@@ -19,7 +19,7 @@ pub struct ModuleSignature {
 }
 
 /// Everything `forward` needs to issue dispatches into a caller-owned
-/// `CommandEncoder`. Per plan-details: no cross-module readback, no
+/// `CommandEncoder`. By design: no cross-module readback, no
 /// mid-forward awaits, single submit per module.
 ///
 /// Borrows are split so `encoder` and `scratch` can be `&mut` independently

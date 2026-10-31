@@ -35,6 +35,7 @@ pub fn streams_for(vd: VideoLatentDims, ad: AudioLatentDims) -> Streams {
         audio_tokens: ad.tokens(),
         video_text: super::connector::CONN_SEQ,
         audio_text: super::connector::CONN_SEQ,
+        video_period: vd.height * vd.width,
     }
 }
 
@@ -146,6 +147,58 @@ pub struct I2vCond<'a> {
 /// `cond = None` this is pure t2v: the X0 estimate is `latent - v*sigma` and the
 /// step recovers the velocity exactly. With `Some`, the conditioned video tokens
 /// are held to `cond.clean_v` via the per-step X0 blend (the caller must also
+/// Relative L1 change between two equal-length latents: `||a - b||_1 / ||b||_1`.
+/// Used only as the step-cache decision metric (host-side; both tensors are
+/// already on the host because the sampler runs there).
+fn rel_l1(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        num += (x - y).abs() as f64;
+        den += y.abs() as f64;
+    }
+    if den > 0.0 { (num / den) as f32 } else { 0.0 }
+}
+
+/// Step-cache threshold (`LTX_STEP_CACHE`, default 0 = off, full evaluation).
+///
+/// Adjacent denoise steps produce highly correlated velocities, so a step whose
+/// INPUT barely moved can reuse the previous step's velocity instead of running
+/// the 22B DiT again. The accumulated relative L1 change of the input latent
+/// since the last real evaluation is the staleness estimate; below the threshold
+/// the step is skipped. This CHANGES the output, so it is opt-in.
+///
+/// NB the distilled schedule is only 8+3 steps, so the correlation this feeds on
+/// is far thinner than on the 20-50 step schedules the technique is usually
+/// reported against. Treat any speedup here as earned, not assumed.
+fn step_cache_threshold() -> f32 {
+    static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("LTX_STEP_CACHE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+
+/// Step-cache policy: reuse the cached velocity for this step?
+///
+/// `staleness` is the accumulated relative L1 input change since the last real
+/// evaluation. Three hard guards, independent of the threshold: caching is off
+/// at `thresh <= 0`, there must BE a cached velocity (so each stage's step 0
+/// always evaluates), and the final step always evaluates because it sets the
+/// latent the VAE decodes.
+fn should_reuse(
+    thresh: f32,
+    staleness: f32,
+    step: usize,
+    last_step: usize,
+    has_cache: bool,
+) -> bool {
+    thresh > 0.0 && has_cache && step != last_step && staleness < thresh
+}
+
 /// seed `latent_v` with the matching `blend_clean`).
 #[allow(clippy::too_many_arguments)]
 pub async fn denoise_loop<S: WeightSource>(
@@ -168,13 +221,42 @@ pub async fn denoise_loop<S: WeightSource>(
     // every step's forward binds the same buffers.
     let inputs = DitLoopInputs::upload(backend, pipes, workspace, vtext, atext, freqs)
         .map_err(DitError::Wgpu)?;
+    // Step cache (opt-in; see `step_cache_threshold`). State is per CALL, so a
+    // two-stage run never reuses a velocity across the stage boundary: each
+    // stage's first step always evaluates.
+    let thresh = step_cache_threshold();
+    let mut prev_latent_v: Option<Vec<f32>> = None;
+    let mut cached: Option<(Vec<f32>, Vec<f32>)> = None;
+    let mut staleness = 0.0f32;
+    let mut skipped = 0usize;
+    let last_step = sigmas.len().saturating_sub(2);
     for (step, w) in sigmas.windows(2).enumerate() {
         let (sigma, sigma_next) = (w[0], w[1]);
-        let (vel_v, vel_a) = model
-            .forward_prepared(
-                backend, pipes, residency, workspace, s, &latent_v, &latent_a, &inputs, sigma,
-            )
-            .await?;
+        // Never skip the final step: it sets the latent the VAE actually decodes.
+        if let Some(pv) = &prev_latent_v {
+            staleness += rel_l1(&latent_v, pv);
+        }
+        let reuse = should_reuse(thresh, staleness, step, last_step, cached.is_some());
+        prev_latent_v = Some(latent_v.clone());
+        let (vel_v, vel_a) = match (reuse, &cached) {
+            (true, Some(c)) => {
+                skipped += 1;
+                (c.0.clone(), c.1.clone())
+            }
+            _ => {
+                staleness = 0.0;
+                let r = model
+                    .forward_prepared(
+                        backend, pipes, residency, workspace, s, &latent_v, &latent_a, &inputs,
+                        sigma,
+                    )
+                    .await?;
+                if thresh > 0.0 {
+                    cached = Some((r.0.clone(), r.1.clone()));
+                }
+                r
+            }
+        };
         let mut x0_v = sampler::to_denoised(&latent_v, &vel_v, sigma);
         if let Some(c) = cond {
             sampler::blend_clean(&mut x0_v, c.clean_v, c.mask_v, dit::IN_CHANNELS);
@@ -186,12 +268,43 @@ pub async fn denoise_loop<S: WeightSource>(
             p(step);
         }
     }
+    if thresh > 0.0 {
+        tracing::info!(
+            "step cache (LTX_STEP_CACHE={thresh}): reused {skipped} of {} steps",
+            sigmas.len() - 1
+        );
+    }
     Ok((latent_v, latent_a))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rel_l1_is_scale_relative() {
+        // Identical inputs => no change.
+        assert_eq!(rel_l1(&[1.0, -2.0, 3.0], &[1.0, -2.0, 3.0]), 0.0);
+        // ||a-b||_1 = 3, ||b||_1 = 6 => 0.5, and the ratio is invariant to a
+        // common scaling of both tensors (it is a RELATIVE metric).
+        assert!((rel_l1(&[2.0, -1.0, 4.0], &[1.0, -2.0, 3.0]) - 0.5).abs() < 1e-6);
+        assert!((rel_l1(&[20.0, -10.0, 40.0], &[10.0, -20.0, 30.0]) - 0.5).abs() < 1e-6);
+        // Degenerate denominator must not produce NaN/inf.
+        assert_eq!(rel_l1(&[0.0, 0.0], &[0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn step_cache_guards_hold_regardless_of_threshold() {
+        // Off by default: no threshold, never reuse.
+        assert!(!should_reuse(0.0, 0.0, 3, 10, true));
+        // A huge threshold still cannot skip the FINAL step ...
+        assert!(!should_reuse(f32::MAX, 0.0, 10, 10, true));
+        // ... nor a step with nothing cached yet (every stage's step 0).
+        assert!(!should_reuse(f32::MAX, 0.0, 0, 10, false));
+        // Within budget and past step 0 => reuse; over budget => evaluate.
+        assert!(should_reuse(0.1, 0.05, 3, 10, true));
+        assert!(!should_reuse(0.1, 0.15, 3, 10, true));
+    }
 
     #[test]
     fn freqs_have_expected_shapes() {

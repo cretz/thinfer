@@ -132,11 +132,14 @@ async fn i2v_e2e_health() {
         eprintln!("skipped[hunyuan i2v_e2e_health]: Comfy VAE not in HF cache");
         return;
     };
-    let Some(enc_path) = resolve_hf(
-        "THINFER_HUNYUAN_ENCODER",
-        "models--Phil2Sat--Qwen-Image-Edit-Rapid-AIO-GGUF",
-        "Qwen2.5-VL-7B-Instruct-abliterated/Qwen2.5-VL-7B-Instruct-abliterated.Q8_0.gguf",
-    ) else {
+    // The shared Qwen2.5-VL weight slot (user sources apply).
+    let Some(enc_path) = std::env::var("THINFER_HUNYUAN_ENCODER")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            thinfer_native::cache::resolve(&thinfer_models::qwen_image::manifest::ENCODER_Q8_0)
+        })
+    else {
         eprintln!("skipped[hunyuan i2v_e2e_health]: encoder GGUF not in HF cache");
         return;
     };

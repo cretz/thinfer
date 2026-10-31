@@ -406,7 +406,13 @@ impl GemmaEncoderPipelines {
                     dq_layout,
                 )
                 .await?;
-            dense_dequant.insert(scheme, DequantStep { pipeline, scheme });
+            dense_dequant.insert(
+                scheme,
+                DequantStep {
+                    pipeline,
+                    scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                },
+            );
         }
         Ok(Self {
             block,

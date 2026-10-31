@@ -108,6 +108,98 @@ pub trait MatmulOp {
     }
 }
 
+/// 16-bit element type of a dense matmul operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmType {
+    F16,
+    Bf16,
+}
+
+impl GemmType {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
+
+/// The contract of a dense 16-bit matmul, for an accelerator to run it in
+/// place of the WGSL: A `[M,K]` row-major of type `a`, B of type `b` as
+/// `[N,K]` (`b_nmajor`) or `[K,N]`, out `[M,N]` row-major (f32 when
+/// `out_f32`, else type `a`), f32 accumulate, dims uniform `(m, n, k, _)`.
+/// Only these combos qualify; f32/i8 acts and fused-quant weights have none
+/// (always WGSL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmDesc {
+    pub a: GemmType,
+    pub b: GemmType,
+    pub b_nmajor: bool,
+    pub out_f32: bool,
+}
+
+const GEMM_MARKER: &str = "// thinfer-gemm:";
+
+impl GemmDesc {
+    pub fn of(c: &MatMulConfig, cfg: &WgslConfig) -> Option<Self> {
+        let a = match cfg.act_dtype {
+            ActDtype::F16 => GemmType::F16,
+            ActDtype::Bf16 => GemmType::Bf16,
+            _ => return None,
+        };
+        let b = match cfg.weight_dtype {
+            WeightDtype::F16 => GemmType::F16,
+            WeightDtype::Bf16 => GemmType::Bf16,
+            _ => return None,
+        };
+        Some(Self {
+            a,
+            b,
+            b_nmajor: c.b_nmajor,
+            out_f32: false,
+        })
+    }
+
+    /// One WGSL comment line carrying this descriptor, so the compiled
+    /// pipeline knows its own contract (see [`Self::parse`]). The tiled WGSL
+    /// matmul always writes A's dtype, so `out_f32` is not encoded.
+    pub fn marker(&self) -> String {
+        format!(
+            "{GEMM_MARKER} a={} b={} nmajor={}\n",
+            self.a.tag(),
+            self.b.tag(),
+            self.b_nmajor as u8
+        )
+    }
+
+    /// The descriptor a matmul WGSL source was built with, if any.
+    pub fn parse(wgsl: &str) -> Option<Self> {
+        let rest = wgsl.strip_prefix(GEMM_MARKER)?.lines().next()?;
+        let ty = |s: &str| match s {
+            "f16" => Some(GemmType::F16),
+            "bf16" => Some(GemmType::Bf16),
+            _ => None,
+        };
+        let mut a = None;
+        let mut b = None;
+        let mut b_nmajor = None;
+        for kv in rest.split_whitespace() {
+            match kv.split_once('=')? {
+                ("a", v) => a = ty(v),
+                ("b", v) => b = ty(v),
+                ("nmajor", v) => b_nmajor = Some(v == "1"),
+                _ => return None,
+            }
+        }
+        Some(Self {
+            a: a?,
+            b: b?,
+            b_nmajor: b_nmajor?,
+            out_f32: false,
+        })
+    }
+}
+
 pub struct MatmulBufs<'a> {
     pub a: &'a BufRef,
     pub b: &'a BufRef,
@@ -691,8 +783,9 @@ fn build_wgsl(c: &MatMulConfig, cfg: &WgslConfig) -> String {
         .to_string();
         (tile_a_decl, tile_b_decl, a_load_loop, inner_loop)
     };
+    let gemm_marker = GemmDesc::of(c, cfg).map(|g| g.marker()).unwrap_or_default();
     format!(
-        r#"{f16_prelude}
+        r#"{gemm_marker}{f16_prelude}
 struct Dims {{ m: u32, n: u32, k: u32, _pad: u32 }};
 
 {a_elem_decl}
@@ -828,5 +921,51 @@ impl OpTest for MatMulF32 {
         ctx: &'a OpTestContext<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
         Box::pin(ctx.run_matmul(MatMulF32::new(self.cfg)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemm_marker_matches_the_compiled_contract() {
+        let nm = MatMulConfig {
+            tn: 2,
+            b_nmajor: true,
+            ..MatMulConfig::DEFAULT
+        };
+        let f16 = WgslConfig {
+            bf16_quant_writes: false,
+            act_dtype: ActDtype::F16,
+            weight_dtype: WeightDtype::F16,
+        };
+        assert_eq!(
+            GemmDesc::parse(&build_wgsl(&nm, &f16)),
+            Some(GemmDesc {
+                a: GemmType::F16,
+                b: GemmType::F16,
+                b_nmajor: true,
+                out_f32: false,
+            })
+        );
+        let packed = MatMulConfig {
+            tn: 2,
+            ..MatMulConfig::DEFAULT
+        };
+        assert_eq!(
+            GemmDesc::parse(&build_wgsl(&packed, &WgslConfig::BF16_PACKED)),
+            Some(GemmDesc {
+                a: GemmType::Bf16,
+                b: GemmType::Bf16,
+                b_nmajor: false,
+                out_f32: false,
+            })
+        );
+        // f32 acts: no accelerator contract.
+        assert_eq!(
+            GemmDesc::parse(&build_wgsl(&MatMulConfig::DEFAULT, &WgslConfig::FP32)),
+            None
+        );
     }
 }

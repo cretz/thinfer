@@ -47,7 +47,8 @@ use thinfer_core::trace::{self, DIAG};
 use thinfer_core::workspace::Workspace;
 use thinfer_models::wan::manifest::{self, role};
 use thinfer_models::wan::pipeline::{
-    GenerationParams, VaeChoice, VideoSampler, WanModel, WanStepDiag, gaussian_noise, renoise_seed,
+    GenerationParams, VaeChoice, VideoSampler, WanModel, WanStepDiag, WanVariant, gaussian_noise,
+    renoise_seed,
 };
 use thinfer_models::wan::source::WanSource;
 use thinfer_models::z_image::pipeline::encode_png;
@@ -58,12 +59,46 @@ use thinfer_native::tokenizer::HfTokenizer;
 const PROMPT: &str = "a red balloon over a green field";
 const SEED: u64 = 42;
 
-/// TI2V high-compression VAE geometry + DiT latent channels (z_dim). The latent
-/// grid the DiT denoises derives from these; they are fixed by the model, so a
-/// drift here means the test and the pipeline disagree about the tensor shape.
-const Z_DIM: usize = 48;
-const VAE_SCALE: usize = 16;
 const TEMPORAL_SCALE: usize = 4;
+
+/// Which FastVideo DMD model the gate drives (`THINFER_E2E_VARIANT`, default the
+/// 5B): the engine variant, its weight roles (DiT first, then umT5, then VAE),
+/// the tiny-decoder role, the expected DiT matmul dtype, and the pyref
+/// `--variant`. Latent geometry derives from the variant's VAE config.
+struct E2eVariant {
+    id: &'static str,
+    wan: WanVariant,
+    dit_role: &'static str,
+    vae_role: &'static str,
+    tiny_role: &'static str,
+    dit_matmul: WeightDtype,
+}
+
+impl E2eVariant {
+    fn from_env() -> Self {
+        match std::env::var("THINFER_E2E_VARIANT").as_deref() {
+            Ok("fastwan2.1-t2v-1.3b") => Self {
+                id: "fastwan2.1-t2v-1.3b",
+                wan: WanVariant::fastwan21_t2v_1_3b(),
+                dit_role: role::DIT_FASTWAN21,
+                vae_role: role::VAE_WAN21,
+                tiny_role: role::TINY_VAE_WAN21,
+                // No block transcode: the fp32 DiT narrows to bf16 at upload.
+                dit_matmul: WeightDtype::Bf16,
+            },
+            Ok("fastwan-ti2v-5b") | Err(_) => Self {
+                id: "fastwan-ti2v-5b",
+                wan: WanVariant::fastwan_ti2v_5b(),
+                dit_role: role::DIT,
+                vae_role: role::VAE,
+                tiny_role: role::TINY_VAE,
+                // bf16 block matmuls transcode to Q8_0 at load.
+                dit_matmul: WeightDtype::Quant(thinfer_core::quant::QuantKind::Q8_0),
+            },
+            Ok(other) => panic!("THINFER_E2E_VARIANT={other}: unknown variant"),
+        }
+    }
+}
 /// DiT text context length (umT5 rows cross-attended), == `config::TEXT_SEQ`.
 const TEXT_SEQ: usize = 512;
 /// FastWan DMD schedule length (`DmdConfig::fastwan_ti2v_5b` = `[1000,757,522]`).
@@ -156,11 +191,14 @@ async fn video_e2e_safetensors() {
     // Prompt override (threaded to BOTH the engine and the pyref so a parity run
     // can localize a prompt-specific divergence, e.g. umT5 odd-token EOS pad).
     let prompt = std::env::var("THINFER_E2E_PROMPT").unwrap_or_else(|_| PROMPT.to_string());
+    let variant = E2eVariant::from_env();
+    eprintln!("video-e2e variant: {}", variant.id);
+    let (z_dim, vae_scale) = (variant.wan.vae.z_dim, variant.wan.vae.spatial_compression);
 
     let f_lat = (num_frames as usize - 1) / TEMPORAL_SCALE + 1;
-    let h_lat = height as usize / VAE_SCALE;
-    let w_lat = width as usize / VAE_SCALE;
-    let n_lat = Z_DIM * f_lat * h_lat * w_lat;
+    let h_lat = height as usize / vae_scale;
+    let w_lat = width as usize / vae_scale;
+    let n_lat = z_dim * f_lat * h_lat * w_lat;
     let out_frames = TEMPORAL_SCALE * f_lat - 3;
     let rgb_elems = 3 * out_frames * height as usize * width as usize;
 
@@ -172,18 +210,18 @@ async fn video_e2e_safetensors() {
     // Resolve every safetensors weight role (1 DiT + 3 umT5 + 1 VAE) plus the
     // tokenizer. Skip cleanly if any role misses the HF cache - never download.
     let weight_roles = [
-        role::DIT,
+        variant.dit_role,
         role::TEXT_ENCODER_SHARD_1,
         role::TEXT_ENCODER_SHARD_2,
         role::TEXT_ENCODER_SHARD_3,
-        role::VAE,
+        variant.vae_role,
     ];
     let mut needed: Vec<&str> = weight_roles.to_vec();
     needed.push(role::TOKENIZER_JSON);
     // The LightTAE decoder weight is a separate lightx2v download; resolve it
     // only when the tiny path is requested (else the gate never needs it).
     if want_tiny {
-        needed.push(role::TINY_VAE);
+        needed.push(variant.tiny_role);
     }
     let mut resolved: Vec<(&str, PathBuf)> = Vec::with_capacity(needed.len());
     for r in needed {
@@ -277,7 +315,9 @@ async fn video_e2e_safetensors() {
         run_python_ref(
             &noise_path,
             &renoise_paths,
-            path_of(role::DIT),
+            path_of(variant.dit_role),
+            path_of(variant.vae_role),
+            variant.id,
             &tmp,
             &prompt,
             width,
@@ -308,7 +348,7 @@ async fn video_e2e_safetensors() {
     // Append the tiny decoder as an extra shard (its `decoder.{N}` keys are
     // disjoint from the real VAE's), so both decoders load from one catalog.
     if want_tiny {
-        let path = path_of(role::TINY_VAE);
+        let path = path_of(variant.tiny_role);
         openers.push(
             MmapFileOpener::new(path)
                 .await
@@ -374,11 +414,12 @@ async fn video_e2e_safetensors() {
     } else {
         VaeChoice::Full
     };
-    let model = WanModel::load_with_act(
+    let model = WanModel::load_variant(
         Arc::clone(&backend),
         residency,
         tokenizer,
         load_vae,
+        variant.wan.clone(),
         act_override,
         std::env::var_os("THINFER_WAN_I8_FFN").is_some(),
     )
@@ -388,12 +429,11 @@ async fn video_e2e_safetensors() {
     // The FastWan variant transcodes bf16 block matmuls to Q8_0 at load. A
     // misnamed rename map / wrong probe would silently fall to some other dtype.
     let dit_w = model.dit_matmul_weight();
-    eprintln!("[safetensors] DiT matmul weight dtype: {dit_w:?} (expected Quant(Q8_0))");
-    assert_eq!(
-        dit_w,
-        WeightDtype::Quant(thinfer_core::quant::QuantKind::Q8_0),
-        "safetensors DiT matmul dtype"
+    eprintln!(
+        "[safetensors] DiT matmul weight dtype: {dit_w:?} (expected {:?})",
+        variant.dit_matmul
     );
+    assert_eq!(dit_w, variant.dit_matmul, "safetensors DiT matmul dtype");
 
     // Temporal self-attention window (latent frames) for perf/quality A/B. Set
     // THINFER_E2E_ATTN_WINDOW=W to restrict self-attention to +-W latent frames;
@@ -930,6 +970,8 @@ fn run_python_ref(
     noise_path: &Path,
     renoise_paths: &[PathBuf],
     dit_shard: &Path,
+    vae_weights: &Path,
+    variant: &str,
     out_dir: &Path,
     prompt: &str,
     width: u32,
@@ -955,6 +997,10 @@ fn run_python_ref(
         noise_path.to_str().unwrap(),
         "--transformer-shard",
         dit_shard.to_str().unwrap(),
+        "--variant",
+        variant,
+        "--vae-weights",
+        vae_weights.to_str().unwrap(),
         "--out",
         out_dir.to_str().unwrap(),
         "--prompt",
@@ -1189,7 +1235,7 @@ fn fmt_mib(bytes: u64) -> String {
 
 /// For a `[rows, dim]` row-major tensor, report how much each channel varies
 /// ACROSS tokens (mean over channels of the cross-token variance). Near-zero ==
-/// the rows are token-uniform, which is the signature the worklog flagged for
+/// the rows are token-uniform, which is the known signature for
 /// the bad DiT velocity. Also prints the mean per-channel magnitude for scale.
 fn cross_token_var(label: &str, v: &[f32], rows: usize) {
     if rows == 0 || !v.len().is_multiple_of(rows) {

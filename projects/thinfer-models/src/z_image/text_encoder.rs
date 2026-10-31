@@ -344,6 +344,9 @@ pub(crate) fn register_one<S: WeightSource>(
             (TransposePolicy::None, Some(k))
         }
         (StorageEncoding::Quant(_), _) => (TransposePolicy::None, None),
+        // An NVFP4 composite uploads raw like a block quant: its dequant pass
+        // (`ops::nvfp4`) undoes the swizzle and emits the N-major workspace.
+        (StorageEncoding::Nvfp4, _) => (TransposePolicy::None, None),
         // F16 float source (the ltx2-rapid DiT stores norms/biases/tables/adaln/
         // caption/patchify/proj_out as F16): treated like F32/Bf16 -- it uploads
         // bf16 (`gpu_encoding`) and the bf16 matmul/rmsnorm reads it. Transcode of

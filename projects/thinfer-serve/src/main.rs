@@ -14,8 +14,8 @@ use axum_server::tls_rustls::RustlsConfig;
 
 mod api;
 mod config;
-mod crypto;
 mod job;
+mod jobspec;
 mod uploads;
 mod vault;
 mod web;
@@ -144,7 +144,7 @@ fn emit_openapi(path: &str) -> ExitCode {
 async fn serve(config_path: Option<String>) -> Result<(), String> {
     match &config_path {
         Some(p) => tracing::info!(config = %p, "loading serve config"),
-        None => tracing::info!("no --config; using built-in defaults (HTTP, no TLS)"),
+        None => tracing::info!("no --config; using built-in defaults"),
     }
     let config = ServeConfig::load(config_path.as_deref().map(std::path::Path::new))?;
     std::fs::create_dir_all(&config.artifact_dir)
@@ -163,12 +163,8 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
         }
     };
     tracing::info!(coopmat_supported, "coopmat capability probe");
-    let workers = config.workers.max(1);
-    for i in 0..workers {
-        worker::spawn_worker(i, store.clone(), backend_cfg, config.download_as_needed);
-    }
     tracing::info!(
-        bind = %config.bind, workers, artifact_dir = %config.artifact_dir.display(),
+        bind = %config.bind, workers = config.workers.max(1), artifact_dir = %config.artifact_dir.display(),
         "thinfer-serve starting",
     );
 
@@ -185,11 +181,27 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
         uploads.clone(),
         std::time::Duration::from_secs(config.upload_ttl_secs),
     );
+    job::spawn_reaper(
+        store.clone(),
+        std::time::Duration::from_secs(config.retention_secs),
+    );
+    let config_arc = Arc::new(config.clone());
+    let workers = config.workers.max(1);
+    for i in 0..workers {
+        worker::spawn_worker(
+            i,
+            worker::WorkerCtx {
+                store: store.clone(),
+                config: config_arc.clone(),
+                uploads: uploads.clone(),
+            },
+        );
+    }
 
     let web = web::router(config.web_dir.as_deref());
     let state = AppState {
         store,
-        config: Arc::new(config.clone()),
+        config: config_arc,
         coopmat_supported,
         vault: Arc::new(thinfer_app::vault::Vault::new(vault_dir)),
         uploads,
@@ -209,6 +221,15 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
                 .map_err(|e| format!("serve tls: {e}"))
         }
         None => {
+            // Plain HTTP only on loopback: job keys and sealed media must not
+            // cross a network in the clear (and browsers need a secure context
+            // for WebCrypto anyway).
+            if !bind_is_loopback(&config.bind) {
+                return Err(format!(
+                    "refusing plain HTTP on non-loopback bind {}; set tls_self_signed = true or tls_cert/tls_key",
+                    config.bind
+                ));
+            }
             let listener = tokio::net::TcpListener::bind(&config.bind)
                 .await
                 .map_err(|e| format!("bind {}: {e}", config.bind))?;
@@ -217,6 +238,14 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
                 .await
                 .map_err(|e| format!("serve: {e}"))
         }
+    }
+}
+
+/// Whether `bind` (`ip:port` or `host:port`) is a loopback address.
+fn bind_is_loopback(bind: &str) -> bool {
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) => addr.ip().is_loopback(),
+        Err(_) => bind.starts_with("localhost:"),
     }
 }
 

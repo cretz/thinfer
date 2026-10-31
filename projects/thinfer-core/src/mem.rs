@@ -96,6 +96,9 @@ impl Counter {
     fn peak(&self) -> u64 {
         self.peak.load(Ordering::Relaxed)
     }
+    fn reset_peak(&self) {
+        self.peak.store(self.current(), Ordering::Relaxed);
+    }
 }
 
 /// Shared memory accountant. Held by `WgpuBackend`; cloned `Arc`s handed to
@@ -121,6 +124,14 @@ pub struct MemAccount {
 impl MemAccount {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Restart every peak from the current level, so the next snapshot's
+    /// peaks cover just the phase that follows (diagnostics).
+    pub fn reset_peaks(&self) {
+        let all = self.vram.iter().chain(&self.ram);
+        all.chain([&self.vram_total, &self.ram_total])
+            .for_each(Counter::reset_peak);
     }
 
     pub fn charge_vram(&self, cat: VramCategory, bytes: u64) {

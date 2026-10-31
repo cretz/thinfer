@@ -299,7 +299,8 @@ pub async fn run(
             vae_res.evict_all_and_free(&**backend);
             out
         }
-        VaeChoice::Full => {
+        // NVFP4 is rejected for Hunyuan at request validation.
+        VaeChoice::Full | VaeChoice::Nvfp4 | VaeChoice::Nvfp4Fast => {
             let vae_path = resolve_role(manifest, role::VAE)?;
             let vae_src = open_st(&vae_path).await?;
             let vae_res = WeightResidency::new(vae_src, req.budget);
@@ -310,7 +311,7 @@ pub async fn run(
             // act_size=2 so they ~2x vs f32 (a single conv3d dispatch can trip the
             // 2s TDR), and/or two co-compiled pipeline sets + the whole-tensor f32
             // mid overshoot the VRAM budget at 480p. Re-enable once the f16 up-stage
-            // is TDR/budget-capped and validated at full res. See worklog.
+            // is TDR/budget-capped and validated at full res.
             let vae = HunyuanVaeDecoder::new(
                 HunyuanVaePipelines::compile_with(backend, ActDtype::F32)
                     .await
@@ -354,7 +355,11 @@ pub async fn run(
     match req.format {
         VideoFormat::Mp4 => {
             sink.note("Encoding MP4 (H.264)");
-            crate::codec::encode_mp4(&wan_video, plan.fps, &req.output)?;
+            crate::progress::write_artifact(
+                sink,
+                &req.output,
+                &crate::codec::encode_mp4(&wan_video, plan.fps)?,
+            )?;
         }
         VideoFormat::PngFrames => {
             sink.note("Writing PNG frames");
@@ -739,7 +744,8 @@ pub async fn run_i2v(
             vae_res.evict_all_and_free(&**backend);
             out
         }
-        VaeChoice::Full => {
+        // NVFP4 is rejected for Hunyuan at request validation.
+        VaeChoice::Full | VaeChoice::Nvfp4 | VaeChoice::Nvfp4Fast => {
             let vae_path = resolve_role(manifest, role::VAE)?;
             let vae_src = open_st(&vae_path).await?;
             let vae_res = WeightResidency::new(vae_src, req.budget);
@@ -783,7 +789,11 @@ pub async fn run_i2v(
     match req.format {
         VideoFormat::Mp4 => {
             sink.note("Encoding MP4 (H.264)");
-            crate::codec::encode_mp4(&wan_video, plan.fps, &req.output)?;
+            crate::progress::write_artifact(
+                sink,
+                &req.output,
+                &crate::codec::encode_mp4(&wan_video, plan.fps)?,
+            )?;
         }
         VideoFormat::PngFrames => {
             sink.note("Writing PNG frames");

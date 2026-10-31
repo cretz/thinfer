@@ -1,8 +1,8 @@
 """Ideogram-4 DiT parity reference.
 
 Loads the `Ideogram4Transformer` FROM THE SAME DiT GGUF the engine loads
-(dequantized Q8_0 -> bf16, isolating kernel correctness from quant loss, per
-`ideogram-plan.md`), generates deterministic `llm_features` (text rows) + noise
+(dequantized Q8_0 -> bf16, isolating kernel correctness from quant loss),
+generates deterministic `llm_features` (text rows) + noise
 (image rows), runs ONE velocity forward over the packed `[text][image]`
 sequence, and dumps:
 

@@ -88,6 +88,16 @@ impl CoopmatMatmulConfig {
         }
     }
 
+    /// The same multiply as an accelerator [`super::GemmDesc`] (f16 A/B).
+    pub fn gemm_desc(&self) -> super::GemmDesc {
+        super::GemmDesc {
+            a: super::GemmType::F16,
+            b: super::GemmType::F16,
+            b_nmajor: self.b_col_major,
+            out_f32: matches!(self.out, CoopmatOut::F32),
+        }
+    }
+
     /// Workgroup output block: rows / cols.
     pub fn wm(&self) -> u32 {
         self.tm * self.tile

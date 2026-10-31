@@ -10,6 +10,7 @@
 //! built via `open_wan22_source`, loaded with `WanVariant::wan22_t2v_a14b()` and
 //! i8 matmul ON (the production default). The full Wan2.1 VAE is forced (no tiny
 //! decoder path exists for A14B). Optional PNG staging via `THINFER_E2E_PNG_DIR`.
+#![cfg(feature = "wan-e2e")]
 
 use std::path::PathBuf;
 use std::sync::Arc;

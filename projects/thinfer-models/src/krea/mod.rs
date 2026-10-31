@@ -7,8 +7,7 @@
 //!
 //! Ground truth = `third-party/stable-diffusion.cpp/src/model/diffusion/
 //! krea2.hpp` (the reference impl; block structure + norms) plus the diffusers
-//! `Krea2Transformer2DModel` config. Per-model port notes:
-//! `projects/thinfer-working-area/worklog.md` (Krea section).
+//! `Krea2Transformer2DModel` config.
 //!
 //! Template = `qwen_image` (GGUF image DiT, Qwen-VL encoder tap, Wan-family KL
 //! VAE reuse, FlowMatchEuler CFG-free t2i). Divergences from qwen_image:

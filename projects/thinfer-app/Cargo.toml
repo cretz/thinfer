@@ -18,6 +18,8 @@ publish.workspace = true
 thinfer-core = { path = "../thinfer-core" }
 thinfer-native = { path = "../thinfer-native" }
 thinfer-models = { path = "../thinfer-models" }
+# Optional native CUDA hot-op interop (runtime-loaded driver; no toolkit needed).
+thinfer-cuda = { path = "../thinfer-cuda" }
 tracing = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # Video output: H.264 encode (Cisco BSD, compiled from source) + MP4 mux. Kept
@@ -49,6 +51,11 @@ argon2 = { version = "0.5", optional = true }
 aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 rand = { version = "0.8", optional = true }
+# Zeroed-on-drop keys and plaintext: per-job encryption (`jobkey`) and the
+# request types (prompts, media, keys are wiped when a job ends).
+zeroize = "1"
+# SHA-256 of a job key: the result-fetch capability (`jobkey::JobKey::proof`).
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -66,7 +73,7 @@ serve = ["serde", "dep:utoipa", "rewrite", "vault"]
 # The encrypted adapter vault (`vault` module + LoRA request plumbing). Native
 # crypto + reqwest download; shared by CLI and serve so the capability is at
 # parity across every interface.
-vault = ["serde", "dep:serde_json", "dep:reqwest", "dep:argon2", "dep:aes-gcm", "dep:base64", "dep:rand"]
+vault = ["serde", "dep:serde_json", "dep:reqwest", "dep:argon2", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
 # Optional HunyuanVideo 1.5 prompt rewriting: runs the cached Qwen3-VL-8B GGUF
 # on-device (native wgpu, `thinfer_models::qwen3_lm`), no HTTP/Python sidecar.
 # Just gates the `rewrite` module + the Phase-0 call; no extra deps. Enabled by
@@ -74,7 +81,7 @@ vault = ["serde", "dep:serde_json", "dep:reqwest", "dep:argon2", "dep:aes-gcm", 
 rewrite = []
 # The HTTP `RemoteExecutor` client (thinfer-cli --remote). Pulls reqwest; other
 # app consumers (serve) stay free of it.
-remote = ["serde", "dep:serde_json", "dep:reqwest", "dep:futures-util"]
+remote = ["serde", "dep:serde_json", "dep:reqwest", "dep:futures-util", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
 # Opt-in Qwen-Image-Edit host PREPROCESS parity test (real PNG -> ViT/VAE/tokens
 # vs the HF/diffusers reference via `uv run`). Touches the HF cache for the
 # tokenizer/preprocessor; skips cleanly when uncached.

@@ -7,8 +7,7 @@
 //!
 //! Ground truth = `third-party/diffusers` (`transformer_qwenimage.py`,
 //! `pipeline_qwenimage_edit.py`, `autoencoder_kl_qwenimage.py`) +
-//! `third-party/transformers/models/qwen2_5_vl`. Port plan +
-//! audit-vs-CONFIRM list: `projects/thinfer-working-area/qwen-image-plan.md`.
+//! `third-party/transformers/models/qwen2_5_vl`.
 //!
 //! Template = `ideogram4` (GGUF-only image DiT, Qwen-VL encoder tap, KL VAE,
 //! folded turbo recipe). Divergences from ideogram4: dual-stream (not single),
@@ -30,7 +29,7 @@ pub mod vision;
 /// DiT backbone config. Audited against `QwenImageTransformer2DModel` defaults
 /// in `transformer_qwenimage.py`. Flags/layer-count marked CONFIRM are verified
 /// against the GGUF metadata header before the loader is written (the Rapid-AIO
-/// finetune may override a flag); see the CONFIRM list in `qwen-image-plan.md`.
+/// finetune may override a flag).
 pub mod config {
     /// `num_attention_heads * attention_head_dim` (24 * 128).
     pub const DIM: usize = 3072;

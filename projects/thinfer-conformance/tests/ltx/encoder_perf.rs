@@ -8,7 +8,7 @@
 //! real-token count (<< the 1024 left-pad), so it is expected to be streaming-
 //! bound: per-layer compute (M = n_real rows) is trivial next to the ~260MB/
 //! layer weight upload. This harness quantifies that and is the rollup the
-//! worklog calls for when comparing a smaller-quant encoder.
+//! is wanted when comparing a smaller-quant encoder.
 //!
 //! Env knobs (all optional):
 //!   LTX_ENC_SEQ        (default 18)  synthetic real-token count
