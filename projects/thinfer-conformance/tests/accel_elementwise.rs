@@ -61,13 +61,16 @@ fn assert_close(what: &str, got: &[f32], want: &[f32]) {
 #[test]
 fn block_elementwise_ops_match_cpu_reference() {
     pollster::block_on(async {
-        let backend = WgpuBackend::new_with_config(WgpuConfig {
+        let Ok(backend) = WgpuBackend::new_with_config(WgpuConfig {
             power_preference: PowerPreference::HighPerformance,
             timestamps: false,
             disable_coopmat: false,
         })
         .await
-        .expect("wgpu adapter");
+        else {
+            eprintln!("SKIP: no wgpu adapter");
+            return;
+        };
         if let Err(e) = thinfer_cuda::install(&backend) {
             eprintln!("SKIP: no CUDA ({e})");
             return;

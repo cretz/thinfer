@@ -245,7 +245,10 @@ __device__ __forceinline__ void gemm_impl(
                     __nv_bfloat162 v = __floats2bfloat162_rn(x, y);
                     packed = *reinterpret_cast<unsigned*>(&v);
                 } else {
-                    __half2 v = __floats2half2_rn(x, y);
+                    // Saturate like the wgpu op's f16 store: a finite result past
+                    // the f16 range is 65504, never inf.
+                    __half2 v = __floats2half2_rn(fminf(fmaxf(x, -65504.f), 65504.f),
+                                                  fminf(fmaxf(y, -65504.f), 65504.f));
                     packed = *reinterpret_cast<unsigned*>(&v);
                 }
                 *reinterpret_cast<unsigned*>(static_cast<unsigned short*>(out) + (size_t)row * d.n + col) =

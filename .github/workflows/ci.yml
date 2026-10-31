@@ -19,6 +19,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Default is 3; a crates.io download blip should not fail a 45-minute matrix.
+  CARGO_NET_RETRY: 10
 
 jobs:
   # Lint and test the workspace on every desktop host. Nothing here needs a GPU, model
@@ -113,9 +115,10 @@ jobs:
           pnpm lint
           pnpm typecheck
 
+      # Every failing test binary in one run, not just the first.
       - name: cargo test (native)
         working-directory: projects
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       # TODO: re-enable. Hangs on GH-hosted runners: output stops right after
       # the Playwright chromium download, before cargo prints anything, on all
@@ -159,7 +162,11 @@ jobs:
         working-directory: projects
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
-        run: cargo test -p thinfer-conformance --features conformance --locked --release
+          # Always run the generator: the mtime cache can call checked-out fixtures
+          # fresh, and the diff below would then compare the committed files to
+          # themselves.
+          THINFER_CONFORMANCE_REGEN: "1"
+        run: cargo test -p thinfer-conformance --features conformance --locked --release --no-fail-fast
 
       - name: verify committed fixtures are up to date
         run: git diff --exit-code projects/thinfer-conformance/fixtures/

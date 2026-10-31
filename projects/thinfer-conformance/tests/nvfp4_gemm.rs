@@ -124,13 +124,16 @@ fn bf16_bits(v: f32) -> u16 {
 fn nvfp4_w4a4_gemm_matches_cpu_reference() {
     pollster::block_on(async {
         // The discrete adapter: the CUDA device must be the one wgpu drives.
-        let backend = WgpuBackend::new_with_config(WgpuConfig {
+        let Ok(backend) = WgpuBackend::new_with_config(WgpuConfig {
             power_preference: PowerPreference::HighPerformance,
             timestamps: false,
             disable_coopmat: false,
         })
         .await
-        .expect("wgpu adapter");
+        else {
+            eprintln!("SKIP: no wgpu adapter");
+            return;
+        };
         match thinfer_cuda::install(&backend) {
             Ok((name, sm)) => eprintln!("cuda: {name} sm_{}{}", sm.0, sm.1),
             Err(e) => {

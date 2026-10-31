@@ -410,24 +410,23 @@ impl LtxVaePipelines {
         };
         let cfg = Conv3dConfig { bm, bn, bk, tm, tn };
         // The kernel asserts these at build time; a bad sweep value should not
-        // panic a render mid-decode.
-        let threads = cfg.threads();
-        if !bm.is_multiple_of(tm)
-            || !bn.is_multiple_of(tn)
-            || threads == 0
-            || threads > 256
-            || (bm * bk + bk * bn) * 4 > 32768
-        {
+        // panic a render mid-decode. Zeros first: `threads()` divides by tm/tn.
+        // The bounds run in u64 so a huge value cannot wrap into range.
+        let legal = !f.contains(&0) && bm.is_multiple_of(tm) && bn.is_multiple_of(tn) && {
+            let (bm, bn, bk) = (u64::from(bm), u64::from(bn), u64::from(bk));
+            let threads = (bm / u64::from(tm)) * (bn / u64::from(tn));
+            (1..=256).contains(&threads) && (bm * bk + bk * bn) * 4 <= 32768
+        };
+        if !legal {
             tracing::warn!(
                 target: thinfer_core::trace::DIAG,
-                "LTX_VAE_CONV3D_CFG={raw} is not a legal tiling ({threads} threads); \
-                 using the default",
+                "LTX_VAE_CONV3D_CFG={raw} is not a legal tiling; using the default",
             );
             return DEFAULT;
         }
         tracing::info!(
             target: thinfer_core::trace::DIAG,
-            bm, bn, bk, tm, tn, threads, "ltx vae conv3d config overridden",
+            bm, bn, bk, tm, tn, threads = cfg.threads(), "ltx vae conv3d config overridden",
         );
         cfg
     }

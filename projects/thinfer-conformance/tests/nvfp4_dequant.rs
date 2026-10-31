@@ -3,6 +3,8 @@
 //! (the padded swizzle path), every E2M1 code, a wide E4M3 scale range and a
 //! distinct alpha per 128-row group.
 
+#![cfg(feature = "conformance")]
+
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend};
 use thinfer_core::ops::dequant::{DequantTarget, layout};
 use thinfer_core::ops::nvfp4::{self, Nvfp4Layout};

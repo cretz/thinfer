@@ -54,7 +54,7 @@ pub fn probe(device: &wgpu::Device) -> Result<CudaDevice, Unavailable> {
     for ordinal in 0..count {
         let dev = result::device::get(ordinal).map_err(driver_err)?;
         let uuid = result::device::get_uuid(dev).map_err(driver_err)?;
-        if uuid.bytes.map(|b| b as u8) != want {
+        if uuid.bytes.map(|b| b.to_ne_bytes()[0]) != want {
             continue;
         }
         let ctx = CudaContext::new(ordinal as usize).map_err(driver_err)?;

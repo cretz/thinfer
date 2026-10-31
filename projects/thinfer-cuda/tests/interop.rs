@@ -92,11 +92,13 @@ fn engine_buffers_are_cuda_addressable_with_the_allocator_installed() {
 
     // The discrete GPU (hybrid laptops default to the integrated one, which
     // correctly probes as "no CUDA match").
-    let backend = pollster::block_on(WgpuBackend::new_with_config(WgpuConfig {
+    let Ok(backend) = pollster::block_on(WgpuBackend::new_with_config(WgpuConfig {
         power_preference: PowerPreference::HighPerformance,
         ..Default::default()
-    }))
-    .expect("wgpu adapter");
+    })) else {
+        eprintln!("skipped[cuda engine alloc]: no wgpu adapter");
+        return;
+    };
     let cuda = match thinfer_cuda::probe(backend.wgpu_device()) {
         Ok(c) => Arc::new(c),
         Err(e) => {
