@@ -35,7 +35,7 @@ use thinfer_core::residency::{
 use thinfer_core::tensor::Shape;
 use thinfer_core::trace::{self, PHASE};
 use thinfer_core::weight::{WeightId, WeightSource};
-use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace, WsBuf};
+use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi, Workspace, WsBuf};
 use tracing::Instrument;
 
 use crate::common::block::{
@@ -281,6 +281,9 @@ pub struct BlockHandles {
     w1_bias: WeightHandle,
     w2: WeightHandle,
     w2_bias: WeightHandle,
+    /// The six linears are NVFP4 composites (FastVideo's NVFP4 decoders, see
+    /// `fasth3::FastH3Source::vae_decoder`): accelerator-only.
+    nvfp4: bool,
 }
 
 pub struct BlockViews<'a> {
@@ -294,6 +297,7 @@ pub struct BlockViews<'a> {
     w1_bias: GpuView<'a>,
     w2: GpuView<'a>,
     w2_bias: GpuView<'a>,
+    nvfp4: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -308,6 +312,7 @@ pub struct BlockBufs {
     pub w1_bias: BufRef,
     pub w2: BufRef,
     pub w2_bias: BufRef,
+    pub nvfp4: bool,
 }
 
 impl BlockHandles {
@@ -339,6 +344,7 @@ impl BlockHandles {
             w1_bias: residency.acquire(self.w1_bias, backend).await?,
             w2: residency.acquire(self.w2, backend).await?,
             w2_bias: residency.acquire(self.w2_bias, backend).await?,
+            nvfp4: self.nvfp4,
         })
     }
 }
@@ -356,6 +362,7 @@ impl BlockViews<'_> {
             w1_bias: self.w1_bias.buf(),
             w2: self.w2.buf(),
             w2_bias: self.w2_bias.buf(),
+            nvfp4: self.nvfp4,
         }
     }
 }
@@ -388,10 +395,14 @@ pub fn register_handles<S: WeightSource>(
     let lin = |id: &WeightId| register_one(residency, id, TransposePolicy::Linear2D, None);
     let dense = |id: &WeightId| register_one(residency, id, TransposePolicy::None, None);
 
+    let catalog = residency.source().catalog();
     let blocks = (0..cfg.decoder_layers)
         .map(|i| {
             let b = BlockWeights::new(i);
+            let nvfp4 = catalog.get(&b.to_qkv).and_then(|e| e.encoding)
+                == Some(thinfer_core::tensor::StorageEncoding::Nvfp4);
             Ok(BlockHandles {
+                nvfp4,
                 norm1: dense(&b.norm1)?,
                 norm2: dense(&b.norm2)?,
                 scale1: dense(&b.scale1)?,
@@ -554,6 +565,9 @@ pub enum DecodeError<SE: core::fmt::Debug> {
         got: usize,
         need: usize,
     },
+    /// An NVFP4 decoder block the accelerator declined: there is no backend
+    /// path for its weights.
+    Nvfp4Declined,
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for DecodeError<SE> {
@@ -827,14 +841,14 @@ fn block_forward<'wsp>(
 /// of a pass is chunked into its own 64-row tiles, and each query tile lists
 /// exactly its own tile's key tiles (block-diagonal), which is the batched
 /// SDPA's contract (attention never crosses tiles, no mask).
-struct TilePlan {
-    geometry: WsBuf<WgpuBackend>,
-    lists: WsBuf<WgpuBackend>,
-    n_tiles: u32,
+pub(crate) struct TilePlan {
+    pub(crate) geometry: WsBuf<WgpuBackend>,
+    pub(crate) lists: WsBuf<WgpuBackend>,
+    pub(crate) n_tiles: u32,
 }
 
 impl TilePlan {
-    fn new(
+    pub(crate) fn new(
         backend: &WgpuBackend,
         scratch: &Workspace<WgpuBackend>,
         batch: usize,
@@ -842,8 +856,8 @@ impl TilePlan {
         heads: usize,
     ) -> Result<Self, WgpuError> {
         let items: Vec<(usize, usize)> = (0..batch).map(|b| (b * tokens, tokens)).collect();
-        let g = super::vsa::VsaGeometry::new(&items, 0, [0, 0, 0]);
-        let (t, per) = (g.n_tiles(), tokens.div_ceil(super::vsa::TILE));
+        let g = super::vsa::VsaGeometry::new(super::vsa::VsaTiling::T64, &items, 0, [0, 0, 0]);
+        let (t, per) = (g.n_tiles(), tokens.div_ceil(g.tiling.rows));
         let mut lists = vec![0u32; heads * t * t + heads * t];
         for h in 0..heads {
             for i in 0..t {
@@ -898,12 +912,19 @@ fn block_forward_accel<'s>(
     let Some(acc) = scope.accelerator() else {
         return Ok(false);
     };
+    // `(n, k)` of to_qkv, to_out, w1, w2.
+    let shapes = [(3 * dim, dim), (dim, dim), (2 * ffn, dim), (dim, ffn)];
+    let gemms_ok = if bufs.nvfp4 {
+        shapes
+            .iter()
+            .all(|&(n, k)| acc.accepts_gemm_nvfp4(rows, n, k).is_some())
+    } else {
+        shapes.iter().all(|&(n, _)| scope.accepts_gemm(mm, rows, n))
+    };
     if p.act_dtype != thinfer_core::ops::ActDtype::Bf16
         || !acc.accepts_elementwise()
         || !acc.accepts_tile_attention(hd)
-        || [3 * dim, dim, 2 * ffn]
-            .iter()
-            .any(|&n| !scope.accepts_gemm(mm, rows, n))
+        || !gemms_ok
         || !scope.accel_begin()?
     {
         return Ok(false);
@@ -919,29 +940,82 @@ fn block_forward_accel<'s>(
     };
     let at = |r: BufRef| addr(scope.import_copy(r));
     let act = |elems: u32| scope.alloc(elems as u64 * p.act_bytes(1));
-    let one = |a: BufRef, b: Option<BufRef>| RowSegments {
-        n: 1,
-        end: [rows, 0, 0, 0],
-        a: [at(a), 0, 0, 0],
-        b: [b.map_or(0, at), 0, 0, 0],
+    let one = |a: BufRef, b: Option<BufRef>| {
+        let mut s = RowSegments {
+            n: 1,
+            ..Default::default()
+        };
+        (s.end[0], s.a[0], s.b[0]) = (rows, at(a), b.map_or(0, at));
+        s
     };
-    let mm_bias = |src: BatchBuf<'s>, w: BufRef, bias: BufRef, n: u32, k: u32| {
-        let raw = act(rows * n)?;
+    // `out = residual + gate * (src @ w + bias)` into `out`. Dense: all in the
+    // GEMM's epilogue (no separate passes over `rows x n`). NVFP4 (unit
+    // activation scale, FlashInfer nibble order): the FP4 GEMM, then the bias
+    // and the gated residual as elementwise passes.
+    let mm_into = |src: BatchBuf<'s>,
+                   w: BufRef,
+                   bias: BufRef,
+                   residual: Option<(BatchBuf<'s>, BufRef)>,
+                   out: BatchBuf<'s>,
+                   n: u32,
+                   k: u32| {
+        if !bufs.nvfp4 {
+            let epi = GemmEpi {
+                bias: Some(scope.import_copy(bias)),
+                residual: residual.map(|(r, _)| r),
+                gate: residual.map(|(_, g)| scope.import_copy(g)),
+            };
+            ran(
+                scope.try_gemm_fused(mm, src, scope.import_copy(w), out, rows, n, k, epi)?,
+                "gemm",
+            );
+            return Ok::<_, WgpuError>(());
+        }
+        let lin = match residual {
+            Some(_) => act(rows * n)?,
+            None => out,
+        };
+        let format = thinfer_core::backend::Nvfp4Format {
+            dynamic_act_scale: false,
+            hi_first: false,
+        };
         ran(
-            scope.try_gemm(mm, src, scope.import_copy(w), raw, rows, n, k)?,
-            "gemm",
+            scope.try_gemm_nvfp4(src, scope.import_copy(w), lin, rows, n, k, format)?,
+            "nvfp4 gemm",
         );
-        let out = act(rows * n)?;
         ran(
             scope.accel_elementwise(&ElementwiseOp::AddBias {
-                x: addr(raw),
+                x: addr(lin),
                 bias: at(bias),
-                out: addr(out),
+                out: addr(lin),
                 rows,
                 dim: n,
             }),
             "bias",
         );
+        if let Some((r, g)) = residual {
+            ran(
+                scope.accel_elementwise(&ElementwiseOp::GateAdd {
+                    x: addr(r),
+                    y: addr(lin),
+                    out: addr(out),
+                    rows,
+                    dim: n,
+                    seg: one(g, None),
+                }),
+                "gated residual",
+            );
+        }
+        Ok(())
+    };
+    let mm_fused = |src: BatchBuf<'s>,
+                    w: BufRef,
+                    bias: BufRef,
+                    residual: Option<(BatchBuf<'s>, BufRef)>,
+                    n: u32,
+                    k: u32| {
+        let out = act(rows * n)?;
+        mm_into(src, w, bias, residual, out, n, k)?;
         Ok::<_, WgpuError>(out)
     };
 
@@ -959,11 +1033,14 @@ fn block_forward_accel<'s>(
         }),
         "norm1",
     );
-    let qkv = mm_bias(n1, bufs.to_qkv, bufs.to_qkv_bias, 3 * dim, dim)?;
+    let qkv = mm_fused(n1, bufs.to_qkv, bufs.to_qkv_bias, None, 3 * dim, dim)?;
     let (q, k, v) = (act(rows * dim)?, act(rows * dim)?, act(rows * dim)?);
     ran(
         scope.accel_elementwise(&ElementwiseOp::QkNormRope {
-            headwise: true,
+            // The dense file interleaves q/k/v per head; the NVFP4 composite is
+            // `[q; k; v]` slabs (see `FastH3Source::vae_decoder`).
+            headwise: !bufs.nvfp4,
+            q_only: false,
             qkv: addr(qkv),
             q_norm: 0,
             k_norm: 0,
@@ -998,19 +1075,14 @@ fn block_forward_accel<'s>(
         )?,
         "tile attention",
     );
-    let proj = mm_bias(sa, bufs.to_out, bufs.to_out_bias, dim, dim)?;
-    let after_attn = act(rows * dim)?;
-    ran(
-        scope.accel_elementwise(&ElementwiseOp::GateAdd {
-            x: at(x_in),
-            y: addr(proj),
-            out: addr(after_attn),
-            rows,
-            dim,
-            seg: one(scale1, None),
-        }),
-        "scale1 residual",
-    );
+    let after_attn = mm_fused(
+        sa,
+        bufs.to_out,
+        bufs.to_out_bias,
+        Some((scope.import_copy(x_in), scale1)),
+        dim,
+        dim,
+    )?;
 
     // --- feed-forward ---
     let n2 = act(rows * dim)?;
@@ -1026,7 +1098,7 @@ fn block_forward_accel<'s>(
         }),
         "norm2",
     );
-    let fused = mm_bias(n2, bufs.w1, bufs.w1_bias, 2 * ffn, dim)?;
+    let fused = mm_fused(n2, bufs.w1, bufs.w1_bias, None, 2 * ffn, dim)?;
     let gu = act(rows * ffn)?;
     ran(
         scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
@@ -1037,18 +1109,15 @@ fn block_forward_accel<'s>(
         }),
         "swiglu",
     );
-    let down = mm_bias(gu, bufs.w2, bufs.w2_bias, dim, ffn)?;
-    ran(
-        scope.accel_elementwise(&ElementwiseOp::GateAdd {
-            x: addr(after_attn),
-            y: addr(down),
-            out: at(y_out),
-            rows,
-            dim,
-            seg: one(scale2, None),
-        }),
-        "scale2 residual",
-    );
+    mm_into(
+        gu,
+        bufs.w2,
+        bufs.w2_bias,
+        Some((after_attn, scale2)),
+        scope.import_copy(y_out),
+        dim,
+        ffn,
+    )?;
     Ok(true)
 }
 
@@ -1298,6 +1367,8 @@ pub async fn decode_passes<S: WeightSource>(
                     deferred.push(scope);
                 } else if accel {
                     scope.submit_void().await?;
+                } else if bufs.nvfp4 {
+                    return Err(DecodeError::Nvfp4Declined);
                 } else {
                     block_forward(
                         &scope,
@@ -1319,7 +1390,7 @@ pub async fn decode_passes<S: WeightSource>(
                 }
                 nxts.push(nxt);
             }
-            Ok::<_, WgpuError>((nxts, deferred))
+            Ok::<_, DecodeError<S::Error>>((nxts, deferred))
         };
         let next_acquire = async {
             match handles.blocks.get(idx + 1) {
@@ -1340,6 +1411,7 @@ pub async fn decode_passes<S: WeightSource>(
     }
 
     // --- per pass: norm_out (affine LayerNorm) -> proj_out, then read back ---
+    tracing::info!(target: thinfer_core::trace::DIAG, "vae blocks done");
     let out_w = cfg.proj_out_dim();
     let affine_bufs = upload_acts(backend, scratch, act, &consts.norm_out)?;
     let [no, no_b] = affine_bufs.each_ref().map(|b| b.as_buf_ref());
@@ -1531,52 +1603,45 @@ impl ClipTiles {
     fn stitch(&self, cfg: &VideoVaeConfig, tokens: &[f32], frames: usize) -> PixelBlock {
         let ratio = cfg.spatial_compression;
         let tile_tokens = frames * self.th * self.tw * cfg.proj_out_dim();
-        let grid: Vec<Vec<PixelBlock>> = (0..self.ys.len())
-            .map(|i| {
-                (0..self.xs.len())
-                    .map(|j| {
-                        let idx = i * self.xs.len() + j;
-                        let data = unpatchify(
-                            cfg,
-                            &tokens[idx * tile_tokens..(idx + 1) * tile_tokens],
-                            frames,
-                            self.th,
-                            self.tw,
-                        );
-                        PixelBlock {
-                            data,
-                            frames: frames * cfg.temporal_compression,
-                            height: self.th * ratio,
-                            width: self.tw * ratio,
-                            channels: cfg.out_channels,
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
+        let (ny, nx) = (self.ys.len(), self.xs.len());
+        // Blend reads the unblended neighbours, so the grid lives until every
+        // tile is cut.
+        let tiles = {
+            let grid = par_map(ny * nx, |idx| PixelBlock {
+                data: unpatchify(
+                    cfg,
+                    &tokens[idx * tile_tokens..(idx + 1) * tile_tokens],
+                    frames,
+                    self.th,
+                    self.tw,
+                ),
+                frames: frames * cfg.temporal_compression,
+                height: self.th * ratio,
+                width: self.tw * ratio,
+                channels: cfg.out_channels,
+            });
 
-        let rows: Vec<PixelBlock> = (0..self.ys.len())
-            .map(|i| {
-                let parts: Vec<PixelBlock> = (0..self.xs.len())
-                    .map(|j| {
-                        let mut tile = grid[i][j].clone();
-                        if i > 0 {
-                            tile.blend_head_from(&grid[i - 1][j], self.y_ov[i - 1], 1);
-                        }
-                        if j > 0 {
-                            tile.blend_head_from(&grid[i][j - 1], self.x_ov[j - 1], 2);
-                        }
-                        if i + 1 < self.ys.len() {
-                            tile.truncate_axis(tile.height - self.y_ov[i], 1);
-                        }
-                        if j + 1 < self.xs.len() {
-                            tile.truncate_axis(tile.width - self.x_ov[j], 2);
-                        }
-                        tile
-                    })
-                    .collect();
-                PixelBlock::concat(parts, 2)
+            par_map(ny * nx, |idx| {
+                let (i, j) = (idx / nx, idx % nx);
+                let mut tile = grid[idx].clone();
+                if i > 0 {
+                    tile.blend_head_from(&grid[idx - nx], self.y_ov[i - 1], 1);
+                }
+                if j > 0 {
+                    tile.blend_head_from(&grid[idx - 1], self.x_ov[j - 1], 2);
+                }
+                if i + 1 < ny {
+                    tile.truncate_axis(tile.height - self.y_ov[i], 1);
+                }
+                if j + 1 < nx {
+                    tile.truncate_axis(tile.width - self.x_ov[j], 2);
+                }
+                tile
             })
+        };
+        let mut parts = tiles.into_iter();
+        let rows: Vec<PixelBlock> = (0..ny)
+            .map(|_| PixelBlock::concat(parts.by_ref().take(nx).collect(), 2))
             .collect();
         PixelBlock::concat(rows, 1)
     }
@@ -1673,7 +1738,7 @@ pub async fn decode_clip<S: WeightSource>(
 /// Every chunk's tiles share one shape, so they decode together: the ViT
 /// stack streams once for the whole video, not once per chunk.
 #[allow(clippy::too_many_arguments)]
-pub async fn decode<S: WeightSource>(
+pub async fn decode_tokens<S: WeightSource>(
     cfg: &VideoVaeConfig,
     backend: &WgpuBackend,
     pipelines: &DecoderPipelines,
@@ -1686,7 +1751,7 @@ pub async fn decode<S: WeightSource>(
     latent_frames: usize,
     lat_height: usize,
     lat_width: usize,
-) -> Result<PixelBlock, DecodeError<S::Error>> {
+) -> Result<DecodedTokens, DecodeError<S::Error>> {
     let plan = ChunkPlan::new(cfg, latent_frames)?;
     let lat_c = cfg.latent_channels;
     let frame_stride = lat_height * lat_width * lat_c;
@@ -1726,40 +1791,101 @@ pub async fn decode<S: WeightSource>(
         tiles.tw,
     )
     .await?;
-    let chunk_tokens = tokens.len() / plan.num_chunks;
+    tracing::info!(target: thinfer_core::trace::DIAG, "vae passes read back");
+    Ok(DecodedTokens {
+        cfg: *cfg,
+        plan,
+        tiles,
+        tokens,
+        latent_frames,
+    })
+}
 
-    let mut decoded: Vec<PixelBlock> = Vec::new();
-    let mut overlap: Option<PixelBlock> = None;
-    for i in 0..plan.num_chunks {
-        let clip = tiles.stitch(cfg, &tokens[i * chunk_tokens..(i + 1) * chunk_tokens], len);
+/// [`decode_tokens`] then [`DecodedTokens::stitch`].
+#[allow(clippy::too_many_arguments)]
+pub async fn decode<S: WeightSource>(
+    cfg: &VideoVaeConfig,
+    backend: &WgpuBackend,
+    pipelines: &DecoderPipelines,
+    residency: &WeightResidency<S>,
+    scratch: &Workspace<WgpuBackend>,
+    handles: &DecoderHandles,
+    consts: &DecoderConsts,
+    policy: TilePolicy,
+    z: &[f32],
+    latent_frames: usize,
+    lat_height: usize,
+    lat_width: usize,
+) -> Result<PixelBlock, DecodeError<S::Error>> {
+    let tokens = decode_tokens(
+        cfg,
+        backend,
+        pipelines,
+        residency,
+        scratch,
+        handles,
+        consts,
+        policy,
+        z,
+        latent_frames,
+        lat_height,
+        lat_width,
+    )
+    .await?;
+    Ok(tokens.stitch())
+}
 
-        // Pass 0 is the chunk itself; pass 1 (present only when the encoder
-        // dropped a tail) is the lead-in that the NEXT chunk blends over.
-        for j in 0..plan.passes_per_chunk() {
-            let mut chunk = clip.clone();
-            chunk.drop_head_axis(j * plan.chunk_num_frames, 0);
-            chunk.truncate_axis(plan.chunk_num_frames.min(chunk.frames), 0);
-            chunk.drop_head_axis(plan.frame_pre_padding, 0);
-            if j == 0 {
-                if let Some(prev) = &overlap {
-                    chunk.blend_head_from(prev, plan.frame_overlap, 0);
+/// A decode's tile tokens, read back: all GPU work is done, and
+/// [`Self::stitch`] is host-only (free to run on another thread).
+pub struct DecodedTokens {
+    cfg: VideoVaeConfig,
+    plan: ChunkPlan,
+    tiles: ClipTiles,
+    tokens: Vec<f32>,
+    latent_frames: usize,
+}
+
+impl DecodedTokens {
+    /// Un-patchify, blend and trim every chunk into the clip's pixels.
+    pub fn stitch(&self) -> PixelBlock {
+        let (cfg, plan, tiles, tokens) = (&self.cfg, &self.plan, &self.tiles, &self.tokens);
+        let len = plan.chunk_tokens + plan.token_overlap;
+        let chunk_tokens = tokens.len() / plan.num_chunks;
+
+        let mut decoded: Vec<PixelBlock> = Vec::new();
+        let mut overlap: Option<PixelBlock> = None;
+        for i in 0..plan.num_chunks {
+            let clip = tiles.stitch(cfg, &tokens[i * chunk_tokens..(i + 1) * chunk_tokens], len);
+
+            // Pass 0 is the chunk itself; pass 1 (present only when the encoder
+            // dropped a tail) is the lead-in that the NEXT chunk blends over.
+            for j in 0..plan.passes_per_chunk() {
+                // Pass j's `chunk_num_frames` window, minus its pre-padding.
+                let s0 = (j * plan.chunk_num_frames).min(clip.frames);
+                let end = s0 + plan.chunk_num_frames.min(clip.frames - s0);
+                let mut chunk = clip.slice_frames((s0 + plan.frame_pre_padding).min(end), end);
+                if j == 0 {
+                    if let Some(prev) = &overlap {
+                        chunk.blend_head_from(prev, plan.frame_overlap, 0);
+                    }
+                    decoded.push(chunk);
+                } else {
+                    overlap = Some(chunk);
                 }
-                decoded.push(chunk);
-            } else {
-                overlap = Some(chunk);
             }
         }
-    }
-    if let Some(tail) = overlap {
-        decoded.push(tail);
-    }
+        if let Some(tail) = overlap {
+            decoded.push(tail);
+        }
 
-    let mut out = PixelBlock::concat(decoded, 0);
-    let pad_frames = plan.pad_frames(cfg, latent_frames);
-    if pad_frames > 0 {
-        out.truncate_axis(out.frames - pad_frames, 0);
+        tracing::info!(target: thinfer_core::trace::DIAG, "vae stitched");
+        let mut out = PixelBlock::concat(decoded, 0);
+        let pad_frames = plan.pad_frames(cfg, self.latent_frames);
+        if pad_frames > 0 {
+            out.truncate_axis(out.frames - pad_frames, 0);
+        }
+        out
     }
-    Ok(out)
 }
 
 /// Temporal chunking of a decode, derived from the encoder's clip geometry.
@@ -1832,6 +1958,23 @@ impl ChunkPlan {
             })
             .sum()
     }
+}
+
+/// `(0..n).map(f)` with one thread per item on native, in order; serial on
+/// wasm (single-threaded). Host-side decode work only: identical results.
+fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if n > 1 {
+        return std::thread::scope(|s| {
+            let f = &f;
+            let workers: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("vae stitch worker panicked"))
+                .collect()
+        });
+    }
+    (0..n).map(f).collect()
 }
 
 /// Un-patchify one tile's tokens into pixels.
@@ -1996,22 +2139,43 @@ impl PixelBlock {
         self.set_axis_len(axis, keep);
     }
 
-    /// Concatenate along `axis`. Every input must agree on the other extents.
-    pub fn concat(parts: Vec<PixelBlock>, axis: usize) -> PixelBlock {
-        let mut it = parts.into_iter();
-        let mut acc = it.next().expect("concat needs at least one block");
-        for part in it {
-            let (outer, len_a, inner) = acc.axis_geometry(axis);
-            let len_b = part.axis_len(axis);
-            let mut out = Vec::with_capacity(outer * (len_a + len_b) * inner);
-            for o in 0..outer {
-                out.extend_from_slice(&acc.data[o * len_a * inner..(o + 1) * len_a * inner]);
-                out.extend_from_slice(&part.data[o * len_b * inner..(o + 1) * len_b * inner]);
-            }
-            acc.data = out;
-            acc.set_axis_len(axis, len_a + len_b);
+    /// Frames `start..end` (axis 0 is outermost, so this is one contiguous copy).
+    pub fn slice_frames(&self, start: usize, end: usize) -> PixelBlock {
+        let step = self.height * self.width * self.channels;
+        PixelBlock {
+            data: self.data[start * step..end * step].to_vec(),
+            frames: end - start,
+            height: self.height,
+            width: self.width,
+            channels: self.channels,
         }
-        acc
+    }
+
+    /// Concatenate along `axis` in one pass. Every input must agree on the
+    /// other extents.
+    pub fn concat(mut parts: Vec<PixelBlock>, axis: usize) -> PixelBlock {
+        if parts.len() == 1 {
+            return parts.pop().expect("one part");
+        }
+        let first = parts.first().expect("concat needs at least one block");
+        let (outer, _, inner) = first.axis_geometry(axis);
+        let total: usize = parts.iter().map(|p| p.axis_len(axis)).sum();
+        let mut data = Vec::with_capacity(outer * total * inner);
+        for o in 0..outer {
+            for part in &parts {
+                let len = part.axis_len(axis);
+                data.extend_from_slice(&part.data[o * len * inner..(o + 1) * len * inner]);
+            }
+        }
+        let mut out = PixelBlock {
+            data,
+            frames: first.frames,
+            height: first.height,
+            width: first.width,
+            channels: first.channels,
+        };
+        out.set_axis_len(axis, total);
+        out
     }
 }
 

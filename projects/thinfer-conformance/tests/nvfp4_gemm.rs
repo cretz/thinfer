@@ -8,7 +8,8 @@
 //! quantizer rounding. Skips when no CUDA sm_120 device is present.
 
 use thinfer_core::backend::{
-    Backend, BufRef, GemmNvfp4Addrs, PowerPreference, WgpuBackend, WgpuConfig,
+    Backend, BufRef, GemmNvfp4Addrs, Nvfp4Format, Nvfp4Rows, PowerPreference, WgpuBackend,
+    WgpuConfig,
 };
 use thinfer_core::ops::nvfp4::{self, E2M1, Nvfp4Layout};
 
@@ -137,7 +138,12 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
             }
         }
         let acc = backend.accelerator().expect("accelerator installed");
-        for (m, n, k) in [(200usize, 256usize, 256usize), (300, 384, 5376)] {
+        // 1100 rows: 9 row tiles, past one 8-row-tile raster group.
+        for (m, n, k) in [
+            (200usize, 256usize, 256usize),
+            (300, 384, 5376),
+            (1100, 512, 256),
+        ] {
             if acc
                 .accepts_gemm_nvfp4(m as u32, n as u32, k as u32)
                 .is_none()
@@ -178,19 +184,55 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                 .expect("flush writes");
             backend.wait_idle();
             let addr = |b: &BufRef| backend.device_address(b).expect("cuda-addressable");
-            let ran = acc
-                .gemm_nvfp4(&GemmNvfp4Addrs {
-                    a: addr(&a_buf),
-                    w: addr(&w_buf),
-                    out: addr(&out_buf),
-                    scratch: addr(&scratch),
-                    m: m as u32,
-                    n: n as u32,
-                    k: k as u32,
-                })
-                .expect("gemm");
+            let full = GemmNvfp4Addrs {
+                a: addr(&a_buf),
+                w: addr(&w_buf),
+                out: addr(&out_buf),
+                scratch: addr(&scratch),
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                lora: Default::default(),
+                format: Default::default(),
+                rows: None,
+            };
+            let ran = acc.gemm_nvfp4(&full).expect("gemm");
             assert!(ran, "gemm declined {m}x{n}x{k}");
             acc.sync().expect("sync");
+
+            // (1b) Weight rows [128, 256) alone = those output columns of the
+            // full product, bit for bit (a fused qkv's q-only GEMM).
+            if n >= 256 {
+                let sub_len = (m * 128 * 2) as u64;
+                let sub = BufRef::new(backend.allocate(sub_len).expect("sub"), sub_len);
+                let ran = acc
+                    .gemm_nvfp4(&GemmNvfp4Addrs {
+                        out: addr(&sub),
+                        n: 128,
+                        rows: Some(Nvfp4Rows {
+                            base: 128,
+                            total: n as u32,
+                        }),
+                        ..full
+                    })
+                    .expect("gemm rows");
+                assert!(ran, "row-range gemm declined");
+                acc.sync().expect("sync");
+                let whole = backend
+                    .read_buffer(out_buf.id, 0, out_len)
+                    .await
+                    .expect("read");
+                let part = backend.read_buffer(sub.id, 0, sub_len).await.expect("read");
+                for r in 0..m {
+                    let at = (r * n + 128) * 2;
+                    assert_eq!(
+                        &whole[at..at + 256],
+                        &part[r * 256..(r + 1) * 256],
+                        "{m}x{n}x{k}: row-range gemm differs at output row {r}"
+                    );
+                }
+                eprintln!("{m}x{n}x{k}: row range [128, 256) bit-identical");
+            }
 
             // (1) quantizer vs CPU.
             let raw = backend
@@ -225,6 +267,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
             let mut err2 = 0f64;
             let mut ref2 = 0f64;
             let mut worst = 0f64;
+            let mut wants = vec![0f64; m * n];
             for r in 0..m {
                 for c in 0..n {
                     let mut sum = 0f64;
@@ -239,6 +282,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                             * sw;
                     }
                     let want = sum * alpha(c / 128) as f64 / gsf as f64;
+                    wants[r * n + c] = want;
                     let o = (r * n + c) * 2;
                     let g = half::bf16::from_bits(u16::from_le_bytes([got[o], got[o + 1]])).to_f32()
                         as f64;
@@ -252,6 +296,212 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
             // bf16 output rounding (2^-9) bounds the rms error; f32 accumulate
             // order adds far less.
             assert!(rel < 4e-3, "gemm rel_rms {rel}");
+
+            // (2b) Comfy format: the same weights packed high-nibble-first and
+            // a dynamic activation scale (`1 / bf16(amax / 2688)`), against the
+            // exact product of the GPU's own codes at the scale it computed.
+            let w_hi: Vec<u8> = w
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    if i < l.packed_len() {
+                        b.rotate_left(4)
+                    } else {
+                        b
+                    }
+                })
+                .collect();
+            let w_hi_buf = upload(&w_hi);
+            let out_hi = BufRef::new(backend.allocate(out_len).expect("out"), out_len);
+            backend
+                .submit(backend.create_command_encoder())
+                .await
+                .expect("flush writes");
+            backend.wait_idle();
+            let ran = acc
+                .gemm_nvfp4(&GemmNvfp4Addrs {
+                    a: addr(&a_buf),
+                    w: addr(&w_hi_buf),
+                    out: addr(&out_hi),
+                    scratch: addr(&scratch),
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    lora: Default::default(),
+                    format: Nvfp4Format {
+                        dynamic_act_scale: true,
+                        hi_first: true,
+                    },
+                    rows: None,
+                })
+                .expect("gemm comfy");
+            assert!(ran, "comfy gemm declined {m}x{n}x{k}");
+            acc.sync().expect("sync");
+            let raw = backend
+                .read_buffer(scratch.id, 0, scratch_len)
+                .await
+                .expect("read scratch");
+            let slot = (m * k / 2 + m * k / 16).next_multiple_of(16);
+            let dyn_gsf = f32::from_le_bytes(raw[slot + 4..slot + 8].try_into().unwrap());
+            let amax = x.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let want_gsf = 1.0 / half::bf16::from_f32(amax / 2688.0).to_f32();
+            assert_eq!(dyn_gsf, want_gsf, "dynamic activation scale");
+            let (hq, hs) = raw.split_at(m * k / 2);
+            let hi = |packed: &[u8], i: usize| code(packed, i ^ 1);
+            let got = backend
+                .read_buffer(out_hi.id, 0, out_len)
+                .await
+                .expect("read out");
+            let (mut err2, mut ref2) = (0f64, 0f64);
+            let mut comfy_wants = Vec::with_capacity(m * n);
+            for r in 0..m {
+                for c in 0..n {
+                    let mut sum = 0f64;
+                    for kk in 0..k {
+                        let sa = nvfp4::e4m3(hs[r * k / 16 + kk / 16]) as f64;
+                        let sw =
+                            nvfp4::e4m3(w[l.scales_offset() + nvfp4::scale_offset(c, kk / 16, bp)])
+                                as f64;
+                        sum += hi(hq, r * k + kk) as f64
+                            * sa
+                            * hi(&w_hi[..l.packed_len()], c * k + kk) as f64
+                            * sw;
+                    }
+                    let want = sum * alpha(c / 128) as f64 / dyn_gsf as f64;
+                    comfy_wants.push(want);
+                    let o = (r * n + c) * 2;
+                    let g = half::bf16::from_bits(u16::from_le_bytes([got[o], got[o + 1]])).to_f32()
+                        as f64;
+                    err2 += (g - want).powi(2);
+                    ref2 += want.powi(2);
+                }
+            }
+            let rel = (err2 / ref2).sqrt();
+            eprintln!("{m}x{n}x{k}: comfy gemm rel_rms {rel:.3e}");
+            assert!(rel < 4e-3, "comfy gemm rel_rms {rel}");
+            // The hi-first codes are the low-first ones nibble-swapped, so the
+            // weights decode the same: the product must also track run (2).
+            let (mut d2, mut b2) = (0f64, 0f64);
+            for (i, want) in wants.iter().enumerate() {
+                let g = half::bf16::from_bits(u16::from_le_bytes([got[2 * i], got[2 * i + 1]]))
+                    .to_f32() as f64;
+                d2 += (g - want).powi(2);
+                b2 += want.powi(2);
+            }
+            let drift = (d2 / b2).sqrt();
+            eprintln!("{m}x{n}x{k}: comfy vs static-scale product {drift:.3e}");
+            assert!(drift < 0.1, "comfy weights decode differently: {drift}");
+
+            // (3) The fused low-rank epilogue: out = W4A4 + mid @ bt (a
+            // rank-16 adapter), against the same product plus the CPU term.
+            let rank = 16usize;
+            let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+            let mid: Vec<f32> = (0..m * rank).map(|_| bf(rng.unit() * 2.0)).collect();
+            let bt: Vec<f32> = (0..rank * n).map(|_| bf(rng.unit())).collect();
+            let to_bytes = |v: &[f32]| -> Vec<u8> {
+                v.iter().flat_map(|x| bf16_bits(*x).to_le_bytes()).collect()
+            };
+            let (mid_buf, bt_buf) = (upload(&to_bytes(&mid)), upload(&to_bytes(&bt)));
+            let out2 = BufRef::new(backend.allocate(out_len).expect("out2"), out_len);
+            backend
+                .submit(backend.create_command_encoder())
+                .await
+                .expect("flush writes");
+            backend.wait_idle();
+            let ran = acc
+                .gemm_nvfp4(&GemmNvfp4Addrs {
+                    a: addr(&a_buf),
+                    w: addr(&w_buf),
+                    out: addr(&out2),
+                    scratch: addr(&scratch),
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    lora: thinfer_core::backend::Nvfp4Lora {
+                        mid: addr(&mid_buf),
+                        bt: addr(&bt_buf),
+                        rank: rank as u32,
+                    },
+                    format: Default::default(),
+                    rows: None,
+                })
+                .expect("gemm lora");
+            assert!(ran, "fused-lora gemm declined {m}x{n}x{k}");
+            acc.sync().expect("sync");
+            let got2 = backend
+                .read_buffer(out2.id, 0, out_len)
+                .await
+                .expect("read out2");
+            let (mut e2, mut r2) = (0f64, 0f64);
+            for r in 0..m {
+                for c in 0..n {
+                    let term: f64 = (0..rank)
+                        .map(|j| mid[r * rank + j] as f64 * bt[j * n + c] as f64)
+                        .sum();
+                    let want = wants[r * n + c] + term;
+                    let o = (r * n + c) * 2;
+                    let g = half::bf16::from_bits(u16::from_le_bytes([got2[o], got2[o + 1]]))
+                        .to_f32() as f64;
+                    e2 += (g - want).powi(2);
+                    r2 += want.powi(2);
+                }
+            }
+            let rel2 = (e2 / r2).sqrt();
+            eprintln!("{m}x{n}x{k}: fused lora rel_rms {rel2:.3e}");
+            assert!(rel2 < 4e-3, "fused lora rel_rms {rel2}");
+
+            // (3b) The same adapter on the Comfy format (FastH3-Omni): the
+            // dynamic scale must not touch the bf16 low-rank seed.
+            let out3 = BufRef::new(backend.allocate(out_len).expect("out3"), out_len);
+            backend
+                .submit(backend.create_command_encoder())
+                .await
+                .expect("flush writes");
+            backend.wait_idle();
+            let ran = acc
+                .gemm_nvfp4(&GemmNvfp4Addrs {
+                    a: addr(&a_buf),
+                    w: addr(&w_hi_buf),
+                    out: addr(&out3),
+                    scratch: addr(&scratch),
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    lora: thinfer_core::backend::Nvfp4Lora {
+                        mid: addr(&mid_buf),
+                        bt: addr(&bt_buf),
+                        rank: rank as u32,
+                    },
+                    format: Nvfp4Format {
+                        dynamic_act_scale: true,
+                        hi_first: true,
+                    },
+                    rows: None,
+                })
+                .expect("gemm comfy lora");
+            assert!(ran, "comfy fused-lora gemm declined {m}x{n}x{k}");
+            acc.sync().expect("sync");
+            let got3 = backend
+                .read_buffer(out3.id, 0, out_len)
+                .await
+                .expect("read out3");
+            let (mut e3, mut r3) = (0f64, 0f64);
+            for r in 0..m {
+                for c in 0..n {
+                    let term: f64 = (0..rank)
+                        .map(|j| mid[r * rank + j] as f64 * bt[j * n + c] as f64)
+                        .sum();
+                    let want = comfy_wants[r * n + c] + term;
+                    let o = (r * n + c) * 2;
+                    let g = half::bf16::from_bits(u16::from_le_bytes([got3[o], got3[o + 1]]))
+                        .to_f32() as f64;
+                    e3 += (g - want).powi(2);
+                    r3 += want.powi(2);
+                }
+            }
+            let rel3 = (e3 / r3).sqrt();
+            eprintln!("{m}x{n}x{k}: comfy fused lora rel_rms {rel3:.3e}");
+            assert!(rel3 < 4e-3, "comfy fused lora rel_rms {rel3}");
         }
     });
 }

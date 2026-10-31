@@ -232,11 +232,7 @@ pub enum ProgressEvent {
 
 pub type ProgressFn<'a> = Option<&'a dyn Fn(ProgressEvent)>;
 
-/// Cooperative cancellation hook. Returns `true` when the caller wants the
-/// in-flight generate to stop; the denoise loops poll it at each step boundary
-/// and bail with [`GenerateError::Cancelled`]. `None` (CLI default) never
-/// cancels. The server passes a closure backed by the job's cancel flag.
-pub type Cancel<'a> = Option<&'a dyn Fn() -> bool>;
+pub use crate::common::Cancel;
 
 /// Which VAE decoder a generate/decode uses. No `Default`: callers state intent
 /// explicitly (the real VAE is the parity path; the LightTAE tiny decoder is

@@ -9,5 +9,7 @@ mod dit_health;
 mod dit_parity;
 mod encoder_parity;
 mod parity_util;
+mod vae_encoder_parity;
 mod vae_parity;
 mod video_vae_health;
+mod vision_parity;

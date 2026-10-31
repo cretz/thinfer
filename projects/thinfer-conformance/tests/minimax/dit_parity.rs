@@ -401,6 +401,7 @@ async fn gpu_stages<S: WeightSource>(
         &audio,
         &text,
         Some(&mut taps),
+        None,
     )
     .await
     .expect("dit forward");
@@ -476,6 +477,7 @@ async fn gpu_stages<S: WeightSource>(
         &video,
         &audio,
         &text,
+        None,
     )
     .await
     .expect("base-only dit forward");

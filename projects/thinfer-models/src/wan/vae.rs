@@ -3234,7 +3234,9 @@ impl WanVaeDecoder {
                     {
                         Ok(()) => {}
                         Err(WanVaeDecodeError::Forward(WanVaeError::Wgpu(
-                            WgpuError::Allocate { .. } | WgpuError::BudgetExceeded { .. },
+                            WgpuError::Allocate { .. }
+                            | WgpuError::BudgetExceeded { .. }
+                            | WgpuError::ExternalAllocate { .. },
                         ))) if tile > VAE_DEC_TILE_MIN => {
                             // Per-tile workspace didn't fit. OOM hits at alloc
                             // (pre-submit), so the failed tile left nothing

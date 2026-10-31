@@ -13,7 +13,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId, VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId,
+    VideoSampler,
 };
 use crate::progress::Stage;
 
@@ -170,6 +171,11 @@ pub struct VideoSpec {
     /// decodes it to a temp file under the job dir.
     #[serde(default)]
     pub source_image: Option<String>,
+    /// Base64-encoded reference images (PNG/JPEG). FastH3-Omni only (at most
+    /// 9): the prompt names them `<Picture 1>`, `<Picture 2>`, ... in order.
+    /// Held in RAM by the server, never written to disk.
+    #[serde(default)]
+    pub ref_images: Option<Vec<String>>,
     /// Base64-encoded target VIDEO bytes (mp4). DreamID-V only (required there):
     /// the clip to swap a face into. Held RAM-first; a large upload spills to an
     /// encrypted on-disk blob under a per-request ephemeral key (never plaintext
@@ -190,6 +196,9 @@ pub struct VideoSpec {
     /// to all LTX models; ignored by Wan.
     pub encoder: Option<EncoderQuant>,
     pub i8_matmul: Option<bool>,
+    /// FastH3 sparse-attention precision: `bf16` (default) or `int8`
+    /// (SageAttention-style QK^T: faster, same quality, different sample).
+    pub attn: Option<AttnPrecision>,
     /// Decode + mux an audio track. Joint-AV models only (LTX and MiniMax-H3;
     /// the silent Wan models ignore it). Defaults to `true`; `false` skips the
     /// audio tail for a video-only, faster MP4.

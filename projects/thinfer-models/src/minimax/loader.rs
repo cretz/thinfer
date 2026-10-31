@@ -29,8 +29,8 @@ use thinfer_core::residency::{TransposePolicy, WeightHandle, WeightMeta, WeightR
 use thinfer_core::tensor::{Shape, StorageEncoding};
 use thinfer_core::weight::{WeightId, WeightReader, WeightSource};
 
-use super::DitConfig;
 use super::adaln::{ModulationLayout, timestep_embedding};
+use super::{AdalnInput, DitConfig};
 use crate::z_image::text_encoder::LoadError;
 
 #[derive(Debug)]
@@ -215,8 +215,94 @@ pub async fn build_modulation_tables<S: WeightSource>(
 ) -> Result<ModulationTables, LoaderError<S::Error>> {
     let t = timesteps.len();
     assert!(t > 0, "modulation table needs at least one timestep");
+    let (a, k) = match cfg.adaln {
+        AdalnInput::Table(r) => (table_rows(source, timesteps, r).await?, r),
+        AdalnInput::Full => (silu_temb(cfg, source, timesteps).await?, cfg.time_embed_dim),
+        // A rank-reduced checkpoint maps silu(temb) through the shared basis
+        // (no further silu).
+        AdalnInput::Basis(r) => {
+            let a = silu_temb(cfg, source, timesteps).await?;
+            let basis = read_tensor_f32(
+                source,
+                &WeightId("adaln_basis.weight".into()),
+                r * cfg.time_embed_dim,
+            )
+            .await?;
+            let a = linear_f32(&a, &basis, &vec![0.0; r], t, cfg.time_embed_dim, r);
+            (a, r)
+        }
+    };
 
-    // temb = proj_out(silu(proj_in(sinusoid))), kept f32 throughout.
+    let mut blocks = Vec::with_capacity(cfg.n_layers);
+    for i in 0..cfg.n_layers {
+        blocks.push(
+            project_adaln(
+                source,
+                &a,
+                t,
+                k,
+                cfg.adaln_out,
+                &format!("blocks.{i}.adaln_proj"),
+            )
+            .await?,
+        );
+    }
+    let final_layer = project_adaln(
+        source,
+        &a,
+        t,
+        k,
+        cfg.final_adaln_out,
+        "final_layer.adaln_proj",
+    )
+    .await?;
+
+    Ok(ModulationTables {
+        layout: ModulationLayout::new(t, cfg.hidden),
+        blocks,
+        final_layer,
+    })
+}
+
+/// The curve table's rows at each `t` (`t = 1 - sigma`), linearly
+/// interpolated: `pos = clamp(t, 0, 1) * (rows - 1)`, lerp rows `floor(pos)`
+/// and the next (Comfy `MiniMaxH3`'s lookup), `[timesteps, rank]`.
+async fn table_rows<S: WeightSource>(
+    source: &S,
+    timesteps: &[f32],
+    rank: usize,
+) -> Result<Vec<f32>, LoaderError<S::Error>> {
+    let id = WeightId("adaln_t_table".into());
+    let rows = source
+        .catalog()
+        .get(&id)
+        .map(|e| e.shape.0[0])
+        .ok_or_else(|| LoaderError::BadTensor {
+            id: id.0.clone(),
+            detail: "absent from the catalog".into(),
+        })?;
+    let table = read_tensor_f32(source, &id, rows * rank).await?;
+    let mut out = Vec::with_capacity(timesteps.len() * rank);
+    for &t in timesteps {
+        let pos = t.clamp(0.0, 1.0) * (rows - 1) as f32;
+        let i0 = (pos.floor() as usize).min(rows - 2);
+        let w = pos - i0 as f32;
+        let (r0, r1) = (
+            &table[i0 * rank..][..rank],
+            &table[(i0 + 1) * rank..][..rank],
+        );
+        out.extend(r0.iter().zip(r1).map(|(a, b)| a + w * (b - a)));
+    }
+    Ok(out)
+}
+
+/// `silu(temb)`, `temb = proj_out(silu(proj_in(sinusoid)))`, f32 throughout.
+async fn silu_temb<S: WeightSource>(
+    cfg: &DitConfig,
+    source: &S,
+    timesteps: &[f32],
+) -> Result<Vec<f32>, LoaderError<S::Error>> {
+    let t = timesteps.len();
     let sinusoid = timestep_embedding(timesteps, cfg.timestep_input_dim);
     let temb = {
         let w_in = read_tensor_f32(
@@ -264,52 +350,8 @@ pub async fn build_modulation_tables<S: WeightSource>(
         )
     };
 
-    // Every AdaLN projection reads silu(temb), not temb; a rank-reduced
-    // checkpoint first maps that through the shared basis (no further silu).
-    let a: Vec<f32> = temb.iter().map(|&v| silu(v)).collect();
-    let (a, k) = match cfg.adaln_rank {
-        None => (a, cfg.time_embed_dim),
-        Some(r) => {
-            let basis = read_tensor_f32(
-                source,
-                &WeightId("adaln_basis.weight".into()),
-                r * cfg.time_embed_dim,
-            )
-            .await?;
-            let a = linear_f32(&a, &basis, &vec![0.0; r], t, cfg.time_embed_dim, r);
-            (a, r)
-        }
-    };
-
-    let mut blocks = Vec::with_capacity(cfg.n_layers);
-    for i in 0..cfg.n_layers {
-        blocks.push(
-            project_adaln(
-                source,
-                &a,
-                t,
-                k,
-                cfg.adaln_out,
-                &format!("blocks.{i}.adaln_proj"),
-            )
-            .await?,
-        );
-    }
-    let final_layer = project_adaln(
-        source,
-        &a,
-        t,
-        k,
-        cfg.final_adaln_out,
-        "final_layer.adaln_proj",
-    )
-    .await?;
-
-    Ok(ModulationTables {
-        layout: ModulationLayout::new(t, cfg.hidden),
-        blocks,
-        final_layer,
-    })
+    // Every AdaLN projection reads silu(temb), not temb.
+    Ok(temb.iter().map(|&v| silu(v)).collect())
 }
 
 /// One `adaln_proj.linear` applied to `a` `[t, k]`, streaming the weight rather

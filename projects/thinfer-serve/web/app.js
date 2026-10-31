@@ -42,7 +42,7 @@ const MODELS = {
   // ~60s distill fold the dev ids pay and streams 14GB instead of 23GB per step.
   // ltx-2.3-dev-q4 (Q4 dev + fold) stays CLI-only: it pays Q4 quality AND the
   // fold. Which checkpoints back these ids is the user's weight-sources choice.
-  video: ["fastwan-ti2v-5b", "fastwan2.1-t2v-1.3b", "wan2.1-t2v-1.3b", "mobilewan", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "ltx-2.3-dev", "ltx2-rapid", "minimax-h3", "fasth3-trim", "dreamid-v"],
+  video: ["fastwan-ti2v-5b", "fastwan2.1-t2v-1.3b", "wan2.1-t2v-1.3b", "mobilewan", "wan2.2-t2v-a14b", "anyflow-t2v-14b", "hunyuan-video-1.5-t2v", "hunyuan-video-1.5-ti2v", "longlive-2.0-5b", "ltx-2.3-distilled", "ltx-2.3-distilled-q4", "ltx-2.3-dev", "ltx2-rapid", "minimax-h3", "fasth3-trim", "fasth3-omni", "dreamid-v"],
   // HyperSwap ONNX face-swap: a source face pasted into every frame of a video.
   // Its own JobSpec (FaceSwapSpec); no prompt / size / steps.
   "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c"],
@@ -70,7 +70,9 @@ const isLtxRapid = (model) => model === "ltx2-rapid";
 // length trade against each other against a hard row cap -- hence its own
 // preset ladder rather than a generic one. FastH3-Trim (its 8-step DMD
 // distillation) rides the same pipeline and surface with a fixed schedule.
-const isMinimaxModel = (model) => model === "minimax-h3" || model === "fasth3-trim";
+// FastH3-Omni (the reference-image distill) rides it too, plus reference images.
+const isFastH3Model = (model) => model === "fasth3-trim" || model === "fasth3-omni";
+const isMinimaxModel = (model) => model === "minimax-h3" || isFastH3Model(model);
 // Wan2.2-T2V-A14B (MoE 14B): a heavier Wan-family tier with its own surface. It
 // runs a fixed 4-step LightX2V distill schedule (the steps/sampler knobs do not
 // apply) and only the full Wan2.1 VAE (no tiny-VAE path), so the Steps + Quality
@@ -126,6 +128,7 @@ const VIDEO_ADAPTER_MODELS = new Set([
   "wan2.1-t2v-1.3b",
   "minimax-h3",
   "fasth3-trim",
+  "fasth3-omni",
 ]);
 const supportsAdapters = (kind, model) =>
   (kind === "image" && ADAPTER_MODELS.has(model)) || (kind === "video" && VIDEO_ADAPTER_MODELS.has(model));
@@ -254,15 +257,17 @@ const RAPID_PRESETS = [
 // MiniMax-H3 / FastH3 size ladder (/32 grid: 16x VAE spatial compression x the
 // (1,2,2) DiT patch). FastVideo runs FastH3 at 832x480 (480p) and H3's native
 // 1344x768; below 480p is off-distribution (faces and fine detail fall apart).
-// Every modality shares one packed self-attention sequence capped at 16384 rows
-// (`MAX_PACKED_ROWS`), so larger canvases fit shorter clips: a blank duration
-// takes the longest clip that fits (see `h3DefaultSeconds`). First = default.
+// Every modality shares one packed self-attention sequence, capped per model
+// (`max_packed_rows`: FastH3's row-chunked CUDA block 73728 rows, base H3
+// 16384), so larger canvases fit shorter clips: a blank duration takes the
+// longest default clip that fits (see `h3Seconds`). First = default.
 const H3_PRESETS = [
-  { label: "480p landscape (832x480, default, 5s)", width: 832, height: 480 },
-  { label: "480p portrait (480x832, 5s)", width: 480, height: 832 },
-  { label: "1024x576 landscape (max ~3.8s clip)", width: 1024, height: 576 },
-  { label: "1280x704 landscape (max ~2.3s clip)", width: 1280, height: 704 },
-  { label: "768p landscape (1344x768, native, max ~1.6s clip)", width: 1344, height: 768 },
+  { label: "480p landscape (832x480, default)", width: 832, height: 480 },
+  { label: "480p portrait (480x832)", width: 480, height: 832 },
+  { label: "1024x576 landscape", width: 1024, height: 576 },
+  { label: "1280x704 landscape", width: 1280, height: 704 },
+  { label: "768p landscape (1344x768, native)", width: 1344, height: 768 },
+  { label: "768p portrait (768x1344, native)", width: 768, height: 1344 },
   { label: "640x352 landscape (below 480p: weaker faces/detail)", width: 640, height: 352 },
 ];
 // Wan2.2-T2V-A14B size ladder (/16 grid, the Wan2.1 VAE 8x + patch 2). The
@@ -373,9 +378,10 @@ const VIDEO_DURATION = {
   "hunyuan-video-1.5-t2v": 5,
   "hunyuan-video-1.5-ti2v": 5,
   // Default frames on the 17n+5 grid at a fixed 24 fps (56f base, 124f FastH3),
-  // capped by the canvas: see `h3DefaultSeconds`.
+  // capped by the canvas: see `h3Seconds`.
   "minimax-h3": 2.3,
   "fasth3-trim": 5.2,
+  "fasth3-omni": 5.2,
 };
 
 const subtle = globalThis.crypto?.subtle;
@@ -520,6 +526,33 @@ function applyKind() {
   applyModel();
 }
 $("kind").addEventListener("change", applyKind);
+// Reference images accumulate across picks (a file input replaces its
+// selection on every pick, and phone pickers often allow only one), in pick
+// order. The prompt names them by position, so the list shows which is which.
+const MAX_REF_IMAGES = 9;
+const refImages = [];
+function renderRefImages() {
+  $("ref-images-order").replaceChildren(
+    ...refImages.map((f, i) => {
+      const row = document.createElement("div");
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Remove";
+      remove.addEventListener("click", () => {
+        refImages.splice(i, 1);
+        renderRefImages();
+      });
+      row.append(`<Picture ${i + 1}> = ${f.name} `, remove);
+      return row;
+    }),
+  );
+}
+$("ref-images").addEventListener("change", () => {
+  const input = $("ref-images");
+  refImages.push(...[...input.files].slice(0, MAX_REF_IMAGES - refImages.length));
+  input.value = ""; // so re-picking the same file fires `change` again
+  renderRefImages();
+});
 
 // Re-grid the size controls + reference-image picker + steps for the selected
 // model. LTX switches to its /64 preset grid; edit models reveal the image
@@ -536,6 +569,8 @@ function applyModel() {
   // Frame-0 strength: ltx2-rapid I2V only (optional image, so always visible for
   // rapid; server ignores it when no image is sent).
   $("strength-row").hidden = !(kind === "video" && isLtxRapid(model));
+  // FastH3-Omni reference images (optional; the prompt names them).
+  $("ref-images-row").hidden = !(kind === "video" && model === "fasth3-omni");
   // DreamID-V (video kind) and the face-swap kind both consume a source FACE
   // image + a target VIDEO instead of a text prompt; reveal those uploaders and
   // drop the prompt / size / steps / seed rows that do not apply.
@@ -602,11 +637,22 @@ function applyModel() {
   const isHunyuan = kind === "video" && isHunyuanModel(model);
   // AnyFlow keeps the dropdown: tiny = taew2_1 (Wan2.1 z16), full = the real
   // Wan2.1 VAE (parity path).
-  $("vae-row").hidden = isLtxVideo || isWan22 || dreamid || faceSwap || isMinimax;
+  $("vae-row").hidden = isLtxVideo || isWan22 || dreamid || faceSwap;
   // The Hunyuan-tuned tiny VAE is a Hunyuan-only checkpoint; only offer it there.
   // If a non-Hunyuan model is selected while it was chosen, fall back to tiny.
   $("vae-opt-tiny-ft").hidden = !isHunyuan;
   if (!isHunyuan && $("vae").value === "tiny-ft") $("vae").value = "tiny";
+  // MiniMax-H3 / FastH3 decode with FastVideo's NVFP4 decoder by default (the
+  // server falls back to their fp16 VAE off Blackwell); "full" = that fp16 VAE,
+  // "nvfp4-fast" = the 8-layer one. The tiny VAEs do not apply to them.
+  $("vae-opt-tiny").hidden = isMinimax;
+  $("vae-opt-nvfp4").hidden = !isMinimax;
+  $("vae-opt-nvfp4-fast").hidden = !isMinimax;
+  const vae = $("vae").value;
+  if (isMinimax && (vae === "tiny" || vae === "tiny-ft")) $("vae").value = "nvfp4";
+  if (!isMinimax && vae.startsWith("nvfp4")) $("vae").value = "tiny";
+  // INT8 attention applies to the FastH3 models' sparse attention only.
+  $("attn-row").hidden = !(kind === "video" && isFastH3Model(model));
   // LTX runs a fixed distilled schedule (8 steps single-stage, or 8 + 3 = 11 when
   // upscaling), Wan2.2-A14B a fixed 4-step LightX2V distill, and Hunyuan 1.5 a
   // fixed lightx2v 4-step flow-match schedule; all ignore the steps/sampler knobs,
@@ -683,21 +729,28 @@ const ltxDefaultSeconds = (w, h) => {
   const frames = Math.min(121, framesCap);
   return Math.round((frames / 24) * 10) / 10;
 };
-// MiniMax-H3 mirror of the server's blank-duration cap (`max_fitting_frames`):
-// the longest 17n+5 clip, up to the model default, whose packed rows (a 256-row
-// prompt reserve + video (5n+2) x (h/32)(w/32) + 2 audio rows per 40 Hz latent)
-// fit 16384 rows.
-const h3DefaultSeconds = (model, w, h) => {
-  const defaultFrames = model === "fasth3-trim" ? 124 : 56;
+// MiniMax-H3 mirror of the server's row budget (`max_fitting_frames`): the
+// longest 17n+5 clip whose packed rows (a 256-row prompt reserve + video
+// (5n+2) x (h/32)(w/32) + 2 audio rows per 40 Hz latent) fit the model's row
+// limit. `def` caps at the model default (a blank field), `max` at H3's ~15s
+// design length as the server renders it (a 15s request rounds up the 17n+5
+// grid to 362 frames, 15.1s). Seconds, or null.
+const H3_MAX_FRAMES = 362;
+const h3Seconds = (model, w, h) => {
+  const fasth3 = isFastH3Model(model);
+  const rowLimit = fasth3 ? 73728 : 16384;
   const perFrame = Math.floor(h / 32) * Math.floor(w / 32);
-  let best = null;
-  for (let n = 0; 17 * n + 5 <= defaultFrames; n++) {
-    const frames = 17 * n + 5;
-    const audio = 2 * Math.round((frames / 24) * 40);
-    if (256 + (5 * n + 2) * perFrame + audio > 16384) break;
-    best = frames;
-  }
-  return best == null ? null : Math.round((best / 24) * 10) / 10;
+  const fit = (cap) => {
+    let best = null;
+    for (let n = 0; 17 * n + 5 <= cap; n++) {
+      const frames = 17 * n + 5;
+      const audio = 2 * Math.round((frames / 24) * 40);
+      if (256 + (5 * n + 2) * perFrame + audio > rowLimit) break;
+      best = frames;
+    }
+    return best == null ? null : Math.round((best / 24) * 10) / 10;
+  };
+  return { def: fit(fasth3 ? 124 : 56), max: fit(H3_MAX_FRAMES) };
 };
 function refreshDurationPlaceholder() {
   const model = $("model").value;
@@ -706,11 +759,12 @@ function refreshDurationPlaceholder() {
     return;
   }
   const [w, h] = [Number($("width").value), Number($("height").value)];
-  const dur = isLtxModel(model)
-    ? ltxDefaultSeconds(w, h)
-    : isMinimaxModel(model)
-      ? h3DefaultSeconds(model, w, h)
-      : VIDEO_DURATION[model];
+  if (isMinimaxModel(model)) {
+    const { def, max } = h3Seconds(model, w, h);
+    $("duration").placeholder = def != null ? `${def}s (default, max ${max}s)` : "too large";
+    return;
+  }
+  const dur = isLtxModel(model) ? ltxDefaultSeconds(w, h) : VIDEO_DURATION[model];
   $("duration").placeholder = dur != null ? `${dur}s (default)` : "(seconds)";
 }
 
@@ -915,8 +969,17 @@ async function removeAdapter(id, name) {
   }
 }
 
-$("adapters-refresh").addEventListener("click", () => void listAdapters());
-$("adapter-add-btn").addEventListener("click", () => void addAdapter());
+// The vault fields sit inside the generate form visually but belong to their
+// own forms (`form=` attributes; HTML forbids nesting), so Enter in them submits
+// the vault action, never a generation.
+$("vault-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  void listAdapters();
+});
+$("adapter-add-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  void addAdapter();
+});
 
 // --- spec building ------------------------------------------------------------
 const intOrNull = (v) => {
@@ -1020,9 +1083,10 @@ async function buildSpec(jobKey) {
   // is the model's native rate, so it is not exposed.
   const duration = floatOrNull($("duration").value);
   // MiniMax-H3 honors dims (its /32 grid), duration (the server snaps to the
-  // 17n+5 frame grid) and the Audio toggle. Its step count is fixed by the
+  // 17n+5 frame grid), the Audio toggle and the decoder choice (its own fp16
+  // VAE = "full", or the opt-in NVFP4 decoders). Its step count is fixed by the
   // required 4-step turbo distillation, its fps is fixed at 24, and it has no
-  // upscale / encoder-quant / sampler / vae knobs.
+  // upscale / encoder-quant / sampler knobs.
   if (isMinimaxModel(model)) {
     const spec = {
       kind: "video",
@@ -1032,8 +1096,13 @@ async function buildSpec(jobKey) {
       height,
       durations: duration === null ? null : [duration],
       audio: $("audio").checked,
+      vae: $("vae").value,
       seed,
     };
+    if (isFastH3Model(model)) spec.attn = $("attn").value;
+    if (model === "fasth3-omni") {
+      if (refImages.length) spec.refImages = await Promise.all(refImages.map(fileToBase64));
+    }
     // Vault LoRAs, applied at runtime (stacked low-rank pairs, no refold).
     attachAdapters(spec, "video", model);
     return spec;
@@ -1213,23 +1282,58 @@ function progressText(stage) {
 // --- SSE over fetch -----------------------------------------------------------
 // Reads the event body as a stream, splitting on blank-line frame boundaries and
 // JSON-parsing each frame's data: payload (one JobEvent). Resolves with the
-// `done` result, rejects on error/cancel or a dropped stream.
+// `done` result, rejects on error/cancel. Phones drop the stream whenever the
+// tab backgrounds or the screen locks while the job keeps running, so a dropped
+// stream reconnects with `Last-Event-ID` (the server replays what was missed)
+// instead of failing; only a run of failed reconnects gives up.
+const RECONNECT_TRIES = 30;
 async function streamEvents(id, jobKey) {
-  const resp = await fetch(`jobs/${id}/events`, { headers: authHeaders() });
+  const cursor = { lastId: null, fails: 0 };
+  for (;;) {
+    try {
+      return await streamOnce(id, jobKey, cursor);
+    } catch (e) {
+      if (!(e instanceof StreamDropped) || ++cursor.fails > RECONNECT_TRIES) throw e;
+      setStatus("Connection lost, reconnecting…");
+      await new Promise((r) => setTimeout(r, Math.min(500 * 2 ** cursor.fails, 8000)));
+    }
+  }
+}
+
+// A network-level drop (fetch/read failed or the body ended early): retryable,
+// unlike a server error status or a terminal job event.
+class StreamDropped extends Error {}
+
+async function streamOnce(id, jobKey, cursor) {
+  const headers = cursor.lastId == null ? authHeaders() : authHeaders({ "last-event-id": cursor.lastId });
+  let resp;
+  try {
+    resp = await fetch(`jobs/${id}/events`, { headers });
+  } catch (e) {
+    throw new StreamDropped(e.message ?? String(e));
+  }
   if (!resp.ok) throw new Error(await errorText(resp));
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
   for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      throw new StreamDropped(e.message ?? String(e));
+    }
+    if (chunk.done) break;
+    buf += decoder.decode(chunk.value, { stream: true });
     let sep;
     while ((sep = firstSep(buf)) !== -1) {
       const frame = buf.slice(0, sep.at);
       buf = buf.slice(sep.at + sep.len);
-      const ev = parseFrame(frame);
-      if (!ev) continue;
+      const parsed = parseFrame(frame);
+      if (!parsed) continue;
+      cursor.lastId = parsed.id ?? cursor.lastId;
+      cursor.fails = 0;
+      const ev = parsed.event;
       if (ev.type === "keyRequired") {
         await deliverKey(id, jobKey);
         continue;
@@ -1238,7 +1342,7 @@ async function streamEvents(id, jobKey) {
       if (result !== undefined) return result;
     }
   }
-  throw new Error("event stream ended before the job finished");
+  throw new StreamDropped("event stream ended before the job finished");
 }
 
 function firstSep(buf) {
@@ -1249,14 +1353,15 @@ function firstSep(buf) {
   return -1;
 }
 
+// One SSE frame -> `{ id, event }` (id = the frame's `id:` sequence, the
+// reconnect cursor), or null for keep-alive/comment frames.
 function parseFrame(frame) {
-  const data = frame
-    .split(/\r?\n/)
-    .filter((l) => l.startsWith("data:"))
-    .map((l) => l.slice(5).replace(/^ /, ""))
-    .join("\n");
+  const lines = frame.split(/\r?\n/);
+  const field = (name) =>
+    lines.filter((l) => l.startsWith(`${name}:`)).map((l) => l.slice(name.length + 1).replace(/^ /, ""));
+  const data = field("data").join("\n");
   if (!data) return null;
-  return JSON.parse(data);
+  return { id: field("id").at(-1) ?? null, event: JSON.parse(data) };
 }
 
 // Returns the `done` result to stop streaming, throws on terminal failure, or
@@ -1355,24 +1460,89 @@ $("form").addEventListener("submit", (ev) => {
   void generate();
 });
 
-// Job id of the in-flight run, for the Cancel button. Null when idle.
+// Job id of the in-flight run, for the Cancel button. Null when idle. Also
+// remembered in localStorage so a reloaded page (phones discard backgrounded
+// tabs) can still cancel it; the result itself is lost with the old page's key.
 let currentJobId = null;
+// True while `generate()` owns a job: leaving the page then loses the result
+// (its key lives only here), so ask first. Browsers show their own wording,
+// and phones often skip the prompt; the orphan watcher below covers those.
+let ownJobRunning = false;
+window.addEventListener("beforeunload", (ev) => {
+  if (ownJobRunning) ev.preventDefault();
+});
+const ACTIVE_JOB_KEY = "thinfer.activeJob";
+function rememberJob(id) {
+  try {
+    if (id) localStorage.setItem(ACTIVE_JOB_KEY, id);
+    else localStorage.removeItem(ACTIVE_JOB_KEY);
+  } catch {
+    /* storage unavailable: cancel still works for this page's own job */
+  }
+}
+function showCancel(show) {
+  const btn = $("cancel");
+  btn.disabled = false;
+  btn.hidden = !show;
+}
+
 $("cancel").addEventListener("click", async () => {
   if (!currentJobId) return;
   $("cancel").disabled = true;
   setStatus("Cancelling…");
   try {
     // A queued job is dropped immediately; a running one is flagged and stops
-    // at the next denoise step boundary. The events stream then ends in
+    // at the next block or phase boundary. The events stream then ends in
     // `cancelled` and `generate()`'s catch reports it.
-    await fetch(`jobs/${currentJobId}/cancel`, {
+    const resp = await fetch(`jobs/${currentJobId}/cancel`, {
       method: "POST",
       headers: authHeaders(),
     });
+    if (!resp.ok) throw new Error(await errorText(resp));
   } catch (e) {
     log(`Cancel request failed: ${e.message ?? e}`);
+    setStatus(`Cancel failed: ${e.message ?? e}`);
+    $("cancel").disabled = false;
   }
 });
+
+// After a reload: offer Cancel for a job the previous page left running, and
+// watch it until it ends. Skipped while this page has its own job.
+async function resumeOrphanJob() {
+  let id = null;
+  try {
+    id = localStorage.getItem(ACTIVE_JOB_KEY);
+  } catch {
+    return;
+  }
+  if (!id) return;
+  for (;;) {
+    if (currentJobId && currentJobId !== id) return;
+    let state;
+    try {
+      const resp = await fetch(`jobs/${id}`, { headers: authHeaders() });
+      state = resp.ok ? (await resp.json()).state : "gone";
+    } catch {
+      state = "unreachable";
+    }
+    if (state !== "queued" && state !== "running") {
+      if (currentJobId === id) {
+        currentJobId = null;
+        showCancel(false);
+        setStatus(`Earlier job ended (${state}).`);
+      }
+      rememberJob(null);
+      return;
+    }
+    if (currentJobId !== id) {
+      currentJobId = id;
+      showCancel(true);
+      setStatus("A job from before this page loaded is still running (its result can't be shown here).");
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+resumeOrphanJob();
 
 async function generate() {
   const kind = $("kind").value;
@@ -1381,6 +1551,7 @@ async function generate() {
   genStart = t0; // stamp every log line with elapsed-from-submit (see `stamp`)
   setStatus("Submitting…");
   let jobKey = null;
+  let streamGaveUp = false;
   try {
     if (!SECURE) throw new Error("insecure context: open this page over https (or localhost) so jobs can be encrypted");
     jobKey = await newJobKey();
@@ -1397,9 +1568,9 @@ async function generate() {
     if (!resp.ok) throw new Error(await errorText(resp));
     const { id } = await resp.json();
     currentJobId = id;
-    const cancelBtn = $("cancel");
-    cancelBtn.disabled = false;
-    cancelBtn.hidden = false;
+    ownJobRunning = true;
+    rememberJob(id);
+    showCancel(true);
     log(`Submitted job ${id} (sealed)`);
     const result = await streamEvents(id, jobKey);
     await showResult(kind, result, jobKey);
@@ -1407,13 +1578,19 @@ async function generate() {
     const seed = result.seed != null ? `seed ${result.seed}, ` : "";
     setStatus(`Done: ${seed}${secs}s.`);
   } catch (e) {
+    streamGaveUp = e instanceof StreamDropped;
     setStatus(`Failed: ${e.message ?? e}`);
     log(`Failed: ${e.message ?? e}`);
   } finally {
     jobKey?.raw.fill(0); // wipe the raw key; the CryptoKey handle is dropped with it
     $("fields").disabled = false;
     genStart = null; // stop stamping; the next run re-arms it
+    ownJobRunning = false;
+    // Forget the job only once it reached a terminal state (or never got an
+    // id); a stream that gave up leaves it remembered so a reload can cancel.
+    if (currentJobId && !streamGaveUp) rememberJob(null);
     currentJobId = null;
-    $("cancel").hidden = true;
+    showCancel(false);
+    if (streamGaveUp) resumeOrphanJob();
   }
 }

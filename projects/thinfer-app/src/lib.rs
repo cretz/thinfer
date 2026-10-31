@@ -16,6 +16,7 @@ pub mod hunyuan;
 pub mod jobkey;
 pub mod ltx;
 pub mod minimax;
+mod minimax_ref;
 pub mod model;
 pub mod preprocess;
 pub mod progress;

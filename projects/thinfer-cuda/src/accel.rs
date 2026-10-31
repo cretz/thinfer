@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use thinfer_core::backend::{
     Accelerator, ElementwiseOp, GemmAddrs, GemmNvfp4Addrs, SdpaAddrs, TileAttnAddrs, TileAttnShape,
-    VsaAddrs, VsaShape,
+    VsaAddrs, VsaPart, VsaScratch, VsaShape,
 };
 use thinfer_core::ops::GemmDesc;
 
@@ -85,6 +85,17 @@ impl CudaAccel {
             .as_ref()
     }
 
+    /// Log the first VSA launch (once per accelerator).
+    fn note_vsa(&self, ran: bool, s: &VsaShape, a: &VsaAddrs) {
+        if ran && !self.vsa_engaged.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                target: thinfer_core::trace::ADAPTER,
+                rows = s.rows, tiles = s.n_tiles, prefix = s.n_prefix, topk = s.topk, gate = a.gate != 0,
+                "cuda vsa engaged",
+            );
+        }
+    }
+
     fn elementwise_kernels(&self) -> Option<&ElementwiseKernels> {
         self.elementwise
             .get_or_init(|| match ElementwiseKernels::new(self.dev.ctx.clone(), self.dev.sm) {
@@ -140,7 +151,7 @@ impl Accelerator for CudaAccel {
         let Some(k) = self.gemm_kernels() else {
             return Ok(false);
         };
-        let ran = k.run(desc, a.a, a.b, a.out, a.dims, a.m, a.n, a.k)?;
+        let ran = k.run(desc, a.a, a.b, a.out, a.dims, a.m, a.n, a.k, a.epilogue)?;
         if ran && !self.gemm_engaged.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 target: thinfer_core::trace::ADAPTER,
@@ -160,7 +171,7 @@ impl Accelerator for CudaAccel {
         let Some(k) = self.gemm_fp4_kernels() else {
             return Ok(false);
         };
-        let ran = k.run(a.a, a.w, a.out, a.scratch, a.m, a.n, a.k)?;
+        let ran = k.run(a)?;
         if ran && !self.fp4_engaged.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 target: thinfer_core::trace::ADAPTER,
@@ -171,9 +182,11 @@ impl Accelerator for CudaAccel {
         Ok(ran)
     }
 
-    fn accepts_vsa(&self, s: &VsaShape) -> Option<u64> {
-        (crate::vsa::accepts(s) && self.vsa_kernels().is_some())
-            .then(|| crate::vsa::scratch_bytes(s))
+    fn accepts_vsa(&self, s: &VsaShape) -> Option<VsaScratch> {
+        (crate::vsa::accepts(s) && self.vsa_kernels().is_some()).then(|| VsaScratch {
+            scratch: crate::vsa::scratch_bytes(s),
+            qk_i8: crate::vsa::qk_i8_bytes(s),
+        })
     }
 
     fn vsa(&self, s: &VsaShape, a: &VsaAddrs) -> Result<bool, String> {
@@ -181,13 +194,16 @@ impl Accelerator for CudaAccel {
             return Ok(false);
         };
         let ran = k.run(s, a)?;
-        if ran && !self.vsa_engaged.swap(true, Ordering::Relaxed) {
-            tracing::info!(
-                target: thinfer_core::trace::ADAPTER,
-                rows = s.rows, tiles = s.n_tiles, prefix = s.n_prefix, topk = s.topk, gate = a.gate != 0,
-                "cuda vsa engaged",
-            );
-        }
+        self.note_vsa(ran, s, a);
+        Ok(ran)
+    }
+
+    fn vsa_part(&self, s: &VsaShape, part: VsaPart, a: &VsaAddrs) -> Result<bool, String> {
+        let Some(k) = self.vsa_kernels() else {
+            return Ok(false);
+        };
+        let ran = k.part(s, part, a)?;
+        self.note_vsa(ran, s, a);
         Ok(ran)
     }
 
@@ -212,7 +228,7 @@ impl Accelerator for CudaAccel {
     }
 
     fn accepts_tile_attention(&self, head_dim: u32) -> bool {
-        matches!(head_dim, 64 | 128) && self.vsa_kernels().is_some()
+        crate::vsa::attention_head_dim_supported(head_dim) && self.vsa_kernels().is_some()
     }
 
     fn tile_attention(&self, s: &TileAttnShape, a: &TileAttnAddrs) -> Result<bool, String> {

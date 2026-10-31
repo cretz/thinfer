@@ -41,6 +41,14 @@
           <input id="input-image" type="file" accept="image/png,image/jpeg" />
         </div>
 
+        <!-- FastH3-Omni reference images (up to 9): the prompt names them
+             <Picture 1>, <Picture 2>, ... in the order listed under the input. -->
+        <div id="ref-images-row" hidden>
+          <label for="ref-images">Reference images</label>
+          <input id="ref-images" type="file" accept="image/png,image/jpeg" multiple />
+          <div id="ref-images-order"></div>
+        </div>
+
         <!-- ltx2-rapid native I2V: frame-0 conditioning strength (only shown with
              an input image on rapid). 1 = lock the input frame, lower = drift. -->
         <div id="strength-row" hidden>
@@ -119,10 +127,10 @@
           <summary>Adapters (LoRA)</summary>
           <div class="adapters-body">
             <label for="vault-password">Password</label>
-            <input id="vault-password" type="password" placeholder="unlocks your adapter vault" autocomplete="off" />
+            <input id="vault-password" form="vault-form" type="password" placeholder="unlocks your adapter vault" autocomplete="off" />
 
             <div class="adapters-actions">
-              <button id="adapters-refresh" type="button">List adapters</button>
+              <button id="adapters-refresh" form="vault-form" type="submit">List adapters</button>
               <span id="adapters-status"></span>
             </div>
 
@@ -135,14 +143,14 @@
               <summary>Add adapter by URL</summary>
               <div class="adapters-add-body">
                 <label for="adapter-url">URL</label>
-                <input id="adapter-url" type="url" placeholder="https://civitai.com/api/download/models/…" />
+                <input id="adapter-url" form="adapter-add-form" type="url" placeholder="https://civitai.com/api/download/models/…" />
                 <label for="adapter-token">Token</label>
-                <input id="adapter-token" type="password" placeholder="Civitai token, if the file needs one" autocomplete="off" />
+                <input id="adapter-token" form="adapter-add-form" type="password" placeholder="Civitai token, if the file needs one" autocomplete="off" />
                 <label for="adapter-name">Name</label>
-                <input id="adapter-name" type="text" placeholder="(defaults to the download filename)" />
+                <input id="adapter-name" form="adapter-add-form" type="text" placeholder="(defaults to the download filename)" />
                 <label for="adapter-weight">Default weight</label>
-                <input id="adapter-weight" type="text" inputmode="decimal" placeholder="1.0" />
-                <button id="adapter-add-btn" type="button">Add to vault</button>
+                <input id="adapter-weight" form="adapter-add-form" type="text" inputmode="decimal" placeholder="1.0" />
+                <button id="adapter-add-btn" form="adapter-add-form" type="submit">Add to vault</button>
               </div>
             </details>
           </div>
@@ -185,9 +193,20 @@
         <div id="vae-row" class="video-only">
           <label for="vae">Quality</label>
           <select id="vae">
-            <option value="tiny" selected>Tiny VAE (fast, default)</option>
+            <option value="tiny" id="vae-opt-tiny" selected>Tiny VAE (fast, default)</option>
             <option value="tiny-ft" id="vae-opt-tiny-ft" hidden>Tiny VAE — Hunyuan-tuned (fast, better)</option>
             <option value="full">Full VAE (clean, slower)</option>
+            <option value="nvfp4" id="vae-opt-nvfp4" hidden>NVFP4 decoder (default; RTX 50, else full)</option>
+            <option value="nvfp4-fast" id="vae-opt-nvfp4-fast" hidden>NVFP4 fast decoder (fastest, softer; RTX 50)</option>
+          </select>
+        </div>
+
+        <!-- FastH3 only: sparse-attention precision. -->
+        <div id="attn-row" class="video-only" hidden>
+          <label for="attn">Attention</label>
+          <select id="attn">
+            <option value="int8" selected>INT8 (default, faster)</option>
+            <option value="bf16">bf16 (reference, different take)</option>
           </select>
         </div>
 
@@ -278,6 +297,10 @@
         <button id="generate" type="submit">Generate</button>
       </fieldset>
     </form>
+    <!-- Owners of the adapter-vault fields above (bound via `form=`): Enter in
+         them runs the vault action instead of submitting a generation. -->
+    <form id="vault-form" hidden></form>
+    <form id="adapter-add-form" hidden></form>
     <button id="cancel" type="button" hidden>Cancel</button>
     <p id="status">Idle.</p>
     <img id="image-out" alt="" hidden />

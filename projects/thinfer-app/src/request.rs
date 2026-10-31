@@ -11,7 +11,8 @@ use thinfer_core::policy::ResidencyBudget;
 pub use thinfer_models::wan::pipeline::Shot;
 
 use crate::model::{
-    EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId, VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId,
+    VideoSampler,
 };
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
@@ -319,6 +320,10 @@ pub struct VideoRequest {
     /// rides in RAM ([`ImageBytes`]) and never touches disk; the large target
     /// video takes the RAM/encrypted `input_video` path.
     pub source_image: Option<ImageBytes>,
+    /// FastH3-Omni only: reference images (PNG/JPEG, at most 9) the prompt can
+    /// name as `<Picture 1>`, `<Picture 2>`, ... in order. Held in RAM like
+    /// `source_image`; a decrypted image never touches disk.
+    pub ref_images: Vec<ImageBytes>,
     /// DreamID-V only: the target VIDEO (the clip to swap a face into), held
     /// RAM-first (encrypted spill for large uploads; see [`VideoInput`]).
     /// Required for DreamID-V, `None` for every other model.
@@ -337,6 +342,8 @@ pub struct VideoRequest {
     /// on long clips); `None` (default) runs full self-attention. Honored only on
     /// the activation-tiled long-clip path; short clips run full attention.
     pub attn_window: Option<u32>,
+    /// FastH3 sparse-attention precision (rejected for every other model).
+    pub attn: AttnPrecision,
     pub vae: VaeChoice,
     /// LTX-2.3 text-encoder quantization (Q8 baseline or Q4_K_M fast). Applies to
     /// every LTX model (shared Gemma encoder); ignored by Wan.
@@ -414,10 +421,15 @@ impl VideoRequest {
         // required turbo adapter + both VAEs), not via the Wan variant registry.
         if self.model.is_minimax() {
             let m = self.model.manifest();
+            // The opt-in NVFP4 decoder rides with (not instead of) the fp16 VAE,
+            // which still supplies the latent stats.
+            let decoder = self.vae.minimax_nvfp4().map(|(r, _)| r);
             return self
                 .model
                 .minimax_roles()
                 .iter()
+                .copied()
+                .chain(decoder)
                 .map(|r| {
                     m.get(r)
                         .copied()
@@ -484,7 +496,8 @@ impl VideoRequest {
             let vae_role = match self.vae {
                 VaeChoice::Tiny => hyrole::TINY_VAE,
                 VaeChoice::TinyFt => hyrole::TINY_VAE_FT,
-                VaeChoice::Full => hyrole::VAE,
+                // NVFP4 is rejected for Hunyuan in `resolve`.
+                VaeChoice::Full | VaeChoice::Nvfp4 | VaeChoice::Nvfp4Fast => hyrole::VAE,
             };
             let mut roles = vec![
                 hyrole::ENCODER_GGUF_Q8_0,
@@ -556,6 +569,18 @@ impl VideoRequest {
     /// Validate dims + resolve fps and the shot plan. Fails fast on every user
     /// error so a server can 400 at submit.
     pub fn resolve(&self) -> Result<VideoPlan, String> {
+        if self.attn == AttnPrecision::Int8 && !self.model.is_fasth3() {
+            return Err(format!(
+                "--attn int8 applies to the FastH3 models' sparse attention; {} does not take it",
+                self.model
+            ));
+        }
+        if self.vae.minimax_nvfp4().is_some() && !self.model.is_minimax() {
+            return Err(format!(
+                "--vae {} is a MiniMax-H3 / FastH3 decoder; {} does not take it",
+                self.vae, self.model
+            ));
+        }
         // DreamID-V is a video face-swap, not a t2v: it consumes a target video +
         // a source face image (no prompt), on the Wan /16 grid. Its own resolve
         // validates those inputs and skips the prompt/sampler/shot machinery.
@@ -596,7 +621,10 @@ impl VideoRequest {
         // MiniMax-H3: its own grid (dims /32, frames 17n+5), single prompt, and
         // none of the FastWan sampler/vae/shot machinery.
         if self.model.is_minimax() {
-            return self.resolve_minimax();
+            // FastH3 runs the row-chunked accelerated block where one exists;
+            // the driver re-resolves with the limit of the backend it has.
+            let accel = self.model.is_fasth3();
+            return self.resolve_minimax(thinfer_models::minimax::pipeline::max_packed_rows(accel));
         }
         validate_dim("height", self.height)?;
         validate_dim("width", self.width)?;
@@ -683,9 +711,19 @@ impl VideoRequest {
     /// The packed-row ceiling is NOT enforced here: it depends on the tokenized
     /// prompt length, which resolve does not have. The driver checks it before
     /// loading any weights.
-    fn resolve_minimax(&self) -> Result<VideoPlan, String> {
+    pub fn resolve_minimax(&self, row_limit: usize) -> Result<VideoPlan, String> {
         if self.prompts.len() > 1 {
             return Err(format!("{} takes a single prompt", self.model));
+        }
+        let max_refs = crate::minimax_ref::MAX_REFERENCES;
+        if !self.ref_images.is_empty() && self.model != VideoModelId::Fasth3Omni {
+            return Err(format!(
+                "{} does not take reference images (fasth3-omni does)",
+                self.model
+            ));
+        }
+        if self.ref_images.len() > max_refs {
+            return Err(format!("at most {max_refs} reference images"));
         }
         let mult = self.model.dim_multiple();
         for (name, v) in [("height", self.height), ("width", self.width)] {
@@ -713,7 +751,7 @@ impl VideoRequest {
                 // canvas fits (the prompt's rows are not known yet: reserve a
                 // typical prompt). An explicit length over the cap still fails
                 // in the driver, with the exact row count.
-                use thinfer_models::minimax::{packing, pipeline::MAX_PACKED_ROWS};
+                use thinfer_models::minimax::packing;
                 let default = self.model.default_frames();
                 let fit = packing::max_fitting_frames(
                     &self.model.minimax_dit_config(),
@@ -721,7 +759,7 @@ impl VideoRequest {
                     (self.height / 16) as usize,
                     (self.width / 16) as usize,
                     default as usize,
-                    MAX_PACKED_ROWS,
+                    row_limit,
                 )
                 .ok_or_else(|| {
                     format!(
@@ -974,7 +1012,8 @@ impl FaceSwapRequest {
 #[derive(Clone, Debug)]
 pub enum JobRequest {
     Image(ImageRequest),
-    Video(VideoRequest),
+    /// Boxed: the video request is several times the others' size.
+    Video(Box<VideoRequest>),
     FaceSwap(FaceSwapRequest),
 }
 
@@ -1233,7 +1272,7 @@ mod tests {
     // A minimal LTX t2v request for resolve() coverage. Only the fields resolve
     // reads matter; the rest take inert defaults.
     fn ltx_req(width: u32, height: u32, frames: Vec<u32>, durations: Vec<f32>) -> VideoRequest {
-        use crate::model::{EncoderQuant, VaeChoice, VideoModelId, VideoSampler};
+        use crate::model::{AttnPrecision, EncoderQuant, VaeChoice, VideoModelId, VideoSampler};
         use thinfer_core::policy::ResidencyBudget;
         VideoRequest {
             model: VideoModelId::Ltx23Distilled,
@@ -1247,6 +1286,7 @@ mod tests {
             input_image: None,
             strength: 1.0,
             source_image: None,
+            ref_images: Vec::new(),
             input_video: None,
             guide_scale: None,
             sampler: VideoSampler::UniPc,
@@ -1255,6 +1295,7 @@ mod tests {
             vae: VaeChoice::Full,
             encoder: EncoderQuant::Q8,
             i8_matmul: true,
+            attn: AttnPrecision::Bf16,
             audio: true,
             upscale: true,
             audio_hq: false,
@@ -1358,7 +1399,7 @@ mod tests {
 
     // A minimal Wan2.2-A14B t2v request for resolve() coverage.
     fn wan22_req(width: u32, height: u32, frames: Vec<u32>, durations: Vec<f32>) -> VideoRequest {
-        use crate::model::{EncoderQuant, VaeChoice, VideoModelId, VideoSampler};
+        use crate::model::{AttnPrecision, EncoderQuant, VaeChoice, VideoModelId, VideoSampler};
         use thinfer_core::policy::ResidencyBudget;
         VideoRequest {
             model: VideoModelId::Wan22T2vA14b,
@@ -1372,6 +1413,7 @@ mod tests {
             input_image: None,
             strength: 1.0,
             source_image: None,
+            ref_images: Vec::new(),
             input_video: None,
             guide_scale: None,
             sampler: VideoSampler::UniPc,
@@ -1380,6 +1422,7 @@ mod tests {
             vae: VaeChoice::Full,
             encoder: EncoderQuant::Q8,
             i8_matmul: true,
+            attn: AttnPrecision::Bf16,
             audio: false,
             upscale: false,
             audio_hq: false,

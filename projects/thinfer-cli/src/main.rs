@@ -13,6 +13,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Top {
+    /// List every model id `--model` accepts.
+    Models,
     /// Model-level dev tools.
     Model {
         #[command(subcommand)]
@@ -79,6 +81,10 @@ fn main() -> ExitCode {
         .expect("build tokio runtime");
     let code = rt.block_on(async {
         match cli.cmd {
+            Top::Models => {
+                cmd::models::run();
+                ExitCode::SUCCESS
+            }
             Top::Model { cmd: sub } => cmd::model::run(sub).await,
             Top::Generate { cmd: sub } => cmd::generate::run(*sub).await,
             Top::Vault { cmd: sub } => match cmd::vault::run(sub).await {

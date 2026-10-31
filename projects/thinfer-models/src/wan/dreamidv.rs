@@ -331,6 +331,12 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
             )));
         }
 
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            frames = vf, height = ph, width = pw, target_area = inputs.target_area,
+            mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
+            "dreamid-v encode start",
+        );
         let (video_lat, mask_lat, image_lat) = {
             let _e = trace::scope!("vae_encode").entered();
             let video_lat = self

@@ -300,6 +300,7 @@ impl<B: Backend> Workspace<B> {
             guards: RefCell::new(Vec::new()),
             scope_id: NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             deferred: std::cell::Cell::new(false),
+            gemm_scratch: RefCell::new(None),
             _life: PhantomData,
         }
     }
@@ -438,6 +439,9 @@ pub struct BatchScope<'wsp, B: Backend> {
     /// Accelerator ops enqueue without per-op drains or syncs (see
     /// [`Self::accel_begin`]); [`Self::accel_end`] or submit waits for them.
     deferred: std::cell::Cell<bool>,
+    /// The NVFP4 GEMMs' activation scratch, shared by every call in the
+    /// scope (see [`Self::gemm_scratch`]).
+    gemm_scratch: RefCell<Option<BufRef>>,
     /// Marker to make `BatchScope<'wsp, B>` carry its lifetime even when the
     /// `'wsp` shows up only behind references; not load-bearing for safety.
     _life: PhantomData<&'wsp ()>,
@@ -460,6 +464,15 @@ pub struct BatchBuf<'s> {
     buf: BufRef,
     scope_id: u64,
     _phantom: PhantomData<*mut &'s ()>,
+}
+
+/// The optional parts of [`BatchScope::try_gemm_fused`]'s epilogue
+/// (`out = residual + gate * (acc + bias)`), as scope buffers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GemmEpi<'s> {
+    pub bias: Option<BatchBuf<'s>>,
+    pub residual: Option<BatchBuf<'s>>,
+    pub gate: Option<BatchBuf<'s>>,
 }
 
 impl<'s> BatchBuf<'s> {
@@ -833,7 +846,17 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let dims = self.resolve(dims);
         let out = self.resolve(out);
         if let Some(desc) = self.backend.pipeline_gemm(pipeline)
-            && self.try_accel_gemm(&desc, &a, &b, Some(&dims), &out, m, n, 0)?
+            && self.try_accel_gemm(
+                &desc,
+                &a,
+                &b,
+                Some(&dims),
+                &out,
+                m,
+                n,
+                0,
+                Default::default(),
+            )?
         {
             return Ok(());
         }
@@ -872,7 +895,17 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let b = self.resolve(b);
         let out = self.resolve(out);
         let dims = self.resolve(dims);
-        if self.try_accel_gemm(&cfg.gemm_desc(), &a, &b, Some(&dims), &out, m, n, 0)? {
+        if self.try_accel_gemm(
+            &cfg.gemm_desc(),
+            &a,
+            &b,
+            Some(&dims),
+            &out,
+            m,
+            n,
+            0,
+            Default::default(),
+        )? {
             return Ok(());
         }
         let bufs = crate::ops::matmul_coopmat::CoopmatBufs {
@@ -1293,7 +1326,43 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             return Ok(false);
         };
         let (a, b, out) = (self.resolve(a), self.resolve(b), self.resolve(out));
-        self.try_accel_gemm(&desc, &a, &b, None, &out, m, n, k)
+        self.try_accel_gemm(&desc, &a, &b, None, &out, m, n, k, Default::default())
+    }
+
+    /// [`Self::try_gemm`] with a fused epilogue (see
+    /// [`crate::backend::GemmEpilogue`]): `out = residual + gate * (acc +
+    /// bias)`, each part optional, saving the separate elementwise passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_fused(
+        &self,
+        pipeline: &B::Pipeline,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        epi: GemmEpi<'wsp>,
+    ) -> Result<bool, B::Error> {
+        let Some(desc) = self.backend.pipeline_gemm(pipeline) else {
+            return Ok(false);
+        };
+        let addr = |b: Option<BatchBuf<'wsp>>| match b {
+            Some(b) => self.backend.device_address(&self.resolve(b)),
+            None => Some(0),
+        };
+        let (Some(bias), Some(residual), Some(gate)) =
+            (addr(epi.bias), addr(epi.residual), addr(epi.gate))
+        else {
+            return Ok(false);
+        };
+        let (a, b, out) = (self.resolve(a), self.resolve(b), self.resolve(out));
+        let epilogue = crate::backend::GemmEpilogue {
+            bias,
+            residual,
+            gate,
+        };
+        self.try_accel_gemm(&desc, &a, &b, None, &out, m, n, k, epilogue)
     }
 
     /// Whether [`Self::try_gemm`] would take this shape (cheap, host-side).
@@ -1431,6 +1500,45 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         }
     }
 
+    /// At least `bytes` of NVFP4 GEMM scratch, the same buffer for every call
+    /// in the scope once it is big enough: accelerator work runs in order on
+    /// one stream (each GEMM quantizes into it, then reads it, before the
+    /// next starts), so a block of many row-chunk GEMMs holds one scratch
+    /// instead of one per call until the scope submits.
+    fn gemm_scratch(&self, bytes: u64) -> Result<BatchBuf<'wsp>, B::Error> {
+        // The scope's guards own the allocation; the slot keeps its view.
+        let mut slot = self.gemm_scratch.borrow_mut();
+        if let Some(s) = *slot
+            && s.len >= bytes
+        {
+            return Ok(self.import_copy(s));
+        }
+        let s = self.alloc(bytes)?;
+        *slot = Some(self.resolve(s));
+        Ok(s)
+    }
+
+    /// Enqueue one part of a VSA forward (deferred mode only; the caller
+    /// owns the scratch across parts). `false` = declined.
+    pub fn accel_vsa_part(
+        &self,
+        shape: &crate::backend::VsaShape,
+        part: crate::backend::VsaPart,
+        addrs: &crate::backend::VsaAddrs,
+    ) -> bool {
+        debug_assert!(self.deferred.get(), "accel_vsa_part outside deferred mode");
+        let Some(acc) = self.backend.accelerator() else {
+            return false;
+        };
+        match acc.vsa_part(shape, part, addrs) {
+            Ok(ran) => ran,
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator vsa part failed");
+                false
+            }
+        }
+    }
+
     /// `out[M,N] = a[M,K] @ W^T` for an NVFP4 composite `w` on the backend's
     /// [`crate::backend::Accelerator`] (native W4A4, no dequant pass), with a
     /// scope-owned scratch for the quantized activations. Same flush/drain
@@ -1445,6 +1553,45 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         m: u32,
         n: u32,
         k: u32,
+        format: crate::backend::Nvfp4Format,
+    ) -> Result<bool, B::Error> {
+        self.try_gemm_nvfp4_lora(a, w, out, m, n, k, None, format)
+    }
+
+    /// [`Self::try_gemm_nvfp4`] plus a low-rank term in the epilogue: `out
+    /// += mid @ bt` for `lora = (mid [m, rank], bt [rank, n], rank)` with
+    /// [`crate::backend::nvfp4_fuses_lora_rank`] (a runtime adapter's
+    /// second GEMM and its add, with no `[m, n]` pass of their own).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_nvfp4_lora(
+        &self,
+        a: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        lora: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>, u32)>,
+        format: crate::backend::Nvfp4Format,
+    ) -> Result<bool, B::Error> {
+        self.try_gemm_nvfp4_rows(a, w, out, m, n, k, lora, format, None)
+    }
+
+    /// [`Self::try_gemm_nvfp4_lora`] over weight rows `rows` of the composite
+    /// (see [`crate::backend::GemmNvfp4Addrs::rows`]): `out` is `[m, n]` of
+    /// just those output columns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_nvfp4_rows(
+        &self,
+        a: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        lora: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>, u32)>,
+        format: crate::backend::Nvfp4Format,
+        rows: Option<crate::backend::Nvfp4Rows>,
     ) -> Result<bool, B::Error> {
         let Some(acc) = self.backend.accelerator() else {
             return Ok(false);
@@ -1452,12 +1599,21 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let Some(scratch_bytes) = acc.accepts_gemm_nvfp4(m, n, k) else {
             return Ok(false);
         };
-        let scratch = self.alloc(scratch_bytes)?;
+        let scratch = self.gemm_scratch(scratch_bytes)?;
         let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
         let (Some(a), Some(w), Some(out), Some(scratch)) =
             (addr(a), addr(w), addr(out), addr(scratch))
         else {
             return Ok(false);
+        };
+        let lora = match lora {
+            None => crate::backend::Nvfp4Lora::default(),
+            Some((mid, bt, rank)) => {
+                let (Some(mid), Some(bt)) = (addr(mid), addr(bt)) else {
+                    return Ok(false);
+                };
+                crate::backend::Nvfp4Lora { mid, bt, rank }
+            }
         };
         let t0 = crate::trace::Instant::now();
         if !self.deferred.get() {
@@ -1473,6 +1629,9 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             m,
             n,
             k,
+            lora,
+            format,
+            rows,
         });
         let res = res.and_then(|ran| self.accel_settle(acc).map(|()| ran));
         tracing::debug!(
@@ -1495,10 +1654,13 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
 
     /// Tile-sparse attention with the gated compression branch on the
     /// backend's [`crate::backend::Accelerator`] (see
-    /// [`crate::backend::VsaShape`]), with a scope-owned scratch. Same
-    /// flush/drain ordering as [`Self::try_accel_sdpa`]. `false` = no
-    /// accelerator, a declined shape, or an unaddressable buffer: the caller
-    /// runs dense attention.
+    /// [`crate::backend::VsaShape`]), with a scope-owned scratch. `reuse` =
+    /// caller memory that is dead for the duration of the call (stream order
+    /// makes earlier writes land before, later reads happen after): the INT8
+    /// path's quantized Q/K go there when it is large enough, instead of a
+    /// fresh allocation. Same flush/drain ordering as
+    /// [`Self::try_accel_sdpa`]. `false` = no accelerator, a declined shape,
+    /// or an unaddressable buffer: the caller runs dense attention.
     #[allow(clippy::too_many_arguments)]
     pub fn try_vsa(
         &self,
@@ -1509,28 +1671,42 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         gate: Option<BatchBuf<'wsp>>,
         out: BatchBuf<'wsp>,
         geometry: BatchBuf<'wsp>,
+        reuse: Option<BatchBuf<'wsp>>,
     ) -> Result<bool, B::Error> {
         let Some(acc) = self.backend.accelerator() else {
             return Ok(false);
         };
-        let Some(scratch_bytes) = acc.accepts_vsa(shape) else {
+        let Some(need) = acc.accepts_vsa(shape) else {
             return Ok(false);
         };
-        let scratch = self.alloc(scratch_bytes)?;
-        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
-        let gate = match gate {
-            None => Some(0),
-            Some(g) => addr(g),
+        let scratch = self.alloc(need.scratch)?;
+        let qk_i8 = match reuse {
+            _ if need.qk_i8 == 0 => None,
+            Some(r) if r.len() >= need.qk_i8 => Some(r),
+            _ => Some(self.alloc(need.qk_i8)?),
         };
-        let (Some(q), Some(k), Some(v), Some(gate), Some(out), Some(geometry), Some(scratch)) = (
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let opt_addr = |b: Option<BatchBuf<'wsp>>| b.map_or(Some(0), addr);
+        let (
+            Some(q),
+            Some(k),
+            Some(v),
+            Some(gate),
+            Some(out),
+            Some(geometry),
+            Some(scratch),
+            Some(qk_i8),
+        ) = (
             addr(q),
             addr(k),
             addr(v),
-            gate,
+            opt_addr(gate),
             addr(out),
             addr(geometry),
             addr(scratch),
-        ) else {
+            opt_addr(qk_i8),
+        )
+        else {
             return Ok(false);
         };
         let t0 = crate::trace::Instant::now();
@@ -1549,6 +1725,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
                 out,
                 geometry,
                 scratch,
+                qk_i8,
             },
         );
         let res = res.and_then(|ran| self.accel_settle(acc).map(|()| ran));
@@ -1583,6 +1760,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         m: u32,
         n: u32,
         k: u32,
+        epilogue: crate::backend::GemmEpilogue,
     ) -> Result<bool, B::Error> {
         let Some(acc) = self.backend.accelerator() else {
             return Ok(false);
@@ -1611,6 +1789,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             m,
             n,
             k,
+            epilogue,
         };
         let t1 = crate::trace::Instant::now();
         let res = acc
@@ -2867,6 +3046,7 @@ where
             guards,
             scope_id: _,
             deferred: _,
+            gemm_scratch: _,
             _life: _,
         } = scope;
         let enc = encoder

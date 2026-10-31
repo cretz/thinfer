@@ -5,7 +5,7 @@ use std::path::Path;
 
 use thinfer_app::JobRequest;
 use thinfer_app::jobkey::JobKey;
-use thinfer_app::model::{ImageModelId, SwapModel, VaeChoice, VideoModelId};
+use thinfer_app::model::{ImageModelId, SwapModel, VideoModelId};
 use thinfer_app::request::{
     FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, VideoFormat,
     VideoInput, VideoRequest,
@@ -105,6 +105,13 @@ pub fn spec_into_request(
                 Some(b64) => Some(ImageBytes(b64_decode("source_image", &b64)?)),
                 None => None,
             };
+            // FastH3-Omni reference images: RAM only, like the source face.
+            let ref_images = s
+                .ref_images
+                .unwrap_or_default()
+                .iter()
+                .map(|b64| b64_decode("ref_images", b64).map(ImageBytes))
+                .collect::<Result<Vec<_>, String>>()?;
             // DreamID-V target VIDEO: a streamed upload id (preferred; the
             // client sealed it under the job key, so it stays ciphertext until
             // the frames are decoded) is consumed into the job dir; else a
@@ -127,14 +134,16 @@ pub fn spec_into_request(
                 input_image,
                 strength: s.strength.unwrap_or(1.0),
                 source_image,
+                ref_images,
                 input_video,
                 guide_scale: s.guide_scale,
                 sampler: s.sampler.unwrap_or(model.default_sampler()),
                 steps: s.steps.unwrap_or(model.default_steps()),
                 attn_window: s.attn_window,
-                vae: s.vae.unwrap_or(VaeChoice::Tiny),
+                vae: s.vae.unwrap_or(model.default_vae()),
                 encoder: s.encoder.unwrap_or_default(),
                 i8_matmul: s.i8_matmul.unwrap_or(true),
+                attn: s.attn.unwrap_or(model.default_attn()),
                 audio: s.audio.unwrap_or(true),
                 upscale: s.upscale.unwrap_or(model.two_stage_default()),
                 audio_hq: s.audio_hq.unwrap_or(false),
@@ -157,7 +166,7 @@ pub fn spec_into_request(
             };
             req.resolve()?;
             make_dir()?;
-            Ok((JobRequest::Video(req), disable_coopmat))
+            Ok((JobRequest::Video(Box::new(req)), disable_coopmat))
         }
         JobSpec::FaceSwap(s) => {
             // Target video: a streamed upload id (sealed under the job key,

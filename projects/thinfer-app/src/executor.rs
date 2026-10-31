@@ -1229,6 +1229,11 @@ impl LocalExecutor {
         )
         .await
         .map_err(|e| format!("face-mask (DWPose): {e:?}"))?;
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
+            "dreamid-v masks done",
+        );
 
         // --- 4. flatten to interleaved RGB [n, h, w, 3] the pipeline expects ---
         let mut video_rgb = Vec::with_capacity(cap * fh * fw * 3);
@@ -1315,10 +1320,14 @@ impl LocalExecutor {
             seed,
         };
         sink.stage(Stage::VaeDecode);
-        let out = pipeline
-            .generate(&inputs, None)
-            .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+        let out = pipeline.generate(&inputs, None).await.map_err(|e| {
+            tracing::warn!(
+                target: thinfer_core::trace::DIAG,
+                mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
+                "dreamid-v generate failed",
+            );
+            format!("generate: {e:?}")
+        })?;
 
         // --- 7. encode the swapped clip -> MP4 ---
         let video = WanVideo {
@@ -1382,13 +1391,22 @@ async fn open_mmap(path: &Path) -> Result<MmapFileOpener, String> {
 /// manifest distill LoRA), so `ShardedSafetensorsSource` can parse it like a
 /// file and every fold stack shares one adapter type. Cheap to reopen (an `Arc`
 /// clone per per-tensor reader). Vault plaintext lives only as long as the fold
-/// source that reads it.
+/// source that reads it, and is zeroed when the last reader drops.
 #[derive(Clone)]
-pub(crate) struct BytesOpener(Arc<[u8]>);
+pub(crate) struct BytesOpener(Arc<PlainBytes>);
+
+/// Decrypted adapter bytes, zeroed on drop (never merely freed).
+pub(crate) struct PlainBytes(Box<[u8]>);
+
+impl Drop for PlainBytes {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0[..]);
+    }
+}
 
 impl BytesOpener {
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self(Arc::from(bytes.into_boxed_slice()))
+        Self(Arc::new(PlainBytes(bytes.into_boxed_slice())))
     }
 }
 
@@ -1403,17 +1421,17 @@ impl thinfer_core::weight::FileOpener for BytesOpener {
 }
 
 pub(crate) struct BytesReader {
-    bytes: Arc<[u8]>,
+    bytes: Arc<PlainBytes>,
 }
 
 impl thinfer_core::weight::WeightReader for BytesReader {
     type Error = std::convert::Infallible;
     fn len(&self) -> u64 {
-        self.bytes.len() as u64
+        self.bytes.0.len() as u64
     }
     async fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
         let off = offset as usize;
-        dst.copy_from_slice(&self.bytes[off..off + dst.len()]);
+        dst.copy_from_slice(&self.bytes.0[off..off + dst.len()]);
         Ok(())
     }
 }

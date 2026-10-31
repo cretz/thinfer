@@ -27,11 +27,14 @@ pub mod loader;
 pub mod lora;
 pub mod manifest;
 pub mod packing;
+pub mod pdd;
 pub mod pipeline;
 pub mod rope3d;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod vae_encoder;
 pub mod video_vae;
+pub mod vision;
 pub mod vsa;
 
 /// DiT architecture constants, from the upstream checkpoint `config.json`
@@ -61,23 +64,45 @@ pub struct DitConfig {
     pub adaln_out: usize,
     /// `2 * hidden` = the final layer's `shift`/`scale`.
     pub final_adaln_out: usize,
-    /// Rank-reduced AdaLN (FastH3 Trim): every projection reads the shared
-    /// `adaln_basis(silu(temb))` (`rank` wide, no further silu) instead of
-    /// `silu(temb)`. `None` = the released full-width projections.
-    pub adaln_rank: Option<usize>,
+    /// What every `adaln_proj` reads.
+    pub adaln: AdalnInput,
+    /// PDD output heads (FastH3-Omni, see [`pdd`]). `None` = one head.
+    pub pdd: Option<pdd::Pdd>,
     /// Video sparse attention: the fraction of video key tiles each video
     /// query tile drops (FastH3's `vsa_sparsity`, trained with 64-row tiles
     /// and a learned compression gate). `None` = dense attention.
     pub vsa_sparsity: Option<f64>,
+    /// Whether VSA adds its learned compression branch (`to_gate_compress`).
+    /// Off with sparsity 0 is exact dense attention on the VSA kernel.
+    pub vsa_gate: bool,
+    /// The tile size and video cube VSA was trained with.
+    pub vsa_tiling: vsa::VsaTiling,
+    /// VSA's QK^T in INT8 (SageAttention-style; P.V stays bf16).
+    pub vsa_int8_qk: bool,
     /// Blocks of the released 50-block H3 that a trimmed checkpoint removed
     /// (the rest are renumbered densely). Maps base-H3 adapters onto it.
     pub dropped_blocks: &'static [usize],
+    /// How the checkpoint's NVFP4 linears quantize their activations.
+    pub nvfp4_format: thinfer_core::backend::Nvfp4Format,
     /// Frequencies per rotary axis. Three axes share one `inv_freq` buffer.
     pub rope_inv_freq_len: usize,
     pub rope_theta: f32,
     pub norm_eps: f32,
     pub qk_norm_eps: f32,
     pub final_norm_eps: f32,
+}
+
+/// The input every `adaln_proj` projects (all of them silu-free past this).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdalnInput {
+    /// `silu(temb)` through the released full-width projections.
+    Full,
+    /// FastH3 Trim: the shared `adaln_basis(silu(temb))`, `rank` wide.
+    Basis(usize),
+    /// FastH3-Omni Comfy: `adaln_t_table [1025, rank]` lerped at `t` (no time
+    /// embedder in the file: the table is the SVD of `silu(temb)` sampled at
+    /// `t = i / 1024`).
+    Table(usize),
 }
 
 impl DitConfig {
@@ -100,9 +125,17 @@ impl DitConfig {
             time_embed_dim: 2688,
             adaln_out: 96768,
             final_adaln_out: 10752,
-            adaln_rank: None,
+            adaln: AdalnInput::Full,
+            pdd: None,
             vsa_sparsity: None,
+            vsa_gate: true,
+            vsa_tiling: vsa::VsaTiling::T64,
+            vsa_int8_qk: false,
             dropped_blocks: &[],
+            nvfp4_format: thinfer_core::backend::Nvfp4Format {
+                dynamic_act_scale: false,
+                hi_first: false,
+            },
             rope_inv_freq_len: 16,
             rope_theta: 10_000.0,
             norm_eps: 1e-5,
@@ -117,11 +150,33 @@ impl DitConfig {
     pub const fn fasth3_trim() -> Self {
         let mut c = Self::h3_33b();
         c.n_layers = 42;
-        c.adaln_rank = Some(16);
+        c.adaln = AdalnInput::Basis(16);
         // `fastvideo_inference.json`: VIDEO_SPARSE_ATTN_H3, tile 64.
         c.vsa_sparsity = Some(0.8);
         // `transformer/config.json` keeps every block but these.
         c.dropped_blocks = &[6, 7, 9, 13, 15, 16, 22, 23];
+        c
+    }
+
+    /// FastVideo FastH3-Omni (the 8-step distill of the Ref2VA checkpoint) as
+    /// the Comfy NVFP4 file ships it: all 50 blocks, AdaLN as a rank-8 curve
+    /// table, 32 PDD output heads, NVFP4 with Comfy's nibble order and dynamic
+    /// activation scale. Attention is the VSA FastVideo distilled it with
+    /// (`fastvideo_inference.json`: tile 128, sparsity 0.9, gated compression;
+    /// reference images join the dense prefix). Comfy runs it dense instead.
+    pub const fn fasth3_omni() -> Self {
+        let mut c = Self::h3_33b();
+        c.vsa_sparsity = Some(0.9);
+        c.vsa_tiling = vsa::VsaTiling::T128;
+        c.adaln = AdalnInput::Table(8);
+        c.pdd = Some(pdd::Pdd {
+            heads: 32,
+            steps: 8,
+        });
+        c.nvfp4_format = thinfer_core::backend::Nvfp4Format {
+            dynamic_act_scale: true,
+            hi_first: true,
+        };
         c
     }
 

@@ -15,7 +15,7 @@ use crate::nvrtc::Module;
 const SOURCE: &str = r#"
 #include <cuda_bf16.h>
 
-#define MAX_SEG 4
+#define MAX_SEG 16
 
 struct Seg { unsigned n; unsigned end[MAX_SEG]; unsigned long long a[MAX_SEG]; unsigned long long b[MAX_SEG]; };
 
@@ -67,20 +67,20 @@ extern "C" __global__ void __launch_bounds__(128) qk_norm_rope(
     const unsigned short* __restrict__ qkv, const unsigned short* __restrict__ qw,
     const unsigned short* __restrict__ kw, const unsigned short* __restrict__ freqs,
     unsigned short* __restrict__ q, unsigned short* __restrict__ k, unsigned short* __restrict__ v,
-    unsigned heads, unsigned rot_pairs, float eps, unsigned headwise)
+    unsigned heads, unsigned rot_pairs, float eps, unsigned headwise, unsigned q_only)
 {
     __shared__ float y[128];
     __shared__ float red[4];
     const unsigned row = blockIdx.x, h = blockIdx.y, c = threadIdx.x, D = blockDim.x;
     const size_t inner = (size_t)heads * D;
-    // Slab layout [q | k | v], or headwise [q_h | k_h | v_h] per head.
+    // Slab layout [q | k | v], or headwise [q_h | k_h | v_h] per head, or
+    // (q_only) the q projection alone.
     const size_t part = headwise ? D : inner;
-    const size_t src = (size_t)row * 3 * inner + (size_t)h * (headwise ? 3 * D : D) + c;
+    const size_t src = (size_t)row * (q_only ? 1 : 3) * inner + (size_t)h * (headwise ? 3 * D : D) + c;
     const size_t dst = (size_t)row * inner + (size_t)h * D + c;
-    v[dst] = qkv[src + 2 * part];
+    if (!q_only) v[dst] = qkv[src + 2 * part];
     const unsigned rot = 2 * rot_pairs;
-    #pragma unroll
-    for (int which = 0; which < 2; ++which) {
+    for (int which = 0; which < (q_only ? 1 : 2); ++which) {
         const float x = bf(qkv[src + which * part]);
         const float inv = rsqrtf(block_sum(x * x, red) / (float)D + eps);
         const unsigned short* gw = which ? kw : qw;
@@ -134,7 +134,7 @@ extern "C" __global__ void __launch_bounds__(256) silu_mul_fused(
 }
 "#;
 
-/// `struct Seg` by value.
+/// `struct Seg` by value (`MAX_SEG` in the source mirrors `MAX_SEGMENTS`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Seg {
@@ -218,6 +218,7 @@ impl ElementwiseKernels {
             }
             ElementwiseOp::QkNormRope {
                 headwise,
+                q_only,
                 qkv,
                 q_norm,
                 k_norm,
@@ -231,14 +232,15 @@ impl ElementwiseKernels {
                 rot_pairs,
                 eps,
             } => {
-                if !matches!(head_dim, 64 | 128) || 2 * rot_pairs > head_dim {
+                if !matches!(head_dim, 64 | 128) || 2 * rot_pairs > head_dim || (headwise && q_only)
+                {
                     return Ok(false);
                 }
                 let (mut qkv, mut qw, mut kw, mut freqs, mut q, mut k, mut v) =
                     (qkv, q_norm, k_norm, freqs, q, k, v);
-                let (mut heads_, mut rot_pairs, mut eps, mut hw) =
-                    (heads, rot_pairs, eps, headwise as u32);
-                let mut a: [*mut c_void; 11] = [
+                let (mut heads_, mut rot_pairs, mut eps, mut hw, mut qo) =
+                    (heads, rot_pairs, eps, headwise as u32, q_only as u32);
+                let mut a: [*mut c_void; 12] = [
                     (&raw mut qkv).cast(),
                     (&raw mut qw).cast(),
                     (&raw mut kw).cast(),
@@ -250,6 +252,7 @@ impl ElementwiseKernels {
                     (&raw mut rot_pairs).cast(),
                     (&raw mut eps).cast(),
                     (&raw mut hw).cast(),
+                    (&raw mut qo).cast(),
                 ];
                 self.module.launch(
                     self.qk_norm_rope,

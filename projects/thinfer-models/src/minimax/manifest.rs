@@ -37,6 +37,17 @@ const REPO_TURBO_LORA: &str = "lightx2v/Minimax-h3-Turbo";
 /// rank-16 AdaLN, block linears in calibrated NVFP4 (served as composites by
 /// `minimax::fasth3`). Two files: NVFP4 linears + the bf16/f32 rest.
 const REPO_FASTH3_TRIM: &str = "FastVideo/FastVideo-FastH3-Trim-8-Step-NVFP4";
+/// FastVideo FastH3-Omni: the 8-step distill of the Ref2VA (`transformer_ref`)
+/// checkpoint, all 50 blocks, NVFP4 linears in the Comfy layout, AdaLN as a
+/// `[1025, 8]` timestep table + rank-8 projections, PDD output heads.
+const REPO_FASTH3_OMNI: &str = "FastVideo/FastH3-Omni-NVFP4-QAD-Comfy";
+/// Qwen3-VL-32B vision tower (mmproj). H3's text encoder is byte-identical to
+/// stock Qwen3-VL-32B-Instruct (shard hashes match), so the stock mmproj is
+/// its vision half; BF16 is the checkpoint dtype, lossless.
+const REPO_VISION: &str = "unsloth/Qwen3-VL-32B-Instruct-GGUF";
+/// FastVideo's NVFP4 video decoders (QAD, opt-in): `quality-36L` and the
+/// depth-cut `fast-8L`, packed `decoder-nvfp4.safetensors` each.
+const REPO_VAE_NVFP4: &str = "FastVideo/FastH3-NVFP4-VAE-Decoder";
 /// Fallback 4-step distillation if the lightx2v preview does not hold up.
 /// Native `blocks.*` naming, 259 pairs (51 of them AdaLN, which we ignore since
 /// the modulation table is precomputed). ckpt850-EMA is the author's pick.
@@ -74,7 +85,25 @@ pub mod role {
     pub const FASTH3_TRIM_NVFP4: &str = "dit/fasth3-trim-nvfp4";
     /// FastH3-Trim norms, embedders, refiner, rank-16 AdaLN (1.9G).
     pub const FASTH3_TRIM_REST: &str = "dit/fasth3-trim-rest";
+    /// FastH3-Omni reference DiT, one Comfy NVFP4 file (12.8G).
+    pub const FASTH3_OMNI: &str = "dit/fasth3-omni";
+    /// Qwen3-VL-32B vision tower, BF16 mmproj (1.2G).
+    pub const VISION: &str = "encoder/qwen3vl-vision";
+    /// NVFP4 video decoder, 36 layers (1.4G). Opt-in, Blackwell.
+    pub const VAE_DECODER_NVFP4: &str = "vae/decoder-nvfp4";
+    /// NVFP4 video decoder, 8 layers (0.3G). Opt-in, Blackwell.
+    pub const VAE_DECODER_NVFP4_FAST: &str = "vae/decoder-nvfp4-fast";
 }
+
+/// Roles a FastH3-Omni reference-image generate (Ref2VA) needs.
+pub const RUNTIME_ROLES_REF2VA_FASTH3_OMNI: &[&str] = &[
+    role::ENCODER_GGUF,
+    role::VISION,
+    role::TOKENIZER,
+    role::FASTH3_OMNI,
+    role::VIDEO_VAE,
+    role::AUDIO_VAE,
+];
 
 /// FastH3's trained DMD rungs (`fastvideo_inference.json`
 /// `dmd_denoising_steps`): 8 forwards, Euler on `shift(rung / 1000)`.
@@ -179,6 +208,22 @@ pub static MANIFEST: ModelManifest = ModelManifest {
             ),
         ),
         (
+            role::FASTH3_OMNI,
+            FileRef::new(
+                REPO_FASTH3_OMNI,
+                "fasth3_omniref_qad_nvfp4_comfy.safetensors",
+            ),
+        ),
+        (role::VISION, FileRef::new(REPO_VISION, "mmproj-BF16.gguf")),
+        (
+            role::VAE_DECODER_NVFP4,
+            FileRef::new(REPO_VAE_NVFP4, "quality-36L/decoder-nvfp4.safetensors"),
+        ),
+        (
+            role::VAE_DECODER_NVFP4_FAST,
+            FileRef::new(REPO_VAE_NVFP4, "fast-8L/decoder-nvfp4.safetensors"),
+        ),
+        (
             role::TURBO_LORA_ALT,
             FileRef::new(
                 REPO_TURBO_LORA_ALT,
@@ -198,6 +243,7 @@ mod tests {
             .iter()
             .chain(RUNTIME_ROLES_T2VA_Q8)
             .chain(RUNTIME_ROLES_T2VA_FASTH3_TRIM)
+            .chain(RUNTIME_ROLES_REF2VA_FASTH3_OMNI)
         {
             assert!(MANIFEST.get(r).is_some(), "missing role {r}");
         }

@@ -120,6 +120,50 @@ pub enum KeyframeAnchor {
     Last,
 }
 
+/// One clean video-latent conditioning block in the packed sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Condition {
+    /// FL2VA: a frame of the target canvas pinned at a clip end.
+    Keyframe(KeyframeAnchor),
+    /// Ref2VA: an image at its own latent size, on its own aspect-normalized
+    /// spatial grid, holding ONE rotary time slot (references take slots
+    /// `L, L + 1, ...` after the `L` text rows and the target starts after).
+    Reference {
+        latent_height: usize,
+        latent_width: usize,
+    },
+}
+
+impl Condition {
+    /// Packed rows this block adds at `patch`, given the target's latent size.
+    pub fn rows(&self, patch: (usize, usize, usize), target: (usize, usize)) -> usize {
+        let (h, w) = match *self {
+            Condition::Keyframe(_) => target,
+            Condition::Reference {
+                latent_height,
+                latent_width,
+            } => (latent_height, latent_width),
+        };
+        (h / patch.1) * (w / patch.2)
+    }
+}
+
+/// An aspect-normalized `(h, w)` patch grid, row-major (`np.meshgrid(...,
+/// indexing="ij")`).
+fn frame_position_grid(
+    latent_height: usize,
+    latent_width: usize,
+    patch: (usize, usize, usize),
+) -> Vec<[f64; 2]> {
+    let sqrt_area = ((latent_height * latent_width) as f64).sqrt();
+    let height_grid = spatial_position_grid(latent_height, patch.1, sqrt_area);
+    let width_grid = spatial_position_grid(latent_width, patch.2, sqrt_area);
+    height_grid
+        .iter()
+        .flat_map(|&h| width_grid.iter().map(move |&w| [h, w]))
+        .collect()
+}
+
 /// The structural description of one packed sequence.
 #[derive(Clone, Debug)]
 pub struct PackedSequence {
@@ -233,10 +277,15 @@ fn temporal_position_span(num_latent_frames: usize) -> f64 {
         .sum()
 }
 
-/// Build the `[text | keyframe conditions | target audio | target video]` layout.
+/// Build the `[text | target audio | conditions | target video]` layout.
+///
+/// The reference orders conditions before the target audio; attention is
+/// full and every row carries its own rotary position, tag and timestep, so
+/// the row ORDER is free, and this one keeps all video rows (conditions then
+/// target) contiguous for the video input projection.
 ///
 /// `text_token_tags` is the modality tag of every text row: text is tagged
-/// [`TAG_TEXT`], except the rows of a keyframe's vision block, which H3 tags
+/// [`TAG_TEXT`], except the rows of an image's vision block, which H3 tags
 /// [`TAG_VIDEO`]. That tag is what the AdaLN modulation keys off.
 pub fn build_packed_sequence(
     text_token_tags: &[i32],
@@ -245,56 +294,68 @@ pub fn build_packed_sequence(
     latent_width: usize,
     num_audio_latents: usize,
     patch: (usize, usize, usize),
-    keyframe_anchors: &[KeyframeAnchor],
+    conditions: &[Condition],
 ) -> PackedSequence {
     let (_, ph, pw) = patch;
     let rows_per_frame = (latent_height / ph) * (latent_width / pw);
     let num_text = text_token_tags.len();
-    let num_condition_rows = keyframe_anchors.len() * rows_per_frame;
+    let target = (latent_height, latent_width);
+    let num_condition_rows: usize = conditions.iter().map(|c| c.rows(patch, target)).sum();
     let num_audio_rows = num_audio_latents * AUDIO_CHANNELS;
     let num_video_rows = num_latent_frames * rows_per_frame;
     let seq_len = num_text + num_condition_rows + num_audio_rows + num_video_rows;
 
-    let condition_start = num_text;
-    let audio_start = condition_start + num_condition_rows;
-    let video_start = audio_start + num_audio_rows;
+    let audio_start = num_text;
+    let condition_start = audio_start + num_audio_rows;
+    let video_start = condition_start + num_condition_rows;
 
     let mut pos = vec![[0.0f64; 3]; seq_len];
 
     // Text rows sit on the time axis at their row index, so text length shifts
-    // the whole media clock: media time starts at `num_text`.
+    // the whole media clock: media time starts at `num_text`, plus one slot
+    // per reference image.
     for (i, p) in pos.iter_mut().take(num_text).enumerate() {
         p[0] = i as f64;
     }
-
-    let sqrt_area = ((latent_height * latent_width) as f64).sqrt();
-    let height_grid = spatial_position_grid(latent_height, ph, sqrt_area);
-    let width_grid = spatial_position_grid(latent_width, pw, sqrt_area);
-    // Row-major over (h, w), matching `np.meshgrid(..., indexing="ij")`.
-    let frame_grid: Vec<[f64; 2]> = height_grid
+    let references = conditions
         .iter()
-        .flat_map(|&h| width_grid.iter().map(move |&w| [h, w]))
-        .collect();
+        .filter(|c| matches!(c, Condition::Reference { .. }))
+        .count();
+    let origin = (num_text + references) as f64;
+
+    let frame_grid = frame_position_grid(latent_height, latent_width, patch);
     debug_assert_eq!(frame_grid.len(), rows_per_frame);
 
-    for (index, anchor) in keyframe_anchors.iter().enumerate() {
-        let anchor_time = match anchor {
-            KeyframeAnchor::First => num_text as f64,
-            KeyframeAnchor::Last => {
-                num_text as f64 + temporal_position_span(num_latent_frames) - ROPE_FRAME_RESCALE
+    let (mut lo, mut slot) = (condition_start, num_text as f64);
+    for condition in conditions {
+        let (time, grid) = match *condition {
+            Condition::Keyframe(KeyframeAnchor::First) => (origin, frame_grid.clone()),
+            Condition::Keyframe(KeyframeAnchor::Last) => (
+                origin + temporal_position_span(num_latent_frames) - ROPE_FRAME_RESCALE,
+                frame_grid.clone(),
+            ),
+            Condition::Reference {
+                latent_height,
+                latent_width,
+            } => {
+                slot += 1.0;
+                (
+                    slot - 1.0,
+                    frame_position_grid(latent_height, latent_width, patch),
+                )
             }
         };
-        let lo = condition_start + index * rows_per_frame;
-        for (row, g) in frame_grid.iter().enumerate() {
-            pos[lo + row] = [anchor_time, g[0], g[1]];
+        for (row, g) in grid.iter().enumerate() {
+            pos[lo + row] = [time, g[0], g[1]];
         }
+        lo += grid.len();
     }
 
     // Audio rows are channel-major and share the video's rotary clock: one unit
     // per latent at 40 latents/s equals 24 fps * 5/3. They carry no height
     // coordinate and are pinned to the two extremes of the width grid.
-    let w_first = *width_grid.first().unwrap_or(&0.0);
-    let w_last = *width_grid.last().unwrap_or(&0.0);
+    let w_first = frame_grid.first().map_or(0.0, |g| g[1]);
+    let w_last = frame_grid.last().map_or(0.0, |g| g[1]);
     for i in 0..num_audio_rows {
         let latent = i % num_audio_latents.max(1);
         let w = if i < num_audio_latents {
@@ -302,10 +363,10 @@ pub fn build_packed_sequence(
         } else {
             w_last
         };
-        pos[audio_start + i] = [num_text as f64 + latent as f64, 0.0, w];
+        pos[audio_start + i] = [origin + latent as f64, 0.0, w];
     }
 
-    let time_grid = temporal_position_grid(num_latent_frames, num_text as f64);
+    let time_grid = temporal_position_grid(num_latent_frames, origin);
     for (f, &t) in time_grid.iter().enumerate() {
         let base = video_start + f * rows_per_frame;
         for (row, g) in frame_grid.iter().enumerate() {
@@ -313,10 +374,8 @@ pub fn build_packed_sequence(
         }
     }
 
-    let video_indices: Vec<u32> = (condition_start as u32..audio_start as u32)
-        .chain(video_start as u32..seq_len as u32)
-        .collect();
-    let audio_indices: Vec<u32> = (audio_start as u32..video_start as u32).collect();
+    let video_indices: Vec<u32> = (condition_start as u32..seq_len as u32).collect();
+    let audio_indices: Vec<u32> = (audio_start as u32..condition_start as u32).collect();
     let text_indices: Vec<u32> = (0..num_text as u32).collect();
 
     let mut token_tags = vec![TAG_VIDEO; seq_len];
@@ -529,7 +588,7 @@ mod tests {
         let fit = |h: usize, w: usize| max_fitting_frames(&cfg, 256, h / 16, w / 16, 124, 16384);
         assert_eq!(fit(480, 832), Some(124));
         let hd = fit(768, 1344).unwrap();
-        assert!(hd < 124 && hd >= 22, "1344x768 fits {hd} frames");
+        assert!((22..124).contains(&hd), "1344x768 fits {hd} frames");
     }
 
     #[test]

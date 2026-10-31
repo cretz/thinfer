@@ -19,3 +19,10 @@ pub mod rope_embedder;
 pub mod seq;
 pub mod vae_taehv;
 pub mod vae_tiling;
+
+/// Cooperative cancellation hook. Returns `true` when the caller wants the
+/// in-flight generate to stop; the denoise loops poll it at step (and, where a
+/// step is long, block) boundaries and bail with their `Cancelled` error.
+/// `None` (CLI default) never cancels. The server passes a closure backed by
+/// the job's cancel flag.
+pub type Cancel<'a> = Option<&'a dyn Fn() -> bool>;

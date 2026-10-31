@@ -1,6 +1,7 @@
 // thinfer-native: desktop/native impls of thinfer-core IO traits.
 
 pub mod cache;
+pub mod prefetch;
 pub mod sources;
 pub mod tokenizer;
 
@@ -11,27 +12,31 @@ use thinfer_core::weight::{FileOpener, WeightReader};
 
 /// `FileOpener` backed by a single mmap'd view of the file. Weight bytes live
 /// in the OS page cache, not our process heap: RSS scales with working set,
-/// not model size. `open()` clones the `Arc<Mmap>` and is effectively free.
-/// `read_at` is a memcpy from the mapped region.
+/// not model size. `open()` clones the `Arc`s and is effectively free.
+/// `read_at` is a memcpy from the mapped region for small reads and a
+/// positioned file read for large ones (see [`DIRECT_READ_MIN`]).
 pub struct MmapFileOpener {
     mmap: Arc<memmap2::Mmap>,
+    file: Arc<std::fs::File>,
 }
 
 impl MmapFileOpener {
     pub async fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mmap = tokio::task::spawn_blocking(move || {
+        let (mmap, file) = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&path)?;
             // SAFETY: We hold no claim that the underlying file is immutable
             // for the lifetime of the mmap; concurrent external truncate or
             // rewrite is UB. Same assumption as safetensors's own mmap loaders
             // and pytorch's safetensors mmap path. Out of scope to defend.
-            unsafe { memmap2::Mmap::map(&file) }
+            let mmap = unsafe { memmap2::Mmap::map(&file) }?;
+            io::Result::Ok((mmap, file))
         })
         .await
         .expect("mmap blocking task panicked")?;
         Ok(Self {
             mmap: Arc::new(mmap),
+            file: Arc::new(file),
         })
     }
 }
@@ -42,12 +47,39 @@ impl FileOpener for MmapFileOpener {
     async fn open(&self) -> Result<Self::Reader, Self::Error> {
         Ok(MmapFile {
             mmap: Arc::clone(&self.mmap),
+            file: Arc::clone(&self.file),
         })
     }
 }
 
+/// Reads at least this large bypass the mapping. A cold mmap copy pages in
+/// fault by fault (measured ~1 GB/s on an NVMe that serves 3+ GB/s to plain
+/// 16 MiB reads); a positioned read hands the OS the whole range as one
+/// request. Warm (page-cached) bytes cost the same either way.
+const DIRECT_READ_MIN: usize = 1 << 20;
+
 pub struct MmapFile {
     mmap: Arc<memmap2::Mmap>,
+    file: Arc<std::fs::File>,
+}
+
+/// Fill `dst` from `file` at `offset` without touching a shared file cursor.
+fn read_exact_at(file: &std::fs::File, mut offset: u64, mut dst: &mut [u8]) -> io::Result<()> {
+    while !dst.is_empty() {
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(file, dst, offset)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(file, dst, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read past file end",
+            ));
+        }
+        offset += n as u64;
+        dst = &mut dst[n..];
+    }
+    Ok(())
 }
 
 impl WeightReader for MmapFile {
@@ -65,6 +97,9 @@ impl WeightReader for MmapFile {
                 io::ErrorKind::UnexpectedEof,
                 "read past mmap end",
             ));
+        }
+        if dst.len() >= DIRECT_READ_MIN {
+            return read_exact_at(&self.file, offset, dst);
         }
         dst.copy_from_slice(&self.mmap[off..end]);
         Ok(())

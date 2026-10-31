@@ -297,9 +297,9 @@ pub trait Accelerator: Send + Sync {
         Ok(false)
     }
 
-    /// Cheap host-side precheck for [`Self::vsa`]; `Some(scratch bytes)` =
+    /// Cheap host-side precheck for [`Self::vsa`]; `Some(scratch sizes)` =
     /// accepted.
-    fn accepts_vsa(&self, _s: &VsaShape) -> Option<u64> {
+    fn accepts_vsa(&self, _s: &VsaShape) -> Option<VsaScratch> {
         None
     }
 
@@ -307,6 +307,11 @@ pub trait Accelerator: Send + Sync {
     /// VSA) over bf16 `[rows, H, D]` Q/K/V/gate/out; see [`VsaShape`]. Inputs
     /// must be complete in VRAM (the caller drained the GPU).
     fn vsa(&self, _s: &VsaShape, _a: &VsaAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// One part of [`Self::vsa`] (see [`VsaPart`]). Enqueued only.
+    fn vsa_part(&self, _s: &VsaShape, _part: VsaPart, _a: &VsaAddrs) -> Result<bool, String> {
         Ok(false)
     }
 
@@ -363,8 +368,11 @@ pub struct TileAttnAddrs {
 }
 
 /// Row segments for the per-segment ops in [`ElementwiseOp`]: rows
-/// `[end[i-1], end[i])` read the i-th `a` / `b` vectors.
-pub const MAX_SEGMENTS: usize = 4;
+/// `[end[i-1], end[i])` read the i-th `a` / `b` vectors. A reference-image
+/// request splits its text span by tag (labels vs vision blocks) and adds a
+/// pinned-timestep segment per block, so this leaves room for several.
+/// (The CUDA kernels' `MAX_SEG` must match.)
+pub const MAX_SEGMENTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RowSegments {
@@ -397,6 +405,9 @@ pub enum ElementwiseOp {
     /// or `headwise`: `[q_h | k_h | v_h]` per head.
     QkNormRope {
         headwise: bool,
+        /// `qkv` holds only the q projection (`[rows, heads * head_dim]`,
+        /// slab layout); `k` / `v` / `k_norm` are ignored.
+        q_only: bool,
         qkv: u64,
         q_norm: u64,
         k_norm: u64,
@@ -439,14 +450,54 @@ pub struct VsaShape {
     pub rows: u32,
     pub heads: u32,
     pub head_dim: u32,
+    /// Rows per tile (64 or 128).
+    pub tile: u32,
+    /// QK^T in INT8 (K smoothed by its per-head mean, per-tile scales; P.V
+    /// stays bf16): SageAttention-style, not bit-identical to the bf16 path.
+    pub int8_qk: bool,
     pub n_tiles: u32,
     pub n_prefix: u32,
     pub topk: u32,
     pub scale: f32,
+    /// Most tiles one [`VsaPart::Pool`] / [`VsaPart::Attend`] slab covers
+    /// (sizes the INT8 Q); `n_tiles` for a whole-sequence call.
+    pub slab_tiles: u32,
+}
+
+/// A run of whole tiles whose rows are the contiguous packed rows starting
+/// at `row0`: the query side's unit when the forward runs in parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VsaSlab {
+    pub tile0: u32,
+    pub tiles: u32,
+    pub row0: u32,
+}
+
+impl VsaSlab {
+    /// Every tile, rows from 0.
+    pub fn whole(s: &VsaShape) -> Self {
+        Self {
+            tile0: 0,
+            tiles: s.n_tiles,
+            row0: 0,
+        }
+    }
+}
+
+/// [`Accelerator::vsa`] in parts, for a caller that never holds the whole
+/// sequence's queries: `Pool` each slab as its rows exist (`q` = the slab's
+/// rows, `k` / `v` every row), `Select` once all are pooled (tile scores,
+/// key-tile lists, INT8 K), then `Attend` each slab (`q` / `gate` / `out` =
+/// the slab's rows). The tables persist in `scratch` between parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VsaPart {
+    Pool(VsaSlab),
+    Select,
+    Attend(VsaSlab),
 }
 
 /// Device addresses for [`Accelerator::vsa`]. `gate == 0` = no compression
-/// branch. `geometry` = `n_tiles * 64` u32 row ids then `n_tiles` u32 sizes.
+/// branch. `geometry` = `n_tiles * tile` u32 row ids then `n_tiles` u32 sizes.
 #[derive(Clone, Copy, Debug)]
 pub struct VsaAddrs {
     pub q: u64,
@@ -456,6 +507,18 @@ pub struct VsaAddrs {
     pub out: u64,
     pub geometry: u64,
     pub scratch: u64,
+    /// INT8 path only ([`VsaShape::int8_qk`]): the quantized Q/K region,
+    /// [`VsaScratch::qk_i8`] bytes. Unused (0) on the bf16 path.
+    pub qk_i8: u64,
+}
+
+/// Scratch [`Accelerator::vsa`] needs, in bytes: `scratch` for its tables and
+/// `qk_i8` for the INT8 path's quantized Q/K (0 on the bf16 path). Separate
+/// so the caller can place the large `qk_i8` in memory dead during the call.
+#[derive(Clone, Copy, Debug)]
+pub struct VsaScratch {
+    pub scratch: u64,
+    pub qk_i8: u64,
 }
 
 /// Device addresses + shape for [`Accelerator::gemm_nvfp4`].
@@ -468,6 +531,55 @@ pub struct GemmNvfp4Addrs {
     pub m: u32,
     pub n: u32,
     pub k: u32,
+    /// Optional low-rank term added in the epilogue (`lora.rank == 0` =
+    /// none): `out += mid @ bt`, `mid` bf16 `[m, rank]`, `bt` bf16 `[rank,
+    /// n]` (a runtime adapter's second factor, pre-transposed).
+    pub lora: Nvfp4Lora,
+    pub format: Nvfp4Format,
+    /// Multiply only weight rows `[base, base + n)` of a composite with
+    /// `total` rows (`base` a multiple of 128); `None` = the whole composite
+    /// (`n` rows). The low-rank `bt` is then `[rank, total]`, read at `base`.
+    pub rows: Option<Nvfp4Rows>,
+}
+
+/// A 128-row-aligned weight-row range of an NVFP4 composite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nvfp4Rows {
+    pub base: u32,
+    pub total: u32,
+}
+
+/// How a checkpoint's NVFP4 weights expect their activations quantized.
+/// Default = FastVideo / FlashInfer: low nibble = even `k`, the composite's
+/// static `input_sf`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Nvfp4Format {
+    /// Activation global scale from this call's `amax(|a|)` (Comfy PTQ:
+    /// `scale = bf16(amax / (448 * 6))`) instead of the static `input_sf`.
+    pub dynamic_act_scale: bool,
+    /// Weight codes packed HIGH nibble = even `k` (Comfy). The activations
+    /// are packed the same way, which permutes `k` within each byte on both
+    /// operands and leaves the product (and every 16-wide scale block) as is.
+    pub hi_first: bool,
+}
+
+/// The low-rank epilogue term of [`GemmNvfp4Addrs`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Nvfp4Lora {
+    pub mid: u64,
+    pub bt: u64,
+    pub rank: u32,
+}
+
+/// Largest adapter rank [`Accelerator::gemm_nvfp4`] fuses (the term's tiles
+/// reuse the main loop's shared memory); see [`nvfp4_fuses_lora_rank`].
+pub const NVFP4_FUSED_LORA_MAX_RANK: u32 = 64;
+
+/// Whether [`Accelerator::gemm_nvfp4`] takes a low-rank term of this rank:
+/// whole k16 MMA steps up to [`NVFP4_FUSED_LORA_MAX_RANK`]. Other adapters run
+/// as separate GEMMs.
+pub fn nvfp4_fuses_lora_rank(rank: u32) -> bool {
+    rank > 0 && rank.is_multiple_of(16) && rank <= NVFP4_FUSED_LORA_MAX_RANK
 }
 
 /// Device addresses + launch shape for [`Accelerator::gemm`] (same roles as
@@ -483,6 +595,25 @@ pub struct GemmAddrs {
     pub m: u32,
     pub n: u32,
     pub k: u32,
+    pub epilogue: GemmEpilogue,
+}
+
+/// Fused GEMM epilogue on device addresses, each part optional (0 = absent):
+/// `out = residual + gate[n] * (acc + bias[n])`, one rounding. `bias` and
+/// `gate` are per-output-column vectors, `residual` is `[m, n]` like `out` and
+/// may alias it (an in-place accumulate). bf16-output GEMMs only; any other
+/// output type declines a non-empty epilogue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GemmEpilogue {
+    pub bias: u64,
+    pub residual: u64,
+    pub gate: u64,
+}
+
+impl GemmEpilogue {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Device addresses for [`Accelerator::sdpa_f16`] (same roles as `SdpaBufs`).

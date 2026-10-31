@@ -148,6 +148,11 @@ fn block_elementwise_ops_match_cpu_reference() {
             out(ROWS * inner),
             out(ROWS * ffn),
         );
+        // The q projection alone (q-only mode reads `[rows, inner]`).
+        let q_part: Vec<f32> = (0..ROWS)
+            .flat_map(|r| qkv[r * 3 * inner..r * 3 * inner + inner].to_vec())
+            .collect();
+        let (q_partb, q_only) = (upload(&q_part), out(ROWS * inner));
         backend
             .submit(backend.create_command_encoder())
             .await
@@ -174,6 +179,7 @@ fn block_elementwise_ops_match_cpu_reference() {
             },
             ElementwiseOp::QkNormRope {
                 headwise: false,
+                q_only: false,
                 qkv: addr(&qkvb),
                 q_norm: addr(&qwb),
                 k_norm: addr(&kwb),
@@ -181,6 +187,22 @@ fn block_elementwise_ops_match_cpu_reference() {
                 q: addr(&q),
                 k: addr(&k),
                 v: addr(&v),
+                rows: ROWS as u32,
+                heads: HEADS as u32,
+                head_dim: HD as u32,
+                rot_pairs: ROT_PAIRS as u32,
+                eps: EPS,
+            },
+            ElementwiseOp::QkNormRope {
+                headwise: false,
+                q_only: true,
+                qkv: addr(&q_partb),
+                q_norm: addr(&qwb),
+                k_norm: 0,
+                freqs: addr(&fb),
+                q: addr(&q_only),
+                k: 0,
+                v: 0,
                 rows: ROWS as u32,
                 heads: HEADS as u32,
                 head_dim: HD as u32,
@@ -267,6 +289,11 @@ fn block_elementwise_ops_match_cpu_reference() {
             .flat_map(|r| qkv[r * 3 * inner + 2 * inner..r * 3 * inner + 3 * inner].to_vec())
             .collect();
         assert_eq!(read(v).await, want, "v must be an exact copy");
+        assert_eq!(
+            read(q_only).await,
+            read(q).await,
+            "q-only norm+rope must match the fused qkv's q bit for bit"
+        );
 
         // SiluMulFused.
         let want: Vec<f32> = (0..ROWS * ffn)

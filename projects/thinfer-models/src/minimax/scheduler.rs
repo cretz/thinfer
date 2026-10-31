@@ -222,6 +222,15 @@ impl JointSchedule {
         })
     }
 
+    /// A PDD checkpoint's grid ([`super::pdd::Pdd::sigmas`]) at H3's video
+    /// and audio shifts.
+    pub fn from_pdd(pdd: &super::pdd::Pdd) -> Result<Self, SchedulerError> {
+        Ok(Self {
+            video: Scheduler::from_sigmas(pdd.sigmas(super::SIGMA_SHIFT_VIDEO as f64))?,
+            audio: Scheduler::from_sigmas(pdd.sigmas(super::SIGMA_SHIFT_AUDIO as f64))?,
+        })
+    }
+
     /// A distilled checkpoint's rungs on both modalities, each with its own
     /// shift (see [`Scheduler::from_rungs`]).
     pub fn from_rungs(

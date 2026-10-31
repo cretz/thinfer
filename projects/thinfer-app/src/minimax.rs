@@ -28,14 +28,13 @@
 
 use std::sync::Arc;
 
-use thinfer_core::backend::WgpuBackend;
+use thinfer_core::backend::{Backend, WgpuBackend};
 use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::format::safetensors::SafetensorsSource;
 use thinfer_core::format::union::UnionSource;
 use thinfer_core::ops::{ActDtype, WeightDtype};
 use thinfer_core::quant::QuantKind;
 use thinfer_core::residency::WeightResidency;
-use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::weight::WeightSource;
 use thinfer_core::workspace::Workspace;
 use thinfer_models::common::bigvgan::read_weight_f32;
@@ -52,17 +51,17 @@ use thinfer_models::minimax::manifest as mmf;
 use thinfer_models::minimax::manifest::role;
 use thinfer_models::minimax::packing;
 use thinfer_models::minimax::pipeline::{
-    DenoisePlan, Latents, MAX_PACKED_ROWS, audio_rows_to_latents, denoise,
-    upload_modulation_tables, video_rows_to_latents,
+    DenoisePlan, LONG_SEQUENCE_WEIGHT_BUDGET, Latents, MAX_PACKED_ROWS, audio_rows_to_latents,
+    denoise, max_packed_rows, upload_modulation_tables, video_rows_to_latents,
 };
 use thinfer_models::minimax::scheduler::JointSchedule;
 use thinfer_models::minimax::text_encoder::{
-    EncoderPipelines, MiniMaxTextEncoder, config as enc_config, encoder_cfgs,
-    register_handles as register_encoder,
+    EncoderPipelines, ImageRows, MiniMaxTextEncoder, config as enc_config, encoder_cfgs,
+    encoder_cfgs_long, register_handles as register_encoder,
 };
 use thinfer_models::minimax::video_vae::{
-    DecoderPipelines, TilePolicy, VideoVaeConfig, decode, load_consts,
-    register_handles as register_vae,
+    DecodedTokens, DecoderPipelines, PixelBlock, TilePolicy, VideoVaeConfig, decode_tokens,
+    load_consts, register_handles as register_vae,
 };
 use thinfer_models::wan::pipeline::WanVideo;
 use thinfer_native::MmapFileOpener;
@@ -71,7 +70,7 @@ use thinfer_native::tokenizer::HfTokenizer;
 use crate::config::{ResidencyBudget, random_seed};
 use crate::download::resolve_role;
 use crate::executor::BytesOpener;
-use crate::model::VideoModelId;
+use crate::minimax_ref;
 use crate::progress::{ProgressSink, Stage};
 use crate::request::{JobSummary, VideoFormat, VideoRequest};
 
@@ -97,14 +96,21 @@ pub async fn run(
     req: &VideoRequest,
     sink: &dyn ProgressSink,
 ) -> Result<JobSummary, String> {
-    let plan_meta = req.resolve()?;
+    let fasth3 = req.model.is_fasth3();
+    // FastH3's NVFP4 block runs row-chunked on the accelerator, which lifts the
+    // packed-row limit; the backend block (base H3, or no accelerator) keeps
+    // the old one. A blank clip length is capped to it.
+    let row_limit = max_packed_rows(fasth3 && backend.accelerator().is_some());
+    let plan_meta = req.resolve_minimax(row_limit)?;
     for w in &plan_meta.warnings {
         tracing::warn!(target: thinfer_core::trace::DIAG, "{w}");
         sink.note(w);
     }
     let manifest = req.model.manifest();
-    let fasth3 = req.model == VideoModelId::Fasth3Trim;
-    let cfg = req.model.minimax_dit_config();
+    let cfg = DitConfig {
+        vsa_int8_qk: req.attn == crate::model::AttnPrecision::Int8,
+        ..req.model.minimax_dit_config()
+    };
     let vae_cfg = VideoVaeConfig::h3();
 
     // --- geometry ---
@@ -143,25 +149,41 @@ pub async fn run(
     let tokenizer = HfTokenizer::from_path(&tok_path)
         .await
         .map_err(|e| format!("load tokenizer {}: {e:?}", tok_path.display()))?;
-    let ids = tokenizer
-        .encode(prompt, false)
-        .map_err(|e| format!("tokenize: {e:?}"))?;
-    if ids.is_empty() {
+    // Reference images (FastH3-Omni): each adds a labelled vision block to the
+    // prompt and one merged token per 32x32 pixels, and as many DiT rows.
+    if !req.ref_images.is_empty() && cfg.pdd.is_none() {
+        return Err(format!("{} does not take reference images", req.model));
+    }
+    let refs = req
+        .ref_images
+        .iter()
+        .map(|b| minimax_ref::prepare(&b.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ref_tokens: Vec<usize> = refs
+        .iter()
+        .map(|r| (r.height / 32) * (r.width / 32))
+        .collect();
+    let prompt_in = minimax_ref::assemble(&tokenizer, prompt, &ref_tokens)?;
+    let ids = prompt_in.ids;
+    if ids.len() == ref_tokens.iter().map(|n| n + 2).sum::<usize>() {
         return Err("empty prompt produced no tokens".into());
     }
     let num_text = ids.len();
 
     // Refuse a canvas we cannot run BEFORE loading 13.6 GiB of conditioner.
-    let rows = packing::sequence_rows(&cfg, num_text, latent_frames, lat_h, lat_w, audio_latents);
-    if rows > MAX_PACKED_ROWS {
+    let rows = packing::sequence_rows(&cfg, num_text, latent_frames, lat_h, lat_w, audio_latents)
+        + ref_tokens.iter().sum::<usize>();
+    if rows > row_limit {
         return Err(format!(
-            "{width}x{height} at {frames} frames packs {rows} rows, over the {MAX_PACKED_ROWS}-row \
+            "{width}x{height} at {frames} frames packs {rows} rows, over the {row_limit}-row \
              limit: one block's activations would not fit. Reduce the resolution or the duration."
         ));
     }
 
     // FastH3 runs its trained rungs; the base runs `steps` turbo evaluations.
-    let steps = if fasth3 {
+    let steps = if let Some(pdd) = cfg.pdd {
+        pdd.steps
+    } else if fasth3 {
         mmf::FASTH3_RUNGS.len()
     } else {
         req.steps.max(1) as usize
@@ -184,8 +206,37 @@ pub async fn run(
         frames as f32 / FPS as f32,
     ));
 
+    // The conditioner leaves the disk mostly idle: warm the DiT's files (then
+    // the video VAE's) in the page cache meanwhile, so the first denoise step
+    // does not read them cold. Skipped without the RAM to hold them.
+    let dit_roles: &[&str] = if cfg.pdd.is_some() {
+        &[role::FASTH3_OMNI]
+    } else if fasth3 {
+        &[role::FASTH3_TRIM_NVFP4, role::FASTH3_TRIM_REST]
+    } else {
+        &[role::DIT_GGUF_Q4_K_M, role::TURBO_LORA]
+    };
+    let mut warm = dit_roles
+        .iter()
+        .map(|r| resolve_role(manifest, r))
+        .collect::<Result<Vec<_>, _>>()?;
+    warm.push(vae_path.clone());
+    let _prefetch = thinfer_native::prefetch::Prefetch::start(warm);
+
     // === Phase A: the truncated Qwen3-VL-32B conditioner ===
     sink.stage(Stage::TextEncode);
+    let vision = if refs.is_empty() {
+        Vec::new()
+    } else {
+        sink.note(&format!("Encoding {} reference image(s)", refs.len()));
+        minimax_ref::vision_features(backend, manifest, budget, &refs).await?
+    };
+    let images: Vec<ImageRows<'_>> = prompt_in
+        .image_starts
+        .iter()
+        .zip(&vision)
+        .map(|(&start, vision)| ImageRows { start, vision })
+        .collect();
     let text = {
         let opener = open_mmap(&enc_path).await?;
         let src = GgufSource::open(opener)
@@ -194,7 +245,14 @@ pub async fn run(
         let residency = WeightResidency::new(src, budget);
         let handles =
             register_encoder(&residency, None).map_err(|e| format!("register encoder: {e:?}"))?;
-        let cfgs = encoder_cfgs();
+        // Reference images make the prompt thousands of tokens long: run it
+        // on bf16 acts (tensor-core matmuls and attention). Text alone keeps
+        // the f32 path.
+        let cfgs = if images.is_empty() {
+            encoder_cfgs()
+        } else {
+            encoder_cfgs_long()
+        };
         let pipelines = EncoderPipelines::compile(backend, &cfgs)
             .await
             .map_err(|e| format!("compile encoder pipelines: {e:?}"))?;
@@ -208,6 +266,7 @@ pub async fn run(
                 &handles,
                 residency.source(),
                 &ids,
+                &images,
             )
             .await
             .map_err(|e| format!("encoder forward: {e:?}"))?;
@@ -215,16 +274,42 @@ pub async fn run(
         debug_assert_eq!(out.hidden.len(), num_text * enc_config::HIDDEN);
         out.hidden
     };
+    drop(images);
+    drop(vision);
+    let (conditions, cond_rows) = if refs.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        minimax_ref::latent_conditions(backend, &cfg, &vae_path, budget, &refs).await?
+    };
+    drop(refs);
+    let cond = Conditioning {
+        text_tags: prompt_in.tags,
+        conditions,
+        cond_rows,
+    };
 
+    check_cancel(sink)?;
     // === Phase B: the DiT ===
     let dims = PlanDims {
-        num_text,
+        rows,
+        row_limit,
         latent_frames,
         lat_h,
         lat_w,
         audio_latents,
     };
-    let latents = if fasth3 {
+    let latents = if let Some(pdd) = cfg.pdd {
+        let file = open_st(&resolve_role(manifest, role::FASTH3_OMNI)?).await?;
+        let src = FastH3Source::omni_comfy(&cfg, file)
+            .map_err(|e| format!("map fasth3-omni checkpoint: {e:?}"))?;
+        let schedule =
+            JointSchedule::from_pdd(&pdd).map_err(|e| format!("fasth3-omni schedule: {e}"))?;
+        let users = user_adapters(req).await?;
+        run_dit_users(
+            backend, &cfg, src, users, schedule, dims, &text, &cond, seed, budget, sink,
+        )
+        .await?
+    } else if fasth3 {
         let nvfp4 = open_st(&resolve_role(manifest, role::FASTH3_TRIM_NVFP4)?).await?;
         let rest = open_st(&resolve_role(manifest, role::FASTH3_TRIM_REST)?).await?;
         let src = FastH3Source::new(&cfg, UnionSource::new(nvfp4, rest))
@@ -236,19 +321,10 @@ pub async fn run(
         )
         .map_err(|e| format!("fasth3 schedule: {e}"))?;
         let users = user_adapters(req).await?;
-        if users.is_empty() {
-            run_dit(
-                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, false,
-            )
-            .await?
-        } else {
-            let lora = lora_source(&cfg, users, sink).await?;
-            let src = MergedSource::new(src, lora);
-            run_dit(
-                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, false,
-            )
-            .await?
-        }
+        run_dit_users(
+            backend, &cfg, src, users, schedule, dims, &text, &cond, seed, budget, sink,
+        )
+        .await?
     } else {
         let opener = open_mmap(&resolve_role(manifest, role::DIT_GGUF_Q4_K_M)?).await?;
         let base = GgufSource::open(opener)
@@ -267,7 +343,7 @@ pub async fn run(
                 .map_err(|e| format!("turbo lora: {e:?}"))?;
             let src = MergedSource::new(base, lora);
             run_dit(
-                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, true,
+                backend, &cfg, src, schedule, dims, &text, &cond, seed, budget, sink, true,
             )
             .await?
         } else {
@@ -286,95 +362,65 @@ pub async fn run(
             .collect();
             let src = MergedSource::new(base, lora_source(&cfg, adapters, sink).await?);
             run_dit(
-                backend, &cfg, src, schedule, dims, &text, seed, budget, sink, true,
+                backend, &cfg, src, schedule, dims, &text, &cond, seed, budget, sink, true,
             )
             .await?
         }
     };
     drop(text);
 
+    check_cancel(sink)?;
     // === Phase C: video VAE (a 36-layer ViT, tiled) ===
     sink.stage(Stage::VaeDecode);
-    let pixels = {
-        let src = open_st(&vae_path).await?;
-        let residency = WeightResidency::new(src, budget);
-        let handles =
-            register_vae(&vae_cfg, &residency).map_err(|e| format!("register video vae: {e:?}"))?;
-        let pipelines = DecoderPipelines::compile(backend)
-            .await
-            .map_err(|e| format!("compile video vae pipelines: {e:?}"))?;
-        let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
-        let (mean, std) = {
-            let read = |id: &'static str| {
-                read_weight_f32(backend, &residency, id, vae_cfg.latent_channels)
-            };
-            (
-                read("latents_mean")
-                    .await
-                    .map_err(|e| format!("read latents_mean: {e:?}"))?,
-                read("latents_std")
-                    .await
-                    .map_err(|e| format!("read latents_std: {e:?}"))?,
-            )
-        };
-        tracing::debug!(
-            target: thinfer_core::trace::DIAG,
-            mean = ?&mean[..4],
-            std = ?&std[..4],
-            "minimax video latent stats",
-        );
-        let z = video_rows_to_latents(
-            &cfg,
-            &latents.video,
-            latent_frames,
-            lat_h,
-            lat_w,
-            &mean,
-            &std,
-        );
-        let consts = load_consts(&vae_cfg, backend, &residency, &handles)
-            .await
-            .map_err(|e| format!("read register/mask tokens: {e:?}"))?;
-        let out = decode(
-            &vae_cfg,
-            backend,
-            &pipelines,
-            &residency,
-            &ws,
-            &handles,
-            &consts,
-            TilePolicy::default(),
-            &z,
-            latent_frames,
-            lat_h,
-            lat_w,
-        )
-        .await
-        .map_err(|e| format!("video vae decode: {e:?}"))?;
-        residency.evict_all_and_free(&**backend);
-        out
-    };
-    if !pixels.data.iter().all(|v| v.is_finite()) {
-        return Err("video decode produced non-finite output".into());
+    let grid = (latent_frames, lat_h, lat_w);
+    // The NVFP4 decoders need the accelerator's FP4 GEMM (NVIDIA Blackwell);
+    // elsewhere the fp16 decoder runs instead (they share the latent space).
+    let fp4 = backend
+        .accelerator()
+        .and_then(|a| a.accepts_gemm_nvfp4(128, 2048, 2048))
+        .is_some();
+    let nvfp4 = req.vae.minimax_nvfp4().filter(|_| fp4);
+    if req.vae.minimax_nvfp4().is_some() && !fp4 {
+        sink.note("NVFP4 decoder needs an NVIDIA Blackwell GPU with CUDA; using the fp16 decoder");
     }
-
-    // The decoder emits more frames than were asked for whenever the frame
-    // count did not land on a whole chunk; trim to the requested clip.
-    let (h_px, w_px) = (pixels.height, pixels.width);
-    let f_px = pixels.frames.min(frames);
-    let planar = pixels.to_signed_planar();
-    let plane = pixels.frames * h_px * w_px;
-    let keep = f_px * h_px * w_px;
-    let video: Vec<f32> = (0..3)
-        .flat_map(|c| planar[c * plane..c * plane + keep].iter().copied())
-        .collect();
-    let wan_video = WanVideo {
-        frames: video,
-        num_frames: f_px,
-        height: h_px,
-        width: w_px,
+    let decoded = match nvfp4 {
+        None => {
+            let src = open_st(&vae_path).await?;
+            decode_video(backend, src, &vae_cfg, &cfg, &latents.video, grid, budget).await?
+        }
+        // FastVideo's NVFP4 decoder over the fp16 VAE (latent stats, mask
+        // token).
+        Some((role, layers)) => {
+            let vae_cfg = VideoVaeConfig {
+                decoder_layers: layers,
+                ..vae_cfg
+            };
+            let decoder = open_st(&resolve_role(manifest, role)?).await?;
+            let host = open_st(&vae_path).await?;
+            let src = FastH3Source::vae_decoder(&vae_cfg, UnionSource::new(decoder, host))
+                .map_err(|e| format!("map nvfp4 video decoder: {e:?}"))?;
+            decode_video(backend, src, &vae_cfg, &cfg, &latents.video, grid, budget).await?
+        }
     };
+    tracing::info!(target: thinfer_core::trace::DIAG, "video vae done");
+    // The stitch and the H.264 encode are host-only: they run on a worker
+    // while the audio VAE has the GPU.
+    let format = req.format;
+    let stitcher = std::thread::Builder::new()
+        .name("h3-vae-stitch".into())
+        .spawn(move || -> Result<_, String> {
+            let video = clip_frames(decoded.stitch(), frames)?;
+            tracing::info!(target: thinfer_core::trace::DIAG, "video frames ready");
+            let dims = (video.height, video.width, video.num_frames);
+            let clip = match format {
+                VideoFormat::Mp4 => Clip::H264(crate::codec::encode_h264(&video, FPS)?),
+                VideoFormat::PngFrames => Clip::Frames(video),
+            };
+            Ok((dims, clip))
+        })
+        .map_err(|e| format!("spawn vae stitch: {e}"))?;
 
+    check_cancel(sink)?;
     // === Phase D: audio VAE (the BigVGAN family we already have) ===
     let wav = if req.audio {
         sink.note("Decoding audio");
@@ -401,9 +447,15 @@ pub async fn run(
         None
     };
 
-    // --- Encode: H.264 video (+ optional AAC audio) -> MP4 ---
-    match req.format {
-        VideoFormat::Mp4 => {
+    tracing::info!(target: thinfer_core::trace::DIAG, "audio vae done");
+    let ((h_px, w_px, f_px), clip) = stitcher
+        .join()
+        .map_err(|_| "vae stitch panicked".to_string())??;
+
+    check_cancel(sink)?;
+    // --- MP4 (the worker's H.264 + optional AAC audio), or PNG frames ---
+    match clip {
+        Clip::H264(video) => {
             let audio = match &wav {
                 Some(wav) => {
                     sink.note("Encoding MP4 (H.264 + AAC)");
@@ -414,15 +466,11 @@ pub async fn run(
                     None
                 }
             };
-            crate::progress::write_artifact(
-                sink,
-                &req.output,
-                &crate::codec::encode_mp4_with_audio(&wan_video, FPS, audio)?,
-            )?;
+            crate::progress::write_artifact(sink, &req.output, &video.mux(audio)?)?;
         }
-        VideoFormat::PngFrames => {
+        Clip::Frames(video) => {
             sink.note("Writing PNG frames (audio dropped for png-frames output)");
-            crate::codec::write_png_frames(&wan_video, &req.output)?;
+            crate::codec::write_png_frames(&video, &req.output)?;
         }
     }
     tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
@@ -437,14 +485,151 @@ pub async fn run(
     })
 }
 
+/// Phase C's GPU half (the video VAE's ViT passes, read back) over any source
+/// carrying the H3 decoder names; the host stitch follows on a worker.
+/// The decoded clip in its output form.
+enum Clip {
+    H264(crate::codec::H264Stream),
+    Frames(WanVideo),
+}
+
+/// Bail between phases when the job was cancelled (the worker reports any
+/// error on a cancel-requested job as cancelled).
+fn check_cancel(sink: &dyn ProgressSink) -> Result<(), String> {
+    if sink.cancelled() {
+        return Err("cancelled".into());
+    }
+    Ok(())
+}
+
+async fn decode_video<S: WeightSource>(
+    backend: &Arc<WgpuBackend>,
+    src: S,
+    vae_cfg: &VideoVaeConfig,
+    cfg: &DitConfig,
+    video_rows: &[f32],
+    (latent_frames, lat_h, lat_w): (usize, usize, usize),
+    budget: ResidencyBudget,
+) -> Result<DecodedTokens, String>
+where
+    S::Error: core::fmt::Debug,
+{
+    let residency = WeightResidency::new(src, budget);
+    let handles =
+        register_vae(vae_cfg, &residency).map_err(|e| format!("register video vae: {e:?}"))?;
+    let pipelines = DecoderPipelines::compile(backend)
+        .await
+        .map_err(|e| format!("compile video vae pipelines: {e:?}"))?;
+    let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+    let read = |id: &'static str| read_weight_f32(backend, &residency, id, vae_cfg.latent_channels);
+    let mean = read("latents_mean")
+        .await
+        .map_err(|e| format!("read latents_mean: {e:?}"))?;
+    let std = read("latents_std")
+        .await
+        .map_err(|e| format!("read latents_std: {e:?}"))?;
+    tracing::debug!(
+        target: thinfer_core::trace::DIAG,
+        mean = ?&mean[..4],
+        std = ?&std[..4],
+        "minimax video latent stats",
+    );
+    let z = video_rows_to_latents(cfg, video_rows, latent_frames, lat_h, lat_w, &mean, &std);
+    let consts = load_consts(vae_cfg, backend, &residency, &handles)
+        .await
+        .map_err(|e| format!("read register/mask tokens: {e:?}"))?;
+    let out = decode_tokens(
+        vae_cfg,
+        backend,
+        &pipelines,
+        &residency,
+        &ws,
+        &handles,
+        &consts,
+        TilePolicy::default(),
+        &z,
+        latent_frames,
+        lat_h,
+        lat_w,
+    )
+    .await
+    .map_err(|e| format!("video vae decode: {e:?}"))?;
+    residency.evict_all_and_free(&**backend);
+    Ok(out)
+}
+
+/// The decoded clip as `[-1, 1]` planar frames, trimmed to the `frames` asked
+/// for (the decoder overshoots whenever the count misses a whole chunk).
+fn clip_frames(pixels: PixelBlock, frames: usize) -> Result<WanVideo, String> {
+    if !pixels.data.iter().all(|v| v.is_finite()) {
+        return Err("video decode produced non-finite output".into());
+    }
+    let (h_px, w_px) = (pixels.height, pixels.width);
+    let f_px = pixels.frames.min(frames);
+    let planar = pixels.to_signed_planar();
+    let plane = pixels.frames * h_px * w_px;
+    let keep = f_px * h_px * w_px;
+    let video: Vec<f32> = (0..3)
+        .flat_map(|c| planar[c * plane..c * plane + keep].iter().copied())
+        .collect();
+    Ok(WanVideo {
+        frames: video,
+        num_frames: f_px,
+        height: h_px,
+        width: w_px,
+    })
+}
+
 /// The latent grid of one t2va request, as the denoise plan needs it.
 #[derive(Clone, Copy)]
 struct PlanDims {
-    num_text: usize,
+    rows: usize,
+    row_limit: usize,
     latent_frames: usize,
     lat_h: usize,
     lat_w: usize,
     audio_latents: usize,
+}
+
+/// What the conditioner produced for the DiT: the text rows' modality tags
+/// (a reference image's vision block tags as video), and each reference
+/// image's clean latent as a conditioning block plus its patchified rows.
+struct Conditioning {
+    text_tags: Vec<i32>,
+    conditions: Vec<packing::Condition>,
+    cond_rows: Vec<f32>,
+}
+
+/// [`run_dit`] for a distill (no turbo adapter), with the request's vault
+/// adapters stacked onto `src` when there are any.
+#[allow(clippy::too_many_arguments)]
+async fn run_dit_users<S: WeightSource>(
+    backend: &Arc<WgpuBackend>,
+    cfg: &DitConfig,
+    src: S,
+    users: Vec<Adapter<SafetensorsSource<BytesOpener>>>,
+    schedule: JointSchedule,
+    d: PlanDims,
+    text: &[f32],
+    cond: &Conditioning,
+    seed: u64,
+    budget: ResidencyBudget,
+    sink: &dyn ProgressSink,
+) -> Result<Latents, String>
+where
+    S::Error: core::fmt::Debug,
+{
+    if users.is_empty() {
+        return run_dit(
+            backend, cfg, src, schedule, d, text, cond, seed, budget, sink, false,
+        )
+        .await;
+    }
+    let src = MergedSource::new(src, lora_source(cfg, users, sink).await?);
+    run_dit(
+        backend, cfg, src, schedule, d, text, cond, seed, budget, sink, false,
+    )
+    .await
 }
 
 /// Phase B, the DiT, over any source carrying the H3 tensor names: the base
@@ -459,6 +644,7 @@ async fn run_dit<S: WeightSource>(
     schedule: JointSchedule,
     d: PlanDims,
     text: &[f32],
+    cond: &Conditioning,
     seed: u64,
     budget: ResidencyBudget,
     sink: &dyn ProgressSink,
@@ -469,14 +655,26 @@ where
 {
     let plan = DenoisePlan::build_with::<String>(
         cfg,
-        d.num_text,
+        &cond.text_tags,
         d.latent_frames,
         d.lat_h,
         d.lat_w,
         d.audio_latents,
+        &cond.conditions,
         schedule,
+        d.row_limit,
     )
     .map_err(|e| format!("build denoise plan: {e:?}"))?;
+    // Past the backend block's limit the activations need the room the weight
+    // LRU would take; the DiT streams block by block either way.
+    let budget = if d.rows > MAX_PACKED_ROWS {
+        ResidencyBudget {
+            vram_bytes: budget.vram_bytes.min(LONG_SEQUENCE_WEIGHT_BUDGET),
+            ..budget
+        }
+    } else {
+        budget
+    };
 
     // The modulation table is built over exactly the plan's distinct
     // timesteps, in the plan's order: the block stack indexes it by that
@@ -525,6 +723,7 @@ where
         &handles,
         &table,
         &plan,
+        &cond.cond_rows,
         text,
         seed,
         |step, total| {
@@ -533,6 +732,7 @@ where
                 n: total as u32,
             })
         },
+        Some(&|| sink.cancelled()),
     )
     .await
     .map_err(|e| format!("denoise: {e:?}"))?;
@@ -606,13 +806,15 @@ async fn lora_source<L: WeightSource>(
     Ok(src)
 }
 
-async fn open_mmap(path: &std::path::Path) -> Result<MmapFileOpener, String> {
+pub(crate) async fn open_mmap(path: &std::path::Path) -> Result<MmapFileOpener, String> {
     MmapFileOpener::new(path)
         .await
         .map_err(|e| format!("open {}: {e}", path.display()))
 }
 
-async fn open_st(path: &std::path::Path) -> Result<SafetensorsSource<MmapFileOpener>, String> {
+pub(crate) async fn open_st(
+    path: &std::path::Path,
+) -> Result<SafetensorsSource<MmapFileOpener>, String> {
     let opener = open_mmap(path).await?;
     SafetensorsSource::open(opener)
         .await

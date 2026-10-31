@@ -25,6 +25,7 @@
 //! shape as the LTX finding; do not "helpfully" add a template here.
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
+use thinfer_core::ops::ActDtype;
 use thinfer_core::quant::QuantKind;
 use thinfer_core::residency::{ResidencyError, TransposePolicy, WeightHandle, WeightResidency};
 use thinfer_core::tensor::StorageEncoding;
@@ -37,7 +38,7 @@ use std::collections::HashMap;
 
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, BlockWgslConfigs, DequantStep, alloc_act, alloc_matmul_out_buf,
-    op_add, op_rmsnorm, op_rope_halfrot, op_sdpa, op_silu_mul,
+    op_add, op_rmsnorm, op_rope_halfrot, op_sdpa_f16, op_silu_mul,
 };
 use crate::common::seq;
 use crate::z_image::text_encoder::{
@@ -59,6 +60,45 @@ pub mod config {
     pub const VOCAB: usize = 151_936;
     pub const EPS: f32 = 1e-6;
     pub const ROPE_THETA: f32 = 5_000_000.0;
+    /// Interleaved M-RoPE frequency slots per `(t, h, w)` axis.
+    pub const MROPE_SECTION: [usize; 3] = [24, 20, 20];
+}
+
+/// One image's `<|image_pad|>` block in the token sequence: rows
+/// `start..start + vision.tokens` take its features.
+pub struct ImageRows<'a> {
+    pub start: usize,
+    pub vision: &'a crate::minimax::vision::VisionOutput,
+}
+
+/// HF `get_rope_index` `(t, h, w)` per row for a sequence with image blocks
+/// (`images` in sequence order). Text advances one position per token on all
+/// three axes; an image holds `t` at the current position, steps `h` / `w`
+/// over its merged grid from there, and advances the clock by the larger
+/// merged side (not by its token count).
+pub fn mrope_positions(seq: usize, images: &[ImageRows<'_>]) -> Vec<i64> {
+    fn text_until(end: usize, row: &mut usize, clock: &mut i64, pos: &mut Vec<i64>) {
+        while *row < end {
+            pos.extend([*clock; 3]);
+            *clock += 1;
+            *row += 1;
+        }
+    }
+    let mut pos = Vec::with_capacity(seq * 3);
+    let (mut row, mut clock) = (0usize, 0i64);
+    for img in images {
+        text_until(img.start, &mut row, &mut clock, &mut pos);
+        let (gh, gw) = img.vision.merged_grid;
+        for r in 0..gh {
+            for c in 0..gw {
+                pos.extend([clock, clock + r as i64, clock + c as i64]);
+            }
+        }
+        row += gh * gw;
+        clock += gh.max(gw) as i64;
+    }
+    text_until(seq, &mut row, &mut clock, &mut pos);
+    pos
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -280,7 +320,7 @@ pub fn register_handles<S: WeightSource>(
 /// would select K-major and silently transpose every weight (the H3 DiT bug,
 /// which also turned this tower's output to noise).
 pub fn encoder_cfgs() -> BlockWgslConfigs {
-    use thinfer_core::ops::{ActDtype, WeightDtype, WgslConfig};
+    use thinfer_core::ops::{WeightDtype, WgslConfig};
     let ops = WgslConfig {
         bf16_quant_writes: false,
         act_dtype: ActDtype::F32,
@@ -310,6 +350,38 @@ pub fn encoder_cfgs() -> BlockWgslConfigs {
         large_d_sdpa: true,
         fast_sdpa: false,
         decode_sdpa: false,
+    }
+}
+
+/// [`encoder_cfgs`] for long sequences (a reference image puts thousands of
+/// vision tokens in the prompt): bf16 activations, the reference's own
+/// encoder dtype, so the matmuls and the causal attention run on the
+/// accelerator's tensor cores (f32 acts have neither path, and a long f32
+/// sequence trips the GPU watchdog). Q and K are RMS-normed before rope, so
+/// the f16 attention inputs stay in range.
+pub fn encoder_cfgs_long() -> BlockWgslConfigs {
+    use thinfer_core::ops::{WeightDtype, WgslConfig};
+    let base = encoder_cfgs();
+    let ops = WgslConfig {
+        act_dtype: ActDtype::Bf16,
+        ..base.ops
+    };
+    let mm = WgslConfig {
+        weight_dtype: WeightDtype::Quant(QuantKind::Q4_K),
+        ..ops
+    };
+    BlockWgslConfigs {
+        matmul_qkv: mm,
+        matmul_qkv_self: mm,
+        matmul_proj: mm,
+        matmul_ffn_up: mm,
+        matmul_ffn_down: mm,
+        matmul_adaln: ops,
+        ops,
+        fast_sdpa: true,
+        // Head dim 128: no large-D kernel (and it has no bf16 variant).
+        large_d_sdpa: false,
+        ..base
     }
 }
 
@@ -475,7 +547,10 @@ impl DecoderBlock {
         op_rope_halfrot(scope, p, kn, freqs_in, kr, rows, hkv, hd)?;
 
         let sa = alloc_act(scope, p, rows, hq * hd)?;
-        op_sdpa(
+        // f16 tensor-core attention under the bf16 config (see
+        // `encoder_cfgs_long`); the f32 config compiles no f16 kernel and this
+        // is the plain backend SDPA.
+        op_sdpa_f16(
             scope,
             p,
             qr,
@@ -522,7 +597,10 @@ pub struct MiniMaxTextEncoder;
 
 impl MiniMaxTextEncoder {
     /// Run the embedding + 50 decoder layers and return the LAST layer's output
-    /// WITHOUT the final norm. Real tokens only, plain causal mask.
+    /// WITHOUT the final norm. Real tokens only, plain causal mask. `images`
+    /// (sequence order) replace their `<|image_pad|>` rows' embeddings, move
+    /// those rows onto 3-D M-RoPE positions, and add their deepstack streams
+    /// into the same rows after layers 0, 1 and 2.
     #[allow(clippy::too_many_arguments)]
     pub async fn forward<S: WeightSource>(
         &self,
@@ -533,6 +611,7 @@ impl MiniMaxTextEncoder {
         handles: &EncoderHandles,
         source: &S,
         token_ids: &[u32],
+        images: &[ImageRows<'_>],
     ) -> Result<EncoderOutput, ForwardError<S::Error>> {
         let seq = token_ids.len();
         assert!(seq > 0, "MiniMaxTextEncoder::forward: empty token list");
@@ -546,10 +625,19 @@ impl MiniMaxTextEncoder {
         let bp = &pipelines.block;
 
         // No embed scale: that is a Gemma detail, not a Qwen3 one.
-        let embeds = embed_lookup_hidden(source, &ids, config::HIDDEN)
+        let mut embeds = embed_lookup_hidden(source, &ids, config::HIDDEN)
             .instrument(tracing::debug_span!(target: PHASE, "minimax.embed_lookup", seq))
             .await
             .map_err(ForwardError::Embed)?;
+        let d = config::HIDDEN;
+        let rows_of = |img: &ImageRows<'_>| img.start * d..(img.start + img.vision.tokens) * d;
+        for img in images {
+            assert!(
+                img.start + img.vision.tokens <= seq,
+                "image rows past the prompt"
+            );
+            embeds[rows_of(img)].copy_from_slice(&img.vision.embeds);
+        }
 
         let shape = BlockShape {
             dim: config::HIDDEN,
@@ -567,16 +655,44 @@ impl MiniMaxTextEncoder {
         let embed_bytes = seq::act_upload_bytes(bp.act_dtype, &embeds);
         backend.write_buffer(x_buf.id, 0, &embed_bytes)?;
 
-        // Single 1-axis half-rot rope. Valid because a text-only request gives
-        // every M-RoPE axis the same position (see the module note).
-        let freqs = build_freqs(config::ROPE_THETA, config::HEAD_DIM, seq_pad);
+        // Interleaved M-RoPE through the half-rot kernel. A text-only request
+        // gives every axis the same position, i.e. plain 1-axis rope.
+        let freqs = crate::ideogram4::mrope::build_freqs(
+            &mrope_positions(seq_pad, images),
+            config::HEAD_DIM,
+            config::ROPE_THETA,
+            config::MROPE_SECTION,
+        );
         let freqs_bytes = seq::freqs_upload_bytes(bp.act_dtype, &freqs);
         let freqs_buf = scratch.alloc(freqs_bytes.len() as u64)?;
         backend.write_buffer(freqs_buf.id, 0, &freqs_bytes)?;
 
-        let mask_bytes = seq::causal_mask_bytes_act(seq_pad, bp.act_dtype);
+        // The f16 attention reads its additive mask as f16 (a bf16 -inf is an
+        // f16 NaN), whatever the activations are.
+        let mask_dtype = if bp.sdpa_sg.is_some() && bp.act_dtype == ActDtype::Bf16 {
+            ActDtype::F16
+        } else {
+            bp.act_dtype
+        };
+        let mask_bytes = seq::causal_mask_bytes_act(seq_pad, mask_dtype);
         let mask_buf = scratch.alloc(mask_bytes.len() as u64)?;
         backend.write_buffer(mask_buf.id, 0, &mask_bytes)?;
+
+        // Deepstack stream k, laid over the whole sequence (zero off the image
+        // rows), added after layer k.
+        let mut deepstack = Vec::new();
+        if !images.is_empty() {
+            for k in 0..3 {
+                let mut full = vec![0.0f32; seq_pad * d];
+                for img in images {
+                    full[rows_of(img)].copy_from_slice(&img.vision.deepstack[k]);
+                }
+                let bytes = seq::act_upload_bytes(bp.act_dtype, &full);
+                let buf = scratch.alloc(bytes.len() as u64)?;
+                backend.write_buffer(buf.id, 0, &bytes)?;
+                deepstack.push(buf);
+            }
+        }
 
         let mut cur = x_buf;
         let mut pending: Option<BlockViews<'_>> = if handles.layers.is_empty() {
@@ -606,16 +722,39 @@ impl MiniMaxTextEncoder {
             let freqs_h = scope.import(&freqs_ref);
             let mask_h = scope.import(&mask_ref);
             let nxt_h = scope.import(&nxt_ref);
-            block.forward(
-                &scope,
-                pipelines,
-                cur_h,
-                freqs_h,
-                mask_h,
-                nxt_h,
-                &bufs,
-                handles.layers[idx].kinds,
-            )?;
+            match deepstack.get(idx) {
+                None => block.forward(
+                    &scope,
+                    pipelines,
+                    cur_h,
+                    freqs_h,
+                    mask_h,
+                    nxt_h,
+                    &bufs,
+                    handles.layers[idx].kinds,
+                )?,
+                Some(ds) => {
+                    let out = alloc_act(&scope, bp, seq_pad as u32, config::HIDDEN as u32)?;
+                    block.forward(
+                        &scope,
+                        pipelines,
+                        cur_h,
+                        freqs_h,
+                        mask_h,
+                        out.data,
+                        &bufs,
+                        handles.layers[idx].kinds,
+                    )?;
+                    let ds_ref = ds.as_buf_ref();
+                    op_add(
+                        &scope,
+                        bp,
+                        out,
+                        ActBuf::dense(scope.import(&ds_ref)),
+                        ActBuf::dense(nxt_h),
+                    )?;
+                }
+            }
 
             // Overlap the next layer's weight fetch with this layer's submit.
             let next_idx = idx + 1;
@@ -645,22 +784,6 @@ impl MiniMaxTextEncoder {
         hidden.truncate(seq * config::HIDDEN);
         Ok(EncoderOutput { hidden, seq })
     }
-}
-
-/// Half-rot rope freqs `[seq, head_dim]`, `(cos, sin)` interleaved per pair.
-/// Computed in f64 then narrowed, matching HF's float32 rope path.
-fn build_freqs(theta: f32, head_dim: usize, seq: usize) -> Vec<f32> {
-    let pairs = head_dim / 2;
-    let mut out = vec![0.0f32; seq * head_dim];
-    for pos in 0..seq {
-        for j in 0..pairs {
-            let inv = 1.0f64 / (theta as f64).powf(2.0 * j as f64 / head_dim as f64);
-            let arg = pos as f64 * inv;
-            out[pos * head_dim + 2 * j] = arg.cos() as f32;
-            out[pos * head_dim + 2 * j + 1] = arg.sin() as f32;
-        }
-    }
-    out
 }
 
 #[derive(Debug)]
@@ -719,20 +842,34 @@ mod tests {
     }
 
     #[test]
-    fn freqs_origin_is_identity() {
-        let f = build_freqs(config::ROPE_THETA, 8, 2);
-        assert_eq!(f.len(), 16);
-        for j in 0..4 {
-            assert_eq!(f[2 * j], 1.0);
-            assert_eq!(f[2 * j + 1], 0.0);
-        }
+    fn text_only_positions_are_sequential_on_every_axis() {
+        let p = mrope_positions(4, &[]);
+        assert_eq!(p, vec![0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]);
     }
 
+    /// The spec's worked example: 7 label/start rows, then a (96 x 64) merged
+    /// image at t = 7, then vision_end at 7 + max(96, 64) = 103.
     #[test]
-    fn freqs_first_pair_is_unscaled() {
-        let f = build_freqs(config::ROPE_THETA, 8, 2);
-        // pos = 1, j = 0 -> inv_freq 1 -> angle 1 rad.
-        assert!((f[8] as f64 - 1.0f64.cos()).abs() < 1e-6);
-        assert!((f[9] as f64 - 1.0f64.sin()).abs() < 1e-6);
+    fn image_holds_t_steps_hw_and_advances_by_its_longer_side() {
+        let vision = crate::minimax::vision::VisionOutput {
+            embeds: Vec::new(),
+            deepstack: [Vec::new(), Vec::new(), Vec::new()],
+            tokens: 96 * 64,
+            merged_grid: (96, 64),
+        };
+        let img = ImageRows {
+            start: 7,
+            vision: &vision,
+        };
+        let seq = 7 + 96 * 64 + 2;
+        let p = mrope_positions(seq, &[img]);
+        assert_eq!(p.len(), seq * 3);
+        assert_eq!(&p[6 * 3..7 * 3], &[6, 6, 6]);
+        assert_eq!(&p[7 * 3..8 * 3], &[7, 7, 7]);
+        // Second image row: (t, h, w) = (7, 7, 8); first of row 1: (7, 8, 7).
+        assert_eq!(&p[8 * 3..9 * 3], &[7, 7, 8]);
+        assert_eq!(&p[(7 + 64) * 3..(8 + 64) * 3], &[7, 8, 7]);
+        let after = 7 + 96 * 64;
+        assert_eq!(&p[after * 3..(after + 1) * 3], &[103, 103, 103]);
     }
 }

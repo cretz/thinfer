@@ -172,6 +172,14 @@ pub enum WgpuError {
         offset: u64,
         bytes: u64,
     },
+    /// The installed external (accelerator-shared) allocator refused the
+    /// buffer, in practice out of device memory. Not papered over with a
+    /// plain buffer: the accelerator could not address one, and the work it
+    /// was for would fail later, far from the cause.
+    ExternalAllocate {
+        bytes: u64,
+        message: String,
+    },
 }
 
 /// A mapped staging chunk from `queue.write_buffer_with`.
@@ -693,10 +701,7 @@ impl WgpuBackend {
                     _mapping: eb.mapping,
                 }),
             ),
-            Some(Err(e)) => {
-                tracing::warn!(target: trace::ADAPTER, bytes, error = %e, "external alloc failed; plain wgpu buffer");
-                (self.create_plain_buffer(bytes, cat)?, None)
-            }
+            Some(Err(message)) => return Err(WgpuError::ExternalAllocate { bytes, message }),
             None => (self.create_plain_buffer(bytes, cat)?, None),
         };
         let id = {

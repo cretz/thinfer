@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, sys};
+use thinfer_core::backend::GemmEpilogue;
 use thinfer_core::ops::{GemmDesc, GemmType};
 
 use crate::nvrtc::Module;
@@ -37,6 +38,10 @@ const SOURCE: &str = r#"
 #define BM 128
 #define BN 128
 #define BK 32
+// Tiles are rasterized in groups of GROUP_M row tiles over a 1-D grid, so the
+// blocks resident at once share a few A row tiles and B column tiles in L2 (a
+// weight wider than L2 is otherwise re-streamed once per row tile).
+#define GROUP_M 8
 #define LDA (BK + 8)
 #define LDBN (BK + 8)
 #define LDBK (BN + 8)
@@ -92,10 +97,18 @@ __device__ __forceinline__ uint4 conv8(uint4 v, bool& over) {
     return make_uint4(w[0], w[1], w[2], w[3]);
 }
 
+// Optional fused epilogue (bf16 output only; null pointers = absent):
+// out = resid + gate[col] * (acc + bias[col]), one rounding. `resid` may alias
+// `out` (each element is read then written by the same thread).
+struct Epi { const unsigned short* bias; const unsigned short* resid; const unsigned short* gate; };
+
+__device__ __forceinline__ float bf_lo(unsigned v) { return __uint_as_float(v << 16); }
+__device__ __forceinline__ float bf_hi(unsigned v) { return __uint_as_float(v & 0xffff0000u); }
+
 template <bool C_BF16, bool B_BF16, bool NMAJ, bool OUT_F32>
 __device__ __forceinline__ void gemm_impl(
     const unsigned short* __restrict__ a, const unsigned short* __restrict__ b,
-    void* __restrict__ out, const Dims d)
+    void* out, const Dims d, const Epi e)
 {
     constexpr int A_TILE = BM * LDA;
     constexpr int B_TILE = NMAJ ? BN * LDBN : BK * LDBK;
@@ -105,7 +118,12 @@ __device__ __forceinline__ void gemm_impl(
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t = lane & 3;
     const int wm0 = (warp >> 2) * 64, wn0 = (warp & 3) * 32;
-    const unsigned m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const unsigned mt = (d.m + BM - 1) / BM, nt = (d.n + BN - 1) / BN;
+    const unsigned per_group = GROUP_M * nt, pid = blockIdx.x;
+    const unsigned first_m = (pid / per_group) * GROUP_M;
+    const unsigned gsize = min(mt - first_m, (unsigned)GROUP_M);
+    const unsigned m0 = (first_m + (pid % per_group) % gsize) * BM;
+    const unsigned n0 = ((pid % per_group) / gsize) * BN;
     const unsigned ntiles = (d.k + BK - 1) / BK;
 
     uint4 ra[2], rb[2];
@@ -201,7 +219,22 @@ __device__ __forceinline__ void gemm_impl(
             for (int h = 0; h < 2; ++h) {
                 const unsigned row = m0 + wm0 + mi * 16 + g + h * 8;
                 if (row >= d.m) continue;
-                const float x = acc[mi][ni][2 * h], y = acc[mi][ni][2 * h + 1];
+                float x = acc[mi][ni][2 * h], y = acc[mi][ni][2 * h + 1];
+                if (C_BF16 && !OUT_F32) {
+                    if (e.bias) {
+                        const unsigned bv = *reinterpret_cast<const unsigned*>(e.bias + col);
+                        x += bf_lo(bv); y += bf_hi(bv);
+                    }
+                    if (e.resid) {
+                        float g0 = 1.f, g1 = 1.f;
+                        if (e.gate) {
+                            const unsigned gv = *reinterpret_cast<const unsigned*>(e.gate + col);
+                            g0 = bf_lo(gv); g1 = bf_hi(gv);
+                        }
+                        const unsigned rv = *reinterpret_cast<const unsigned*>(e.resid + (size_t)row * d.n + col);
+                        x = bf_lo(rv) + g0 * x; y = bf_hi(rv) + g1 * y;
+                    }
+                }
                 if (OUT_F32) {
                     *reinterpret_cast<float2*>(static_cast<float*>(out) + (size_t)row * d.n + col) =
                         make_float2(x, y);
@@ -224,8 +257,8 @@ __device__ __forceinline__ void gemm_impl(
 
 #define GEMM(NAME, CB, BB, NM, O32) \
 extern "C" __global__ void __launch_bounds__(256) NAME( \
-    const unsigned short* a, const unsigned short* b, void* out, const Dims d) \
-{ gemm_impl<CB, BB, NM, O32>(a, b, out, d); }
+    const unsigned short* a, const unsigned short* b, void* out, const Dims d, const Epi e) \
+{ gemm_impl<CB, BB, NM, O32>(a, b, out, d, e); }
 
 GEMM(gemm_a16_b16_k, false, false, false, false)
 GEMM(gemm_a16_b16_n, false, false, true, false)
@@ -302,7 +335,8 @@ impl GemmKernels {
     /// `k` from the caller or (`k == 0`) read from `dims`. `Ok(false)` =
     /// unsupported shape or a bf16 weight past the f16 range (caller runs
     /// wgpu). Enqueued only, except the narrowing form, which must read its
-    /// overflow flag and so waits.
+    /// overflow flag and so waits. A non-empty `epi` (see [`GemmEpilogue`])
+    /// is taken on the bf16-output forms only.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
@@ -314,10 +348,20 @@ impl GemmKernels {
         m: u32,
         n: u32,
         k: u32,
+        epi: GemmEpilogue,
     ) -> Result<bool, String> {
         let Some(f) = index(desc) else {
             return Ok(false);
         };
+        let bf16_out = desc.a == GemmType::Bf16 && !desc.out_f32;
+        // Bias / gate are read as bf16 pairs, the residual like the output.
+        let epi_ok = epi.is_empty()
+            || (bf16_out
+                && [epi.bias, epi.gate].iter().all(|p| p.is_multiple_of(4))
+                && epi.residual.is_multiple_of(8));
+        if !epi_ok {
+            return Ok(false);
+        }
         let dm: GemmDims = if k == 0 {
             self.module.read(dims)?
         } else {
@@ -342,16 +386,18 @@ impl GemmKernels {
             self.module.write(self.overflow, 0u32)?;
         }
         let (mut a, mut b, mut out, mut dims) = (a, b, out, dm);
-        let mut args: [*mut c_void; 4] = [
+        let mut e = [epi.bias, epi.residual, epi.gate];
+        let mut args: [*mut c_void; 5] = [
             (&raw mut a).cast(),
             (&raw mut b).cast(),
             (&raw mut out).cast(),
             (&raw mut dims).cast(),
+            (&raw mut e).cast(),
         ];
         self.module.bind()?;
         self.module.launch(
             self.funcs[f],
-            (n.div_ceil(BN), m.div_ceil(BM), 1),
+            (n.div_ceil(BN) * m.div_ceil(BM), 1, 1),
             THREADS,
             0,
             &mut args,

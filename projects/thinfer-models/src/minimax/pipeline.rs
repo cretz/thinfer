@@ -6,14 +6,15 @@
 //! its own timestep.
 //!
 //! **Sequence-length budget.** Activations scale with the packed row count, and
-//! the widest intermediate is the fused SwiGLU at `rows x 2 * ffn_hidden`. At
-//! the native 1344x768 canvas that is ~37.8k rows, so the fused buffer alone is
-//! 4.3 GiB in f32 and the block does not fit an 8 GiB card however the weights
-//! are streamed. Making the native canvas fit needs the row-independent sites
-//! (both patch projections and the whole feed-forward) chunked over rows; only
-//! attention genuinely needs the full sequence resident. Until that lands,
-//! [`check_sequence_budget`] refuses a canvas it cannot run instead of dying
-//! mid-denoise with a device loss.
+//! the widest intermediate is the fused SwiGLU at `rows x 2 * ffn_hidden`. The
+//! backend block materializes it for every row, which caps the sequence at
+//! [`MAX_PACKED_ROWS`]. The accelerated block (`dit::block_forward_accel`) runs
+//! every row-local op over row chunks, so only attention's q/k/v/gate/output
+//! scale with the sequence: [`ACCEL_MAX_PACKED_ROWS`] (the native 1344x768
+//! canvas at 5s). [`check_sequence_budget`] refuses a canvas past the limit the
+//! run will use instead of dying mid-denoise with a device loss.
+
+use std::borrow::Cow;
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
 use thinfer_core::residency::{ResidencyError, WeightResidency};
@@ -23,13 +24,13 @@ use thinfer_core::workspace::Workspace;
 use tracing::Instrument;
 
 use crate::common::block::{ActBuf, Block, alloc_matmul_out_buf};
-use crate::common::seq;
+use crate::common::{Cancel, seq};
 use crate::ltx::sampler::gaussian_noise;
 
 use super::adaln::{ModSegment, ModulationPlan};
 use super::dit::{
-    BlockBufs, BlockProbe, DitHandles, DitPipelines, DitShape, ModulationTable, VsaPlan,
-    forward_block, forward_final_norm, forward_refiner_block, probe_layout,
+    BlockBufs, BlockProbe, DitHandles, DitPipelines, DitShape, ModulationTable, QUERY_SLAB_ROWS,
+    ROW_CHUNK, VsaPlan, forward_block, forward_final_norm, forward_refiner_block, probe_layout,
 };
 use super::loader::ModulationTables;
 use super::packing::{self, PackedSequence};
@@ -45,6 +46,30 @@ use super::{DitConfig, TAG_AUDIO, TAG_TEXT, TAG_VIDEO};
 /// (The old 6144 cap was derived at 4 bytes/element, i.e. f32 acts.)
 pub const MAX_PACKED_ROWS: usize = 16384;
 
+/// Row limit on the accelerated (row-chunked) block. Past
+/// [`super::dit::QUERY_SLAB_ROWS`] queries live one slab at a time, so what
+/// scales with the sequence is the residual stream `rows x 5376` (updated in
+/// place), k / v `2 x rows x 7168` (bf16) and the INT8 keys `rows x 7168`:
+/// ~3.3 GiB at 73728 rows, beside ~0.7 GiB of fixed chunk scratch and a
+/// weight budget cut to [`LONG_SEQUENCE_WEIGHT_BUDGET`]. Covers H3's 15s
+/// design length at 832x480 (~43k rows) with two 2048-edge reference images
+/// (~65k).
+pub const ACCEL_MAX_PACKED_ROWS: usize = 72 * 1024;
+
+/// VRAM weight budget past [`MAX_PACKED_ROWS`]: the DiT streams block by block
+/// whatever the budget, so a long sequence trades the weight LRU (two blocks in
+/// flight is all the pipeline needs, ~0.5 GiB) for activation room.
+pub const LONG_SEQUENCE_WEIGHT_BUDGET: u64 = 1024 * 1024 * 1024;
+
+/// The packed-row limit for a run: the accelerated block's when it will run.
+pub fn max_packed_rows(accelerated: bool) -> usize {
+    if accelerated {
+        ACCEL_MAX_PACKED_ROWS
+    } else {
+        MAX_PACKED_ROWS
+    }
+}
+
 #[derive(Debug)]
 pub enum PipelineError<SE: core::fmt::Debug> {
     Wgpu(WgpuError),
@@ -58,6 +83,8 @@ pub enum PipelineError<SE: core::fmt::Debug> {
     /// The packed layout is not the contiguous `[text | audio | video]` the
     /// t2va path assumes.
     NonContiguousLayout,
+    /// The caller's `cancel` predicate returned true at a block boundary.
+    Cancelled,
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for PipelineError<SE> {
@@ -78,12 +105,12 @@ impl<SE: core::fmt::Debug> From<packing::GeometryError> for PipelineError<SE> {
 
 /// Refuse a canvas whose packed sequence cannot run, with the numbers that
 /// decide it rather than an out-of-memory later.
-pub fn check_sequence_budget<SE: core::fmt::Debug>(rows: usize) -> Result<(), PipelineError<SE>> {
-    if rows > MAX_PACKED_ROWS {
-        return Err(PipelineError::SequenceTooLong {
-            rows,
-            limit: MAX_PACKED_ROWS,
-        });
+pub fn check_sequence_budget<SE: core::fmt::Debug>(
+    rows: usize,
+    limit: usize,
+) -> Result<(), PipelineError<SE>> {
+    if rows > limit {
+        return Err(PipelineError::SequenceTooLong { rows, limit });
     }
     Ok(())
 }
@@ -160,47 +187,56 @@ impl DenoisePlan {
         let schedule = JointSchedule::new(steps + 1).expect("schedule");
         Self::build_with(
             cfg,
-            num_text_rows,
+            &vec![TAG_TEXT; num_text_rows],
             num_latent_frames,
             latent_height,
             latent_width,
             num_audio_latents,
+            &[],
             schedule,
+            MAX_PACKED_ROWS,
         )
     }
 
     /// [`Self::build`] on an explicit schedule (e.g. a distilled checkpoint's
-    /// rungs, [`JointSchedule::from_rungs`]).
+    /// rungs, [`JointSchedule::from_rungs`]) and row limit
+    /// ([`max_packed_rows`]), with per-row text tags (an image's vision block
+    /// tags as video) and clean conditioning blocks (reference images).
+    #[allow(clippy::too_many_arguments)]
     pub fn build_with<SE: core::fmt::Debug>(
         cfg: &DitConfig,
-        num_text_rows: usize,
+        text_tags: &[i32],
         num_latent_frames: usize,
         latent_height: usize,
         latent_width: usize,
         num_audio_latents: usize,
+        conditions: &[packing::Condition],
         schedule: JointSchedule,
+        row_limit: usize,
     ) -> Result<Self, PipelineError<SE>> {
-        let text_tags = vec![TAG_TEXT; num_text_rows];
+        let num_text_rows = text_tags.len();
         let packed = packing::build_packed_sequence(
-            &text_tags,
+            text_tags,
             num_latent_frames,
             latent_height,
             latent_width,
             num_audio_latents,
             cfg.patch,
-            &[],
+            conditions,
         );
-        check_sequence_budget::<SE>(packed.seq_len)?;
-        // t2va pins no conditioning rows, so both conditioning levels are
-        // unused; text rows inherit the video timestep.
+        check_sequence_budget::<SE>(packed.seq_len, row_limit)?;
+        // Conditioning video rows sit at `max(t, 0.999)` (their noise
+        // augmentation level), conditioning audio is clean; text rows inherit
+        // the video timestep.
         let per_step: Vec<_> = (0..schedule.num_steps())
             .map(|i| {
+                let tv = schedule.video.timesteps()[i];
                 packing::build_row_timesteps(
                     &packed,
-                    schedule.video.timesteps()[i],
+                    tv,
                     schedule.audio.timesteps()[i],
-                    schedule.video.timesteps()[i],
-                    schedule.audio.timesteps()[i],
+                    tv.max(packing::KEYFRAME_NOISE_AUG),
+                    1.0,
                 )
             })
             .collect();
@@ -364,10 +400,11 @@ pub async fn forward<S: WeightSource>(
     video_rows: &[f32],
     audio_rows: &[f32],
     text: &[f32],
+    cancel: Cancel<'_>,
 ) -> Result<Velocity, PipelineError<S::Error>> {
     forward_tapped(
         cfg, backend, pipelines, residency, workspace, handles, table, plan, step, video_rows,
-        audio_rows, text, None,
+        audio_rows, text, None, cancel,
     )
     .await
 }
@@ -388,12 +425,17 @@ pub async fn forward_tapped<S: WeightSource>(
     audio_rows: &[f32],
     text: &[f32],
     mut taps: Option<&mut ForwardTaps>,
+    cancel: Cancel<'_>,
 ) -> Result<Velocity, PipelineError<S::Error>> {
     let p = &pipelines.block;
     let act = p.act_dtype;
     let seq_len = plan.packed.seq_len;
     let hidden = cfg.hidden;
     let [(text_at, n_text), (audio_at, n_audio), (video_at, n_video)] = plan.contiguous_spans()?;
+    // The video span leads with the clean conditioning blocks; only the rows
+    // after them are generated.
+    let n_cond = plan.packed.num_condition_video_rows;
+    let (target_at, n_target) = (video_at + n_cond, n_video - n_cond);
 
     let shape = DitShape {
         cfg: *cfg,
@@ -402,37 +444,56 @@ pub async fn forward_tapped<S: WeightSource>(
     let segments = plan.modulation.segments(step, &plan.packed.token_tags);
     let ts_segments = timestep_segments(&plan.modulation, step);
 
-    // Video sparse attention: one tile table, shared by every block. Text and
-    // audio are the dense prefix; the video grid tiles into latent cubes.
+    // Video sparse attention: one tile table, shared by every block. Text,
+    // audio and reference images are the dense prefix; the target video grid
+    // tiles into latent cubes.
     let vsa_buf = match cfg.vsa_sparsity {
         Some(sparsity) => {
-            let g = VsaGeometry::new(
-                &[(text_at, n_text), (audio_at, n_audio)],
-                video_at,
-                plan.video_grid,
-            );
+            let mut prefix = vec![(text_at, n_text), (audio_at, n_audio)];
+            if n_cond > 0 {
+                prefix.push((video_at, n_cond));
+            }
+            let g = VsaGeometry::new(cfg.vsa_tiling, &prefix, target_at, plan.video_grid);
             debug_assert_eq!(g.tile_sizes.iter().sum::<u32>() as usize, seq_len);
             let bytes = g.bytes();
             let buf = workspace.alloc(bytes.len() as u64)?;
             backend.write_buffer(buf.id(), 0, &bytes)?;
+            let slabs = g.slabs(ROW_CHUNK);
+            let query_slabs = seq_len > QUERY_SLAB_ROWS;
             let shape = thinfer_core::backend::VsaShape {
                 rows: seq_len as u32,
                 heads: cfg.n_heads as u32,
                 head_dim: cfg.head_dim as u32,
+                tile: g.tiling.rows as u32,
+                int8_qk: cfg.vsa_int8_qk,
                 n_tiles: g.n_tiles() as u32,
                 n_prefix: g.n_prefix as u32,
                 topk: g.topk(sparsity) as u32,
                 scale: shape.sdpa_scale(),
+                slab_tiles: if query_slabs {
+                    slabs.iter().map(|s| s.tiles.len()).max().unwrap_or(1) as u32
+                } else {
+                    g.n_tiles() as u32
+                },
             };
-            Some((buf, shape))
+            Some((buf, shape, slabs, query_slabs))
         }
         None => None,
     };
-    let vsa_plan = vsa_buf.as_ref().map(|(buf, shape)| VsaPlan {
-        geometry: buf.as_buf_ref(),
-        shape: *shape,
-    });
+    let vsa_plan = vsa_buf
+        .as_ref()
+        .map(|(buf, shape, slabs, query_slabs)| VsaPlan {
+            geometry: buf.as_buf_ref(),
+            shape: *shape,
+            slabs: slabs.clone(),
+            query_slabs: *query_slabs,
+        });
 
+    // The pool reuses buffers by exact size, so each phase's buffers (input
+    // projections + refiner, the block stack, the final layer) would idle
+    // beside the next phase's own: drain at every switch so the peak is one
+    // phase's live set. Here: the previous step's final layer.
+    workspace.drain_pool();
     // Packed activation buffer, filled per modality.
     let x_bytes = p.act_bytes((seq_len * hidden) as u32);
     let x_buf = workspace.alloc(x_bytes)?;
@@ -583,20 +644,27 @@ pub async fn forward_tapped<S: WeightSource>(
         }
     }
 
+    // Phase switch (see the first drain): the refiner's buffers, sized by the
+    // text rows (thousands with reference images).
+    workspace.drain_pool();
+
     // --- the 50-block stack ---
     let freqs_ref = freqs_buf.as_buf_ref();
-    let mut cur = x_buf;
+    // The residual stream, updated in place block after block.
+    let x_ref = x_buf.as_buf_ref();
     let mut pending = match handles.blocks.first() {
         Some(h) => Some(h.acquire(residency, backend).await?),
         None => None,
     };
     for idx in 0..handles.blocks.len() {
         let _guard = trace::scope!(format!("minimax.dit.block.{idx}")).entered();
+        // A step is seconds to tens of seconds; poll per block so a cancel
+        // lands promptly.
+        if cancel.is_some_and(|c| c()) {
+            return Err(PipelineError::Cancelled);
+        }
         let views = pending.take().expect("pending acquire missing");
         let bufs: BlockBufs = views.bufs();
-        let cur_ref = cur.as_buf_ref();
-        let nxt = workspace.alloc(x_bytes)?;
-        let nxt_ref = nxt.as_buf_ref();
         let probe = ProbeBufs::alloc(workspace, act, shape, taps.is_some() && idx == 0)?;
         // Readahead only pays on the cold first pass: later steps read the
         // stack from page cache, where the hint is ~12 ms of page-table walk
@@ -613,9 +681,8 @@ pub async fn forward_tapped<S: WeightSource>(
             &scope,
             pipelines,
             shape,
-            scope.import(&cur_ref),
+            scope.import(&x_ref),
             scope.import(&freqs_ref),
-            scope.import(&nxt_ref),
             &bufs,
             handles.blocks[idx].kinds(),
             table,
@@ -639,19 +706,12 @@ pub async fn forward_tapped<S: WeightSource>(
         let submit = scope
             .submit_void()
             .instrument(tracing::debug_span!(target: PHASE, "minimax.dit.submit", idx));
-        let t_join = thinfer_core::trace::Instant::now();
         let (submit_res, next_res) = if deferred {
             let next = next_acquire.await;
             (submit.await, next)
         } else {
             futures::join!(submit, next_acquire)
         };
-        tracing::debug!(
-            target: thinfer_core::trace::DIAG,
-            at = "join",
-            us = t_join.elapsed().as_micros() as u64,
-            "block mark"
-        );
         submit_res?;
         pending = next_res?;
         drop(views);
@@ -659,33 +719,28 @@ pub async fn forward_tapped<S: WeightSource>(
             if let Some(pb) = &probe {
                 pb.record(t, backend, act, &format!("block{idx}")).await?;
             }
-            t.record(
-                backend,
-                act,
-                format!("block{idx}"),
-                nxt.as_buf_ref(),
-                seq_len * hidden,
-            )
-            .await?;
+            t.record(backend, act, format!("block{idx}"), x_ref, seq_len * hidden)
+                .await?;
         }
         // No per-block `drain_pool`: every block allocates the same live set, so
         // draining never lowers the peak and turned each block's ~66 workspace
         // buffers into fresh (exportable, CUDA-imported) allocations.
-        cur = nxt;
     }
+
+    // Phase switch (see the first drain): the block stack's buffers.
+    workspace.drain_pool();
 
     // --- final layer: shared modulated norm, then both heads over every row ---
     let normed = workspace.alloc(x_bytes)?;
     {
         let fnorm = residency.acquire(handles.final_norm, backend).await?;
-        let cur_ref = cur.as_buf_ref();
         let out_ref = normed.as_buf_ref();
         let scope = workspace.batch();
         forward_final_norm(
             &scope,
             pipelines,
             shape,
-            scope.import(&cur_ref),
+            scope.import(&x_ref),
             &fnorm.buf(),
             scope.import(&out_ref),
             table,
@@ -699,6 +754,7 @@ pub async fn forward_tapped<S: WeightSource>(
             .await?;
     }
 
+    let heads = handles.heads_for(step);
     let video = read_head(
         cfg,
         backend,
@@ -706,12 +762,12 @@ pub async fn forward_tapped<S: WeightSource>(
         residency,
         workspace,
         &normed,
-        handles.video_out,
-        handles.video_out_bias,
+        heads.video_out,
+        heads.video_out_bias,
         seq_len,
         cfg.video_patch_dim(),
-        video_at,
-        n_video,
+        target_at,
+        n_target,
     )
     .await?;
     let audio = read_head(
@@ -721,8 +777,8 @@ pub async fn forward_tapped<S: WeightSource>(
         residency,
         workspace,
         &normed,
-        handles.audio_out,
-        handles.audio_out_bias,
+        heads.audio_out,
+        heads.audio_out_bias,
         seq_len,
         cfg.audio_latents_dim,
         audio_at,
@@ -881,11 +937,30 @@ pub async fn denoise<S: WeightSource>(
     handles: &DitHandles,
     table: &ModulationTable,
     plan: &DenoisePlan,
+    cond_video: &[f32],
     text: &[f32],
     seed: u64,
     mut progress: impl FnMut(usize, usize),
+    cancel: Cancel<'_>,
 ) -> Result<Latents, PipelineError<S::Error>> {
-    let (mut video, mut audio) = initial_noise(cfg, plan.num_video_rows, plan.num_audio_rows, seed);
+    // Conditioning rows (clean, patchified) are noise-augmented ONCE to the
+    // 0.999 level and then held fixed; their noise comes first off the seed,
+    // as the reference draws it before the target's.
+    let n_cond = plan.packed.num_condition_video_rows;
+    assert_eq!(cond_video.len(), n_cond * cfg.video_patch_dim());
+    let (cond_noise, mut video, mut audio) = initial_noise(
+        cfg,
+        n_cond,
+        plan.num_video_rows - n_cond,
+        plan.num_audio_rows,
+        seed,
+    );
+    let aug = packing::KEYFRAME_NOISE_AUG;
+    let cond: Vec<f32> = cond_video
+        .iter()
+        .zip(&cond_noise)
+        .map(|(z, n)| aug * z + (1.0 - aug) * n)
+        .collect();
     // A rung grid starts just below sigma 1 (FastH3: shift(0.999)); the noise
     // enters at that level. The base grid starts at exactly 1.
     let (sv, sa) = (
@@ -897,9 +972,16 @@ pub async fn denoise<S: WeightSource>(
     let steps = plan.schedule.num_steps();
     for step in 0..steps {
         let _guard = trace::scope!(format!("minimax.denoise.step.{step}")).entered();
+        // The step-end memory line below then reports this step's own peaks.
+        backend.mem_account().reset_peaks();
+        let rows: Cow<[f32]> = if cond.is_empty() {
+            Cow::Borrowed(&video)
+        } else {
+            Cow::Owned([cond.as_slice(), &video].concat())
+        };
         let v = forward(
-            cfg, backend, pipelines, residency, workspace, handles, table, plan, step, &video,
-            &audio, text,
+            cfg, backend, pipelines, residency, workspace, handles, table, plan, step, &rows,
+            &audio, text, cancel,
         )
         .await?;
         // The reference evaluates `ratio * x + (1 - ratio) * (x + sigma * v)`
@@ -927,6 +1009,13 @@ pub async fn denoise<S: WeightSource>(
             let x0 = *x + ac.sigma_from_timestep * dv;
             *x = ac.ratio * *x + ac.one_minus_ratio * x0;
         }
+        tracing::debug!(
+            target: thinfer_core::trace::DIAG,
+            step,
+            mem = ?backend.mem_account().snapshot(),
+            pool = workspace.pool_bytes(),
+            "minimax denoise memory",
+        );
         progress(step + 1, steps);
     }
     // Spatial coherence of the result: correlation between horizontally
@@ -1005,33 +1094,40 @@ pub fn audio_rows_to_latents(cfg: &DitConfig, rows: &[f32], num_audio_latents: u
 
 /// Draw the initial noise for a t2va run.
 ///
-/// The draw order matches the reference so a seed reproduces a run: video
-/// first, then audio.
+/// The draw order matches the reference's: conditioning video first, then the
+/// target video, then audio (with no conditioning rows, a t2va run's noise).
 pub fn initial_noise(
     cfg: &DitConfig,
+    num_condition_rows: usize,
     num_video_rows: usize,
     num_audio_rows: usize,
     seed: u64,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let c = num_condition_rows * cfg.video_patch_dim();
     let v = num_video_rows * cfg.video_patch_dim();
     let a = num_audio_rows * cfg.audio_latents_dim;
-    let all = gaussian_noise(v + a, seed);
-    let (video, audio) = all.split_at(v);
-    (video.to_vec(), audio.to_vec())
+    let all = gaussian_noise(c + v + a, seed);
+    let (cond, rest) = all.split_at(c);
+    let (video, audio) = rest.split_at(v);
+    (cond.to_vec(), video.to_vec(), audio.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The native canvas is knowingly out of budget; the guard must say so
-    /// rather than let a device loss report it.
+    /// The native canvas at 5s is past the backend block's budget but inside
+    /// the row-chunked accelerated block's; the guard must say which.
     #[test]
-    fn native_canvas_is_refused_until_row_chunking_lands() {
+    fn native_canvas_needs_the_chunked_block() {
         // 1344x768 -> latent 84x48 -> patch (1,2,2) -> 1008 rows/frame.
         let native_rows = 37 * 1008 + 414 + 64;
-        assert!(check_sequence_budget::<std::convert::Infallible>(native_rows).is_err());
-        assert!(check_sequence_budget::<std::convert::Infallible>(4600).is_ok());
+        let check = |rows, accel| {
+            check_sequence_budget::<std::convert::Infallible>(rows, max_packed_rows(accel))
+        };
+        assert!(check(native_rows, false).is_err());
+        assert!(check(native_rows, true).is_ok());
+        assert!(check(4600, false).is_ok());
     }
 
     /// Timestep segments must collapse contiguous equal timesteps, or the final
@@ -1108,12 +1204,16 @@ mod tests {
     #[test]
     fn noise_is_seed_reproducible_and_split_by_modality() {
         let c = DitConfig::h3_33b();
-        let (v1, a1) = initial_noise(&c, 10, 4, 7);
-        let (v2, a2) = initial_noise(&c, 10, 4, 7);
+        let (_, v1, a1) = initial_noise(&c, 0, 10, 4, 7);
+        let (_, v2, a2) = initial_noise(&c, 0, 10, 4, 7);
         assert_eq!(v1, v2);
         assert_eq!(a1, a2);
         assert_eq!(v1.len(), 10 * c.video_patch_dim());
         assert_eq!(a1.len(), 4 * c.audio_latents_dim);
-        assert_ne!(initial_noise(&c, 10, 4, 8).0, v1);
+        assert_ne!(initial_noise(&c, 0, 10, 4, 8).1, v1);
+        // Conditioning noise is drawn first: the target's shifts behind it.
+        let (c3, v3, _) = initial_noise(&c, 2, 10, 4, 7);
+        assert_eq!(c3, v1[..2 * c.video_patch_dim()]);
+        assert_ne!(v3, v1);
     }
 }

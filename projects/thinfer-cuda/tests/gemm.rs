@@ -100,8 +100,19 @@ fn run(ctx: &Arc<CudaContext>, kernels: &GemmKernels, c: &Case, rng: &mut Rng) -
     );
     let out_bytes = if c.desc.out_f32 { 4 } else { 2 };
     let po = upload(ctx, &vec![0u8; m * n * out_bytes]);
+    // k = 0: read K from the dims buffer (the uniform path).
     let ran = kernels
-        .run(&c.desc, pa, pb, po, pd, m as u32, n as u32)
+        .run(
+            &c.desc,
+            pa,
+            pb,
+            po,
+            pd,
+            m as u32,
+            n as u32,
+            0,
+            Default::default(),
+        )
         .unwrap();
     let mut raw = vec![0u8; m * n * out_bytes];
     unsafe { sys::cuMemcpyDtoH_v2(raw.as_mut_ptr().cast(), po, raw.len()) }
@@ -167,7 +178,8 @@ fn cuda_gemm_matches_reference() {
                     continue;
                 }
                 // Ragged M/N/K (not tile multiples) and an exact-tile shape.
-                for (m, n, k) in [(200, 136, 72), (256, 256, 256)] {
+                // 1100 x 520: 9 x 5 tiles, past one 8-row-tile raster group, ragged.
+                for (m, n, k) in [(200, 136, 72), (256, 256, 256), (1100, 520, 264)] {
                     let c = Case {
                         desc,
                         m,
@@ -201,5 +213,108 @@ fn cuda_gemm_matches_reference() {
     assert!(
         run(&ctx, &kernels, &c, &mut rng).is_none(),
         "overflowing bf16 weight did not decline"
+    );
+}
+
+/// The fused epilogue `out = residual + gate * (acc + bias)` against the CPU
+/// reference, with the residual in its own buffer and aliasing the output
+/// (the in-place accumulate), on a multi-group ragged shape; a non-bf16 output
+/// declines it.
+#[test]
+fn cuda_gemm_fused_epilogue() {
+    let Ok(ctx) = CudaContext::new(0) else {
+        eprintln!("skipped[cuda gemm epilogue]: no device");
+        return;
+    };
+    let sm = ctx.compute_capability().unwrap();
+    let Ok(kernels) = GemmKernels::new(ctx.clone(), sm) else {
+        eprintln!("skipped[cuda gemm epilogue]: no kernels");
+        return;
+    };
+    let mut rng = Rng(23);
+    let (m, n, k) = (1100usize, 520usize, 264usize);
+    let desc = GemmDesc {
+        a: GemmType::Bf16,
+        b: GemmType::Bf16,
+        b_nmajor: false,
+        out_f32: false,
+    };
+    let bf = |rng: &mut Rng, len: usize, s: f32| -> (Vec<f32>, Vec<u16>) {
+        (0..len)
+            .map(|_| store(GemmType::Bf16, rng.next() * s))
+            .unzip()
+    };
+    let (a_val, a_bits) = bf(&mut rng, m * k, 1.0);
+    let (b_val, b_bits) = bf(&mut rng, k * n, 0.1);
+    let (bias_val, bias_bits) = bf(&mut rng, n, 0.5);
+    let (gate_val, gate_bits) = bf(&mut rng, n, 1.5);
+    let (res_val, res_bits) = bf(&mut rng, m * n, 2.0);
+    let want: Vec<f32> = (0..m * n)
+        .map(|i| {
+            let (r, c) = (i / n, i % n);
+            let acc: f32 = (0..k).map(|kk| a_val[r * k + kk] * b_val[kk * n + c]).sum();
+            res_val[i] + gate_val[c] * (acc + bias_val[c])
+        })
+        .collect();
+    for in_place in [false, true] {
+        let (pa, pb) = (upload(&ctx, bytes(&a_bits)), upload(&ctx, bytes(&b_bits)));
+        let (pbias, pgate) = (
+            upload(&ctx, bytes(&bias_bits)),
+            upload(&ctx, bytes(&gate_bits)),
+        );
+        let pres = upload(&ctx, bytes(&res_bits));
+        let po = if in_place {
+            pres
+        } else {
+            upload(&ctx, &vec![0u8; m * n * 2])
+        };
+        let epi = thinfer_core::backend::GemmEpilogue {
+            bias: pbias,
+            residual: pres,
+            gate: pgate,
+        };
+        let ran = kernels
+            .run(&desc, pa, pb, po, 0, m as u32, n as u32, k as u32, epi)
+            .unwrap();
+        assert!(ran, "fused epilogue declined (in_place {in_place})");
+        let mut raw = vec![0u8; m * n * 2];
+        unsafe { sys::cuMemcpyDtoH_v2(raw.as_mut_ptr().cast(), po, raw.len()) }
+            .result()
+            .unwrap();
+        let (mut num, mut den) = (0f64, 0f64);
+        for (i, b) in raw.chunks_exact(2).enumerate() {
+            let e = load(GemmType::Bf16, u16::from_le_bytes([b[0], b[1]])) - want[i];
+            num += (e * e) as f64;
+            den += (want[i] * want[i]) as f64;
+        }
+        let rel = (num / den).sqrt();
+        eprintln!("cuda gemm epilogue in_place {in_place}: rel_l2 {rel:.2e}");
+        assert!(
+            rel < 8e-3,
+            "epilogue rel_l2 {rel:.2e} (in_place {in_place})"
+        );
+        let mut ptrs = vec![pa, pb, pbias, pgate, pres];
+        if !in_place {
+            ptrs.push(po);
+        }
+        for p in ptrs {
+            unsafe { sys::cuMemFree_v2(p) }.result().unwrap();
+        }
+    }
+    // f16 output: a non-empty epilogue is declined, never silently dropped.
+    let f16_desc = GemmDesc {
+        a: GemmType::F16,
+        ..desc
+    };
+    let epi = thinfer_core::backend::GemmEpilogue {
+        bias: 16,
+        residual: 0,
+        gate: 0,
+    };
+    assert!(
+        !kernels
+            .run(&f16_desc, 16, 16, 16, 0, 128, 64, 64, epi)
+            .unwrap(),
+        "f16 output took an epilogue"
     );
 }

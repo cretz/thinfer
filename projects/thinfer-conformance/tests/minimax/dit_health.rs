@@ -169,13 +169,13 @@ async fn dit_health() {
     let (table, _held) = upload_modulation_tables(&backend, &workspace, &tables, ActDtype::Bf16)
         .expect("upload table");
 
-    let (video, audio) = initial_noise(&cfg, plan.num_video_rows, plan.num_audio_rows, 42);
+    let (_, video, audio) = initial_noise(&cfg, 0, plan.num_video_rows, plan.num_audio_rows, 42);
     let text = synthetic_rows(plan.num_text_rows * cfg.text_dim, 0.25);
 
     let started = std::time::Instant::now();
     let v = forward(
         &cfg, &backend, &pipelines, &residency, &workspace, &handles, &table, &plan, 0, &video,
-        &audio, &text,
+        &audio, &text, None,
     )
     .await
     .expect("dit forward");
@@ -217,7 +217,7 @@ async fn dit_health() {
     let base_only = handles.without_lora();
     let v0 = forward(
         &cfg, &backend, &pipelines, &residency, &workspace, &base_only, &table, &plan, 0, &video,
-        &audio, &text,
+        &audio, &text, None,
     )
     .await
     .expect("base-only dit forward");
@@ -267,6 +267,7 @@ async fn dit_health() {
         &video,
         &audio,
         &text,
+        None,
     )
     .await
     .expect("dense dit forward");
@@ -307,7 +308,7 @@ async fn dit_health() {
         .unwrap_or_else(|e| panic!("compile {name} coopmat pipelines: {e:?}"));
         let out = forward(
             &cfg, &backend, &pipes, &residency, &workspace, &handles, &table, &plan, 0, &video,
-            &audio, &text,
+            &audio, &text, None,
         )
         .await
         .unwrap_or_else(|e| panic!("{name} coopmat forward: {e:?}"));

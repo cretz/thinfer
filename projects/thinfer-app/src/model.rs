@@ -38,7 +38,7 @@ pub const VIDEO_MAX_STEPS: u32 = 8;
 /// string), so they take a plain model string and validate it against this set
 /// instead of a typed enum. Keep in sync with the typed
 /// `ImageModelId::supports_adapters` / `VideoModelId::supports_adapters` predicates.
-pub const ADAPTER_MODEL_IDS: [&str; 8] = [
+pub const ADAPTER_MODEL_IDS: [&str; 9] = [
     "krea-2-turbo",
     "qwen-image-rapid",
     "qwen-image-edit-rapid",
@@ -47,6 +47,7 @@ pub const ADAPTER_MODEL_IDS: [&str; 8] = [
     "wan2.1-t2v-1.3b",
     "minimax-h3",
     "fasth3-trim",
+    "fasth3-omni",
 ];
 
 /// Whether `id` names an adapter-supporting model (see [`ADAPTER_MODEL_IDS`]).
@@ -126,6 +127,19 @@ impl ImageModelId {
     /// Z-Image-Turbo Q4_K_M: upstream weights, the fastest image model, and the
     /// web UI's first entry (keep the two in step).
     pub const DEFAULT: ImageModelId = ImageModelId::ZImageTurboQ4;
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ZImageTurboQ8 => "Z-Image Turbo, 8-step (Q8)",
+            Self::ZImageTurboQ4 => "Z-Image Turbo, 8-step (Q4, smaller)",
+            Self::ZImageTurboBf16 => "Z-Image Turbo, 8-step (bf16, largest)",
+            Self::Ideogram4Q8 => "Ideogram 4 + turbotime LoRA",
+            Self::QwenImageEditRapid => "Qwen-Image Edit Rapid, 4-step (edits --input-image)",
+            Self::QwenImageRapid => "Qwen-Image Rapid, 4-step",
+            Self::Krea2Turbo => "Krea 2 Turbo, 8-step, aesthetic",
+        }
+    }
 
     /// Which engine pipeline this id drives.
     pub fn kind(self) -> ImageKind {
@@ -372,10 +386,61 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "fasth3-trim"))]
     #[cfg_attr(feature = "serde", serde(rename = "fasth3-trim"))]
     Fasth3Trim,
+    /// FastVideo FastH3-Omni: the 8-step distillation of the Ref2VA
+    /// checkpoint (all 50 blocks, PDD heads, Comfy NVFP4). Text to video+audio,
+    /// optionally conditioned on reference images the prompt can name.
+    #[cfg_attr(feature = "cli", value(name = "fasth3-omni"))]
+    #[cfg_attr(feature = "serde", serde(rename = "fasth3-omni"))]
+    Fasth3Omni,
 }
 
 impl VideoModelId {
     pub const DEFAULT: VideoModelId = VideoModelId::FastwanTi2v5b;
+
+    /// The attention precision a request gets without `--attn`: INT8 on the
+    /// FastH3 models (same quality, faster), bf16 elsewhere (no INT8 path).
+    pub fn default_attn(self) -> AttnPrecision {
+        if self.is_fasth3() {
+            AttnPrecision::Int8
+        } else {
+            AttnPrecision::Bf16
+        }
+    }
+
+    /// The decoder a request gets without `--vae`. MiniMax-H3 family: the
+    /// NVFP4 decoder (indistinguishable frames, ~2x faster decode), which the
+    /// driver swaps for the fp16 one on hardware without NVFP4. Others: tiny.
+    pub fn default_vae(self) -> VaeChoice {
+        if self.is_minimax() {
+            VaeChoice::Nvfp4
+        } else {
+            VaeChoice::Tiny
+        }
+    }
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::FastwanTi2v5b => "FastWan2.2 TI2V 5B, 3-step",
+            Self::Longlive205b => "LongLive 2.0 5B, long clips",
+            Self::AnyflowT2v14b => "AnyFlow Wan2.1 14B, any step count",
+            Self::Mobilewan => "MobileWan, pruned 5B",
+            Self::Fastwan21T2v13b => "FastWan2.1 1.3B, 3-step",
+            Self::Wan21T2v13b => "Wan2.1 1.3B + step-distill LoRA",
+            Self::Ltx23Distilled => "LTX-2.3 22B distilled, video + audio (Q8)",
+            Self::Ltx23DistilledQ4 => "LTX-2.3 22B distilled, video + audio (Q4)",
+            Self::Ltx23Dev => "LTX-2.3 22B dev + distill LoRA, video + audio (Q8)",
+            Self::Ltx23DevQ4 => "LTX-2.3 22B dev + distill LoRA, video + audio (Q4)",
+            Self::Ltx2Rapid => "LTX-2 19B rapid merge, video + audio",
+            Self::Wan22T2vA14b => "Wan2.2 A14B MoE, 4-step",
+            Self::Hunyuan15T2v => "HunyuanVideo 1.5, 4-step",
+            Self::Hunyuan15I2v => "HunyuanVideo 1.5 image-to-video (--input-image)",
+            Self::DreamIdV => "DreamID-V video face swap (--input-video, --source-image)",
+            Self::MinimaxH3 => "MiniMax-H3 33B + turbo LoRA, video + audio",
+            Self::Fasth3Trim => "FastH3-Trim, 8-step, video + audio",
+            Self::Fasth3Omni => "FastH3-Omni, 8-step, video + audio, --ref-image",
+        }
+    }
 
     pub fn manifest(self) -> &'static ModelManifest {
         match self {
@@ -383,7 +448,9 @@ impl VideoModelId {
             VideoModelId::Ltx23Dev | VideoModelId::Ltx23DevQ4 => &ltxmf::DEV_MANIFEST,
             VideoModelId::Ltx2Rapid => &ltxmf::LTX2_RAPID_MANIFEST,
             VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v => &hunmf::MANIFEST,
-            VideoModelId::MinimaxH3 | VideoModelId::Fasth3Trim => &mmmf::MANIFEST,
+            VideoModelId::MinimaxH3 | VideoModelId::Fasth3Trim | VideoModelId::Fasth3Omni => {
+                &mmmf::MANIFEST
+            }
             _ => &wanmf::MANIFEST,
         }
     }
@@ -482,7 +549,13 @@ impl VideoModelId {
     /// MiniMax-H3 and its distillations: their own single-stream packed-sequence
     /// pipeline + audio tail. None of the Wan/LTX machinery applies.
     pub fn is_minimax(self) -> bool {
-        matches!(self, VideoModelId::MinimaxH3 | VideoModelId::Fasth3Trim)
+        self == VideoModelId::MinimaxH3 || self.is_fasth3()
+    }
+
+    /// FastVideo's 8-step H3 distills: fixed schedules, NVFP4 block linears on
+    /// the accelerated row-chunked block.
+    pub fn is_fasth3(self) -> bool {
+        matches!(self, VideoModelId::Fasth3Trim | VideoModelId::Fasth3Omni)
     }
 
     /// The roles a MiniMax-family t2va generate downloads and opens.
@@ -490,6 +563,7 @@ impl VideoModelId {
         use thinfer_models::minimax::manifest as m;
         match self {
             VideoModelId::Fasth3Trim => m::RUNTIME_ROLES_T2VA_FASTH3_TRIM,
+            VideoModelId::Fasth3Omni => m::RUNTIME_ROLES_REF2VA_FASTH3_OMNI,
             _ => m::RUNTIME_ROLES_T2VA_Q4,
         }
     }
@@ -499,6 +573,7 @@ impl VideoModelId {
         use thinfer_models::minimax::DitConfig;
         match self {
             VideoModelId::Fasth3Trim => DitConfig::fasth3_trim(),
+            VideoModelId::Fasth3Omni => DitConfig::fasth3_omni(),
             _ => DitConfig::h3_33b(),
         }
     }
@@ -822,7 +897,7 @@ impl VideoModelId {
     pub fn default_frames(self) -> u32 {
         if self.is_ltx() {
             Self::LTX_DEFAULT_FRAMES
-        } else if matches!(self, VideoModelId::Fasth3Trim) {
+        } else if self.is_fasth3() {
             Self::FASTH3_DEFAULT_FRAMES
         } else if self.is_minimax() {
             Self::MINIMAX_DEFAULT_FRAMES
@@ -1036,6 +1111,32 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::DreamIdV => "dreamid-v",
             VideoModelId::MinimaxH3 => "minimax-h3",
             VideoModelId::Fasth3Trim => "fasth3-trim",
+            VideoModelId::Fasth3Omni => "fasth3-omni",
+        })
+    }
+}
+
+/// Attention precision for the FastH3 models' sparse attention (VSA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum AttnPrecision {
+    /// bf16 Q/K/V (the reference path).
+    Bf16,
+    /// INT8 QK^T (SageAttention-style: K smoothed by its mean, per-tile
+    /// scales; P.V stays bf16). Same quality, but a different sample per seed
+    /// than bf16; ~1.2x faster attention (~1.35x with reference images). The
+    /// FastH3 default.
+    Int8,
+}
+
+impl std::fmt::Display for AttnPrecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AttnPrecision::Bf16 => "bf16",
+            AttnPrecision::Int8 => "int8",
         })
     }
 }
@@ -1054,12 +1155,34 @@ pub enum VaeChoice {
     /// than the base tiny. Hunyuan-only; other models fall back to `Tiny`.
     #[cfg_attr(feature = "cli", value(name = "tiny-ft"))]
     TinyFt,
+    /// MiniMax-H3 family: FastVideo's NVFP4 video decoder, all 36 layers
+    /// (QAD; ~46 dB PSNR vs the original decoder). Opt-in: lossy, faster, needs
+    /// an NVIDIA Blackwell GPU (NVFP4).
+    Nvfp4,
+    /// MiniMax-H3 family: the 8-layer NVFP4 decoder (~36 dB). Opt-in, fastest.
+    #[cfg_attr(feature = "cli", value(name = "nvfp4-fast"))]
+    Nvfp4Fast,
+}
+
+impl VaeChoice {
+    /// The MiniMax-H3 NVFP4 decoder this selects, as (manifest role, decoder
+    /// layers). `None` = the H3 family's own fp16 decoder.
+    pub fn minimax_nvfp4(self) -> Option<(&'static str, usize)> {
+        use thinfer_models::minimax::manifest::role;
+        match self {
+            VaeChoice::Nvfp4 => Some((role::VAE_DECODER_NVFP4, 36)),
+            VaeChoice::Nvfp4Fast => Some((role::VAE_DECODER_NVFP4_FAST, 8)),
+            VaeChoice::Full | VaeChoice::Tiny | VaeChoice::TinyFt => None,
+        }
+    }
 }
 
 impl From<VaeChoice> for thinfer_models::wan::pipeline::VaeChoice {
     fn from(v: VaeChoice) -> Self {
         match v {
-            VaeChoice::Full => Self::Full,
+            // The NVFP4 decoders are MiniMax-H3 only and rejected for every
+            // other model at request validation.
+            VaeChoice::Full | VaeChoice::Nvfp4 | VaeChoice::Nvfp4Fast => Self::Full,
             // Wan has no fine-tuned tiny decoder; a `tiny-ft` request on a Wan
             // model degrades to its own tiny (the ft is a Hunyuan-only option,
             // and the web only offers it for Hunyuan).
@@ -1074,6 +1197,8 @@ impl std::fmt::Display for VaeChoice {
             VaeChoice::Full => "full",
             VaeChoice::Tiny => "tiny",
             VaeChoice::TinyFt => "tiny-ft",
+            VaeChoice::Nvfp4 => "nvfp4",
+            VaeChoice::Nvfp4Fast => "nvfp4-fast",
         })
     }
 }
@@ -1207,6 +1332,15 @@ pub enum SwapModel {
 
 impl SwapModel {
     pub const DEFAULT: SwapModel = SwapModel::Hyperswap1a;
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Hyperswap1a => "HyperSwap 1a",
+            Self::Hyperswap1b => "HyperSwap 1b",
+            Self::Hyperswap1c => "HyperSwap 1c",
+        }
+    }
 
     /// The HyperSwap weight file for this checkpoint.
     pub fn file(self) -> thinfer_core::manifest::FileRef {

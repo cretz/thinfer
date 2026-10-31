@@ -299,7 +299,8 @@ pub async fn run(
             vae_res.evict_all_and_free(&**backend);
             out
         }
-        VaeChoice::Full => {
+        // NVFP4 is rejected for Hunyuan at request validation.
+        VaeChoice::Full | VaeChoice::Nvfp4 | VaeChoice::Nvfp4Fast => {
             let vae_path = resolve_role(manifest, role::VAE)?;
             let vae_src = open_st(&vae_path).await?;
             let vae_res = WeightResidency::new(vae_src, req.budget);
@@ -743,7 +744,8 @@ pub async fn run_i2v(
             vae_res.evict_all_and_free(&**backend);
             out
         }
-        VaeChoice::Full => {
+        // NVFP4 is rejected for Hunyuan at request validation.
+        VaeChoice::Full | VaeChoice::Nvfp4 | VaeChoice::Nvfp4Fast => {
             let vae_path = resolve_role(manifest, role::VAE)?;
             let vae_src = open_st(&vae_path).await?;
             let vae_res = WeightResidency::new(vae_src, req.budget);

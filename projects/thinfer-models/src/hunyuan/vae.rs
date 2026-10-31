@@ -1204,9 +1204,11 @@ impl HunyuanVaeDecoder {
                 .await
             {
                 Ok(v) => return Ok(v),
-                Err(WgpuError::Allocate { .. } | WgpuError::BudgetExceeded { .. })
-                    if tile > TILE_MIN || tf as u32 > TEMPORAL_TILE_MIN =>
-                {
+                Err(
+                    WgpuError::Allocate { .. }
+                    | WgpuError::BudgetExceeded { .. }
+                    | WgpuError::ExternalAllocate { .. },
+                ) if tile > TILE_MIN || tf as u32 > TEMPORAL_TILE_MIN => {
                     workspace.drain_pool();
                     let prev = (tf, tile);
                     loop {

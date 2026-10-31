@@ -102,6 +102,7 @@ async fn encoder_parity() {
                 &handles,
                 residency.source(),
                 &exp_ids,
+                &[],
             )
             .await
             .expect("encoder forward")

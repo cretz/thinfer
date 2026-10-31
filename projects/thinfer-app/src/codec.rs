@@ -50,6 +50,36 @@ pub fn encode_mp4_with_audio(
     fps: u32,
     audio: Option<AudioPassthrough>,
 ) -> Result<Vec<u8>, String> {
+    encode_h264(video, fps)?.mux(audio)
+}
+
+/// An encoded H.264 track awaiting its container: [`encode_h264`]'s output,
+/// so the (CPU-heavy) encode can run while other work produces the audio.
+pub struct H264Stream {
+    width: usize,
+    height: usize,
+    fps: u32,
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+    samples: Vec<(bool, Vec<u8>)>,
+}
+
+impl H264Stream {
+    /// The MP4: this track plus `audio` when given.
+    pub fn mux(&self, audio: Option<AudioPassthrough>) -> Result<Vec<u8>, String> {
+        mux_mp4(
+            self.width,
+            self.height,
+            self.fps,
+            &self.sps,
+            &self.pps,
+            &self.samples,
+            audio,
+        )
+    }
+}
+
+pub fn encode_h264(video: &WanVideo, fps: u32) -> Result<H264Stream, String> {
     use openh264::OpenH264API;
     use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
     use openh264::formats::{RgbSliceU8, YUVBuffer};
@@ -82,9 +112,14 @@ pub fn encode_mp4_with_audio(
         samples.push((is_key, sample));
     }
 
-    let sps = sps.ok_or("openh264 produced no SPS")?;
-    let pps = pps.ok_or("openh264 produced no PPS")?;
-    mux_mp4(w, h, fps, &sps, &pps, &samples, audio)
+    Ok(H264Stream {
+        width: w,
+        height: h,
+        fps,
+        sps: sps.ok_or("openh264 produced no SPS")?,
+        pps: pps.ok_or("openh264 produced no PPS")?,
+        samples,
+    })
 }
 
 /// Encode planar stereo f32 PCM `[2, n]` (channel-major, `[-1, 1]`) to AAC-LC
