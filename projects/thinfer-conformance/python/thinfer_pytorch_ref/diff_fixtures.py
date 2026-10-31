@@ -18,8 +18,10 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-# A few ulps of each file's stored precision (fp32: 2^-23; bf16: 2^-8).
-RTOL = {"fp32": 2.0**-20, "bf16w": 2.0**-6, "bf16p": 2.0**-6}
+# Rounding noise in each file's stored precision (fp32 ulp: 2^-23; bf16: 2^-8).
+# fp32 gets more room: a long reduction (conv3d multitile) sums in a different
+# order on another CPU and lands ~40 ulps away (seen: 4.6e-6 relative on CI).
+RTOL = {"fp32": 2.0**-16, "bf16w": 2.0**-6, "bf16p": 2.0**-6}
 
 
 def main() -> None:

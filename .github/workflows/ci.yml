@@ -114,12 +114,22 @@ jobs:
         working-directory: projects
         run: cargo clippy -p thinfer-web --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
 
-      - name: pnpm fmt:check / lint / typecheck
+      # One command per step: Windows runs `run:` in PowerShell, which reports only
+      # the LAST command's exit code, so a multi-line step there swallowed failures.
+      # Formatting is OS-independent and the Windows checkout has CRLF line endings
+      # (runner autocrlf), so it is checked off Windows only.
+      - name: pnpm fmt:check
+        if: runner.os != 'Windows'
         working-directory: projects/thinfer-web
-        run: |
-          pnpm fmt:check
-          pnpm lint
-          pnpm typecheck
+        run: pnpm fmt:check
+
+      - name: pnpm lint
+        working-directory: projects/thinfer-web
+        run: pnpm lint
+
+      - name: pnpm typecheck
+        working-directory: projects/thinfer-web
+        run: pnpm typecheck
 
       # Every failing test binary in one run, not just the first.
       - name: cargo test (native)
