@@ -13,6 +13,7 @@
 //!
 //! Health: finiteness, latent variance, decoded-video variance + temporal
 //! motion; optional PNG staging via `THINFER_E2E_PNG_DIR`.
+#![cfg(feature = "wan-e2e")]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -1,6 +1,7 @@
 //! Shared-memory round trip: bytes written by wgpu are read back by CUDA from
 //! the same allocation, and vice versa. Skips (passes, with a note) when the
 //! machine has no NVIDIA Vulkan adapter with CUDA.
+#![cfg(not(target_os = "macos"))]
 
 use cudarc::driver::sys;
 

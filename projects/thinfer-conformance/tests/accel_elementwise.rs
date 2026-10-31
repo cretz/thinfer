@@ -3,6 +3,7 @@
 //! between RMSNorm and modulation / RoPE: RMSNorm + AdaLN over three row
 //! segments, qkv split + per-head q/k RMSNorm + partial half-rot RoPE, the
 //! gated residual add, and the fused SwiGLU. Skips without CUDA.
+#![cfg(not(target_os = "macos"))]
 
 use thinfer_core::backend::{
     Backend, BufRef, ElementwiseOp, PowerPreference, RowSegments, WgpuBackend, WgpuConfig,

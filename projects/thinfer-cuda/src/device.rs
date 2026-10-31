@@ -8,42 +8,14 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, result, sys};
 
+use crate::Unavailable;
+
 /// The CUDA side of the wgpu adapter.
 pub struct CudaDevice {
     pub ctx: Arc<CudaContext>,
     pub name: String,
     /// Compute capability `(major, minor)`, e.g. `(12, 0)` for consumer Blackwell.
     pub sm: (i32, i32),
-}
-
-/// Why the CUDA path is unavailable. Logged once by the caller; never fatal.
-#[derive(Debug)]
-pub enum Unavailable {
-    /// The wgpu device is not on the Vulkan backend (no shared-memory interop).
-    NotVulkan,
-    /// The Vulkan driver reports no valid device UUID.
-    NoVulkanUuid,
-    /// The Vulkan device cannot export memory to another API on this OS.
-    NoExternalMemory,
-    /// The CUDA driver library is not installed.
-    NoDriver,
-    /// The driver loaded but a call failed.
-    Driver(String),
-    /// No CUDA device has the adapter's UUID (e.g. a non-NVIDIA adapter).
-    NoMatch,
-}
-
-impl std::fmt::Display for Unavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotVulkan => f.write_str("wgpu device is not on the Vulkan backend"),
-            Self::NoVulkanUuid => f.write_str("Vulkan driver reports no device UUID"),
-            Self::NoExternalMemory => f.write_str("Vulkan device cannot export memory to CUDA"),
-            Self::NoDriver => f.write_str("CUDA driver library not found"),
-            Self::Driver(e) => write!(f, "CUDA driver: {e}"),
-            Self::NoMatch => f.write_str("no CUDA device matches the wgpu adapter"),
-        }
-    }
 }
 
 fn driver_err(e: result::DriverError) -> Unavailable {

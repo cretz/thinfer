@@ -1083,6 +1083,9 @@ impl LocalExecutor {
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         req.validate()?;
+        // The ONNX runtime runs no accelerator op and reallocates per frame:
+        // exportable (CUDA-shared) buffers would cost ~3x the whole swap.
+        let _plain = self.backend.plain_allocations();
         let scrfd = std::fs::read(resolve_file(&crate::model::SCRFD)?)
             .map_err(|e| format!("read scrfd: {e}"))?;
         let arcface = std::fs::read(resolve_file(&crate::model::ARCFACE)?)

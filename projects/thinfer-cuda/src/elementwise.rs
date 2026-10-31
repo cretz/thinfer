@@ -137,7 +137,7 @@ extern "C" __global__ void __launch_bounds__(256) silu_mul_fused(
 /// `struct Seg` by value (`MAX_SEG` in the source mirrors `MAX_SEGMENTS`).
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Seg {
+pub(crate) struct Seg {
     n: u32,
     end: [u32; MAX_SEGMENTS],
     a: [u64; MAX_SEGMENTS],

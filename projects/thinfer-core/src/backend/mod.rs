@@ -540,6 +540,18 @@ pub struct GemmNvfp4Addrs {
     /// `total` rows (`base` a multiple of 128); `None` = the whole composite
     /// (`n` rows). The low-rank `bt` is then `[rank, total]`, read at `base`.
     pub rows: Option<Nvfp4Rows>,
+    /// Optional gated residual on the bf16 product (see [`Nvfp4GateAdd`]).
+    pub gate_add: Option<Nvfp4GateAdd>,
+}
+
+/// `out = bf16(residual + a[seg] * bf16(acc))`: [`ElementwiseOp::GateAdd`]
+/// over the GEMM's own output, with the same two roundings (bit-identical to
+/// the separate pass, without its `[m, n]` round trip). `residual` is `[m,
+/// n]` bf16 and must not alias `out`; `seg` rows are the GEMM's rows.
+#[derive(Clone, Copy, Debug)]
+pub struct Nvfp4GateAdd {
+    pub residual: u64,
+    pub seg: RowSegments,
 }
 
 /// A 128-row-aligned weight-row range of an NVFP4 composite.

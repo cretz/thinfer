@@ -930,9 +930,12 @@ fn block_forward_accel<'s>(
         return Ok(false);
     }
 
-    // Past this point work is enqueued, so a decline is a broken accept
-    // contract, not a fallback.
-    let ran = |ok: bool, what: &str| assert!(ok, "accelerator declined {what} after accepting it");
+    // Past this point work is enqueued, so a decline fails the run (no
+    // fallback); the scope waits for the enqueued work as it drops.
+    let ran = |ok: bool, what: &str| match ok {
+        true => Ok(()),
+        false => Err(WgpuError::AcceleratorDeclined { op: what.into() }),
+    };
     let addr = |b: BatchBuf<'s>| {
         scope
             .accel_addr(b)
@@ -968,7 +971,7 @@ fn block_forward_accel<'s>(
             ran(
                 scope.try_gemm_fused(mm, src, scope.import_copy(w), out, rows, n, k, epi)?,
                 "gemm",
-            );
+            )?;
             return Ok::<_, WgpuError>(());
         }
         let lin = match residual {
@@ -982,7 +985,7 @@ fn block_forward_accel<'s>(
         ran(
             scope.try_gemm_nvfp4(src, scope.import_copy(w), lin, rows, n, k, format)?,
             "nvfp4 gemm",
-        );
+        )?;
         ran(
             scope.accel_elementwise(&ElementwiseOp::AddBias {
                 x: addr(lin),
@@ -992,7 +995,7 @@ fn block_forward_accel<'s>(
                 dim: n,
             }),
             "bias",
-        );
+        )?;
         if let Some((r, g)) = residual {
             ran(
                 scope.accel_elementwise(&ElementwiseOp::GateAdd {
@@ -1004,7 +1007,7 @@ fn block_forward_accel<'s>(
                     seg: one(g, None),
                 }),
                 "gated residual",
-            );
+            )?;
         }
         Ok(())
     };
@@ -1032,7 +1035,7 @@ fn block_forward_accel<'s>(
             seg: one(zeros, Some(zeros)),
         }),
         "norm1",
-    );
+    )?;
     let qkv = mm_fused(n1, bufs.to_qkv, bufs.to_qkv_bias, None, 3 * dim, dim)?;
     let (q, k, v) = (act(rows * dim)?, act(rows * dim)?, act(rows * dim)?);
     ran(
@@ -1055,7 +1058,7 @@ fn block_forward_accel<'s>(
             eps,
         }),
         "qk norm + rope",
-    );
+    )?;
     let sa = act(rows * dim)?;
     ran(
         scope.try_tile_attention(
@@ -1074,7 +1077,7 @@ fn block_forward_accel<'s>(
             scope.import_copy(plan.lists.as_buf_ref()),
         )?,
         "tile attention",
-    );
+    )?;
     let after_attn = mm_fused(
         sa,
         bufs.to_out,
@@ -1097,7 +1100,7 @@ fn block_forward_accel<'s>(
             seg: one(zeros, Some(zeros)),
         }),
         "norm2",
-    );
+    )?;
     let fused = mm_fused(n2, bufs.w1, bufs.w1_bias, None, 2 * ffn, dim)?;
     let gu = act(rows * ffn)?;
     ran(
@@ -1108,7 +1111,7 @@ fn block_forward_accel<'s>(
             h: ffn,
         }),
         "swiglu",
-    );
+    )?;
     mm_into(
         gu,
         bufs.w2,

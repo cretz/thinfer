@@ -11,6 +11,9 @@ publish.workspace = true
 # adapter means the wgpu op runs unchanged.
 [dependencies]
 thinfer-core = { path = "../thinfer-core" }
+
+# macOS has no Vulkan interop (wgpu runs on Metal): only the `install` stub builds there.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 tracing = { workspace = true }
 wgpu = "29"
 # Same ash as wgpu-hal 29 (raw Vulkan handles for external-memory interop).

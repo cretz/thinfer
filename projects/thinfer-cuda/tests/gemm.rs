@@ -2,6 +2,7 @@
 //! contract: every supported (A type, B type, B layout) variant, shapes that are not
 //! tile multiples, and the bf16 -> f16 overflow decline. Skips when no CUDA
 //! device / NVRTC is present.
+#![cfg(not(target_os = "macos"))]
 
 use std::sync::Arc;
 

@@ -4,6 +4,7 @@
 //! tiles always kept, prefix queries dense) and the gated compression branch.
 //! Ragged prefix and video tiles, with and without the gate, sparse and
 //! dense. Skips when no CUDA device is present.
+#![cfg(not(target_os = "macos"))]
 
 use thinfer_core::backend::{
     Backend, BufRef, PowerPreference, VsaAddrs, VsaPart, VsaShape, VsaSlab, WgpuBackend, WgpuConfig,

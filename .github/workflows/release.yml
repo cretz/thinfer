@@ -1,0 +1,128 @@
+# Build `thinfer` (CLI) and `thinfer-serve` (web UI server) for every platform on a release
+# tag and attach the archives to the GitHub release.
+#
+# Triggered by a `v*` tag. The release is created here if the tag has none yet
+# (`gh release create`, generated notes); re-running the workflow re-uploads the assets with
+# `--clobber`. The usual flow: draft a release in the GitHub UI with a new `v*` tag and
+# publish it. Publishing creates the tag, which runs this; the archives attach when the
+# builds finish.
+#
+# Targets: Linux and Windows on x86_64 AND arm64, macOS on Apple Silicon only. One archive per
+# target (`thinfer-<tag>-<target>.{tar.gz,zip}`) holding both binaries plus README and
+# LICENSE. Nothing else to bundle: serve embeds its web UI (`include_str!`), and the optional
+# CUDA fast path loads the driver and NVRTC at runtime (README: install the CUDA toolkit).
+#
+# Linux builds on Ubuntu 22.04, not `latest`: a binary needs the glibc it was linked against
+# or newer, so the older the build host, the more distributions run it (22.04 = glibc 2.35).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            exe: .exe
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same pin as ci.yml and `projects/rust-toolchain.toml`: a released artifact and the
+      # build that tested it must come from one compiler.
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        working-directory: projects
+        run: cargo build --release --locked -p thinfer-cli -p thinfer-serve --target ${{ matrix.target }}
+
+      - name: Name the release
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then tag="${GITHUB_REF#refs/tags/}"; else tag="manual-${GITHUB_SHA::8}"; fi
+          echo "name=thinfer-$tag-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage
+        shell: bash
+        run: |
+          dir="stage/${{ steps.meta.outputs.name }}"
+          mkdir -p "$dir"
+          for bin in thinfer thinfer-serve; do
+            cp "projects/target/${{ matrix.target }}/release/$bin${{ matrix.exe }}" "$dir/"
+          done
+          cp README.md LICENSE "$dir/"
+
+      - name: Archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C stage -czf dist/${{ steps.meta.outputs.name }}.tar.gz ${{ steps.meta.outputs.name }}
+
+      - name: Archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path stage/${{ steps.meta.outputs.name }} -DestinationPath dist/${{ steps.meta.outputs.name }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: attach to the release
+    needs: build
+    # A manual run builds and keeps the artifacts on the workflow run; only a tag publishes.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release if the tag has none, then upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          ls -la dist
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --generate-notes
+          gh release upload "$tag" dist/* --clobber

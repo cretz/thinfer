@@ -180,6 +180,12 @@ pub enum WgpuError {
         bytes: u64,
         message: String,
     },
+    /// An accelerator op declined after its block was accepted and work was
+    /// enqueued (in practice its own scratch ran out of device memory; the
+    /// cause is logged where it happened). No fallback for enqueued work.
+    AcceleratorDeclined {
+        op: String,
+    },
 }
 
 /// A mapped staging chunk from `queue.write_buffer_with`.

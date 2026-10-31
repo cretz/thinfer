@@ -297,9 +297,12 @@ impl<B: Backend> Workspace<B> {
             workspace: self,
             backend: &self.backend,
             encoder: RefCell::new(Some(encoder)),
+            deferred: Deferred {
+                backend: &self.backend,
+                on: std::cell::Cell::new(false),
+            },
             guards: RefCell::new(Vec::new()),
             scope_id: NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
-            deferred: std::cell::Cell::new(false),
             gemm_scratch: RefCell::new(None),
             _life: PhantomData,
         }
@@ -434,17 +437,37 @@ pub struct BatchScope<'wsp, B: Backend> {
     workspace: &'wsp Workspace<B>,
     backend: &'wsp B,
     encoder: RefCell<Option<B::CommandEncoder>>,
-    guards: RefCell<Vec<WsBuf<B>>>,
-    scope_id: u64,
     /// Accelerator ops enqueue without per-op drains or syncs (see
     /// [`Self::accel_begin`]); [`Self::accel_end`] or submit waits for them.
-    deferred: std::cell::Cell<bool>,
+    /// Declared before `guards` so it drops first (see [`Deferred`]).
+    deferred: Deferred<'wsp, B>,
+    guards: RefCell<Vec<WsBuf<B>>>,
+    scope_id: u64,
     /// The NVFP4 GEMMs' activation scratch, shared by every call in the
     /// scope (see [`Self::gemm_scratch`]).
     gemm_scratch: RefCell<Option<BufRef>>,
     /// Marker to make `BatchScope<'wsp, B>` carry its lifetime even when the
     /// `'wsp` shows up only behind references; not load-bearing for safety.
     _life: PhantomData<&'wsp ()>,
+}
+
+/// Deferred accelerator mode of a [`BatchScope`]. A scope dropped while
+/// deferred (an error return mid-block) waits here for its enqueued
+/// accelerator work before the buffers that work touches return to the pool.
+struct Deferred<'wsp, B: Backend> {
+    backend: &'wsp B,
+    on: std::cell::Cell<bool>,
+}
+
+impl<B: Backend> Drop for Deferred<'_, B> {
+    fn drop(&mut self) {
+        if self.on.get()
+            && let Some(acc) = self.backend.accelerator()
+            && let Err(e) = acc.sync()
+        {
+            tracing::error!(target: crate::trace::ADAPTER, error = %e, "accelerator sync failed abandoning a deferred scope");
+        }
+    }
 }
 
 /// Handle for an allocation made inside a `BatchScope`. Copy; can ONLY be
@@ -1406,7 +1429,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         ) else {
             return Ok(false);
         };
-        if !self.deferred.get() {
+        if !self.deferred.on.get() {
             self.flush()?;
             self.backend.wait_idle();
         }
@@ -1442,7 +1465,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         }
         self.flush()?;
         self.backend.wait_idle();
-        self.deferred.set(true);
+        self.deferred.on.set(true);
         Ok(true)
     }
 
@@ -1450,7 +1473,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// A failed wait is a lost device: there is no backend path to fall back
     /// to for work already enqueued.
     pub fn accel_end(&self) {
-        if self.deferred.replace(false)
+        if self.deferred.on.replace(false)
             && let Some(acc) = self.backend.accelerator()
             && let Err(e) = acc.sync()
         {
@@ -1460,7 +1483,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
 
     /// Outside deferred mode an accelerator op completes before returning.
     fn accel_settle(&self, acc: &dyn crate::backend::Accelerator) -> Result<(), String> {
-        if self.deferred.get() {
+        if self.deferred.on.get() {
             Ok(())
         } else {
             acc.sync()
@@ -1473,7 +1496,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     }
 
     pub fn is_deferred(&self) -> bool {
-        self.deferred.get()
+        self.deferred.on.get()
     }
 
     /// Device address of `b` for an [`crate::backend::ElementwiseOp`].
@@ -1485,7 +1508,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// enqueued stays valid.
     pub fn accel_elementwise(&self, op: &crate::backend::ElementwiseOp) -> bool {
         debug_assert!(
-            self.deferred.get(),
+            self.deferred.on.get(),
             "accel_elementwise outside deferred mode"
         );
         let Some(acc) = self.backend.accelerator() else {
@@ -1526,7 +1549,10 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         part: crate::backend::VsaPart,
         addrs: &crate::backend::VsaAddrs,
     ) -> bool {
-        debug_assert!(self.deferred.get(), "accel_vsa_part outside deferred mode");
+        debug_assert!(
+            self.deferred.on.get(),
+            "accel_vsa_part outside deferred mode"
+        );
         let Some(acc) = self.backend.accelerator() else {
             return false;
         };
@@ -1593,6 +1619,46 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         format: crate::backend::Nvfp4Format,
         rows: Option<crate::backend::Nvfp4Rows>,
     ) -> Result<bool, B::Error> {
+        self.gemm_nvfp4_call(a, w, out, m, n, k, lora, format, rows, None)
+    }
+
+    /// [`Self::try_gemm_nvfp4_lora`] with the gated residual of
+    /// [`crate::backend::Nvfp4GateAdd`] in its epilogue: `out = residual +
+    /// a[seg] * product`, bit-identical to the GEMM then
+    /// [`crate::backend::ElementwiseOp::GateAdd`]. `residual` must not alias
+    /// `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_nvfp4_gate_add(
+        &self,
+        a: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        lora: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>, u32)>,
+        format: crate::backend::Nvfp4Format,
+        residual: BatchBuf<'wsp>,
+        seg: crate::backend::RowSegments,
+    ) -> Result<bool, B::Error> {
+        let gate = (residual, seg);
+        self.gemm_nvfp4_call(a, w, out, m, n, k, lora, format, None, Some(gate))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_nvfp4_call(
+        &self,
+        a: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        lora: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>, u32)>,
+        format: crate::backend::Nvfp4Format,
+        rows: Option<crate::backend::Nvfp4Rows>,
+        gate: Option<(BatchBuf<'wsp>, crate::backend::RowSegments)>,
+    ) -> Result<bool, B::Error> {
         let Some(acc) = self.backend.accelerator() else {
             return Ok(false);
         };
@@ -1615,8 +1681,17 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
                 crate::backend::Nvfp4Lora { mid, bt, rank }
             }
         };
+        let gate_add = match gate {
+            None => None,
+            Some((residual, seg)) => {
+                let Some(residual) = addr(residual) else {
+                    return Ok(false);
+                };
+                Some(crate::backend::Nvfp4GateAdd { residual, seg })
+            }
+        };
         let t0 = crate::trace::Instant::now();
-        if !self.deferred.get() {
+        if !self.deferred.on.get() {
             self.flush()?;
             self.backend.wait_idle();
         }
@@ -1632,6 +1707,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             lora,
             format,
             rows,
+            gate_add,
         });
         let res = res.and_then(|ran| self.accel_settle(acc).map(|()| ran));
         tracing::debug!(
@@ -1710,7 +1786,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             return Ok(false);
         };
         let t0 = crate::trace::Instant::now();
-        if !self.deferred.get() {
+        if !self.deferred.on.get() {
             self.flush()?;
             self.backend.wait_idle();
         }
@@ -1777,7 +1853,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             return Ok(false);
         };
         let t0 = crate::trace::Instant::now();
-        if !self.deferred.get() {
+        if !self.deferred.on.get() {
             self.flush()?;
             self.backend.wait_idle();
         }
@@ -3039,6 +3115,7 @@ where
             .current
             .take()
             .expect("ScopePacker::cut: no open scope");
+        scope.accel_end();
         let BatchScope {
             workspace: _,
             backend,

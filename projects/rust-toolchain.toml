@@ -1,0 +1,6 @@
+# One compiler for developers and CI (ci.yml installs exactly this version): the lint set CI
+# denies is the lint set a developer sees. Bump deliberately.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

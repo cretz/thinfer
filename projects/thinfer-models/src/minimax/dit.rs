@@ -944,9 +944,12 @@ fn block_forward_accel<'wsp>(
         return Ok(false);
     }
 
-    // Past this point work is enqueued, so a decline is a broken accept
-    // contract, not a fallback.
-    let ran = |ok: bool, what: &str| assert!(ok, "accelerator declined {what} after accepting it");
+    // Past this point work is enqueued, so a decline fails the run (no
+    // fallback); the scope waits for the enqueued work as it drops.
+    let ran = |ok: bool, what: &str| match ok {
+        true => Ok(()),
+        false => Err(WgpuError::AcceleratorDeclined { op: what.into() }),
+    };
     let addr = |b: BatchBuf<'wsp>| {
         scope
             .accel_addr(b)
@@ -1042,7 +1045,7 @@ fn block_forward_accel<'wsp>(
                 k,
             )?,
             "adapter A",
-        );
+        )?;
         Ok(Some((mid, scope.import_copy(l.b), l.rank)))
     };
     let fused = |t: Option<Term<'wsp>>| t.filter(|&(_, _, r)| nvfp4_fuses_lora_rank(r));
@@ -1057,10 +1060,60 @@ fn block_forward_accel<'wsp>(
         ran(
             scope.try_gemm_fused(&p.matmul_module, mid, bt, base, m, n, rank, epi)?,
             "adapter B",
-        );
+        )?;
         Ok(())
     };
     let site = |pick: fn(BlockLoraBufs) -> Option<SiteLoraBufs>| bufs.lora.and_then(pick);
+    // `out = residual + gate[seg] * (src @ W^T + adapter)` over a chunk's `m`
+    // rows (`n = dim`): the gate rides the GEMM's epilogue unless an unfused
+    // adapter must land in the product first (then `t` holds it).
+    let gated = |src: BatchBuf<'wsp>,
+                 w: &'wsp BufRef,
+                 k: u32,
+                 lora: Option<SiteLoraBufs>,
+                 (residual, out): (BatchBuf<'wsp>, BatchBuf<'wsp>),
+                 (r0, m, gate): (u32, u32, usize),
+                 what: &str|
+     -> Result<(), WgpuError> {
+        let lt = lora_head(src, m, k, lora)?;
+        let seg = seg(gate, None, r0, m);
+        if lt.is_none_or(|(_, _, r)| nvfp4_fuses_lora_rank(r)) {
+            ran(
+                scope.try_gemm_nvfp4_gate_add(
+                    src,
+                    scope.import(w),
+                    out,
+                    m,
+                    dim,
+                    k,
+                    lt,
+                    c.nvfp4_format,
+                    residual,
+                    seg,
+                )?,
+                what,
+            )?;
+            return Ok(());
+        }
+        let prod = rows_of(t, 0, m, dim);
+        ran(
+            scope.try_gemm_nvfp4(src, scope.import(w), prod, m, dim, k, c.nvfp4_format)?,
+            what,
+        )?;
+        lora_tail(lt, prod, m, dim)?;
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::GateAdd {
+                x: addr(residual),
+                y: addr(prod),
+                out: addr(out),
+                rows: m,
+                dim,
+                seg,
+            }),
+            what,
+        )?;
+        Ok(())
+    };
 
     // --- attention ---
     // Keys and values for every row. Queries and the gate either for every
@@ -1102,7 +1155,7 @@ fn block_forward_accel<'wsp>(
             scratch: addr(scratch),
             qk_i8: qk_i8.map_or(0, addr),
         };
-        ran(scope.accel_vsa_part(&vsa_shape, part, &addrs), "vsa part");
+        ran(scope.accel_vsa_part(&vsa_shape, part, &addrs), "vsa part")
     };
     let slab = |ci: usize| {
         let s = &vsa.slabs[ci];
@@ -1112,7 +1165,7 @@ fn block_forward_accel<'wsp>(
             row0: s.rows.start as u32,
         }
     };
-    let norm1 = |r0: u32, n: u32| {
+    let norm1 = |r0: u32, n: u32| -> Result<BatchBuf<'wsp>, WgpuError> {
         let h1 = rows_of(h, 0, n, dim);
         ran(
             scope.accel_elementwise(&ElementwiseOp::NormModulate {
@@ -1125,8 +1178,8 @@ fn block_forward_accel<'wsp>(
                 seg: seg(SCALE_MSA, Some(SHIFT_MSA), r0, n),
             }),
             "norm1",
-        );
-        h1
+        )?;
+        Ok(h1)
     };
     let gate_proj = |h1: BatchBuf<'wsp>, r0: u32, n: u32| -> Result<(), WgpuError> {
         if let (Some(gate_w), Some(gate)) = (gate_w, gate) {
@@ -1141,7 +1194,7 @@ fn block_forward_accel<'wsp>(
                     c.nvfp4_format,
                 )?,
                 "gate",
-            );
+            )?;
         }
         Ok(())
     };
@@ -1162,7 +1215,7 @@ fn block_forward_accel<'wsp>(
                 c.nvfp4_format,
             )?,
             "qkv",
-        );
+        )?;
         lora_tail(lt, qkv, n, 3 * inner)?;
         ran(
             scope.accel_elementwise(&ElementwiseOp::QkNormRope {
@@ -1182,17 +1235,17 @@ fn block_forward_accel<'wsp>(
                 eps: c.qk_norm_eps,
             }),
             "qk norm + rope",
-        );
+        )?;
         Ok(())
     };
     for (ci, &(r0, n)) in chunks.iter().enumerate() {
-        let h1 = norm1(r0, n);
+        let h1 = norm1(r0, n)?;
         if !query_slabs {
             gate_proj(h1, r0, n)?;
         }
         qkv_proj(h1, r0, n)?;
         if query_slabs {
-            vsa_part(VsaPart::Pool(slab(ci)), r0, n);
+            vsa_part(VsaPart::Pool(slab(ci)), r0, n)?;
         }
     }
     // The attention output overwrites q in place: each VSA query tile reads
@@ -1200,12 +1253,12 @@ fn block_forward_accel<'wsp>(
     // those rows, and the pooled means were taken by an earlier launch. One
     // `rows x inner` buffer less, which is what lets a full 15s clip fit.
     if query_slabs {
-        vsa_part(VsaPart::Select, 0, chunks[0].1);
+        vsa_part(VsaPart::Select, 0, chunks[0].1)?;
     } else {
         ran(
             scope.try_vsa(&vsa_shape, q, k, v, gate, q, geometry, Some(arena))?,
             "vsa",
-        );
+        )?;
     }
 
     // --- per chunk: (slabbed) its queries and attention, then the out
@@ -1216,7 +1269,7 @@ fn block_forward_accel<'wsp>(
             // same weight rows, same adapter term): the q rows of the
             // projection alone, or the whole projection (rewriting k / v with
             // the bits they hold) when the adapter is past the fused rank.
-            let h1 = norm1(r0, n);
+            let h1 = norm1(r0, n)?;
             gate_proj(h1, r0, n)?;
             if q_rows_only {
                 let qp = rows_of(qkv, 0, n, inner);
@@ -1237,7 +1290,7 @@ fn block_forward_accel<'wsp>(
                         }),
                     )?,
                     "q",
-                );
+                )?;
                 ran(
                     scope.accel_elementwise(&ElementwiseOp::QkNormRope {
                         headwise: false,
@@ -1256,41 +1309,22 @@ fn block_forward_accel<'wsp>(
                         eps: c.qk_norm_eps,
                     }),
                     "q norm + rope",
-                );
+                )?;
             } else {
                 qkv_proj(h1, r0, n)?;
             }
-            vsa_part(VsaPart::Attend(slab(ci)), r0, n);
+            vsa_part(VsaPart::Attend(slab(ci)), r0, n)?;
         }
-        let sa_c = q_side(q, r0, n);
-        let proj = rows_of(t, 0, n, dim);
-        let lt = lora_head(sa_c, n, inner, site(|l| l.out))?;
-        ran(
-            scope.try_gemm_nvfp4_lora(
-                sa_c,
-                scope.import(&bufs.out_proj),
-                proj,
-                n,
-                dim,
-                inner,
-                fused(lt),
-                c.nvfp4_format,
-            )?,
-            "out",
-        );
-        lora_tail(lt, proj, n, dim)?;
         let after = rows_of(after_attn, 0, n, dim);
-        ran(
-            scope.accel_elementwise(&ElementwiseOp::GateAdd {
-                x: addr(rows_of(x_in, r0, n, dim)),
-                y: addr(proj),
-                out: addr(after),
-                rows: n,
-                dim,
-                seg: seg(GATE_MSA, None, r0, n),
-            }),
-            "attn gate",
-        );
+        gated(
+            q_side(q, r0, n),
+            &bufs.out_proj,
+            inner,
+            site(|l| l.out),
+            (rows_of(x_in, r0, n, dim), after),
+            (r0, n, GATE_MSA),
+            "out + attn gate",
+        )?;
         let h2 = rows_of(h, 0, n, dim);
         ran(
             scope.accel_elementwise(&ElementwiseOp::NormModulate {
@@ -1303,7 +1337,7 @@ fn block_forward_accel<'wsp>(
                 seg: seg(SCALE_MLP, Some(SHIFT_MLP), r0, n),
             }),
             "norm2",
-        );
+        )?;
         let fused_c = rows_of(fused_buf, 0, n, 2 * ffn);
         let lt = lora_head(h2, n, dim, site(|l| l.fc1))?;
         ran(
@@ -1318,7 +1352,7 @@ fn block_forward_accel<'wsp>(
                 c.nvfp4_format,
             )?,
             "fc1",
-        );
+        )?;
         lora_tail(lt, fused_c, n, 2 * ffn)?;
         let gu = rows_of(gu, 0, n, ffn);
         ran(
@@ -1329,34 +1363,16 @@ fn block_forward_accel<'wsp>(
                 h: ffn,
             }),
             "swiglu",
-        );
-        let down = rows_of(t, 0, n, dim);
-        let lt = lora_head(gu, n, ffn, site(|l| l.fc2))?;
-        ran(
-            scope.try_gemm_nvfp4_lora(
-                gu,
-                scope.import(&bufs.fc2),
-                down,
-                n,
-                dim,
-                ffn,
-                fused(lt),
-                c.nvfp4_format,
-            )?,
-            "fc2",
-        );
-        lora_tail(lt, down, n, dim)?;
-        ran(
-            scope.accel_elementwise(&ElementwiseOp::GateAdd {
-                x: addr(after),
-                y: addr(down),
-                out: addr(rows_of(y_out, r0, n, dim)),
-                rows: n,
-                dim,
-                seg: seg(GATE_MLP, None, r0, n),
-            }),
-            "mlp gate",
-        );
+        )?;
+        gated(
+            gu,
+            &bufs.fc2,
+            ffn,
+            site(|l| l.fc2),
+            (after, rows_of(y_out, r0, n, dim)),
+            (r0, n, GATE_MLP),
+            "fc2 + mlp gate",
+        )?;
     }
     Ok(true)
 }

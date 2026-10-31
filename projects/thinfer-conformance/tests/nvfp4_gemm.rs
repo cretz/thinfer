@@ -6,10 +6,11 @@
 //! from the GPU's OWN quantized activations, so the GEMM (fragment layouts,
 //! scale swizzle, per-group alpha, input scale) is checked independently of
 //! quantizer rounding. Skips when no CUDA sm_120 device is present.
+#![cfg(not(target_os = "macos"))]
 
 use thinfer_core::backend::{
-    Backend, BufRef, GemmNvfp4Addrs, Nvfp4Format, Nvfp4Rows, PowerPreference, WgpuBackend,
-    WgpuConfig,
+    Backend, BufRef, GemmNvfp4Addrs, Nvfp4Format, Nvfp4GateAdd, Nvfp4Rows, PowerPreference,
+    RowSegments, WgpuBackend, WgpuConfig,
 };
 use thinfer_core::ops::nvfp4::{self, E2M1, Nvfp4Layout};
 
@@ -195,6 +196,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                 lora: Default::default(),
                 format: Default::default(),
                 rows: None,
+                gate_add: None,
             };
             let ran = acc.gemm_nvfp4(&full).expect("gemm");
             assert!(ran, "gemm declined {m}x{n}x{k}");
@@ -232,6 +234,68 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                     );
                 }
                 eprintln!("{m}x{n}x{k}: row range [128, 256) bit-identical");
+            }
+
+            // (1c) The gated-residual epilogue = the separate gate-add pass
+            // over the plain product (`rn(r + g * p)`, contracted to one FMA
+            // as the kernels compile it), two row segments.
+            {
+                let bf_bytes = |v: &[f32]| -> Vec<u8> {
+                    v.iter().flat_map(|v| bf16_bits(*v).to_le_bytes()).collect()
+                };
+                let resid: Vec<f32> = (0..m * n).map(|_| rng.unit() * 3.0).collect();
+                let gates: Vec<Vec<f32>> = (0..2)
+                    .map(|_| (0..n).map(|_| rng.unit()).collect())
+                    .collect();
+                let r_buf = upload(&bf_bytes(&resid));
+                let g_bufs: Vec<BufRef> = gates.iter().map(|g| upload(&bf_bytes(g))).collect();
+                let gated = BufRef::new(backend.allocate(out_len).expect("gated"), out_len);
+                backend
+                    .submit(backend.create_command_encoder())
+                    .await
+                    .expect("flush writes");
+                backend.wait_idle();
+                let split = (m / 2) as u32;
+                let mut seg = RowSegments {
+                    n: 2,
+                    ..Default::default()
+                };
+                seg.end[..2].copy_from_slice(&[split, m as u32]);
+                seg.a[0] = addr(&g_bufs[0]);
+                seg.a[1] = addr(&g_bufs[1]);
+                let ran = acc
+                    .gemm_nvfp4(&GemmNvfp4Addrs {
+                        out: addr(&gated),
+                        gate_add: Some(Nvfp4GateAdd {
+                            residual: addr(&r_buf),
+                            seg,
+                        }),
+                        ..full
+                    })
+                    .expect("gemm gate add");
+                assert!(ran, "gate-add gemm declined");
+                acc.sync().expect("sync");
+                let plain = backend
+                    .read_buffer(out_buf.id, 0, out_len)
+                    .await
+                    .expect("read");
+                let got = backend
+                    .read_buffer(gated.id, 0, out_len)
+                    .await
+                    .expect("read");
+                let bf = |b: &[u8], i: usize| {
+                    half::bf16::from_bits(u16::from_le_bytes([b[2 * i], b[2 * i + 1]])).to_f32()
+                };
+                for i in 0..m * n {
+                    let (r, c) = (i / n, i % n);
+                    let g = gates[(r as u32 >= split) as usize][c];
+                    let rb = half::bf16::from_f32(resid[i]).to_f32();
+                    let gb = half::bf16::from_f32(g).to_f32();
+                    let want = bf16_bits(gb.mul_add(bf(&plain, i), rb));
+                    let have = u16::from_le_bytes([got[2 * i], got[2 * i + 1]]);
+                    assert_eq!(have, want, "{m}x{n}x{k}: gate add differs at ({r}, {c})");
+                }
+                eprintln!("{m}x{n}x{k}: gate-add epilogue bit-identical");
             }
 
             // (1) quantizer vs CPU.
@@ -333,6 +397,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                         hi_first: true,
                     },
                     rows: None,
+                    gate_add: None,
                 })
                 .expect("gemm comfy");
             assert!(ran, "comfy gemm declined {m}x{n}x{k}");
@@ -424,6 +489,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                     },
                     format: Default::default(),
                     rows: None,
+                    gate_add: None,
                 })
                 .expect("gemm lora");
             assert!(ran, "fused-lora gemm declined {m}x{n}x{k}");
@@ -477,6 +543,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                         hi_first: true,
                     },
                     rows: None,
+                    gate_add: None,
                 })
                 .expect("gemm comfy lora");
             assert!(ran, "comfy fused-lora gemm declined {m}x{n}x{k}");

@@ -1,6 +1,7 @@
 //! The CUDA attention kernel against a CPU f32 reference with the `sdpa_sg`
 //! contract: both head dims, GQA, all three mask modes, and sequence lengths
 //! that are not tile multiples. Skips when no CUDA device / NVRTC is present.
+#![cfg(not(target_os = "macos"))]
 
 use std::sync::Arc;
 
