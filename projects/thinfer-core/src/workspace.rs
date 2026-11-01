@@ -451,6 +451,15 @@ pub struct BatchScope<'wsp, B: Backend> {
     _life: PhantomData<&'wsp ()>,
 }
 
+/// [`crate::backend::Nvfp4Epilogue`] over scope buffers.
+#[expect(clippy::large_enum_variant, reason = "a per-call argument")]
+pub enum Nvfp4Epi<'wsp> {
+    Store,
+    GateAdd(BatchBuf<'wsp>, crate::backend::RowSegments),
+    SwiGlu,
+    QkNormRope(crate::backend::Nvfp4QkNormRope),
+}
+
 /// Deferred accelerator mode of a [`BatchScope`]. A scope dropped while
 /// deferred (an error return mid-block) waits here for its enqueued
 /// accelerator work before the buffers that work touches return to the pool.
@@ -1619,7 +1628,19 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         format: crate::backend::Nvfp4Format,
         rows: Option<crate::backend::Nvfp4Rows>,
     ) -> Result<bool, B::Error> {
-        self.gemm_nvfp4_call(a, w, out, m, n, k, lora, format, rows, None)
+        self.gemm_nvfp4_call(
+            a,
+            w,
+            out,
+            m,
+            n,
+            k,
+            lora,
+            format,
+            rows,
+            None,
+            Nvfp4Epi::Store,
+        )
     }
 
     /// [`Self::try_gemm_nvfp4_lora`] with the gated residual of
@@ -1641,8 +1662,60 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         residual: BatchBuf<'wsp>,
         seg: crate::backend::RowSegments,
     ) -> Result<bool, B::Error> {
-        let gate = (residual, seg);
-        self.gemm_nvfp4_call(a, w, out, m, n, k, lora, format, None, Some(gate))
+        let epi = Nvfp4Epi::GateAdd(residual, seg);
+        self.gemm_nvfp4_call(a, w, out, m, n, k, lora, format, None, None, epi)
+    }
+
+    /// [`Self::try_gemm_nvfp4_lora`] over a `[gate; value]` composite of `2n`
+    /// rows, storing its SwiGLU `out[m, n]` (see
+    /// [`crate::backend::Nvfp4Epilogue::SwiGlu`]); `lora`'s `bt` is `[rank,
+    /// 2n]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_nvfp4_swiglu(
+        &self,
+        a: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        lora: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>, u32)>,
+        format: crate::backend::Nvfp4Format,
+    ) -> Result<bool, B::Error> {
+        self.gemm_nvfp4_call(
+            a,
+            w,
+            out,
+            m,
+            n,
+            k,
+            lora,
+            format,
+            None,
+            None,
+            Nvfp4Epi::SwiGlu,
+        )
+    }
+
+    /// The NVFP4 GEMM of [`Self::try_gemm_nvfp4_rows`] with an optional bf16
+    /// `bias` per composite row (see [`crate::backend::GemmNvfp4Addrs::bias`])
+    /// and any epilogue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_nvfp4_epi(
+        &self,
+        a: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        lora: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>, u32)>,
+        format: crate::backend::Nvfp4Format,
+        rows: Option<crate::backend::Nvfp4Rows>,
+        bias: Option<BatchBuf<'wsp>>,
+        epi: Nvfp4Epi<'wsp>,
+    ) -> Result<bool, B::Error> {
+        self.gemm_nvfp4_call(a, w, out, m, n, k, lora, format, rows, bias, epi)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1657,7 +1730,8 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         lora: Option<(BatchBuf<'wsp>, BatchBuf<'wsp>, u32)>,
         format: crate::backend::Nvfp4Format,
         rows: Option<crate::backend::Nvfp4Rows>,
-        gate: Option<(BatchBuf<'wsp>, crate::backend::RowSegments)>,
+        bias: Option<BatchBuf<'wsp>>,
+        epilogue: Nvfp4Epi<'wsp>,
     ) -> Result<bool, B::Error> {
         let Some(acc) = self.backend.accelerator() else {
             return Ok(false);
@@ -1681,14 +1755,28 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
                 crate::backend::Nvfp4Lora { mid, bt, rank }
             }
         };
-        let gate_add = match gate {
-            None => None,
-            Some((residual, seg)) => {
+        let bias = match bias {
+            None => 0,
+            Some(b) => {
+                let Some(b) = addr(b) else {
+                    return Ok(false);
+                };
+                b
+            }
+        };
+        let epilogue = match epilogue {
+            Nvfp4Epi::Store => crate::backend::Nvfp4Epilogue::Store,
+            Nvfp4Epi::GateAdd(residual, seg) => {
                 let Some(residual) = addr(residual) else {
                     return Ok(false);
                 };
-                Some(crate::backend::Nvfp4GateAdd { residual, seg })
+                crate::backend::Nvfp4Epilogue::GateAdd(crate::backend::Nvfp4GateAdd {
+                    residual,
+                    seg,
+                })
             }
+            Nvfp4Epi::SwiGlu => crate::backend::Nvfp4Epilogue::SwiGlu,
+            Nvfp4Epi::QkNormRope(q) => crate::backend::Nvfp4Epilogue::QkNormRope(q),
         };
         let t0 = crate::trace::Instant::now();
         if !self.deferred.on.get() {
@@ -1707,7 +1795,8 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             lora,
             format,
             rows,
-            gate_add,
+            bias,
+            epilogue,
         });
         let res = res.and_then(|ran| self.accel_settle(acc).map(|()| ran));
         tracing::debug!(

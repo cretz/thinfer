@@ -167,25 +167,32 @@ pub fn act_upload_bytes(act: ActDtype, slice: &[f32]) -> Vec<u8> {
 /// of `n_elems`. Bf16 path zero-extends the 2-byte half to f32 via `(h << 16)`.
 pub fn act_readback_to_f32(act: ActDtype, bytes: &[u8], n_elems: usize) -> Vec<f32> {
     let mut out = vec![0f32; n_elems];
+    act_readback_into_f32(act, bytes, &mut out);
+    out
+}
+
+/// [`act_readback_to_f32`] into `out` (`bytes` holds exactly `out.len()`
+/// elements).
+pub fn act_readback_into_f32(act: ActDtype, bytes: &[u8], out: &mut [f32]) {
     match act {
         ActDtype::F32 => {
-            debug_assert_eq!(bytes.len(), n_elems * 4);
-            for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-                out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            debug_assert_eq!(bytes.len(), out.len() * 4);
+            for (o, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                *o = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             }
         }
         ActDtype::Bf16 => {
-            debug_assert_eq!(bytes.len(), n_elems * 2);
-            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+            debug_assert_eq!(bytes.len(), out.len() * 2);
+            for (o, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
                 let half = u16::from_le_bytes([chunk[0], chunk[1]]);
-                out[i] = f32::from_bits((half as u32) << 16);
+                *o = f32::from_bits((half as u32) << 16);
             }
         }
         ActDtype::F16 => {
-            debug_assert_eq!(bytes.len(), n_elems * 2);
-            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+            debug_assert_eq!(bytes.len(), out.len() * 2);
+            for (o, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                out[i] = half::f16::from_bits(bits).to_f32();
+                *o = half::f16::from_bits(bits).to_f32();
             }
         }
         ActDtype::I8 => {
@@ -194,7 +201,6 @@ pub fn act_readback_to_f32(act: ActDtype, bytes: &[u8], n_elems: usize) -> Vec<f
             )
         }
     }
-    out
 }
 
 /// Decode paired I8 bytes (packed i8 data + per-32-block vec2<f16> params)

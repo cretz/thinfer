@@ -35,7 +35,7 @@ use thinfer_core::residency::{
 use thinfer_core::tensor::Shape;
 use thinfer_core::trace::{self, PHASE};
 use thinfer_core::weight::{WeightId, WeightSource};
-use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi, Workspace, WsBuf};
+use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi, Nvfp4Epi, Workspace, WsBuf};
 use tracing::Instrument;
 
 use crate::common::block::{
@@ -951,10 +951,8 @@ fn block_forward_accel<'s>(
         (s.end[0], s.a[0], s.b[0]) = (rows, at(a), b.map_or(0, at));
         s
     };
-    // `out = residual + gate * (src @ w + bias)` into `out`. Dense: all in the
-    // GEMM's epilogue (no separate passes over `rows x n`). NVFP4 (unit
-    // activation scale, FlashInfer nibble order): the FP4 GEMM, then the bias
-    // and the gated residual as elementwise passes.
+    // `out = residual + gate * (src @ w + bias)` into `out`, all in the GEMM's
+    // epilogue (no separate passes over `rows x n`), dense or NVFP4.
     let mm_into = |src: BatchBuf<'s>,
                    w: BufRef,
                    bias: BufRef,
@@ -974,41 +972,28 @@ fn block_forward_accel<'s>(
             )?;
             return Ok::<_, WgpuError>(());
         }
-        let lin = match residual {
-            Some(_) => act(rows * n)?,
-            None => out,
+        let epi = match residual {
+            Some((r, g)) => Nvfp4Epi::GateAdd(r, one(g, None)),
+            None => Nvfp4Epi::Store,
         };
-        let format = thinfer_core::backend::Nvfp4Format {
-            dynamic_act_scale: false,
-            hi_first: false,
-        };
+        let w = scope.import_copy(w);
+        let bias = Some(scope.import_copy(bias));
         ran(
-            scope.try_gemm_nvfp4(src, scope.import_copy(w), lin, rows, n, k, format)?,
+            scope.try_gemm_nvfp4_epi(
+                src,
+                w,
+                out,
+                rows,
+                n,
+                k,
+                None,
+                NVFP4_FORMAT,
+                None,
+                bias,
+                epi,
+            )?,
             "nvfp4 gemm",
         )?;
-        ran(
-            scope.accel_elementwise(&ElementwiseOp::AddBias {
-                x: addr(lin),
-                bias: at(bias),
-                out: addr(lin),
-                rows,
-                dim: n,
-            }),
-            "bias",
-        )?;
-        if let Some((r, g)) = residual {
-            ran(
-                scope.accel_elementwise(&ElementwiseOp::GateAdd {
-                    x: addr(r),
-                    y: addr(lin),
-                    out: addr(out),
-                    rows,
-                    dim: n,
-                    seg: one(g, None),
-                }),
-                "gated residual",
-            )?;
-        }
         Ok(())
     };
     let mm_fused = |src: BatchBuf<'s>,
@@ -1101,17 +1086,38 @@ fn block_forward_accel<'s>(
         }),
         "norm2",
     )?;
-    let fused = mm_fused(n2, bufs.w1, bufs.w1_bias, None, 2 * ffn, dim)?;
     let gu = act(rows * ffn)?;
-    ran(
-        scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
-            x: addr(fused),
-            out: addr(gu),
-            rows,
-            h: ffn,
-        }),
-        "swiglu",
-    )?;
+    if bufs.nvfp4 {
+        let (w1, bias) = (scope.import_copy(bufs.w1), scope.import_copy(bufs.w1_bias));
+        let epi = Nvfp4Epi::SwiGlu;
+        ran(
+            scope.try_gemm_nvfp4_epi(
+                n2,
+                w1,
+                gu,
+                rows,
+                ffn,
+                dim,
+                None,
+                NVFP4_FORMAT,
+                None,
+                Some(bias),
+                epi,
+            )?,
+            "w1 + swiglu",
+        )?;
+    } else {
+        let fused = mm_fused(n2, bufs.w1, bufs.w1_bias, None, 2 * ffn, dim)?;
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
+                x: addr(fused),
+                out: addr(gu),
+                rows,
+                h: ffn,
+            }),
+            "swiglu",
+        )?;
+    }
     mm_into(
         gu,
         bufs.w2,
@@ -1151,12 +1157,11 @@ pub async fn decode_tiles<S: WeightSource>(
     width: usize,
 ) -> Result<Vec<f32>, DecodeError<S::Error>> {
     let passes = [TilePass { latents, batch }];
-    let mut out = decode_passes(
+    decode_passes(
         cfg, backend, pipelines, residency, scratch, handles, consts, &passes, frames, height,
         width,
     )
-    .await?;
-    Ok(out.pop().expect("one pass in, one out"))
+    .await
 }
 
 /// One batched ViT pass: `batch` tiles' latents, `[batch, patches, channels]`.
@@ -1170,6 +1175,7 @@ pub struct TilePass<'a> {
 /// next block, instead of re-streaming the ~4.8 GiB stack per pass. Passes are
 /// independent (attention stays within a tile), so this is exactly the
 /// pass-by-pass result; it only costs keeping every pass's activations live.
+/// Returns every pass's tile tokens, concatenated in pass order.
 #[allow(clippy::too_many_arguments)]
 pub async fn decode_passes<S: WeightSource>(
     cfg: &VideoVaeConfig,
@@ -1183,7 +1189,7 @@ pub async fn decode_passes<S: WeightSource>(
     frames: usize,
     height: usize,
     width: usize,
-) -> Result<Vec<Vec<f32>>, DecodeError<S::Error>> {
+) -> Result<Vec<f32>, DecodeError<S::Error>> {
     let p = &pipelines.block;
     let act = p.act_dtype;
     let dim = cfg.dim();
@@ -1420,7 +1426,10 @@ pub async fn decode_passes<S: WeightSource>(
     let [no, no_b] = affine_bufs.each_ref().map(|b| b.as_buf_ref());
     let po = residency.acquire(handles.proj_out, backend).await?;
     let po_b = residency.acquire(handles.proj_out_bias, backend).await?;
-    let mut outs = Vec::with_capacity(passes.len());
+    // Every pass's kept rows, in pass order.
+    let per = n_patches * out_w;
+    let mut out = vec![0f32; passes.iter().map(|ps| ps.batch).sum::<usize>() * per];
+    let mut filled = 0;
     for (pass, cur) in passes.iter().zip(&curs) {
         let batch = pass.batch;
         let rows = batch * tokens;
@@ -1487,19 +1496,26 @@ pub async fn decode_passes<S: WeightSource>(
             scope.submit_void().await?;
         }
 
-        // Drop the suffix rows: they exist only to be attended to.
+        // Drop the suffix rows: they exist only to be attended to. The kept
+        // rows decode on worker threads, in about READBACK_PARTS pieces.
         let bytes = backend
             .read_buffer(out_buf.id(), 0, p.act_bytes((rows * out_w) as u32))
             .await?;
-        let all = seq::act_readback_to_f32(act, &bytes, rows * out_w);
-        let mut kept = Vec::with_capacity(batch * n_patches * out_w);
-        for i in 0..batch {
-            let base = i * tokens * out_w;
-            kept.extend_from_slice(&all[base..base + n_patches * out_w]);
+        let elem = p.act_bytes(1) as usize;
+        let piece = per.div_ceil(READBACK_PARTS.div_ceil(batch));
+        let dst = &mut out[filled..filled + batch * per];
+        filled += batch * per;
+        let mut chunks = Vec::new();
+        for (i, tile) in dst.chunks_mut(per).enumerate() {
+            for (j, c) in tile.chunks_mut(piece).enumerate() {
+                chunks.push((i * tokens * out_w + j * piece, c));
+            }
         }
-        outs.push(kept);
+        par_fill(chunks, |src, c| {
+            seq::act_readback_into_f32(act, &bytes[src * elem..(src + c.len()) * elem], c);
+        });
     }
-    Ok(outs)
+    Ok(out)
 }
 
 /// Upload host vectors as act-dtype scratch buffers (see [`DecoderConsts`]).
@@ -1525,6 +1541,18 @@ fn upload_acts<const N: usize>(
 /// 16384 decodes ~3s SLOWER than 8192 at 640x352x124 (fewer, bigger passes
 /// do not beat the per-pass overhead they save).
 pub const MAX_TOKENS_PER_PASS: usize = 8192;
+
+/// Worker pieces a pass's token readback decodes in (see `decode_tokens`).
+const READBACK_PARTS: usize = 8;
+
+/// Worker pieces of the host pixel passes over a decoded clip.
+const PIXEL_PARTS: usize = 8;
+
+/// The NVFP4 decoder's activations: unit static scale, FlashInfer nibble order.
+const NVFP4_FORMAT: thinfer_core::backend::Nvfp4Format = thinfer_core::backend::Nvfp4Format {
+    dynamic_act_scale: false,
+    hi_first: false,
+};
 
 /// Tiles per pass at this tile shape, at least one.
 fn tiles_per_pass(tokens_per_tile: usize) -> usize {
@@ -1680,11 +1708,10 @@ async fn decode_gathered<S: WeightSource>(
             }
         })
         .collect();
-    let outs = decode_passes(
+    decode_passes(
         cfg, backend, pipelines, residency, scratch, handles, consts, &passes, frames, th, tw,
     )
-    .await?;
-    Ok(outs.concat())
+    .await
 }
 
 /// Decode one temporal chunk of latents, tiled over height and width.
@@ -1965,6 +1992,24 @@ impl ChunkPlan {
 
 /// `(0..n).map(f)` with one thread per item on native, in order; serial on
 /// wasm (single-threaded). Host-side decode work only: identical results.
+/// `f(src, chunk)` over `(src, chunk)` pairs on scoped worker threads (in
+/// order on wasm).
+fn par_fill(chunks: Vec<(usize, &mut [f32])>, f: impl Fn(usize, &mut [f32]) + Sync) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if chunks.len() > 1 {
+        std::thread::scope(|s| {
+            let f = &f;
+            for (src, c) in chunks {
+                s.spawn(move || f(src, c));
+            }
+        });
+        return;
+    }
+    for (src, c) in chunks {
+        f(src, c);
+    }
+}
+
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     #[cfg(not(target_arch = "wasm32"))]
     if n > 1 {
@@ -2050,16 +2095,46 @@ impl PixelBlock {
     /// no range check would catch: the block is channels-LAST, and its values
     /// are normalized against a `[0, 1]` base rather than a signed one.
     pub fn to_signed_planar(&self) -> Vec<f32> {
-        let mut out = vec![0.0f32; self.data.len()];
-        let plane = self.frames * self.height * self.width;
-        for c in 0..self.channels {
-            let (mu, sd) = (IMAGENET_MEAN[c], IMAGENET_STD[c]);
-            for i in 0..plane {
-                let unit = self.data[i * self.channels + c] * sd + mu;
-                out[c * plane + i] = (unit * 2.0 - 1.0).clamp(-1.0, 1.0);
+        self.to_signed_planar_frames(self.frames)
+    }
+
+    /// [`Self::to_signed_planar`] of the leading `frames` frames only (each
+    /// channel plane `frames * height * width` long), on worker threads.
+    pub fn to_signed_planar_frames(&self, frames: usize) -> Vec<f32> {
+        let keep = frames.min(self.frames) * self.height * self.width;
+        let mut out = vec![0.0f32; self.channels * keep];
+        if keep == 0 {
+            return out;
+        }
+        let piece = keep.div_ceil(PIXEL_PARTS);
+        let mut chunks = Vec::new();
+        for (c, plane) in out.chunks_mut(keep).enumerate() {
+            for (j, d) in plane.chunks_mut(piece).enumerate() {
+                chunks.push((c * keep + j * piece, d));
             }
         }
+        par_fill(chunks, |at, d| {
+            let (c, i0) = (at / keep, at % keep);
+            let (mu, sd) = (IMAGENET_MEAN[c], IMAGENET_STD[c]);
+            for (k, o) in d.iter_mut().enumerate() {
+                let unit = self.data[(i0 + k) * self.channels + c] * sd + mu;
+                *o = (unit * 2.0 - 1.0).clamp(-1.0, 1.0);
+            }
+        });
         out
+    }
+
+    /// Whether every sample is finite, checked on worker threads.
+    pub fn all_finite(&self) -> bool {
+        let piece = self.data.len().div_ceil(PIXEL_PARTS).max(1);
+        let parts = self.data.len().div_ceil(piece);
+        par_map(parts, |j| {
+            self.data[j * piece..((j + 1) * piece).min(self.data.len())]
+                .iter()
+                .all(|v| v.is_finite())
+        })
+        .into_iter()
+        .all(|ok| ok)
     }
 
     /// Element count of one step along `axis`, and how many steps it has.

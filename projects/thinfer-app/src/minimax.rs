@@ -561,19 +561,13 @@ where
 /// The decoded clip as `[-1, 1]` planar frames, trimmed to the `frames` asked
 /// for (the decoder overshoots whenever the count misses a whole chunk).
 fn clip_frames(pixels: PixelBlock, frames: usize) -> Result<WanVideo, String> {
-    if !pixels.data.iter().all(|v| v.is_finite()) {
+    if !pixels.all_finite() {
         return Err("video decode produced non-finite output".into());
     }
     let (h_px, w_px) = (pixels.height, pixels.width);
     let f_px = pixels.frames.min(frames);
-    let planar = pixels.to_signed_planar();
-    let plane = pixels.frames * h_px * w_px;
-    let keep = f_px * h_px * w_px;
-    let video: Vec<f32> = (0..3)
-        .flat_map(|c| planar[c * plane..c * plane + keep].iter().copied())
-        .collect();
     Ok(WanVideo {
-        frames: video,
+        frames: pixels.to_signed_planar_frames(f_px),
         num_frames: f_px,
         height: h_px,
         width: w_px,

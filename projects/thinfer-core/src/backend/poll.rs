@@ -2,7 +2,8 @@
 //! completion) without blocking the async executor.
 //!
 //! Native: a single OS thread parked at rest. While any `PollGuard` is alive
-//! it loops on `device.poll(Maintain::Wait)`; when all guards drop it re-parks.
+//! it loops on short bounded `device.poll` waits ([`POLL_SLICE`]); when all
+//! guards drop it re-parks.
 //! `Arc::strong_count` on a sentinel is the wake/sleep signal — baseline is 2
 //! (one in `WgpuPoll`, one in the thread); a guard pushes it to 3+.
 //!
@@ -22,6 +23,10 @@
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Longest the pump holds the device in one wait (see the loop).
+#[cfg(not(target_arch = "wasm32"))]
+const POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WgpuPoll {
@@ -51,12 +56,22 @@ impl WgpuPoll {
                         break;
                     }
                     if Arc::strong_count(&sentinel_thread) > 2 {
-                        if let Err(err) = device.poll(wgpu::PollType::wait_indefinitely()) {
-                            tracing::error!(
+                        // A wait holds the device's fence lock throughout, and
+                        // every `queue.submit` / staged write needs it: an
+                        // unbounded wait stalls the engine thread (and the
+                        // weight reads it drives) behind the whole in-flight
+                        // submit. Wait in short slices instead.
+                        let slice = wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: Some(POLL_SLICE),
+                        };
+                        match device.poll(slice) {
+                            Ok(_) | Err(wgpu::PollError::Timeout) => {}
+                            Err(err) => tracing::error!(
                                 target: crate::trace::WGPU_ERR,
                                 kind = "poll",
                                 error = ?err,
-                            );
+                            ),
                         }
                     } else {
                         std::thread::park();

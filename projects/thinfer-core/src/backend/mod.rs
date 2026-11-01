@@ -540,8 +540,52 @@ pub struct GemmNvfp4Addrs {
     /// `total` rows (`base` a multiple of 128); `None` = the whole composite
     /// (`n` rows). The low-rank `bt` is then `[rank, total]`, read at `base`.
     pub rows: Option<Nvfp4Rows>,
-    /// Optional gated residual on the bf16 product (see [`Nvfp4GateAdd`]).
-    pub gate_add: Option<Nvfp4GateAdd>,
+    /// Optional bf16 bias per composite row (0 = none), added to the product
+    /// as [`ElementwiseOp::AddBias`] would (bit-identical), before the
+    /// epilogue.
+    pub bias: u64,
+    pub epilogue: Nvfp4Epilogue,
+}
+
+/// What the NVFP4 GEMM stores.
+#[derive(Clone, Copy, Debug, Default)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a per-call stack value inside the Copy GemmNvfp4Addrs"
+)]
+pub enum Nvfp4Epilogue {
+    /// The bf16 product.
+    #[default]
+    Store,
+    /// A gated residual on the bf16 product (see [`Nvfp4GateAdd`]).
+    GateAdd(Nvfp4GateAdd),
+    /// `w` is a `[gate; value]` composite of `2n` rows and `out[m, n] =
+    /// bf16(silu(gate) * value)` of the bf16 products: bit-identical to the
+    /// `[m, 2n]` GEMM then [`ElementwiseOp::SiluMulFused`], without that
+    /// intermediate. The low-rank `bt` is `[rank, 2n]`. Not with `rows`.
+    SwiGlu,
+    /// The product's per-head norm + rope (see [`Nvfp4QkNormRope`]); `out`
+    /// is not written.
+    QkNormRope(Nvfp4QkNormRope),
+}
+
+/// [`ElementwiseOp::QkNormRope`] (slab layout, not `headwise`) of a `[q; k;
+/// v]` composite's product, bit-identical to the GEMM then that op, without
+/// the `[m, n]` product round trip. Covers head_dim 128 with up to 64 pairs
+/// rotated; the call's weight rows (its [`Nvfp4Rows`] range, which may be
+/// the q rows alone) start on a 256-row boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct Nvfp4QkNormRope {
+    pub q_norm: u64,
+    pub k_norm: u64,
+    pub freqs: u64,
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    /// Width of one projection (`heads * 128`).
+    pub inner: u32,
+    pub rot_pairs: u32,
+    pub eps: f32,
 }
 
 /// `out = bf16(residual + a[seg] * bf16(acc))`: [`ElementwiseOp::GateAdd`]

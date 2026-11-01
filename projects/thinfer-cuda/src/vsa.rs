@@ -29,6 +29,10 @@ const THREADS: u32 = 128;
 /// Query rows per attention block (4 warps x 16), and keys per K/V stage.
 const QT: u32 = 64;
 const BC: u32 = 32;
+/// Mirrors the source's `IQ`: query tiles per `vsa_scores` block.
+const SCORES_IQ: u32 = 8;
+/// Dynamic smem cap of the selection kernels (T floats per query tile).
+const SELECT_SMEM: u32 = 48 * 1024;
 
 // Compiled once per tile size (the FastH3 contract's `vsa_tile_size`): `TILE`
 // is defined ahead of this body.
@@ -40,7 +44,6 @@ macro_rules! vsa_source {
 #define D 128
 #define LD (D + 8)
 #define NEG_MAX (-3.402823e38f)
-#define NEG_INF __int_as_float(0xff800000)
 
 // `tile0`: the launch's first tile (its grid covers a slab of tiles);
 // `qrow0`: the packed row at q/gate/out's start (query-side buffers hold just
@@ -72,11 +75,25 @@ extern "C" __global__ void __launch_bounds__(128) vsa_pool(
     const unsigned t = p.tile0 + blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const unsigned n = tile_size[t];
     float sq = 0.f, sk = 0.f, sv = 0.f;
-    for (unsigned r = 0; r < n; ++r) {
-        const unsigned row = tile_rows[t * TILE + r];
-        const size_t off = ((size_t)row * p.heads + h) * D + d;
-        sq += bf(q[((size_t)(row - p.qrow0) * p.heads + h) * D + d]);
-        sk += bf(k[off]); sv += bf(v[off]);
+    // Rows in groups of U: every load of a group in flight before its adds,
+    // which keep the row order.
+    constexpr unsigned U = 8;
+    for (unsigned r0 = 0; r0 < n; r0 += U) {
+        unsigned short xq[U], xk[U], xv[U];
+        #pragma unroll
+        for (unsigned u = 0; u < U; ++u) {
+            if (r0 + u >= n) break;
+            const unsigned row = tile_rows[t * TILE + r0 + u];
+            const size_t off = ((size_t)row * p.heads + h) * D + d;
+            xq[u] = q[((size_t)(row - p.qrow0) * p.heads + h) * D + d];
+            xk[u] = k[off];
+            xv[u] = v[off];
+        }
+        #pragma unroll
+        for (unsigned u = 0; u < U; ++u) {
+            if (r0 + u >= n) break;
+            sq += bf(xq[u]); sk += bf(xk[u]); sv += bf(xv[u]);
+        }
     }
     const float inv = 1.f / (float)n;
     const size_t o = ((size_t)h * p.n_tiles + t) * D + d;
@@ -100,60 +117,88 @@ __device__ float block_reduce(float x, bool is_max, float* red) {
     return r;
 }
 
-// Tile scores and the compression output: grid (T, H), smem T floats.
+// Tile scores and the compression output for `iq` (<= IQ) query tiles per
+// block, which share every pooled K / V row they read (a block per query tile
+// re-read both planes T times): grid (ceil(T / iq), H), smem iq * T floats.
+// Each query tile's arithmetic is a lone block's: lane dot + xor tree, strided
+// per-thread sums, `block_reduce`, the sequential coarse sum.
+#define IQ 8
 extern "C" __global__ void __launch_bounds__(128) vsa_scores(
-    const float* __restrict__ pooled, float* __restrict__ scores, float* __restrict__ coarse, const VsaP p)
+    const float* __restrict__ pooled, float* __restrict__ scores, float* __restrict__ coarse, const VsaP p,
+    unsigned iq)
 {
     extern __shared__ float s[];
-    __shared__ __align__(16) float qi[D];
+    __shared__ __align__(16) float qi[IQ][D];
     __shared__ float red[4];
-    const unsigned i = blockIdx.x, h = blockIdx.y, T = p.n_tiles;
+    const unsigned i0 = blockIdx.x * iq, h = blockIdx.y, T = p.n_tiles;
+    const unsigned nq = min(iq, T - i0);
     const size_t plane = (size_t)p.heads * T * D;
     const float* qp = pooled + (size_t)h * T * D;
     const float* kp = pooled + plane + (size_t)h * T * D;
     const float* vp = pooled + 2 * plane + (size_t)h * T * D;
-    qi[threadIdx.x] = qp[(size_t)i * D + threadIdx.x];
+    for (unsigned ii = 0; ii < nq; ++ii) qi[ii][threadIdx.x] = qp[(size_t)(i0 + ii) * D + threadIdx.x];
     __syncthreads();
     // One warp per key tile, each lane a coalesced float4 slice of the D = 128
     // channels (a thread-per-tile dot product reads 512-byte-strided scalars).
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const float4 qv = reinterpret_cast<const float4*>(qi)[lane];
-    float mx = NEG_MAX;
+    float4 qv[IQ];
+    float mx[IQ];
+    #pragma unroll
+    for (int ii = 0; ii < IQ; ++ii) {
+        qv[ii] = reinterpret_cast<const float4*>(qi[ii])[lane];
+        mx[ii] = NEG_MAX;
+    }
     for (unsigned j = warp; j < T; j += blockDim.x >> 5) {
         const float4 kv = reinterpret_cast<const float4*>(kp + (size_t)j * D)[lane];
-        float acc = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-        acc *= p.scale;
-        if (lane == 0) {
-            s[j] = acc;
-            scores[((size_t)h * T + i) * T + j] = acc;
+        for (int ii = 0; ii < IQ; ++ii) {
+            if ((unsigned)ii >= nq) continue;
+            float acc = qv[ii].x * kv.x + qv[ii].y * kv.y + qv[ii].z * kv.z + qv[ii].w * kv.w;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+            acc *= p.scale;
+            if (lane == 0) {
+                s[ii * T + j] = acc;
+                scores[((size_t)h * T + i0 + ii) * T + j] = acc;
+            }
+            mx[ii] = fmaxf(mx[ii], acc);
         }
-        mx = fmaxf(mx, acc);
     }
-    mx = block_reduce(mx, true, red);
-    float sum = 0.f;
-    for (unsigned j = threadIdx.x; j < T; j += blockDim.x) {
-        const float e = expf(s[j] - mx);
-        s[j] = e;
-        sum += e;
+    float inv[IQ];
+    #pragma unroll
+    for (int ii = 0; ii < IQ; ++ii) {
+        if ((unsigned)ii >= nq) continue;
+        const float m = block_reduce(mx[ii], true, red);
+        float sum = 0.f;
+        for (unsigned j = threadIdx.x; j < T; j += blockDim.x) {
+            const float e = expf(s[ii * T + j] - m);
+            s[ii * T + j] = e;
+            sum += e;
+        }
+        inv[ii] = 1.f / block_reduce(sum, false, red);
     }
-    sum = block_reduce(sum, false, red);
-    const float inv = 1.f / sum;
-    float acc = 0.f;
-    for (unsigned j = 0; j < T; ++j) acc += s[j] * vp[(size_t)j * D + threadIdx.x];
-    coarse[((size_t)h * T + i) * D + threadIdx.x] = acc * inv;
+    float acc[IQ];
+    #pragma unroll
+    for (int ii = 0; ii < IQ; ++ii) acc[ii] = 0.f;
+    for (unsigned j = 0; j < T; ++j) {
+        const float vj = vp[(size_t)j * D + threadIdx.x];
+        #pragma unroll
+        for (int ii = 0; ii < IQ; ++ii)
+            if ((unsigned)ii < nq) acc[ii] += s[ii * T + j] * vj;
+    }
+    #pragma unroll
+    for (int ii = 0; ii < IQ; ++ii)
+        if ((unsigned)ii < nq) coarse[((size_t)h * T + i0 + ii) * D + threadIdx.x] = acc[ii] * inv[ii];
 }
 
 // Key-tile lists: grid (T, H), smem T floats. Prefix query tiles take every
 // tile; a video query tile takes every prefix tile plus its top-k video tiles
-// (ties to the lower index, as a stable descending sort keeps them).
+// (ties to the lower index, as a stable descending sort keeps them): each
+// video tile's rank is the count of tiles ahead of it in that order.
 extern "C" __global__ void __launch_bounds__(128) vsa_lists(
     const float* __restrict__ scores, unsigned* __restrict__ lists, unsigned* __restrict__ counts, const VsaP p)
 {
     extern __shared__ float vals[];
-    __shared__ float bv[4];
-    __shared__ unsigned bi[4];
     const unsigned i = blockIdx.x, h = blockIdx.y, T = p.n_tiles, P = p.n_prefix, V = T - P;
     unsigned* list = lists + ((size_t)h * T + i) * T;
     if (i < P || p.topk >= V) {
@@ -165,30 +210,14 @@ extern "C" __global__ void __launch_bounds__(128) vsa_lists(
     for (unsigned j = threadIdx.x; j < V; j += blockDim.x) vals[j] = row[j];
     for (unsigned j = threadIdx.x; j < P; j += blockDim.x) list[j] = j;
     __syncthreads();
-    for (unsigned r = 0; r < p.topk; ++r) {
-        float best = NEG_INF;
-        unsigned idx = 0xffffffffu;
-        for (unsigned j = threadIdx.x; j < V; j += blockDim.x) {
-            const float x = vals[j];
-            if (x > best || (x == best && j < idx)) { best = x; idx = j; }
+    for (unsigned j = threadIdx.x; j < V; j += blockDim.x) {
+        const float x = vals[j];
+        unsigned rank = 0;
+        for (unsigned o = 0; o < V; ++o) {
+            const float y = vals[o];
+            rank += y > x || (y == x && o < j);
         }
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ob = __shfl_xor_sync(0xffffffffu, best, o);
-            const unsigned oi = __shfl_xor_sync(0xffffffffu, idx, o);
-            if (ob > best || (ob == best && oi < idx)) { best = ob; idx = oi; }
-        }
-        if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = best; bi[threadIdx.x >> 5] = idx; }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float b = bv[0];
-            unsigned bix = bi[0];
-            for (int w = 1; w < 4; ++w)
-                if (bv[w] > b || (bv[w] == b && bi[w] < bix)) { b = bv[w]; bix = bi[w]; }
-            list[P + r] = P + bix;
-            vals[bix] = NEG_INF;
-        }
-        __syncthreads();
+        if (rank < p.topk) list[P + rank] = P + j;
     }
     if (threadIdx.x == 0) counts[h * T + i] = P + p.topk;
 }
@@ -320,22 +349,17 @@ __device__ __forceinline__ void attn_impl(ATTN_ARGS)
     if (n_steps > 0) issue(0, 0);
     int buf = 0;
     for (unsigned s = 0; s < n_steps; buf ^= 1) {
-        const unsigned nxt = next_live(s);
-        if (nxt < n_steps) {
-            issue(nxt, buf ^ 1);
-            asm volatile("cp.async.wait_group 1;\n" ::);
-        } else {
-            asm volatile("cp.async.wait_group 0;\n" ::);
-        }
+        // One barrier per step: it publishes this step's stage AND proves
+        // every warp finished the previous step, whose stage is refilled next.
+        asm volatile("cp.async.wait_group 0;\n" ::);
         __syncthreads();
+        const unsigned nxt = next_live(s);
+        if (nxt < n_steps) issue(nxt, buf ^ 1);
         const unsigned short* ks = stage + buf * STAGE;
         const unsigned short* vs = ks + BC * DS;
         const unsigned k0 = s % SPT * BC, nk = tile_size[list[s / SPT]];
         s = nxt;
-        if (!warp_live) {
-            __syncthreads();
-            continue;
-        }
+        if (!warp_live) continue;
 
         float sc[BC / 8][4];
         #pragma unroll
@@ -389,10 +413,13 @@ __device__ __forceinline__ void attn_impl(ATTN_ARGS)
             pa[kb][2] = pack_bf2(sc[2 * kb + 1][0], sc[2 * kb + 1][1]);
             pa[kb][3] = pack_bf2(sc[2 * kb + 1][2], sc[2 * kb + 1][3]);
         }
-        #pragma unroll
-        for (int j = 0; j < DP / 8; ++j) {
-            o[j][0] *= alpha[0]; o[j][1] *= alpha[0];
-            o[j][2] *= alpha[1]; o[j][3] *= alpha[1];
+        // No row max moved anywhere in the warp: every alpha is exactly 1.
+        if (!__all_sync(0xffffffffu, alpha[0] == 1.f && alpha[1] == 1.f)) {
+            #pragma unroll
+            for (int j = 0; j < DP / 8; ++j) {
+                o[j][0] *= alpha[0]; o[j][1] *= alpha[0];
+                o[j][2] *= alpha[1]; o[j][3] *= alpha[1];
+            }
         }
         #pragma unroll
         for (int kb = 0; kb < BC / 16; ++kb) {
@@ -405,7 +432,6 @@ __device__ __forceinline__ void attn_impl(ATTN_ARGS)
                 mma_bf16(o[2 * dn + 1], pa[kb], b[2], b[3]);
             }
         }
-        __syncthreads(); // this stage is consumed before it is refilled
     }
 
     float inv[2];
@@ -599,23 +625,18 @@ extern "C" __global__ void __launch_bounds__(128) vsa_attn_i8(
     if (n_steps > 0) issue(0, 0);
     int buf = 0;
     for (unsigned s = 0; s < n_steps; buf ^= 1) {
-        const unsigned nxt = next_live(s);
-        if (nxt < n_steps) {
-            issue(nxt, buf ^ 1);
-            asm volatile("cp.async.wait_group 1;\n" ::);
-        } else {
-            asm volatile("cp.async.wait_group 0;\n" ::);
-        }
+        // One barrier per step: it publishes this step's stage AND proves
+        // every warp finished the previous step, whose stage is refilled next.
+        asm volatile("cp.async.wait_group 0;\n" ::);
         __syncthreads();
+        const unsigned nxt = next_live(s);
+        if (nxt < n_steps) issue(nxt, buf ^ 1);
         const unsigned char* ks = smem + buf * STAGE;
         const unsigned char* vs = ks + BC * KROW;
         const unsigned kt = list[s / SPT], k0 = s % SPT * BC, nk = tile_size[kt];
         const float kscale = scale2 * ks_of[kt];
         s = nxt;
-        if (!warp_live) {
-            __syncthreads();
-            continue;
-        }
+        if (!warp_live) continue;
 
         int si[BC / 8][4];
         #pragma unroll
@@ -670,10 +691,13 @@ extern "C" __global__ void __launch_bounds__(128) vsa_attn_i8(
             pa[kb][2] = pack_bf2(sc[2 * kb + 1][0], sc[2 * kb + 1][1]);
             pa[kb][3] = pack_bf2(sc[2 * kb + 1][2], sc[2 * kb + 1][3]);
         }
-        #pragma unroll
-        for (int j = 0; j < D8 / 8; ++j) {
-            o[j][0] *= alpha[0]; o[j][1] *= alpha[0];
-            o[j][2] *= alpha[1]; o[j][3] *= alpha[1];
+        // No row max moved anywhere in the warp: every alpha is exactly 1.
+        if (!__all_sync(0xffffffffu, alpha[0] == 1.f && alpha[1] == 1.f)) {
+            #pragma unroll
+            for (int j = 0; j < D8 / 8; ++j) {
+                o[j][0] *= alpha[0]; o[j][1] *= alpha[0];
+                o[j][2] *= alpha[1]; o[j][3] *= alpha[1];
+            }
         }
         #pragma unroll
         for (int kb = 0; kb < BC / 16; ++kb) {
@@ -689,7 +713,6 @@ extern "C" __global__ void __launch_bounds__(128) vsa_attn_i8(
                 mma_bf16(o[2 * dn + 1], pa[kb], b[2], b[3]);
             }
         }
-        __syncthreads();
     }
 
     float inv[2];
@@ -861,8 +884,8 @@ impl TileKernels {
         let module = Module::compile(ctx, source, "thinfer_vsa.cu", sm)?;
         let pool = module.function(c"vsa_pool", 0)?;
         // Dynamic smem sized per call (T floats); the attribute caps it.
-        let scores = module.function(c"vsa_scores", 48 * 1024)?;
-        let lists = module.function(c"vsa_lists", 48 * 1024)?;
+        let scores = module.function(c"vsa_scores", SELECT_SMEM)?;
+        let lists = module.function(c"vsa_lists", SELECT_SMEM)?;
         let attn = module.function(c"vsa_attn", attn_smem(D))?;
         let kmean = module.function(c"vsa_kmean", 0)?;
         let quant_k = module.function(c"vsa_quant_k", 0)?;
@@ -940,14 +963,27 @@ impl TileKernels {
                     .launch(self.pool, slab_grid, THREADS, 0, &mut a, "vsa_pool");
             }
             VsaPart::Select => {
-                let mut a: [*mut c_void; 4] = [
+                // Query tiles per scores block: as many as fit the smem cap.
+                let mut iq = SCORES_IQ;
+                while iq > 1 && iq * row_smem > SELECT_SMEM {
+                    iq /= 2;
+                }
+                let mut a: [*mut c_void; 5] = [
                     (&raw mut pooled).cast(),
                     (&raw mut scores).cast(),
                     (&raw mut coarse).cast(),
                     (&raw mut p).cast(),
+                    (&raw mut iq).cast(),
                 ];
-                self.module
-                    .launch(self.scores, grid, THREADS, row_smem, &mut a, "vsa_scores")?;
+                let scores_grid = (s.n_tiles.div_ceil(iq), s.heads, 1);
+                self.module.launch(
+                    self.scores,
+                    scores_grid,
+                    THREADS,
+                    iq * row_smem,
+                    &mut a,
+                    "vsa_scores",
+                )?;
                 let mut a: [*mut c_void; 4] = [
                     (&raw mut scores).cast(),
                     (&raw mut lists).cast(),
@@ -1112,7 +1148,7 @@ impl VsaKernels {
             .all(|a| a.is_multiple_of(16))
             && b.gate.is_multiple_of(16);
         // Per-row smem score buffers: T floats must fit the 48 KiB cap.
-        if !aligned || !accepts(s) || s.n_tiles as u64 * 4 > 48 * 1024 {
+        if !aligned || !accepts(s) || s.n_tiles as u64 * 4 > SELECT_SMEM as u64 {
             return Ok(None);
         }
         Ok(Some(match s.tile {

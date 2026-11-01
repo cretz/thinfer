@@ -38,7 +38,7 @@ use thinfer_core::residency::{
 };
 use thinfer_core::tensor::StorageEncoding;
 use thinfer_core::weight::{WeightId, WeightSource};
-use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi};
+use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi, Nvfp4Epi};
 
 use std::collections::HashMap;
 
@@ -839,7 +839,8 @@ fn block_forward_accel<'wsp>(
     vsa: &'wsp VsaPlan,
 ) -> Result<bool, WgpuError> {
     use thinfer_core::backend::{
-        ElementwiseOp, MAX_SEGMENTS, Nvfp4Rows, RowSegments, VsaAddrs, VsaPart, VsaShape, VsaSlab,
+        ElementwiseOp, MAX_SEGMENTS, Nvfp4QkNormRope, Nvfp4Rows, RowSegments, VsaAddrs, VsaPart,
+        VsaShape, VsaSlab,
     };
     let p = &pipelines.block;
     let c = shape.cfg;
@@ -1004,7 +1005,14 @@ fn block_forward_accel<'wsp>(
     // of the two, so the INT8 path's peak is a max, not a sum. (Slabbed
     // queries interleave the arena's work with attention: their INT8 Q/K get
     // a region of their own below.)
-    let chunk_bytes = [dim, 3 * inner, dim, dim, 2 * ffn, ffn, max_rank]
+    // fc1 stores its SwiGLU directly unless an unfused adapter must land in
+    // the `[gate; value]` product first.
+    let fc1_product = bufs
+        .lora
+        .and_then(|l| l.fc1)
+        .is_some_and(|l| !nvfp4_fuses_lora_rank(l.rank));
+    let product = if fc1_product { 2 * ffn } else { 0 };
+    let chunk_bytes = [dim, 3 * inner, dim, dim, product, ffn, max_rank]
         .map(|w| (max_chunk * w) as u64 * elem_bytes);
     let at = |i: usize| -> u64 {
         chunk_bytes[..i]
@@ -1200,9 +1208,53 @@ fn block_forward_accel<'wsp>(
     };
     // The whole qkv projection of chunk `[r0, r0 + n)` (from its normed
     // `h1`), normed and rotated into q (query side) and k / v.
+    // The qk-norm + rope epilogue of chunk `[r0, r0 + n)` (q alone for a
+    // slab's q-row pass), when the shape is the kernel's.
+    let qk_epi = |r0: u32, n: u32, q_only: bool| {
+        (hd == 128).then(|| {
+            let kv = |b: BatchBuf<'wsp>| {
+                if q_only {
+                    0
+                } else {
+                    addr(rows_of(b, r0, n, inner))
+                }
+            };
+            Nvfp4Epi::QkNormRope(Nvfp4QkNormRope {
+                q_norm: weight(&bufs.q_norm),
+                k_norm: if q_only { 0 } else { weight(&bufs.k_norm) },
+                freqs: addr(rows_of(freqs, r0, n, 2 * rot_pairs)),
+                q: addr(q_side(q, r0, n)),
+                k: kv(k),
+                v: kv(v),
+                inner,
+                rot_pairs,
+                eps: c.qk_norm_eps,
+            })
+        })
+    };
+    let fusable = |t: Option<Term<'wsp>>| t.is_none_or(|(_, _, r)| nvfp4_fuses_lora_rank(r));
     let qkv_proj = |h1: BatchBuf<'wsp>, r0: u32, n: u32| -> Result<(), WgpuError> {
         let qkv = rows_of(qkv, 0, n, 3 * inner);
         let lt = lora_head(h1, n, dim, site(|l| l.qkv))?;
+        if let Some(epi) = qk_epi(r0, n, false).filter(|_| fusable(lt)) {
+            let w = scope.import(&bufs.qkv_proj);
+            let (fmt, total) = (c.nvfp4_format, 3 * inner);
+            if scope.try_gemm_nvfp4_epi(
+                h1,
+                w,
+                qkv,
+                n,
+                total,
+                dim,
+                fused(lt),
+                fmt,
+                None,
+                None,
+                epi,
+            )? {
+                return Ok(());
+            }
+        }
         ran(
             scope.try_gemm_nvfp4_lora(
                 h1,
@@ -1274,42 +1326,63 @@ fn block_forward_accel<'wsp>(
             if q_rows_only {
                 let qp = rows_of(qkv, 0, n, inner);
                 let lt = lora_head(h1, n, dim, site(|l| l.qkv))?;
-                ran(
-                    scope.try_gemm_nvfp4_rows(
+                let q_rows = Some(Nvfp4Rows {
+                    base: 0,
+                    total: 3 * inner,
+                });
+                let w = scope.import(&bufs.qkv_proj);
+                let fmt = c.nvfp4_format;
+                let fused_qk = match qk_epi(r0, n, true).filter(|_| fusable(lt)) {
+                    Some(epi) => scope.try_gemm_nvfp4_epi(
                         h1,
-                        scope.import(&bufs.qkv_proj),
+                        w,
                         qp,
                         n,
                         inner,
                         dim,
                         fused(lt),
-                        c.nvfp4_format,
-                        Some(Nvfp4Rows {
-                            base: 0,
-                            total: 3 * inner,
-                        }),
+                        fmt,
+                        q_rows,
+                        None,
+                        epi,
                     )?,
-                    "q",
-                )?;
-                ran(
-                    scope.accel_elementwise(&ElementwiseOp::QkNormRope {
-                        headwise: false,
-                        q_only: true,
-                        qkv: addr(qp),
-                        q_norm: weight(&bufs.q_norm),
-                        k_norm: 0,
-                        freqs: addr(rows_of(freqs, r0, n, 2 * rot_pairs)),
-                        q: addr(q_side(q, r0, n)),
-                        k: 0,
-                        v: 0,
-                        rows: n,
-                        heads,
-                        head_dim: hd,
-                        rot_pairs,
-                        eps: c.qk_norm_eps,
-                    }),
-                    "q norm + rope",
-                )?;
+                    None => false,
+                };
+                if !fused_qk {
+                    ran(
+                        scope.try_gemm_nvfp4_rows(
+                            h1,
+                            w,
+                            qp,
+                            n,
+                            inner,
+                            dim,
+                            fused(lt),
+                            fmt,
+                            q_rows,
+                        )?,
+                        "q",
+                    )?;
+                    ran(
+                        scope.accel_elementwise(&ElementwiseOp::QkNormRope {
+                            headwise: false,
+                            q_only: true,
+                            qkv: addr(qp),
+                            q_norm: weight(&bufs.q_norm),
+                            k_norm: 0,
+                            freqs: addr(rows_of(freqs, r0, n, 2 * rot_pairs)),
+                            q: addr(q_side(q, r0, n)),
+                            k: 0,
+                            v: 0,
+                            rows: n,
+                            heads,
+                            head_dim: hd,
+                            rot_pairs,
+                            eps: c.qk_norm_eps,
+                        }),
+                        "q norm + rope",
+                    )?;
+                }
             } else {
                 qkv_proj(h1, r0, n)?;
             }
@@ -1338,32 +1411,49 @@ fn block_forward_accel<'wsp>(
             }),
             "norm2",
         )?;
-        let fused_c = rows_of(fused_buf, 0, n, 2 * ffn);
         let lt = lora_head(h2, n, dim, site(|l| l.fc1))?;
-        ran(
-            scope.try_gemm_nvfp4_lora(
-                h2,
-                scope.import(&bufs.fc1),
-                fused_c,
-                n,
-                2 * ffn,
-                dim,
-                fused(lt),
-                c.nvfp4_format,
-            )?,
-            "fc1",
-        )?;
-        lora_tail(lt, fused_c, n, 2 * ffn)?;
         let gu = rows_of(gu, 0, n, ffn);
-        ran(
-            scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
-                x: addr(fused_c),
-                out: addr(gu),
-                rows: n,
-                h: ffn,
-            }),
-            "swiglu",
-        )?;
+        if lt.is_none_or(|(_, _, r)| nvfp4_fuses_lora_rank(r)) {
+            ran(
+                scope.try_gemm_nvfp4_swiglu(
+                    h2,
+                    scope.import(&bufs.fc1),
+                    gu,
+                    n,
+                    ffn,
+                    dim,
+                    fused(lt),
+                    c.nvfp4_format,
+                )?,
+                "fc1 + swiglu",
+            )?;
+        } else {
+            // An unfused adapter lands in the `[gate; value]` product first.
+            let fused_c = rows_of(fused_buf, 0, n, 2 * ffn);
+            ran(
+                scope.try_gemm_nvfp4_lora(
+                    h2,
+                    scope.import(&bufs.fc1),
+                    fused_c,
+                    n,
+                    2 * ffn,
+                    dim,
+                    None,
+                    c.nvfp4_format,
+                )?,
+                "fc1",
+            )?;
+            lora_tail(lt, fused_c, n, 2 * ffn)?;
+            ran(
+                scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
+                    x: addr(fused_c),
+                    out: addr(gu),
+                    rows: n,
+                    h: ffn,
+                }),
+                "swiglu",
+            )?;
+        }
         gated(
             gu,
             &bufs.fc2,
