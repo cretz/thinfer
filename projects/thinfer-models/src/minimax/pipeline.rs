@@ -29,8 +29,9 @@ use crate::ltx::sampler::gaussian_noise;
 
 use super::adaln::{ModSegment, ModulationPlan};
 use super::dit::{
-    BlockBufs, BlockProbe, DitHandles, DitPipelines, DitShape, ModulationTable, QUERY_SLAB_ROWS,
-    ROW_CHUNK, VsaPlan, forward_block, forward_final_norm, forward_refiner_block, probe_layout,
+    BlockBufs, BlockProbe, BlockViews, DitHandles, DitPipelines, DitShape, ModulationTable,
+    QUERY_SLAB_ROWS, ROW_CHUNK, VsaPlan, forward_block, forward_final_norm, forward_refiner_block,
+    probe_layout,
 };
 use super::loader::ModulationTables;
 use super::packing::{self, PackedSequence};
@@ -424,9 +425,58 @@ pub async fn forward_tapped<S: WeightSource>(
     video_rows: &[f32],
     audio_rows: &[f32],
     text: &[f32],
-    mut taps: Option<&mut ForwardTaps>,
+    taps: Option<&mut ForwardTaps>,
     cancel: Cancel<'_>,
 ) -> Result<Velocity, PipelineError<S::Error>> {
+    forward_impl(
+        cfg, backend, pipelines, residency, workspace, handles, table, plan, step, video_rows,
+        audio_rows, text, taps, None, cancel,
+    )
+    .await
+}
+
+/// What one request's denoise steps hand each other (never across requests).
+#[derive(Default)]
+struct StepCarry<'r> {
+    /// The token refiner's output, the refined text rows (`[n_text, hidden]`):
+    /// the refiner has no AdaLN and no rotary, and its input is the
+    /// conditioner state projected once, so every step computes the same
+    /// rows. The first forward keeps them; later forwards copy them in instead
+    /// of re-running the text projection and refiner (bit-identical, and it
+    /// skips the refiner's weight acquires, which idle the GPU).
+    refined: Option<thinfer_core::workspace::WsBuf<WgpuBackend>>,
+    /// The stack's block 0 for the next step, acquired during this step's
+    /// last block: otherwise the next stack starts on a weight acquire with
+    /// nothing in flight.
+    first_block: Option<BlockViews<'r>>,
+    /// Another step follows this forward.
+    more_steps: bool,
+}
+
+/// [`forward_tapped`]; `carry` (untapped forwards only) is what one
+/// request's steps hand each other (see [`StepCarry`]).
+#[allow(clippy::too_many_arguments)]
+async fn forward_impl<'r, S: WeightSource>(
+    cfg: &DitConfig,
+    backend: &WgpuBackend,
+    pipelines: &DitPipelines,
+    residency: &'r WeightResidency<S>,
+    workspace: &Workspace<WgpuBackend>,
+    handles: &DitHandles,
+    table: &ModulationTable,
+    plan: &DenoisePlan,
+    step: usize,
+    video_rows: &[f32],
+    audio_rows: &[f32],
+    text: &[f32],
+    mut taps: Option<&mut ForwardTaps>,
+    mut carry: Option<&mut StepCarry<'r>>,
+    cancel: Cancel<'_>,
+) -> Result<Velocity, PipelineError<S::Error>> {
+    debug_assert!(
+        taps.is_none() || carry.is_none(),
+        "taps record the refiner every step"
+    );
     let p = &pipelines.block;
     let act = p.act_dtype;
     let seq_len = plan.packed.seq_len;
@@ -466,6 +516,7 @@ pub async fn forward_tapped<S: WeightSource>(
                 head_dim: cfg.head_dim as u32,
                 tile: g.tiling.rows as u32,
                 int8_qk: cfg.vsa_int8_qk,
+                fp8_pv: cfg.vsa_fp8_pv,
                 n_tiles: g.n_tiles() as u32,
                 n_prefix: g.n_prefix as u32,
                 topk: g.topk(sparsity) as u32,
@@ -501,11 +552,27 @@ pub async fn forward_tapped<S: WeightSource>(
     let freqs_buf = workspace.alloc(freqs_bytes.len() as u64)?;
     backend.write_buffer(freqs_buf.id(), 0, &freqs_bytes)?;
 
-    // --- input projections ---
+    let row_bytes = hidden as u64 * p.act_bytes(1);
+    let text_bytes = n_text as u64 * row_bytes;
+    // The text span of `x_buf`: the refiner's input and output, in place.
+    let text_rows = BufRef::view(
+        x_buf.as_buf_ref().id,
+        x_buf.as_buf_ref().offset + text_at as u64 * row_bytes,
+        text_bytes,
+    );
+    let cached = carry
+        .as_deref()
+        .and_then(|c| c.refined.as_ref())
+        .map(|b| b.as_buf_ref());
+
+    // --- input projections (text: the refiner's kept output, when held) ---
     {
         let vid_in = upload_rows(backend, workspace, act, video_rows)?;
         let aud_in = upload_rows(backend, workspace, act, audio_rows)?;
-        let txt_in = upload_rows(backend, workspace, act, text)?;
+        let txt_in = match cached {
+            None => Some(upload_rows(backend, workspace, act, text)?),
+            Some(_) => None,
+        };
 
         let vp = residency.acquire(handles.video_patch_proj, backend).await?;
         let vpb = residency
@@ -515,17 +582,21 @@ pub async fn forward_tapped<S: WeightSource>(
         let apb = residency
             .acquire(handles.audio_patch_proj_bias, backend)
             .await?;
-        let cp = residency.acquire(handles.condition_proj, backend).await?;
-        let cpb = residency
-            .acquire(handles.condition_proj_bias, backend)
-            .await?;
+        let cond_proj = match txt_in {
+            Some(_) => Some((
+                residency.acquire(handles.condition_proj, backend).await?,
+                residency
+                    .acquire(handles.condition_proj_bias, backend)
+                    .await?,
+            )),
+            None => None,
+        };
 
         let x_ref = x_buf.as_buf_ref();
-        let row_bytes = hidden as u64 * p.act_bytes(1);
         let scope = workspace.batch();
         let x_all = scope.import(&x_ref);
 
-        for (src, w, b, rows, in_w, at) in [
+        let mut inputs = vec![
             (
                 vid_in.as_buf_ref(),
                 vp.buf(),
@@ -542,15 +613,22 @@ pub async fn forward_tapped<S: WeightSource>(
                 cfg.audio_latents_dim,
                 audio_at,
             ),
-            (
-                txt_in.as_buf_ref(),
+        ];
+        if let (Some(t), Some((cp, cpb))) = (&txt_in, &cond_proj) {
+            inputs.push((
+                t.as_buf_ref(),
                 cp.buf(),
                 cpb.buf(),
                 n_text,
                 cfg.text_dim,
                 text_at,
-            ),
-        ] {
+            ));
+        }
+        if let Some(rows) = cached {
+            let (src, dst) = (scope.import_copy(rows), scope.import_copy(text_rows));
+            scope.copy_buffer_to_buffer(src, 0, dst, 0, text_bytes)?;
+        }
+        for (src, w, b, rows, in_w, at) in inputs {
             let dst = scope.subview(&x_all, at as u64 * row_bytes, rows as u64 * row_bytes);
             project_into(
                 &scope,
@@ -572,22 +650,16 @@ pub async fn forward_tapped<S: WeightSource>(
             .await?;
     }
 
-    // --- token refiner over the text rows, in place ---
-    {
+    // --- token refiner over the text rows, in place (once per request) ---
+    if cached.is_none() {
         let refiner_shape = DitShape {
             cfg: *cfg,
             rows: n_text,
         };
-        let row_bytes = hidden as u64 * p.act_bytes(1);
-        let text_bytes = n_text as u64 * row_bytes;
         // The refiner writes the text rows back in place, so each block runs
         // into `scratch` and is copied home. Two blocks, so a second full-size
         // buffer would cost more than the copies.
-        let cur = BufRef::view(
-            x_buf.as_buf_ref().id,
-            x_buf.as_buf_ref().offset + text_at as u64 * row_bytes,
-            text_bytes,
-        );
+        let cur = text_rows;
         let scratch = workspace.alloc(text_bytes)?;
         for (j, block) in handles.refiner.iter().enumerate() {
             let views = block.acquire(residency, backend).await?;
@@ -637,6 +709,12 @@ pub async fn forward_tapped<S: WeightSource>(
         let a = scope.import_copy(scratch.as_buf_ref());
         let b = scope.import_copy(cur);
         scope.copy_buffer_to_buffer(a, 0, b, 0, text_bytes)?;
+        if let Some(c) = carry.as_deref_mut() {
+            let kept = workspace.alloc(text_bytes)?;
+            let k = scope.import_copy(kept.as_buf_ref());
+            scope.copy_buffer_to_buffer(a, 0, k, 0, text_bytes)?;
+            c.refined = Some(kept);
+        }
         scope.submit_void().await?;
         if let Some(t) = taps.as_deref_mut() {
             t.record(backend, act, "refiner_out".into(), cur, n_text * hidden)
@@ -652,10 +730,14 @@ pub async fn forward_tapped<S: WeightSource>(
     let freqs_ref = freqs_buf.as_buf_ref();
     // The residual stream, updated in place block after block.
     let x_ref = x_buf.as_buf_ref();
-    let mut pending = match handles.blocks.first() {
-        Some(h) => Some(h.acquire(residency, backend).await?),
-        None => None,
+    let mut pending = match carry.as_deref_mut().and_then(|c| c.first_block.take()) {
+        Some(views) => Some(views),
+        None => match handles.blocks.first() {
+            Some(h) => Some(h.acquire(residency, backend).await?),
+            None => None,
+        },
     };
+    let more_steps = carry.as_deref().is_some_and(|c| c.more_steps);
     for idx in 0..handles.blocks.len() {
         let _guard = trace::scope!(format!("minimax.dit.block.{idx}")).entered();
         // A step is seconds to tens of seconds; poll per block so a cancel
@@ -691,8 +773,15 @@ pub async fn forward_tapped<S: WeightSource>(
             vsa_plan.as_ref(),
             probe.as_ref().map(|p| p.probe()).as_ref(),
         )?;
+        // The last block's lookahead is the next step's block 0.
+        let wraps = idx + 1 == handles.blocks.len() && more_steps;
+        let next = if wraps {
+            handles.blocks.first()
+        } else {
+            handles.blocks.get(idx + 1)
+        };
         let next_acquire = async {
-            match handles.blocks.get(idx + 1) {
+            match next {
                 Some(h) => Ok::<_, ResidencyError<S::Error, WgpuError>>(Some(
                     h.acquire(residency, backend).await?,
                 )),
@@ -713,7 +802,10 @@ pub async fn forward_tapped<S: WeightSource>(
             futures::join!(submit, next_acquire)
         };
         submit_res?;
-        pending = next_res?;
+        match carry.as_deref_mut().filter(|_| wraps) {
+            Some(c) => c.first_block = next_res?,
+            None => pending = next_res?,
+        }
         drop(views);
         if let Some(t) = taps.as_deref_mut() {
             if let Some(pb) = &probe {
@@ -970,7 +1062,9 @@ pub async fn denoise<S: WeightSource>(
     video.iter_mut().for_each(|x| *x *= sv);
     audio.iter_mut().for_each(|x| *x *= sa);
     let steps = plan.schedule.num_steps();
+    let mut carry = StepCarry::default();
     for step in 0..steps {
+        carry.more_steps = step + 1 < steps;
         let _guard = trace::scope!(format!("minimax.denoise.step.{step}")).entered();
         // The step-end memory line below then reports this step's own peaks.
         backend.mem_account().reset_peaks();
@@ -979,9 +1073,22 @@ pub async fn denoise<S: WeightSource>(
         } else {
             Cow::Owned([cond.as_slice(), &video].concat())
         };
-        let v = forward(
-            cfg, backend, pipelines, residency, workspace, handles, table, plan, step, &rows,
-            &audio, text, cancel,
+        let v = forward_impl(
+            cfg,
+            backend,
+            pipelines,
+            residency,
+            workspace,
+            handles,
+            table,
+            plan,
+            step,
+            &rows,
+            &audio,
+            text,
+            None,
+            Some(&mut carry),
+            cancel,
         )
         .await?;
         // The reference evaluates `ratio * x + (1 - ratio) * (x + sigma * v)`

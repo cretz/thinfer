@@ -57,6 +57,14 @@ async fn vae_encoder_parity() {
         .await
         .expect("wgpu backend"),
     );
+    // Opt-in CUDA (`THINFER_CUDA=on`): the same gate then measures the
+    // accelerator path (one deferred sequence per frame) against the pyref.
+    if std::env::var("THINFER_CUDA").is_ok_and(|v| v == "on") {
+        match thinfer_cuda::install(&backend) {
+            Ok((name, sm)) => eprintln!("cuda hot ops ON: {name} sm_{}{}", sm.0, sm.1),
+            Err(e) => eprintln!("cuda hot ops requested but unavailable: {e}"),
+        }
+    }
     let opener = MmapFileOpener::new(&path).await.expect("open video vae");
     let raw = SafetensorsSource::open(opener)
         .await
@@ -78,57 +86,63 @@ async fn vae_encoder_parity() {
 
     let input = read_f32(&dir.join("input.bin"));
     assert_eq!(input.len(), 3 * hh * ww);
-    let mut taps = EncodeTaps::default();
-    let out = enc
-        .encode_frame(
-            &backend,
-            &residency,
-            &ws,
-            &pl,
-            &input,
-            hh,
-            ww,
-            (&mean, &std),
-            // The pyref runs `_encode_clip` with tiling off and dumps the mean.
-            EncodeOptions {
-                tiled: false,
-                posterior: Posterior::Mean,
-            },
-            Some(&mut taps),
-        )
-        .await
-        .expect("encode");
-    assert_eq!((out.height, out.width), (h, w));
+    // The default f32 convolutions, then the opt-in bf16 tensor-core ones
+    // (the reference's own precision), against the same dumps. Without the
+    // CUDA accelerator both runs are the f32 path.
+    for bf16_conv in [false, true] {
+        let mut taps = EncodeTaps::default();
+        let out = enc
+            .encode_frame(
+                &backend,
+                &residency,
+                &ws,
+                &pl,
+                &input,
+                hh,
+                ww,
+                (&mean, &std),
+                // The pyref runs `_encode_clip` with tiling off and dumps the mean.
+                EncodeOptions {
+                    tiled: false,
+                    posterior: Posterior::Mean,
+                    bf16_conv,
+                },
+                Some(&mut taps),
+            )
+            .await
+            .expect("encode");
+        assert_eq!((out.height, out.width), (h, w));
 
-    let mut worst = Vec::new();
-    let mut check = |label: &str, exp: &[f32], got: &[f32]| {
-        assert_eq!(exp.len(), got.len(), "{label}: length");
-        let (slope, rel) = report(label, exp, got);
-        worst.push((label.to_string(), slope, rel));
-    };
-    check(
-        "conv_in",
-        &read_f32(&dir.join("conv_in.bin")),
-        &taps.conv_in,
-    );
-    for (i, lv) in taps.levels.iter().enumerate() {
+        let mut worst = Vec::new();
+        let mut check = |label: &str, exp: &[f32], got: &[f32]| {
+            assert_eq!(exp.len(), got.len(), "{label}: length");
+            let (slope, rel) = report(&format!("{label} (bf16 conv {bf16_conv})"), exp, got);
+            worst.push((label.to_string(), slope, rel));
+        };
         check(
-            &format!("down{i}"),
-            &read_f32(&dir.join(format!("down{i}.bin"))),
-            lv,
+            "conv_in",
+            &read_f32(&dir.join("conv_in.bin")),
+            &taps.conv_in,
         );
-    }
-    check(
-        "moments",
-        &read_f32(&dir.join("moments.bin")),
-        &taps.moments,
-    );
-    check("latents", &read_f32(&dir.join("latents.bin")), &out.latent);
-    for (label, slope, rel) in &worst {
-        assert!(
-            (slope - 1.0).abs() < SLOPE_TOL && *rel < REL_TOL,
-            "{label}: slope {slope:.4} rel {rel:.4}"
+        for (i, lv) in taps.levels.iter().enumerate() {
+            check(
+                &format!("down{i}"),
+                &read_f32(&dir.join(format!("down{i}.bin"))),
+                lv,
+            );
+        }
+        check(
+            "moments",
+            &read_f32(&dir.join("moments.bin")),
+            &taps.moments,
         );
+        check("latents", &read_f32(&dir.join("latents.bin")), &out.latent);
+        for (label, slope, rel) in &worst {
+            assert!(
+                (slope - 1.0).abs() < SLOPE_TOL && *rel < REL_TOL,
+                "{label} (bf16 conv {bf16_conv}): slope {slope:.4} rel {rel:.4}"
+            );
+        }
     }
 }
 

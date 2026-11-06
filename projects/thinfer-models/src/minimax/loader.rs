@@ -395,38 +395,53 @@ async fn project_adaln<S: WeightSource>(
         .await
         .map_err(|e| LoaderError::ReadAt(format!("{}: {e:?}", wid.0)))?;
 
-    let mut out = vec![0f32; t * n];
-    match encoding {
-        StorageEncoding::Quant(kind) => {
-            // Decode a whole number of output rows at a time. K-quant blocks
-            // are 256 elements and `k` need not be a multiple of that, so the
-            // chunk is `rows_per_chunk` output rows chosen to land on a block
-            // boundary.
-            let rows_per_chunk = rows_per_quant_chunk(kind, k);
-            let chunk_elems = rows_per_chunk * k;
-            let chunk_bytes = kind.bytes_for_elements(chunk_elems as u64) as usize;
-            let mut buf = vec![0f32; chunk_elems];
-            let mut j = 0usize;
-            let mut at = 0usize;
-            while j < n {
-                let rows = rows_per_chunk.min(n - j);
-                let take = if rows == rows_per_chunk {
-                    chunk_bytes
-                } else {
-                    kind.bytes_for_elements((rows * k) as u64) as usize
-                };
-                dequantize_row(kind, &bytes[at..at + take], &mut buf[..rows * k]);
-                accumulate(&mut out, a, &buf[..rows * k], &bias, t, k, n, j, rows);
-                j += rows;
-                at += take;
-            }
+    // Decode a whole number of output rows at a time. K-quant blocks are 256
+    // elements and `k` need not be a multiple of that, so a quant chunk is the
+    // fewest output rows landing on a block boundary.
+    let chunk = match encoding {
+        StorageEncoding::Quant(kind) => rows_per_quant_chunk(kind, k),
+        _ => DENSE_CHUNK_ROWS,
+    };
+    // Every output is its own sum over `k`: the output rows split into
+    // contiguous groups across workers, each decoding only its own rows
+    // (identical bits to one pass).
+    let group = n.div_ceil(chunk).div_ceil(PROJECT_PARTS) * chunk;
+    let parts = crate::common::seq::par_map(n.div_ceil(group), |g| {
+        let (j0, j1) = (g * group, ((g + 1) * group).min(n));
+        let mut part = vec![0f32; t * (j1 - j0)];
+        let mut j = j0;
+        while j < j1 {
+            let rows = chunk.min(j1 - j);
+            let at = encoded_bytes(encoding, j * k);
+            let w = decode_f32(encoding, &bytes[at..], rows * k);
+            accumulate(&mut part, a, &w, &bias[j..], t, k, j1 - j0, j - j0, rows);
+            j += rows;
         }
-        enc => {
-            let w = decode_f32(enc, &bytes, n * k);
-            accumulate(&mut out, a, &w, &bias, t, k, n, 0, n);
+        part
+    });
+    let mut out = vec![0f32; t * n];
+    for (g, part) in parts.iter().enumerate() {
+        let (j0, cols) = (g * group, part.len() / t);
+        for ti in 0..t {
+            out[ti * n + j0..][..cols].copy_from_slice(&part[ti * cols..][..cols]);
         }
     }
     Ok(out)
+}
+
+/// Worker groups [`project_adaln`] splits its output rows into.
+const PROJECT_PARTS: usize = 8;
+
+/// Output rows a dense [`project_adaln`] weight decodes at a time.
+const DENSE_CHUNK_ROWS: usize = 16;
+
+/// Bytes `elements` leading elements take in `encoding` (whole quant blocks).
+fn encoded_bytes(encoding: StorageEncoding, elements: usize) -> usize {
+    match encoding {
+        StorageEncoding::F32 => elements * 4,
+        StorageEncoding::Quant(kind) => kind.bytes_for_elements(elements as u64) as usize,
+        _ => elements * 2,
+    }
 }
 
 /// Output rows that span a whole number of quant blocks, so chunked decoding
@@ -441,6 +456,8 @@ fn rows_per_quant_chunk(kind: QuantKind, k: usize) -> usize {
     rows
 }
 
+/// `out[ti, col0 + r] = bias[r] + a[ti] . w[r]` for `rows` weight rows, `out`
+/// being `[t, cols]`.
 #[allow(clippy::too_many_arguments)]
 fn accumulate(
     out: &mut [f32],
@@ -449,20 +466,19 @@ fn accumulate(
     bias: &[f32],
     t: usize,
     k: usize,
-    n: usize,
-    j0: usize,
+    cols: usize,
+    col0: usize,
     rows: usize,
 ) {
     for r in 0..rows {
         let wr = &w[r * k..(r + 1) * k];
-        let j = j0 + r;
         for ti in 0..t {
             let ar = &a[ti * k..(ti + 1) * k];
-            let mut acc = bias[j];
+            let mut acc = bias[r];
             for i in 0..k {
                 acc += ar[i] * wr[i];
             }
-            out[ti * n + j] = acc;
+            out[ti * cols + col0 + r] = acc;
         }
     }
 }

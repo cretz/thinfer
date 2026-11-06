@@ -108,11 +108,12 @@ pub trait MatmulOp {
     }
 }
 
-/// 16-bit element type of a dense matmul operand.
+/// Element type of a dense matmul operand (`F32`: A only, f32 activations).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmType {
     F16,
     Bf16,
+    F32,
 }
 
 impl GemmType {
@@ -120,15 +121,16 @@ impl GemmType {
         match self {
             Self::F16 => "f16",
             Self::Bf16 => "bf16",
+            Self::F32 => "f32",
         }
     }
 }
 
-/// The contract of a dense 16-bit matmul, for an accelerator to run it in
+/// The contract of a dense matmul, for an accelerator to run it in
 /// place of the WGSL: A `[M,K]` row-major of type `a`, B of type `b` as
 /// `[N,K]` (`b_nmajor`) or `[K,N]`, out `[M,N]` row-major (f32 when
 /// `out_f32`, else type `a`), f32 accumulate, dims uniform `(m, n, k, _)`.
-/// Only these combos qualify; f32/i8 acts and fused-quant weights have none
+/// Only these combos qualify; i8 acts and fused-quant weights have none
 /// (always WGSL).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmDesc {
@@ -145,6 +147,7 @@ impl GemmDesc {
         let a = match cfg.act_dtype {
             ActDtype::F16 => GemmType::F16,
             ActDtype::Bf16 => GemmType::Bf16,
+            ActDtype::F32 => GemmType::F32,
             _ => return None,
         };
         let b = match cfg.weight_dtype {
@@ -178,6 +181,7 @@ impl GemmDesc {
         let ty = |s: &str| match s {
             "f16" => Some(GemmType::F16),
             "bf16" => Some(GemmType::Bf16),
+            "f32" => Some(GemmType::F32),
             _ => None,
         };
         let mut a = None;

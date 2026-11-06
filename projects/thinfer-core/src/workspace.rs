@@ -300,6 +300,9 @@ impl<B: Backend> Workspace<B> {
             deferred: Deferred {
                 backend: &self.backend,
                 on: std::cell::Cell::new(false),
+                mixed: std::cell::Cell::new(false),
+                wgpu_dirty: std::cell::Cell::new(false),
+                accel_pending: std::cell::Cell::new(false),
             },
             guards: RefCell::new(Vec::new()),
             scope_id: NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
@@ -466,6 +469,15 @@ pub enum Nvfp4Epi<'wsp> {
 struct Deferred<'wsp, B: Backend> {
     backend: &'wsp B,
     on: std::cell::Cell<bool>,
+    /// [`BatchScope::accel_begin_mixed`]: backend work may interleave with
+    /// the accelerator's in any order; each switch of engine waits once.
+    mixed: std::cell::Cell<bool>,
+    /// Mixed mode: backend work (or a queue write) is encoded since the last
+    /// drain, so the next accelerator op flushes and drains first.
+    wgpu_dirty: std::cell::Cell<bool>,
+    /// Mixed mode: accelerator work is enqueued since the last wait, so the
+    /// next backend encode or queue write waits for it first.
+    accel_pending: std::cell::Cell<bool>,
 }
 
 impl<B: Backend> Drop for Deferred<'_, B> {
@@ -626,6 +638,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// `backend.write_buffer`. Common case for kernel uniform parameters.
     pub fn write_uniform(&self, bytes: &[u8]) -> Result<BatchBuf<'wsp>, B::Error> {
         let h = self.alloc(bytes.len() as u64)?;
+        self.note_backend_work();
         self.backend.write_buffer(h.buf.id, 0, bytes)?;
         Ok(h)
     }
@@ -685,6 +698,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     }
 
     pub(crate) fn encoder_mut(&self) -> RefMut<'_, B::CommandEncoder> {
+        self.note_backend_work();
         RefMut::map(self.encoder.borrow_mut(), |o| {
             o.as_mut().expect("BatchScope encoder already taken")
         })
@@ -1312,8 +1326,13 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             return Ok(false);
         };
         let t0 = crate::trace::Instant::now();
+        // Always drained: its uniform is a queue write, even when deferred.
         self.flush()?;
         self.backend.wait_idle();
+        self.deferred.wgpu_dirty.set(false);
+        if self.deferred.mixed.get() {
+            self.deferred.accel_pending.set(true);
+        }
         let addrs = crate::backend::SdpaAddrs {
             q,
             k,
@@ -1408,6 +1427,84 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         }
     }
 
+    /// One-image 2D convolution on the accelerator (see
+    /// [`crate::backend::Conv2dAddrs`]). `false` = not covered: run the
+    /// backend op. Deferred-aware.
+    pub fn try_conv2d(
+        &self,
+        shape: &crate::backend::Conv2dShape,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let (Some(x), Some(w), Some(bias), Some(out)) = (addr(x), addr(w), addr(bias), addr(out))
+        else {
+            return Ok(false);
+        };
+        self.accel_drain()?;
+        let addrs = crate::backend::Conv2dAddrs {
+            x,
+            w,
+            bias,
+            out,
+            shape: *shape,
+        };
+        match acc
+            .conv2d(&addrs)
+            .and_then(|ran| self.accel_settle(acc).map(|()| ran))
+        {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator conv2d failed; wgpu op");
+                Ok(false)
+            }
+        }
+    }
+
+    /// f16-act 3D convolution on the accelerator (see
+    /// [`crate::backend::Conv3dAddrs`]). `false` = not covered: run the
+    /// backend op. Deferred-aware.
+    pub fn try_conv3d_f16(
+        &self,
+        shape: &crate::backend::Conv3dShape,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let (Some(x), Some(w), Some(bias), Some(out)) = (addr(x), addr(w), addr(bias), addr(out))
+        else {
+            return Ok(false);
+        };
+        self.accel_drain()?;
+        let addrs = crate::backend::Conv3dAddrs {
+            x,
+            w,
+            bias,
+            out,
+            shape: *shape,
+        };
+        match acc
+            .conv3d_f16(&addrs)
+            .and_then(|ran| self.accel_settle(acc).map(|()| ran))
+        {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator conv3d failed; wgpu op");
+                Ok(false)
+            }
+        }
+    }
+
     /// Block-sparse tile attention with caller-built key lists on the
     /// accelerator (see [`crate::backend::TileAttnShape`]). Deferred-aware.
     #[allow(clippy::too_many_arguments)]
@@ -1438,10 +1535,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         ) else {
             return Ok(false);
         };
-        if !self.deferred.on.get() {
-            self.flush()?;
-            self.backend.wait_idle();
-        }
+        self.accel_drain()?;
         let addrs = crate::backend::TileAttnAddrs {
             q,
             k,
@@ -1478,15 +1572,65 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         Ok(true)
     }
 
+    /// Deferred mode where backend work may interleave with the
+    /// accelerator's freely: a backend encode after accelerator work waits
+    /// for it, and an accelerator op after backend work (or a queue write)
+    /// flushes and drains first, so each engine switch costs one wait and
+    /// runs of same-engine ops none. Idempotent. `false` = no accelerator.
+    pub fn accel_begin_mixed(&self) -> bool {
+        if self.backend.accelerator().is_none() {
+            return false;
+        }
+        if !self.deferred.mixed.replace(true) {
+            self.deferred.on.set(true);
+            self.deferred.wgpu_dirty.set(true);
+        }
+        true
+    }
+
     /// Leave deferred mode, waiting for everything the accelerator enqueued.
     /// A failed wait is a lost device: there is no backend path to fall back
     /// to for work already enqueued.
     pub fn accel_end(&self) {
-        if self.deferred.on.replace(false)
-            && let Some(acc) = self.backend.accelerator()
+        self.deferred.mixed.set(false);
+        self.deferred.accel_pending.set(false);
+        if self.deferred.on.replace(false) {
+            self.accel_wait();
+        }
+    }
+
+    fn accel_wait(&self) {
+        if let Some(acc) = self.backend.accelerator()
             && let Err(e) = acc.sync()
         {
             panic!("accelerator sync failed: {e}");
+        }
+    }
+
+    /// Before an accelerator op: outside deferred mode (or in mixed mode
+    /// after backend work), submit what is encoded and wait for it, so the
+    /// accelerator reads complete inputs.
+    fn accel_drain(&self) -> Result<(), B::Error> {
+        let on = self.deferred.on.get();
+        if !on || (self.deferred.mixed.get() && self.deferred.wgpu_dirty.replace(false)) {
+            self.flush()?;
+            self.backend.wait_idle();
+        }
+        if self.deferred.mixed.get() {
+            self.deferred.accel_pending.set(true);
+        }
+        Ok(())
+    }
+
+    /// Mixed mode, before a backend encode or queue write (which lands at
+    /// the next submit): wait for enqueued accelerator work, and make the
+    /// next accelerator op flush first.
+    fn note_backend_work(&self) {
+        if self.deferred.mixed.get() {
+            if self.deferred.accel_pending.replace(false) {
+                self.accel_wait();
+            }
+            self.deferred.wgpu_dirty.set(true);
         }
     }
 
@@ -1523,6 +1667,10 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let Some(acc) = self.backend.accelerator() else {
             return false;
         };
+        if let Err(e) = self.accel_drain() {
+            tracing::warn!(target: crate::trace::ADAPTER, error = ?e, "flush before an accelerator op failed");
+            return false;
+        }
         match acc.elementwise(op) {
             Ok(ran) => ran,
             Err(e) => {
@@ -1565,6 +1713,10 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let Some(acc) = self.backend.accelerator() else {
             return false;
         };
+        if let Err(e) = self.accel_drain() {
+            tracing::warn!(target: crate::trace::ADAPTER, error = ?e, "flush before an accelerator op failed");
+            return false;
+        }
         match acc.vsa_part(shape, part, addrs) {
             Ok(ran) => ran,
             Err(e) => {
@@ -1779,10 +1931,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             Nvfp4Epi::QkNormRope(q) => crate::backend::Nvfp4Epilogue::QkNormRope(q),
         };
         let t0 = crate::trace::Instant::now();
-        if !self.deferred.on.get() {
-            self.flush()?;
-            self.backend.wait_idle();
-        }
+        self.accel_drain()?;
         let t1 = crate::trace::Instant::now();
         let res = acc.gemm_nvfp4(&crate::backend::GemmNvfp4Addrs {
             a,
@@ -1875,10 +2024,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             return Ok(false);
         };
         let t0 = crate::trace::Instant::now();
-        if !self.deferred.on.get() {
-            self.flush()?;
-            self.backend.wait_idle();
-        }
+        self.accel_drain()?;
         let t1 = crate::trace::Instant::now();
         let res = acc.vsa(
             shape,
@@ -1942,10 +2088,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             return Ok(false);
         };
         let t0 = crate::trace::Instant::now();
-        if !self.deferred.on.get() {
-            self.flush()?;
-            self.backend.wait_idle();
-        }
+        self.accel_drain()?;
         let addrs = crate::backend::GemmAddrs {
             a,
             b,
@@ -1955,6 +2098,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             n,
             k,
             epilogue,
+            checked: !self.deferred.on.get(),
         };
         let t1 = crate::trace::Instant::now();
         let res = acc
@@ -3039,6 +3183,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         bytes: &[u8],
     ) -> Result<(), B::Error> {
         let r = self.resolve(dst);
+        self.note_backend_work();
         self.backend.write_buffer(r.id, r.offset + offset, bytes)
     }
 
@@ -3127,6 +3272,8 @@ pub struct ScopePacker<'wsp, B: Backend> {
     current_live: u64,
     pending: Vec<ScopeSubmitFuture<'wsp, B>>,
     carry_holds: Vec<WsBuf<B>>,
+    /// Every scope runs in [`BatchScope::accel_begin_mixed`] mode.
+    accel_mixed: bool,
 }
 
 impl<'wsp, B: Backend> ScopePacker<'wsp, B>
@@ -3152,7 +3299,15 @@ where
             current_live: 0,
             pending: Vec::new(),
             carry_holds: Vec::new(),
+            accel_mixed: false,
         }
+    }
+
+    /// Run this and every later scope in [`BatchScope::accel_begin_mixed`]
+    /// mode. `false` = no accelerator.
+    pub fn accel_mixed(&mut self) -> bool {
+        self.accel_mixed = self.scope().accel_begin_mixed();
+        self.accel_mixed
     }
 
     /// Current open scope. Panics if a cut consumed it without opening the
@@ -3260,6 +3415,9 @@ where
         self.current = Some(self.workspace.batch());
         self.current_live = peak_bytes;
         let new_scope = self.current.as_ref().unwrap();
+        if self.accel_mixed {
+            new_scope.accel_begin_mixed();
+        }
         // Re-mint one BatchBuf per carry_in entry, preserving each input's
         // exact (id, offset, len) sub-view so fused pairs come back as the
         // same two views the caller passed in.

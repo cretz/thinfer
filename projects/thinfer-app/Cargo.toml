@@ -44,6 +44,9 @@ utoipa = { version = "5", optional = true }
 serde_json = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
 futures-util = { version = "0.3", optional = true }
+# The minimax DiT pipeline compile runs on its own thread (`oneshot` + `block_on`).
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+pollster = "0.4"
 # User-driven encrypted adapter (LoRA) vault (`vault` module): Argon2id KDF +
 # AES-256-GCM, both native-only. Gated so a bare thinfer-app stays dep-clean;
 # both `cli` and `serve` turn it on for CLI/web parity.

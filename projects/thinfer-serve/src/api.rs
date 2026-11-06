@@ -121,27 +121,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Submit a sealed job. The server cannot read it; it queues the ciphertext.
-/// Large-input jobs (face-swap) are rejected with 409 when a worker is busy
-/// rather than queued.
+/// The uploads it names are held for it (exempt from the upload TTL) while it
+/// waits.
 #[utoipa::path(
     post, path = "/jobs",
     request_body = SealedJob,
     responses(
         (status = 202, description = "Accepted", body = CreateResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 409, description = "Busy (large-input job, worker not idle)"),
+        (status = 400, description = "Invalid request or unknown upload"),
     )
 )]
 async fn create_job(
     State(state): State<AppState>,
     Json(job): Json<SealedJob>,
 ) -> Result<(StatusCode, Json<CreateResponse>), ApiError> {
-    if job.large_input && state.store.is_busy() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "worker busy; large-input jobs are not queued, retry when idle",
-        ));
-    }
     let sealed = base64::engine::general_purpose::STANDARD
         .decode(job.sealed.as_bytes())
         .map_err(|e| {
@@ -150,7 +143,12 @@ async fn create_job(
                 format!("sealed is not base64: {e}"),
             )
         })?;
-    let (handle, position) = state.store.submit(&state.config.artifact_dir, sealed);
+    let handle = state.store.create(&state.config.artifact_dir, sealed);
+    state
+        .uploads
+        .claim(&job.uploads, &handle)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+    let position = state.store.enqueue(&handle);
     Ok((
         StatusCode::ACCEPTED,
         Json(CreateResponse {

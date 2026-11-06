@@ -104,6 +104,50 @@ pub struct LoadedWanDitHandles {
     pub ref_conv: Option<LinearBiasHandles>,
 }
 
+impl LoadedWanDitHandles {
+    /// Pin-priority list for a denoise phase (`WeightResidency::set_pin_plan`).
+    /// Every weight is read once per step, so each pinned byte saves the same
+    /// upload; the order only shapes the streaming that remains. Small per-step
+    /// weights first, then the blocks role-major, largest roles first, so every
+    /// block streams the same remainder (as `ZImageDit::pin_priority`).
+    pub fn pin_priority(&self) -> Vec<thinfer_core::residency::WeightHandle> {
+        let lb = |h: &LinearBiasHandles| [h.weight, h.bias];
+        let c = &self.condition;
+        let mut out: Vec<_> = [&c.time_linear_1, &c.time_linear_2, &c.time_proj]
+            .into_iter()
+            .chain([
+                &c.text_linear_1,
+                &c.text_linear_2,
+                &self.patch,
+                &self.proj_out,
+            ])
+            .chain(self.ref_conv.as_ref())
+            .flat_map(lb)
+            .chain([self.scale_shift_table])
+            .collect();
+        let roles: [fn(&super::dit_block::WanDitBlockHandles) -> Vec<_>; 7] = [
+            |b| vec![b.ffn_down_w],
+            |b| vec![b.ffn_up_w],
+            |b| vec![b.cross_attn.k_w, b.cross_attn.v_w],
+            |b| vec![b.cross_attn.q_w, b.cross_attn.o_w],
+            |b| vec![b.self_attn.q_w, b.self_attn.k_w, b.self_attn.v_w],
+            |b| vec![b.self_attn.o_w],
+            |b| {
+                let a = [&b.self_attn, &b.cross_attn];
+                a.iter()
+                    .flat_map(|h| [h.q_b, h.k_b, h.v_b, h.o_b, h.norm_q, h.norm_k])
+                    .chain([b.norm2_w, b.norm2_b, b.ffn_up_b, b.ffn_down_b])
+                    .chain([b.scale_shift_table])
+                    .collect()
+            },
+        ];
+        for role in roles {
+            out.extend(self.blocks.iter().flat_map(role));
+        }
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shape + inputs + outputs
 // ---------------------------------------------------------------------------
@@ -205,6 +249,16 @@ impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for WanDitError<S
 /// Cross-submit residual-stream buffer (dense activation at the pipeline dtype).
 struct ResStream {
     data: WsBuf<WgpuBackend>,
+}
+
+/// One input's state through the block loop: the residual stream plus the
+/// conditioning the blocks and the head read.
+struct Front {
+    x: ResStream,
+    temb: WsBuf<WgpuBackend>,
+    tproj: WsBuf<WgpuBackend>,
+    text: ResStream,
+    freqs: WsBuf<WgpuBackend>,
 }
 
 /// Boxed completion fence carried ACROSS blocks: block N's last pass-B submit,
@@ -316,34 +370,38 @@ impl WanDit {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn forward_with_taps<S: WeightSource>(
-        &self,
-        backend: &WgpuBackend,
-        pipelines: &WanDitPipelines,
-        residency: &WeightResidency<S>,
-        scratch: &Workspace<WgpuBackend>,
-        inputs: &WanDitInputs<'_>,
-        mut taps: WanDitTaps<'_>,
-        mut cross_kv: Option<&mut WanCrossKvCache>,
-    ) -> Result<WanDitOutput, WanDitError<S::Error>> {
-        let bp = &pipelines.block;
+    /// Rows of the residual stream: `(n_tok, ref_rows, rows)`. DreamID-V's
+    /// `ref_rows` source-face tokens ride in front of the `n_tok` video patch
+    /// tokens; zero on every plain Wan model.
+    fn stream_rows(&self) -> (u32, u32, u32) {
         let s = self.shape;
-        let inner = self.cfg.inner() as u32;
-        let ppf = s.grid.ppf;
-        let text_seq = s.text_seq as u32;
-        // DreamID-V prefix geometry: `ref_rows` source-face tokens ride in front
-        // of the `n_tok` video patch tokens, and RoPE runs over the grown grid
-        // `(ppf + 1, pph, ppw)` (ref = frame 0, video = frames 1..ppf). Both are
-        // zero / identity on every plain Wan model, so `rows == n_tok` and the
-        // whole forward stays bit-identical there.
         let n_tok = s.n_tok as u32;
         let ref_rows = if self.cfg.ref_conv {
             (s.grid.pph * s.grid.ppw) as u32
         } else {
             0
         };
-        let rows = n_tok + ref_rows;
+        (n_tok, ref_rows, n_tok + ref_rows)
+    }
+
+    /// Steps 1-3 of a forward for one input: the patch-embedded residual
+    /// stream (ref prefix first), the condition embedder outputs and the
+    /// RoPE table.
+    async fn front<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipelines: &WanDitPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        inputs: &WanDitInputs<'_>,
+        taps: &mut WanDitTaps<'_>,
+    ) -> Result<Front, WanDitError<S::Error>> {
+        let bp = &pipelines.block;
+        let s = self.shape;
+        let inner = self.cfg.inner() as u32;
+        let ppf = s.grid.ppf;
+        let text_seq = s.text_seq as u32;
+        let (n_tok, ref_rows, rows) = self.stream_rows();
         let ppf_full = ppf + if self.cfg.ref_conv { 1 } else { 0 };
 
         // --- 1. patchify image + front-door linear -> x [rows, inner] ---
@@ -471,6 +529,153 @@ impl WanDit {
         );
         let freqs = scratch.alloc(freqs_bytes.len() as u64)?;
         backend.write_buffer(freqs.id, 0, &freqs_bytes)?;
+
+        Ok(Front {
+            x,
+            temb,
+            tproj,
+            text,
+            freqs,
+        })
+    }
+
+    /// Steps 6-7 of a forward: strip the ref prefix, final norm + modulation
+    /// + proj_out, unpatchify on the host.
+    async fn head<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipelines: &WanDitPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        x_cur: &ResStream,
+        temb: &WsBuf<WgpuBackend>,
+        taps: &mut WanDitTaps<'_>,
+    ) -> Result<WanDitOutput, WanDitError<S::Error>> {
+        let bp = &pipelines.block;
+        let s = self.shape;
+        let inner = self.cfg.inner() as u32;
+        let (n_tok, ref_rows, _) = self.stream_rows();
+
+        // --- 6. strip the ref prefix, then final norm + modulation + proj_out ---
+        // The head runs on the VIDEO rows only: DreamID-V slices off the `ref_rows`
+        // source-face prefix (`x[ref_rows..]`); on plain Wan models `ref_rows == 0`
+        // and `head_rows == rows`, so `x_head` is the whole stream (bit-identical).
+        let head_rows = n_tok;
+        let x_head = act_slice(x_cur.as_act_ref(), ref_rows, head_rows, inner, bp);
+        let proj_w = self.cfg.out_channels * config::PATCH_T * config::PATCH_H * config::PATCH_W;
+        let proj_out = ResStream::alloc(scratch, bp, head_rows, proj_w as u32)?;
+        // Persist the post-modulation activation when a tap wants it (readback
+        // after submit; scope-local buffers do not survive the submit).
+        let final_norm_ws = match taps.final_norm {
+            Some(_) => Some(scratch.alloc(bp.act_bytes(head_rows * inner))?),
+            None => None,
+        };
+        {
+            let sst = residency
+                .acquire(self.handles.scale_shift_table, backend)
+                .await?;
+            let pv = self.handles.proj_out.acquire(residency, backend).await?;
+            let scope = scratch.batch();
+            // shift = table[0] + temb ; scale = table[1] + temb (all [inner]).
+            // Same bf16-decoding `mod_signal` path as the per-block modulation.
+            let temb_h = scope.import_copy(temb.as_buf_ref());
+            let shift = self.mod_signal(&scope, bp, sst.buf(), 0, temb_h, inner)?;
+            let scale = self.mod_signal(&scope, bp, sst.buf(), 1, temb_h, inner)?;
+            // norm_out (FP32 LayerNorm, no affine).
+            let x_h = ActBuf::dense(scope.import_copy(x_head));
+            let normed = alloc_act(&scope, bp, head_rows, inner)?;
+            let ln_u = scope.u32x4_uniform(head_rows, inner, config::EPS.to_bits(), 0)?;
+            scope.layernorm::<LayerNormF32>(
+                &bp.layernorm,
+                x_h.data,
+                ln_u,
+                normed.data,
+                head_rows,
+            )?;
+            // out = normed * (1 + scale) + shift.
+            let modded = alloc_act(&scope, bp, head_rows, inner)?;
+            self.modulate(&scope, bp, normed, scale, shift, modded, head_rows, inner)?;
+            if let Some(fnw) = &final_norm_ws {
+                let dst = scope.import_copy(fnw.as_buf_ref());
+                scope.copy_buffer_to_buffer(
+                    modded.data,
+                    0,
+                    dst,
+                    0,
+                    bp.act_bytes(head_rows * inner),
+                )?;
+            }
+            // proj_out: [head_rows, inner] @ [proj_w, inner]ᵀ + bias.
+            self.linear_bias(
+                &scope,
+                bp,
+                modded.data,
+                &pv.bufs(),
+                head_rows,
+                inner,
+                proj_w as u32,
+                scope.import_copy(proj_out.as_act_ref()),
+            )?;
+            scope.submit_void().await?;
+        }
+        if let (Some(fnw), Some(sink)) = (&final_norm_ws, taps.final_norm.as_deref_mut()) {
+            read_into_f32(
+                backend,
+                &fnw.as_buf_ref(),
+                (head_rows * inner) as usize,
+                bp.act_dtype,
+                sink,
+            )
+            .await?;
+        }
+        read_tap(
+            backend,
+            &proj_out.as_act_ref(),
+            (head_rows * proj_w as u32) as usize,
+            bp.act_dtype,
+            &mut taps.proj_out,
+        )
+        .await?;
+
+        // --- 7. unpatchify on CPU -> [out_ch, F, H, W] ---
+        let mut tokens_out = Vec::new();
+        read_into_f32(
+            backend,
+            &proj_out.as_act_ref(),
+            (head_rows * proj_w as u32) as usize,
+            bp.act_dtype,
+            &mut tokens_out,
+        )
+        .await?;
+        let image = patchify::unpatchify(&tokens_out, &s.grid, self.cfg.out_channels);
+        Ok(WanDitOutput { image })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_with_taps<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipelines: &WanDitPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        inputs: &WanDitInputs<'_>,
+        mut taps: WanDitTaps<'_>,
+        mut cross_kv: Option<&mut WanCrossKvCache>,
+    ) -> Result<WanDitOutput, WanDitError<S::Error>> {
+        let bp = &pipelines.block;
+        let s = self.shape;
+        let inner = self.cfg.inner() as u32;
+        let text_seq = s.text_seq as u32;
+        let (_, _, rows) = self.stream_rows();
+        let Front {
+            x,
+            temb,
+            tproj,
+            text,
+            freqs,
+        } = self
+            .front(backend, pipelines, residency, scratch, inputs, &mut taps)
+            .await?;
 
         // --- 4. main transformer blocks (residency-paged) ---
         // The six modulation vectors `scale_shift_table[k] + timestep_proj[k]`
@@ -701,99 +906,119 @@ impl WanDit {
             }
         }
 
-        // --- 6. strip the ref prefix, then final norm + modulation + proj_out ---
-        // The head runs on the VIDEO rows only: DreamID-V slices off the `ref_rows`
-        // source-face prefix (`x[ref_rows..]`); on plain Wan models `ref_rows == 0`
-        // and `head_rows == rows`, so `x_head` is the whole stream (bit-identical).
-        let head_rows = n_tok;
-        let x_head = act_slice(x_cur.as_act_ref(), ref_rows, head_rows, inner, bp);
-        let proj_w = self.cfg.out_channels * config::PATCH_T * config::PATCH_H * config::PATCH_W;
-        let proj_out = ResStream::alloc(scratch, bp, head_rows, proj_w as u32)?;
-        // Persist the post-modulation activation when a tap wants it (readback
-        // after submit; scope-local buffers do not survive the submit).
-        let final_norm_ws = match taps.final_norm {
-            Some(_) => Some(scratch.alloc(bp.act_bytes(head_rows * inner))?),
+        self.head(
+            backend, pipelines, residency, scratch, &x_cur, &temb, &mut taps,
+        )
+        .await
+    }
+
+    /// One forward per input in `inputs`, sharing each block's weights: every
+    /// block runs for all inputs while it is resident, so a streamed DiT is
+    /// read once per call instead of once per input (DreamID-V's two
+    /// image-CFG forwards). Per input it is exactly [`Self::forward`]'s
+    /// dispatch sequence: bit-identical outputs. Untiled models only.
+    pub async fn forward_many<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipelines: &WanDitPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        inputs: &[WanDitInputs<'_>],
+    ) -> Result<Vec<WanDitOutput>, WanDitError<S::Error>> {
+        assert!(
+            self.cfg.ref_conv && !self.cfg.rehyat,
+            "forward_many runs the untiled block path (DreamID-V)"
+        );
+        let bp = &pipelines.block;
+        let inner = self.cfg.inner() as u32;
+        let (_, _, rows) = self.stream_rows();
+        let mut fronts = Vec::with_capacity(inputs.len());
+        for inp in inputs {
+            fronts.push(
+                self.front(
+                    backend,
+                    pipelines,
+                    residency,
+                    scratch,
+                    inp,
+                    &mut WanDitTaps::default(),
+                )
+                .await?,
+            );
+        }
+
+        let _lr = trace::scope!("wan.dit.blocks", n = self.handles.blocks.len()).entered();
+        let mut pending = match self.handles.blocks.first() {
+            Some(h) => Some(h.acquire(residency, backend).await?),
             None => None,
         };
-        {
-            let sst = residency
-                .acquire(self.handles.scale_shift_table, backend)
-                .await?;
-            let pv = self.handles.proj_out.acquire(residency, backend).await?;
-            let scope = scratch.batch();
-            // shift = table[0] + temb ; scale = table[1] + temb (all [inner]).
-            // Same bf16-decoding `mod_signal` path as the per-block modulation.
-            let temb_h = scope.import_copy(temb.as_buf_ref());
-            let shift = self.mod_signal(&scope, bp, sst.buf(), 0, temb_h, inner)?;
-            let scale = self.mod_signal(&scope, bp, sst.buf(), 1, temb_h, inner)?;
-            // norm_out (FP32 LayerNorm, no affine).
-            let x_h = ActBuf::dense(scope.import_copy(x_head));
-            let normed = alloc_act(&scope, bp, head_rows, inner)?;
-            let ln_u = scope.u32x4_uniform(head_rows, inner, config::EPS.to_bits(), 0)?;
-            scope.layernorm::<LayerNormF32>(
-                &bp.layernorm,
-                x_h.data,
-                ln_u,
-                normed.data,
-                head_rows,
-            )?;
-            // out = normed * (1 + scale) + shift.
-            let modded = alloc_act(&scope, bp, head_rows, inner)?;
-            self.modulate(&scope, bp, normed, scale, shift, modded, head_rows, inner)?;
-            if let Some(fnw) = &final_norm_ws {
-                let dst = scope.import_copy(fnw.as_buf_ref());
-                scope.copy_buffer_to_buffer(
-                    modded.data,
-                    0,
-                    dst,
-                    0,
-                    bp.act_bytes(head_rows * inner),
-                )?;
-            }
-            // proj_out: [head_rows, inner] @ [proj_w, inner]ᵀ + bias.
-            self.linear_bias(
-                &scope,
-                bp,
-                modded.data,
-                &pv.bufs(),
-                head_rows,
-                inner,
-                proj_w as u32,
-                scope.import_copy(proj_out.as_act_ref()),
-            )?;
-            scope.submit_void().await?;
+        for idx in 0..self.handles.blocks.len() {
+            let _bs = trace::scope!(format_args!("block.{idx}")).entered();
+            let views = pending.take().expect("pending block acquire missing");
+            let next_acquire = async {
+                match self.handles.blocks.get(idx + 1) {
+                    Some(h) => Ok::<_, ResidencyError<S::Error, WgpuError>>(Some(
+                        h.acquire(residency, backend).await?,
+                    )),
+                    None => Ok(None),
+                }
+            };
+            let prefetch_after = async {
+                match self.handles.blocks.get(idx + 2) {
+                    Some(h) => h.prefetch(residency, backend).await,
+                    None => Ok(()),
+                }
+            };
+            // One submit per input, so the block's activations peak at one
+            // input's; the weight streaming overlaps all of them.
+            let compute = async {
+                for f in fronts.iter_mut() {
+                    let nxt = ResStream::alloc(scratch, bp, rows, inner)?;
+                    let scope = scratch.batch();
+                    let tproj_h = scope.import_copy(f.tproj.as_buf_ref());
+                    let m =
+                        self.build_mod(&scope, bp, views.scale_shift_table(), tproj_h, inner)?;
+                    if bp.act_dtype == ActDtype::F16 {
+                        scope.accel_begin()?;
+                    }
+                    self.block.forward(
+                        &scope,
+                        pipelines,
+                        scope.import_copy(f.x.as_act_ref()),
+                        scope.import_copy(f.text.as_act_ref()),
+                        scope.import_copy(f.freqs.as_buf_ref()),
+                        &m,
+                        scope.import_copy(nxt.as_act_ref()),
+                        &views.bufs(),
+                        &WanDitBlockTaps::default(),
+                    )?;
+                    scope.submit_deferred().await?;
+                    f.x = nxt;
+                }
+                Ok::<_, WanDitError<S::Error>>(())
+            };
+            let (c_res, n_res, p_res) = futures::join!(compute, next_acquire, prefetch_after);
+            c_res?;
+            p_res?;
+            pending = n_res?;
         }
-        if let (Some(fnw), Some(sink)) = (&final_norm_ws, taps.final_norm.as_deref_mut()) {
-            read_into_f32(
-                backend,
-                &fnw.as_buf_ref(),
-                (head_rows * inner) as usize,
-                bp.act_dtype,
-                sink,
-            )
-            .await?;
-        }
-        read_tap(
-            backend,
-            &proj_out.as_act_ref(),
-            (head_rows * proj_w as u32) as usize,
-            bp.act_dtype,
-            &mut taps.proj_out,
-        )
-        .await?;
 
-        // --- 7. unpatchify on CPU -> [out_ch, F, H, W] ---
-        let mut tokens_out = Vec::new();
-        read_into_f32(
-            backend,
-            &proj_out.as_act_ref(),
-            (head_rows * proj_w as u32) as usize,
-            bp.act_dtype,
-            &mut tokens_out,
-        )
-        .await?;
-        let image = patchify::unpatchify(&tokens_out, &s.grid, self.cfg.out_channels);
-        Ok(WanDitOutput { image })
+        let mut out = Vec::with_capacity(fronts.len());
+        for f in &fronts {
+            out.push(
+                self.head(
+                    backend,
+                    pipelines,
+                    residency,
+                    scratch,
+                    &f.x,
+                    &f.temb,
+                    &mut WanDitTaps::default(),
+                )
+                .await?,
+            );
+        }
+        Ok(out)
     }
 
     /// AR (LongLive) forward for ONE chunk against the windowed KV cache. Same

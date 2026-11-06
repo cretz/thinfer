@@ -7,14 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use thinfer_core::backend::{
-    Accelerator, ElementwiseOp, GemmAddrs, GemmNvfp4Addrs, SdpaAddrs, TileAttnAddrs, TileAttnShape,
-    VsaAddrs, VsaPart, VsaScratch, VsaShape,
+    Accelerator, Conv2dAddrs, Conv3dAddrs, ElementwiseOp, GemmAddrs, GemmNvfp4Addrs, SdpaAddrs,
+    TileAttnAddrs, TileAttnShape, VsaAddrs, VsaPart, VsaScratch, VsaShape,
 };
 use thinfer_core::ops::GemmDesc;
 
 use crate::device::CudaDevice;
 use crate::elementwise::ElementwiseKernels;
-use crate::gemm::{GemmKernels, MIN_M, index};
+use crate::gemm::{self, GemmKernels};
 use crate::gemm_fp4::GemmFp4Kernels;
 use crate::sdpa::{SdpaKernels, UNIFORM_LEN};
 use crate::vsa::VsaKernels;
@@ -144,14 +144,14 @@ impl Accelerator for CudaAccel {
     }
 
     fn accepts_gemm(&self, desc: &GemmDesc, m: u32, n: u32) -> bool {
-        m >= MIN_M && n.is_multiple_of(8) && index(desc).is_some() && self.gemm_kernels().is_some()
+        gemm::accepts(desc, m, n) && self.gemm_kernels().is_some()
     }
 
     fn gemm(&self, desc: &GemmDesc, a: &GemmAddrs) -> Result<bool, String> {
         let Some(k) = self.gemm_kernels() else {
             return Ok(false);
         };
-        let ran = k.run(desc, a.a, a.b, a.out, a.dims, a.m, a.n, a.k, a.epilogue)?;
+        let ran = k.run(desc, a)?;
         if ran && !self.gemm_engaged.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 target: thinfer_core::trace::ADAPTER,
@@ -160,6 +160,24 @@ impl Accelerator for CudaAccel {
             );
         }
         Ok(ran)
+    }
+
+    fn conv2d(&self, a: &Conv2dAddrs) -> Result<bool, String> {
+        match self.gemm_kernels() {
+            Some(k) => k.run_conv2d(a),
+            None => Ok(false),
+        }
+    }
+
+    fn accepts_conv2d(&self) -> bool {
+        self.gemm_kernels().is_some()
+    }
+
+    fn conv3d_f16(&self, a: &Conv3dAddrs) -> Result<bool, String> {
+        match self.gemm_kernels() {
+            Some(k) => k.run_conv3d_f16(a),
+            None => Ok(false),
+        }
     }
 
     fn accepts_gemm_nvfp4(&self, m: u32, n: u32, k: u32) -> Option<u64> {
@@ -224,7 +242,13 @@ impl Accelerator for CudaAccel {
             .bind_to_thread()
             .map_err(|e| format!("bind: {e:?}"))?;
         // SAFETY: plain context-wide wait on the bound context.
-        crate::nvrtc::drv(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, "sync")
+        crate::nvrtc::drv(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, "sync")?;
+        if let Some(Some(k)) = self.gemm.get()
+            && k.take_unchecked_overflow()?
+        {
+            return Err("an unchecked f16 GEMM overflowed narrowing its bf16 weight".into());
+        }
+        Ok(())
     }
 
     fn accepts_tile_attention(&self, head_dim: u32) -> bool {

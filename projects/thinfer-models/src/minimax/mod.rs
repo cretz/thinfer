@@ -79,6 +79,8 @@ pub struct DitConfig {
     pub vsa_tiling: vsa::VsaTiling,
     /// VSA's QK^T in INT8 (SageAttention-style; P.V stays bf16).
     pub vsa_int8_qk: bool,
+    /// With `vsa_int8_qk`: P.V in FP8 too (SageAttention2-style).
+    pub vsa_fp8_pv: bool,
     /// Blocks of the released 50-block H3 that a trimmed checkpoint removed
     /// (the rest are renumbered densely). Maps base-H3 adapters onto it.
     pub dropped_blocks: &'static [usize],
@@ -131,6 +133,7 @@ impl DitConfig {
             vsa_gate: true,
             vsa_tiling: vsa::VsaTiling::T64,
             vsa_int8_qk: false,
+            vsa_fp8_pv: false,
             dropped_blocks: &[],
             nvfp4_format: thinfer_core::backend::Nvfp4Format {
                 dynamic_act_scale: false,

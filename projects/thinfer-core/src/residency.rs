@@ -95,6 +95,30 @@ fn yield_now() -> impl core::future::Future<Output = ()> {
 /// evicting unpinned residents. Rounded down to whole (even) rows per weight.
 const PREP_BAND_BYTES: u64 = 32 * 1024 * 1024;
 
+/// See [`WeightResidency`]'s `host_cache`.
+#[derive(Default)]
+struct HostCache {
+    entries: HashMap<WeightHandle, (Arc<Vec<u8>>, RamCharge)>,
+    bytes: u64,
+}
+
+impl HostCache {
+    fn get(&self, h: WeightHandle) -> Option<Arc<Vec<u8>>> {
+        self.entries.get(&h).map(|(b, _)| Arc::clone(b))
+    }
+
+    /// Whether `bytes` more fit, leaving a quarter of the RAM budget for
+    /// staging and the rest of the request.
+    fn fits(&self, bytes: u64, ram_budget: u64) -> bool {
+        self.bytes + bytes <= ram_budget / 4 * 3
+    }
+
+    fn insert(&mut self, h: WeightHandle, b: Arc<Vec<u8>>, charge: RamCharge) {
+        self.bytes += b.len() as u64;
+        self.entries.insert(h, (b, charge));
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransposePolicy {
     /// 1-D weights, biases, norm gains, pad tokens. No layout change.
@@ -294,14 +318,25 @@ pub struct WeightResidency<S: WeightSource> {
     /// `vram_bytes` ceiling enters the system; handed out via
     /// [`Self::arbiter`].
     arbiter: Arc<MemArbiter>,
-    /// Persistent VRAM staging band for `NarrowTransposeF32` prep, lazily
-    /// allocated on first use (when VRAM is still empty) and reused for every
-    /// band. Allocating it once - rather than per-acquire - keeps it from being
-    /// a net-new allocation against an already-full budget: charged up front,
-    /// the warm weight set self-limits to `budget - PREP_BAND_BYTES` via the
-    /// arbiter, so the transient narrow never pushes the true peak over budget.
-    /// Freed at phase boundaries by [`Self::evict_all_and_free`].
-    prep_staging: Mutex<Option<GpuBufferId>>,
+    /// Idle persistent VRAM staging bands for `NarrowTransposeF32` prep. A prep
+    /// takes one for its whole band loop and returns it after, so concurrent
+    /// acquires (the driver overlaps the next block's acquire with a prefetch)
+    /// never share a band: one would overwrite the other's source before its
+    /// narrow dispatch reads it. A band is allocated only when none is idle
+    /// (first use, while VRAM is still empty, or a second concurrent prep) and
+    /// is then reused rather than per-acquire, so it is not a net-new
+    /// allocation against an already-full budget: charged up front, the warm
+    /// weight set self-limits around it via the arbiter. Freed at phase
+    /// boundaries by [`Self::evict_all_and_free`].
+    prep_staging: Mutex<Vec<GpuBufferId>>,
+    /// Host copies of streamed `NarrowTransposeF32` weights in their GPU
+    /// layout (bf16, transposed), built on the CPU on first touch while they
+    /// fit `ResidencyBudget::ram_bytes` (charged as `RamCategory::Other`), so
+    /// every later re-acquire uploads half the bytes with no source read or
+    /// GPU narrow pass. The CPU narrow is the GPU one's exact bits (RNE).
+    /// Pinned weights are never re-uploaded, so they are not cached. Cleared
+    /// at phase boundaries by [`Self::evict_all_and_free`].
+    host_cache: Mutex<HostCache>,
     /// Sticky VRAM reserve the weight-acquire path holds free on every weight
     /// admission, so the streamed weight working set caps at `budget - reserve`
     /// and the in-flight transient envelope (concurrent upload staging + the
@@ -321,7 +356,8 @@ impl<S: WeightSource> WeightResidency<S> {
             source,
             arbiter: MemArbiter::new(MemTier::Vram, budget.vram_bytes),
             budget,
-            prep_staging: Mutex::new(None),
+            prep_staging: Mutex::new(Vec::new()),
+            host_cache: Mutex::new(HostCache::default()),
             transient_reserve: AtomicU64::new(0),
             inner: Arc::new(Mutex::new(Inner {
                 metas: Vec::new(),
@@ -689,7 +725,36 @@ impl<S: WeightSource> WeightResidency<S> {
                     .map_err(ResidencyError::Backend)?
             }
         };
+        let cached = self.host_cache.lock().unwrap().get(handle);
         match prep {
+            Some(_) if let Some(bytes) = cached => {
+                backend
+                    .write_buffer(id, 0, &bytes)
+                    .map_err(ResidencyError::Backend)?;
+            }
+            Some(WeightPrep::NarrowTransposeF32 { .. })
+                if !self.inner.lock().unwrap().pinned.contains(&handle)
+                    && self
+                        .host_cache
+                        .lock()
+                        .unwrap()
+                        .fits(gpu_size, self.budget.ram_bytes) =>
+            {
+                let bytes = Arc::new(self.read_for_gpu::<B>(&meta).await?);
+                backend.mem_account().add_source_bytes(meta.on_disk_bytes);
+                backend
+                    .write_buffer(id, 0, &bytes)
+                    .map_err(ResidencyError::Backend)?;
+                let charge = RamCharge::new(
+                    backend.mem_account().clone(),
+                    RamCategory::Other,
+                    bytes.len() as u64,
+                );
+                self.host_cache
+                    .lock()
+                    .unwrap()
+                    .insert(handle, bytes, charge);
+            }
             Some(op) => {
                 // Diag-gated clock: the timing only surfaces via the diag
                 // event below, and on wasm each enabled read is a JS roundtrip.
@@ -1098,25 +1163,72 @@ impl<S: WeightSource> WeightResidency<S> {
     /// padding; `padded_len` is 4-byte aligned for `write_buffer`) are
     /// zero-filled. No transform: callers pair this with GPU `weight_prep`
     /// or use it for passthrough layouts.
-    /// The persistent `NarrowTransposeF32` staging band, allocated on first
-    /// use. Sized `PREP_BAND_BYTES`; the band loop caps each band to fit (real
-    /// linears have `K <= ~16K`, so one band is well under this). Charged to
-    /// VRAM once so it reserves its own headroom against the budget.
-    fn prep_staging_buf<B: Backend>(
+    /// Take an idle `NarrowTransposeF32` staging band, allocating one if none
+    /// is idle. Sized `PREP_BAND_BYTES`; the band loop caps each band to fit
+    /// (real linears have `K <= ~16K`, so one band is well under this). The
+    /// caller owns it until [`Self::return_prep_band`].
+    fn take_prep_band<B: Backend>(
         &self,
         backend: &B,
     ) -> Result<GpuBufferId, ResidencyError<S::Error, B::Error>> {
-        let mut slot = self.prep_staging.lock().unwrap();
-        if let Some(id) = *slot {
+        if let Some(id) = self.prep_staging.lock().unwrap().pop() {
             return Ok(id);
         }
         self.arbiter
             .ensure_headroom(backend.mem_account(), PREP_BAND_BYTES + 16);
-        let id = backend
+        backend
             .allocate_in(PREP_BAND_BYTES, VramCategory::Staging)
-            .map_err(ResidencyError::Backend)?;
-        *slot = Some(id);
-        Ok(id)
+            .map_err(ResidencyError::Backend)
+    }
+
+    fn return_prep_band(&self, id: GpuBufferId) {
+        self.prep_staging.lock().unwrap().push(id);
+    }
+
+    /// The banded `NarrowTransposeF32` prep of `meta` into `dst`, through
+    /// `staging` (one band, owned by this call).
+    #[allow(clippy::too_many_arguments)]
+    async fn narrow_bands<B: Backend>(
+        &self,
+        backend: &B,
+        meta: &WeightMeta,
+        staging: GpuBufferId,
+        n: u32,
+        k: u32,
+        dst: GpuBufferId,
+        gpu_size: u64,
+    ) -> Result<(), ResidencyError<S::Error, B::Error>> {
+        // Whole even row-bands, capped to the staging band and to the weight
+        // itself (small weights take a single band). N even (prep gate) keeps
+        // every band start/length even, so the two-rows-per-output-word
+        // writes never straddle a band boundary.
+        let row_bytes = k as u64 * 4;
+        let cap_rows = (PREP_BAND_BYTES / row_bytes.max(1)) as u32 & !1;
+        let band_rows = cap_rows.max(2).min(n);
+        let mut n0 = 0u32;
+        while n0 < n {
+            let band_n = band_rows.min(n - n0);
+            let band_bytes = band_n as u64 * row_bytes;
+            self.stream_source_to_gpu(
+                backend,
+                meta,
+                staging,
+                n0 as u64 * row_bytes,
+                band_bytes,
+                band_bytes,
+            )
+            .await?;
+            backend
+                .weight_prep(
+                    WeightPrep::NarrowTransposeF32 { n, k, n0, band_n },
+                    &BufRef::new(staging, band_bytes),
+                    &BufRef::new(dst, gpu_size),
+                )
+                .await
+                .map_err(ResidencyError::Backend)?;
+            n0 += band_n;
+        }
+        Ok(())
     }
 
     /// Stage the source into a transient VRAM buffer and run `op`'s prep
@@ -1135,38 +1247,12 @@ impl<S: WeightSource> WeightResidency<S> {
     ) -> Result<(), ResidencyError<S::Error, B::Error>> {
         let mem = backend.mem_account();
         if let WeightPrep::NarrowTransposeF32 { n, k, .. } = op {
-            // Whole even row-bands, capped to the persistent staging band and
-            // to the weight itself (small weights take a single band). N even
-            // (prep gate) keeps every band start/length even, so the
-            // two-rows-per-output-word writes never straddle a band boundary.
-            let row_bytes = k as u64 * 4;
-            let cap_rows = (PREP_BAND_BYTES / row_bytes.max(1)) as u32 & !1;
-            let band_rows = cap_rows.max(2).min(n);
-            let staging = self.prep_staging_buf(backend)?;
-            let mut n0 = 0u32;
-            while n0 < n {
-                let band_n = band_rows.min(n - n0);
-                let band_bytes = band_n as u64 * row_bytes;
-                self.stream_source_to_gpu(
-                    backend,
-                    meta,
-                    staging,
-                    n0 as u64 * row_bytes,
-                    band_bytes,
-                    band_bytes,
-                )
-                .await?;
-                backend
-                    .weight_prep(
-                        WeightPrep::NarrowTransposeF32 { n, k, n0, band_n },
-                        &BufRef::new(staging, band_bytes),
-                        &BufRef::new(dst, gpu_size),
-                    )
-                    .await
-                    .map_err(ResidencyError::Backend)?;
-                n0 += band_n;
-            }
-            return Ok(());
+            let staging = self.take_prep_band(backend)?;
+            let res = self
+                .narrow_bands(backend, meta, staging, n, k, dst, gpu_size)
+                .await;
+            self.return_prep_band(staging);
+            return res;
         }
         let staging_len = meta.on_disk_bytes.next_multiple_of(4);
         self.arbiter.ensure_headroom(mem, staging_len + 16);
@@ -1295,6 +1381,21 @@ impl<S: WeightSource> WeightResidency<S> {
             chunk[n_read..].fill(0);
             drop(staged);
             off += n_write as u64;
+            // A staged write's copy runs at the head of the NEXT submit, and its
+            // staging memory is reclaimed only once that copy retires. Flushing
+            // per chunk retires a big weight's chunks as they land instead of
+            // all at its end: the staging allocator otherwise grows a fresh
+            // host block for the backlog (a 64 MiB vkAllocateMemory, ~70 ms on
+            // Windows) and frees it again once drained, once per encoder layer.
+            // The flush also starts the copies now, overlapped with in-flight
+            // compute, rather than stalling the next block's first submit.
+            // Sub-chunk weights skip it: each flush is a real (if cheap) submit.
+            if total >= UPLOAD_CHUNK_BYTES {
+                let enc = backend.create_command_encoder();
+                backend
+                    .flush_encoder(enc)
+                    .map_err(ResidencyError::Backend)?;
+            }
             // Cooperative yield between chunks: on a single-threaded executor
             // a `join!`ed prefetch leg would otherwise run this whole loop
             // (mmap memcpy + write_buffer memcpy per chunk) without ever
@@ -1304,19 +1405,6 @@ impl<S: WeightSource> WeightResidency<S> {
             if off < padded_len {
                 yield_now().await;
             }
-        }
-        // The chunk writes above are staged: `queue.write_buffer` defers the
-        // actual DMA to the head of the NEXT `queue.submit`, so bytes staged
-        // after a block's last compute submit would stall the next block's
-        // first submit instead of copying during idle queue time. An empty
-        // flush makes the copies execute now, overlapped with in-flight
-        // compute. Skip it for small weights: each flush is a real (if cheap)
-        // submit, and sub-chunk weights don't move the needle.
-        if total >= UPLOAD_CHUNK_BYTES {
-            let enc = backend.create_command_encoder();
-            backend
-                .flush_encoder(enc)
-                .map_err(ResidencyError::Backend)?;
         }
         tracing::debug!(
             target: "thinfer::diag",
@@ -1432,10 +1520,11 @@ impl<S: WeightSource> WeightResidency<S> {
         // multi-GiB reserve free, evicting weights it needs (the DiT block loop
         // streaming right after a VAE encode). The next phase sets its own.
         self.transient_reserve.store(0, Ordering::Relaxed);
-        // Release the persistent prep staging band too: the next phase
-        // re-allocates it lazily (while VRAM is empty again), so its reserved
-        // headroom does not carry across a phase boundary.
-        if let Some(id) = self.prep_staging.lock().unwrap().take() {
+        *self.host_cache.lock().unwrap() = HostCache::default();
+        // Release the persistent prep staging bands too: the next phase
+        // re-allocates them lazily (while VRAM is empty again), so their
+        // reserved headroom does not carry across a phase boundary.
+        for id in std::mem::take(&mut *self.prep_staging.lock().unwrap()) {
             backend.free(id);
         }
         let mut g = self.inner.lock().unwrap();

@@ -24,7 +24,7 @@
 //! `WeightId` bundles, residency handles, GPU views, `BufRef` bundles, and the
 //! compiled-pipeline set. The forward driver lands in a follow-up.
 
-use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
+use thinfer_core::backend::{Backend, BufRef, Conv3dShape, ElementwiseOp, WgpuBackend, WgpuError};
 use thinfer_core::cache::KernelKey;
 use thinfer_core::mem::VramCategory;
 use thinfer_core::ops::{
@@ -40,6 +40,7 @@ use thinfer_core::workspace::{BatchBuf, BatchScope, ScopePacker, Workspace, WsBu
 use tracing::Instrument;
 
 use crate::common::loader::{LoadError, register_passthrough};
+use crate::wan::dit_block::accel_op;
 
 // ============================================================================
 // Config: derived dims for the Wan2.1 VAE encoder + decoder.
@@ -1683,6 +1684,49 @@ fn conv3d_uniform<'wsp>(
     scope.write_uniform(&bytes)
 }
 
+/// [`ConcatTimeF32`] over `[b, c, t, h*w]` (see [`concat_time_uniform`]), or
+/// its f16 accelerator form in a deferred scope.
+#[allow(clippy::too_many_arguments)]
+fn concat_time_run<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pl: &WanVaePipelines,
+    a: BatchBuf<'wsp>,
+    b: BatchBuf<'wsp>,
+    out: BatchBuf<'wsp>,
+    out_elems: u32,
+    dims: [u32; 4],
+    a_t: u32,
+    b_t: u32,
+    a_start: u32,
+    a_count: u32,
+    b_start: u32,
+    b_count: u32,
+) -> Result<(), WgpuError> {
+    let [bn, c, h, w] = dims;
+    if scope.is_deferred() {
+        return accel_op(scope, "concat_time", |ad| {
+            Some(ElementwiseOp::ConcatTimeF16 {
+                a: ad(a)?,
+                b: ad(b)?,
+                out: ad(out)?,
+                bc: bn * c,
+                hw: h * w,
+                a_t,
+                b_t,
+                a_start,
+                a_count,
+                b_start,
+                b_count,
+                a_zero: 0,
+            })
+        });
+    }
+    let u = concat_time_uniform(
+        scope, bn, c, h, w, a_t, b_t, a_start, a_count, b_start, b_count, 0,
+    )?;
+    scope.concat_time::<ConcatTimeF32>(&pl.concat_time, a, b, u, out, out_elems)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn concat_time_uniform<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
@@ -1851,6 +1895,28 @@ fn conv3d_run<'wsp>(
         w: w_out,
     };
     let out = scope.alloc(out_shape.bytes(pl.act_size))?;
+    let wb = scope.import(&w.weight);
+    let bb = scope.import(&w.bias);
+    // The accelerator's f16-act conv3d has this op's exact bits.
+    if pl.act_dtype == ActDtype::F16 {
+        let shape = Conv3dShape {
+            b: in_shape.b,
+            cin: in_shape.c,
+            cout,
+            t: in_shape.t,
+            h: in_shape.h,
+            w: in_shape.w,
+            t_out,
+            h_out,
+            w_out,
+            kernel: [kt, kh, kw],
+            pad: [pad_t, pad_h, pad_w],
+            stride: [st, sh, sw],
+        };
+        if scope.try_conv3d_f16(&shape, x, wb, bb, out)? {
+            return Ok((out, out_shape));
+        }
+    }
     let u = conv3d_uniform(
         scope,
         (in_shape.b, in_shape.c, in_shape.t, in_shape.h, in_shape.w),
@@ -1859,8 +1925,6 @@ fn conv3d_run<'wsp>(
         pad,
         stride,
     )?;
-    let wb = scope.import(&w.weight);
-    let bb = scope.import(&w.bias);
     let conv = conv3d_pipeline(pl, cout);
     scope.conv3d(
         &conv.pipeline,
@@ -1908,8 +1972,21 @@ fn rmsnorm3d_run<'wsp>(
     w: &'wsp RmsBufs,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
     let out = scope.alloc(shape.bytes(pl.act_size))?;
-    let u = rmsnorm3d_uniform(scope, shape.n_pos(), shape.c, shape.thw())?;
     let gamma = scope.import(&w.gamma);
+    if scope.is_deferred() {
+        accel_op(scope, "rmsnorm3d", |a| {
+            Some(ElementwiseOp::RmsNorm3dF16 {
+                x: a(x)?,
+                gamma: a(gamma)?,
+                out: a(out)?,
+                n_pos: shape.n_pos(),
+                channels: shape.c,
+                stride: shape.thw(),
+            })
+        })?;
+        return Ok(out);
+    }
+    let u = rmsnorm3d_uniform(scope, shape.n_pos(), shape.c, shape.thw())?;
     scope.rmsnorm3d::<RmsNorm3dF32>(&pl.rmsnorm3d, x, gamma, u, out, shape.n_pos())?;
     Ok(out)
 }
@@ -1921,6 +1998,16 @@ fn silu_run<'wsp>(
     shape: Shape5,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
     let out = scope.alloc(shape.bytes(pl.act_size))?;
+    if scope.is_deferred() {
+        accel_op(scope, "silu", |a| {
+            Some(ElementwiseOp::SiluF16 {
+                x: a(x)?,
+                out: a(out)?,
+                n: shape.elems(),
+            })
+        })?;
+        return Ok(out);
+    }
     scope.dispatch_op::<SiluF32>(&pl.silu, &[x], out)?;
     Ok(out)
 }
@@ -1933,6 +2020,17 @@ fn add_run<'wsp>(
     shape: Shape5,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
     let out = scope.alloc(shape.bytes(pl.act_size))?;
+    if scope.is_deferred() {
+        accel_op(scope, "add", |ad| {
+            Some(ElementwiseOp::AddF16 {
+                x: ad(a)?,
+                y: ad(b)?,
+                out: ad(out)?,
+                n: shape.elems(),
+            })
+        })?;
+        return Ok(out);
+    }
     scope.dispatch_op::<AddF32>(&pl.add, &[a, b], out)?;
     Ok(out)
 }
@@ -2034,10 +2132,22 @@ fn causal_conv3d<'wsp>(
             w: ww,
         };
         let out = scope.alloc(asm.bytes(asz))?;
-        let u = concat_time_uniform(
-            scope, in_shape.b, cin, h, ww, old_t, tin, 0, old_t, 0, tin, 0,
+        let dims = [in_shape.b, cin, h, ww];
+        concat_time_run(
+            scope,
+            pl,
+            a,
+            x,
+            out,
+            asm.elems(),
+            dims,
+            old_t,
+            tin,
+            0,
+            old_t,
+            0,
+            tin,
         )?;
-        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, a, x, u, out, asm.elems())?;
         (out, old_t + tin)
     } else {
         (x, tin)
@@ -2080,8 +2190,9 @@ fn causal_conv3d<'wsp>(
     let nb = scope.import_copy(new_ref);
     if tin >= 2 {
         // A = x tail (last 2 frames); B unused (bind x).
-        let u = concat_time_uniform(scope, in_shape.b, cin, h, ww, tin, tin, tin - 2, 2, 0, 0, 0)?;
-        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, x, x, u, nb, cache_shape.elems())?;
+        let dims = [in_shape.b, cin, h, ww];
+        let n = cache_shape.elems();
+        concat_time_run(scope, pl, x, x, nb, n, dims, tin, tin, tin - 2, 2, 0, 0)?;
     } else if old_t > 0 {
         // A = old cache last frame, B = x (single frame).
         let old_ref = match &fc.entries[idx] {
@@ -2089,25 +2200,14 @@ fn causal_conv3d<'wsp>(
             _ => unreachable!(),
         };
         let a = scope.import_copy(old_ref);
-        let u = concat_time_uniform(
-            scope,
-            in_shape.b,
-            cin,
-            h,
-            ww,
-            old_t,
-            tin,
-            old_t - 1,
-            1,
-            0,
-            1,
-            0,
-        )?;
-        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, a, x, u, nb, cache_shape.elems())?;
+        let dims = [in_shape.b, cin, h, ww];
+        let n = cache_shape.elems();
+        concat_time_run(scope, pl, a, x, nb, n, dims, old_t, tin, old_t - 1, 1, 0, 1)?;
     } else {
         // First frame, single input frame: cache just that frame.
-        let u = concat_time_uniform(scope, in_shape.b, cin, h, ww, tin, tin, 0, 1, 0, 0, 0)?;
-        scope.concat_time::<ConcatTimeF32>(&pl.concat_time, x, x, u, nb, cache_shape.elems())?;
+        let dims = [in_shape.b, cin, h, ww];
+        let n = cache_shape.elems();
+        concat_time_run(scope, pl, x, x, nb, n, dims, tin, tin, 0, 1, 0, 0)?;
     }
 
     retire.push(std::mem::replace(
@@ -2124,10 +2224,14 @@ fn causal_conv3d<'wsp>(
 // resnet / attention / upsampler / up_block
 // ---------------------------------------------------------------------------
 
+/// Wan VAE resnet (shortcut, norm1 -> silu -> conv1 -> norm2 -> silu ->
+/// conv2, add) as four `ScopePacker` phases (norm1+silu, conv1, norm2+silu,
+/// conv2+add), so at full res only a few of its activations are live per
+/// submit; at small res the phases share one submit.
 #[allow(clippy::too_many_arguments)]
-fn resnet_forward<'wsp>(
+async fn resnet_forward<'wsp>(
     workspace: &'wsp Workspace<WgpuBackend>,
-    scope: &BatchScope<'wsp, WgpuBackend>,
+    packer: &mut ScopePacker<'wsp, WgpuBackend>,
     pl: &WanVaePipelines,
     fc: &mut FeatCache,
     retire: &mut Vec<FeatEntry>,
@@ -2136,18 +2240,42 @@ fn resnet_forward<'wsp>(
     cout: u32,
     w: &'wsp ResnetBufs,
 ) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
-    // Shortcut (1x1x1 conv when channels change, else identity).
+    let asz = pl.act_size;
+    let s = in_shape;
+    let peak_in = peak_bytes(s.c, s.t, s.h, s.w, asz);
+    let peak_out = peak_bytes(cout, s.t, s.h, s.w, asz);
+
+    let [x] = <[_; 1]>::try_from(packer.advance(&[x], 3 * peak_in).await?).unwrap();
+    let scope = packer.scope();
     let (skip, _) = match &w.conv_shortcut {
         Some(cs) => conv3d_1x1x1(scope, pl, x, in_shape, cs, cout)?,
         None => (x, in_shape),
     };
     let h0 = rmsnorm3d_run(scope, pl, x, in_shape, &w.norm1)?;
     let h1 = silu_run(scope, pl, h0, in_shape)?;
+
+    let [skip, h1] = <[_; 2]>::try_from(packer.advance(&[skip, h1], 3 * peak_out).await?).unwrap();
     let (h2, sh2) = causal_conv3d(
-        workspace, scope, pl, fc, retire, h1, in_shape, &w.conv1, cout, 3, 3,
+        workspace,
+        packer.scope(),
+        pl,
+        fc,
+        retire,
+        h1,
+        in_shape,
+        &w.conv1,
+        cout,
+        3,
+        3,
     )?;
+
+    let [skip, h2] = <[_; 2]>::try_from(packer.advance(&[skip, h2], 2 * peak_out).await?).unwrap();
+    let scope = packer.scope();
     let h3 = rmsnorm3d_run(scope, pl, h2, sh2, &w.norm2)?;
     let h4 = silu_run(scope, pl, h3, sh2)?;
+
+    let [skip, h4] = <[_; 2]>::try_from(packer.advance(&[skip, h4], 3 * peak_out).await?).unwrap();
+    let scope = packer.scope();
     let (h5, sh5) = causal_conv3d(
         workspace, scope, pl, fc, retire, h4, sh2, &w.conv2, cout, 3, 3,
     )?;
@@ -2329,19 +2457,8 @@ async fn up_block_forward<'wsp>(
 
     for resnet in &w.resnets {
         // Resnets preserve t/h/w; only the channel count moves to out_c.
-        let peak = peak_bytes(out_c, shape.t, shape.h, shape.w, asz);
-        x = packer.advance(&[x], peak).await?.pop().unwrap();
-        let (y, sh) = resnet_forward(
-            workspace,
-            packer.scope(),
-            pl,
-            fc,
-            retire,
-            x,
-            shape,
-            out_c,
-            resnet,
-        )?;
+        let (y, sh) =
+            resnet_forward(workspace, packer, pl, fc, retire, x, shape, out_c, resnet).await?;
         x = y;
         shape = sh;
     }
@@ -2695,6 +2812,11 @@ async fn decode_frame(
         // the unpacked path. Carried activations (`advance`) survive cuts via
         // the packer's hold-bag; `retire`/persisted taps are workspace-owned.
         let mut packer = ScopePacker::new(workspace, VAE_SUBMIT_BUDGET_BYTES);
+        // f16 acts: the accelerator's convs and elementwise ops enqueue back
+        // to back, with one wait per switch to a backend op.
+        if pl.act_dtype == ActDtype::F16 {
+            packer.accel_mixed();
+        }
         let z_dim = cfg.z_dim as u32;
         let in_shape = Shape5 {
             b: 1,
@@ -2748,14 +2870,9 @@ async fn decode_frame(
         }
 
         // mid_block: resnet -> attention -> resnet (latent res, T=1).
-        x = packer
-            .advance(&[x], peak_bytes(mid_c, sh.t, sh.h, sh.w, asz))
-            .await?
-            .pop()
-            .unwrap();
         let (m0, s0) = resnet_forward(
             workspace,
-            packer.scope(),
+            &mut packer,
             pl,
             fc,
             &mut retire,
@@ -2763,7 +2880,8 @@ async fn decode_frame(
             sh,
             mid_c,
             &bufs.mid_block.resnets[0],
-        )?;
+        )
+        .await?;
         let m0 = packer
             .advance(&[m0], peak_bytes(mid_c, s0.t, s0.h, s0.w, asz))
             .await?
@@ -2771,14 +2889,9 @@ async fn decode_frame(
             .unwrap();
         let (m1, s1) =
             mid_attention_forward(packer.scope(), pl, m0, s0, &bufs.mid_block.attention)?;
-        let m1 = packer
-            .advance(&[m1], peak_bytes(mid_c, s1.t, s1.h, s1.w, asz))
-            .await?
-            .pop()
-            .unwrap();
         let (m2, s2) = resnet_forward(
             workspace,
-            packer.scope(),
+            &mut packer,
             pl,
             fc,
             &mut retire,
@@ -2786,7 +2899,8 @@ async fn decode_frame(
             s1,
             mid_c,
             &bufs.mid_block.resnets[1],
-        )?;
+        )
+        .await?;
         x = m2;
         sh = s2;
         if want_mid {
@@ -3464,11 +3578,12 @@ fn downsample_temporal<'wsp>(
 
 /// Encoder down stage: `num_res_blocks` resnets (`in_c -> out_c` on the first,
 /// then `out_c -> out_c`) then an optional downsampler (spatial 2x always,
-/// plus the temporal conv for `downsample3d`).
+/// plus the temporal conv for `downsample3d`). Each resnet and the
+/// downsampler is a `ScopePacker` phase, as in [`up_block_forward`].
 #[allow(clippy::too_many_arguments)]
-fn down_stage_forward<'wsp>(
+async fn down_stage_forward<'wsp>(
     workspace: &'wsp Workspace<WgpuBackend>,
-    scope: &BatchScope<'wsp, WgpuBackend>,
+    packer: &mut ScopePacker<'wsp, WgpuBackend>,
     pl: &WanVaePipelines,
     fc: &mut FeatCache,
     retire: &mut Vec<FeatEntry>,
@@ -3478,8 +3593,10 @@ fn down_stage_forward<'wsp>(
     temporal: bool,
     w: &'wsp DownStageBufs,
 ) -> Result<(BatchBuf<'wsp>, Shape5), WgpuError> {
+    let asz = pl.act_size;
     for resnet in &w.resnets {
-        let (y, sh) = resnet_forward(workspace, scope, pl, fc, retire, x, shape, out_c, resnet)?;
+        let (y, sh) =
+            resnet_forward(workspace, packer, pl, fc, retire, x, shape, out_c, resnet).await?;
         x = y;
         shape = sh;
     }
@@ -3488,6 +3605,9 @@ fn down_stage_forward<'wsp>(
     };
 
     // Spatial first (per-frame), then the temporal conv for downsample3d.
+    let peak = peak_bytes(shape.c, shape.t, shape.h, shape.w, asz);
+    x = packer.advance(&[x], peak).await?.pop().unwrap();
+    let scope = packer.scope();
     let (y, sh) = spatial_downsample(scope, pl, x, shape, &ds.spatial_conv)?;
     x = y;
     shape = sh;
@@ -3509,7 +3629,9 @@ fn down_stage_forward<'wsp>(
 
 /// Encode one input chunk `[1, 3, tin, h, w]` (`tin` = 1 on chunk 0, else 4)
 /// into one latent frame `[1, 2*z_dim, 1, h/8, w/8]` written to `out_ref`.
-/// Runs the whole chunk in one BatchScope + submit.
+/// Each stage is a `ScopePacker` phase (as in [`decode_frame`]): at native res
+/// the chunk spans several submits, so only the live phase's intermediates
+/// hold VRAM; at parity res it collapses into one submit.
 #[allow(clippy::too_many_arguments)]
 async fn encode_chunk(
     backend: &WgpuBackend,
@@ -3544,8 +3666,13 @@ async fn encode_chunk(
     let mut p_conv_out = None;
     let out_shape;
     {
-        let scope = workspace.batch();
-        let x0 = scope.import(chunk_in);
+        let mut packer = ScopePacker::new(workspace, VAE_SUBMIT_BUDGET_BYTES);
+        // f16 acts: the accelerator's convs and elementwise ops enqueue back
+        // to back, with one wait per switch to a backend op.
+        if pl.act_dtype == ActDtype::F16 {
+            packer.accel_mixed();
+        }
+        let x0 = packer.scope().import_copy(*chunk_in);
         let in_shape = Shape5 {
             b: 1,
             c: cfg.in_channels as u32,
@@ -3555,21 +3682,27 @@ async fn encode_chunk(
         };
 
         // conv_in (causal 3x3x3).
+        let c0 = cfg.enc_dim(0) as u32;
+        let x0 = packer
+            .advance(&[x0], peak_bytes(c0, tin, h_in, w_in, asz))
+            .await?
+            .pop()
+            .unwrap();
         let (mut x, mut sh) = causal_conv3d(
             workspace,
-            &scope,
+            packer.scope(),
             pl,
             fc,
             &mut retire,
             x0,
             in_shape,
             &bufs.conv_in,
-            cfg.enc_dim(0) as u32,
+            c0,
             3,
             3,
         )?;
         if want_conv_in {
-            p_conv_in = Some(persist_stage(workspace, &scope, x, sh, asz)?);
+            p_conv_in = Some(persist_stage(workspace, packer.scope(), x, sh, asz)?);
         }
 
         // down stages 0..N.
@@ -3578,7 +3711,7 @@ async fn encode_chunk(
             let temporal = cfg.down_temporal(i);
             let (y, s) = down_stage_forward(
                 workspace,
-                &scope,
+                &mut packer,
                 pl,
                 fc,
                 &mut retire,
@@ -3587,50 +3720,66 @@ async fn encode_chunk(
                 out_c,
                 temporal,
                 ds,
-            )?;
+            )
+            .await?;
             x = y;
             sh = s;
             if want_downs {
-                p_downs.push(persist_stage(workspace, &scope, x, sh, asz)?);
+                p_downs.push(persist_stage(workspace, packer.scope(), x, sh, asz)?);
             }
         }
 
         // mid_block: resnet -> attention -> resnet (T=1 here).
+        let mid_c = cfg.enc_mid_channels() as u32;
         let (m0, s0) = resnet_forward(
             workspace,
-            &scope,
+            &mut packer,
             pl,
             fc,
             &mut retire,
             x,
             sh,
-            cfg.enc_mid_channels() as u32,
+            mid_c,
             &bufs.mid_block.resnets[0],
-        )?;
-        let (m1, s1) = mid_attention_forward(&scope, pl, m0, s0, &bufs.mid_block.attention)?;
+        )
+        .await?;
+        let m0 = packer
+            .advance(&[m0], peak_bytes(mid_c, s0.t, s0.h, s0.w, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let (m1, s1) =
+            mid_attention_forward(packer.scope(), pl, m0, s0, &bufs.mid_block.attention)?;
         let (m2, s2) = resnet_forward(
             workspace,
-            &scope,
+            &mut packer,
             pl,
             fc,
             &mut retire,
             m1,
             s1,
-            cfg.enc_mid_channels() as u32,
+            mid_c,
             &bufs.mid_block.resnets[1],
-        )?;
+        )
+        .await?;
         x = m2;
         sh = s2;
         if want_mid {
-            p_mid = Some(persist_stage(workspace, &scope, x, sh, asz)?);
+            p_mid = Some(persist_stage(workspace, packer.scope(), x, sh, asz)?);
         }
 
         // norm_out -> silu -> conv_out (causal 3x3x3, cout=2*z_dim).
-        let n = rmsnorm3d_run(&scope, pl, x, sh, &bufs.norm_out)?;
-        let a = silu_run(&scope, pl, n, sh)?;
+        x = packer
+            .advance(&[x], peak_bytes(sh.c, sh.t, sh.h, sh.w, asz))
+            .await?
+            .pop()
+            .unwrap();
+        let scope = packer.scope();
+        let n = rmsnorm3d_run(scope, pl, x, sh, &bufs.norm_out)?;
+        let a = silu_run(scope, pl, n, sh)?;
         let (c_out, c_sh) = causal_conv3d(
             workspace,
-            &scope,
+            scope,
             pl,
             fc,
             &mut retire,
@@ -3642,12 +3791,12 @@ async fn encode_chunk(
             3,
         )?;
         if want_conv_out {
-            p_conv_out = Some(persist_stage(workspace, &scope, c_out, c_sh, asz)?);
+            p_conv_out = Some(persist_stage(workspace, scope, c_out, c_sh, asz)?);
         }
 
         // quant_conv (1x1x1, pointwise in time so per-chunk == whole).
         let (q, q_sh) = conv3d_1x1x1(
-            &scope,
+            scope,
             pl,
             c_out,
             c_sh,
@@ -3656,10 +3805,10 @@ async fn encode_chunk(
         )?;
         out_shape = q_sh;
 
-        let dst = scope.import(out_ref);
+        let dst = scope.import_copy(*out_ref);
         scope.copy_buffer_to_buffer(q, 0, dst, 0, q_sh.bytes(pl.act_size))?;
-        scope
-            .submit_void()
+        packer
+            .finish_void()
             .instrument(tracing::debug_span!(target: PHASE, "wan_vae.submit", phase = "encode_chunk", chunk = chunk_idx))
             .await
             .map_err(WanVaeError::Wgpu)?;
@@ -3950,11 +4099,14 @@ impl WanVaeEncoder {
                                 .copy_from_slice(&vals[src..src + lwext as usize]);
                         }
                     }
-                    // Return this tile's idle buffers to the pool before the next
-                    // grows it, so the live set stays bounded to one tile.
-                    if !single {
-                        workspace.drain_pool();
-                    }
+                }
+                // Free this tile's idle buffers before the next tile (whose
+                // edge shapes may differ), so the live set stays bounded to
+                // one tile. Its chunks share shapes and reuse the pool: freeing
+                // per chunk re-created every buffer (each an exported,
+                // accelerator-imported allocation) 31 times per tile at 121f.
+                if !single {
+                    workspace.drain_pool();
                 }
             }
         }

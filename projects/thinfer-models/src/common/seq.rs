@@ -433,3 +433,20 @@ mod tests {
         }
     }
 }
+
+/// `(0..n).map(f)` with one scoped thread per item on native, in order;
+/// serial on wasm (single-threaded). Host-side work only: identical results.
+pub fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if n > 1 {
+        return std::thread::scope(|s| {
+            let f = &f;
+            let workers: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+    }
+    (0..n).map(f).collect()
+}

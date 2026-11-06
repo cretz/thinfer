@@ -35,6 +35,7 @@
 //! the six modulation signals lives in the driver; this block consumes the six
 //! ready `[inner]` vectors via [`WanMod`].
 
+use thinfer_core::backend::ElementwiseOp;
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::ops::{
     BcastAddF32, BcastFmaF32, BcastModulateF32, BcastMulF32, GeluF32, LayerNormF32, MatMulF32,
@@ -42,7 +43,7 @@ use thinfer_core::ops::{
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::weight::WeightSource;
-use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace, WsBuf};
+use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi, Workspace, WsBuf};
 
 use crate::common::block::{
     ActBuf, Block, BlockPipelines, DequantStep, PreparedWeight, alloc_act, alloc_matmul_out_buf,
@@ -824,8 +825,63 @@ fn op_layernorm<'wsp>(
     dim: u32,
     eps: f32,
 ) -> Result<(), WgpuError> {
+    if scope.is_deferred() {
+        return accel_op(scope, "layernorm", |a| {
+            Some(ElementwiseOp::LayerNormF16 {
+                x: a(x.data)?,
+                out: a(dst.data)?,
+                rows,
+                dim,
+                eps,
+            })
+        });
+    }
     let u = scope.u32x4_uniform(rows, dim, eps.to_bits(), 0)?;
     scope.layernorm::<LayerNormF32>(&bp.layernorm, x.data, u, dst.data, rows)
+}
+
+/// [`op_rmsnorm`] with the deferred f16 accelerator form.
+#[allow(clippy::too_many_arguments)]
+fn rmsnorm<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    x: ActBuf<'wsp>,
+    w: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+) -> Result<(), WgpuError> {
+    if scope.is_deferred() {
+        return accel_op(scope, "rmsnorm", |a| {
+            Some(ElementwiseOp::RmsNormF16 {
+                x: a(x.data)?,
+                w: a(w)?,
+                out: a(dst.data)?,
+                rows,
+                dim,
+                eps,
+            })
+        });
+    }
+    op_rmsnorm(scope, bp, x, w, dst, rows, dim, eps)
+}
+
+/// In a deferred (accelerator) scope, enqueue the f16 op `op` builds from the
+/// scope buffers' device addresses. A decline is an error there: deferred
+/// work cannot fall back to the wgpu op mid-scope.
+pub(crate) fn accel_op<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    what: &str,
+    op: impl FnOnce(&dyn Fn(BatchBuf<'w>) -> Option<u64>) -> Option<ElementwiseOp>,
+) -> Result<(), WgpuError> {
+    let declined = || WgpuError::AcceleratorDeclined { op: what.into() };
+    let op = op(&|b| scope.accel_addr(b)).ok_or_else(declined)?;
+    if scope.accel_elementwise(&op) {
+        Ok(())
+    } else {
+        Err(declined())
+    }
 }
 
 /// Channel-broadcast bias add `out[i] = x[i] + bias[i % dim]`. `bias` is a
@@ -839,6 +895,17 @@ fn op_bias_add<'wsp>(
     rows: u32,
     dim: u32,
 ) -> Result<(), WgpuError> {
+    if scope.is_deferred() {
+        return accel_op(scope, "bias_add", |a| {
+            Some(ElementwiseOp::AddBiasF16 {
+                x: a(x.data)?,
+                bias: a(bias)?,
+                out: a(dst.data)?,
+                rows,
+                dim,
+            })
+        });
+    }
     let u = scope.u32x4_uniform(dim, 0, 0, 0)?;
     scope.bcast_add::<BcastAddF32>(&bp.bcast_add, x.data, bias, u, dst.data, rows * dim)
 }
@@ -860,6 +927,18 @@ fn op_modulate<'wsp>(
     rows: u32,
     dim: u32,
 ) -> Result<(), WgpuError> {
+    if scope.is_deferred() {
+        return accel_op(scope, "modulate", |a| {
+            Some(ElementwiseOp::ModulateF16 {
+                x: a(x.data)?,
+                scale: a(scale)?,
+                shift: a(shift)?,
+                out: a(dst.data)?,
+                rows,
+                dim,
+            })
+        });
+    }
     let u = scope.u32x4_uniform(dim, 1.0_f32.to_bits(), 0, 0)?;
     scope.bcast_modulate::<BcastModulateF32>(
         &bp.bcast_modulate,
@@ -886,6 +965,18 @@ fn op_gate_residual<'wsp>(
     rows: u32,
     dim: u32,
 ) -> Result<(), WgpuError> {
+    if scope.is_deferred() {
+        return accel_op(scope, "gate_residual", |a| {
+            Some(ElementwiseOp::GateAddF16 {
+                x: a(x.data)?,
+                gate: a(gate)?,
+                y: a(y.data)?,
+                out: a(dst.data)?,
+                rows,
+                dim,
+            })
+        });
+    }
     let u = scope.u32x4_uniform(dim, 0, 0, 0)?;
     scope.bcast_fma::<BcastFmaF32>(&bp.bcast_fma, x.data, gate, y.data, u, dst.data, rows * dim)
 }
@@ -910,10 +1001,68 @@ fn lin<'wsp>(
     pipe: &WgpuPipeline,
     inst: &MatMulF32,
 ) -> Result<(), WgpuError> {
+    // Deferred: the dense site's accelerator gemm straight on the raw weight
+    // with a host `k`. Every wgpu form (the dims uniform, a dequant or the
+    // coopmat A padding copy) would run after the accelerator read it.
+    if scope.is_deferred() {
+        if prepared.is_none()
+            && dq.is_none()
+            && input.scale.is_none()
+            && scope.try_gemm(pipe, input.data, w, out, rows, n, k)?
+        {
+            return Ok(());
+        }
+        return Err(WgpuError::AcceleratorDeclined { op: "lin".into() });
+    }
     let dims = scope.u32x4_uniform(rows, n, k, 0)?;
     Block::dispatch_matmul_site_coopmat(
         scope, bp, input, w, out, dims, prepared, coopmat, i8, dq_i8, dq, pipe, inst, rows, n, k,
     )
+}
+
+/// [`lin`] into a scratch output, then `+ bias` (bf16 `[n]`) into `dst`; in a
+/// deferred scope one accelerator GEMM with the bias in its epilogue.
+#[allow(clippy::too_many_arguments)]
+fn lin_biased<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    input: ActBuf<'wsp>,
+    w: BatchBuf<'wsp>,
+    bias: BatchBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    n: u32,
+    k: u32,
+    prepared: Option<PreparedWeight>,
+    coopmat: Option<&crate::common::block::CoopmatStep>,
+    i8: Option<&WgpuPipeline>,
+    dq_i8: Option<&DequantStep>,
+    dq: Option<&DequantStep>,
+    pipe: &WgpuPipeline,
+    inst: &MatMulF32,
+) -> Result<(), WgpuError> {
+    if scope.is_deferred() {
+        let epi = GemmEpi {
+            bias: Some(bias),
+            residual: None,
+            gate: None,
+        };
+        if prepared.is_none()
+            && dq.is_none()
+            && input.scale.is_none()
+            && scope.try_gemm_fused(pipe, input.data, w, dst.data, rows, n, k, epi)?
+        {
+            return Ok(());
+        }
+        return Err(WgpuError::AcceleratorDeclined {
+            op: "lin_biased".into(),
+        });
+    }
+    let out = alloc_matmul_out_buf(scope, bp, rows * n)?;
+    lin(
+        scope, bp, input, w, out, rows, n, k, prepared, coopmat, i8, dq_i8, dq, pipe, inst,
+    )?;
+    op_bias_add(scope, bp, ActBuf::dense(out), bias, dst, rows, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,8 +1342,27 @@ impl WanDitBlock {
         // norm2 weight is a stored bf16 weight, not an act: use `bcast_mul`
         // (decodes by weight_dtype) NOT `bcast_affine` (reads its scale as an
         // f16 act, which reinterprets the bf16 weight bits -> wrong scale).
-        let u_mul = scope.u32x4_uniform(dim, 0, 0, 0)?;
-        scope.bcast_add::<BcastMulF32>(&bp.bcast_mul, n2.data, w2, u_mul, n2w.data, rows * dim)?;
+        if scope.is_deferred() {
+            accel_op(scope, "norm2_mul", |a| {
+                Some(ElementwiseOp::MulWeightF16 {
+                    x: a(n2.data)?,
+                    w: a(w2)?,
+                    out: a(n2w.data)?,
+                    rows,
+                    dim,
+                })
+            })?;
+        } else {
+            let u_mul = scope.u32x4_uniform(dim, 0, 0, 0)?;
+            scope.bcast_add::<BcastMulF32>(
+                &bp.bcast_mul,
+                n2.data,
+                w2,
+                u_mul,
+                n2w.data,
+                rows * dim,
+            )?;
+        }
         let b2 = scope.import_copy(bufs.norm2_b);
         let n2wb = alloc_act(scope, bp, rows, dim)?;
         op_bias_add(scope, bp, n2w, b2, n2wb, rows, dim)?;
@@ -1224,7 +1392,18 @@ impl WanDitBlock {
         )?;
         // residual, no gate
         let x2 = alloc_act(scope, bp, rows, dim)?;
-        op_add(scope, bp, x1, ca, x2)?;
+        if scope.is_deferred() {
+            accel_op(scope, "add", |a| {
+                Some(ElementwiseOp::AddF16 {
+                    x: a(x1.data)?,
+                    y: a(ca.data)?,
+                    out: a(x2.data)?,
+                    n: rows * dim,
+                })
+            })?;
+        } else {
+            op_add(scope, bp, x1, ca, x2)?;
+        }
         copy_tap(
             scope,
             x2.data,
@@ -1274,13 +1453,14 @@ impl WanDitBlock {
             copy_tap(scope, n3m.data, taps.norm3.as_ref(), bp.act_bytes(rc * dim))?;
 
             // up: [rc, inner] @ [ffn_dim, inner]ᵀ + bias -> [rc, ffn_dim]
-            let up = alloc_matmul_out_buf(scope, bp, rc * dff)?;
-            lin(
+            let upb = alloc_act(scope, bp, rc, dff)?;
+            lin_biased(
                 scope,
                 bp,
                 n3m,
                 wi,
-                up,
+                bi,
+                upb,
                 rc,
                 dff,
                 inner,
@@ -1292,11 +1472,19 @@ impl WanDitBlock {
                 &bp.matmul_ffn_up,
                 &bp.matmuls.ffn_up,
             )?;
-            let upb = alloc_act(scope, bp, rc, dff)?;
-            op_bias_add(scope, bp, ActBuf::dense(up), bi, upb, rc, dff)?;
             // gelu-tanh
             let gelu = alloc_act(scope, bp, rc, dff)?;
-            scope.dispatch_op::<GeluF32>(&pipelines.gelu, &[upb.data], gelu.data)?;
+            if scope.is_deferred() {
+                accel_op(scope, "gelu", |a| {
+                    Some(ElementwiseOp::GeluTanhF16 {
+                        x: a(upb.data)?,
+                        out: a(gelu.data)?,
+                        n: rc * dff,
+                    })
+                })?;
+            } else {
+                scope.dispatch_op::<GeluF32>(&pipelines.gelu, &[upb.data], gelu.data)?;
+            }
             copy_tap(
                 scope,
                 gelu.data,
@@ -1304,13 +1492,14 @@ impl WanDitBlock {
                 bp.act_bytes(rc * dff),
             )?;
             // down: [rc, ffn_dim] @ [inner, ffn_dim]ᵀ + bias -> [rc, inner]
-            let down = alloc_matmul_out_buf(scope, bp, rc * dim)?;
-            lin(
+            let downb = alloc_act(scope, bp, rc, dim)?;
+            lin_biased(
                 scope,
                 bp,
                 gelu,
                 wo,
-                down,
+                bo,
+                downb,
                 rc,
                 dim,
                 dff,
@@ -1322,8 +1511,6 @@ impl WanDitBlock {
                 &bp.matmul_ffn_down,
                 &bp.matmuls.ffn_down,
             )?;
-            let downb = alloc_act(scope, bp, rc, dim)?;
-            op_bias_add(scope, bp, ActBuf::dense(down), bo, downb, rc, dim)?;
             copy_tap(
                 scope,
                 downb.data,
@@ -2011,14 +2198,16 @@ impl WanDitBlock {
         inner: u32,
         prepared: Option<PreparedWeight>,
     ) -> Result<ActBuf<'wsp>, WgpuError> {
-        let proj = alloc_matmul_out_buf(scope, bp, rows * inner)?;
         let ow = scope.import_copy(w.o_w);
-        lin(
+        let ob = scope.import_copy(w.o_b);
+        let projb = alloc_act(scope, bp, rows, inner)?;
+        lin_biased(
             scope,
             bp,
             sa,
             ow,
-            proj,
+            ob,
+            projb,
             rows,
             inner,
             inner,
@@ -2030,9 +2219,6 @@ impl WanDitBlock {
             &bp.matmul_proj,
             &bp.matmuls.proj,
         )?;
-        let ob = scope.import_copy(w.o_b);
-        let projb = alloc_act(scope, bp, rows, inner)?;
-        op_bias_add(scope, bp, ActBuf::dense(proj), ob, projb, rows, inner)?;
         Ok(projb)
     }
 
@@ -2080,7 +2266,7 @@ impl WanDitBlock {
         copy_tap(scope, q.data, tap_q, bp.act_bytes(q_rows * inner))?;
         let qn = alloc_act(scope, bp, q_rows, inner)?;
         let nq = scope.import_copy(w.norm_q);
-        op_rmsnorm(scope, bp, q, nq, qn, q_rows, inner, eps)?;
+        rmsnorm(scope, bp, q, nq, qn, q_rows, inner, eps)?;
 
         let (kn, v) = match precomputed_kv {
             Some((pk, pv)) => {
@@ -2101,7 +2287,7 @@ impl WanDitBlock {
                 copy_tap(scope, v.data, tap_v, bp.act_bytes(kv_rows * inner))?;
                 let kn = alloc_act(scope, bp, kv_rows, inner)?;
                 let nk = scope.import_copy(w.norm_k);
-                op_rmsnorm(scope, bp, k, nk, kn, kv_rows, inner, eps)?;
+                rmsnorm(scope, bp, k, nk, kn, kv_rows, inner, eps)?;
                 (kn, v)
             }
         };
@@ -2164,7 +2350,6 @@ impl WanDitBlock {
         prepared: Option<PreparedWeight>,
     ) -> Result<ActBuf<'wsp>, WgpuError> {
         let dim = self.shape.dim as u32;
-        let out = alloc_matmul_out_buf(scope, bp, rows * n)?;
         let wv = scope.import_copy(w);
         // Self-attn qkv may be i8 (normed A-side); cross-attn qkv stays dense
         // (un-normed umT5 text K/V), or runs coopmat when opted in.
@@ -2188,12 +2373,12 @@ impl WanDitBlock {
                 &bp.matmuls.qkv,
             ),
         };
-        lin(
-            scope, bp, x, wv, out, rows, n, dim, prepared, coopmat, mm_i8, dq_i8, dq, pipe, inst,
-        )?;
         let bv = scope.import_copy(b);
         let biased = alloc_act(scope, bp, rows, n)?;
-        op_bias_add(scope, bp, ActBuf::dense(out), bv, biased, rows, n)?;
+        lin_biased(
+            scope, bp, x, wv, bv, biased, rows, n, dim, prepared, coopmat, mm_i8, dq_i8, dq, pipe,
+            inst,
+        )?;
         Ok(biased)
     }
 
@@ -2211,6 +2396,18 @@ impl WanDitBlock {
         let nh = self.shape.n_heads as u32;
         let hd = self.shape.head_dim as u32;
         let pairs = hd / 2;
+        if scope.is_deferred() {
+            return accel_op(scope, "rope", |a| {
+                Some(ElementwiseOp::RopeF16 {
+                    x: a(src.data)?,
+                    freqs: a(freqs)?,
+                    out: a(dst.data)?,
+                    rows,
+                    heads: nh,
+                    pairs,
+                })
+            });
+        }
         let u = scope.u32x4_uniform(rows, nh, pairs, 0)?;
         scope.rope::<RopeF32>(&bp.rope, src.data, freqs, u, dst.data, rows, nh, pairs)
     }

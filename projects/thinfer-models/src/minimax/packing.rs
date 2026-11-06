@@ -34,6 +34,11 @@ pub const MAX_ASPECT_RATIO: f64 = 4.0;
 pub const MIN_DURATION: f64 = 5.0;
 pub const MAX_DURATION: f64 = 15.0;
 
+/// The longest trained clip on the `17n + 5` grid (15 s rounds up to 362).
+pub fn max_clip_frames() -> usize {
+    align_num_frames((MAX_DURATION * FPS as f64) as usize).expect("a positive frame count")
+}
+
 /// The video VAE encodes 17 pixel frames per chunk and drops the 3 trailing
 /// latent frames of every chunk, so `17n + 5` pixel frames map to `5n + 2`
 /// latent frames.

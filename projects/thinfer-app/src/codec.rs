@@ -13,8 +13,9 @@ use thinfer_models::z_image::pipeline::encode_png;
 
 use crate::progress::{ProgressSink, Stage};
 
-// visually near-lossless H.264 at our dims.
-const BITS_PER_PIXEL: f64 = 0.2;
+// Visually near-lossless H.264 at our dims (~3.8 Mbps at 832x480x24). 0.2
+// visibly smeared fine skin texture (freckles, pores) on generated faces.
+const BITS_PER_PIXEL: f64 = 0.4;
 
 /// Decode a PNG/JPEG source image into an RGB [`Image`].
 pub fn load_image(path: &Path) -> Result<Image, String> {
@@ -80,46 +81,86 @@ impl H264Stream {
 }
 
 pub fn encode_h264(video: &WanVideo, fps: u32) -> Result<H264Stream, String> {
-    use openh264::OpenH264API;
-    use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
-    use openh264::formats::{RgbSliceU8, YUVBuffer};
+    let mut enc = H264Encoder::new(video.width, video.height, fps)?;
+    enc.push(video, 0..video.num_frames)?;
+    enc.finish()
+}
 
-    let (w, h, n) = (video.width, video.height, video.num_frames);
-    // openh264 wants even dims for 4:2:0; ours are /16. The default config
-    // (120 kbps, frame-skip on) is built for low-bandwidth camera streams and
-    // would drop frames -- our muxer emits one sample per encode(), so a drop
-    // becomes a broken sample. Configure for offline archival quality.
-    let bitrate = ((w as f64) * (h as f64) * (fps as f64) * BITS_PER_PIXEL).max(1_000_000.0) as u32;
-    let cfg = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(bitrate))
-        .skip_frames(false)
-        .max_frame_rate(FrameRate::from_hz(fps as f32));
-    let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)
-        .map_err(|e| format!("openh264 init: {e}"))?;
+/// An H.264 encode fed in order, clip by clip (chained clips share one track).
+pub struct H264Encoder {
+    enc: openh264::encoder::Encoder,
+    width: usize,
+    height: usize,
+    fps: u32,
+    samples: Vec<(bool, Vec<u8>)>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    rgb: Vec<u8>,
+}
 
-    let mut samples: Vec<(bool, Vec<u8>)> = Vec::with_capacity(n);
-    let mut sps: Option<Vec<u8>> = None;
-    let mut pps: Option<Vec<u8>> = None;
-    let mut rgb = vec![0u8; w * h * 3];
-
-    for t in 0..n {
-        frame_to_rgb(video, t, &mut rgb);
-        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (w, h)));
-        let bitstream = enc
-            .encode(&yuv)
-            .map_err(|e| format!("openh264 encode frame {t}: {e}"))?;
-        let (sample, is_key) = annexb_to_avcc(&bitstream.to_vec(), &mut sps, &mut pps);
-        samples.push((is_key, sample));
+impl H264Encoder {
+    pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, String> {
+        use openh264::OpenH264API;
+        use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
+        // openh264 wants even dims for 4:2:0; ours are /16. The default config
+        // (120 kbps, frame-skip on) is built for low-bandwidth camera streams
+        // and would drop frames -- our muxer emits one sample per encode(), so
+        // a drop becomes a broken sample. Configure for offline archival quality.
+        let bitrate = ((width as f64) * (height as f64) * (fps as f64) * BITS_PER_PIXEL)
+            .max(1_000_000.0) as u32;
+        let cfg = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(bitrate))
+            .skip_frames(false)
+            .max_frame_rate(FrameRate::from_hz(fps as f32));
+        let enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)
+            .map_err(|e| format!("openh264 init: {e}"))?;
+        Ok(Self {
+            enc,
+            width,
+            height,
+            fps,
+            samples: Vec::new(),
+            sps: None,
+            pps: None,
+            rgb: vec![0u8; width * height * 3],
+        })
     }
 
-    Ok(H264Stream {
-        width: w,
-        height: h,
-        fps,
-        sps: sps.ok_or("openh264 produced no SPS")?,
-        pps: pps.ok_or("openh264 produced no PPS")?,
-        samples,
-    })
+    /// Encode `frames` of `video` (same dims as the encoder) after everything
+    /// pushed so far.
+    pub fn push(&mut self, video: &WanVideo, frames: std::ops::Range<usize>) -> Result<(), String> {
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        if (video.width, video.height) != (self.width, self.height) {
+            return Err(format!(
+                "h264: clip is {}x{}, the track {}x{}",
+                video.width, video.height, self.width, self.height
+            ));
+        }
+        for t in frames {
+            frame_to_rgb(video, t, &mut self.rgb);
+            let yuv =
+                YUVBuffer::from_rgb_source(RgbSliceU8::new(&self.rgb, (self.width, self.height)));
+            let bitstream = self
+                .enc
+                .encode(&yuv)
+                .map_err(|e| format!("openh264 encode frame {}: {e}", self.samples.len()))?;
+            let (sample, is_key) =
+                annexb_to_avcc(&bitstream.to_vec(), &mut self.sps, &mut self.pps);
+            self.samples.push((is_key, sample));
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<H264Stream, String> {
+        Ok(H264Stream {
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            sps: self.sps.ok_or("openh264 produced no SPS")?,
+            pps: self.pps.ok_or("openh264 produced no PPS")?,
+            samples: self.samples,
+        })
+    }
 }
 
 /// Encode planar stereo f32 PCM `[2, n]` (channel-major, `[-1, 1]`) to AAC-LC
@@ -213,22 +254,40 @@ fn freq_index_for(sample_rate: u32) -> Result<mp4::SampleFreqIndex, String> {
 /// Write each decoded frame as `frame{n:03}.png` into directory `dir`. The
 /// codec-free view of the raw decode.
 pub fn write_png_frames(video: &WanVideo, dir: &Path) -> Result<(), String> {
+    write_png_frames_from(video, 0..video.num_frames, dir, 0)
+}
+
+/// [`write_png_frames`] of `frames` only, numbered from `first_index` (chained
+/// clips continue one sequence).
+pub fn write_png_frames_from(
+    video: &WanVideo,
+    frames: std::ops::Range<usize>,
+    dir: &Path,
+    first_index: usize,
+) -> Result<(), String> {
     let (w, h, n) = (video.width, video.height, video.num_frames);
     let per = h * w;
     let plane = n * per;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let mut chw = vec![0.0f32; 3 * per];
-    for t in 0..n {
+    for (i, t) in frames.enumerate() {
         let base = t * per;
         for c in 0..3 {
             chw[c * per..(c + 1) * per]
                 .copy_from_slice(&video.frames[c * plane + base..c * plane + base + per]);
         }
         let png = encode_png(&chw, w as u32, h as u32)?;
-        let p = dir.join(format!("frame{t:03}.png"));
+        let p = dir.join(format!("frame{:03}.png", first_index + i));
         std::fs::write(&p, &png).map_err(|e| format!("write {}: {e}", p.display()))?;
     }
     Ok(())
+}
+
+/// Frame `t` of `video` as RGB8 `[h, w, 3]` (the H.264 encode's quantization).
+pub fn frame_rgb8(video: &WanVideo, t: usize) -> Vec<u8> {
+    let mut out = vec![0u8; video.width * video.height * 3];
+    frame_to_rgb(video, t, &mut out);
+    out
 }
 
 /// Fill `out` (RGB8, `w*h*3`) from frame `t` of the CTHW `[-1, 1]` tensor.

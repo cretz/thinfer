@@ -142,6 +142,10 @@ pub struct DreamIdvInputs<'a> {
     pub steps: u32,
     pub guide_scale: f32,
     pub seed: u64,
+    /// Run the unguided (zero-reference) forward every this many steps and
+    /// reuse its last guidance delta in between. 1 = every step (the
+    /// reference); higher is faster, an opt-in approximation.
+    pub cfg_every: u32,
 }
 
 /// Decoded output: RGB CTHW `[3, frames, height, width]` in `[-1, 1]`.
@@ -251,14 +255,17 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
         let before_dec = residency.total_registered_bytes();
         let dec_handles = register_decoder(&residency, &VaeDecoderWeights::new(&vae_cfg))?;
         let dec_footprint = residency.total_registered_bytes() - before_dec;
+        let vae_pipelines = || async {
+            Ok::<_, DreamIdvError<S::Error>>(WanVaePipelines::compile(&backend).await?)
+        };
         let vae_encoder = WanVaeEncoder {
-            pipelines: WanVaePipelines::compile(&backend).await?,
+            pipelines: vae_pipelines().await?,
             handles: enc_handles,
             cfg: vae_cfg.clone(),
             weight_footprint: enc_footprint,
         };
         let vae_decoder = WanVaeDecoder {
-            pipelines: WanVaePipelines::compile(&backend).await?,
+            pipelines: vae_pipelines().await?,
             handles: dec_handles,
             cfg: vae_cfg,
             weight_footprint: dec_footprint,
@@ -358,6 +365,12 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
         debug_assert_eq!(video_lat.len(), z * f_lat * h_lat * w_lat);
         debug_assert_eq!(image_lat.len(), z * h_lat * w_lat);
 
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            video = f32_digest(&video_lat), mask = f32_digest(&mask_lat),
+            image = f32_digest(&image_lat),
+            "dreamid-v latents digest",
+        );
         if let Some(d) = diag.as_deref_mut() {
             d.video_latent = video_lat.clone();
             d.mask_latent = mask_lat.clone();
@@ -377,10 +390,41 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
         let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
         let zeros_ref = vec![0.0_f32; image_lat.len()];
 
+        // Pin as much of the DiT as the budget holds past one block's
+        // activations, so steps 2..N re-stream only the rest (pin-on-first-
+        // touch; `evict_all_and_free` after the denoise drops the plan).
+        // Untiled block peak ~ rows x (ffn + 6 x inner) activations, plus the
+        // two inputs' residual streams (in + out) and the text stream.
+        {
+            let act = 2u64; // f16 / bf16 acts
+            let inner = self.cfg.inner() as u64;
+            let rows = (hw / 4 * (f_lat + 1)) as u64;
+            let block_peak = rows * (self.cfg.ffn_dim as u64 + 6 * inner) * act;
+            let persist = (2 * 2 * rows + 2 * TEXT_SEQ as u64) * inner * act;
+            let reserve = self.residency.ring_reserved_bytes()
+                + self.residency.staging_reserve_bytes()
+                + block_peak
+                + persist;
+            let pin_budget = self.residency.budget().vram_bytes.saturating_sub(reserve);
+            let (pinned, count) = self
+                .residency
+                .set_pin_plan(&self.dit_handles.pin_priority(), pin_budget);
+            tracing::info!(
+                pinned_mib = pinned / (1024 * 1024),
+                pinned_count = count,
+                pin_budget_mib = pin_budget / (1024 * 1024),
+                reserve_mib = reserve / (1024 * 1024),
+                "dreamid-v dit pin plan",
+            );
+        }
+
         // --- 3. image-CFG UniPC denoise ---
         let mut unipc = FlowUniPc::new(&UniPcConfig::dreamid_v(inputs.steps));
         let mut latents = gaussian_noise(z * plane, inputs.seed); // z16 noise
         let scale = inputs.guide_scale;
+        let cfg_every = inputs.cfg_every.max(1) as usize;
+        // `cond - uncond` of the last guided step (reused between them).
+        let mut delta: Vec<f32> = Vec::new();
         {
             let _denoise = trace::scope!("denoise").entered();
             for i in 0..unipc.num_steps() {
@@ -391,19 +435,50 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
                 x_in[..z * plane].copy_from_slice(&latents);
                 x_in[z * plane..].copy_from_slice(&y);
 
-                let out_tiv = self
-                    .forward(&dit, &workspace, &x_in, Some(&image_lat), t)
+                // Both image-CFG forwards share each block's weights.
+                let input = |img_ref| WanDitInputs {
+                    image: &x_in,
+                    img_ref: Some(img_ref),
+                    text: &self.context,
+                    timestep: t,
+                    r_timestep: None,
+                    attn_window: None,
+                };
+                let guided = i % cfg_every == 0;
+                let mut ins = vec![input(&image_lat)];
+                if guided {
+                    ins.push(input(&zeros_ref));
+                }
+                let mut outs = dit
+                    .forward_many(
+                        &self.backend,
+                        &self.dit_pipelines,
+                        &self.residency,
+                        &workspace,
+                        &ins,
+                    )
                     .await?;
-                let out_tv = self
-                    .forward(&dit, &workspace, &x_in, Some(&zeros_ref), t)
-                    .await?;
+                if guided {
+                    let out_tv = outs.pop().expect("two outputs").image;
+                    delta = outs[0]
+                        .image
+                        .iter()
+                        .zip(&out_tv)
+                        .map(|(&a, &b)| a - b)
+                        .collect();
+                }
+                let out_tiv = outs.pop().expect("one output").image;
                 // noise_pred = pos_tiv + scale * (pos_tiv - pos_tv).
                 let noise_pred: Vec<f32> = out_tiv
                     .iter()
-                    .zip(&out_tv)
-                    .map(|(&a, &b)| a + scale * (a - b))
+                    .zip(&delta)
+                    .map(|(&a, &d)| a + scale * d)
                     .collect();
                 latents = unipc.step(&noise_pred, &latents);
+                tracing::info!(
+                    target: thinfer_core::trace::DIAG,
+                    step = i, latents = f32_digest(&latents), "dreamid-v step digest",
+                );
             }
         }
 
@@ -434,35 +509,6 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
             height: ph,
             width: pw,
         })
-    }
-
-    /// One DiT forward returning the velocity latent `[16, F_lat, h, w]`.
-    async fn forward(
-        &self,
-        dit: &WanDit,
-        workspace: &Workspace<WgpuBackend>,
-        image: &[f32],
-        img_ref: Option<&[f32]>,
-        timestep: f32,
-    ) -> Result<Vec<f32>, DreamIdvError<S::Error>> {
-        let inputs = WanDitInputs {
-            image,
-            img_ref,
-            text: &self.context,
-            timestep,
-            r_timestep: None,
-            attn_window: None,
-        };
-        let out = dit
-            .forward(
-                &self.backend,
-                &self.dit_pipelines,
-                &self.residency,
-                workspace,
-                &inputs,
-            )
-            .await?;
-        Ok(out.image)
     }
 
     /// Parity/diag accessor (no forward-logic change): run ONE DiT forward on
@@ -686,6 +732,16 @@ fn resize_bilinear_u8(src: &[u8], sh: usize, sw: usize, dh: usize, dw: usize) ->
 /// Take the VAE moments `[2*z, F_lat, h, w]` (mean ++ logvar), keep the mode
 /// (mean = channels `0..z`), and normalize per channel `(m - latents_mean) /
 /// latents_std`. Mirrors the reference `WanVAE.encode` (`(mu - mean) * 1/std`).
+/// Run-to-run determinism probe for the DIAG log: a hash of the exact bits.
+fn f32_digest(v: &[f32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for x in v {
+        x.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
 fn normalize_moments(moments: &[f32], cfg: &WanVaeConfig) -> Vec<f32> {
     let z = cfg.z_dim;
     let plane = moments.len() / (2 * z);

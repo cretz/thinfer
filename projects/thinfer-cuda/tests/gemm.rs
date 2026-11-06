@@ -33,6 +33,7 @@ fn store(ty: GemmType, x: f32) -> (f32, u16) {
             let h = bf16::from_f32(x);
             (h.to_f32(), h.to_bits())
         }
+        GemmType::F32 => unreachable!("16-bit operands only"),
     }
 }
 
@@ -40,6 +41,7 @@ fn load(ty: GemmType, bits: u16) -> f32 {
     match ty {
         GemmType::F16 => f16::from_bits(bits).to_f32(),
         GemmType::Bf16 => bf16::from_bits(bits).to_f32(),
+        GemmType::F32 => unreachable!("16-bit operands only"),
     }
 }
 
@@ -221,6 +223,92 @@ fn cuda_gemm_matches_reference() {
     );
 }
 
+/// The f32-act form (bf16 n-major B, f32 out, M <= 64) against an f64 CPU
+/// reference: ragged rows / columns / K strips, one row, and the full block;
+/// past 64 rows (or an epilogue) it declines.
+#[test]
+fn cuda_gemm_f32_acts() {
+    if !thinfer_cuda::driver_present() {
+        eprintln!("skipped[cuda gemm f32]: no CUDA driver");
+        return;
+    }
+    let Ok(ctx) = CudaContext::new(0) else {
+        eprintln!("skipped[cuda gemm f32]: no device");
+        return;
+    };
+    let sm = ctx.compute_capability().unwrap();
+    let Ok(kernels) = GemmKernels::new(ctx.clone(), sm) else {
+        eprintln!("skipped[cuda gemm f32]: no kernels");
+        return;
+    };
+    let desc = GemmDesc {
+        a: GemmType::F32,
+        b: GemmType::Bf16,
+        b_nmajor: true,
+        out_f32: false,
+    };
+    let mut rng = Rng(5);
+    for (m, n, k) in [(47, 200, 136), (1, 64, 64), (64, 1032, 5128), (65, 64, 64)] {
+        let a: Vec<f32> = (0..m * k).map(|_| rng.next() * 3.0).collect();
+        let b: Vec<bf16> = (0..n * k)
+            .map(|_| bf16::from_f32(rng.next() * 0.1))
+            .collect();
+        let dims = GemmDims {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            pad: 0,
+        };
+        let (pa, pb, pd) = (
+            upload(&ctx, bytes(&a)),
+            upload(&ctx, bytes(&b)),
+            upload(&ctx, bytes(std::slice::from_ref(&dims))),
+        );
+        let po = upload(&ctx, &vec![0u8; m * n * 4]);
+        let ran = kernels
+            .run(
+                &desc,
+                pa,
+                pb,
+                po,
+                pd,
+                m as u32,
+                n as u32,
+                0,
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(ran, thinfer_cuda::gemm::accepts(&desc, m as u32, n as u32));
+        let mut got = vec![0f32; m * n];
+        unsafe { sys::cuMemcpyDtoH_v2(got.as_mut_ptr().cast(), po, m * n * 4) }
+            .result()
+            .unwrap();
+        for p in [pa, pb, pd, po] {
+            unsafe { sys::cuMemFree_v2(p) }.result().unwrap();
+        }
+        if m > 64 {
+            assert!(!ran, "{m} rows must decline");
+            continue;
+        }
+        assert!(ran, "declined {m}x{n}x{k}");
+        let mut worst = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let w: f64 = (0..k)
+                    .map(|kk| a[i * k + kk] as f64 * b[j * k + kk].to_f64())
+                    .sum();
+                let scale: f64 = (0..k)
+                    .map(|kk| (a[i * k + kk] as f64 * b[j * k + kk].to_f64()).abs())
+                    .sum();
+                worst = worst.max((got[i * n + j] as f64 - w).abs() / scale.max(1e-30));
+            }
+        }
+        eprintln!("cuda gemm f32 {m}x{n}x{k}: worst err / sum|ab| {worst:.2e}");
+        // f32 accumulation over K terms: a few ulps of the absolute sum.
+        assert!(worst < 1e-6, "{m}x{n}x{k}: {worst:.2e}");
+    }
+}
+
 /// The fused epilogue `out = residual + gate * (acc + bias)` against the CPU
 /// reference, with the residual in its own buffer and aliasing the output
 /// (the in-place accumulate), on a multi-group ragged shape; a non-bf16 output
@@ -326,4 +414,148 @@ fn cuda_gemm_fused_epilogue() {
             .unwrap(),
         "f16 output took an epilogue"
     );
+}
+
+/// The one-image conv against a CPU reference summing each output with
+/// `mul_add` in the kernel's (and the WGSL op's) order: bit-exact, over the
+/// encoder's forms (3x3 reflect, the stride-2 downsampler, a 1x1 shortcut),
+/// ragged shapes, and both tile kernels (few tiles -> small; many -> big).
+#[test]
+fn cuda_conv2d_is_bit_exact() {
+    use thinfer_core::backend::{Conv2dAddrs, Conv2dShape};
+    if !thinfer_cuda::driver_present() {
+        eprintln!("skipped[cuda conv2d]: no CUDA driver");
+        return;
+    }
+    let Ok(ctx) = CudaContext::new(0) else {
+        eprintln!("skipped[cuda conv2d]: no device");
+        return;
+    };
+    let sm = ctx.compute_capability().unwrap();
+    let Ok(kernels) = GemmKernels::new(ctx.clone(), sm) else {
+        eprintln!("skipped[cuda conv2d]: no kernels");
+        return;
+    };
+    let mut rng = Rng(9);
+    // (cin, cout, h, w, k, stride, pad, reflect)
+    let cases = [
+        (3, 128, 20, 18, 3, 1, 1, true),
+        (24, 48, 9, 7, 3, 2, 0, true),
+        (32, 70, 5, 5, 1, 1, 0, true),
+        (8, 1024, 64, 32, 3, 1, 1, true),
+        (5, 16, 6, 6, 3, 1, 1, false),
+    ];
+    for (cin, cout, h, w, k, stride, pad, reflect) in cases {
+        let h_out = (h + 2 * pad + stride - 1 - k) / stride + 1;
+        let w_out = (w + 2 * pad + stride - 1 - k) / stride + 1;
+        let x: Vec<f32> = (0..cin * h * w).map(|_| rng.next()).collect();
+        let wt: Vec<bf16> = (0..cout * cin * k * k)
+            .map(|_| bf16::from_f32(rng.next() * 0.2))
+            .collect();
+        let bias: Vec<bf16> = (0..cout).map(|_| bf16::from_f32(rng.next())).collect();
+        let at = |i: i64, n: usize| -> Option<usize> {
+            let n = n as i64;
+            match (reflect, i) {
+                (true, i) if i < 0 => Some(-i as usize),
+                (true, i) if i >= n => Some((2 * n - 2 - i) as usize),
+                (false, i) if i < 0 || i >= n => None,
+                (_, i) => Some(i as usize),
+            }
+        };
+        let mut want = vec![0f32; cout * h_out * w_out];
+        for co in 0..cout {
+            for ho in 0..h_out {
+                for wo in 0..w_out {
+                    let mut acc = 0f32;
+                    for ci in 0..cin {
+                        for dh in 0..k {
+                            for dw in 0..k {
+                                let hi = at((ho * stride + dh) as i64 - pad as i64, h);
+                                let wi = at((wo * stride + dw) as i64 - pad as i64, w);
+                                let xv = match (hi, wi) {
+                                    (Some(hi), Some(wi)) => x[(ci * h + hi) * w + wi],
+                                    _ => 0.0,
+                                };
+                                let wv = wt[((co * cin + ci) * k + dh) * k + dw].to_f32();
+                                acc = wv.mul_add(xv, acc);
+                            }
+                        }
+                    }
+                    want[(co * h_out + ho) * w_out + wo] = acc + bias[co].to_f32();
+                }
+            }
+        }
+        let (px, pw, pb) = (
+            upload(&ctx, bytes(&x)),
+            upload(&ctx, bytes(&wt)),
+            upload(&ctx, bytes(&bias)),
+        );
+        let po = upload(&ctx, &vec![0u8; want.len() * 4]);
+        let shape = Conv2dShape {
+            cin: cin as u32,
+            cout: cout as u32,
+            h: h as u32,
+            w: w as u32,
+            h_out: h_out as u32,
+            w_out: w_out as u32,
+            k: k as u32,
+            stride: stride as u32,
+            pad: pad as u32,
+            reflect,
+            bf16: false,
+        };
+        let ran = kernels
+            .run_conv2d(&Conv2dAddrs {
+                x: px,
+                w: pw,
+                bias: pb,
+                out: po,
+                shape,
+            })
+            .unwrap();
+        assert!(ran, "declined {shape:?}");
+        let read = || {
+            let mut got = vec![0f32; want.len()];
+            unsafe { sys::cuMemcpyDtoH_v2(got.as_mut_ptr().cast(), po, got.len() * 4) }
+                .result()
+                .unwrap();
+            got
+        };
+        let got = read();
+        // The opt-in bf16 tensor-core form: inputs rounded to bf16 (kdim
+        // multiples of 8; the rest stay on the exact kernel).
+        let bf16_shape = Conv2dShape {
+            bf16: true,
+            ..shape
+        };
+        let ran = kernels
+            .run_conv2d(&Conv2dAddrs {
+                x: px,
+                w: pw,
+                bias: pb,
+                out: po,
+                shape: bf16_shape,
+            })
+            .unwrap();
+        assert!(ran, "declined {bf16_shape:?}");
+        let got16 = read();
+        let (mut e2, mut r2) = (0f64, 0f64);
+        for (g, w) in got16.iter().zip(&want) {
+            e2 += ((g - w) as f64).powi(2);
+            r2 += (*w as f64).powi(2);
+        }
+        let rel = (e2 / r2).sqrt();
+        eprintln!("cuda conv2d bf16 {shape:?}: rel_rms {rel:.3e}");
+        assert!(rel < 5e-3, "bf16 conv rel_rms {rel}");
+        for p in [px, pw, pb, po] {
+            unsafe { sys::cuMemFree_v2(p) }.result().unwrap();
+        }
+        let bad = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        eprintln!("cuda conv2d {shape:?}: {bad} of {} differ", want.len());
+        assert_eq!(bad, 0, "{shape:?}");
+    }
 }

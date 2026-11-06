@@ -11,8 +11,8 @@ use thinfer_core::policy::ResidencyBudget;
 pub use thinfer_models::wan::pipeline::Shot;
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId,
-    VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SwapModel, VaeChoice,
+    VideoModelId, VideoSampler,
 };
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
@@ -315,23 +315,13 @@ pub struct VideoRequest {
     /// anchor); lower values let it drift toward the model's own frame-0. Only
     /// used when `input_image` is set on an LTX i2v model; ignored otherwise.
     pub strength: f32,
-    /// DreamID-V only: the source FACE image (PNG/JPEG) to swap into the target
-    /// video. Required for DreamID-V, rejected by every other model. Small, so it
-    /// rides in RAM ([`ImageBytes`]) and never touches disk; the large target
-    /// video takes the RAM/encrypted `input_video` path.
-    pub source_image: Option<ImageBytes>,
     /// FastH3-Omni only: reference images (PNG/JPEG, at most 9) the prompt can
-    /// name as `<Picture 1>`, `<Picture 2>`, ... in order. Held in RAM like
-    /// `source_image`; a decrypted image never touches disk.
+    /// name as `<Picture 1>`, `<Picture 2>`, ... in order. Held in RAM
+    /// ([`ImageBytes`]); a decrypted image never touches disk.
     pub ref_images: Vec<ImageBytes>,
-    /// DreamID-V only: the target VIDEO (the clip to swap a face into), held
-    /// RAM-first (encrypted spill for large uploads; see [`VideoInput`]).
-    /// Required for DreamID-V, `None` for every other model.
-    pub input_video: Option<VideoInput>,
-    /// DreamID-V image-CFG guidance scale on the source-face reference. `None` ->
-    /// the model default ([`VideoModelId::default_guide_scale`]). Ignored by the
-    /// other (CFG-free) video models.
-    pub guide_scale: Option<f32>,
+    /// FastH3-Omni only: how each reference image is sized (rejected for every
+    /// other model when not the default).
+    pub ref_image_size: RefImageSize,
     /// FastWan denoise sampler (ignored on the AR path).
     pub sampler: VideoSampler,
     /// UniPC denoise step count (1..=`VIDEO_MAX_STEPS`); DMD ignores it.
@@ -370,6 +360,11 @@ pub struct VideoRequest {
     /// stage schedules on the two-stage 22B line, 8+3 -> 16+11 steps (~2.5x
     /// denoise). Wan ignores it. Default `false`.
     pub audio_hq: bool,
+    /// MiniMax-H3 / FastH3: run the VAE encoder's convolutions (reference
+    /// images, first frame) in f32, the exact path. By default they run in
+    /// bf16 on tensor cores (the precision the reference runs that encoder
+    /// in, ~3x faster), which needs the CUDA accelerator (f32 without it).
+    pub vae_encode_f32: bool,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed, structured
     /// caption via the rewrite endpoint before encoding (the model is trained on
     /// long captions; short raw prompts are out-of-distribution). Default `true`;
@@ -402,6 +397,9 @@ pub struct VideoRequest {
 pub struct VideoPlan {
     pub frames: u32,
     pub shots: Vec<Shot>,
+    /// MiniMax-H3 / FastH3 past one clip: the chained clips in order (empty =
+    /// one clip of `frames`).
+    pub chain: Vec<ChainSegment>,
     pub fps: u32,
     /// Non-fatal notices the user should see (e.g. a requested duration capped
     /// to the per-resolution VRAM envelope). Surfaced via the progress sink at
@@ -409,14 +407,18 @@ pub struct VideoPlan {
     pub warnings: Vec<String>,
 }
 
+/// One clip of a chained MiniMax-H3 / FastH3 video. Every clip after the
+/// first starts from the previous one's last frame (FL2VA first-frame
+/// conditioning, as FastVideo's DreamVerse chains FastH3 segments), repeats
+/// it, and the output drops the repeat (and its audio).
+#[derive(Clone, Debug)]
+pub struct ChainSegment {
+    pub prompt: String,
+    pub frames: u32,
+}
+
 impl VideoRequest {
     pub fn required_files(&self) -> Result<Vec<FileRef>, String> {
-        // DreamID-V's whole fetch set is its variant `files()`: the DiT `.pth`
-        // (dit_pt_role), the Wan2.1 VAE (weight_roles), and the baked context +
-        // the two DWPose ONNX nets (aux_roles). No special-casing needed.
-        if self.model.is_dreamidv() {
-            return Ok(self.model.variant().files().map(|(_, f)| *f).collect());
-        }
         // MiniMax-H3 sources by role (conditioner + tokenizer + DiT + the
         // required turbo adapter + both VAEs), not via the Wan variant registry.
         if self.model.is_minimax() {
@@ -424,12 +426,21 @@ impl VideoRequest {
             // The opt-in NVFP4 decoder rides with (not instead of) the fp16 VAE,
             // which still supplies the latent stats.
             let decoder = self.vae.minimax_nvfp4().map(|(r, _)| r);
+            // A keyframe (first frame, or a chained clip's handoff) also goes
+            // through the vision tower.
+            let vision = (self.minimax_keyframes()
+                && !self
+                    .model
+                    .minimax_roles()
+                    .contains(&thinfer_models::minimax::manifest::role::VISION))
+            .then_some(thinfer_models::minimax::manifest::role::VISION);
             return self
                 .model
                 .minimax_roles()
                 .iter()
                 .copied()
                 .chain(decoder)
+                .chain(vision)
                 .map(|r| {
                     m.get(r)
                         .copied()
@@ -569,9 +580,15 @@ impl VideoRequest {
     /// Validate dims + resolve fps and the shot plan. Fails fast on every user
     /// error so a server can 400 at submit.
     pub fn resolve(&self) -> Result<VideoPlan, String> {
-        if self.attn == AttnPrecision::Int8 && !self.model.is_fasth3() {
+        if self.attn != AttnPrecision::Bf16 && !self.model.is_fasth3() {
             return Err(format!(
-                "--attn int8 applies to the FastH3 models' sparse attention; {} does not take it",
+                "--attn {} applies to the FastH3 models' sparse attention; {} does not take it",
+                self.attn, self.model
+            ));
+        }
+        if self.vae_encode_f32 && !self.model.is_minimax() {
+            return Err(format!(
+                "--vae-encode-f32 applies to the MiniMax-H3 / FastH3 reference encode; {} does not take it",
                 self.model
             ));
         }
@@ -581,20 +598,17 @@ impl VideoRequest {
                 self.vae, self.model
             ));
         }
-        // DreamID-V is a video face-swap, not a t2v: it consumes a target video +
-        // a source face image (no prompt), on the Wan /16 grid. Its own resolve
-        // validates those inputs and skips the prompt/sampler/shot machinery.
-        if self.model.is_dreamidv() {
-            return self.resolve_dreamidv();
-        }
         // First-frame image conditioning exists only on the causal Hunyuan TI2V
         // model, where it is OPTIONAL: with an image the run is I2V; without it
         // the model runs text-only (the upstream `mask_type="t2v"` shape --
         // probe-validated to produce coherent prompt-following video despite the
         // i2v-trained checkpoint). Every other model rejects it.
-        if !(self.model.is_hunyuan_i2v() || self.model.is_ltx_i2v()) && self.input_image.is_some() {
+        if !(self.model.is_hunyuan_i2v() || self.model.is_ltx_i2v() || self.model.minimax_fl2va())
+            && self.input_image.is_some()
+        {
             return Err(format!(
-                "--input-image is only supported by hunyuan-video-1.5-ti2v and ltx2-rapid (got {})",
+                "--input-image is only supported by hunyuan-video-1.5-ti2v, ltx2-rapid, fasth3-trim \
+                 and minimax-h3 (got {})",
                 self.model
             ));
         }
@@ -669,36 +683,9 @@ impl VideoRequest {
         Ok(VideoPlan {
             frames,
             shots,
+            chain: Vec::new(),
             fps,
             warnings,
-        })
-    }
-
-    /// DreamID-V plan resolution: validate the /16 dims + require BOTH a source
-    /// face image and a target video (no prompt). `frames` is the requested
-    /// target on the 4k+1 grid (default 81); the executor clamps it to the actual
-    /// decoded length of the target clip. Single-clip, no shots.
-    fn resolve_dreamidv(&self) -> Result<VideoPlan, String> {
-        validate_dim("height", self.height)?;
-        validate_dim("width", self.width)?;
-        if self.source_image.is_none() {
-            return Err(format!("{} requires a source face image", self.model));
-        }
-        if self.input_video.is_none() {
-            return Err(format!("{} requires a target video", self.model));
-        }
-        let frames = match self.frames.first() {
-            Some(&f) => {
-                self.model.validate_frames(f)?;
-                f
-            }
-            None => self.model.default_frames(),
-        };
-        Ok(VideoPlan {
-            frames,
-            shots: Vec::new(),
-            fps: self.fps.unwrap_or_else(|| self.model.fps()),
-            warnings: Vec::new(),
         })
     }
 
@@ -712,13 +699,29 @@ impl VideoRequest {
     /// prompt length, which resolve does not have. The driver checks it before
     /// loading any weights.
     pub fn resolve_minimax(&self, row_limit: usize) -> Result<VideoPlan, String> {
-        if self.prompts.len() > 1 {
-            return Err(format!("{} takes a single prompt", self.model));
+        if self.prompts.len() > 1 && !self.model.minimax_fl2va() {
+            return Err(format!(
+                "{} takes a single prompt (chained clips need FL2VA: fasth3-trim, minimax-h3)",
+                self.model
+            ));
+        }
+        if self.input_image.is_some() && !self.model.minimax_fl2va() {
+            return Err(format!(
+                "{} takes no --input-image (FL2VA first frames: fasth3-trim, minimax-h3)",
+                self.model
+            ));
         }
         let max_refs = crate::minimax_ref::MAX_REFERENCES;
         if !self.ref_images.is_empty() && self.model != VideoModelId::Fasth3Omni {
             return Err(format!(
                 "{} does not take reference images (fasth3-omni does)",
+                self.model
+            ));
+        }
+        if self.ref_image_size != RefImageSize::default() && self.model != VideoModelId::Fasth3Omni
+        {
+            return Err(format!(
+                "--ref-image-size applies to fasth3-omni reference images; {} does not take it",
                 self.model
             ));
         }
@@ -743,6 +746,9 @@ impl VideoRequest {
             ));
         }
         let mut warnings = Vec::new();
+        if self.minimax_chains() {
+            return self.resolve_minimax_chain(row_limit);
+        }
         let requested = match (self.frames.first(), self.durations.first()) {
             (Some(&f), _) => f,
             (None, Some(&d)) => ((d * fps as f32).round() as u32).max(1),
@@ -792,6 +798,133 @@ impl VideoRequest {
         Ok(VideoPlan {
             frames,
             shots: Vec::new(),
+            chain: Vec::new(),
+            fps,
+            warnings,
+        })
+    }
+
+    /// The frames each `--frames` / `--duration` value asks for (no grid snap).
+    fn requested_frames(&self, fps: u32) -> Result<Vec<u32>, String> {
+        if self.durations.is_empty() {
+            return Ok(self.frames.clone());
+        }
+        self.durations
+            .iter()
+            .map(|&d| {
+                if !(d.is_finite() && d > 0.0) {
+                    return Err(format!(
+                        "--duration must be a positive number of seconds (got {d})"
+                    ));
+                }
+                Ok(((d * fps as f32).round() as u32).max(1))
+            })
+            .collect()
+    }
+
+    /// Whether a MiniMax-H3 / FastH3 request runs as chained clips: several
+    /// prompts, or one past the trained clip length (FL2VA models only).
+    pub fn minimax_chains(&self) -> bool {
+        let one_clip = thinfer_models::minimax::packing::max_clip_frames() as u32;
+        self.model.minimax_fl2va()
+            && (self.prompts.len() > 1
+                || self
+                    .requested_frames(crate::minimax::FPS)
+                    .is_ok_and(|v| v.first().is_some_and(|&f| f > one_clip)))
+    }
+
+    /// Whether a MiniMax-H3 / FastH3 request conditions on a keyframe.
+    pub fn minimax_keyframes(&self) -> bool {
+        self.model.is_minimax() && (self.input_image.is_some() || self.minimax_chains())
+    }
+
+    /// The chained plan (see [`ChainSegment`]): one length per prompt, or one
+    /// total split evenly across them; a single prompt past one clip splits
+    /// into as few equal clips as fit the canvas.
+    fn resolve_minimax_chain(&self, row_limit: usize) -> Result<VideoPlan, String> {
+        use thinfer_models::minimax::packing;
+        let fps = crate::minimax::FPS;
+        let mut warnings = Vec::new();
+        // Each clip carries its keyframe twice: vision tokens in the prompt and
+        // as many latent condition rows.
+        let keyframe_rows = 2 * (self.height / 32 * (self.width / 32)) as usize;
+        let cap = packing::max_fitting_frames(
+            &self.model.minimax_dit_config(),
+            MINIMAX_TEXT_ROW_RESERVE + keyframe_rows,
+            (self.height / 16) as usize,
+            (self.width / 16) as usize,
+            packing::max_clip_frames(),
+            row_limit,
+        )
+        .ok_or_else(|| {
+            format!(
+                "{}x{} is too large for chained {} clips: not even the shortest clip fits \
+                 with its keyframe",
+                self.width, self.height, self.model
+            )
+        })? as u32;
+        let align = |f: u32| {
+            packing::align_num_frames(f as usize)
+                .map(|v| v as u32)
+                .map_err(|e| format!("frame count {f}: {e:?}"))
+        };
+        // A clip after the first repeats its keyframe, so it adds `frames - 1`.
+        let split = |total: u32, parts: u32| total.saturating_sub(1).div_ceil(parts) + 1;
+        let values = self.requested_frames(fps)?;
+        let n = self.prompts.len() as u32;
+        let lens: Vec<u32> = match (n, values.len()) {
+            (1, 1) => {
+                let parts = values[0].saturating_sub(1).div_ceil(cap - 1).max(1);
+                vec![align(split(values[0], parts))?; parts as usize]
+            }
+            (_, 0) => vec![align(self.model.default_frames())?; n as usize],
+            (_, 1) => vec![align(split(values[0], n))?; n as usize],
+            (_, m) if m == n as usize => {
+                values.iter().map(|&f| align(f)).collect::<Result<_, _>>()?
+            }
+            (_, m) => {
+                return Err(format!(
+                    "expected 1 --duration/--frames value (split evenly) or {n} (one per \
+                     --prompt), got {m}"
+                ));
+            }
+        };
+        if let Some(&f) = lens.iter().find(|&&f| f > cap) {
+            return Err(format!(
+                "a {f}-frame clip does not fit: at most {cap} frames (~{:.1}s) per chained clip \
+                 at {}x{}",
+                cap as f32 / fps as f32,
+                self.width,
+                self.height
+            ));
+        }
+        let frames = lens[0] + lens[1..].iter().map(|f| f - 1).sum::<u32>();
+        let asked: u32 = match values.len() {
+            1 => values[0],
+            0 => frames,
+            _ => values[0] + values[1..].iter().map(|f| f.saturating_sub(1)).sum::<u32>(),
+        };
+        if frames != asked {
+            warnings.push(format!(
+                "{} renders {frames} frames (~{:.1}s) as {} chained clips on its 17n+5 grid \
+                 (asked {asked}).",
+                self.model,
+                frames as f32 / fps as f32,
+                lens.len(),
+            ));
+        }
+        let chain = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &frames)| ChainSegment {
+                prompt: self.prompts[if n == 1 { 0 } else { i }].clone(),
+                frames,
+            })
+            .collect();
+        Ok(VideoPlan {
+            frames,
+            shots: Vec::new(),
+            chain,
             fps,
             warnings,
         })
@@ -894,6 +1027,7 @@ impl VideoRequest {
         Ok(VideoPlan {
             frames,
             shots: Vec::new(),
+            chain: Vec::new(),
             fps,
             warnings,
         })
@@ -929,7 +1063,49 @@ pub struct FaceSwapOptions {
     /// start/end.
     pub start_secs: Option<f32>,
     pub end_secs: Option<f32>,
+    /// DreamID-V's knobs (ignored by HyperSwap).
+    pub diffusion: DiffusionSwapOptions,
 }
+
+/// DreamID-V (diffusion face swap) settings.
+#[derive(Clone, Copy, Debug)]
+pub struct DiffusionSwapOptions {
+    /// Denoise steps (the distill is authored for 16).
+    pub steps: u32,
+    /// Image-CFG guidance scale on the source face.
+    pub guide_scale: f32,
+    /// `None` = random.
+    pub seed: Option<u64>,
+    /// Working size: the clip is resized toward this pixel area (its own
+    /// aspect kept), on the /16 grid. The reference default is 832x480.
+    pub width: u32,
+    pub height: u32,
+    /// Opt-in: the unguided forward every this many steps, its guidance
+    /// delta reused in between (1 = every step, the reference).
+    pub cfg_every: u32,
+    /// Opt-in: run on the clip's face region only (the masks' union, with
+    /// context) at up to its native size, pasted back into the full-resolution
+    /// frames with a feathered edge. Far fewer tokens; the output keeps the
+    /// source resolution.
+    pub face_crop: bool,
+}
+
+impl Default for DiffusionSwapOptions {
+    fn default() -> Self {
+        Self {
+            steps: thinfer_models::wan::dreamidv::DEFAULT_STEPS,
+            guide_scale: thinfer_models::wan::dreamidv::DEFAULT_GUIDE_SCALE,
+            seed: None,
+            width: 832,
+            height: 480,
+            cfg_every: 1,
+            face_crop: false,
+        }
+    }
+}
+
+/// The most DreamID-V denoise steps a request may ask for.
+pub const DREAMIDV_MAX_STEPS: u32 = 50;
 
 impl Default for FaceSwapOptions {
     fn default() -> Self {
@@ -941,6 +1117,7 @@ impl Default for FaceSwapOptions {
             bitrate_scale: 1.15,
             start_secs: None,
             end_secs: None,
+            diffusion: DiffusionSwapOptions::default(),
         }
     }
 }
@@ -960,11 +1137,10 @@ pub struct FaceSwapRequest {
 
 impl FaceSwapRequest {
     pub fn required_files(&self) -> Vec<FileRef> {
-        let mut files = vec![
-            crate::model::SCRFD,
-            crate::model::ARCFACE,
-            self.model.file(),
-        ];
+        let Some(swap) = self.model.file() else {
+            return SwapModel::dreamidv_files();
+        };
+        let mut files = vec![crate::model::SCRFD, crate::model::ARCFACE, swap];
         if self.options.occlusion {
             files.push(crate::model::XSEG);
         }
@@ -1003,12 +1179,31 @@ impl FaceSwapRequest {
         {
             return Err("--end must be greater than --start".into());
         }
+        if self.model.is_dreamidv() {
+            if o.hyperswap_mask || o.occlusion || o.enhance || o.detect_stride > 1 {
+                return Err(
+                    "--hyperswap-mask, --occlusion-mask, --enhance and --detect-stride are HyperSwap options; dreamid-v makes its own face mask"
+                        .into(),
+                );
+            }
+            let d = &o.diffusion;
+            validate_dim("width", d.width)?;
+            validate_dim("height", d.height)?;
+            if !(1..=DREAMIDV_MAX_STEPS).contains(&d.steps) {
+                return Err(format!("--steps must be 1..={DREAMIDV_MAX_STEPS}"));
+            }
+            if d.cfg_every == 0 || d.cfg_every > d.steps {
+                return Err("--cfg-every must be 1..=--steps".into());
+            }
+            if d.guide_scale < 0.0 || !d.guide_scale.is_finite() {
+                return Err("--guide-scale must be a non-negative number".into());
+            }
+        }
         Ok(())
     }
 }
 
-/// A unit of work. Large-input variants (face-swap) are flagged so a server can
-/// reject them when busy instead of queuing.
+/// A unit of work.
 #[derive(Clone, Debug)]
 pub enum JobRequest {
     Image(ImageRequest),
@@ -1018,12 +1213,6 @@ pub enum JobRequest {
 }
 
 impl JobRequest {
-    /// True if this request reads a large local input (face-swap video), which
-    /// a server must run now-or-reject rather than queue.
-    pub fn is_large_input(&self) -> bool {
-        matches!(self, JobRequest::FaceSwap(_))
-    }
-
     /// Files this request needs in the HF cache.
     pub fn required_files(&self) -> Result<Vec<FileRef>, String> {
         match self {
@@ -1285,10 +1474,8 @@ mod tests {
             seed: None,
             input_image: None,
             strength: 1.0,
-            source_image: None,
             ref_images: Vec::new(),
-            input_video: None,
-            guide_scale: None,
+            ref_image_size: Default::default(),
             sampler: VideoSampler::UniPc,
             steps: 8,
             attn_window: None,
@@ -1299,6 +1486,7 @@ mod tests {
             audio: true,
             upscale: true,
             audio_hq: false,
+            vae_encode_f32: false,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
             lora: vec![],
@@ -1412,10 +1600,8 @@ mod tests {
             seed: None,
             input_image: None,
             strength: 1.0,
-            source_image: None,
             ref_images: Vec::new(),
-            input_video: None,
-            guide_scale: None,
+            ref_image_size: Default::default(),
             sampler: VideoSampler::UniPc,
             steps: 4,
             attn_window: None,
@@ -1426,6 +1612,7 @@ mod tests {
             audio: false,
             upscale: false,
             audio_hq: false,
+            vae_encode_f32: false,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
             lora: vec![],
@@ -1514,5 +1701,53 @@ mod tests {
         assert!(Ll.validate_frames(97).is_err());
         assert!(Ll.validate_frames(61).is_ok());
         assert!(Ll.validate_frames(29).is_ok());
+    }
+
+    /// A FastH3-Trim request at 832x480 with `prompts` and `durations`.
+    fn trim_req(prompts: usize, durations: Vec<f32>) -> VideoRequest {
+        let mut r = ltx_req(832, 480, vec![], durations);
+        r.model = crate::model::VideoModelId::Fasth3Trim;
+        r.prompts = (0..prompts).map(|i| format!("clip {i}")).collect();
+        r
+    }
+
+    #[test]
+    fn fasth3_chains_past_one_clip() {
+        let row_limit = thinfer_models::minimax::pipeline::max_packed_rows(true);
+        // 15s and under stays one clip.
+        let plan = trim_req(1, vec![15.0]).resolve_minimax(row_limit).unwrap();
+        assert!(plan.chain.is_empty());
+        assert_eq!(plan.frames, 362);
+        // 30s: as few equal clips as fit, each on the 17n+5 grid, together
+        // (minus the repeated keyframes) at least the ask.
+        let plan = trim_req(1, vec![30.0]).resolve_minimax(row_limit).unwrap();
+        assert!(plan.chain.len() >= 2, "{:?}", plan.chain);
+        let lens: Vec<u32> = plan.chain.iter().map(|c| c.frames).collect();
+        assert!(lens.iter().all(|&f| f % 17 == 5 && f <= 362), "{lens:?}");
+        assert!(lens.windows(2).all(|w| w[0] == w[1]), "{lens:?}");
+        assert_eq!(
+            plan.frames,
+            lens[0] + lens[1..].iter().map(|f| f - 1).sum::<u32>()
+        );
+        assert!(plan.frames >= 720);
+        assert!(plan.chain.iter().all(|c| c.prompt == "clip 0"));
+        // One length per prompt, each its own clip.
+        let plan = trim_req(2, vec![5.0, 4.0])
+            .resolve_minimax(row_limit)
+            .unwrap();
+        let lens: Vec<u32> = plan.chain.iter().map(|c| c.frames).collect();
+        assert_eq!(lens, vec![124, 107]);
+        assert_eq!(plan.chain[1].prompt, "clip 1");
+        assert_eq!(plan.frames, 124 + 106);
+        // A per-prompt clip past the cap is an error, not a silent split.
+        assert!(
+            trim_req(2, vec![20.0, 5.0])
+                .resolve_minimax(row_limit)
+                .is_err()
+        );
+        // The Ref2VA model has no FL2VA keyframes, so no chain.
+        let mut omni = trim_req(2, vec![5.0, 5.0]);
+        omni.model = crate::model::VideoModelId::Fasth3Omni;
+        assert!(omni.resolve_minimax(row_limit).is_err());
     }
 }

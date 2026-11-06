@@ -69,25 +69,63 @@ pub struct MmapFile {
 const SPLIT_READ_MIN: usize = 8 << 20;
 const READ_PARTS: usize = 4;
 
-/// [`read_exact_at`], as [`READ_PARTS`] concurrent reads when `dst` is at
-/// least [`SPLIT_READ_MIN`].
-fn read_exact_at_split(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> io::Result<()> {
-    if dst.len() < SPLIT_READ_MIN {
-        return read_exact_at(file, offset, dst);
+/// [`read_exact_at`] on worker threads, as [`READ_PARTS`] concurrent reads
+/// when `dst` is at least [`SPLIT_READ_MIN`], awaited without blocking the
+/// calling thread: the engine runs its legs on one thread, and a read held
+/// there stalls every `join!`ed sibling (the GPU submits of the block whose
+/// next weights are streaming idle the device for the read's duration).
+async fn read_exact_at_split(
+    file: &Arc<std::fs::File>,
+    offset: u64,
+    dst: &mut [u8],
+) -> io::Result<()> {
+    let part = if dst.len() < SPLIT_READ_MIN {
+        dst.len()
+    } else {
+        dst.len().div_ceil(READ_PARTS)
+    };
+    let mut workers = Workers(Vec::new());
+    let mut done = Vec::new();
+    for (i, chunk) in dst.chunks_mut(part).enumerate() {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        let (file, at) = (Arc::clone(file), offset + (i * part) as u64);
+        let chunk = RawChunk(chunk.as_mut_ptr(), chunk.len());
+        workers.0.push(std::thread::spawn(move || {
+            // SAFETY: `dst` outlives this thread: `Workers` joins it before the
+            // borrow ends, even when the future is dropped mid-read.
+            let _ = tx.send(read_exact_at(&file, at, unsafe { chunk.slice() }));
+        }));
+        done.push(rx);
     }
-    let part = dst.len().div_ceil(READ_PARTS);
-    std::thread::scope(|s| {
-        let reads: Vec<_> = dst
-            .chunks_mut(part)
-            .enumerate()
-            .map(|(i, chunk)| {
-                s.spawn(move || read_exact_at(file, offset + (i * part) as u64, chunk))
-            })
-            .collect();
-        reads
-            .into_iter()
-            .try_for_each(|r| r.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-    })
+    for rx in done {
+        rx.await
+            .map_err(|_| io::Error::other("read worker panicked"))??;
+    }
+    Ok(())
+}
+
+/// One worker's slice of the destination buffer.
+struct RawChunk(*mut u8, usize);
+// SAFETY: each worker gets a disjoint slice; `Workers` bounds its lifetime.
+unsafe impl Send for RawChunk {}
+
+impl RawChunk {
+    /// # Safety
+    /// The slice must still be live and written by no one else.
+    unsafe fn slice<'a>(self) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.0, self.1) }
+    }
+}
+
+/// Joins the read workers on drop, so none outlives the buffer it writes.
+struct Workers(Vec<std::thread::JoinHandle<()>>);
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        for w in self.0.drain(..) {
+            let _ = w.join();
+        }
+    }
 }
 
 /// Fill `dst` from `file` at `offset` without touching a shared file cursor.
@@ -126,7 +164,7 @@ impl WeightReader for MmapFile {
             ));
         }
         if dst.len() >= DIRECT_READ_MIN {
-            return read_exact_at_split(&self.file, offset, dst);
+            return read_exact_at_split(&self.file, offset, dst).await;
         }
         dst.copy_from_slice(&self.mmap[off..end]);
         Ok(())

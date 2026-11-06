@@ -49,7 +49,7 @@ use thinfer_models::minimax::loader::{build_modulation_tables, register_video_pa
 use thinfer_models::minimax::lora::{Adapter, LoraSource, TURBO_ALPHA};
 use thinfer_models::minimax::manifest as mmf;
 use thinfer_models::minimax::manifest::role;
-use thinfer_models::minimax::packing;
+use thinfer_models::minimax::packing::{self, KeyframeAnchor};
 use thinfer_models::minimax::pipeline::{
     DenoisePlan, LONG_SEQUENCE_WEIGHT_BUDGET, Latents, MAX_PACKED_ROWS, audio_rows_to_latents,
     denoise, max_packed_rows, upload_modulation_tables, video_rows_to_latents,
@@ -90,7 +90,8 @@ const AUDIO_SR: u32 = 32_000;
 /// larger than any cache we could hold anyway.
 const VRAM_BUDGET_CAP: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Run a MiniMax-H3 t2va generate to completion.
+/// Run a MiniMax-H3 t2va generate to completion: one clip, or chained clips
+/// (each after the first starts from the previous one's last frame).
 pub async fn run(
     backend: &Arc<WgpuBackend>,
     req: &VideoRequest,
@@ -101,14 +102,139 @@ pub async fn run(
     // packed-row limit; the backend block (base H3, or no accelerator) keeps
     // the old one. A blank clip length is capped to it.
     let row_limit = max_packed_rows(fasth3 && backend.accelerator().is_some());
-    let plan_meta = req.resolve_minimax(row_limit)?;
-    for w in &plan_meta.warnings {
+    let plan = req.resolve_minimax(row_limit)?;
+    for w in &plan.warnings {
         tracing::warn!(target: thinfer_core::trace::DIAG, "{w}");
         sink.note(w);
     }
+    let clips: Vec<(&str, u32)> = if plan.chain.is_empty() {
+        vec![(req.prompts[0].as_str(), plan.frames)]
+    } else {
+        plan.chain
+            .iter()
+            .map(|c| (c.prompt.as_str(), c.frames))
+            .collect()
+    };
+    let seed = req.seed.unwrap_or_else(random_seed);
+    let mut keyframe = req
+        .input_image
+        .as_ref()
+        .map(|b| minimax_ref::prepare_keyframe(&b.0, req.height as usize, req.width as usize))
+        .transpose()?;
+    let output = Output::start(req.format, req.output.clone())?;
+    // Planar stereo, per channel across the clips.
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    for (k, &(prompt, frames)) in clips.iter().enumerate() {
+        if clips.len() > 1 {
+            sink.note(&format!(
+                "Clip {}/{}: {frames} frames{}",
+                k + 1,
+                clips.len(),
+                if k > 0 {
+                    ", from the previous clip's last frame"
+                } else {
+                    ""
+                }
+            ));
+        }
+        let clip = run_clip(
+            backend,
+            req,
+            row_limit,
+            prompt,
+            frames,
+            keyframe.take(),
+            seed,
+            &output,
+            ClipLink {
+                repeats_keyframe: k > 0,
+                hands_off: k + 1 < clips.len(),
+            },
+            sink,
+        )
+        .await?;
+        keyframe = clip.last_frame;
+        if let Some(wav) = clip.wav {
+            let n = wav.len() / 2;
+            // A chained clip repeats its keyframe: drop that frame's audio too.
+            let skip = if k > 0 {
+                ((AUDIO_SR / FPS) as usize).min(n)
+            } else {
+                0
+            };
+            left.extend_from_slice(&wav[skip..n]);
+            right.extend_from_slice(&wav[n + skip..]);
+        }
+    }
+    let wav = req.audio.then(|| [left, right].concat());
+    let ((h_px, w_px, f_px), video) = output.finish()?;
+
+    check_cancel(sink)?;
+    // --- MP4 (the worker's H.264 + optional AAC audio), or PNG frames ---
+    match video {
+        Some(video) => {
+            let audio = match &wav {
+                Some(wav) => {
+                    sink.note("Encoding MP4 (H.264 + AAC)");
+                    Some(crate::codec::encode_aac_stereo(wav, AUDIO_SR)?)
+                }
+                None => {
+                    sink.note("Encoding MP4 (H.264, no audio)");
+                    None
+                }
+            };
+            crate::progress::write_artifact(sink, &req.output, &video.mux(audio)?)?;
+        }
+        None => sink.note("Wrote PNG frames (audio dropped for png-frames output)"),
+    }
+    tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
+
+    Ok(JobSummary {
+        output: req.output.clone(),
+        width: w_px as u32,
+        height: h_px as u32,
+        frames: f_px as u32,
+        fps: Some(FPS),
+        seed: Some(seed),
+    })
+}
+
+/// Where a clip sits in a chain.
+#[derive(Clone, Copy)]
+struct ClipLink {
+    /// Its first frame repeats the previous clip's last (the output drops it).
+    repeats_keyframe: bool,
+    /// Its last frame is the next clip's keyframe.
+    hands_off: bool,
+}
+
+/// What one clip leaves for the chain: its audio (planar stereo) and, when it
+/// hands off, its last frame.
+struct ClipOut {
+    wav: Option<Vec<f32>>,
+    last_frame: Option<minimax_ref::Prepared>,
+}
+
+/// One clip: conditioner (+ the keyframe or reference images) -> DiT -> video
+/// VAE (frames out through `output`) -> audio VAE.
+#[allow(clippy::too_many_arguments)]
+async fn run_clip(
+    backend: &Arc<WgpuBackend>,
+    req: &VideoRequest,
+    row_limit: usize,
+    prompt: &str,
+    frames: u32,
+    keyframe: Option<minimax_ref::Prepared>,
+    seed: u64,
+    output: &Output,
+    link: ClipLink,
+    sink: &dyn ProgressSink,
+) -> Result<ClipOut, String> {
+    let fasth3 = req.model.is_fasth3();
     let manifest = req.model.manifest();
     let cfg = DitConfig {
-        vsa_int8_qk: req.attn == crate::model::AttnPrecision::Int8,
+        vsa_int8_qk: req.attn.int8_qk(),
+        vsa_fp8_pv: req.attn == crate::model::AttnPrecision::Int8Fp8,
         ..req.model.minimax_dit_config()
     };
     let vae_cfg = VideoVaeConfig::h3();
@@ -116,8 +242,8 @@ pub async fn run(
     // --- geometry ---
     // Frames snap up to `17n + 5` (latent `5n + 2`); the spatial axes are
     // whole latent voxels after the 16x compression.
-    let frames = packing::align_num_frames(plan_meta.frames as usize)
-        .map_err(|e| format!("frame count: {e:?}"))?;
+    let frames =
+        packing::align_num_frames(frames as usize).map_err(|e| format!("frame count: {e:?}"))?;
     let latent_frames =
         packing::video_latent_num_frames(frames).map_err(|e| format!("latent frames: {e:?}"))?;
     let (height, width) = (req.height as usize, req.width as usize);
@@ -132,7 +258,7 @@ pub async fn run(
     );
     let audio_latents = packing::audio_latent_num_frames(frames);
 
-    let prompt = req.prompts[0].trim();
+    let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err("empty prompt produced no tokens".into());
     }
@@ -154,11 +280,25 @@ pub async fn run(
     if !req.ref_images.is_empty() && cfg.pdd.is_none() {
         return Err(format!("{} does not take reference images", req.model));
     }
-    let refs = req
-        .ref_images
-        .iter()
-        .map(|b| minimax_ref::prepare(&b.0))
-        .collect::<Result<Vec<_>, _>>()?;
+    // An FL2VA keyframe takes the same two paths as a reference, pinned at
+    // the clip start (the request rejects both together).
+    let (refs, anchor) = match keyframe {
+        Some(k) => (vec![k], Some(KeyframeAnchor::First)),
+        None => (
+            req.ref_images
+                .iter()
+                .map(|b| {
+                    minimax_ref::prepare(
+                        &b.0,
+                        req.ref_image_size,
+                        req.width as usize,
+                        req.height as usize,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None,
+        ),
+    };
     let ref_tokens: Vec<usize> = refs
         .iter()
         .map(|r| (r.height / 32) * (r.width / 32))
@@ -188,7 +328,6 @@ pub async fn run(
     } else {
         req.steps.max(1) as usize
     };
-    let seed = req.seed.unwrap_or_else(random_seed);
     let budget = ResidencyBudget {
         vram_bytes: req.budget.vram_bytes.min(VRAM_BUDGET_CAP),
         ..req.budget
@@ -212,7 +351,8 @@ pub async fn run(
     let dit_roles: &[&str] = if cfg.pdd.is_some() {
         &[role::FASTH3_OMNI]
     } else if fasth3 {
-        &[role::FASTH3_TRIM_NVFP4, role::FASTH3_TRIM_REST]
+        // The rest file (the bf16 refiner and projections) is read first.
+        &[role::FASTH3_TRIM_REST, role::FASTH3_TRIM_NVFP4]
     } else {
         &[role::DIT_GGUF_Q4_K_M, role::TURBO_LORA]
     };
@@ -228,7 +368,10 @@ pub async fn run(
     let vision = if refs.is_empty() {
         Vec::new()
     } else {
-        sink.note(&format!("Encoding {} reference image(s)", refs.len()));
+        sink.note(&match anchor {
+            Some(_) => "Encoding the first frame".to_string(),
+            None => format!("Encoding {} reference image(s)", refs.len()),
+        });
         minimax_ref::vision_features(backend, manifest, budget, &refs).await?
     };
     let images: Vec<ImageRows<'_>> = prompt_in
@@ -237,6 +380,7 @@ pub async fn run(
         .zip(&vision)
         .map(|(&start, vision)| ImageRows { start, vision })
         .collect();
+    let dit_compile;
     let text = {
         let opener = open_mmap(&enc_path).await?;
         let src = GgufSource::open(opener)
@@ -256,6 +400,7 @@ pub async fn run(
         let pipelines = EncoderPipelines::compile(backend, &cfgs)
             .await
             .map_err(|e| format!("compile encoder pipelines: {e:?}"))?;
+        dit_compile = compile_dit_pipelines(backend);
         let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
         let out = MiniMaxTextEncoder
             .forward(
@@ -274,12 +419,24 @@ pub async fn run(
         debug_assert_eq!(out.hidden.len(), num_text * enc_config::HIDDEN);
         out.hidden
     };
+    let dit_pipelines = dit_compile
+        .await
+        .unwrap_or_else(|_| Err("dit pipeline compile thread panicked".to_string()))?;
     drop(images);
     drop(vision);
     let (conditions, cond_rows) = if refs.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        minimax_ref::latent_conditions(backend, &cfg, &vae_path, budget, &refs).await?
+        minimax_ref::latent_conditions(
+            backend,
+            &cfg,
+            &vae_path,
+            budget,
+            &refs,
+            anchor,
+            !req.vae_encode_f32,
+        )
+        .await?
     };
     drop(refs);
     let cond = Conditioning {
@@ -306,7 +463,18 @@ pub async fn run(
             JointSchedule::from_pdd(&pdd).map_err(|e| format!("fasth3-omni schedule: {e}"))?;
         let users = user_adapters(req).await?;
         run_dit_users(
-            backend, &cfg, src, users, schedule, dims, &text, &cond, seed, budget, sink,
+            backend,
+            &dit_pipelines,
+            &cfg,
+            src,
+            users,
+            schedule,
+            dims,
+            &text,
+            &cond,
+            seed,
+            budget,
+            sink,
         )
         .await?
     } else if fasth3 {
@@ -322,7 +490,18 @@ pub async fn run(
         .map_err(|e| format!("fasth3 schedule: {e}"))?;
         let users = user_adapters(req).await?;
         run_dit_users(
-            backend, &cfg, src, users, schedule, dims, &text, &cond, seed, budget, sink,
+            backend,
+            &dit_pipelines,
+            &cfg,
+            src,
+            users,
+            schedule,
+            dims,
+            &text,
+            &cond,
+            seed,
+            budget,
+            sink,
         )
         .await?
     } else {
@@ -343,7 +522,18 @@ pub async fn run(
                 .map_err(|e| format!("turbo lora: {e:?}"))?;
             let src = MergedSource::new(base, lora);
             run_dit(
-                backend, &cfg, src, schedule, dims, &text, &cond, seed, budget, sink, true,
+                backend,
+                &dit_pipelines,
+                &cfg,
+                src,
+                schedule,
+                dims,
+                &text,
+                &cond,
+                seed,
+                budget,
+                sink,
+                true,
             )
             .await?
         } else {
@@ -362,7 +552,18 @@ pub async fn run(
             .collect();
             let src = MergedSource::new(base, lora_source(&cfg, adapters, sink).await?);
             run_dit(
-                backend, &cfg, src, schedule, dims, &text, &cond, seed, budget, sink, true,
+                backend,
+                &dit_pipelines,
+                &cfg,
+                src,
+                schedule,
+                dims,
+                &text,
+                &cond,
+                seed,
+                budget,
+                sink,
+                true,
             )
             .await?
         }
@@ -403,20 +604,23 @@ pub async fn run(
         }
     };
     tracing::info!(target: thinfer_core::trace::DIAG, "video vae done");
-    // The stitch and the H.264 encode are host-only: they run on a worker
-    // while the audio VAE has the GPU.
-    let format = req.format;
+    // The stitch is host-only: it runs on a worker while the audio VAE has the
+    // GPU, then hands the frames to the output's encode.
+    let tx = output.sender();
     let stitcher = std::thread::Builder::new()
         .name("h3-vae-stitch".into())
         .spawn(move || -> Result<_, String> {
             let video = clip_frames(decoded.stitch(), frames)?;
             tracing::info!(target: thinfer_core::trace::DIAG, "video frames ready");
-            let dims = (video.height, video.width, video.num_frames);
-            let clip = match format {
-                VideoFormat::Mp4 => Clip::H264(crate::codec::encode_h264(&video, FPS)?),
-                VideoFormat::PngFrames => Clip::Frames(video),
-            };
-            Ok((dims, clip))
+            let last = link.hands_off.then(|| minimax_ref::Prepared {
+                rgb: crate::codec::frame_rgb8(&video, video.num_frames - 1),
+                height: video.height,
+                width: video.width,
+            });
+            let n = video.num_frames;
+            tx.send((video, usize::from(link.repeats_keyframe)..n))
+                .map_err(|_| "video output worker stopped".to_string())?;
+            Ok(last)
         })
         .map_err(|e| format!("spawn vae stitch: {e}"))?;
 
@@ -446,51 +650,77 @@ pub async fn run(
     } else {
         None
     };
-
     tracing::info!(target: thinfer_core::trace::DIAG, "audio vae done");
-    let ((h_px, w_px, f_px), clip) = stitcher
+    let last_frame = stitcher
         .join()
         .map_err(|_| "vae stitch panicked".to_string())??;
-
-    check_cancel(sink)?;
-    // --- MP4 (the worker's H.264 + optional AAC audio), or PNG frames ---
-    match clip {
-        Clip::H264(video) => {
-            let audio = match &wav {
-                Some(wav) => {
-                    sink.note("Encoding MP4 (H.264 + AAC)");
-                    Some(crate::codec::encode_aac_stereo(wav, AUDIO_SR)?)
-                }
-                None => {
-                    sink.note("Encoding MP4 (H.264, no audio)");
-                    None
-                }
-            };
-            crate::progress::write_artifact(sink, &req.output, &video.mux(audio)?)?;
-        }
-        Clip::Frames(video) => {
-            sink.note("Writing PNG frames (audio dropped for png-frames output)");
-            crate::codec::write_png_frames(&video, &req.output)?;
-        }
-    }
-    tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
-
-    Ok(JobSummary {
-        output: req.output.clone(),
-        width: w_px as u32,
-        height: h_px as u32,
-        frames: f_px as u32,
-        fps: Some(FPS),
-        seed: Some(seed),
-    })
+    Ok(ClipOut { wav, last_frame })
 }
 
-/// Phase C's GPU half (the video VAE's ViT passes, read back) over any source
-/// carrying the H3 decoder names; the host stitch follows on a worker.
-/// The decoded clip in its output form.
-enum Clip {
-    H264(crate::codec::H264Stream),
-    Frames(WanVideo),
+/// A clip's frames for the output, and which of them to keep.
+type OutFrames = (WanVideo, std::ops::Range<usize>);
+
+/// The video on its way out: one worker owns the H.264 encode (or the PNG
+/// writes) for every clip, fed in order, so a clip encodes while the next
+/// one computes. Yields `(height, width, frames)` and the H.264 track (none
+/// for PNG frames).
+struct Output {
+    tx: Option<std::sync::mpsc::Sender<OutFrames>>,
+    worker: std::thread::JoinHandle<OutputResult>,
+}
+
+type OutputResult = Result<((usize, usize, usize), Option<crate::codec::H264Stream>), String>;
+
+impl Output {
+    fn start(format: VideoFormat, dir: std::path::PathBuf) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::channel::<OutFrames>();
+        let worker = std::thread::Builder::new()
+            .name("h3-output".into())
+            .spawn(move || -> OutputResult {
+                let (mut enc, mut dims) = (None, (0, 0, 0));
+                for (video, keep) in rx {
+                    let first = dims.2;
+                    dims = (video.height, video.width, first + keep.len());
+                    match format {
+                        VideoFormat::Mp4 => {
+                            let e = match &mut enc {
+                                Some(e) => e,
+                                None => enc.insert(crate::codec::H264Encoder::new(
+                                    video.width,
+                                    video.height,
+                                    FPS,
+                                )?),
+                            };
+                            e.push(&video, keep)?;
+                        }
+                        VideoFormat::PngFrames => {
+                            crate::codec::write_png_frames_from(&video, keep, &dir, first)?
+                        }
+                    }
+                }
+                Ok((
+                    dims,
+                    enc.map(crate::codec::H264Encoder::finish).transpose()?,
+                ))
+            })
+            .map_err(|e| format!("spawn video output: {e}"))?;
+        Ok(Self {
+            tx: Some(tx),
+            worker,
+        })
+    }
+
+    fn sender(&self) -> std::sync::mpsc::Sender<OutFrames> {
+        self.tx.clone().expect("open until finish")
+    }
+
+    /// Close the input and wait for the encode.
+    fn finish(mut self) -> OutputResult {
+        self.tx = None;
+        self.worker
+            .join()
+            .map_err(|_| "video output panicked".to_string())?
+    }
 }
 
 /// Bail between phases when the job was cancelled (the worker reports any
@@ -599,6 +829,7 @@ struct Conditioning {
 #[allow(clippy::too_many_arguments)]
 async fn run_dit_users<S: WeightSource>(
     backend: &Arc<WgpuBackend>,
+    pipelines: &DitPipelines,
     cfg: &DitConfig,
     src: S,
     users: Vec<Adapter<SafetensorsSource<BytesOpener>>>,
@@ -615,15 +846,38 @@ where
 {
     if users.is_empty() {
         return run_dit(
-            backend, cfg, src, schedule, d, text, cond, seed, budget, sink, false,
+            backend, pipelines, cfg, src, schedule, d, text, cond, seed, budget, sink, false,
         )
         .await;
     }
     let src = MergedSource::new(src, lora_source(cfg, users, sink).await?);
     run_dit(
-        backend, cfg, src, schedule, d, text, cond, seed, budget, sink, false,
+        backend, pipelines, cfg, src, schedule, d, text, cond, seed, budget, sink, false,
     )
     .await
+}
+
+/// The DiT's pipelines, compiled on their own thread: they depend on nothing
+/// the conditioner makes, so they build while it streams (a disk-bound phase)
+/// instead of after it. Started once the conditioner's own pipelines exist,
+/// so the two compiles do not contend.
+fn compile_dit_pipelines(
+    backend: &Arc<WgpuBackend>,
+) -> futures_channel::oneshot::Receiver<Result<DitPipelines, String>> {
+    let (tx, rx) = futures_channel::oneshot::channel();
+    let backend = Arc::clone(backend);
+    std::thread::spawn(move || {
+        let cfgs = dit_cfgs(
+            WeightDtype::Quant(QuantKind::Q4_K),
+            ActDtype::Bf16,
+            COOPMAT_SITES,
+        );
+        let _ = tx.send(
+            pollster::block_on(DitPipelines::compile(&backend, &cfgs))
+                .map_err(|e| format!("compile dit pipelines: {e:?}")),
+        );
+    });
+    rx
 }
 
 /// Phase B, the DiT, over any source carrying the H3 tensor names: the base
@@ -633,6 +887,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_dit<S: WeightSource>(
     backend: &Arc<WgpuBackend>,
+    pipelines: &DitPipelines,
     cfg: &DitConfig,
     src: S,
     schedule: JointSchedule,
@@ -695,14 +950,6 @@ where
         ));
     }
 
-    let cfgs = dit_cfgs(
-        WeightDtype::Quant(QuantKind::Q4_K),
-        ActDtype::Bf16,
-        COOPMAT_SITES,
-    );
-    let pipelines = DitPipelines::compile(backend, &cfgs)
-        .await
-        .map_err(|e| format!("compile dit pipelines: {e:?}"))?;
     let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
     let (table, _held) = upload_modulation_tables(backend, &ws, &tables, ActDtype::Bf16)
         .map_err(|e| format!("upload modulation table: {e:?}"))?;
@@ -711,7 +958,7 @@ where
     let out = denoise(
         cfg,
         backend,
-        &pipelines,
+        pipelines,
         &residency,
         &ws,
         &handles,

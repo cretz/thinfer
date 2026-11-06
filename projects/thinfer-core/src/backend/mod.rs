@@ -327,6 +327,25 @@ pub trait Accelerator: Send + Sync {
         Ok(false)
     }
 
+    /// One-image 2D convolution with exactly the f32-act `conv3d` op's
+    /// contract at `T = 1` (see [`Conv2dAddrs`]). Enqueued only, like
+    /// [`Self::vsa`]. `Ok(false)` = not covered (the caller runs the op).
+    fn conv2d(&self, _a: &Conv2dAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::conv2d`] covers every valid shape (kernels compiled),
+    /// so a caller may enqueue a whole conv network deferred.
+    fn accepts_conv2d(&self) -> bool {
+        false
+    }
+
+    /// A 3D convolution with exactly the f16-act `conv3d` op's contract (see
+    /// [`Conv3dAddrs`]). Enqueued only. `Ok(false)` = not covered.
+    fn conv3d_f16(&self, _a: &Conv3dAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Whether [`Self::elementwise`] is available at all (kernels compiled).
     fn accepts_elementwise(&self) -> bool {
         false
@@ -367,6 +386,73 @@ pub struct TileAttnAddrs {
     pub lists: u64,
 }
 
+/// [`Accelerator::conv2d`]: `out[co, ho, wo] = bias[co] + sum over (ci, dh,
+/// dw) of w[co, ci, dh, dw] * x[ci, hi, wi]`, `hi = ho * stride + dh - pad`
+/// (likewise `wi`), out-of-range indices reflected (`-i`, `2n - 2 - i`) when
+/// `reflect`, else zero. `x` / `out` f32 `[c, h, w]`, `w` / `bias` bf16
+/// (`w` as `[cout, cin * k * k]`). Each output sums its terms in that index
+/// order with fused multiply-adds, then adds the bias, as the WGSL op does.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv2dAddrs {
+    pub x: u64,
+    pub w: u64,
+    pub bias: u64,
+    pub out: u64,
+    pub shape: Conv2dShape,
+}
+
+/// [`Accelerator::conv3d_f16`]: `out[b, co, to, ho, wo] = bias[co] + sum over
+/// (ci, dt, dh, dw) of w[co, ci, dt, dh, dw] * x[b, ci, ti, hi, wi]`, with
+/// `ti = to * stride_t + dt - pad_t` (likewise `hi`, `wi`), out-of-range
+/// indices zero. `x` / `out` f16 NCTHW, `w` / `bias` bf16 (`w` as
+/// `[cout, cin * kt * kh * kw]`). Each output sums its terms in that index order with fused
+/// multiply-adds in f32, adds the bias, then stores f16 (clamped to the f16
+/// range, round to nearest even), as the WGSL op does.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv3dAddrs {
+    pub x: u64,
+    pub w: u64,
+    pub bias: u64,
+    pub out: u64,
+    pub shape: Conv3dShape,
+}
+
+/// The geometry of a [`Conv3dAddrs`] convolution, `[kernel]`/`[pad]`/`[stride]`
+/// as `(t, h, w)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv3dShape {
+    pub b: u32,
+    pub cin: u32,
+    pub cout: u32,
+    pub t: u32,
+    pub h: u32,
+    pub w: u32,
+    pub t_out: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kernel: [u32; 3],
+    pub pad: [u32; 3],
+    pub stride: [u32; 3],
+}
+
+/// The geometry of a [`Conv2dAddrs`] convolution.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv2dShape {
+    pub cin: u32,
+    pub cout: u32,
+    pub h: u32,
+    pub w: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub k: u32,
+    pub stride: u32,
+    pub pad: u32,
+    pub reflect: bool,
+    /// Multiply in bf16 on tensor cores (input rounded to bf16, f32
+    /// accumulate): an opt-in faster form, not the WGSL op's bits.
+    pub bf16: bool,
+}
+
 /// Row segments for the per-segment ops in [`ElementwiseOp`]: rows
 /// `[end[i-1], end[i])` read the i-th `a` / `b` vectors. A reference-image
 /// request splits its text span by tag (labels vs vision blocks) and adds a
@@ -382,9 +468,20 @@ pub struct RowSegments {
     pub b: [u64; MAX_SEGMENTS],
 }
 
+/// Elements of one [`ElementwiseOp::GroupNormF32`] partial-statistics part.
+pub const GROUP_NORM_PART: u32 = 4096;
+
+/// Scratch bytes of [`ElementwiseOp::GroupNormF32`]: per (group, part) mean
+/// and M2, then per group mean and inverse std (f32 pairs).
+pub fn group_norm_scratch_bytes(c: u32, hw: u32, groups: u32) -> u64 {
+    let parts = (c / groups * hw).div_ceil(GROUP_NORM_PART) as u64;
+    8 * groups as u64 * (parts + 1)
+}
+
 /// The non-matmul ops of a MiniMax-H3 block, on bf16 activations (device
 /// addresses), each matching the wgpu op it replaces including its bf16
-/// rounding points.
+/// rounding points; and the f32 ones of the H3 VAE encoder (same math as
+/// their WGSL ops, not bit-identical: reduction order and `exp` differ).
 #[derive(Clone, Copy, Debug)]
 pub enum ElementwiseOp {
     /// `out = bf16(bf16(rmsnorm(x) * w) * (1 + a[seg]) + b[seg])` over
@@ -440,6 +537,146 @@ pub enum ElementwiseOp {
     },
     /// `out[r, c] = silu(x[r, c]) * x[r, h + c]` for `x` `[rows, 2h]`.
     SiluMulFused { x: u64, out: u64, rows: u32, h: u32 },
+    /// GroupNorm of f32 `[c, hw]` over `groups` contiguous channel groups
+    /// (biased variance), bf16 affine `w` / `bias` per channel, then SiLU
+    /// when `silu`. `scratch` holds [`group_norm_scratch_bytes`].
+    GroupNormF32 {
+        x: u64,
+        w: u64,
+        bias: u64,
+        out: u64,
+        scratch: u64,
+        c: u32,
+        hw: u32,
+        groups: u32,
+        eps: f32,
+        silu: bool,
+    },
+    /// `out = x + y` over `n` f32.
+    AddF32 { x: u64, y: u64, out: u64, n: u32 },
+    /// The Wan DiT's f16 norm + AdaLN: `n = f16(layernorm(x))` (no affine,
+    /// biased variance) then `out = f16(n * (1 + scale[c]) + shift[c])`, over
+    /// `[rows, dim]`; `scale` / `shift` f16 `[dim]` activations.
+    LayerNormModulateF16 {
+        x: u64,
+        scale: u64,
+        shift: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// The Wan DiT's f16 interleaved-pair RoPE: per row and head, pair
+    /// `(x[2p], x[2p+1])` rotates by the row's f16 `(cos, sin)` pair `p`
+    /// (`freqs` `[rows, pairs]` pairs), in f16 arithmetic like the WGSL op.
+    RopeF16 {
+        x: u64,
+        freqs: u64,
+        out: u64,
+        rows: u32,
+        heads: u32,
+        pairs: u32,
+    },
+    /// The Wan DiT's f16 RMSNorm with a bf16 gain `w` `[dim]`:
+    /// `out = f16(x * rsqrt(mean(x^2) + eps) * w)` over `[rows, dim]`.
+    RmsNormF16 {
+        x: u64,
+        w: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// The Wan DiT's f16 affine LayerNorm (bf16 `w` / `b`), `[rows, dim]`.
+    LayerNormAffineF16 {
+        x: u64,
+        w: u64,
+        b: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// `out = f16(x + bias[c])`, f16 `x`, bf16 `bias` `[dim]`.
+    AddBiasF16 {
+        x: u64,
+        bias: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `out = f16(layernorm(x))` (no affine, biased variance), `[rows, dim]`.
+    LayerNormF16 {
+        x: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// `out = f16(x * (1 + scale[c]) + shift[c])`, f16 `[dim]` `scale` /
+    /// `shift` activations, over `[rows, dim]`.
+    ModulateF16 {
+        x: u64,
+        scale: u64,
+        shift: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `out = f16(x * w[c])`, bf16 `w` `[dim]`, over `[rows, dim]`.
+    MulWeightF16 {
+        x: u64,
+        w: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `out = f16(x + y)` over `n` f16.
+    AddF16 { x: u64, y: u64, out: u64, n: u32 },
+    /// The Wan VAE's f16 channel RMSNorm over `[b, channels, stride]`:
+    /// `out = f16(x * (sqrt(channels) / max(|x|, 1e-12)) * gamma[c])`, the
+    /// norm over each position's channels (bf16 `gamma` `[channels]`).
+    RmsNorm3dF16 {
+        x: u64,
+        gamma: u64,
+        out: u64,
+        n_pos: u32,
+        channels: u32,
+        stride: u32,
+    },
+    /// `out = f16(x / (1 + exp(-x)))` over `n` f16.
+    SiluF16 { x: u64, out: u64, n: u32 },
+    /// The Wan VAE's f16 time concat over `[b, c, t, hw]`: output frame `to`
+    /// is `a[a_start + to]` (zero with `a_zero`) for `to < a_count`, else
+    /// `b[b_start + to - a_count]`; `a` / `b` hold `a_t` / `b_t` frames.
+    ConcatTimeF16 {
+        a: u64,
+        b: u64,
+        out: u64,
+        bc: u32,
+        hw: u32,
+        a_t: u32,
+        b_t: u32,
+        a_start: u32,
+        a_count: u32,
+        b_start: u32,
+        b_count: u32,
+        a_zero: u32,
+    },
+    /// `out = f16(gelu_tanh(x))` over `n` f16.
+    GeluTanhF16 { x: u64, out: u64, n: u32 },
+    /// The Wan DiT's f16 gated residual `out = f16(x + gate[c] * y)` over
+    /// `[rows, dim]`; `gate` an f16 `[dim]` activation.
+    GateAddF16 {
+        x: u64,
+        gate: u64,
+        y: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `bytes` from `src` to `dst` (non-overlapping), in stream order.
+    Copy { src: u64, dst: u64, bytes: u64 },
 }
 
 /// Shapes for [`Accelerator::vsa`]. Tiles are 64 rows: the first `n_prefix`
@@ -455,6 +692,9 @@ pub struct VsaShape {
     /// QK^T in INT8 (K smoothed by its per-head mean, per-tile scales; P.V
     /// stays bf16): SageAttention-style, not bit-identical to the bf16 path.
     pub int8_qk: bool,
+    /// With [`Self::int8_qk`]: P.V in FP8 e4m3 too (SageAttention2-style:
+    /// P scaled by 448, V per-tile scales, f32 accumulate across stages).
+    pub fp8_pv: bool,
     pub n_tiles: u32,
     pub n_prefix: u32,
     pub topk: u32,
@@ -652,6 +892,10 @@ pub struct GemmAddrs {
     pub n: u32,
     pub k: u32,
     pub epilogue: GemmEpilogue,
+    /// Verify an f16 narrowing of the B operand per call (a blocking read;
+    /// an overflow declines the call). Unchecked calls (deferred scopes)
+    /// leave an overflow for [`Accelerator::sync`] to report as an error.
+    pub checked: bool,
 }
 
 /// Fused GEMM epilogue on device addresses, each part optional (0 = absent):

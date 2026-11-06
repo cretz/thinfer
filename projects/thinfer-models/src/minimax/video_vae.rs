@@ -1638,7 +1638,7 @@ impl ClipTiles {
         // Blend reads the unblended neighbours, so the grid lives until every
         // tile is cut.
         let tiles = {
-            let grid = par_map(ny * nx, |idx| PixelBlock {
+            let grid = seq::par_map(ny * nx, |idx| PixelBlock {
                 data: unpatchify(
                     cfg,
                     &tokens[idx * tile_tokens..(idx + 1) * tile_tokens],
@@ -1652,7 +1652,7 @@ impl ClipTiles {
                 channels: cfg.out_channels,
             });
 
-            par_map(ny * nx, |idx| {
+            seq::par_map(ny * nx, |idx| {
                 let (i, j) = (idx / nx, idx % nx);
                 let mut tile = grid[idx].clone();
                 if i > 0 {
@@ -2010,21 +2010,6 @@ fn par_fill(chunks: Vec<(usize, &mut [f32])>, f: impl Fn(usize, &mut [f32]) + Sy
     }
 }
 
-fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    #[cfg(not(target_arch = "wasm32"))]
-    if n > 1 {
-        return std::thread::scope(|s| {
-            let f = &f;
-            let workers: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
-            workers
-                .into_iter()
-                .map(|w| w.join().expect("vae stitch worker panicked"))
-                .collect()
-        });
-    }
-    (0..n).map(f).collect()
-}
-
 /// Un-patchify one tile's tokens into pixels.
 ///
 /// `tokens` is `[frames * height * width, out_channels * pt * p * p]` and the
@@ -2128,7 +2113,7 @@ impl PixelBlock {
     pub fn all_finite(&self) -> bool {
         let piece = self.data.len().div_ceil(PIXEL_PARTS).max(1);
         let parts = self.data.len().div_ceil(piece);
-        par_map(parts, |j| {
+        seq::par_map(parts, |j| {
             self.data[j * piece..((j + 1) * piece).min(self.data.len())]
                 .iter()
                 .all(|v| v.is_finite())

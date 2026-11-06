@@ -163,6 +163,12 @@ impl JobHandle {
         self.cancel.load(Ordering::SeqCst)
     }
 
+    /// Whether this job may still consume its claimed uploads: not finished
+    /// and not cancelled.
+    pub fn may_consume(&self) -> bool {
+        !self.is_cancel_requested() && self.inner.lock().unwrap().finished.is_none()
+    }
+
     /// Take the sealed spec (once; the worker that runs the job).
     pub fn take_sealed(&self) -> Option<Vec<u8>> {
         self.sealed.lock().unwrap().take()
@@ -250,16 +256,19 @@ fn random_id() -> String {
 }
 
 impl JobStore {
-    /// Register + enqueue a sealed job whose dir is `<artifact_dir>/<id>`.
-    /// Returns (handle, queue position).
-    pub fn submit(
-        &self,
-        artifact_dir: &std::path::Path,
-        sealed: Vec<u8>,
-    ) -> (Arc<JobHandle>, usize) {
+    /// A new sealed job whose dir is `<artifact_dir>/<id>`, not yet visible to
+    /// workers or lookups until [`JobStore::enqueue`].
+    pub fn create(&self, artifact_dir: &std::path::Path, sealed: Vec<u8>) -> Arc<JobHandle> {
         let id = random_id();
-        let handle = Arc::new(JobHandle::new(id.clone(), artifact_dir.join(&id), sealed));
-        self.jobs.lock().unwrap().insert(id, handle.clone());
+        Arc::new(JobHandle::new(id.clone(), artifact_dir.join(&id), sealed))
+    }
+
+    /// Register + enqueue a created job. Returns its queue position.
+    pub fn enqueue(&self, handle: &Arc<JobHandle>) -> usize {
+        self.jobs
+            .lock()
+            .unwrap()
+            .insert(handle.id.clone(), handle.clone());
         let position = {
             let mut q = self.queue.lock().unwrap();
             q.push_back(handle.clone());
@@ -267,7 +276,7 @@ impl JobStore {
         };
         handle.push(JobEvent::Queued { position });
         self.notify.notify_one();
-        (handle, position)
+        position
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<JobHandle>> {
@@ -284,12 +293,6 @@ impl JobStore {
     /// Index of `id` in the pending queue, if still queued.
     pub fn position(&self, id: &str) -> Option<usize> {
         self.queue.lock().unwrap().iter().position(|h| h.id == id)
-    }
-
-    /// True when a large-input job would have to wait (worker busy or others
-    /// queued) -- such jobs are rejected rather than queued.
-    pub fn is_busy(&self) -> bool {
-        self.active.load(Ordering::SeqCst) > 0 || !self.queue.lock().unwrap().is_empty()
     }
 
     /// Pop the next job for a worker, skipping any that were cancelled while

@@ -1131,20 +1131,24 @@ fn main(
     let mask_row = select(bb * u.s_q + sq, (bb * u.h_q + hq) * u.s_q + sq, u.has_mask == 2u);
     let mask_w_base = (mask_row * u.s_k) >> 1u;
 
-    // d_per (in elements) must be even since D is even and WG divides D.
-    // d_per_w (in words) = d_per / 2.
-    let d_per = u.d / WG;
-    let d_per_w = d_per >> 1u;
-    let d_off_w = t * d_per_w;
+    // Each thread owns up to `n_w` of the D/2 packed words: a contiguous run
+    // when WG divides D/2, else every WG-th word (D = 384: the Wan VAE mid
+    // block; a contiguous `(D / WG) / 2` words per thread would drop a third
+    // of the channels from every dot product and never write them out).
+    let wpt = d_w / WG;
+    let strided = (d_w % WG) != 0u;
+    let n_w = (d_w + WG - 1u) / WG;
 
     var q_local: array<f32, 8>;
-    for (var i = 0u; i < d_per_w; i = i + 1u) {
-        let qv: vec2<f32> = vec2<f32>(q[q_w_off + d_off_w + i]);
+    for (var i = 0u; i < n_w; i = i + 1u) {
+        let w = select(t * wpt + i, t + i * WG, strided);
+        var qv: vec2<f32> = vec2<f32>(0.0, 0.0);
+        if (w < d_w) { qv = vec2<f32>(q[q_w_off + w]); }
         q_local[i * 2u]      = qv.x;
         q_local[i * 2u + 1u] = qv.y;
     }
     var o_local: array<f32, 8>;
-    for (var i = 0u; i < d_per; i = i + 1u) {
+    for (var i = 0u; i < 2u * n_w; i = i + 1u) {
         o_local[i] = 0.0;
     }
 
@@ -1157,9 +1161,12 @@ fn main(
     for (var j = 0u; j < u.s_k; j = j + 1u) {
         let kj_w = kv_b0_w + j * kv_step_w;
         var partial: f32 = 0.0;
-        for (var i = 0u; i < d_per_w; i = i + 1u) {
-            let kv: vec2<f32> = vec2<f32>(k[kj_w + d_off_w + i]);
-            partial = partial + q_local[i * 2u] * kv.x + q_local[i * 2u + 1u] * kv.y;
+        for (var i = 0u; i < n_w; i = i + 1u) {
+            let w = select(t * wpt + i, t + i * WG, strided);
+            if (w < d_w) {
+                let kv: vec2<f32> = vec2<f32>(k[kj_w + w]);
+                partial = partial + q_local[i * 2u] * kv.x + q_local[i * 2u + 1u] * kv.y;
+            }
         }
         shared_red[t] = partial;
         workgroupBarrier();
@@ -1196,18 +1203,24 @@ fn main(
 
         let alpha = shared_scalar[3];
         let p_j   = shared_scalar[2];
-        for (var i = 0u; i < d_per_w; i = i + 1u) {
-            let vv: vec2<f32> = vec2<f32>(v[kj_w + d_off_w + i]);
-            o_local[i * 2u]      = o_local[i * 2u]      * alpha + p_j * vv.x;
-            o_local[i * 2u + 1u] = o_local[i * 2u + 1u] * alpha + p_j * vv.y;
+        for (var i = 0u; i < n_w; i = i + 1u) {
+            let w = select(t * wpt + i, t + i * WG, strided);
+            if (w < d_w) {
+                let vv: vec2<f32> = vec2<f32>(v[kj_w + w]);
+                o_local[i * 2u]      = o_local[i * 2u]      * alpha + p_j * vv.x;
+                o_local[i * 2u + 1u] = o_local[i * 2u + 1u] * alpha + p_j * vv.y;
+            }
         }
     }
 
     let inv_l = 1.0 / shared_scalar[1];
-    for (var i = 0u; i < d_per_w; i = i + 1u) {
-        out[q_w_off + d_off_w + i] = vec2<f16>(vec2<f32>(
-            o_local[i * 2u] * inv_l, o_local[i * 2u + 1u] * inv_l
-        ));
+    for (var i = 0u; i < n_w; i = i + 1u) {
+        let w = select(t * wpt + i, t + i * WG, strided);
+        if (w < d_w) {
+            out[q_w_off + w] = vec2<f16>(vec2<f32>(
+                o_local[i * 2u] * inv_l, o_local[i * 2u + 1u] * inv_l
+            ));
+        }
     }
 }
 "#

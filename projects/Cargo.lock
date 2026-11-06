@@ -3003,11 +3003,13 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "fdk-aac",
+ "futures-channel",
  "futures-util",
  "image",
  "mp4",
  "openh264",
  "openh264-sys2",
+ "pollster",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -3106,6 +3108,7 @@ name = "thinfer-native"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
+ "futures-channel",
  "half",
  "hf-hub",
  "memmap2",

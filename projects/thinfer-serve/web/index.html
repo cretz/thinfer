@@ -47,6 +47,12 @@
           <label for="ref-images">Reference images</label>
           <input id="ref-images" type="file" accept="image/png,image/jpeg" multiple />
           <div id="ref-images-order"></div>
+          <label for="ref-image-size">Reference size</label>
+          <select id="ref-image-size">
+            <option value="match" selected>Match the video size (default, fastest)</option>
+            <option value="max">Up to 2048 short edge (never upscaled)</option>
+            <option value="diffusers">2048 short edge (reference, ~2.4x slower)</option>
+          </select>
         </div>
 
         <!-- ltx2-rapid native I2V: frame-0 conditioning strength (only shown with
@@ -183,6 +189,15 @@
           <label for="guide-scale">Guidance (face)</label>
           <input id="guide-scale" type="number" value="4" min="0" step="0.5" />
         </div>
+        <!-- DreamID-V opt-in speedups (each changes the output slightly). -->
+        <div id="face-crop-row" hidden>
+          <label for="face-crop" title="Swap on the face region only, pasted back at full resolution">Face crop (fast)</label>
+          <input id="face-crop" type="checkbox" />
+        </div>
+        <div id="cfg-every-row" hidden>
+          <label for="cfg-every" title="Run the unguided pass every N steps (1 = every step)">Guidance every N steps</label>
+          <input id="cfg-every" type="number" value="1" min="1" step="1" />
+        </div>
 
         <label for="duration" class="video-only">Duration (s)</label>
         <input id="duration" class="video-only" type="text" inputmode="decimal" placeholder="(seconds)" />
@@ -205,9 +220,17 @@
         <div id="attn-row" class="video-only" hidden>
           <label for="attn">Attention</label>
           <select id="attn">
-            <option value="int8" selected>INT8 (default, faster)</option>
+            <option value="int8-fp8" selected>INT8 + FP8 P.V (default, fastest; RTX 40/50, else INT8)</option>
+            <option value="int8">INT8 (bf16 P.V)</option>
             <option value="bf16">bf16 (reference, different take)</option>
           </select>
+        </div>
+
+        <!-- FastH3 only: reference / first-frame VAE encode in f32 (the exact
+             path) instead of the default bf16 tensor cores. -->
+        <div id="vae-encode-f32-row" class="video-only" hidden>
+          <label for="vae-encode-f32">Exact reference encode (f32, slower)</label>
+          <input id="vae-encode-f32" type="checkbox" />
         </div>
 
         <!-- LTX joint audio-video only. app.js reveals this row for LTX and

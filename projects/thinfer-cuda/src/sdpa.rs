@@ -8,11 +8,14 @@
 //! FlashAttention-2 forward on `mma.sync.m16n8k16` (f16 in, f32 accumulate)
 //! with `ldmatrix` operand loads. A block owns BR=128 query rows (8 warps x 16)
 //! and streams BC=64 key tiles through padded shared memory (row stride D+8
-//! halves keeps `ldmatrix` bank-conflict free). Scores, softmax state, and the
-//! running output never leave registers; softmax probabilities are repacked
-//! from the score accumulators straight into the P*V A-fragments. The one
-//! numeric difference from `sdpa_sg`: probabilities are rounded to f16 for the
-//! P*V product (standard FlashAttention practice).
+//! halves keeps `ldmatrix` bank-conflict free), double-buffered with
+//! `cp.async` so the next tile loads during this one's math (the Q tile lives
+//! in registers once loaded, so its shared memory is the second stage).
+//! Scores, softmax state, and the running output never leave registers;
+//! softmax probabilities are repacked from the score accumulators straight
+//! into the P*V A-fragments. The one numeric difference from `sdpa_sg`:
+//! probabilities are rounded to f16 for the P*V product (standard
+//! FlashAttention practice).
 //!
 //! Compiled once per process by NVRTC straight to a cubin for the device's
 //! compute capability (no driver PTX JIT, so a newer toolkit than the driver
@@ -57,6 +60,14 @@ __device__ __forceinline__ void mma16816(float (&d)[4], const unsigned (&a)[4], 
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+// 16-byte global -> shared copy, zero-filled when `full` is false.
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool full) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(smem_addr(dst)), "l"(src), "r"(full ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<unsigned*>(&h);
@@ -72,9 +83,9 @@ __device__ __forceinline__ void sdpa_impl(
     constexpr int LD = D + 8;
     const SdpaU u = *up;
     extern __shared__ __align__(16) unsigned char smem[];
-    half* qs = reinterpret_cast<half*>(smem); // [BR][LD]
-    half* ks = qs + BR * LD;                   // [BC][LD]
-    half* vs = ks + BC * LD;                   // [BC][LD]
+    half* qs = reinterpret_cast<half*>(smem); // [BR][LD], then K/V stage 1
+    // K/V stage `st`: [BC][LD] K then [BC][LD] V (stage 0 after the Q tile).
+    auto kstage = [&](int st) { return st ? qs : qs + BR * LD; };
 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t = lane & 3;
@@ -98,6 +109,20 @@ __device__ __forceinline__ void sdpa_impl(
         #pragma unroll
         for (int kk = 0; kk < D / 16; ++kk) ldsm_x4(qa[kk], base + kk * 16);
     }
+    __syncthreads(); // every warp holds its Q fragments: the tile is stage 1 now
+    auto load_kv = [&](unsigned kt, int st) {
+        half* ks = kstage(st);
+        half* vs = ks + BC * LD;
+        for (int i = tid; i < BC * (D / 8); i += blockDim.x) {
+            const int r = i / (D / 8), c8 = i % (D / 8);
+            const unsigned key = kt + r;
+            const bool ok = key < u.s_k;
+            const size_t off = ((size_t)(bb * u.s_k + (ok ? key : 0u)) * u.h_kv + hkv) * D + c8 * 8;
+            cp_async16(ks + r * LD + c8 * 8, k + off, ok);
+            cp_async16(vs + r * LD + c8 * 8, v + off, ok);
+        }
+        cp_async_commit();
+    };
 
     float o[D / 8][4];
     #pragma unroll
@@ -113,21 +138,20 @@ __device__ __forceinline__ void sdpa_impl(
                                          : ((size_t)bb * u.s_q + rc[e]);
     }
 
-    for (unsigned kt = 0; kt < u.s_k; kt += BC) {
-        __syncthreads(); // previous K/V tile fully consumed
-        for (int i = tid; i < BC * (D / 8); i += blockDim.x) {
-            const int r = i / (D / 8), c8 = i % (D / 8);
-            const unsigned key = kt + r;
-            uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
-            if (key < u.s_k) {
-                const size_t off = ((size_t)(bb * u.s_k + key) * u.h_kv + hkv) * D + c8 * 8;
-                kv = *reinterpret_cast<const uint4*>(k + off);
-                vv = *reinterpret_cast<const uint4*>(v + off);
-            }
-            *reinterpret_cast<uint4*>(ks + r * LD + c8 * 8) = kv;
-            *reinterpret_cast<uint4*>(vs + r * LD + c8 * 8) = vv;
+    load_kv(0, 0);
+    int st = 0;
+    for (unsigned kt = 0; kt < u.s_k; kt += BC, st ^= 1) {
+        // The other stage was consumed by the previous iteration (its
+        // trailing barrier): fill it with the next tile while this one runs.
+        if (kt + BC < u.s_k) {
+            load_kv(kt + BC, st ^ 1);
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
         }
         __syncthreads();
+        const half* ks = kstage(st);
+        const half* vs = ks + BC * LD;
 
         // S = Q K^T: 16 rows x BC keys per warp, as BC/8 C tiles.
         float s[BC / 8][4];
@@ -204,6 +228,7 @@ __device__ __forceinline__ void sdpa_impl(
                 mma16816(o[2 * dn + 1], pa[kb], b[2], b[3]);
             }
         }
+        __syncthreads(); // this stage fully consumed before it is refilled
     }
 
     float inv[2];
