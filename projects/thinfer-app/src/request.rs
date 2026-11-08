@@ -250,7 +250,8 @@ impl ImageRequest {
             crate::model::ImageKind::Ideogram4
             | crate::model::ImageKind::QwenImageEdit
             | crate::model::ImageKind::QwenImage
-            | crate::model::ImageKind::Krea2 => {
+            | crate::model::ImageKind::Krea2
+            | crate::model::ImageKind::QwenImage21 => {
                 let m = self.model.manifest();
                 self.model
                     .required_roles()
@@ -274,6 +275,8 @@ impl ImageRequest {
                     return Err(format!("--input-image is required for {}", self.model));
                 }
             }
+            // Optional: an edit / composition when present, text-to-image when not.
+            crate::model::ImageKind::QwenImage21 => {}
             _ => {
                 if self.input_image.is_some() {
                     return Err(format!("--input-image is not supported by {}", self.model));

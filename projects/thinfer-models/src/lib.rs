@@ -9,5 +9,6 @@ pub mod ltx;
 pub mod minimax;
 pub mod qwen3_lm;
 pub mod qwen_image;
+pub mod qwen_image21;
 pub mod wan;
 pub mod z_image;

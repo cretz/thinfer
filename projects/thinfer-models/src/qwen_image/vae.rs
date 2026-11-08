@@ -66,6 +66,7 @@ pub fn qwen_image_vae() -> WanVaeConfig {
         temporal_downsample: vec![false, true, true],
         is_residual: false,
         patch_size: 1,
+        temporal_kernel: 3,
         spatial_compression: 8,
         temporal_compression: 4,
         // Wan `WanRMS_norm` / `F.normalize` default eps.

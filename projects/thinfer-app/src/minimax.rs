@@ -56,7 +56,7 @@ use thinfer_models::minimax::pipeline::{
 };
 use thinfer_models::minimax::scheduler::JointSchedule;
 use thinfer_models::minimax::text_encoder::{
-    EncoderPipelines, ImageRows, MiniMaxTextEncoder, config as enc_config, encoder_cfgs,
+    EncoderPipelines, ImageRows, LmDims, MiniMaxTextEncoder, config as enc_config, encoder_cfgs,
     encoder_cfgs_long, register_handles as register_encoder,
 };
 use thinfer_models::minimax::video_vae::{
@@ -387,8 +387,8 @@ async fn run_clip(
             .await
             .map_err(|e| format!("parse encoder gguf: {e:?}"))?;
         let residency = WeightResidency::new(src, budget);
-        let handles =
-            register_encoder(&residency, None).map_err(|e| format!("register encoder: {e:?}"))?;
+        let handles = register_encoder(&residency, None, LmDims::H3)
+            .map_err(|e| format!("register encoder: {e:?}"))?;
         // Reference images make the prompt thousands of tokens long: run it
         // on bf16 acts (tensor-core matmuls and attention). Text alone keeps
         // the f32 path.

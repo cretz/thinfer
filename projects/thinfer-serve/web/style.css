@@ -1,218 +1,400 @@
+/* thinfer web UI. Layout contract (see index.html): every control sits in its
+   own `.field` (label above the control) or `.check` (checkbox + label) block,
+   so `hidden` on any field never disturbs the layout; `.grid` flows fields into
+   as many columns as fit; a `.group` with no visible field collapses. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --text: #1c1e22;
+  --muted: #5e6470;
+  --border: #d5d9e0;
+  --field: #ffffff;
+  --accent: #3b6ef5;
+  --accent-text: #ffffff;
+  --danger: #c93a3a;
+  --warn: #c98a1b;
+  --radius: 0.6rem;
+  --gap: 0.9rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111317;
+    --card: #1a1d23;
+    --text: #e6e8ec;
+    --muted: #9aa1ad;
+    --border: #2f343d;
+    --field: #13161b;
+    --accent: #5b8cff;
+    --accent-text: #0b0d10;
+    --danger: #ff6b6b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
 body {
-  font-family: system-ui, sans-serif;
-  max-width: 48rem;
-  margin: 2rem auto;
-  padding: 0 1rem;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
-#server {
+/* --- page layout ----------------------------------------------------------- */
+
+.topbar {
   display: flex;
-  gap: 0.75rem;
   align-items: center;
-  flex-wrap: wrap;
-  margin-bottom: 1rem;
+  justify-content: space-between;
+  gap: 1rem;
+  max-width: 88rem;
+  margin: 0 auto;
+  padding: 1rem 1rem 0.5rem;
+}
+.topbar h1 {
+  margin: 0;
+  font-size: 1.35rem;
+  letter-spacing: 0.02em;
+}
+#server > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+#server[open] {
+  min-width: min(22rem, 100%);
 }
 
-#server input {
-  flex: 1 1 16rem;
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+  max-width: 88rem;
+  margin: 0 auto;
+  padding: 0.5rem 1rem 2rem;
+}
+/* Wide screens: form left, result right (kept in view while the form scrolls). */
+@media (min-width: 64rem) {
+  .layout {
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    align-items: start;
+  }
+  .output {
+    position: sticky;
+    top: 1rem;
+  }
 }
 
-#token-hint {
-  font-size: 0.75rem;
-  opacity: 0.6;
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.1rem;
 }
 
-/* Inline caveat under a field (e.g. the LTX adherence floor). Spans both columns
-   of the #fields grid so it reads as a note on the row above, not a new field. */
-.warn {
-  grid-column: 1 / -1;
-  font-size: 0.75rem;
-  line-height: 1.4;
-  padding: 0.4rem 0.6rem;
-  border-left: 3px solid #c98a1b;
-  background: rgba(201, 138, 27, 0.1);
-}
+/* --- form structure -------------------------------------------------------- */
 
 #fields {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.5rem 1rem;
-  align-items: center;
   border: none;
+  margin: 0;
   padding: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
 }
 
-/* The reference-image order list sits under its file input, not in the label
-   column of a new row. */
-#ref-images-order {
-  grid-column: 2;
-  font-size: 0.75rem;
-  opacity: 0.8;
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
 }
-
-#fields > button {
-  grid-column: 2;
-  justify-self: start;
-  padding: 0.4rem 1.2rem;
+.group > h2 {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
 }
-
-/* The reference-image, audio, encoder, steps, etc. rows each wrap a label+input
-   pair in a div; `display: contents` promotes them into the #fields grid so they
-   align like every other row (label in column 1, input in column 2) instead of
-   cramming into one cell (which shoves every following row's label into column 2,
-   visibly mis-wrapping the rows below -- e.g. Quality/Seed). Guarded with
-   :not([hidden]) so the `hidden` attribute still collapses the row. */
-#input-image-row:not([hidden]),
-#source-image-row:not([hidden]),
-#input-video-row:not([hidden]),
-#guide-scale-row:not([hidden]),
-#audio-row:not([hidden]),
-#upscale-row:not([hidden]),
-#encoder-row:not([hidden]),
-#steps-row:not([hidden]),
-#coopmat-row:not([hidden]),
-#rewrite-row:not([hidden]),
-#rewrite-quality-row:not([hidden]),
-#full-precision-row:not([hidden]),
-#strength-row:not([hidden]),
-#occlusion-mask-row:not([hidden]),
-#hyperswap-mask-row:not([hidden]),
-#enhance-row:not([hidden]),
-#detect-stride-row:not([hidden]),
-#bitrate-scale-row:not([hidden]),
-#trim-start-row:not([hidden]),
-#trim-end-row:not([hidden]),
-#attn-window-row:not([hidden]),
-#attn-row:not([hidden]),
-#ref-images-row:not([hidden]) {
-  display: contents;
-}
-/* The Quality (VAE) row is `.video-only` (hidden in image mode via the class, not
-   the `hidden` attribute), so gate its contents-promotion on video mode -- an
-   ungated `#vae-row` (id) would beat the `.video-only` (class) display:none and
-   leak the row onto image gens. */
-body.kind-video #vae-row:not([hidden]) {
-  display: contents;
-}
-
-/* Per-type field visibility is toggled by a body class set in app.js. */
-.image-only,
-.video-only {
+/* A section whose every field is hidden disappears, heading and all. */
+section.group:not(:has(.field:not([hidden]), .check:not([hidden]), .warn:not([hidden]))) {
   display: none;
 }
-body.kind-image .image-only,
-body.kind-video .video-only {
-  display: revert;
+
+.grid {
+  display: grid;
+  /* Never wider than the container: one column on a narrow phone. */
+  grid-template-columns: repeat(auto-fit, minmax(min(10rem, 100%), 1fr));
+  gap: var(--gap);
+  align-items: start;
 }
-/* The `hidden` attribute must always win, even over the kind-based reveal above
-   (app.js hides e.g. the Wan VAE row for LTX). Author `!important` beats the
-   `display: revert` rule that would otherwise un-hide a `.video-only` element. */
-[hidden] {
-  display: none !important;
+.span-all {
+  grid-column: 1 / -1;
 }
 
-/* The adapter (LoRA) vault is a self-contained collapsible block, NOT part of
-   the label/input grid: it spans both columns and lays out its own controls, so
-   its password field / list / add-form never fight the two-column form grid. */
-#adapters-section {
-  grid-column: 1 / -1;
-  border: 1px solid rgba(128, 128, 128, 0.4);
-  border-radius: 0.4rem;
-  padding: 0.5rem 0.75rem;
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
 }
-#adapters-section > summary {
+.field > label {
+  font-size: 0.85rem;
+  font-weight: 550;
+  color: var(--muted);
+}
+
+.checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.4rem;
+}
+.checks:not(:has(.check:not([hidden]))) {
+  display: none;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.check > label {
+  cursor: pointer;
+}
+.check input[type="checkbox"] {
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+/* --- controls -------------------------------------------------------------- */
+
+input:not([type="checkbox"]),
+select,
+textarea {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  padding: 0.5rem 0.6rem;
+  min-height: 2.4rem;
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+input[type="file"] {
+  padding: 0.35rem;
+}
+input[type="file"]::file-selector-button {
+  font: inherit;
+  margin-right: 0.6rem;
+  padding: 0.2rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+.inline > input[type="file"] {
+  flex: 1 1 14rem;
+  width: auto;
+}
+
+#prompt {
+  min-height: 9rem;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+button {
+  font: inherit;
+  border-radius: 0.45rem;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.actions {
+  display: flex;
+}
+.actions > .primary {
+  width: 100%;
+  padding: 0.8rem;
+  font-size: 1.05rem;
+}
+
+/* Inline caveat (e.g. the LTX adherence floor). */
+.warn {
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 0.45rem 0.65rem;
+  border-left: 3px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-radius: 0.25rem;
+}
+
+/* Collapsible panels (adapters, advanced). */
+details.panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.85rem;
+}
+details.panel > summary {
   cursor: pointer;
   font-weight: 600;
 }
-/* Inner label|input grid, mirroring #fields but scoped to the section. */
-.adapters-body {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.5rem 1rem;
-  align-items: center;
-  margin-top: 0.75rem;
+details.panel[open] > summary {
+  margin-bottom: 0.4rem;
 }
-/* Full-width sub-rows: the List button + status, the rendered list, and the
-   nested add-form each span both inner columns. */
-.adapters-actions,
-#adapters-list,
-#adapters-add {
-  grid-column: 1 / -1;
+#advanced .grid:not(:has(.field:not([hidden]))) {
+  display: none;
 }
-.adapters-actions {
+/* Nothing advanced applies to this model: drop the whole panel. */
+#advanced:not(:has(.field:not([hidden]), .check:not([hidden]))) {
+  display: none;
+}
+#adapters-add > summary {
+  cursor: pointer;
+  margin-bottom: 0.4rem;
+}
+
+/* Reference-image order list (FastH3-Omni). */
+#ref-images-order {
   display: flex;
-  gap: 0.75rem;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+}
+#ref-images-order > div {
+  display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
 }
-#adapters-status {
-  font-size: 0.8rem;
-  opacity: 0.75;
+#ref-images-order button {
+  font-size: 0.78rem;
+  padding: 0.2rem 0.6rem;
 }
+
 /* One rendered adapter: checkbox, name (grows), weight, remove. */
 .adapter-item {
   display: flex;
   gap: 0.5rem;
   align-items: center;
-  padding: 0.15rem 0;
+  padding: 0.2rem 0;
 }
 .adapter-item label {
   flex: 1;
   min-width: 0;
 }
-.adapter-weight {
-  width: 4rem;
-}
-#adapters-add > summary {
-  cursor: pointer;
-}
-.adapters-add-body {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.4rem 0.8rem;
-  align-items: center;
-  margin-top: 0.5rem;
-}
-.adapters-add-body > button {
-  grid-column: 2;
-  justify-self: start;
+.adapter-item input.adapter-weight {
+  width: 5rem;
 }
 
+/* --- output ---------------------------------------------------------------- */
+
+.output {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
 #status {
-  margin: 1rem 0;
+  margin: 0;
   font-variant-numeric: tabular-nums;
   white-space: pre-wrap;
 }
-
+.media:not(:has(:not([hidden]))) {
+  display: none;
+}
 #image-out,
 #video-out {
+  display: block;
   max-width: 100%;
+  max-height: 75vh;
+  margin: 0 auto;
+  border-radius: 0.4rem;
+  /* A checkerboard shows through transparent (RGBA) results. */
+  background: repeating-conic-gradient(#8883 0 25%, transparent 0 50%) 0 0 / 16px 16px;
 }
-
+.download {
+  font-weight: 600;
+  color: var(--accent);
+}
+.log-panel > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
 #log {
-  width: 100%;
-  margin-top: 1rem;
-  font-family: monospace;
-  font-size: 0.8rem;
+  margin-top: 0.4rem;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.78rem;
   white-space: pre;
+  resize: vertical;
 }
 
-/* Cancel stays reachable on a phone: full-width, thumb-sized, and pinned to
-   the bottom of the viewport while the (long) form scrolls above it. */
+/* Cancel stays reachable on a phone: full width, thumb-sized, pinned to the
+   bottom of the viewport while the page scrolls. */
 #cancel {
   position: sticky;
   bottom: 0.75rem;
   z-index: 1;
-  display: block;
   width: 100%;
-  margin: 1rem 0 0;
-  padding: 0.9rem;
-  font-size: 1.1rem;
+  padding: 0.85rem;
+  font-size: 1.05rem;
+  background: var(--card);
 }
-#cancel[hidden] {
+
+/* --- visibility ------------------------------------------------------------- */
+
+/* Per-type fields (body class set by app.js). */
+body:not(.kind-image) .image-only,
+body:not(.kind-video) .video-only {
   display: none;
 }
-#ref-images-order button {
-  margin-left: 0.5rem;
-  font-size: 0.75rem;
+/* The `hidden` attribute always wins over any display rule above. */
+[hidden] {
+  display: none !important;
 }

@@ -20,6 +20,7 @@ mod minimax_ref;
 pub mod model;
 pub mod preprocess;
 pub mod progress;
+mod qwen21;
 #[cfg(feature = "remote")]
 pub mod remote;
 pub mod request;

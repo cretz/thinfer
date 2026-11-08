@@ -11,6 +11,7 @@ pub const BK_I8: u32 = 32;
 
 pub mod act_quant;
 pub mod add;
+pub mod avgdown3d;
 pub mod bcast_add;
 pub mod bcast_affine;
 pub mod bcast_fma;
@@ -67,6 +68,8 @@ pub mod upsample2d_nearest;
 pub mod weight_prep;
 
 pub use add::AddF32;
+pub(crate) use avgdown3d::dispatch_avgdown3d;
+pub use avgdown3d::{AvgDown3dBufs, AvgDown3dF32, AvgDown3dOp};
 pub(crate) use bcast_add::dispatch_bcast_add;
 pub use bcast_add::{BcastAddBufs, BcastAddF32, BcastAddOp};
 pub(crate) use bcast_affine::dispatch_bcast_affine;

@@ -11,6 +11,7 @@ use thinfer_models::krea::manifest as kreamf;
 use thinfer_models::ltx::manifest as ltxmf;
 use thinfer_models::minimax::manifest as mmmf;
 use thinfer_models::qwen_image::manifest as qimf;
+use thinfer_models::qwen_image21::manifest as qi21mf;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::z_image::manifest as zmf;
 
@@ -107,6 +108,12 @@ pub enum ImageModelId {
     #[cfg_attr(feature = "cli", value(name = "krea-2-turbo"))]
     #[cfg_attr(feature = "serde", serde(rename = "krea-2-turbo"))]
     Krea2Turbo,
+    /// Qwen-Image-2.1-Turbo: a 7B single-stream DiT, 8 CFG-free steps, text to
+    /// image or editing / composing from `--input-image` (optional). Qwen3-VL-8B
+    /// encoder; 2K native. Qwen Research License (non-commercial).
+    #[cfg_attr(feature = "cli", value(name = "qwen-image-2.1-turbo"))]
+    #[cfg_attr(feature = "serde", serde(rename = "qwen-image-2.1-turbo"))]
+    QwenImage21Turbo,
 }
 
 /// Which engine pipeline an image id drives. The executor branches on this:
@@ -121,6 +128,8 @@ pub enum ImageKind {
     QwenImage,
     /// Krea 2 Turbo (text->image; Qwen3-VL encoder + single-stream DiT).
     Krea2,
+    /// Qwen-Image-2.1 (text->image, or image->image with optional inputs).
+    QwenImage21,
 }
 
 impl ImageModelId {
@@ -138,6 +147,7 @@ impl ImageModelId {
             Self::QwenImageEditRapid => "Qwen-Image Edit Rapid, 4-step (edits --input-image)",
             Self::QwenImageRapid => "Qwen-Image Rapid, 4-step",
             Self::Krea2Turbo => "Krea 2 Turbo, 8-step, aesthetic",
+            Self::QwenImage21Turbo => "Qwen-Image 2.1 Turbo, 8-step (optional --input-image)",
         }
     }
 
@@ -148,6 +158,7 @@ impl ImageModelId {
             ImageModelId::QwenImageEditRapid => ImageKind::QwenImageEdit,
             ImageModelId::QwenImageRapid => ImageKind::QwenImage,
             ImageModelId::Krea2Turbo => ImageKind::Krea2,
+            ImageModelId::QwenImage21Turbo => ImageKind::QwenImage21,
             _ => ImageKind::ZImage,
         }
     }
@@ -158,6 +169,7 @@ impl ImageModelId {
             ImageKind::Ideogram4 => &idmf::MANIFEST,
             ImageKind::QwenImageEdit | ImageKind::QwenImage => &qimf::MANIFEST,
             ImageKind::Krea2 => &kreamf::MANIFEST,
+            ImageKind::QwenImage21 => &qi21mf::MANIFEST,
         }
     }
 
@@ -190,6 +202,7 @@ impl ImageModelId {
             ImageModelId::QwenImageRapid => qimf::RUNTIME_ROLES_T2I_Q8,
             // Krea sources by role (Q8_0 canary DiT + Qwen3-VL encoder + VAE).
             ImageModelId::Krea2Turbo => kreamf::RUNTIME_ROLES_Q8,
+            ImageModelId::QwenImage21Turbo => qi21mf::RUNTIME_ROLES_Q4,
             // Z-Image uses the variant registry, not roles.
             _ => &[],
         }
@@ -223,6 +236,13 @@ impl ImageModelId {
                 height: 1024,
                 steps: 8,
             },
+            // Qwen-Image-2.1-Turbo: the checkpoint's own 8-sigma schedule (the
+            // step count is fixed); 1024 is the reference's default size.
+            ImageKind::QwenImage21 => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 8,
+            },
         }
     }
 }
@@ -237,6 +257,7 @@ impl std::fmt::Display for ImageModelId {
             ImageModelId::QwenImageEditRapid => "qwen-image-edit-rapid",
             ImageModelId::QwenImageRapid => "qwen-image-rapid",
             ImageModelId::Krea2Turbo => "krea-2-turbo",
+            ImageModelId::QwenImage21Turbo => "qwen-image-2.1-turbo",
         })
     }
 }

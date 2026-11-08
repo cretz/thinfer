@@ -17,13 +17,11 @@ const $ = (id) => document.getElementById(id);
 const setStatus = (text) => {
   $("status").textContent = text;
 };
-// Toggle the `hidden` attribute on a control AND its `<label for=id>` together
-// (for the bare label|input grid rows that are not wrapped in a row div).
+// Hide a control together with its label: the `.field` block that holds both.
 const setLabeledHidden = (id, hidden) => {
   const el = $(id);
-  if (el) el.hidden = hidden;
-  const lab = document.querySelector(`label[for="${id}"]`);
-  if (lab) lab.hidden = hidden;
+  const field = el?.closest(".field") ?? el;
+  if (field) field.hidden = hidden;
 };
 // Set when a generation starts; log lines are then prefixed with elapsed-from-
 // start, mirroring the CLI's stamped stderr sink (`[  12.3s] ...`, width-6 like
@@ -37,7 +35,7 @@ const log = (line) => {
 };
 
 const MODELS = {
-  image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"],
+  image: ["zimage-turbo-q4", "zimage-turbo-q8", "zimage-turbo-bf16", "ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo", "qwen-image-2.1-turbo"],
   // ltx-2.3-distilled-q4 is the fast tier: a pre-distilled Q4_K_M DiT skips the
   // ~60s distill fold the dev ids pay and streams 14GB instead of 23GB per step.
   // ltx-2.3-dev-q4 (Q4 dev + fold) stays CLI-only: it pays Q4 quality AND the
@@ -110,6 +108,10 @@ const isMultiShotModel = (model) => model === "longlive-2.0-5b";
 // REQUIRE an uploaded input image (mirrors the server's QwenImageEdit kind).
 const EDIT_MODELS = new Set(["qwen-image-edit-rapid"]);
 const isEditModel = (model) => EDIT_MODELS.has(model);
+// Image models that take an OPTIONAL input image: with one they edit / compose
+// from it (the output keeps its aspect), without one they are text-to-image.
+const OPTIONAL_IMAGE_MODELS = new Set(["qwen-image-2.1-turbo"]);
+const takesInputImage = (model) => EDIT_MODELS.has(model) || OPTIONAL_IMAGE_MODELS.has(model);
 
 // Z-Image variants whose DiT source is bf16 safetensors: they take the
 // "Full precision" toggle (default off = load-time Q8 transcode, fast; on = bf16,
@@ -180,13 +182,25 @@ const PRESETS = {
 // Image models authored at 1024 (resolution-aware schedules): Ideogram-4, both
 // Qwen-Image-Rapid variants, and Krea 2 Turbo default to 1024x1024 (mirrors the
 // server `ImageModelId::defaults`). Z-Image stays on the 768-led PRESETS.image.
-const IMAGE_1024_MODELS = new Set(["ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo"]);
+const IMAGE_1024_MODELS = new Set(["ideogram4-q8", "qwen-image-rapid", "qwen-image-edit-rapid", "krea-2-turbo", "qwen-image-2.1-turbo"]);
 const IMAGE_1024_PRESETS = [
   { label: "1024x1024 (default)", width: 1024, height: 1024 },
   { label: "768x768 (faster)", width: 768, height: 768 },
   { label: "512x512 (fastest)", width: 512, height: 512 },
   { label: "768x1024 portrait", width: 768, height: 1024 },
   { label: "1024x768 landscape", width: 1024, height: 768 },
+];
+// Qwen-Image-2.1-Turbo: /32 sides. Qwen's own presets are ~2K, but it also
+// holds up well at 512 (user-tested), so the fast sizes stay.
+const QWEN21_PRESETS = [
+  { label: "1024x1024 (default)", width: 1024, height: 1024 },
+  { label: "768x768 (faster)", width: 768, height: 768 },
+  { label: "512x512 (fastest)", width: 512, height: 512 },
+  { label: "1216x832 landscape", width: 1216, height: 832 },
+  { label: "832x1216 portrait", width: 832, height: 1216 },
+  { label: "1344x768 wide", width: 1344, height: 768 },
+  { label: "1536x1536 (slower)", width: 1536, height: 1536 },
+  { label: "2048x2048 (2K native, slowest)", width: 2048, height: 2048 },
 ];
 // LTX-2.3 has its own grid: dims must be a multiple of 64 and at least 256 (the
 // server rejects below 256). The decode tiles to the VRAM budget so larger dims
@@ -316,6 +330,8 @@ function sizeSpec(kind, model) {
   if (kind === "video" && (isAnyflowModel(model) || model === "mobilewan"))
     return { presets: WAN22_PRESETS, step: 16, min: 16 };
   if (kind === "video" && isFastwan21Model(model)) return { presets: FASTWAN21_PRESETS, step: 16, min: 16 };
+  if (kind === "image" && model === "qwen-image-2.1-turbo")
+    return { presets: QWEN21_PRESETS, step: 32, min: 32 };
   if (kind === "image" && IMAGE_1024_MODELS.has(model)) return { presets: IMAGE_1024_PRESETS, step: 16, min: 16 };
   if (kind === "video" && isHunyuanModel(model)) return { presets: HUNYUAN_PRESETS, step: 16, min: 16 };
   // DreamID-V: the /16 Wan2.1-VAE grid led by its 832x480 default (the target
@@ -343,6 +359,7 @@ const MODEL_STEPS = {
   "qwen-image-rapid": 4,
   "qwen-image-edit-rapid": 4,
   "krea-2-turbo": 8,
+  "qwen-image-2.1-turbo": 8,
   "dreamid-v": 16,
   // AnyFlow any-step flow map: 2 holds 4-step quality on our sweep and each step
   // re-streams the 15GB DiT, so 2 is the quality-neutral fast default.
@@ -411,6 +428,44 @@ const fileToBase64 = (file) =>
     r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ""));
     r.readAsDataURL(file);
   });
+
+// The last generated image's PNG bytes, kept so a video (or an edit) can start
+// from it without a download + re-upload round trip. Replaced by each new image.
+let currentImageBytes = null;
+
+// The input image the form selected, base64 (no data: prefix), or null: the
+// on-page image when "Use current image" is checked, else the picked file.
+async function inputImageBase64() {
+  if ($("use-current-image").checked && currentImageBytes) {
+    return bytesToBase64(currentImageBytes);
+  }
+  const file = $("input-image").files[0];
+  return file ? fileToBase64(file) : null;
+}
+
+// Show "Use current image" (and Omni's "Add current image") only when there is
+// one to use.
+function refreshCurrentImageOption() {
+  const have = currentImageBytes !== null;
+  $("add-current-ref").hidden = !have;
+  $("use-current-image-row").hidden = !have;
+  if (!have) $("use-current-image").checked = false;
+  $("input-image").required =
+    $("input-image").dataset.required === "1" && !$("use-current-image").checked;
+}
+
+// `thinfer-<local yyyymmdd-hhmmss>-<4 hex>.<ext>`: unique, time-sortable.
+function downloadName(ext) {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, "0");
+  const stamp =
+    `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-` +
+    `${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+  const tag = Array.from(crypto.getRandomValues(new Uint8Array(2)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  return `thinfer-${stamp}-${tag}.${ext}`;
+}
 
 // Seal a video file under the job key and POST it to /uploads as a raw body
 // (no base64, no JSON); returns its opaque id. The server stores only this
@@ -527,6 +582,13 @@ function applyKind() {
   applyModel();
 }
 $("kind").addEventListener("change", applyKind);
+const growPrompt = () => {
+  const el = $("prompt");
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight + 2, window.innerHeight * 0.6)}px`;
+};
+$("prompt").addEventListener("input", growPrompt);
+$("use-current-image").addEventListener("change", refreshCurrentImageOption);
 // Reference images accumulate across picks (a file input replaces its
 // selection on every pick, and phone pickers often allow only one), in pick
 // order. The prompt names them by position, so the list shows which is which.
@@ -543,11 +605,22 @@ function renderRefImages() {
         refImages.splice(i, 1);
         renderRefImages();
       });
-      row.append(`<Picture ${i + 1}> = ${f.name} `, remove);
+      const name = document.createElement("span");
+      name.textContent = `<Picture ${i + 1}> = ${f.name}`;
+      row.append(name, remove);
       return row;
     }),
   );
 }
+// Omni: the image on the page joins the references like a picked file.
+$("add-current-ref").addEventListener("click", () => {
+  if (!currentImageBytes || refImages.length >= MAX_REF_IMAGES) return;
+  const n = refImages.filter((f) => f.name.startsWith("current image")).length;
+  refImages.push(
+    new File([currentImageBytes], `current image${n ? ` ${n + 1}` : ""}.png`, { type: "image/png" }),
+  );
+  renderRefImages();
+});
 $("ref-images").addEventListener("change", () => {
   const input = $("ref-images");
   refImages.push(...[...input.files].slice(0, MAX_REF_IMAGES - refImages.length));
@@ -562,18 +635,21 @@ function applyModel() {
   const model = $("model").value;
   const kind = $("kind").value;
   const edit = kind === "image" && isEditModel(model);
+  const optionalImage = kind === "image" && OPTIONAL_IMAGE_MODELS.has(model);
   // The causal Hunyuan TI2V optionally animates a first-frame image: same
   // picker as the image-edit models, but NOT required (no image = text-only).
   // FastH3-Trim / MiniMax-H3 take it as an FL2VA first frame.
   const i2v =
     kind === "video" && (isHunyuanI2vModel(model) || isLtxRapid(model) || isMinimaxFl2va(model));
-  $("input-image-row").hidden = !edit && !i2v;
-  $("input-image").required = edit;
+  $("input-image-row").hidden = !edit && !i2v && !optionalImage;
+  $("input-image").dataset.required = edit ? "1" : "0";
+  refreshCurrentImageOption();
   // Frame-0 strength: ltx2-rapid I2V only (optional image, so always visible for
   // rapid; server ignores it when no image is sent).
   $("strength-row").hidden = !(kind === "video" && isLtxRapid(model));
   // FastH3-Omni reference images (optional; the prompt names them).
   $("ref-images-row").hidden = !(kind === "video" && model === "fasth3-omni");
+  $("ref-image-size-row").hidden = $("ref-images-row").hidden;
   // Face swap consumes a source FACE image + a target VIDEO instead of a text
   // prompt; reveal those uploaders and drop the rows that do not apply.
   const faceSwap = kind === "face-swap";
@@ -668,7 +744,9 @@ function applyModel() {
   // FastWan2.1-1.3B runs its fixed DMD 3-step schedule (the server default
   // sampler for it), so steps do not apply either.
   const isFastwan21 = kind === "video" && isFastwan21Model(model);
-  $("steps-row").hidden = isLtxVideo || isWan22 || isHunyuan || hyperswap || isMinimax || isFastwan21;
+  const fixedImageSteps = kind === "image" && model === "qwen-image-2.1-turbo";
+  $("steps-row").hidden =
+    isLtxVideo || isWan22 || isHunyuan || hyperswap || isMinimax || isFastwan21 || fixedImageSteps;
   // AnyFlow is ANY-step; DreamID-V runs a 16-step distill. Both exceed the FastWan
   // 1..=8 cap, so lift the max for them (else the pre-filled default is invalid and
   // the browser blocks Generate).
@@ -1057,10 +1135,12 @@ async function buildSpec(jobKey) {
     };
     // Edit models (qwen-image-edit) consume a reference image; encode the
     // picked file as base64 (camelCase `inputImage` matches the wire schema).
-    if (isEditModel(model)) {
-      const file = $("input-image").files[0];
-      if (!file) throw new Error(`${model} requires a reference image; choose one first`);
-      spec.inputImage = await fileToBase64(file);
+    if (takesInputImage(model)) {
+      const image = await inputImageBase64();
+      if (!image && isEditModel(model)) {
+        throw new Error(`${model} requires a reference image; choose one first`);
+      }
+      if (image) spec.inputImage = image;
     }
     // bf16 Z-Image variants: opt into full bf16 precision (default off = Q8).
     if (isBf16Model(model) && $("full-precision").checked) spec.fullPrecision = true;
@@ -1108,8 +1188,8 @@ async function buildSpec(jobKey) {
       spec.refImageSize = $("ref-image-size").value;
     }
     if (isMinimaxFl2va(model)) {
-      const file = $("input-image").files[0];
-      if (file) spec.inputImage = await fileToBase64(file);
+      const image = await inputImageBase64();
+      if (image) spec.inputImage = image;
     }
     // Vault LoRAs, applied at runtime (stacked low-rank pairs, no refold).
     attachAdapters(spec, "video", model);
@@ -1145,9 +1225,9 @@ async function buildSpec(jobKey) {
     // rapid native I2V: an optional first-frame image (with = I2V frame-0
     // anchor, without = t2v) + its conditioning strength.
     if (isLtxRapid(model)) {
-      const file = $("input-image").files[0];
-      if (file) {
-        spec.inputImage = await fileToBase64(file);
+      const image = await inputImageBase64();
+      if (image) {
+        spec.inputImage = image;
         spec.strength = floatOrNull($("strength").value) ?? 1.0;
       }
     }
@@ -1213,7 +1293,7 @@ async function buildSpec(jobKey) {
   // attn-window do not apply); the tiny/full VAE choice governs the decode;
   // the rewriter runs on text-only requests.
   if (isHunyuanI2vModel(model)) {
-    const file = $("input-image").files[0];
+    const image = await inputImageBase64();
     const spec = {
       kind: "video",
       model,
@@ -1226,7 +1306,7 @@ async function buildSpec(jobKey) {
       rewriteQuality: $("rewrite-quality").value,
       seed,
     };
-    if (file) spec.inputImage = await fileToBase64(file);
+    if (image) spec.inputImage = image;
     return spec;
   }
   // HunyuanVideo 1.5 runs a fixed lightx2v 4-step flow-match schedule (steps/
@@ -1429,6 +1509,8 @@ async function showResult(kind, result, jobKey) {
     img.src = url;
     img.hidden = false;
     video.hidden = true;
+    currentImageBytes = bytes;
+    refreshCurrentImageOption();
   } else {
     if (video.src) URL.revokeObjectURL(video.src);
     // Diagnostics: an inline-playback failure often surfaces NOTHING (0:00 white
@@ -1454,7 +1536,7 @@ async function showResult(kind, result, jobKey) {
   }
   // A real download link with an explicit filename: saving the blob: URL
   // directly would drop the extension and the OS would not know it is an mp4.
-  const filename = kind === "image" ? "thinfer.png" : "thinfer.mp4";
+  const filename = downloadName(kind === "image" ? "png" : "mp4");
   const dl = $("download");
   dl.href = url;
   dl.download = filename;

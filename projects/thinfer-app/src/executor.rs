@@ -121,6 +121,9 @@ impl LocalExecutor {
             crate::model::ImageKind::QwenImageEdit => self.run_qwen_image_edit(req, sink).await,
             crate::model::ImageKind::QwenImage => self.run_qwen_image(req, sink).await,
             crate::model::ImageKind::Krea2 => self.run_krea(req, sink).await,
+            crate::model::ImageKind::QwenImage21 => {
+                crate::qwen21::run(&self.backend, req, image_budget(req.budget), sink).await
+            }
         }
     }
 
