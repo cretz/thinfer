@@ -124,14 +124,27 @@ impl UploadStore {
     /// Consume upload `id` into a job whose dir is `job_dir`, under the job's
     /// `key`: the ciphertext moves into the job dir (delete-on-fetch / the job
     /// reaper govern it from here) and becomes a decrypt-on-read input. Errors
-    /// if the id is unknown or already expired/consumed.
-    pub fn consume(&self, id: &str, job_dir: &Path, key: &JobKey) -> Result<VideoInput, String> {
-        let entry = self
-            .entries
-            .lock()
-            .unwrap()
-            .remove(id)
-            .ok_or("upload not found (expired, already used, or never uploaded)")?;
+    /// if the id is unknown, already expired/consumed, or claimed by a job
+    /// other than `job_id` (left in place for its owner).
+    pub fn consume(
+        &self,
+        id: &str,
+        job_id: &str,
+        job_dir: &Path,
+        key: &JobKey,
+    ) -> Result<VideoInput, String> {
+        let entry = {
+            let mut entries = self.entries.lock().unwrap();
+            let e = entries
+                .get(id)
+                .ok_or("upload not found (expired, already used, or never uploaded)")?;
+            if let Some(owner) = &e.owner
+                && owner.upgrade().is_none_or(|j| j.id != job_id)
+            {
+                return Err(format!("upload {id} is claimed by another job"));
+            }
+            entries.remove(id).expect("present under the lock")
+        };
         std::fs::create_dir_all(job_dir)
             .map_err(|e| format!("create {}: {e}", job_dir.display()))?;
         let dest = job_dir.join("input_video.enc");
@@ -220,7 +233,7 @@ mod tests {
         );
 
         let job_dir = tmp.join("job");
-        let input = store.consume(&id, &job_dir, &key).unwrap();
+        let input = store.consume(&id, "job", &job_dir, &key).unwrap();
         let (path, raw_key, nonce) = match &input {
             VideoInput::Encrypted { path, key, nonce } => (path.clone(), *key, nonce.clone()),
             VideoInput::Ram(_) => panic!("expected a decrypt-on-read input"),
@@ -229,7 +242,10 @@ mod tests {
         let ct = std::fs::read(&path).unwrap();
         let opened = thinfer_app::vault::ephemeral_unseal(&raw_key, &nonce, &ct).unwrap();
         assert_eq!(opened, plaintext);
-        assert!(store.consume(&id, &job_dir, &key).is_err(), "consumed once");
+        assert!(
+            store.consume(&id, "job", &job_dir, &key).is_err(),
+            "consumed once"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -243,7 +259,7 @@ mod tests {
         assert_eq!(store.reap(Duration::from_secs(3600)), 0);
         assert_eq!(store.reap(Duration::ZERO), 1);
         assert!(!tmp.join(&id).exists(), "reaped dir should be gone");
-        assert!(store.consume(&id, &tmp.join("job"), &key).is_err());
+        assert!(store.consume(&id, "job", &tmp.join("job"), &key).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -260,6 +276,16 @@ mod tests {
         store.claim(&ids, &job).unwrap();
         let other = jobs.create(&tmp, Vec::new());
         assert!(store.claim(&ids, &other).is_err(), "one owner per upload");
+        assert!(
+            store
+                .consume(&id, &other.id, &tmp.join("other"), &key)
+                .is_err(),
+            "only the claimant consumes"
+        );
+        assert!(
+            tmp.join(&id).exists(),
+            "a refused consume leaves the upload"
+        );
 
         assert_eq!(store.reap(Duration::ZERO), 0, "claim overrides the TTL");
         job.request_cancel();

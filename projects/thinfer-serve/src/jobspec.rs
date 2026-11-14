@@ -38,6 +38,7 @@ fn video_input(bytes: Vec<u8>, dir: &std::path::Path) -> Result<VideoInput, Stri
 /// format). Returns the request + the per-request coopmat opt-out.
 pub fn spec_into_request(
     spec: JobSpec,
+    job_id: &str,
     dir: &Path,
     key: &JobKey,
     config: &ServeConfig,
@@ -162,7 +163,7 @@ pub fn spec_into_request(
                 return Err("server-side input paths are not accepted; upload the media".into());
             }
             let input_video = match (s.input_video_upload, s.input_video_b64) {
-                (Some(uid), _) => uploads.consume(&uid, dir, key)?,
+                (Some(uid), _) => uploads.consume(&uid, job_id, dir, key)?,
                 (None, Some(b64)) => video_input(b64_decode("input_video_b64", &b64)?, dir)?,
                 (None, None) => return Err("face-swap requires an input video".into()),
             };

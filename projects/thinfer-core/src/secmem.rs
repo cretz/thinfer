@@ -7,8 +7,8 @@
 //! zeroizes but leaves paging alone.
 //!
 //! Under enforcement a lock that cannot be taken (no lockable memory left)
-//! does not abort the allocation: it raises a process-wide flag
-//! ([`failed`]) that the job runner treats as a cancellation, so the job ends
+//! does not abort the allocation: it bumps a process-wide failure count
+//! ([`failed_since`]) that the job runner treats as a cancellation, so the job ends
 //! with an error instead of carrying on with swappable plaintext. Model
 //! weights are never locked (they are not job data and would not fit).
 //!
@@ -17,12 +17,14 @@
 //! their own mappings, so this only ever concerns a buffer's edge pages.
 
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use zeroize::{DefaultIsZeroes, Zeroize};
 
 static ENFORCED: AtomicBool = AtomicBool::new(false);
-static FAILED: AtomicBool = AtomicBool::new(false);
+/// Lock failures so far (monotone: a job compares against its start mark, so
+/// concurrent jobs never reset each other's failures).
+static FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Lock every [`Locked`] buffer from now on (a server, at startup), raising
 /// the process's lock limits where the platform allows it.
@@ -31,15 +33,20 @@ pub fn enforce() {
     ENFORCED.store(true, Ordering::SeqCst);
 }
 
-/// Whether a lock failed since the last [`clear_failure`]: some job data is
-/// swappable, so the running job must stop.
-pub fn failed() -> bool {
-    FAILED.load(Ordering::SeqCst)
+/// A mark to take at a job's start, for [`failed_since`].
+pub fn failure_mark() -> u64 {
+    FAILURES.load(Ordering::SeqCst)
 }
 
-/// Reset [`failed`] (at a job's start).
-pub fn clear_failure() {
-    FAILED.store(false, Ordering::SeqCst);
+/// Whether a lock failed since `mark`: some job data is swappable, so the
+/// running job must stop. Process-wide: a failure stops every job running at
+/// the time (lockable memory is shared), but no job can clear another's.
+pub fn failed_since(mark: u64) -> bool {
+    FAILURES.load(Ordering::SeqCst) != mark
+}
+
+fn record_failure() {
+    FAILURES.fetch_add(1, Ordering::SeqCst);
 }
 
 /// A page-locked (under [`enforce`]), zeroize-on-drop buffer. Its length is
@@ -56,7 +63,7 @@ impl<T: DefaultIsZeroes> Locked<T> {
         let locked = ENFORCED.load(Ordering::SeqCst) && !buf.is_empty() && {
             let ok = platform::lock(buf.as_ptr().cast(), std::mem::size_of_val(&buf[..]));
             if !ok {
-                FAILED.store(true, Ordering::SeqCst);
+                record_failure();
                 tracing::error!(
                     target: crate::trace::ADAPTER,
                     bytes = std::mem::size_of_val(&buf[..]),
@@ -71,6 +78,12 @@ impl<T: DefaultIsZeroes> Locked<T> {
     /// A zeroed buffer of `len` elements.
     pub fn zeroed(len: usize) -> Self {
         Self::new(vec![T::default(); len])
+    }
+
+    /// Enforcement is on but this buffer's pages could not be locked: do not
+    /// fill it with plaintext.
+    pub fn lock_failed(&self) -> bool {
+        ENFORCED.load(Ordering::SeqCst) && !self.buf.is_empty() && !self.locked
     }
 }
 
@@ -118,7 +131,7 @@ pub fn lock_slice(bytes: &[u8]) {
         && !bytes.is_empty()
         && !platform::lock(bytes.as_ptr().cast(), bytes.len())
     {
-        FAILED.store(true, Ordering::SeqCst);
+        record_failure();
         tracing::error!(
             target: crate::trace::ADAPTER,
             bytes = bytes.len(),
@@ -252,13 +265,13 @@ mod tests {
     #[test]
     fn locked_buffer_round_trips() {
         enforce();
-        clear_failure();
+        let mark = failure_mark();
         let mut b = Locked::new(vec![1.5f32; 1 << 20]);
         assert!(b.locked || cfg!(not(any(windows, unix))));
         b[7] = 2.0;
         assert_eq!(b[7], 2.0);
         assert_eq!(b.len(), 1 << 20);
         drop(b);
-        assert!(!failed());
+        assert!(!failed_since(mark));
     }
 }

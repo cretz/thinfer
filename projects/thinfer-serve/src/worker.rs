@@ -106,7 +106,7 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>) {
     };
     // Job plaintext is page-locked from here on; a lock that fails (no
     // lockable memory left) stops the job rather than let it reach swap.
-    thinfer_core::secmem::clear_failure();
+    let lock_mark = thinfer_core::secmem::failure_mark();
     let (request, disable_coopmat) = match decrypt_request(ctx, job, &key, &sealed) {
         Ok(r) => r,
         Err(message) => return job.push(JobEvent::Error { message }),
@@ -127,6 +127,7 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>) {
                 &request,
                 &key,
                 ctx.config.download_as_needed,
+                lock_mark,
             )
             .await
         }
@@ -147,7 +148,7 @@ fn decrypt_request(
     let spec_json = key.open(sealed)?;
     let spec: JobSpec =
         serde_json::from_slice(&spec_json).map_err(|e| format!("invalid job spec: {e}"))?;
-    crate::jobspec::spec_into_request(spec, &job.dir, key, &ctx.config, &ctx.uploads)
+    crate::jobspec::spec_into_request(spec, &job.id, &job.dir, key, &ctx.config, &ctx.uploads)
 }
 
 async fn process(
@@ -156,6 +157,7 @@ async fn process(
     request: &JobRequest,
     key: &JobKey,
     download_as_needed: bool,
+    lock_mark: u64,
 ) {
     job.push(JobEvent::Started);
     // Durable job record (structural fields ONLY -- prompts are never logged).
@@ -190,6 +192,7 @@ async fn process(
     let sink = ServeSink {
         job: job.clone(),
         key,
+        lock_mark,
     };
     let summary = match executor.run(request, &sink).await {
         Ok(summary) => summary,
@@ -197,7 +200,7 @@ async fn process(
         // cancel (the denoise loop bails with GenerateError::Cancelled); report
         // it as Cancelled, not a failure. Any other error is a real failure.
         Err(message) => {
-            return if thinfer_core::secmem::failed() {
+            return if thinfer_core::secmem::failed_since(lock_mark) {
                 tracing::warn!(id = %job.id, "job stopped: job data could not be locked in RAM");
                 job.push(JobEvent::Error {
                     message: LOCK_FAILED.into(),
@@ -213,7 +216,7 @@ async fn process(
     };
     // A lock that failed after the last cancel poll: the result was sealed,
     // but some plaintext was swappable, so the job does not count as done.
-    if thinfer_core::secmem::failed() {
+    if thinfer_core::secmem::failed_since(lock_mark) {
         tracing::warn!(id = %job.id, "job stopped: job data could not be locked in RAM");
         return job.push(JobEvent::Error {
             message: LOCK_FAILED.into(),
@@ -258,11 +261,13 @@ pub const RESULT_FILE: &str = "result.sealed";
 struct ServeSink<'k> {
     job: Arc<JobHandle>,
     key: &'k JobKey,
+    /// [`thinfer_core::secmem::failure_mark`] at the job's start.
+    lock_mark: u64,
 }
 
 impl ProgressSink for ServeSink<'_> {
     fn artifact(&self, _path: &std::path::Path, bytes: &[u8]) -> Result<bool, String> {
-        if thinfer_core::secmem::failed() {
+        if thinfer_core::secmem::failed_since(self.lock_mark) {
             return Err(LOCK_FAILED.into());
         }
         let out = self.job.dir.join(RESULT_FILE);
@@ -282,6 +287,6 @@ impl ProgressSink for ServeSink<'_> {
     }
     fn cancelled(&self) -> bool {
         // A failed page lock stops the job at its next poll.
-        self.job.is_cancel_requested() || thinfer_core::secmem::failed()
+        self.job.is_cancel_requested() || thinfer_core::secmem::failed_since(self.lock_mark)
     }
 }

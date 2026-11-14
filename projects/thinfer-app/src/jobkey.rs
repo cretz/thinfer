@@ -9,13 +9,15 @@
 //! Blob layout: `[12-byte nonce][AES-GCM ciphertext + 16-byte tag]`. A fresh
 //! random nonce per seal; one key seals several blobs of the same job.
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::aead::{Aead, AeadInPlace};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
 use base64::Engine;
 use zeroize::Zeroizing;
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
+/// AES-GCM tag length (trails the ciphertext).
+const TAG_LEN: usize = 16;
 
 /// One job's key. Zeroed on drop and never rendered by `Debug`.
 pub struct JobKey(Zeroizing<[u8; KEY_LEN]>);
@@ -93,23 +95,36 @@ impl JobKey {
     }
 
     /// Open a blob from [`Self::seal`]. The plaintext is page-locked on a
-    /// server and zeroed on drop.
+    /// server and zeroed on drop: it is decrypted in place inside the locked
+    /// buffer, never in an ordinary allocation, and not at all when the lock
+    /// fails.
     pub fn open(&self, blob: &[u8]) -> Result<thinfer_core::secmem::Locked<u8>, String> {
-        if blob.len() < NONCE_LEN + 16 {
+        if blob.len() < NONCE_LEN + TAG_LEN {
             return Err("sealed blob too short".into());
         }
         let (nonce, body) = blob.split_at(NONCE_LEN);
+        let (ct, tag) = body.split_at(body.len() - TAG_LEN);
+        let mut out = thinfer_core::secmem::Locked::<u8>::zeroed(ct.len());
+        if out.lock_failed() {
+            return Err("could not lock job data in RAM (not enough lockable memory)".into());
+        }
+        out.copy_from_slice(ct);
         self.cipher()
-            .decrypt(Nonce::from_slice(nonce), body)
-            .map(thinfer_core::secmem::Locked::new)
-            .map_err(|_| "decrypt failed (wrong job key or corrupt data)".into())
+            .decrypt_in_place_detached(
+                Nonce::from_slice(nonce),
+                &[],
+                &mut out,
+                Tag::from_slice(tag),
+            )
+            .map_err(|_| "decrypt failed (wrong job key or corrupt data)".to_string())?;
+        Ok(out)
     }
 }
 
 /// Split a sealed blob into (base64 nonce, ciphertext+tag), the shape a
 /// decrypt-on-read input stores (`request::VideoInput::Encrypted`).
 pub fn split_sealed(blob: &[u8]) -> Result<(String, &[u8]), String> {
-    if blob.len() < NONCE_LEN + 16 {
+    if blob.len() < NONCE_LEN + TAG_LEN {
         return Err("sealed blob too short".into());
     }
     let (nonce, body) = blob.split_at(NONCE_LEN);

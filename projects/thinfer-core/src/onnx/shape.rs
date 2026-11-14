@@ -641,6 +641,11 @@ fn slice_ints(
         if step == 0 {
             return Err(PlanError::Shape("Slice step 0".into()));
         }
+        if d == 0 {
+            // Empty axis: empty slice (the clamps below need d >= 1).
+            sel[ax] = (0, step, 0);
+            continue;
+        }
         let norm = |x: i64| if x < 0 { x + d } else { x };
         let (s, e) = if step > 0 {
             (norm(starts[i]).clamp(0, d), norm(ends[i]).clamp(0, d))

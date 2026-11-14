@@ -136,6 +136,12 @@ fn window_attn_and_hadamard_match_host() {
             eprintln!("skipped: no adapter");
             return;
         };
+        // CI's Windows runners only have WARP, which did not finish this test
+        // in 30+ minutes (the kernel's 128-float per-thread arrays).
+        if be.is_software() {
+            eprintln!("skipped: software adapter");
+            return;
+        }
         let be = Arc::new(be);
         let mut acts = vec![(ActDtype::F32, 1e-4f32)];
         if be.supports_shader_f16() {
