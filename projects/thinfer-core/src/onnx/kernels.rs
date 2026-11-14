@@ -327,12 +327,16 @@ struct U { total: u32, val: f32, mode: u32, _p1: u32, id: vec4<u32>, od: vec4<u3
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> u: U;
 // mode 1 reflect (no edge repeat), 2 edge (clamp); in-range coords unchanged.
+// Reflect folds over the period 2(n-1), so pads wider than the axis reflect
+// repeatedly (numpy/ORT); a length-1 axis always maps to 0.
 fn wrap(c: i32, n: u32) -> i32 {
   let m = i32(n);
   if (u.mode == 1u) {
-    var r = c;
-    if (r < 0) { r = -r; }
-    if (r >= m) { r = 2 * (m - 1) - r; }
+    if (m == 1) { return 0; }
+    let p = 2 * (m - 1);
+    var r = c % p;
+    if (r < 0) { r = r + p; }
+    if (r >= m) { r = p - r; }
     return r;
   }
   return clamp(c, 0, m - 1);

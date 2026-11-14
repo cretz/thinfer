@@ -2010,7 +2010,8 @@ impl OnnxModel {
                             .and_then(|n| self.plan.consts.get(n))
                             .map(|d| d.as_i64().to_vec())
                     })
-                    .ok_or_else(|| OnnxError::Unsupported("ReduceSum without axes".into()))?;
+                    // No axes: every axis (ONNX default; matches shape inference).
+                    .unwrap_or_else(|| (0..rank).collect());
                 // Normalize + sort the axes. Multiple axes are supported only when
                 // contiguous (the common trailing-block reduce, e.g. StyleGAN
                 // weight demod over [in,kh,kw]): collapse them into one logical
