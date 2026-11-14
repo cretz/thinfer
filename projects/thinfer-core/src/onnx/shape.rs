@@ -655,11 +655,14 @@ fn slice_ints(
                 norm(ends[i]).clamp(-1, d - 1),
             )
         };
+        // In i128: `step` may be any i64 (e.g. i64::MIN), which overflows
+        // `-step` and the rounding sums. The count fits i64 (at most `d`).
+        let (s_w, e_w, st) = (s as i128, e as i128, step as i128);
         let len = if step > 0 {
-            (e - s + step - 1).div_euclid(step).max(0)
+            (e_w - s_w + st - 1).div_euclid(st).max(0)
         } else {
-            (s - e - step - 1).div_euclid(-step).max(0)
-        };
+            (s_w - e_w - st - 1).div_euclid(-st).max(0)
+        } as i64;
         sel[ax] = (s, step, len);
     }
     let out_shape: Vec<i64> = sel.iter().map(|s| s.2).collect();
@@ -864,7 +867,19 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
                         .and_then(|v| v.data.as_ref())
                         .map(|d| d.as_i64().to_vec())
                 })
-                .unwrap_or_else(|| (0..rank).collect());
+                .unwrap_or_default();
+            // Missing or empty axes: every axis, unless noop_with_empty_axes
+            // (identity), which nothing here needs.
+            let axes = if !axes.is_empty() {
+                axes
+            } else if node.attr_i("noop_with_empty_axes", 0) != 0 {
+                return Err(PlanError::Unsupported(format!(
+                    "{} with noop_with_empty_axes",
+                    node.op_type
+                )));
+            } else {
+                (0..rank).collect()
+            };
             let axset: std::collections::HashSet<i64> = axes
                 .iter()
                 .map(|&a| if a < 0 { a + rank } else { a })
@@ -994,4 +1009,29 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
         other => return Err(PlanError::Unsupported(format!("op '{other}'"))),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slice_ints;
+
+    fn slice(data: &[i64], shape: &[i64], s: i64, e: i64, step: i64) -> (Vec<i64>, Vec<i64>) {
+        slice_ints(data, shape, &[s], &[e], &[0], &[step]).expect("slice")
+    }
+
+    /// Extreme steps (any i64 is legal ONNX) and empty axes neither overflow
+    /// nor panic, and match numpy-style slicing.
+    #[test]
+    fn slice_ints_extreme_steps_and_empty_axes() {
+        let x = [10, 20, 30];
+        assert_eq!(slice(&x, &[3], 0, i64::MAX, i64::MAX), (vec![1], vec![10]));
+        assert_eq!(slice(&x, &[3], -1, i64::MIN, i64::MIN), (vec![1], vec![30]));
+        assert_eq!(
+            slice(&x, &[3], -1, i64::MIN, -1),
+            (vec![3], vec![30, 20, 10])
+        );
+        assert_eq!(slice(&x, &[3], 0, i64::MAX, 2), (vec![2], vec![10, 30]));
+        assert_eq!(slice(&[], &[0], -1, i64::MIN, -1), (vec![0], vec![]));
+        assert_eq!(slice(&[], &[0], 0, i64::MAX, 1), (vec![0], vec![]));
+    }
 }

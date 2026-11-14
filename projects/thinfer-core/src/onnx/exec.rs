@@ -2010,8 +2010,19 @@ impl OnnxModel {
                             .and_then(|n| self.plan.consts.get(n))
                             .map(|d| d.as_i64().to_vec())
                     })
-                    // No axes: every axis (ONNX default; matches shape inference).
-                    .unwrap_or_else(|| (0..rank).collect());
+                    .unwrap_or_default();
+                // Missing or empty axes: every axis (ONNX default; matches
+                // shape inference, which refuses noop_with_empty_axes).
+                let axes = if axes.is_empty() {
+                    if node.attr_i("noop_with_empty_axes", 0) != 0 {
+                        return Err(OnnxError::Unsupported(format!(
+                            "{op} with noop_with_empty_axes"
+                        )));
+                    }
+                    (0..rank).collect()
+                } else {
+                    axes
+                };
                 // Normalize + sort the axes. Multiple axes are supported only when
                 // contiguous (the common trailing-block reduce, e.g. StyleGAN
                 // weight demod over [in,kh,kw]): collapse them into one logical
@@ -2022,7 +2033,9 @@ impl OnnxModel {
                     .collect();
                 axset.sort_unstable();
                 axset.dedup();
-                let (first, last) = (axset[0], *axset.last().unwrap());
+                let (Some(&first), Some(&last)) = (axset.first(), axset.last()) else {
+                    return Err(OnnxError::Unsupported(format!("{op} over a scalar")));
+                };
                 if axset != (first..=last).collect::<Vec<_>>() {
                     return Err(OnnxError::Unsupported(
                         "ReduceSum over non-contiguous axes".into(),
