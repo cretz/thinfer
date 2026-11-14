@@ -86,9 +86,9 @@ async fn preprocess_parity() {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qwen_preprocess_parity");
     std::fs::create_dir_all(&tmp).expect("tmpdir");
     let png = tmp.join("input.png");
-    // Non-square so VAE/ViT aspect handling is exercised; mid-size keeps the run
-    // fast while still landing on real 28/32 grids.
-    write_test_png(&png, 200, 140);
+    // Non-square so VAE/ViT aspect handling is exercised; larger than both
+    // target areas so each channel downscales, as a real photo does.
+    write_test_png(&png, 1200, 840);
     let prompt = "make the sky a vivid sunset orange";
 
     run_python_ref(&png, snapshot_dir, snapshot_dir, prompt, &tmp);
@@ -98,7 +98,7 @@ async fn preprocess_parity() {
         .split_whitespace()
         .map(|s| s.parse().expect("meta int"))
         .collect();
-    let (gh, gw, n_img, pad_start, hv, wv) = (m[0], m[1], m[2], m[3], m[4], m[5]);
+    let (gh, gw, n_img, pad_start, hv, wv, drop) = (m[0], m[1], m[2], m[3], m[4], m[5], m[6]);
     eprintln!("preprocess-parity: ViT={gh}x{gw} n_img={n_img} pad_start={pad_start} VAE={hv}x{wv}");
 
     let ref_pixels = read_f32(&tmp.join("pixel_values.bin"));
@@ -115,6 +115,7 @@ async fn preprocess_parity() {
     assert_eq!(got.vit_grid, (gh, gw), "ViT grid mismatch");
     assert_eq!(got.vae_dims, (hv, wv), "VAE dims mismatch");
     assert_eq!(got.image_pad_start, pad_start, "image_pad_start mismatch");
+    assert_eq!(got.drop, drop, "template drop mismatch");
 
     // token_ids EXACT.
     assert_eq!(

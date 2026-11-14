@@ -275,6 +275,53 @@ pub trait Accelerator: Send + Sync {
     /// Inputs must be complete in VRAM (the caller drained the GPU).
     fn sdpa_f16(&self, a: &SdpaAddrs) -> Result<bool, String>;
 
+    /// Window attention with exactly the `ops::window_attn` contract on f16
+    /// Q/K/V/out (shapes in `u`). Inputs must be complete in VRAM (the caller
+    /// drained the GPU). Enqueued in stream order without a wait: outside a
+    /// deferred scope the caller syncs before reading `out`. `Ok(false)` =
+    /// declined.
+    fn window_attn_f16(
+        &self,
+        _u: &crate::ops::window_attn::WindowAttnUniform,
+        _a: &WindowAttnAddrs,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// 8-bit tensor-core GEMM `out = bf16(acc * sa[m] * sb[n] + bias[n])`
+    /// over per-row quantized operands ([`GemmQ8Addrs`], `[m, k]` x n-major
+    /// `[n, k]`), enqueued in stream order. `Ok(false)` = declined.
+    fn gemm_q8(&self, _a: &GemmQ8Addrs, _m: u32, _n: u32, _k: u32) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Per-row 8-bit quantization of a bf16 `[rows, k]` `x` into `q` and
+    /// `scale` (f32 `[rows]`, `max|row|` over the format's max), enqueued in
+    /// stream order. `Ok(false)` = declined.
+    fn quant_rows_q8(
+        &self,
+        _format: Q8,
+        _x: u64,
+        _q: u64,
+        _scale: u64,
+        _rows: u32,
+        _k: u32,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Unmasked f16 attention ([`DenseAttention`]) enqueued in stream order,
+    /// for deferred mode: no wait before or after. `Ok(false)` = declined
+    /// (nothing enqueued).
+    fn dense_attention_f16(&self, _a: &DenseAttention) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Host-side precheck for [`Self::dense_attention_f16`] at `head_dim`.
+    fn accepts_dense_attention(&self, _head_dim: u32) -> bool {
+        false
+    }
+
     /// Cheap host-side precheck for [`Self::gemm`] (before the flush + drain).
     fn accepts_gemm(&self, desc: &crate::ops::GemmDesc, m: u32, n: u32) -> bool;
 
@@ -356,6 +403,13 @@ pub trait Accelerator: Send + Sync {
         Ok(false)
     }
 
+    /// Without blocking: a future that resolves once everything enqueued so
+    /// far has run, reporting what [`Self::sync`] would. `None` = not
+    /// supported (the caller syncs).
+    fn fence(&self) -> Result<Option<AccelFence>, String> {
+        Ok(None)
+    }
+
     /// Wait for every op this accelerator has enqueued. [`Self::gemm_nvfp4`],
     /// [`Self::vsa`] and [`Self::elementwise`] only ENQUEUE (in order, on one
     /// stream); the caller syncs before anything else reads their outputs or
@@ -364,6 +418,9 @@ pub trait Accelerator: Send + Sync {
         Ok(())
     }
 }
+
+/// See [`Accelerator::fence`].
+pub type AccelFence = core::pin::Pin<Box<dyn Future<Output = Result<(), String>>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TileAttnShape {
@@ -646,6 +703,12 @@ pub enum ElementwiseOp {
     },
     /// `out = f16(x / (1 + exp(-x)))` over `n` f16.
     SiluF16 { x: u64, out: u64, n: u32 },
+    /// `out = f16(silu(g) * u)` over `n` f16 (separate gate / up buffers).
+    SiluMulF16 { g: u64, u: u64, out: u64, n: u32 },
+    /// `crate::ops::hadamard` out of place: every 256-wide group of the f16
+    /// `[rows, k]` `x` becomes `group @ H` (normalized regular Hadamard,
+    /// f32 math, one rounding) in `out`. `out` may alias `x`.
+    HadamardF16 { x: u64, out: u64, rows: u32, k: u32 },
     /// The Wan VAE's f16 time concat over `[b, c, t, hw]`: output frame `to`
     /// is `a[a_start + to]` (zero with `a_zero`) for `to < a_count`, else
     /// `b[b_start + to - a_count]`; `a` / `b` hold `a_t` / `b_t` frames.
@@ -677,6 +740,28 @@ pub enum ElementwiseOp {
     },
     /// `bytes` from `src` to `dst` (non-overlapping), in stream order.
     Copy { src: u64, dst: u64, bytes: u64 },
+    /// A GGUF block-quant `[n, k]` weight (row-contiguous blocks) into its
+    /// bf16 N-major image, with the arithmetic of `crate::quant`'s CPU
+    /// reference and one bf16 rounding.
+    Dequant {
+        kind: crate::quant::QuantKind,
+        src: u64,
+        out: u64,
+        n: u32,
+        k: u32,
+    },
+    /// A 16-bit `[rows, cols]` matrix into `out` as `[cols, rows]` (no
+    /// aliasing).
+    Transpose16 {
+        x: u64,
+        out: u64,
+        rows: u32,
+        cols: u32,
+    },
+    /// `out = f16(x)` over `n` bf16; `out` may alias `x`.
+    Bf16ToF16 { x: u64, out: u64, n: u32 },
+    /// `out = bf16(x)` over `n` f16; `out` may alias `x`.
+    F16ToBf16 { x: u64, out: u64, n: u32 },
 }
 
 /// Shapes for [`Accelerator::vsa`]. Tiles are 64 rows: the first `n_prefix`
@@ -878,6 +963,30 @@ pub fn nvfp4_fuses_lora_rank(rank: u32) -> bool {
     rank > 0 && rank.is_multiple_of(16) && rank <= NVFP4_FUSED_LORA_MAX_RANK
 }
 
+/// The 8-bit format of a [`Accelerator::gemm_q8`]'s operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q8 {
+    /// int8, `max|row| / 127` scales, int32 accumulate (exact).
+    I8,
+    /// FP8 e4m3, `max|row| / 16` scales, k-128 partials in f16 then summed in
+    /// f32 (sm_89+).
+    E4m3,
+}
+
+/// Device addresses of one [`Accelerator::gemm_q8`]: 8-bit `a` `[m, k]` with
+/// f32 per-row scales `sa` `[m]`, 8-bit n-major `b` `[n, k]` with `sb` `[n]`,
+/// bf16 `out` `[m, n]`, bf16 `bias` `[n]` (0 = none), both in `format`.
+#[derive(Clone, Copy, Debug)]
+pub struct GemmQ8Addrs {
+    pub format: Q8,
+    pub a: u64,
+    pub sa: u64,
+    pub b: u64,
+    pub sb: u64,
+    pub out: u64,
+    pub bias: u64,
+}
+
 /// Device addresses + launch shape for [`Accelerator::gemm`] (same roles as
 /// `MatmulBufs`).
 #[derive(Clone, Copy, Debug)]
@@ -914,6 +1023,34 @@ impl GemmEpilogue {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// [`Accelerator::dense_attention_f16`]: the `sdpa_sg` math with no mask on
+/// one batch of BSHD f16 tensors, `q` / `out` `[s_q, heads, head_dim]` (a row
+/// range of a longer sequence when offset), `k` / `v` `[s_k, kv_heads,
+/// head_dim]`. `out` may alias `q`: each query tile reads its rows before it
+/// writes them, and no other tile reads them.
+#[derive(Clone, Copy, Debug)]
+pub struct DenseAttention {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub out: u64,
+    pub s_q: u32,
+    pub s_k: u32,
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub scale: f32,
+}
+
+/// Device addresses for [`Accelerator::window_attn_f16`].
+#[derive(Clone, Copy, Debug)]
+pub struct WindowAttnAddrs {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub out: u64,
 }
 
 /// Device addresses for [`Accelerator::sdpa_f16`] (same roles as `SdpaBufs`).

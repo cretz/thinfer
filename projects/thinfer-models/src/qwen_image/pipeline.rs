@@ -39,11 +39,6 @@ use crate::z_image::pipeline::encode_png;
 /// system preamble (`prompt_template_encode_start_idx`).
 pub const DROP_IDX: usize = 34;
 
-/// Tokens dropped from the front of the EDIT encoder output: the edit prompt
-/// template's longer system preamble (`prompt_template_encode_start_idx` for the
-/// edit pipeline). The `<|image_pad|>` hiddens survive this drop.
-pub const EDIT_DROP_IDX: usize = 64;
-
 /// Progress notifications, mirroring `z_image`/`ideogram4::pipeline`.
 #[derive(Clone, Copy, Debug)]
 pub enum ProgressEvent {
@@ -409,7 +404,9 @@ impl<S: WeightSource> QwenImagePipeline<S> {
     ///
     /// `token_ids` carry the edit chat template with `<|image_pad|>` already
     /// expanded to `n_img = (vit_gh/2)*(vit_gw/2)` slots; `image_pad_start` is the
-    /// index of the first image-pad token. `vit_pixels` is the patchified ViT
+    /// index of the first image-pad token; the encoder output drops the first
+    /// `drop` rows (the template preamble; the image-pad hiddens survive it).
+    /// `vit_pixels` is the patchified ViT
     /// input `[N, 1176]` (`N = vit_gh*vit_gw`). `vae_image` is the SAME source
     /// image preprocessed for the VAE channel: CTHW `[3, 1, Hv, Wv]` in `[-1, 1]`.
     #[allow(clippy::too_many_arguments)]
@@ -417,6 +414,7 @@ impl<S: WeightSource> QwenImagePipeline<S> {
         &self,
         token_ids: &[u32],
         image_pad_start: usize,
+        drop: usize,
         vit_pixels: &[f32],
         vit_grid: (usize, usize),
         vae_image: &[f32],
@@ -502,7 +500,7 @@ impl<S: WeightSource> QwenImagePipeline<S> {
                 .map_err(GenerateError::Encode)?
         };
         let hd = enc_config::HIDDEN;
-        let drop = EDIT_DROP_IDX.min(enc.seq.saturating_sub(1));
+        let drop = drop.min(enc.seq.saturating_sub(1));
         let txt_embeds: Vec<f32> = enc.hidden[drop * hd..].to_vec();
         debug_assert_eq!(txt_embeds.len() % config::JOINT_ATTENTION_DIM, 0);
         self.residency.evict_all_and_free(&*self.backend);

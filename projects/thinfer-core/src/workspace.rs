@@ -1,5 +1,5 @@
 use crate::arbiter::{MemArbiter, MemReclaimer, RECLAIM_IDLE_POOL};
-use crate::backend::{Backend, Binding, BufRef};
+use crate::backend::{AccelFence, Backend, Binding, BufRef};
 use crate::tensor::GpuBufferId;
 use crate::trace;
 use crate::weight::WeightId;
@@ -202,7 +202,7 @@ impl<B: Backend> Workspace<B> {
         self.inner.lock().unwrap().pool_bytes
     }
 
-    fn size_class(bytes: u64) -> u64 {
+    pub(crate) fn size_class(bytes: u64) -> u64 {
         bytes.next_multiple_of(256).max(256)
     }
 
@@ -303,8 +303,10 @@ impl<B: Backend> Workspace<B> {
                 mixed: std::cell::Cell::new(false),
                 wgpu_dirty: std::cell::Cell::new(false),
                 accel_pending: std::cell::Cell::new(false),
+                backend_work: std::cell::Cell::new(false),
             },
             guards: RefCell::new(Vec::new()),
+            spare: RefCell::new(Vec::new()),
             scope_id: NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             gemm_scratch: RefCell::new(None),
             _life: PhantomData,
@@ -445,6 +447,9 @@ pub struct BatchScope<'wsp, B: Backend> {
     /// Declared before `guards` so it drops first (see [`Deferred`]).
     deferred: Deferred<'wsp, B>,
     guards: RefCell<Vec<WsBuf<B>>>,
+    /// [`Self::recycle`]d guards (size class, id) a later [`Self::alloc`]
+    /// may hand out again; they stay in `guards` until submit.
+    spare: RefCell<Vec<(u64, GpuBufferId)>>,
     scope_id: u64,
     /// The NVFP4 GEMMs' activation scratch, shared by every call in the
     /// scope (see [`Self::gemm_scratch`]).
@@ -478,6 +483,10 @@ struct Deferred<'wsp, B: Backend> {
     /// Mixed mode: accelerator work is enqueued since the last wait, so the
     /// next backend encode or queue write waits for it first.
     accel_pending: std::cell::Cell<bool>,
+    /// Backend work (an encode or queue write) since [`BatchScope::accel_begin`]
+    /// or the last drain: it runs at submit, after the accelerator's, so
+    /// buffers stop recycling until a drain completes it.
+    backend_work: std::cell::Cell<bool>,
 }
 
 impl<B: Backend> Drop for Deferred<'_, B> {
@@ -488,6 +497,16 @@ impl<B: Backend> Drop for Deferred<'_, B> {
         {
             tracing::error!(target: crate::trace::ADAPTER, error = %e, "accelerator sync failed abandoning a deferred scope");
         }
+    }
+}
+
+/// Await a scope's [`BatchScope::accel_end_fence`]. A failed fence is a lost
+/// device, as for a blocking wait.
+async fn await_fence(fence: Option<AccelFence>) {
+    if let Some(f) = fence
+        && let Err(e) = f.await
+    {
+        panic!("accelerator sync failed: {e}");
     }
 }
 
@@ -551,6 +570,18 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// retained in `guards` for the life of the scope; the returned handle
     /// is the safe way to bind it to dispatches.
     pub fn alloc(&self, bytes: u64) -> Result<BatchBuf<'wsp>, B::Error> {
+        if self.recycles() {
+            let class = Workspace::<B>::size_class(bytes);
+            let mut spare = self.spare.borrow_mut();
+            if let Some(i) = spare.iter().position(|&(c, _)| c == class) {
+                let (_, id) = spare.swap_remove(i);
+                return Ok(BatchBuf {
+                    buf: BufRef::view(id, 0, bytes),
+                    scope_id: self.scope_id,
+                    _phantom: PhantomData,
+                });
+            }
+        }
         let ws = self.workspace.alloc(bytes)?;
         let buf = ws.as_buf_ref();
         self.guards.borrow_mut().push(ws);
@@ -559,6 +590,30 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             scope_id: self.scope_id,
             _phantom: PhantomData,
         })
+    }
+
+    /// Declare `b`'s last use: a later [`Self::alloc`] of its size class in
+    /// this scope may hand the same buffer out again. Only in a pure
+    /// accelerator stretch ([`Self::accel_begin`], no backend work since):
+    /// those ops run in enqueue order on one stream, so the new writer runs
+    /// after every earlier reader. Anywhere else (and for imports) a no-op,
+    /// the buffer staying live until submit as usual.
+    pub fn recycle(&self, b: BatchBuf<'wsp>) {
+        if !self.recycles() || b.buf.offset != 0 {
+            return;
+        }
+        let guards = self.guards.borrow();
+        let Some(g) = guards.iter().find(|g| g.id() == b.buf.id) else {
+            return;
+        };
+        let mut spare = self.spare.borrow_mut();
+        if !spare.iter().any(|&(_, id)| id == b.buf.id) {
+            spare.push((Workspace::<B>::size_class(g.len()), b.buf.id));
+        }
+    }
+
+    fn recycles(&self) -> bool {
+        self.deferred.on.get() && !self.deferred.mixed.get() && !self.deferred.backend_work.get()
     }
 
     /// Allocate one scratch buffer of `a_bytes + b_bytes` and return three
@@ -734,7 +789,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// guards live until GPU completion regardless of future state. v1
     /// callers don't cancel submit futures; tracked as a follow-up.
     pub async fn submit(self, out: BatchBuf<'wsp>) -> Result<WsBuf<B>, B::Error> {
-        self.accel_end();
+        let fence = self.accel_end_fence();
         debug_assert_eq!(
             out.scope_id, self.scope_id,
             "submit output BatchBuf came from a different scope"
@@ -753,6 +808,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             .expect("submit output BatchBuf was not allocated by this scope");
         let out_ws = guards.swap_remove(idx);
         self.backend.submit(enc).await?;
+        await_fence(fence).await;
         Ok(out_ws)
     }
 
@@ -763,6 +819,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         for h in outs {
             debug_assert_eq!(h.scope_id, self.scope_id);
         }
+        let fence = self.accel_end_fence();
         let enc = self
             .encoder
             .into_inner()
@@ -777,6 +834,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             result.push(guards.swap_remove(idx));
         }
         self.backend.submit(enc).await?;
+        await_fence(fence).await;
         Ok(result)
     }
 
@@ -799,6 +857,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         for h in outs {
             debug_assert_eq!(h.scope_id, self.scope_id);
         }
+        let fence = self.accel_end_fence();
         let enc = self
             .encoder
             .into_inner()
@@ -815,7 +874,9 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let fut = self.backend.submit(enc);
         let completion = async move {
             let _g = guards;
-            fut.await
+            let r = fut.await;
+            await_fence(fence).await;
+            r
         };
         (result, completion)
     }
@@ -824,12 +885,13 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// completion. Use when the scope's effect is a side-effect on an
     /// imported (caller-owned) destination buffer.
     pub async fn submit_void(self) -> Result<(), B::Error> {
-        self.accel_end();
+        let fence = self.accel_end_fence();
         let enc = self
             .encoder
             .into_inner()
             .expect("BatchScope encoder already taken");
         self.backend.submit(enc).await?;
+        await_fence(fence).await;
         Ok(())
     }
 
@@ -849,6 +911,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// `scope.import`) must also be held alive until the returned future
     /// resolves. The scope only tracks buffers it allocated itself.
     pub fn submit_deferred(self) -> impl core::future::Future<Output = Result<(), B::Error>> {
+        let fence = self.accel_end_fence();
         let enc = self
             .encoder
             .into_inner()
@@ -859,7 +922,9 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let fut = self.backend.submit(enc);
         async move {
             let _g = guards;
-            fut.await
+            let r = fut.await;
+            await_fence(fence).await;
+            r
         }
     }
 }
@@ -1330,6 +1395,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         self.flush()?;
         self.backend.wait_idle();
         self.deferred.wgpu_dirty.set(false);
+        self.deferred.backend_work.set(false);
         if self.deferred.mixed.get() {
             self.deferred.accel_pending.set(true);
         }
@@ -1359,6 +1425,52 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         }
     }
 
+    /// [`crate::ops::window_attn`] on the accelerator (f16 acts). In a
+    /// deferred scope it is enqueued in stream order like the other deferred
+    /// ops; otherwise drained first and waited for. `false` = run the wgpu
+    /// kernel.
+    pub fn try_window_attn(
+        &self,
+        q: BatchBuf<'wsp>,
+        k: BatchBuf<'wsp>,
+        v: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        u: &crate::ops::window_attn::WindowAttnUniform,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let (Some(q), Some(k), Some(v), Some(out)) = (addr(q), addr(k), addr(v), addr(out)) else {
+            return Ok(false);
+        };
+        let t0 = crate::trace::Instant::now();
+        self.accel_drain()?;
+        let t1 = crate::trace::Instant::now();
+        let res = acc
+            .window_attn_f16(u, &crate::backend::WindowAttnAddrs { q, k, v, out })
+            .and_then(|done| {
+                if done {
+                    self.accel_settle(acc)?;
+                }
+                Ok(done)
+            });
+        tracing::debug!(
+            target: crate::trace::DIAG,
+            op = "window_attn",
+            drain_us = (t1 - t0).as_micros() as u64,
+            run_us = t1.elapsed().as_micros() as u64,
+            "accel call",
+        );
+        match res {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator window attention failed; wgpu op");
+                Ok(false)
+            }
+        }
+    }
+
     /// `out[M,N] = a[M,K] @ b` with `pipeline`'s dense-matmul contract on the
     /// accelerator, `k` from the host (no uniform). Deferred-aware like
     /// [`Self::try_gemm_nvfp4`]. `false` = not covered: run the backend op.
@@ -1376,8 +1488,25 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let Some(desc) = self.backend.pipeline_gemm(pipeline) else {
             return Ok(false);
         };
+        self.try_gemm_desc(&desc, a, b, out, m, n, k)
+    }
+
+    /// [`Self::try_gemm`] under an explicit contract, for a site whose wgpu
+    /// pipeline carries none (a quant site that dequantizes into its own dense
+    /// workspace first).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_desc(
+        &self,
+        desc: &crate::ops::GemmDesc,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<bool, B::Error> {
         let (a, b, out) = (self.resolve(a), self.resolve(b), self.resolve(out));
-        self.try_accel_gemm(&desc, &a, &b, None, &out, m, n, k, Default::default())
+        self.try_accel_gemm(desc, &a, &b, None, &out, m, n, k, Default::default())
     }
 
     /// [`Self::try_gemm`] with a fused epilogue (see
@@ -1398,6 +1527,23 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let Some(desc) = self.backend.pipeline_gemm(pipeline) else {
             return Ok(false);
         };
+        self.try_gemm_desc_fused(&desc, a, b, out, m, n, k, epi)
+    }
+
+    /// [`Self::try_gemm_fused`] under an explicit accelerator contract (a
+    /// quant site's dequantized image, which no compiled pipeline describes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_desc_fused(
+        &self,
+        desc: &crate::ops::GemmDesc,
+        a: BatchBuf<'wsp>,
+        b: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+        m: u32,
+        n: u32,
+        k: u32,
+        epi: GemmEpi<'wsp>,
+    ) -> Result<bool, B::Error> {
         let addr = |b: Option<BatchBuf<'wsp>>| match b {
             Some(b) => self.backend.device_address(&self.resolve(b)),
             None => Some(0),
@@ -1413,10 +1559,15 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             residual,
             gate,
         };
-        self.try_accel_gemm(&desc, &a, &b, None, &out, m, n, k, epilogue)
+        self.try_accel_gemm(desc, &a, &b, None, &out, m, n, k, epilogue)
     }
 
     /// Whether [`Self::try_gemm`] would take this shape (cheap, host-side).
+    /// `pipeline`'s accelerator GEMM contract, for up-front shape checks.
+    pub fn pipeline_gemm(&self, pipeline: &B::Pipeline) -> Option<crate::ops::GemmDesc> {
+        self.backend.pipeline_gemm(pipeline)
+    }
+
     pub fn accepts_gemm(&self, pipeline: &B::Pipeline, m: u32, n: u32) -> bool {
         match (
             self.backend.accelerator(),
@@ -1569,6 +1720,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         self.flush()?;
         self.backend.wait_idle();
         self.deferred.on.set(true);
+        self.deferred.backend_work.set(false);
         Ok(true)
     }
 
@@ -1599,6 +1751,31 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         }
     }
 
+    /// [`Self::accel_end`] for a submit: when no backend work is left to run
+    /// at submit (it could touch what the accelerator still reads), a fence
+    /// to await with the backend's completion instead of a blocking wait, so
+    /// other futures progress while the accelerator runs. The scope's guards
+    /// must outlive it. `None` = nothing pending, or waited here.
+    fn accel_end_fence(&self) -> Option<AccelFence> {
+        if self.deferred.on.get()
+            && !self.deferred.backend_work.get()
+            && let Some(acc) = self.backend.accelerator()
+        {
+            match acc.fence() {
+                Ok(Some(f)) => {
+                    self.deferred.mixed.set(false);
+                    self.deferred.accel_pending.set(false);
+                    self.deferred.on.set(false);
+                    return Some(f);
+                }
+                Ok(None) => {}
+                Err(e) => panic!("accelerator fence failed: {e}"),
+            }
+        }
+        self.accel_end();
+        None
+    }
+
     fn accel_wait(&self) {
         if let Some(acc) = self.backend.accelerator()
             && let Err(e) = acc.sync()
@@ -1615,6 +1792,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         if !on || (self.deferred.mixed.get() && self.deferred.wgpu_dirty.replace(false)) {
             self.flush()?;
             self.backend.wait_idle();
+            self.deferred.backend_work.set(false);
         }
         if self.deferred.mixed.get() {
             self.deferred.accel_pending.set(true);
@@ -1626,6 +1804,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
     /// the next submit): wait for enqueued accelerator work, and make the
     /// next accelerator op flush first.
     fn note_backend_work(&self) {
+        self.deferred.backend_work.set(true);
         if self.deferred.mixed.get() {
             if self.deferred.accel_pending.replace(false) {
                 self.accel_wait();
@@ -1675,6 +1854,75 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             Ok(ran) => ran,
             Err(e) => {
                 tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator elementwise failed");
+                false
+            }
+        }
+    }
+
+    /// Enqueue [`crate::backend::DenseAttention`] (deferred mode only).
+    /// `false` = declined; work already enqueued stays valid.
+    pub fn accel_dense_attention(&self, a: &crate::backend::DenseAttention) -> bool {
+        debug_assert!(
+            self.deferred.on.get(),
+            "accel_dense_attention outside deferred mode"
+        );
+        let Some(acc) = self.backend.accelerator() else {
+            return false;
+        };
+        if let Err(e) = self.accel_drain() {
+            tracing::warn!(target: crate::trace::ADAPTER, error = ?e, "flush before an accelerator op failed");
+            return false;
+        }
+        match acc.dense_attention_f16(a) {
+            Ok(ran) => ran,
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator dense attention failed");
+                false
+            }
+        }
+    }
+
+    /// Enqueue [`crate::backend::Accelerator::gemm_q8`] (deferred mode only).
+    /// `false` = declined; work already enqueued stays valid.
+    pub fn accel_gemm_q8(&self, a: &crate::backend::GemmQ8Addrs, m: u32, n: u32, k: u32) -> bool {
+        self.accel_deferred_call("gemm_q8", |acc| acc.gemm_q8(a, m, n, k))
+    }
+
+    /// Enqueue [`crate::backend::Accelerator::quant_rows_q8`] (deferred mode
+    /// only). `false` = declined.
+    pub fn accel_quant_rows_q8(
+        &self,
+        format: crate::backend::Q8,
+        x: u64,
+        q: u64,
+        scale: u64,
+        rows: u32,
+        k: u32,
+    ) -> bool {
+        self.accel_deferred_call("quant_rows_q8", |acc| {
+            acc.quant_rows_q8(format, x, q, scale, rows, k)
+        })
+    }
+
+    /// Drain dirty backend work, then run `call` on the accelerator (deferred
+    /// mode only). A failure logs and declines.
+    fn accel_deferred_call(
+        &self,
+        what: &str,
+        call: impl FnOnce(&dyn crate::backend::Accelerator) -> Result<bool, String>,
+    ) -> bool {
+        debug_assert!(self.deferred.on.get(), "{what} outside deferred mode");
+        let Some(acc) = self.backend.accelerator() else {
+            return false;
+        };
+        if let Err(e) = self.accel_drain() {
+            tracing::warn!(target: crate::trace::ADAPTER, error = ?e, "flush before an accelerator op failed");
+            return false;
+        }
+        match call(acc) {
+            Ok(ran) => ran,
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, op = what, "accelerator op failed");
                 false
             }
         }
@@ -3030,6 +3278,25 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         )
     }
 
+    /// Raw dispatch: `bufs` bind to slots `0..n` in order, explicit grid. For
+    /// kernels whose launch shape is not a function of one output's size
+    /// (`ops::window_attn`, `ops::hadamard`).
+    pub fn dispatch(
+        &self,
+        pipeline: &B::Pipeline,
+        bufs: &[BatchBuf<'wsp>],
+        workgroups: [u32; 3],
+    ) -> Result<(), B::Error> {
+        let refs: Vec<BufRef> = bufs.iter().map(|&b| self.resolve(b)).collect();
+        let bindings: Vec<Binding> = refs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r.binding(i as u32))
+            .collect();
+        self.backend
+            .dispatch(&mut self.encoder_mut(), pipeline, &bindings, workgroups)
+    }
+
     /// Generic elementwise op dispatch (AddF32, MulF32, SiluF32, TanhF32).
     pub fn dispatch_op<O: crate::ops::Op>(
         &self,
@@ -3390,6 +3657,7 @@ where
             backend,
             encoder,
             guards,
+            spare: _,
             scope_id: _,
             deferred: _,
             gemm_scratch: _,

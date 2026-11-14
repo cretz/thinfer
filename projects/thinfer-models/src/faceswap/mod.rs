@@ -27,6 +27,8 @@ use occluder::Occluder;
 /// accuracy for speed).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SwapOptions {
+    /// The swapper network (its input / output / embedding conventions).
+    pub swapper: SwapperKind,
     /// Intersect the paste mask with HyperSwap's own confidence mask output
     /// (its 2nd output, otherwise ignored). Tightens the blend to the region the
     /// GAN actually synthesized. Free (already computed).
@@ -40,6 +42,36 @@ pub struct SwapOptions {
     /// to be loaded). Restores GAN detail (skin/eyes/teeth). Adds one ONNX
     /// forward per face.
     pub enhance: bool,
+}
+
+/// The 256 swapper network: both take the `arcface_128` crop and a 512-d
+/// ArcFace source, with FaceFusion's per-model conventions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SwapperKind {
+    /// HyperSwap: target `[-1, 1]`, L2-normalized source, output `[-1, 1]`
+    /// plus a confidence mask.
+    #[default]
+    HyperSwap,
+    /// AlphaFace: target `[0, 1]`, raw (unnormalized) source, output `[0, 1]`.
+    AlphaFace,
+}
+
+impl SwapperKind {
+    /// Target pixel map `a * p + b` from `[0, 255]`.
+    fn target_affine(self) -> (f32, f32) {
+        match self {
+            SwapperKind::HyperSwap => (1.0 / 127.5, -1.0),
+            SwapperKind::AlphaFace => (1.0 / 255.0, 0.0),
+        }
+    }
+
+    /// Output map `a * v + b` to `[0, 1]`.
+    fn output_affine(self) -> (f32, f32) {
+        match self {
+            SwapperKind::HyperSwap => (0.5, 0.5),
+            SwapperKind::AlphaFace => (1.0, 0.0),
+        }
+    }
 }
 
 /// FaceFusion 5-point alignment templates (normalized to `[0, 1]`; multiply by
@@ -91,9 +123,9 @@ pub const SWAP_BATCH: usize = 4;
 pub struct FaceSwapper {
     scrfd: OnnxModel,
     arcface: OnnxModel,
-    hyperswap: OnnxModel,
-    hyperswap_source_name: String,
-    hyperswap_target_name: String,
+    swapper: OnnxModel,
+    swapper_source_name: String,
+    swapper_target_name: String,
     occluder: Option<Occluder>,
     enhancer: Option<Enhancer>,
     opts: SwapOptions,
@@ -107,13 +139,13 @@ impl FaceSwapper {
         backend: Arc<WgpuBackend>,
         scrfd_onnx: &[u8],
         arcface_onnx: &[u8],
-        hyperswap_onnx: &[u8],
+        swapper_onnx: &[u8],
     ) -> Result<Self, OnnxError> {
         Self::load_with(
             backend,
             scrfd_onnx,
             arcface_onnx,
-            hyperswap_onnx,
+            swapper_onnx,
             SwapOptions::default(),
             None,
             None,
@@ -128,7 +160,7 @@ impl FaceSwapper {
         backend: Arc<WgpuBackend>,
         scrfd_onnx: &[u8],
         arcface_onnx: &[u8],
-        hyperswap_onnx: &[u8],
+        swapper_onnx: &[u8],
         opts: SwapOptions,
         xseg_onnx: Option<&[u8]>,
         gfpgan_onnx: Option<&[u8]>,
@@ -170,43 +202,51 @@ impl FaceSwapper {
         // -- their i8 error is unvalidated and detection quality is load-bearing).
         // Gated OFF by default; i8 rounds the GAN and needs a visual eyeball.
         let i8_conv = std::env::var_os("THINFER_ONNX_I8_CONV").is_some();
-        let hyperswap = OnnxModel::load_i8(
+        // AlphaFace is ~1.3 TFLOP per crop, nearly all 3x3 convs: bf16 tensor
+        // cores when the backend has an accelerator (validated by eye and
+        // against the f32 path; HyperSwap keeps its wgpu bits).
+        let accel_conv = opts.swapper == SwapperKind::AlphaFace;
+        let swapper = OnnxModel::load_with(
             Arc::clone(&backend),
-            hyperswap_onnx,
-            &hyperswap_shapes(hyperswap_onnx, SWAP_BATCH)?,
-            i8_conv,
+            swapper_onnx,
+            &swapper_shapes(swapper_onnx, SWAP_BATCH)?,
+            thinfer_core::onnx::LoadOptions {
+                i8_conv,
+                accel_conv,
+            },
         )
         .await?;
 
-        // HyperSwap has two inputs: the 512-d source embedding and the 256x256
+        // The swapper has two inputs: the 512-d source embedding and the 256x256
         // target crop. Identify by name (FaceFusion uses "source"/"target").
-        let source_name = hyperswap
+        let source_name = swapper
             .input_names
             .iter()
             .find(|n| n.to_lowercase().contains("source") || n.to_lowercase().contains("emb"))
             .cloned()
-            .unwrap_or_else(|| hyperswap.input_names[0].clone());
-        let target_name = hyperswap
+            .unwrap_or_else(|| swapper.input_names[0].clone());
+        let target_name = swapper
             .input_names
             .iter()
             .find(|n| **n != source_name)
             .cloned()
-            .unwrap_or_else(|| hyperswap.input_names[1].clone());
+            .unwrap_or_else(|| swapper.input_names[1].clone());
 
         Ok(Self {
             scrfd,
             arcface,
-            hyperswap,
-            hyperswap_source_name: source_name,
-            hyperswap_target_name: target_name,
+            swapper,
+            swapper_source_name: source_name,
+            swapper_target_name: target_name,
             occluder,
             enhancer,
             opts,
         })
     }
 
-    /// Extract the 512-d (L2-normalized) ArcFace embedding of the first face in
-    /// `img`. Errors if no face is detected.
+    /// Extract the 512-d ArcFace embedding of the first face in `img`, in the
+    /// swapper's convention (L2-normalized for HyperSwap, raw for AlphaFace).
+    /// Errors if no face is detected.
     pub async fn source_embedding(&self, img: &Image) -> Result<Vec<f32>, OnnxError> {
         let faces = detect::detect(&self.scrfd, img).await?;
         let face = faces
@@ -221,7 +261,10 @@ impl FaceSwapper {
         let (_shape, emb) = out
             .get(&self.arcface.output_names[0])
             .ok_or_else(|| OnnxError::Unsupported("arcface output missing".into()))?;
-        Ok(l2_normalize(emb))
+        Ok(match self.opts.swapper {
+            SwapperKind::HyperSwap => l2_normalize(emb),
+            SwapperKind::AlphaFace => emb.clone(),
+        })
     }
 
     /// Detect every face in `frame` and swap each one using `source_embedding`.
@@ -294,8 +337,8 @@ impl FaceSwapper {
                     &TEMPLATE_ARCFACE_128,
                     SWAP_SIZE,
                 );
-                // HyperSwap target: RGB, (p/255 - 0.5)/0.5 == p/127.5 - 1.
-                let target = to_nchw(&crop, false, 1.0 / 127.5, -1.0);
+                let (a, b) = self.opts.swapper.target_affine();
+                let target = to_nchw(&crop, false, a, b);
                 jobs.push(CropJob {
                     frame_idx,
                     face: face.clone(),
@@ -314,11 +357,11 @@ impl FaceSwapper {
         let mut swaps: Vec<(Image, Option<Vec<f32>>)> = Vec::with_capacity(jobs.len());
         for chunk in jobs.chunks(SWAP_BATCH) {
             let targets: Vec<&[f32]> = chunk.iter().map(|j| j.target.as_slice()).collect();
-            swaps.extend(self.hyperswap_batch(&targets, source_embedding).await?);
+            swaps.extend(self.swap_batch(&targets, source_embedding).await?);
         }
         if prof {
             eprintln!(
-                "[fs-profile] hyperswap_batch crops={} run={:.1}ms",
+                "[fs-profile] swap_batch crops={} run={:.1}ms",
                 jobs.len(),
                 t.elapsed().as_secs_f64() * 1e3
             );
@@ -348,12 +391,12 @@ impl FaceSwapper {
         Ok(())
     }
 
-    /// Run HyperSwap over `targets` (<= [`SWAP_BATCH`] NCHW crops) in one
+    /// Run the swapper over `targets` (<= [`SWAP_BATCH`] NCHW crops) in one
     /// dispatch. The batch is padded to SWAP_BATCH (extra rows discarded); the
     /// single `source_embedding` broadcasts across every row. Returns, per input
     /// crop, the de-normalized swapped image and its raw confidence mask (if the
     /// model emits one).
-    async fn hyperswap_batch(
+    async fn swap_batch(
         &self,
         targets: &[&[f32]],
         source_embedding: &[f32],
@@ -366,12 +409,9 @@ impl FaceSwapper {
             stacked[i * per..(i + 1) * per].copy_from_slice(t);
         }
         let mut feeds = HashMap::new();
-        feeds.insert(self.hyperswap_target_name.clone(), stacked);
-        feeds.insert(
-            self.hyperswap_source_name.clone(),
-            source_embedding.to_vec(),
-        );
-        let out = self.hyperswap.run(&feeds).await?;
+        feeds.insert(self.swapper_target_name.clone(), stacked);
+        feeds.insert(self.swapper_source_name.clone(), source_embedding.to_vec());
+        let out = self.swapper.run(&feeds).await?;
 
         // Locate the 3-channel image output and the optional 1-channel mask by
         // shape (batch-robust; the name heuristic only picks the tensor).
@@ -380,7 +420,7 @@ impl FaceSwapper {
             .find(|(k, (sh, _))| sh.len() == 4 && sh[1] == 3 && k.to_lowercase().contains("output"))
             .or_else(|| out.iter().find(|(_, (sh, _))| sh.len() == 4 && sh[1] == 3))
             .map(|(_, v)| v)
-            .ok_or_else(|| OnnxError::Unsupported("hyperswap output missing".into()))?;
+            .ok_or_else(|| OnnxError::Unsupported("swapper output missing".into()))?;
         let mask = out
             .iter()
             .find(|(k, (sh, _))| sh.len() == 4 && sh[1] == 1 && k.to_lowercase().contains("mask"))
@@ -388,9 +428,10 @@ impl FaceSwapper {
             .map(|(_, (_, d))| d);
 
         let hw = SWAP_SIZE * SWAP_SIZE;
+        let (a, b) = self.opts.swapper.output_affine();
         let mut res = Vec::with_capacity(n);
         for i in 0..n {
-            let swapped = nchw_to_image(&img.1[i * per..(i + 1) * per], SWAP_SIZE, SWAP_SIZE);
+            let swapped = nchw_to_image(&img.1[i * per..(i + 1) * per], SWAP_SIZE, SWAP_SIZE, a, b);
             let m = mask.map(|md| md[i * hw..(i + 1) * hw].to_vec());
             res.push((swapped, m));
         }
@@ -466,13 +507,13 @@ fn to_nchw(img: &Image, bgr: bool, a: f32, b: f32) -> Vec<f32> {
     out
 }
 
-/// NCHW `[1,3,h,w]` in `[-1,1]` -> HWC RGB `[0,255]` Image (`*0.5+0.5`, clamp).
-fn nchw_to_image(data: &[f32], w: usize, h: usize) -> Image {
+/// NCHW `[1,3,h,w]` -> HWC RGB `[0,255]` Image via `a * v + b` to `[0, 1]`, clamped.
+fn nchw_to_image(data: &[f32], w: usize, h: usize, a: f32, b: f32) -> Image {
     let hw = w * h;
     let mut img = Image::new(w, h);
     for i in 0..hw {
         for c in 0..3 {
-            let v = (data[c * hw + i] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0;
+            let v = (data[c * hw + i] * a + b).clamp(0.0, 1.0) * 255.0;
             img.data[i * 3 + c] = v;
         }
     }
@@ -500,10 +541,10 @@ fn input_shape_map(onnx: &[u8], shape: &[i64]) -> Result<HashMap<String, Vec<i64
     Ok(m)
 }
 
-/// HyperSwap input-shape map: 512-d source + `batch`x256x256x3 target, bound by
+/// Swapper input-shape map: 512-d source + `batch`x256x256x3 target, bound by
 /// name. The source stays `[1, 512]` and broadcasts across the target batch (one
 /// source face swapped into every crop).
-fn hyperswap_shapes(onnx: &[u8], batch: usize) -> Result<HashMap<String, Vec<i64>>, OnnxError> {
+fn swapper_shapes(onnx: &[u8], batch: usize) -> Result<HashMap<String, Vec<i64>>, OnnxError> {
     let graph =
         thinfer_core::onnx::proto::parse_model(onnx).map_err(|e| OnnxError::Io(e.to_string()))?;
     let mut m = HashMap::new();

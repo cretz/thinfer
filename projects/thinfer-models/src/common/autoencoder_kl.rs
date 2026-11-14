@@ -797,7 +797,7 @@ pub struct ConvPipeline {
 }
 
 impl ConvPipeline {
-    async fn compile(
+    pub(crate) async fn compile(
         backend: &WgpuBackend,
         label: &str,
         cfg: &WgslConfig,
@@ -1009,7 +1009,7 @@ impl From<WgpuError> for VaeForwardError {
     }
 }
 
-fn conv2d_uniform<'wsp>(
+pub(crate) fn conv2d_uniform<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
     cfg_in: (u32, u32, u32, u32),           // (b, cin, h_in, w_in)
     cfg_out: (u32, u32, u32),               // (cout, h_out, w_out)

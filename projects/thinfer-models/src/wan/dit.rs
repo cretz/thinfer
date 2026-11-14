@@ -35,7 +35,7 @@ use tracing::Instrument;
 
 use thinfer_core::trace::{self, PHASE};
 
-use crate::common::block::{ActBuf, BlockPipelines, alloc_act, alloc_matmul_out_buf};
+use crate::common::block::{ActBuf, BlockPipelines, alloc_act, alloc_matmul_out_buf, op_add};
 use crate::common::embedders::{LinearBiasBufs, LinearBiasHandles};
 use crate::common::seq::{act_upload_bytes, freqs_upload_bytes};
 use crate::wan::condition_embedder::{
@@ -45,14 +45,6 @@ use crate::wan::dit_block::{
     WanDitBlock, WanDitBlockBufs, WanDitBlockHandles, WanDitBlockShape, WanDitBlockTaps,
     WanDitConfig, WanDitPipelines, WanMod, config,
 };
-use crate::wan::kv_cache::{ChunkPlan, KvStore};
-
-/// Per-layer clean-pass K/V commit sinks for [`WanDit::forward_ar`]: when `Some`,
-/// the chunk's roped-k (`.0`) and v (`.1`) bytes are read back per layer (one
-/// `Vec<u8>` per DiT layer) so the cache tail can be committed. `None` on the 4
-/// denoise steps (read-only window).
-type ChunkKvCommit<'a> = Option<(&'a mut Vec<Vec<u8>>, &'a mut Vec<Vec<u8>>)>;
-
 use crate::wan::patchify::{self, PatchGrid};
 use crate::wan::rope3d::WanRope3d;
 
@@ -63,8 +55,7 @@ use crate::wan::rope3d::WanRope3d;
 /// pair in-scope (the block's weights are already resident) and reads it back;
 /// every later forward replays the exact bytes, skipping the two `[text_seq,
 /// dim] @ [inner, dim]T` projections + k-norm per layer. The byte round-trip
-/// keeps the SDPA inputs bit-identical. Used by [`WanDit::forward_ar`] (one
-/// cache per unique prompt) and by the tiled denoise step loop via
+/// keeps the SDPA inputs bit-identical. Used by the tiled denoise step loop via
 /// [`WanDit::forward_cached`] (one cache per DiT weight set - the K/V depend
 /// on the block weights, so MoE experts must not share one). Sizing:
 /// `num_layers * 2 * text_seq * inner * act_bytes` host RAM (~189 MB at 30
@@ -195,6 +186,10 @@ pub struct WanDitInputs<'a> {
     /// attack for long clips); `None` runs full self-attention. Set per run from
     /// the `--attn-window` flag.
     pub attn_window: Option<u32>,
+    /// Act-dtype `[n_tok, inner]` tokens added to the patch-embedded stream
+    /// before the blocks (RelayVSR's `lq_proj_in` LR projection). `None` on
+    /// every other model.
+    pub token_add: Option<BufRef>,
 }
 
 /// One DiT forward output, ready for VAE decode.
@@ -308,11 +303,14 @@ impl WanDit {
         } else {
             0
         };
-        let block = WanDitBlock::new(WanDitBlockShape::new(
-            &cfg,
-            shape.n_tok + ref_rows,
-            shape.text_seq,
-        ));
+        let mut block_shape = WanDitBlockShape::new(&cfg, shape.n_tok + ref_rows, shape.text_seq);
+        block_shape.window = cfg.relay.map(|relay| super::dit_block::WindowGeom {
+            planes: shape.grid.ppf as u32,
+            h: shape.grid.pph as u32,
+            w: shape.grid.ppw as u32,
+            relay,
+        });
+        let block = WanDitBlock::new(block_shape);
         Self {
             shape,
             cfg,
@@ -456,6 +454,22 @@ impl WanDit {
             )?;
             scope.submit_void().await?;
         }
+        let x = match inputs.token_add {
+            Some(add) => {
+                let sum = ResStream::alloc(scratch, bp, rows, inner)?;
+                let scope = scratch.batch();
+                op_add(
+                    &scope,
+                    bp,
+                    ActBuf::dense(scope.import_copy(add)),
+                    ActBuf::dense(scope.import_copy(x.as_act_ref())),
+                    ActBuf::dense(scope.import_copy(sum.as_act_ref())),
+                )?;
+                scope.submit_void().await?;
+                sum
+            }
+            None => x,
+        };
         read_tap(
             backend,
             &x.as_act_ref(),
@@ -916,7 +930,9 @@ impl WanDit {
     /// block runs for all inputs while it is resident, so a streamed DiT is
     /// read once per call instead of once per input (DreamID-V's two
     /// image-CFG forwards). Per input it is exactly [`Self::forward`]'s
-    /// dispatch sequence: bit-identical outputs. Untiled models only.
+    /// dispatch sequence: bit-identical outputs. Untiled models only
+    /// (DreamID-V; RelayVSR's keyframe forward, one input, for the deferred
+    /// accelerator block).
     pub async fn forward_many<S: WeightSource>(
         &self,
         backend: &WgpuBackend,
@@ -926,8 +942,8 @@ impl WanDit {
         inputs: &[WanDitInputs<'_>],
     ) -> Result<Vec<WanDitOutput>, WanDitError<S::Error>> {
         assert!(
-            self.cfg.ref_conv && !self.cfg.rehyat,
-            "forward_many runs the untiled block path (DreamID-V)"
+            (self.cfg.ref_conv || self.cfg.relay.is_some()) && !self.cfg.rehyat,
+            "forward_many runs the untiled block path (DreamID-V, RelayVSR)"
         );
         let bp = &pipelines.block;
         let inner = self.cfg.inner() as u32;
@@ -1019,287 +1035,6 @@ impl WanDit {
             );
         }
         Ok(out)
-    }
-
-    /// AR (LongLive) forward for ONE chunk against the windowed KV cache. Same
-    /// backbone as [`Self::forward`] (patchify, condition embedder, the 30 blocks,
-    /// final norm + proj_out, unpatchify); the ONLY difference is the per-block
-    /// self-attention, which runs [`WanDitBlock::self_attn_ar`] over `[committed
-    /// window prefix ++ this chunk]` instead of the full-sequence self-SDPA. The
-    /// chunk's q/k rotate at the chunk's absolute frame position (`plan
-    /// .chunk_start_frame` + `plan.temporal_offset`, release `use_relative_rope=
-    /// False`). `store` supplies the committed prefix K/V (host-resident); when
-    /// `commit` is `Some`, the chunk's roped-k / v are read back per layer into it
-    /// (the clean recache pass writes these to the cache tail).
-    ///
-    /// `cross_kv` caches the per-layer cross-attention text K/V across this
-    /// request's forwards (see [`WanCrossKvCache`]); pass the same cache for
-    /// every forward that shares the prompt.
-    ///
-    /// `self.shape` must be the per-CHUNK shape (`n_tok == chunk frames * pph *
-    /// ppw`). Serial block residency (acquire -> compute -> next); the AR perf
-    /// path (prefetch overlap / activation tiling) is a follow-up, the e2e gate
-    /// runs at small chunk-token counts.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn forward_ar<S: WeightSource>(
-        &self,
-        backend: &WgpuBackend,
-        pipelines: &WanDitPipelines,
-        residency: &WeightResidency<S>,
-        scratch: &Workspace<WgpuBackend>,
-        inputs: &WanDitInputs<'_>,
-        store: &dyn KvStore,
-        plan: &ChunkPlan,
-        cross_kv: &mut WanCrossKvCache,
-        mut commit: ChunkKvCommit<'_>,
-        mut block_res_diag: Option<&mut Vec<Vec<f32>>>,
-    ) -> Result<WanDitOutput, WanDitError<S::Error>> {
-        let bp = &pipelines.block;
-        let s = self.shape;
-        let inner = self.cfg.inner() as u32;
-        let rows = s.n_tok as u32;
-        let ppf = s.grid.ppf;
-        let text_seq = s.text_seq as u32;
-        let token_bytes = inner as usize * bp.act_dtype.bytes_per_elem() as usize;
-        let num_layers = self.handles.blocks.len();
-
-        // --- patchify chunk + front-door linear -> x [chunk_rows, inner] ---
-        let patch_in = s.grid.patch_in() as u32;
-        let tokens = patchify::patchify(inputs.image, &s.grid);
-        let tok_bytes = act_upload_bytes(bp.act_dtype, &tokens);
-        let tok_buf = scratch.alloc(tok_bytes.len() as u64)?;
-        backend.write_buffer(tok_buf.id, 0, &tok_bytes)?;
-        let x = ResStream::alloc(scratch, bp, rows, inner)?;
-        {
-            let views = self.handles.patch.acquire(residency, backend).await?;
-            let scope = scratch.batch();
-            self.linear_bias(
-                &scope,
-                bp,
-                scope.import_copy(tok_buf.as_buf_ref()),
-                &views.bufs(),
-                rows,
-                patch_in,
-                inner,
-                scope.import_copy(x.as_act_ref()),
-            )?;
-            scope.submit_void().await?;
-        }
-
-        // --- condition embedder -> temb, timestep_proj, text ---
-        let text_bytes = act_upload_bytes(bp.act_dtype, inputs.text);
-        let text_in = scratch.alloc(text_bytes.len() as u64)?;
-        backend.write_buffer(text_in.id, 0, &text_bytes)?;
-        let temb = scratch.alloc(bp.act_bytes(inner))?;
-        let tproj = scratch.alloc(bp.act_bytes(6 * inner))?;
-        let text = ResStream::alloc(scratch, bp, text_seq, inner)?;
-        {
-            let views = self.handles.condition.acquire(residency, backend).await?;
-            let scope = scratch.batch();
-            let out = ConditionEmbedderOut {
-                temb: scope.import_copy(temb.as_buf_ref()),
-                timestep_proj: scope.import_copy(tproj.as_buf_ref()),
-                text: scope.import_copy(text.as_act_ref()),
-            };
-            self.condition_embedder.forward(
-                &scope,
-                bp,
-                &pipelines.gelu,
-                inputs.timestep,
-                inputs.r_timestep,
-                scope.import_copy(text_in.as_buf_ref()),
-                text_seq,
-                &out,
-                &views.bufs(),
-            )?;
-            scope.submit_void().await?;
-        }
-
-        // --- per-chunk RoPE3D freqs at the chunk's ABSOLUTE temporal position ---
-        let t_start = plan.chunk_start_frame + plan.temporal_offset as usize;
-        let freqs_bytes = freqs_upload_bytes(
-            bp.act_dtype,
-            &self
-                .rope
-                .lookup_temporal(ppf, s.grid.pph, s.grid.ppw, t_start),
-        );
-        let freqs = scratch.alloc(freqs_bytes.len() as u64)?;
-        backend.write_buffer(freqs.id, 0, &freqs_bytes)?;
-
-        // Window geometry (token counts) from the chunk plan.
-        let prefix_rows = plan.prefix_tokens as u32;
-        let window_rows = plan.window_tokens as u32;
-        debug_assert_eq!(plan.tail.len as u32, rows, "chunk tokens must match shape");
-
-        // --- transformer blocks (serial residency; AR self-attn) ---
-        let _lr = trace::scope!("wan.dit.ar_blocks", n = num_layers).entered();
-        let mut x_cur = x;
-        for idx in 0..num_layers {
-            let _bs = trace::scope!(format_args!("ar_block.{idx}")).entered();
-            let views = self.handles.blocks[idx]
-                .acquire(residency, backend)
-                .instrument(tracing::debug_span!(target: PHASE, "wan.acquire", idx))
-                .await?;
-            let block_bufs = views.bufs();
-
-            let nxt = ResStream::alloc(scratch, bp, rows, inner)?;
-            let window_k = scratch.alloc(bp.act_bytes(window_rows * inner))?;
-            let window_v = scratch.alloc(bp.act_bytes(window_rows * inner))?;
-            // Upload this layer's committed window prefix (K already roped, V
-            // raw) straight into the window buffers, one write per committed
-            // segment (no host gather, no GPU staging copy); the chunk's fresh
-            // K/V land after it in-scope. Empty for the first chunk.
-            let mut dst = 0u64;
-            for seg in &plan.prefix {
-                backend.write_buffer(
-                    window_k.id,
-                    dst,
-                    &store.k(idx)[seg.byte_range(token_bytes)],
-                )?;
-                backend.write_buffer(
-                    window_v.id,
-                    dst,
-                    &store.v(idx)[seg.byte_range(token_bytes)],
-                )?;
-                dst += (seg.len * token_bytes) as u64;
-            }
-
-            // Cross-attention text K/V: replay the request-constant bytes when
-            // cached, else compute in-scope and read back after the submit.
-            let ckv_bytes = bp.act_bytes(text_seq * inner);
-            let cross_k = scratch.alloc(ckv_bytes)?;
-            let cross_v = scratch.alloc(ckv_bytes)?;
-            let ckv_cached = match &cross_kv.layers[idx] {
-                Some((kb, vb)) => {
-                    backend.write_buffer(cross_k.id, 0, kb)?;
-                    backend.write_buffer(cross_v.id, 0, vb)?;
-                    true
-                }
-                None => false,
-            };
-
-            let roped_k = scratch.alloc(bp.act_bytes(rows * inner))?;
-            let v_out = scratch.alloc(bp.act_bytes(rows * inner))?;
-            {
-                let scope = scratch.batch();
-                let tproj_h = scope.import_copy(tproj.as_buf_ref());
-                let m = self.build_mod(&scope, bp, views.scale_shift_table(), tproj_h, inner)?;
-                let x1 = scratch.alloc(bp.act_bytes(rows * inner))?;
-                let cross_k_h = scope.import_copy(cross_k.as_buf_ref());
-                let cross_v_h = scope.import_copy(cross_v.as_buf_ref());
-                if !ckv_cached {
-                    self.block.cross_kv(
-                        &scope,
-                        pipelines,
-                        scope.import_copy(text.as_act_ref()),
-                        &block_bufs.cross_attn,
-                        cross_k_h,
-                        cross_v_h,
-                        text_seq,
-                    )?;
-                }
-                self.block.self_attn_ar(
-                    &scope,
-                    pipelines,
-                    scope.import_copy(x_cur.as_act_ref()),
-                    scope.import_copy(freqs.as_buf_ref()),
-                    &m,
-                    prefix_rows,
-                    scope.import_copy(window_k.as_buf_ref()),
-                    scope.import_copy(window_v.as_buf_ref()),
-                    scope.import_copy(roped_k.as_buf_ref()),
-                    scope.import_copy(v_out.as_buf_ref()),
-                    scope.import_copy(x1.as_buf_ref()),
-                    rows,
-                    window_rows,
-                    &block_bufs.self_attn,
-                )?;
-                self.block.cross_ffn(
-                    &scope,
-                    pipelines,
-                    ActBuf::dense(scope.import_copy(x1.as_buf_ref())),
-                    scope.import_copy(text.as_act_ref()),
-                    &m,
-                    ActBuf::dense(scope.import_copy(nxt.as_act_ref())),
-                    &block_bufs,
-                    &WanDitBlockTaps::default(),
-                    rows,
-                    text_seq,
-                    Some((cross_k_h, cross_v_h)),
-                )?;
-                scope.submit_void().await?;
-            }
-            if !ckv_cached {
-                cross_kv.layers[idx] = Some((
-                    backend.read_buffer(cross_k.id, 0, ckv_bytes).await?,
-                    backend.read_buffer(cross_v.id, 0, ckv_bytes).await?,
-                ));
-            }
-            // Clean-pass commit: read back the chunk's roped-k / v for this layer.
-            if let Some((k_sink, v_sink)) = commit.as_mut() {
-                let n = (rows * inner) as u64 * bp.act_dtype.bytes_per_elem();
-                k_sink[idx] = backend.read_buffer(roped_k.id, 0, n).await?;
-                v_sink[idx] = backend.read_buffer(v_out.id, 0, n).await?;
-            }
-            x_cur = nxt;
-            // Per-block residual readback (localization): the token-space stream
-            // [n_tok, inner] after block `idx`, matching the pyref block hooks.
-            if let Some(sink) = block_res_diag.as_deref_mut() {
-                let mut v = Vec::new();
-                read_into_f32(
-                    backend,
-                    &x_cur.as_act_ref(),
-                    (rows * inner) as usize,
-                    bp.act_dtype,
-                    &mut v,
-                )
-                .await?;
-                sink.push(v);
-            }
-        }
-
-        // --- final norm + modulation + proj_out -> velocity ---
-        let proj_w = self.cfg.out_channels * config::PATCH_T * config::PATCH_H * config::PATCH_W;
-        let proj_out = ResStream::alloc(scratch, bp, rows, proj_w as u32)?;
-        {
-            let sst = residency
-                .acquire(self.handles.scale_shift_table, backend)
-                .await?;
-            let pv = self.handles.proj_out.acquire(residency, backend).await?;
-            let scope = scratch.batch();
-            let temb_h = scope.import_copy(temb.as_buf_ref());
-            let shift = self.mod_signal(&scope, bp, sst.buf(), 0, temb_h, inner)?;
-            let scale = self.mod_signal(&scope, bp, sst.buf(), 1, temb_h, inner)?;
-            let x_h = ActBuf::dense(scope.import_copy(x_cur.as_act_ref()));
-            let normed = alloc_act(&scope, bp, rows, inner)?;
-            let ln_u = scope.u32x4_uniform(rows, inner, config::EPS.to_bits(), 0)?;
-            scope.layernorm::<LayerNormF32>(&bp.layernorm, x_h.data, ln_u, normed.data, rows)?;
-            let modded = alloc_act(&scope, bp, rows, inner)?;
-            self.modulate(&scope, bp, normed, scale, shift, modded, rows, inner)?;
-            self.linear_bias(
-                &scope,
-                bp,
-                modded.data,
-                &pv.bufs(),
-                rows,
-                inner,
-                proj_w as u32,
-                scope.import_copy(proj_out.as_act_ref()),
-            )?;
-            scope.submit_void().await?;
-        }
-
-        let mut tokens_out = Vec::new();
-        read_into_f32(
-            backend,
-            &proj_out.as_act_ref(),
-            (rows * proj_w as u32) as usize,
-            bp.act_dtype,
-            &mut tokens_out,
-        )
-        .await?;
-        let image = patchify::unpatchify(&tokens_out, &s.grid, self.cfg.out_channels);
-        Ok(WanDitOutput { image })
     }
 
     /// Run one transformer block in the activation-tiled regime: pass A

@@ -20,10 +20,12 @@ pub struct GenerateImage {
     pub model: ImageModelId,
     #[arg(long)]
     pub prompt: String,
-    /// Reference image to edit (REQUIRED for `qwen-image-edit-rapid`; rejected
-    /// for the t2i models). PNG/JPEG.
-    #[arg(long)]
-    pub input_image: Option<PathBuf>,
+    /// Input image (PNG/JPEG); repeat for several, in prompt order. Exactly one
+    /// for `qwen-image-edit-rapid` (the image to edit); up to 10 condition
+    /// images for `qwen-image-2.1-turbo` (edit / composition: the prompt
+    /// names them "image 1", "image 2", ...); rejected for the t2i models.
+    #[arg(long = "input-image")]
+    pub input_images: Vec<PathBuf>,
     #[arg(long)]
     pub output: PathBuf,
     /// Output format. Defaults to inferring from the `--output` extension;
@@ -89,9 +91,6 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
     )?;
 
     if args.remote.remote.is_some() {
-        if args.input_image.is_some() {
-            return Err("--input-image (image edit) is not supported over --remote yet".into());
-        }
         if !args.lora.is_empty() {
             return Err(
                 "--lora (adapters) is not supported over --remote; run locally or use the web UI"
@@ -107,8 +106,11 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
             height: args.height,
             steps: args.steps,
             seed: args.seed,
-            // Edit-over-remote is guarded above (returns early), so no image here.
-            input_image: None,
+            input_images: args
+                .input_images
+                .iter()
+                .map(|p| super::video::base64_file(p))
+                .collect::<Result<_, _>>()?,
             i8_matmul: Some(!args.no_i8_matmul),
             full_precision: Some(args.full_precision),
             // Remote path defers coopmat to the server default; local runs read
@@ -143,12 +145,15 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
         seed: args.seed,
         i8_matmul: !args.no_i8_matmul,
         full_precision: args.full_precision,
-        input_image: match &args.input_image {
-            Some(p) => Some(ImageBytes(
-                std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?,
-            )),
-            None => None,
-        },
+        input_images: args
+            .input_images
+            .iter()
+            .map(|p| {
+                std::fs::read(p)
+                    .map(ImageBytes)
+                    .map_err(|e| format!("read {}: {e}", p.display()))
+            })
+            .collect::<Result<_, _>>()?,
         lora,
         vault_password,
         vault_dir: vault::resolve_dir(args.vault_dir.as_deref()),

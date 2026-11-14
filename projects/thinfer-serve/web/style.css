@@ -297,23 +297,40 @@ details.panel[open] > summary {
   margin-bottom: 0.4rem;
 }
 
-/* Reference-image order list (FastH3-Omni). */
-#ref-images-order {
+/* Chosen input images (the single slot, and Omni's ordered references): one
+   item per image with a Remove button. */
+.chosen {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
   font-size: 0.85rem;
 }
-#ref-images-order > div {
+.chosen:empty {
+  display: none;
+}
+.chosen > div {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
+  gap: 0.6rem;
   padding: 0.3rem 0.5rem;
   border: 1px solid var(--border);
   border-radius: 0.35rem;
 }
-#ref-images-order button {
+.chosen .thumb {
+  width: 3.5rem;
+  height: 3.5rem;
+  object-fit: cover;
+  border-radius: 0.3rem;
+  flex: none;
+}
+.chosen .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chosen button {
   font-size: 0.78rem;
   padding: 0.2rem 0.6rem;
 }

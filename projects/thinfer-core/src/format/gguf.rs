@@ -104,6 +104,13 @@ pub struct GgufHeader {
 pub struct GgufTensorInfo {
     pub name: String,
     pub shape: Shape,
+    /// The comfy converter's `comfy.gguf.orig_shape.<name>`: the tensor's
+    /// logical outer-first (PyTorch) shape when the converter stored it
+    /// reshaped (same element order, different dims). Converter versions
+    /// differ in which tensors they reshape: one ships only
+    /// `video_patch_proj` and the AdaLN projections reshaped, another every
+    /// large F16 matrix as `[64, ..]`.
+    pub orig_shape: Option<Shape>,
     pub ggml_type: u32,
     /// Offset from start of tensor_data (i.e., absolute file offset =
     /// `header.tensor_data_offset + offset_in_tensor_data`).
@@ -146,13 +153,23 @@ pub fn parse_header(buf: &[u8]) -> Result<GgufHeader, ParseError> {
         });
     }
 
-    // Parse metadata KV pairs. The only key we read by name is
-    // `general.alignment` (u32 per spec); everything else is skipped
+    // Parse metadata KV pairs. The keys we read by name are
+    // `general.alignment` (u32 per spec) and the comfy converter's
+    // `comfy.gguf.orig_shape.<tensor>` int arrays; everything else is skipped
     // without retaining the value, but we still have to walk the bytes.
     let mut alignment: u64 = DEFAULT_ALIGNMENT;
+    let mut orig_shapes: HashMap<String, Shape> = HashMap::new();
     for _ in 0..n_kv {
         let key = c.read_string()?;
         let vtype = c.read_u32()?;
+        if vtype == VT_ARRAY
+            && let Some(tensor) = key.strip_prefix(ORIG_SHAPE_PREFIX)
+        {
+            if let Some(dims) = read_int_array(&mut c)? {
+                orig_shapes.insert(tensor.to_string(), Shape(dims));
+            }
+            continue;
+        }
         let v = parse_value(&mut c, vtype)?;
         if let Some(parsed) = v
             && key == "general.alignment"
@@ -183,9 +200,11 @@ pub fn parse_header(buf: &[u8]) -> Result<GgufHeader, ParseError> {
         let encoding = encoding_from_ggml_type(ggml_type);
         let shape = Shape(dims);
         let on_disk_bytes = encoding.and_then(|e| bytes_for(&shape, e));
+        let orig_shape = orig_shapes.remove(&name);
         tensors.push(GgufTensorInfo {
             name,
             shape,
+            orig_shape,
             ggml_type,
             offset_in_tensor_data,
             encoding,
@@ -233,8 +252,25 @@ pub fn catalog_from(h: &GgufHeader, file_size: Option<u64>) -> WeightCatalog {
             file_size.unwrap_or(abs_offset + t.on_disk_bytes.unwrap_or(0))
         };
         let size = next_abs.saturating_sub(abs_offset);
-        // Innermost-first GGUF dims -> outer-first engine convention.
-        let shape = Shape(t.shape.0.iter().rev().copied().collect());
+        // Innermost-first GGUF dims -> outer-first engine convention. A float
+        // tensor the converter reshaped takes its recorded logical shape (the
+        // element order is unchanged, so only the dims differ). A quantized
+        // one keeps the stored dims: its superblocks may straddle logical rows
+        // (2688-wide AdaLN rows are 10.5 Q4_K superblocks), so its consumer
+        // reads it as a flat stream.
+        let float = matches!(
+            t.encoding,
+            Some(StorageEncoding::F32 | StorageEncoding::F16 | StorageEncoding::Bf16)
+        );
+        let shape = match &t.orig_shape {
+            Some(o)
+                if float
+                    && o.0.iter().product::<usize>() == t.shape.0.iter().product::<usize>() =>
+            {
+                o.clone()
+            }
+            _ => Shape(t.shape.0.iter().rev().copied().collect()),
+        };
         entries.insert(
             WeightId(t.name.clone()),
             WeightEntry {
@@ -396,6 +432,42 @@ fn parse_value(c: &mut Cursor<'_>, vt: u32) -> Result<Option<u64>, ParseError> {
         }
         other => return Err(ParseError::BadValueType(other)),
     })
+}
+
+/// The comfy converter's per-tensor logical-shape metadata key prefix.
+const ORIG_SHAPE_PREFIX: &str = "comfy.gguf.orig_shape.";
+
+/// Read an array value (cursor after its value type) as non-negative
+/// integers, or `None` (still fully consumed) when its elements are not an
+/// integer type or any is negative.
+fn read_int_array(c: &mut Cursor<'_>) -> Result<Option<Vec<usize>>, ParseError> {
+    let inner = c.read_u32()?;
+    let len = c.read_u64()?;
+    if len > MAX_ARRAY_LEN {
+        return Err(ParseError::Oversized {
+            field: "array_len",
+            got: len,
+            max: MAX_ARRAY_LEN,
+        });
+    }
+    let mut out = Some(Vec::with_capacity(len.min(8) as usize));
+    for _ in 0..len {
+        let v = match inner {
+            VT_I32 => i64::from(c.read_u32()? as i32),
+            VT_U32 => i64::from(c.read_u32()?),
+            VT_I64 => c.read_u64()? as i64,
+            VT_U64 => i64::try_from(c.read_u64()?).unwrap_or(-1),
+            other => {
+                parse_value(c, other)?;
+                -1
+            }
+        };
+        match (usize::try_from(v), out.as_mut()) {
+            (Ok(d), Some(o)) => o.push(d),
+            _ => out = None,
+        }
+    }
+    Ok(out)
 }
 
 struct Cursor<'a> {
@@ -667,5 +739,57 @@ mod tests {
         // Catalog shape is outer-first (engine convention), reversed from
         // the GGUF header's innermost-first dims.
         assert_eq!(bb.shape.0, vec![2, 32]);
+    }
+
+    /// The comfy converter's `orig_shape` restores a reshaped float tensor's
+    /// logical dims; a quantized tensor keeps its stored dims (its blocks may
+    /// straddle logical rows); a key whose element count disagrees is ignored.
+    #[test]
+    fn catalog_applies_orig_shape_to_float_tensors() {
+        fn s(b: &mut Vec<u8>, v: &str) {
+            b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            b.extend_from_slice(v.as_bytes());
+        }
+        fn orig(b: &mut Vec<u8>, name: &str, dims: &[i32]) {
+            s(b, &format!("{ORIG_SHAPE_PREFIX}{name}"));
+            b.extend_from_slice(&VT_ARRAY.to_le_bytes());
+            b.extend_from_slice(&VT_I32.to_le_bytes());
+            b.extend_from_slice(&(dims.len() as u64).to_le_bytes());
+            for d in dims {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+        // (name, GGUF innermost-first dims, ggml_type, bytes)
+        let tensors: [(&str, [u64; 2], u32, u64); 3] = [
+            ("f", [64, 6], 1, 64 * 6 * 2),
+            ("q", [32, 4], 8, 4 * 34),
+            ("bad", [32, 2], 1, 32 * 2 * 2),
+        ];
+        let mut b = Vec::<u8>::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&VERSION.to_le_bytes());
+        b.extend_from_slice(&3u64.to_le_bytes());
+        b.extend_from_slice(&3u64.to_le_bytes());
+        orig(&mut b, "f", &[16, 24]);
+        orig(&mut b, "q", &[2, 64]);
+        orig(&mut b, "bad", &[3, 7]);
+        let mut off = 0u64;
+        for (name, dims, ty, bytes) in tensors {
+            s(&mut b, name);
+            b.extend_from_slice(&2u32.to_le_bytes());
+            for d in dims {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&off.to_le_bytes());
+            off += bytes.next_multiple_of(32);
+        }
+        b.resize(b.len().next_multiple_of(32) + off as usize, 0);
+        let h = parse_header(&b).unwrap();
+        let cat = catalog_from(&h, Some(b.len() as u64));
+        let shape = |n: &str| cat.get(&WeightId(n.to_string())).unwrap().shape.0.clone();
+        assert_eq!(shape("f"), vec![16, 24]);
+        assert_eq!(shape("q"), vec![4, 32]);
+        assert_eq!(shape("bad"), vec![2, 32]);
     }
 }

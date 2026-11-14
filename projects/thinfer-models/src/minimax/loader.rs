@@ -29,7 +29,7 @@ use thinfer_core::residency::{TransposePolicy, WeightHandle, WeightMeta, WeightR
 use thinfer_core::tensor::{Shape, StorageEncoding};
 use thinfer_core::weight::{WeightId, WeightReader, WeightSource};
 
-use super::adaln::{ModulationLayout, timestep_embedding};
+use super::adaln::{ModulationLayout, TimeKey, timestep_embedding};
 use super::{AdalnInput, DitConfig};
 use crate::z_image::text_encoder::LoadError;
 
@@ -113,6 +113,84 @@ pub fn register_video_patch_proj<S: WeightSource>(
 /// `final_layer` is `[num_timesteps, 2 * hidden]`. Both are the projection
 /// output verbatim: the checkpoint already emits `[t][modality][param][hidden]`
 /// order, so no permutation is involved.
+/// One `adaln_proj.linear` low-rank pair of an adapter (larryvrh's turbo
+/// LoRA ships them for every block and the final layer): `out += scale * B @
+/// (A @ silu(temb))`. The projections never run at sampling time, so the pair
+/// folds into the precomputed table exactly (ComfyUI injects the same delta at
+/// run time).
+pub struct AdalnPair {
+    /// `[rank, k]`.
+    a: Vec<f32>,
+    /// `[n, rank]`.
+    b: Vec<f32>,
+    rank: usize,
+    scale: f32,
+}
+
+impl AdalnPair {
+    /// Add the delta for each of the `t` rows of `x` (`[t, k]`) to `out`
+    /// (`[t, n]`).
+    fn apply(&self, x: &[f32], t: usize, k: usize, n: usize, out: &mut [f32]) {
+        for ti in 0..t {
+            let xr = &x[ti * k..][..k];
+            let mid: Vec<f32> = (0..self.rank)
+                .map(|r| {
+                    self.a[r * k..][..k]
+                        .iter()
+                        .zip(xr)
+                        .map(|(w, v)| w * v)
+                        .sum::<f32>()
+                        * self.scale
+                })
+                .collect();
+            let row = &mut out[ti * n..][..n];
+            for (j, o) in row.iter_mut().enumerate() {
+                let bj = &self.b[j * self.rank..][..self.rank];
+                *o += bj.iter().zip(&mid).map(|(w, m)| w * m).sum::<f32>();
+            }
+        }
+    }
+}
+
+/// Every AdaLN pair of an adapter, per block and for the final layer.
+pub struct AdalnLora {
+    pub blocks: Vec<Option<AdalnPair>>,
+    pub final_layer: Option<AdalnPair>,
+}
+
+/// Read the `*.adaln_proj.linear.lora_{A,B}.weight` pairs of `adapter` (alpha
+/// == rank, so the scale is `strength`). `None` when it carries none.
+pub async fn read_adaln_lora<S: WeightSource>(
+    cfg: &DitConfig,
+    adapter: &S,
+    strength: f32,
+) -> Result<Option<AdalnLora>, LoaderError<S::Error>> {
+    let pair = |prefix: String, n: usize| async move {
+        let a_id = WeightId(format!("{prefix}.adaln_proj.linear.lora_A.weight"));
+        let b_id = WeightId(format!("{prefix}.adaln_proj.linear.lora_B.weight"));
+        let Some(rank) = adapter.catalog().get(&a_id).map(|e| e.shape.0[0]) else {
+            return Ok::<_, LoaderError<S::Error>>(None);
+        };
+        let k = cfg.time_embed_dim;
+        Ok(Some(AdalnPair {
+            a: read_tensor_f32(adapter, &a_id, rank * k).await?,
+            b: read_tensor_f32(adapter, &b_id, n * rank).await?,
+            rank,
+            scale: strength,
+        }))
+    };
+    let mut blocks = Vec::with_capacity(cfg.n_layers);
+    for i in 0..cfg.n_layers {
+        blocks.push(pair(format!("blocks.{i}"), cfg.adaln_out).await?);
+    }
+    let final_layer = pair("final_layer".into(), cfg.final_adaln_out).await?;
+    let any = final_layer.is_some() || blocks.iter().any(Option::is_some);
+    Ok(any.then_some(AdalnLora {
+        blocks,
+        final_layer,
+    }))
+}
+
 pub struct ModulationTables {
     pub layout: ModulationLayout,
     pub blocks: Vec<Vec<f32>>,
@@ -211,17 +289,20 @@ fn linear_f32(x: &[f32], w: &[f32], bias: &[f32], rows: usize, k: usize, n: usiz
 pub async fn build_modulation_tables<S: WeightSource>(
     cfg: &DitConfig,
     source: &S,
-    timesteps: &[f32],
+    keys: &[TimeKey],
+    adaln_lora: Option<&AdalnLora>,
 ) -> Result<ModulationTables, LoaderError<S::Error>> {
-    let t = timesteps.len();
+    let t = keys.len();
+    let timesteps: Vec<f32> = keys.iter().map(|k| k.t).collect();
+    let timesteps = &timesteps[..];
     assert!(t > 0, "modulation table needs at least one timestep");
     let (a, k) = match cfg.adaln {
         AdalnInput::Table(r) => (table_rows(source, timesteps, r).await?, r),
-        AdalnInput::Full => (silu_temb(cfg, source, timesteps).await?, cfg.time_embed_dim),
+        AdalnInput::Full => (silu_temb(cfg, source, keys).await?, cfg.time_embed_dim),
         // A rank-reduced checkpoint maps silu(temb) through the shared basis
         // (no further silu).
         AdalnInput::Basis(r) => {
-            let a = silu_temb(cfg, source, timesteps).await?;
+            let a = silu_temb(cfg, source, keys).await?;
             let basis = read_tensor_f32(
                 source,
                 &WeightId("adaln_basis.weight".into()),
@@ -233,29 +314,40 @@ pub async fn build_modulation_tables<S: WeightSource>(
         }
     };
 
-    let mut blocks = Vec::with_capacity(cfg.n_layers);
-    for i in 0..cfg.n_layers {
-        blocks.push(
-            project_adaln(
-                source,
-                &a,
-                t,
-                k,
-                cfg.adaln_out,
-                &format!("blocks.{i}.adaln_proj"),
-            )
-            .await?,
-        );
+    // Every block's projection, then the final layer's. Block `i + 1` is read
+    // while block `i` projects on a worker: the read (~150 MB per Q4 block on
+    // the full checkpoint) overlaps the math instead of alternating with it.
+    let projs: Vec<(String, usize)> = (0..cfg.n_layers)
+        .map(|i| (format!("blocks.{i}.adaln_proj"), cfg.adaln_out))
+        .chain([("final_layer.adaln_proj".to_string(), cfg.final_adaln_out)])
+        .collect();
+    let a = std::sync::Arc::new(a);
+    let mut outs = Vec::with_capacity(projs.len());
+    let mut next = Some(read_adaln(source, &projs[0].0, projs[0].1, k).await?);
+    for i in 0..projs.len() {
+        let w = next.take().expect("read ahead");
+        let shared = std::sync::Arc::clone(&a);
+        let compute = crate::common::seq::off_thread(move || w.project(&shared, t));
+        let read = async {
+            match projs.get(i + 1) {
+                Some((prefix, n)) => read_adaln(source, prefix, *n, k).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        let (out, read) = futures::join!(compute, read);
+        next = read?;
+        outs.push(out);
     }
-    let final_layer = project_adaln(
-        source,
-        &a,
-        t,
-        k,
-        cfg.final_adaln_out,
-        "final_layer.adaln_proj",
-    )
-    .await?;
+    let mut final_layer = outs.pop().expect("final layer projection");
+    let mut blocks = outs;
+    for (i, out) in blocks.iter_mut().enumerate() {
+        if let Some(p) = adaln_lora.and_then(|l| l.blocks[i].as_ref()) {
+            p.apply(&a, t, k, cfg.adaln_out, out);
+        }
+    }
+    if let Some(p) = adaln_lora.and_then(|l| l.final_layer.as_ref()) {
+        p.apply(&a, t, k, cfg.final_adaln_out, &mut final_layer);
+    }
 
     Ok(ModulationTables {
         layout: ModulationLayout::new(t, cfg.hidden),
@@ -297,26 +389,45 @@ async fn table_rows<S: WeightSource>(
 }
 
 /// `silu(temb)`, `temb = proj_out(silu(proj_in(sinusoid)))`, f32 throughout.
+/// Two-time checkpoints mix in the endpoint embedder at each key's `r`:
+/// `temb(t) + gate * (temb_r(r) - temb(t))` (HyperFlow `time_embedding`).
 async fn silu_temb<S: WeightSource>(
     cfg: &DitConfig,
     source: &S,
+    keys: &[TimeKey],
+) -> Result<Vec<f32>, LoaderError<S::Error>> {
+    let ts: Vec<f32> = keys.iter().map(|k| k.t).collect();
+    let mut temb = embed_time(cfg, source, "time_embedder", &ts).await?;
+    if cfg.two_time {
+        let rs: Vec<f32> = keys.iter().map(|k| k.r).collect();
+        let temb_r = embed_time(cfg, source, "endpoint_time_embedder", &rs).await?;
+        let gate = read_tensor_f32(source, &WeightId("hyperflow_gate".into()), 1).await?[0];
+        for (a, b) in temb.iter_mut().zip(&temb_r) {
+            *a += gate * (b - *a);
+        }
+    }
+    // Every AdaLN projection reads silu(temb), not temb.
+    Ok(temb.iter().map(|&v| silu(v)).collect())
+}
+
+/// `proj_out(silu(proj_in(sinusoid(t))))` of the time embedder `name`, f32.
+async fn embed_time<S: WeightSource>(
+    cfg: &DitConfig,
+    source: &S,
+    name: &str,
     timesteps: &[f32],
 ) -> Result<Vec<f32>, LoaderError<S::Error>> {
     let t = timesteps.len();
     let sinusoid = timestep_embedding(timesteps, cfg.timestep_input_dim);
+    let w = |s: &str| WeightId(format!("{name}.{s}"));
     let temb = {
         let w_in = read_tensor_f32(
             source,
-            &WeightId("time_embedder.proj_in.weight".into()),
+            &w("proj_in.weight"),
             cfg.time_embed_hidden * cfg.timestep_input_dim,
         )
         .await?;
-        let b_in = read_tensor_f32(
-            source,
-            &WeightId("time_embedder.proj_in.bias".into()),
-            cfg.time_embed_hidden,
-        )
-        .await?;
+        let b_in = read_tensor_f32(source, &w("proj_in.bias"), cfg.time_embed_hidden).await?;
         let mut h = linear_f32(
             &sinusoid,
             &w_in,
@@ -330,16 +441,11 @@ async fn silu_temb<S: WeightSource>(
         }
         let w_out = read_tensor_f32(
             source,
-            &WeightId("time_embedder.proj_out.weight".into()),
+            &w("proj_out.weight"),
             cfg.time_embed_dim * cfg.time_embed_hidden,
         )
         .await?;
-        let b_out = read_tensor_f32(
-            source,
-            &WeightId("time_embedder.proj_out.bias".into()),
-            cfg.time_embed_dim,
-        )
-        .await?;
+        let b_out = read_tensor_f32(source, &w("proj_out.bias"), cfg.time_embed_dim).await?;
         linear_f32(
             &h,
             &w_out,
@@ -349,22 +455,26 @@ async fn silu_temb<S: WeightSource>(
             cfg.time_embed_dim,
         )
     };
-
-    // Every AdaLN projection reads silu(temb), not temb.
-    Ok(temb.iter().map(|&v| silu(v)).collect())
+    Ok(temb)
 }
 
-/// One `adaln_proj.linear` applied to `a` `[t, k]`, streaming the weight rather
-/// than materializing it: a full f32 dequantization of one block's projection is
-/// ~1 GiB, and there are 50 of them.
-async fn project_adaln<S: WeightSource>(
-    source: &S,
-    a: &[f32],
-    t: usize,
-    k: usize,
+/// One `adaln_proj.linear` as read from the file: the encoded `[n, k]` weight
+/// and the f32 bias (see [`AdalnWeight::project`]).
+struct AdalnWeight {
+    bytes: Vec<u8>,
+    encoding: StorageEncoding,
+    bias: Vec<f32>,
     n: usize,
+    k: usize,
+}
+
+/// Read `{prefix}.linear` (`n` outputs over `k`).
+async fn read_adaln<S: WeightSource>(
+    source: &S,
     prefix: &str,
-) -> Result<Vec<f32>, LoaderError<S::Error>> {
+    n: usize,
+    k: usize,
+) -> Result<AdalnWeight, LoaderError<S::Error>> {
     let wid = WeightId(format!("{prefix}.linear.weight"));
     let bias = read_tensor_f32(source, &WeightId(format!("{prefix}.linear.bias")), n).await?;
 
@@ -394,45 +504,79 @@ async fn project_adaln<S: WeightSource>(
         .read_at(0, &mut bytes)
         .await
         .map_err(|e| LoaderError::ReadAt(format!("{}: {e:?}", wid.0)))?;
-
-    // Decode a whole number of output rows at a time. K-quant blocks are 256
-    // elements and `k` need not be a multiple of that, so a quant chunk is the
-    // fewest output rows landing on a block boundary.
-    let chunk = match encoding {
-        StorageEncoding::Quant(kind) => rows_per_quant_chunk(kind, k),
-        _ => DENSE_CHUNK_ROWS,
-    };
-    // Every output is its own sum over `k`: the output rows split into
-    // contiguous groups across workers, each decoding only its own rows
-    // (identical bits to one pass).
-    let group = n.div_ceil(chunk).div_ceil(PROJECT_PARTS) * chunk;
-    let parts = crate::common::seq::par_map(n.div_ceil(group), |g| {
-        let (j0, j1) = (g * group, ((g + 1) * group).min(n));
-        let mut part = vec![0f32; t * (j1 - j0)];
-        let mut j = j0;
-        while j < j1 {
-            let rows = chunk.min(j1 - j);
-            let at = encoded_bytes(encoding, j * k);
-            let w = decode_f32(encoding, &bytes[at..], rows * k);
-            accumulate(&mut part, a, &w, &bias[j..], t, k, j1 - j0, j - j0, rows);
-            j += rows;
-        }
-        part
-    });
-    let mut out = vec![0f32; t * n];
-    for (g, part) in parts.iter().enumerate() {
-        let (j0, cols) = (g * group, part.len() / t);
-        for ti in 0..t {
-            out[ti * n + j0..][..cols].copy_from_slice(&part[ti * cols..][..cols]);
-        }
-    }
-    Ok(out)
+    Ok(AdalnWeight {
+        bytes,
+        encoding,
+        bias,
+        n,
+        k,
+    })
 }
 
-/// Worker groups [`project_adaln`] splits its output rows into.
+impl AdalnWeight {
+    /// The projection applied to `a` `[t, k]`, decoding the weight a few rows
+    /// at a time rather than materializing it (a full f32 dequantization of
+    /// one block's projection is ~1 GiB, and there are 50 of them).
+    fn project(&self, a: &[f32], t: usize) -> Vec<f32> {
+        let AdalnWeight {
+            bytes,
+            encoding,
+            bias,
+            n,
+            k,
+        } = self;
+        let (encoding, n, k) = (*encoding, *n, *k);
+        // Decode a whole number of output rows at a time. K-quant blocks are
+        // 256 elements and `k` need not be a multiple of that, so a quant
+        // chunk is the fewest output rows landing on a block boundary.
+        let chunk = match encoding {
+            StorageEncoding::Quant(kind) => rows_per_quant_chunk(kind, k) * ROW_TILE,
+            _ => DENSE_CHUNK_ROWS,
+        };
+        // Every output is its own sum over `k`: the output rows split into
+        // contiguous groups across workers, each decoding only its own rows
+        // (identical bits to one pass).
+        let group = n.div_ceil(chunk).div_ceil(PROJECT_PARTS) * chunk;
+        let lanes = lane_groups(a, t, k);
+        let lanes = &lanes;
+        let parts = crate::common::seq::par_map(n.div_ceil(group), |g| {
+            let (j0, j1) = (g * group, ((g + 1) * group).min(n));
+            let mut part = vec![0f32; t * (j1 - j0)];
+            let mut j = j0;
+            while j < j1 {
+                let rows = chunk.min(j1 - j);
+                let at = encoded_bytes(encoding, j * k);
+                let w = decode_f32(encoding, &bytes[at..], rows * k);
+                accumulate(
+                    &mut part,
+                    lanes,
+                    &w,
+                    &bias[j..],
+                    t,
+                    k,
+                    j1 - j0,
+                    j - j0,
+                    rows,
+                );
+                j += rows;
+            }
+            part
+        });
+        let mut out = vec![0f32; t * n];
+        for (g, part) in parts.iter().enumerate() {
+            let (j0, cols) = (g * group, part.len() / t);
+            for ti in 0..t {
+                out[ti * n + j0..][..cols].copy_from_slice(&part[ti * cols..][..cols]);
+            }
+        }
+        out
+    }
+}
+
+/// Worker groups [`AdalnWeight::project`] splits its output rows into.
 const PROJECT_PARTS: usize = 8;
 
-/// Output rows a dense [`project_adaln`] weight decodes at a time.
+/// Output rows a dense [`AdalnWeight::project`] weight decodes at a time.
 const DENSE_CHUNK_ROWS: usize = 16;
 
 /// Bytes `elements` leading elements take in `encoding` (whole quant blocks).
@@ -456,12 +600,37 @@ fn rows_per_quant_chunk(kind: QuantKind, k: usize) -> usize {
     rows
 }
 
+/// Timesteps one [`accumulate`] lane group carries.
+const LANES: usize = 8;
+/// Weight rows [`accumulate`] runs side by side.
+const ROW_TILE: usize = 4;
+
+/// `a` `[t, k]` regrouped for [`accumulate`]: group `g` holds, per `i < k`,
+/// the lanes `a[g * LANES + l][i]` (zero past `t`).
+fn lane_groups(a: &[f32], t: usize, k: usize) -> Vec<Vec<[f32; LANES]>> {
+    (0..t.div_ceil(LANES))
+        .map(|g| {
+            (0..k)
+                .map(|i| {
+                    std::array::from_fn(|l| {
+                        let ti = g * LANES + l;
+                        if ti < t { a[ti * k + i] } else { 0.0 }
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// `out[ti, col0 + r] = bias[r] + a[ti] . w[r]` for `rows` weight rows, `out`
-/// being `[t, cols]`.
+/// being `[t, cols]`, `a` as [`lane_groups`]. Every output is still one sum
+/// in `k` order (`acc + a * w`, two roundings), so the bits match a plain
+/// scalar loop; the timestep lanes and `ROW_TILE` rows are independent
+/// chains, which is what lets it vectorize instead of waiting on one add.
 #[allow(clippy::too_many_arguments)]
 fn accumulate(
     out: &mut [f32],
-    a: &[f32],
+    at: &[Vec<[f32; LANES]>],
     w: &[f32],
     bias: &[f32],
     t: usize,
@@ -470,15 +639,30 @@ fn accumulate(
     col0: usize,
     rows: usize,
 ) {
-    for r in 0..rows {
-        let wr = &w[r * k..(r + 1) * k];
-        for ti in 0..t {
-            let ar = &a[ti * k..(ti + 1) * k];
-            let mut acc = bias[r];
-            for i in 0..k {
-                acc += ar[i] * wr[i];
+    for (g, ag) in at.iter().enumerate() {
+        for r0 in (0..rows).step_by(ROW_TILE) {
+            let live = (rows - r0).min(ROW_TILE);
+            // Rows past `live` repeat the last live row (results dropped).
+            let wr: [&[f32]; ROW_TILE] =
+                std::array::from_fn(|q| &w[(r0 + q.min(live - 1)) * k..][..k]);
+            let mut acc: [[f32; LANES]; ROW_TILE] =
+                std::array::from_fn(|q| [bias[r0 + q.min(live - 1)]; LANES]);
+            for (i, av) in ag.iter().enumerate() {
+                for q in 0..ROW_TILE {
+                    let wv = wr[q][i];
+                    for l in 0..LANES {
+                        acc[q][l] += av[l] * wv;
+                    }
+                }
             }
-            out[ti * cols + col0 + r] = acc;
+            for (q, row) in acc.iter().enumerate().take(live) {
+                for (l, &v) in row.iter().enumerate() {
+                    let ti = g * LANES + l;
+                    if ti < t {
+                        out[ti * cols + col0 + r0 + q] = v;
+                    }
+                }
+            }
         }
     }
 }
@@ -486,6 +670,50 @@ fn accumulate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lane-grouped, row-tiled accumulate is bit-identical to one scalar
+    /// sum per output in `k` order (ragged `t` and row counts included).
+    #[test]
+    fn accumulate_matches_scalar_bits() {
+        let (k, rows) = (37, 7);
+        let mut seed = 0x2545_f491_u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for t in [1, 7, 8, 11] {
+            let a: Vec<f32> = (0..t * k).map(|_| rnd()).collect();
+            let w: Vec<f32> = (0..rows * k).map(|_| rnd() * 3.0).collect();
+            let bias: Vec<f32> = (0..rows).map(|_| rnd()).collect();
+            let mut got = vec![f32::NAN; t * rows];
+            accumulate(
+                &mut got,
+                &lane_groups(&a, t, k),
+                &w,
+                &bias,
+                t,
+                k,
+                rows,
+                0,
+                rows,
+            );
+            for ti in 0..t {
+                for r in 0..rows {
+                    let mut acc = bias[r];
+                    for i in 0..k {
+                        acc += a[ti * k + i] * w[r * k + i];
+                    }
+                    assert_eq!(
+                        got[ti * rows + r].to_bits(),
+                        acc.to_bits(),
+                        "t {t} ti {ti} r {r}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn encoder_depth_rejects_only_short_stacks() {

@@ -63,6 +63,8 @@ faceswap-e2e = []
 # end + produces structured (finite, non-constant) output; NOT the torch parity
 # gate.
 dreamidv-e2e = []
+# Opt-in RelayVSR parity vs the pyref fixture (paths via env); skips when unset.
+relayvsr-e2e = []
 # Opt-in LTX-2.3 parity tests (Gemma encoder + FE V2, connector, VAE, DiT, e2e).
 # Needs the unsloth LTX-2.3 + gemma QAT GGUF bundle in cache + `uv`.
 ltx-e2e = []

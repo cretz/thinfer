@@ -236,15 +236,13 @@ impl<S: WeightSource> FastH3Source<S> {
         Ok(out)
     }
 
-    /// FastH3-Omni as the Comfy NVFP4 file ships it ([`DitConfig::fasth3_omni`]).
-    /// Tensor names are already the H3 originals (fused `qkv_proj`, `fc1` as
-    /// `[gate; up]`), so everything renames to itself except the compression
-    /// gate; the five block linears become composites over the Comfy parts,
-    /// and the PDD heads become one fused head per step.
-    pub fn omni_comfy(cfg: &DitConfig, inner: S) -> Result<Self, FastH3Error<S::Error>> {
-        let pdd = cfg
-            .pdd
-            .ok_or_else(|| FastH3Error::Missing("omni config without PDD heads".into()))?;
+    /// A FastH3 Comfy NVFP4 file (Omni: [`DitConfig::fasth3_omni`], V2:
+    /// [`DitConfig::fasth3_v2`]). Tensor names are already the H3 originals
+    /// (fused `qkv_proj`, `fc1` as `[gate; up]`), so everything renames to
+    /// itself except the compression gate; the five block linears become
+    /// composites over the Comfy parts, and PDD heads (Omni) become one fused
+    /// head per step.
+    pub fn comfy(cfg: &DitConfig, inner: S) -> Result<Self, FastH3Error<S::Error>> {
         let mut out = Self {
             inner,
             catalog: WeightCatalog::new(),
@@ -276,7 +274,10 @@ impl<S: WeightSource> FastH3Source<S> {
                 quantized.push(prefix);
             }
         }
-        let heads = ["final_layer.video_out", "final_layer.audio_out"];
+        let heads: &[&str] = match cfg.pdd {
+            Some(_) => &["final_layer.video_out", "final_layer.audio_out"],
+            None => &[],
+        };
         let names: Vec<String> = out
             .inner
             .catalog()
@@ -290,6 +291,9 @@ impl<S: WeightSource> FastH3Source<S> {
                 out.rename(&name, &name)?;
             }
         }
+        let Some(pdd) = cfg.pdd else {
+            return Ok(out);
+        };
         for (head, shift) in [
             ("final_layer.video_out", super::SIGMA_SHIFT_VIDEO),
             ("final_layer.audio_out", super::SIGMA_SHIFT_AUDIO),

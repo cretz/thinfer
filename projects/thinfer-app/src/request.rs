@@ -1,18 +1,17 @@
 //! Job request types and their validation/resolution. One `JobRequest` per
 //! modality; every front end (CLI flags, serve JSON) builds these and hands
 //! them to a [`crate::executor::LocalExecutor`]. Resolution that can fail
-//! (output format, frame grid, shot plan) is exposed standalone so a server can
+//! (output format, frame grid, clip chain) is exposed standalone so a server can
 //! reject a bad request at submit time rather than mid-job.
 
 use std::path::PathBuf;
 
 use thinfer_core::manifest::FileRef;
 use thinfer_core::policy::ResidencyBudget;
-pub use thinfer_models::wan::pipeline::Shot;
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SwapModel, VaeChoice,
-    VideoModelId, VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SuperRes, SwapModel,
+    VaeChoice, VideoModelId, VideoSampler,
 };
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
@@ -218,10 +217,12 @@ pub struct ImageRequest {
     /// `true` = max precision, ~6x slower. No effect on the GGUF variants
     /// (already quant) or non-Z-Image models.
     pub full_precision: bool,
-    /// Reference image for the image-EDIT path (Qwen-Image-Edit). REQUIRED for
-    /// the `QwenImageEdit` kind; rejected for the t2i kinds (Z-Image, Ideogram).
-    /// Held in RAM ([`ImageBytes`]); a decrypted image never touches disk.
-    pub input_image: Option<ImageBytes>,
+    /// Input images, in prompt order: exactly one for the `QwenImageEdit` kind
+    /// (the image to edit), up to `MAX_CONDITION_IMAGES` condition images for
+    /// Qwen-Image-2.1 (edit / composition; none = text-to-image), rejected
+    /// for the t2i kinds. Held in RAM ([`ImageBytes`]); a decrypted image
+    /// never touches disk.
+    pub input_images: Vec<ImageBytes>,
     /// User adapters to fold into the DiT for this generation, in fold order
     /// (each id is a vault entry for THIS model). Empty = the plain base model.
     /// Only models where [`ImageModelId::supports_adapters`] is true accept a
@@ -269,16 +270,28 @@ impl ImageRequest {
         if self.steps == 0 {
             return Err("--steps must be > 0".into());
         }
+        let n = self.input_images.len();
         match self.model.kind() {
             crate::model::ImageKind::QwenImageEdit => {
-                if self.input_image.is_none() {
-                    return Err(format!("--input-image is required for {}", self.model));
+                if n != 1 {
+                    return Err(format!(
+                        "{} edits exactly one --input-image (got {n})",
+                        self.model
+                    ));
                 }
             }
             // Optional: an edit / composition when present, text-to-image when not.
-            crate::model::ImageKind::QwenImage21 => {}
+            crate::model::ImageKind::QwenImage21 => {
+                let max = thinfer_models::qwen_image21::config::MAX_CONDITION_IMAGES;
+                if n > max {
+                    return Err(format!(
+                        "{} takes at most {max} input images (got {n})",
+                        self.model
+                    ));
+                }
+            }
             _ => {
-                if self.input_image.is_some() {
+                if n > 0 {
                     return Err(format!("--input-image is not supported by {}", self.model));
                 }
             }
@@ -295,8 +308,8 @@ impl ImageRequest {
     }
 }
 
-/// Generate a video from one or more prompts (t2v; multi-prompt = multi-shot,
-/// LongLive only).
+/// Generate a video from one or more prompts (t2v; several prompts = chained
+/// FastH3 / MiniMax-H3 clips).
 #[derive(Clone)]
 pub struct VideoRequest {
     pub model: VideoModelId,
@@ -335,7 +348,7 @@ pub struct VideoRequest {
     /// on long clips); `None` (default) runs full self-attention. Honored only on
     /// the activation-tiled long-clip path; short clips run full attention.
     pub attn_window: Option<u32>,
-    /// FastH3 sparse-attention precision (rejected for every other model).
+    /// MiniMax-H3 family attention precision (rejected for every other model).
     pub attn: AttnPrecision,
     pub vae: VaeChoice,
     /// LTX-2.3 text-encoder quantization (Q8 baseline or Q4_K_M fast). Applies to
@@ -352,8 +365,11 @@ pub struct VideoRequest {
     /// res). Default `false` = single-stage denoise directly at the target
     /// `width`x`height`, which stays in-distribution at low res and skips the
     /// upscaler model swap. Two-stage is only the cheaper route to HIGH res.
-    /// Ignored by the Wan/LongLive models.
+    /// Ignored by the Wan models.
     pub upscale: bool,
+    /// MiniMax-H3 / FastH3: RelayVSR super-resolution of the finished video by
+    /// this factor (every frame, before encoding). `None` = native res.
+    pub super_res: Option<SuperRes>,
     /// LTX joint-AV: opt in to a finer denoise schedule for better audio. The
     /// distilled 8-step sigma table takes very coarse late steps, where the
     /// delicate audio residual under-resolves and drifts to gibberish; this
@@ -368,6 +384,13 @@ pub struct VideoRequest {
     /// bf16 on tensor cores (the precision the reference runs that encoder
     /// in, ~3x faster), which needs the CUDA accelerator (f32 without it).
     pub vae_encode_f32: bool,
+    /// MiniMax-H3 GGUF models (minimax-h3, minimax-h3-turbo(-ref),
+    /// hyperflow-flash(-ref)): run every block GEMM in bf16 with unfolded
+    /// adapters, the exact path. By default the sites run as 8-bit tensor-core
+    /// GEMMs (INT8 qkv/fc1, FP8 out/fc2) and adapters fold into the bf16
+    /// weights (a different but equally good sample, ~30% faster steps; needs
+    /// the CUDA accelerator, bf16 without it). Default `false`.
+    pub bf16_gemm: bool,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed, structured
     /// caption via the rewrite endpoint before encoding (the model is trained on
     /// long captions; short raw prompts are out-of-distribution). Default `true`;
@@ -394,12 +417,11 @@ pub struct VideoRequest {
     pub format: VideoFormat,
 }
 
-/// The resolved video plan: total frame count, per-shot list (empty = the
-/// single-shot path), and the effective fps.
+/// The resolved video plan: total frame count, the clip chain, and the
+/// effective fps.
 #[derive(Clone, Debug)]
 pub struct VideoPlan {
     pub frames: u32,
-    pub shots: Vec<Shot>,
     /// MiniMax-H3 / FastH3 past one clip: the chained clips in order (empty =
     /// one clip of `frames`).
     pub chain: Vec<ChainSegment>,
@@ -437,7 +459,7 @@ impl VideoRequest {
                     .minimax_roles()
                     .contains(&thinfer_models::minimax::manifest::role::VISION))
             .then_some(thinfer_models::minimax::manifest::role::VISION);
-            return self
+            let mut files = self
                 .model
                 .minimax_roles()
                 .iter()
@@ -449,7 +471,15 @@ impl VideoRequest {
                         .copied()
                         .ok_or_else(|| format!("MiniMax-H3 manifest missing role {r}"))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
+            if let Some(sr) = self.super_res {
+                use thinfer_models::wan::relayvsr::manifest as vsr;
+                let (dit, flash) = vsr::roles(sr.factor());
+                for r in [dit, flash] {
+                    files.push(*vsr::MANIFEST.get(r).ok_or("RelayVSR manifest role")?);
+                }
+            }
+            return Ok(files);
         }
         // LTX sources by role (joint-AV: encoder + tokenizer + connector + DiT +
         // both VAEs + upscaler), not via the Wan variant registry.
@@ -583,10 +613,23 @@ impl VideoRequest {
     /// Validate dims + resolve fps and the shot plan. Fails fast on every user
     /// error so a server can 400 at submit.
     pub fn resolve(&self) -> Result<VideoPlan, String> {
-        if self.attn != AttnPrecision::Bf16 && !self.model.is_fasth3() {
+        if self.super_res.is_some() && !self.model.is_minimax() {
             return Err(format!(
-                "--attn {} applies to the FastH3 models' sparse attention; {} does not take it",
+                "--super-res applies to the MiniMax-H3 / FastH3 models; {} does not take it",
+                self.model
+            ));
+        }
+        if self.attn != AttnPrecision::Bf16 && !self.model.is_minimax() {
+            return Err(format!(
+                "--attn {} applies to the MiniMax-H3 family's attention; {} does not take it",
                 self.attn, self.model
+            ));
+        }
+        if self.bf16_gemm && !self.model.is_minimax_gguf() {
+            return Err(format!(
+                "--bf16-gemm applies to the MiniMax-H3 GGUF models (minimax-h3, minimax-h3-turbo, \
+                 minimax-h3-turbo-ref, hyperflow-flash, hyperflow-flash-ref); {} does not take it",
+                self.model
             ));
         }
         if self.vae_encode_f32 && !self.model.is_minimax() {
@@ -610,8 +653,8 @@ impl VideoRequest {
             && self.input_image.is_some()
         {
             return Err(format!(
-                "--input-image is only supported by hunyuan-video-1.5-ti2v, ltx2-rapid, fasth3-trim \
-                 and minimax-h3 (got {})",
+                "--input-image is only supported by hunyuan-video-1.5-ti2v, ltx2-rapid, the FL2VA \
+                 MiniMax line (fasth3-trim, fasth3-v2, minimax-h3, hyperflow-flash) (got {})",
                 self.model
             ));
         }
@@ -638,17 +681,16 @@ impl VideoRequest {
         // MiniMax-H3: its own grid (dims /32, frames 17n+5), single prompt, and
         // none of the FastWan sampler/vae/shot machinery.
         if self.model.is_minimax() {
-            // FastH3 runs the row-chunked accelerated block where one exists;
-            // the driver re-resolves with the limit of the backend it has.
-            let accel = self.model.is_fasth3();
-            return self.resolve_minimax(thinfer_models::minimax::pipeline::max_packed_rows(accel));
+            // The row-chunked accelerated block where one exists; the driver
+            // re-resolves with the limit of the backend it has.
+            return self.resolve_minimax(self.model.minimax_row_limit(true));
         }
         validate_dim("height", self.height)?;
         validate_dim("width", self.width)?;
         if self.steps == 0 {
             return Err("--steps must be > 0".into());
         }
-        let (mut frames, shots) = resolve_shot_plan(
+        let mut frames = resolve_frames(
             self.model,
             &self.prompts,
             &self.frames,
@@ -660,7 +702,7 @@ impl VideoRequest {
         // the dims -- see `VideoModelId::max_frames`). Explicit `--frames` over
         // budget is a hard error (fail fast at submit instead of device-losing
         // mid-denoise); `--duration` and the default cap DOWN with a warning.
-        // Uncapped models (FastWan/LongLive) return `None` -> no-op.
+        // Uncapped models (FastWan) return `None` -> no-op.
         let mut warnings = Vec::new();
         if let Some(max_frames) = self.model.max_frames(self.width, self.height)
             && frames > max_frames
@@ -685,7 +727,6 @@ impl VideoRequest {
         }
         Ok(VideoPlan {
             frames,
-            shots,
             chain: Vec::new(),
             fps,
             warnings,
@@ -704,27 +745,28 @@ impl VideoRequest {
     pub fn resolve_minimax(&self, row_limit: usize) -> Result<VideoPlan, String> {
         if self.prompts.len() > 1 && !self.model.minimax_fl2va() {
             return Err(format!(
-                "{} takes a single prompt (chained clips need FL2VA: fasth3-trim, minimax-h3)",
+                "{} takes a single prompt (chained clips need FL2VA: fasth3-trim, fasth3-v2, \
+                 minimax-h3)",
                 self.model
             ));
         }
         if self.input_image.is_some() && !self.model.minimax_fl2va() {
             return Err(format!(
-                "{} takes no --input-image (FL2VA first frames: fasth3-trim, minimax-h3)",
+                "{} takes no --input-image (FL2VA first frames: fasth3-trim, fasth3-v2, minimax-h3)",
                 self.model
             ));
         }
         let max_refs = crate::minimax_ref::MAX_REFERENCES;
-        if !self.ref_images.is_empty() && self.model != VideoModelId::Fasth3Omni {
+        if !self.ref_images.is_empty() && !self.model.takes_refs() {
             return Err(format!(
-                "{} does not take reference images (fasth3-omni does)",
+                "{} does not take reference images (fasth3-omni, hyperflow-flash-ref, \
+                 minimax-h3-turbo-ref do)",
                 self.model
             ));
         }
-        if self.ref_image_size != RefImageSize::default() && self.model != VideoModelId::Fasth3Omni
-        {
+        if self.ref_image_size != RefImageSize::default() && !self.model.takes_refs() {
             return Err(format!(
-                "--ref-image-size applies to fasth3-omni reference images; {} does not take it",
+                "--ref-image-size applies to reference images; {} does not take them",
                 self.model
             ));
         }
@@ -800,7 +842,6 @@ impl VideoRequest {
         }
         Ok(VideoPlan {
             frames,
-            shots: Vec::new(),
             chain: Vec::new(),
             fps,
             warnings,
@@ -926,7 +967,6 @@ impl VideoRequest {
             .collect();
         Ok(VideoPlan {
             frames,
-            shots: Vec::new(),
             chain,
             fps,
             warnings,
@@ -934,7 +974,7 @@ impl VideoRequest {
     }
 
     /// LTX-2.3 plan resolution: single-prompt t2v on the LTX grid (dims a
-    /// multiple of 64, frames `8k+1`). No shots, no sampler/vae knobs. Returns
+    /// multiple of 64, frames `8k+1`). No chain, no sampler/vae knobs. Returns
     /// an empty shot list (the single-clip path).
     fn resolve_ltx(&self, fps: u32) -> Result<VideoPlan, String> {
         let mult = self.model.dim_multiple();
@@ -950,10 +990,7 @@ impl VideoRequest {
             }
         }
         if self.prompts.len() != 1 {
-            return Err(format!(
-                "{} is single-prompt t2v; multi-shot is LongLive-only",
-                self.model
-            ));
+            return Err(format!("{} takes a single prompt", self.model));
         }
         if self.input_image.is_some() && !(0.0..=1.0).contains(&self.strength) {
             return Err(format!(
@@ -1029,7 +1066,6 @@ impl VideoRequest {
         }
         Ok(VideoPlan {
             frames,
-            shots: Vec::new(),
             chain: Vec::new(),
             fps,
             warnings,
@@ -1240,108 +1276,37 @@ pub struct JobSummary {
     pub seed: Option<u64>,
 }
 
-/// Resolve prompts + frames/durations into the total frame count and per-shot
-/// plan. A single frames/duration value splits the clip evenly across shots (in
-/// chunk units, mirroring upstream `_even_durations`); one value per prompt
-/// sizes each shot independently; any other count is an error. A single prompt
-/// yields an empty shot list (the parity single-shot path stays untouched).
-/// Multi-shot is LongLive-only.
-pub fn resolve_shot_plan(
+/// Resolve frames/durations into the clip's frame count. These models take one
+/// prompt and one length: `--frames` must sit on the model grid, `--duration`
+/// snaps to it, and neither gives the model default.
+pub fn resolve_frames(
     model: VideoModelId,
     prompts: &[String],
     frames: &[u32],
     durations: &[f32],
     fps: u32,
-) -> Result<(u32, Vec<Shot>), String> {
-    let num_shots = prompts.len();
-    let values: Vec<u32> = if !durations.is_empty() {
-        durations
-            .iter()
-            .map(|&d| {
-                if !(d.is_finite() && d > 0.0) {
-                    return Err(format!(
-                        "--duration must be a positive number of seconds (got {d})"
-                    ));
-                }
-                Ok(model.snap_frames((d * fps as f32).round() as u32))
-            })
-            .collect::<Result<_, _>>()?
-    } else {
-        frames.to_vec()
-    };
-
-    if !model.is_ar() {
-        if num_shots != 1 {
+) -> Result<u32, String> {
+    if prompts.len() != 1 {
+        return Err(format!("{model} takes a single --prompt"));
+    }
+    if frames.len() + durations.len() > 1 {
+        return Err(format!("{model} takes a single --frames/--duration"));
+    }
+    if let Some(&d) = durations.first() {
+        if !(d.is_finite() && d > 0.0) {
             return Err(format!(
-                "multiple --prompt (multi-shot) is only supported by longlive-2.0-5b, not {model}"
+                "--duration must be a positive number of seconds (got {d})"
             ));
         }
-        if values.len() > 1 {
-            return Err(format!(
-                "multiple --frames/--duration is only for multi-shot longlive-2.0-5b, not {model}"
-            ));
+        return Ok(model.snap_frames((d * fps as f32).round() as u32));
+    }
+    match frames.first() {
+        Some(&f) => {
+            model.validate_frames(f)?;
+            Ok(f)
         }
-        let frames = match values.first() {
-            Some(&f) if !frames.is_empty() => {
-                model.validate_frames(f)?;
-                f
-            }
-            Some(&f) => f, // from --duration, already snapped legal
-            None => model.default_frames(),
-        };
-        return Ok((frames, Vec::new()));
+        None => Ok(model.default_frames()),
     }
-
-    let shot_chunks: Vec<usize> = match values.len() {
-        0 => even_chunk_split(model.frames_to_chunks(model.default_frames())?, num_shots)?,
-        1 => even_chunk_split(model.frames_to_chunks(values[0])?, num_shots)?,
-        n if n == num_shots => values
-            .iter()
-            .map(|&f| model.frames_to_chunks(f))
-            .collect::<Result<_, _>>()?,
-        n => {
-            return Err(format!(
-                "expected 1 --{} value (split evenly) or {num_shots} (one per --prompt), got {n}",
-                if durations.is_empty() {
-                    "frames"
-                } else {
-                    "duration"
-                }
-            ));
-        }
-    };
-
-    let total_chunks: usize = shot_chunks.iter().sum();
-    let frames = model.chunks_to_frames(total_chunks);
-    if num_shots == 1 {
-        return Ok((frames, Vec::new()));
-    }
-    let shots = prompts
-        .iter()
-        .zip(shot_chunks)
-        .map(|(p, chunks)| Shot {
-            prompt: p.clone(),
-            chunks,
-        })
-        .collect();
-    Ok((frames, shots))
-}
-
-/// Split `total` chunks across `num_shots` shots as evenly as possible (the
-/// first `total % num_shots` shots get one extra), mirroring upstream
-/// `_even_durations`. Errors if there are fewer chunks than shots.
-pub fn even_chunk_split(total: usize, num_shots: usize) -> Result<Vec<usize>, String> {
-    if total < num_shots {
-        return Err(format!(
-            "clip is {total} chunk(s) but there are {num_shots} shots; give a longer \
-             --frames/--duration or fewer --prompt"
-        ));
-    }
-    let base = total / num_shots;
-    let extra = total % num_shots;
-    Ok((0..num_shots)
-        .map(|i| base + usize::from(i < extra))
-        .collect())
 }
 
 // Prompts are user content: never rendered by `Debug` (structural fields only)
@@ -1394,71 +1359,38 @@ impl Drop for VideoRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{VideoFormat, VideoRequest, even_chunk_split, resolve_shot_plan};
-    use crate::model::VideoModelId::{FastwanTi2v5b as Fw, Longlive205b as Ll};
+    use super::{VideoFormat, VideoRequest, resolve_frames};
+    use crate::model::VideoModelId::FastwanTi2v5b as Fw;
 
     const FPS: u32 = 24;
 
     fn prompts(n: usize) -> Vec<String> {
-        (0..n).map(|i| format!("shot {i}")).collect()
+        (0..n).map(|i| format!("prompt {i}")).collect()
     }
 
     #[test]
-    fn even_split_distributes_remainder_to_front() {
-        assert_eq!(even_chunk_split(6, 3).unwrap(), vec![2, 2, 2]);
-        assert_eq!(even_chunk_split(7, 3).unwrap(), vec![3, 2, 2]);
-        assert_eq!(even_chunk_split(8, 3).unwrap(), vec![3, 3, 2]);
-        assert_eq!(even_chunk_split(3, 3).unwrap(), vec![1, 1, 1]);
-        assert!(even_chunk_split(2, 3).is_err());
-    }
-
-    #[test]
-    fn single_prompt_yields_no_shots() {
-        let (frames, shots) = resolve_shot_plan(Ll, &prompts(1), &[61], &[], FPS).unwrap();
-        assert_eq!(frames, 61);
-        assert!(shots.is_empty());
-        let (frames, shots) = resolve_shot_plan(Fw, &prompts(1), &[], &[], FPS).unwrap();
-        assert_eq!(frames, Fw.default_frames());
-        assert!(shots.is_empty());
-    }
-
-    #[test]
-    fn one_frames_value_splits_evenly_across_shots() {
-        let (frames, shots) = resolve_shot_plan(Ll, &prompts(2), &[125], &[], FPS).unwrap();
-        assert_eq!(frames, 125);
-        assert_eq!(shots.len(), 2);
-        assert_eq!((shots[0].chunks, shots[1].chunks), (2, 2));
-        assert_eq!(shots[0].prompt, "shot 0");
-        assert_eq!(shots[1].prompt, "shot 1");
-    }
-
-    #[test]
-    fn frames_per_shot_sizes_each_independently() {
-        let (frames, shots) = resolve_shot_plan(Ll, &prompts(2), &[29, 61], &[], FPS).unwrap();
-        assert_eq!(shots.len(), 2);
-        assert_eq!((shots[0].chunks, shots[1].chunks), (1, 2));
-        assert_eq!(frames, Ll.chunks_to_frames(3));
-        assert_eq!(frames, 93);
-    }
-
-    #[test]
-    fn wrong_value_count_is_an_error() {
-        assert!(resolve_shot_plan(Ll, &prompts(3), &[29, 61], &[], FPS).is_err());
-        assert!(resolve_shot_plan(Fw, &prompts(2), &[], &[], FPS).is_err());
-        assert!(resolve_shot_plan(Fw, &prompts(1), &[61, 61], &[], FPS).is_err());
-    }
-
-    #[test]
-    fn duration_per_shot_converts_and_snaps() {
-        let (frames, shots) = resolve_shot_plan(Ll, &prompts(2), &[], &[1.2, 2.5], FPS).unwrap();
-        assert_eq!(shots.len(), 2);
-        for s in &shots {
-            assert!(s.chunks >= 1);
-        }
+    fn frames_resolve_on_the_model_grid() {
         assert_eq!(
-            frames,
-            Ll.chunks_to_frames(shots.iter().map(|s| s.chunks).sum())
+            resolve_frames(Fw, &prompts(1), &[61], &[], FPS).unwrap(),
+            61
         );
+        assert_eq!(
+            resolve_frames(Fw, &prompts(1), &[], &[], FPS).unwrap(),
+            Fw.default_frames()
+        );
+        assert!(resolve_frames(Fw, &prompts(1), &[60], &[], FPS).is_err());
+        // 2.5s @ 24fps = 60 -> 61 (nearest 4k+1).
+        assert_eq!(
+            resolve_frames(Fw, &prompts(1), &[], &[2.5], FPS).unwrap(),
+            61
+        );
+    }
+
+    #[test]
+    fn multiple_prompts_or_lengths_are_an_error() {
+        assert!(resolve_frames(Fw, &prompts(2), &[], &[], FPS).is_err());
+        assert!(resolve_frames(Fw, &prompts(1), &[61, 61], &[], FPS).is_err());
+        assert!(resolve_frames(Fw, &prompts(1), &[61], &[2.5], FPS).is_err());
     }
 
     // A minimal LTX t2v request for resolve() coverage. Only the fields resolve
@@ -1488,8 +1420,10 @@ mod tests {
             attn: AttnPrecision::Bf16,
             audio: true,
             upscale: true,
+            super_res: None,
             audio_hq: false,
             vae_encode_f32: false,
+            bf16_gemm: false,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
             lora: vec![],
@@ -1614,8 +1548,10 @@ mod tests {
             attn: AttnPrecision::Bf16,
             audio: false,
             upscale: false,
+            super_res: None,
             audio_hq: false,
             vae_encode_f32: false,
+            bf16_gemm: false,
             rewrite: false,
             rewrite_quality: crate::model::RewriteQuality::Fast,
             lora: vec![],
@@ -1677,23 +1613,10 @@ mod tests {
     }
 
     #[test]
-    fn longlive_snaps_to_latent_multiple_of_8() {
-        assert_eq!(Ll.snap_frames(61), 61);
-        assert_eq!(Ll.snap_frames(50), 61);
-        assert_eq!(Ll.snap_frames(40), 29);
-        assert_eq!(Ll.snap_frames(97), 93);
-        assert_eq!(Ll.snap_frames(1), 29);
-        // Default is 5s @ 24fps = 120 -> 125 (nearest on the chunk-of-8 grid).
-        assert_eq!(Ll.default_frames(), 125);
-    }
-
-    #[test]
     fn snapped_frames_always_validate() {
         for raw in 1u32..400 {
-            for m in [Fw, Ll] {
-                m.validate_frames(m.snap_frames(raw))
-                    .unwrap_or_else(|e| panic!("{m} snap({raw}) not legal: {e}"));
-            }
+            Fw.validate_frames(Fw.snap_frames(raw))
+                .unwrap_or_else(|e| panic!("{Fw} snap({raw}) not legal: {e}"));
         }
     }
 
@@ -1701,9 +1624,6 @@ mod tests {
     fn validate_rejects_off_grid() {
         assert!(Fw.validate_frames(96).is_err());
         assert!(Fw.validate_frames(97).is_ok());
-        assert!(Ll.validate_frames(97).is_err());
-        assert!(Ll.validate_frames(61).is_ok());
-        assert!(Ll.validate_frames(29).is_ok());
     }
 
     /// A FastH3-Trim request at 832x480 with `prompts` and `durations`.
@@ -1716,7 +1636,7 @@ mod tests {
 
     #[test]
     fn fasth3_chains_past_one_clip() {
-        let row_limit = thinfer_models::minimax::pipeline::max_packed_rows(true);
+        let row_limit = crate::model::VideoModelId::Fasth3Trim.minimax_row_limit(true);
         // 15s and under stays one clip.
         let plan = trim_req(1, vec![15.0]).resolve_minimax(row_limit).unwrap();
         assert!(plan.chain.is_empty());

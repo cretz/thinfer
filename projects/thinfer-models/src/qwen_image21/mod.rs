@@ -19,6 +19,7 @@
 
 pub mod dit;
 pub mod loader;
+pub mod lora;
 pub mod manifest;
 pub mod pipeline;
 pub mod rope;

@@ -104,6 +104,9 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>) {
             }
         });
     };
+    // Job plaintext is page-locked from here on; a lock that fails (no
+    // lockable memory left) stops the job rather than let it reach swap.
+    thinfer_core::secmem::clear_failure();
     let (request, disable_coopmat) = match decrypt_request(ctx, job, &key, &sealed) {
         Ok(r) => r,
         Err(message) => return job.push(JobEvent::Error { message }),
@@ -194,7 +197,12 @@ async fn process(
         // cancel (the denoise loop bails with GenerateError::Cancelled); report
         // it as Cancelled, not a failure. Any other error is a real failure.
         Err(message) => {
-            return if job.is_cancel_requested() {
+            return if thinfer_core::secmem::failed() {
+                tracing::warn!(id = %job.id, "job stopped: job data could not be locked in RAM");
+                job.push(JobEvent::Error {
+                    message: LOCK_FAILED.into(),
+                })
+            } else if job.is_cancel_requested() {
                 tracing::info!(id = %job.id, "job cancelled");
                 job.push(JobEvent::Cancelled)
             } else {
@@ -203,6 +211,14 @@ async fn process(
             };
         }
     };
+    // A lock that failed after the last cancel poll: the result was sealed,
+    // but some plaintext was swappable, so the job does not count as done.
+    if thinfer_core::secmem::failed() {
+        tracing::warn!(id = %job.id, "job stopped: job data could not be locked in RAM");
+        return job.push(JobEvent::Error {
+            message: LOCK_FAILED.into(),
+        });
+    }
     tracing::info!(
         id = %job.id,
         width = summary.width,
@@ -230,6 +246,10 @@ fn to_result(id: &str, s: &JobSummary) -> JobResult {
     }
 }
 
+/// The error a job ends with when its plaintext could not be page-locked.
+const LOCK_FAILED: &str = "not enough lockable memory to keep this job's data out of swap; \
+    the job was stopped (free some RAM, or raise the memory-lock limit)";
+
 /// The sealed artifact's file name in the job dir.
 pub const RESULT_FILE: &str = "result.sealed";
 
@@ -242,6 +262,9 @@ struct ServeSink<'k> {
 
 impl ProgressSink for ServeSink<'_> {
     fn artifact(&self, _path: &std::path::Path, bytes: &[u8]) -> Result<bool, String> {
+        if thinfer_core::secmem::failed() {
+            return Err(LOCK_FAILED.into());
+        }
         let out = self.job.dir.join(RESULT_FILE);
         std::fs::write(&out, self.key.seal(bytes))
             .map_err(|e| format!("write {}: {e}", out.display()))?;
@@ -258,6 +281,7 @@ impl ProgressSink for ServeSink<'_> {
         });
     }
     fn cancelled(&self) -> bool {
-        self.job.is_cancel_requested()
+        // A failed page lock stops the job at its next poll.
+        self.job.is_cancel_requested() || thinfer_core::secmem::failed()
     }
 }

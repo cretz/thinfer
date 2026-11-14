@@ -92,15 +92,16 @@ impl JobKey {
         out
     }
 
-    /// Open a blob from [`Self::seal`]. The plaintext is zeroed on drop.
-    pub fn open(&self, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    /// Open a blob from [`Self::seal`]. The plaintext is page-locked on a
+    /// server and zeroed on drop.
+    pub fn open(&self, blob: &[u8]) -> Result<thinfer_core::secmem::Locked<u8>, String> {
         if blob.len() < NONCE_LEN + 16 {
             return Err("sealed blob too short".into());
         }
         let (nonce, body) = blob.split_at(NONCE_LEN);
         self.cipher()
             .decrypt(Nonce::from_slice(nonce), body)
-            .map(Zeroizing::new)
+            .map(thinfer_core::secmem::Locked::new)
             .map_err(|_| "decrypt failed (wrong job key or corrupt data)".into())
     }
 }

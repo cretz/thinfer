@@ -1,7 +1,7 @@
-//! FlowUniPC multistep sampler for LongLive-2.0-5B (the AR causal variant).
+//! FlowUniPC multistep sampler (DreamID-V, and FastWan's served UniPC path).
 //!
-//! LongLive does NOT use FastWan's stateless Euler-renoise [`super::scheduler::
-//! DmdSampler`]; per chunk it runs upstream's `FlowUniPCMultistepScheduler`
+//! The alternative to FastWan's stateless Euler-renoise [`super::scheduler::
+//! DmdSampler`]: upstream's `FlowUniPCMultistepScheduler`
 //! (`wan_5b/utils/fm_solvers_unipc.py`) with `solver_order=2`, `predict_x0=True`,
 //! `solver_type="bh2"`, `lower_order_final=True`, `final_sigmas_type="zero"`, CFG
 //! off. This is a genuine predictor+corrector multistep solver, so it carries a
@@ -9,13 +9,13 @@
 //! from the source; orders never exceed 2, so the only linear solve (the order-2
 //! corrector's 2x2 system) is inlined in closed form.
 //!
-//! Per AR chunk: [`FlowUniPc::reset`], then for each of the 4 steps feed the DiT
+//! Per denoise: [`FlowUniPc::reset`], then for each step feed the DiT
 //! velocity at [`FlowUniPc::timestep`] into [`FlowUniPc::step`]; the returned
 //! latent is the next step's input. After the last step the result is the clean
 //! latent (final sigma 0). Scalar coefficients are computed in f32 to mirror the
 //! float32 `sigmas` table torch builds; the latent vectors stay f32.
 
-/// Per-variant FlowUniPC schedule knobs. LongLive: 4 steps, shift 5.0.
+/// Per-variant FlowUniPC schedule knobs.
 #[derive(Clone, Debug)]
 pub struct UniPcConfig {
     pub sampling_steps: usize,
@@ -27,17 +27,6 @@ pub struct UniPcConfig {
 }
 
 impl UniPcConfig {
-    /// LongLive-2.0-5B (`configs/inference.yaml`): `sampling_steps=4`,
-    /// `timestep_shift=5.0`, `num_train_timesteps=1000`.
-    pub fn longlive() -> Self {
-        Self {
-            sampling_steps: 4,
-            shift: 5.0,
-            num_train_timesteps: 1000.0,
-            sigma_min: 0.001,
-        }
-    }
-
     /// DreamID-V-Wan-1.3B-Faster (`wan_swapface.py::generate`): the upstream
     /// `FlowUniPCMultistepScheduler(shift=1)` re-shifted by `set_timesteps(steps,
     /// shift=5.0)`, `num_train_timesteps=1000`, CFG on the image ref only. The
@@ -69,8 +58,8 @@ impl UniPcConfig {
 
 const SOLVER_ORDER: usize = 2;
 
-/// Stateful FlowUniPC sampler. Hold one per AR denoise; [`Self::reset`] between
-/// chunks (the upstream `set_timesteps` re-init).
+/// Stateful FlowUniPC sampler. Hold one per denoise; [`Self::reset`] re-inits
+/// it (the upstream `set_timesteps`).
 pub struct FlowUniPc {
     /// Flow sigmas, length `sampling_steps + 1`, final entry 0.0.
     sigmas: Vec<f32>,
@@ -332,7 +321,7 @@ mod tests {
 
     #[test]
     fn schedule_matches_upstream() {
-        let s = FlowUniPc::new(&UniPcConfig::longlive());
+        let s = FlowUniPc::new(&UniPcConfig::dreamid_v(4));
         assert_eq!(s.num_steps(), 4);
         assert_eq!(s.timesteps, vec![1000, 937, 833, 625]);
         let want = [1.0, 0.937578, 0.833611, 0.625936, 0.0];
@@ -351,7 +340,7 @@ mod tests {
     /// the order [1,2,2,1] progression, and the final sigma=0 / expm1(-inf) edge.
     #[test]
     fn constant_x0_is_a_fixed_point() {
-        let mut s = FlowUniPc::new(&UniPcConfig::longlive());
+        let mut s = FlowUniPc::new(&UniPcConfig::dreamid_v(4));
         s.reset();
         let c: Vec<f32> = vec![0.3, -1.2, 0.75, 2.0, -0.5];
         // Start from arbitrary noise.
@@ -375,7 +364,7 @@ mod tests {
     /// 1..=3. Drive trivial (zero-velocity) steps and inspect the recorded order.
     #[test]
     fn order_progression_is_1_2_2_1() {
-        let mut s = FlowUniPc::new(&UniPcConfig::longlive());
+        let mut s = FlowUniPc::new(&UniPcConfig::dreamid_v(4));
         let mut orders = Vec::new();
         let mut sample = vec![0.5f32; 3];
         for _ in 0..s.num_steps() {

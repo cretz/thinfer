@@ -59,30 +59,33 @@
           <section class="group">
             <h2>Inputs</h2>
             <div class="grid">
-              <!-- First-frame / edit / condition image (edit models require it;
-                   I2V and optional-image models do not). -->
+              <!-- First-frame / edit image (edit models require it; I2V models
+                   do not). -->
               <div class="field span-all" id="input-image-row" hidden>
                 <label for="input-image">Input image</label>
-                <input id="input-image" type="file" accept="image/png,image/jpeg" />
-                <!-- Shown once an image has been generated on this page: use it
-                     instead of a file (no download + re-upload). -->
-                <div class="check" id="use-current-image-row" hidden>
-                  <input id="use-current-image" type="checkbox" />
-                  <label for="use-current-image">Use current image (last generated)</label>
+                <!-- Pick a file or use the image on the page (shown once one has
+                     been generated); either fills the one slot listed below. -->
+                <div class="inline">
+                  <input id="input-image" type="file" accept="image/png,image/jpeg" />
+                  <button id="use-current-image" type="button" class="secondary" hidden>
+                    Use current image
+                  </button>
                 </div>
+                <div id="input-image-chosen" class="chosen"></div>
               </div>
 
-              <!-- FastH3-Omni reference images (up to 9): the prompt names them
-                   <Picture 1>, <Picture 2>, ... in the order listed. -->
+              <!-- Ordered reference images: FastH3-Omni (up to 9, the prompt names
+                   them <Picture 1>, ...) and Qwen-Image-2.1 (up to 10, image 1,
+                   ...), in the order listed. -->
               <div class="field span-all" id="ref-images-row" hidden>
                 <label for="ref-images">Reference images</label>
                 <div class="inline">
                   <input id="ref-images" type="file" accept="image/png,image/jpeg" multiple />
                   <button id="add-current-ref" type="button" class="secondary" hidden>
-                    Add current image
+                    Use current image
                   </button>
                 </div>
-                <div id="ref-images-order"></div>
+                <div id="ref-images-order" class="chosen"></div>
               </div>
               <div class="field span-all" id="ref-image-size-row" hidden>
                 <label for="ref-image-size">Reference size</label>
@@ -160,6 +163,14 @@
                   <option value="nvfp4-fast" id="vae-opt-nvfp4-fast" hidden>NVFP4 fast decoder (fastest, softer; RTX 50)</option>
                 </select>
               </div>
+              <div class="field span-all" id="super-res-row" hidden>
+                <label for="super-res">Super-res</label>
+                <select id="super-res">
+                  <option value="" selected>Off (native resolution)</option>
+                  <option value="2x">2x RelayVSR (tuned for H3, fast)</option>
+                  <option value="4x">4x RelayVSR (slower)</option>
+                </select>
+              </div>
               <div class="field span-all" id="attn-row" hidden>
                 <label for="attn">Attention</label>
                 <select id="attn">
@@ -225,6 +236,10 @@
               <div class="check" id="vae-encode-f32-row" hidden>
                 <input id="vae-encode-f32" type="checkbox" />
                 <label for="vae-encode-f32">Exact reference encode (f32, slower)</label>
+              </div>
+              <div class="check" id="bf16-gemm-row" hidden>
+                <input id="bf16-gemm" type="checkbox" />
+                <label for="bf16-gemm" title="By default the matmuls run in INT8/FP8 and adapters fold into the weights (faster, a different but equally good sample)">Exact bf16 matmuls (slower)</label>
               </div>
               <div class="check" id="face-crop-row" hidden>
                 <input id="face-crop" type="checkbox" />

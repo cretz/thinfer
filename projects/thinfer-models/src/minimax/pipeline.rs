@@ -27,7 +27,7 @@ use crate::common::block::{ActBuf, Block, alloc_matmul_out_buf};
 use crate::common::{Cancel, seq};
 use crate::ltx::sampler::gaussian_noise;
 
-use super::adaln::{ModSegment, ModulationPlan};
+use super::adaln::{ModSegment, ModulationPlan, TimeKey};
 use super::dit::{
     BlockBufs, BlockProbe, BlockViews, DitHandles, DitPipelines, DitShape, ModulationTable,
     QUERY_SLAB_ROWS, ROW_CHUNK, VsaPlan, forward_block, forward_final_norm, forward_refiner_block,
@@ -57,17 +57,37 @@ pub const MAX_PACKED_ROWS: usize = 16384;
 /// (~65k).
 pub const ACCEL_MAX_PACKED_ROWS: usize = 72 * 1024;
 
+/// Row limit on the accelerated GGUF block (`dit::block_forward_generic_accel`),
+/// row-chunked too but holding every row's q / k / v (`3 x rows x 7168`
+/// bf16) and, with INT8 / FP8 attention, their 8-bit copies (`3 x rows x
+/// 7168`): ~2.3 GiB at 32k rows plus the residual stream and ~1.1 GiB of
+/// per-pass weight images and chunk scratch, beside
+/// [`LONG_SEQUENCE_WEIGHT_BUDGET`]. Covers 10s at 832x480 (~29k rows) with
+/// reference images.
+pub const GENERIC_ACCEL_MAX_PACKED_ROWS: usize = 32 * 1024;
+
+/// The block a run's DiT gets, for its packed-row limit ([`max_packed_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockPath {
+    /// The backend (wgpu) block: [`MAX_PACKED_ROWS`].
+    Backend,
+    /// The accelerated GGUF block: [`GENERIC_ACCEL_MAX_PACKED_ROWS`].
+    GenericAccel,
+    /// FastH3's accelerated NVFP4 block: [`ACCEL_MAX_PACKED_ROWS`].
+    Fasth3Accel,
+}
+
 /// VRAM weight budget past [`MAX_PACKED_ROWS`]: the DiT streams block by block
 /// whatever the budget, so a long sequence trades the weight LRU (two blocks in
 /// flight is all the pipeline needs, ~0.5 GiB) for activation room.
 pub const LONG_SEQUENCE_WEIGHT_BUDGET: u64 = 1024 * 1024 * 1024;
 
-/// The packed-row limit for a run: the accelerated block's when it will run.
-pub fn max_packed_rows(accelerated: bool) -> usize {
-    if accelerated {
-        ACCEL_MAX_PACKED_ROWS
-    } else {
-        MAX_PACKED_ROWS
+/// The packed-row limit for a run on `path`.
+pub fn max_packed_rows(path: BlockPath) -> usize {
+    match path {
+        BlockPath::Backend => MAX_PACKED_ROWS,
+        BlockPath::GenericAccel => GENERIC_ACCEL_MAX_PACKED_ROWS,
+        BlockPath::Fasth3Accel => ACCEL_MAX_PACKED_ROWS,
     }
 }
 
@@ -229,15 +249,25 @@ impl DenoisePlan {
         // Conditioning video rows sit at `max(t, 0.999)` (their noise
         // augmentation level), conditioning audio is clean; text rows inherit
         // the video timestep.
+        // Two-time checkpoints also key each row by its step endpoint `r`;
+        // conditioning rows go nowhere (`r == t`).
+        let key = |s: &super::scheduler::Scheduler, i: usize| TimeKey {
+            t: s.timesteps()[i],
+            r: if cfg.two_time {
+                s.endpoint(i)
+            } else {
+                s.timesteps()[i]
+            },
+        };
         let per_step: Vec<_> = (0..schedule.num_steps())
             .map(|i| {
-                let tv = schedule.video.timesteps()[i];
+                let video = key(&schedule.video, i);
                 packing::build_row_timesteps(
                     &packed,
-                    tv,
-                    schedule.audio.timesteps()[i],
-                    tv.max(packing::KEYFRAME_NOISE_AUG),
-                    1.0,
+                    video,
+                    key(&schedule.audio, i),
+                    TimeKey::single(video.t.max(packing::KEYFRAME_NOISE_AUG)),
+                    TimeKey::single(1.0),
                 )
             })
             .collect();
@@ -758,21 +788,6 @@ async fn forward_impl<'r, S: WeightSource>(
                 .await
                 .map_err(ResidencyError::<_, WgpuError>::Source)?;
         }
-        let scope = workspace.batch();
-        forward_block(
-            &scope,
-            pipelines,
-            shape,
-            scope.import(&x_ref),
-            scope.import(&freqs_ref),
-            &bufs,
-            handles.blocks[idx].kinds(),
-            table,
-            idx,
-            &segments,
-            vsa_plan.as_ref(),
-            probe.as_ref().map(|p| p.probe()).as_ref(),
-        )?;
         // The last block's lookahead is the next step's block 0.
         let wraps = idx + 1 == handles.blocks.len() && more_steps;
         let next = if wraps {
@@ -788,18 +803,80 @@ async fn forward_impl<'r, S: WeightSource>(
                 None => Ok(None),
             }
         };
-        // A block that ran as one deferred accelerator sequence is still in
-        // flight: stream the next block's weights NOW, overlapping it, and only
-        // then let the submit wait for it (and release its buffers).
-        let deferred = scope.is_deferred();
-        let submit = scope
-            .submit_void()
-            .instrument(tracing::debug_span!(target: PHASE, "minimax.dit.submit", idx));
-        let (submit_res, next_res) = if deferred {
-            let next = next_acquire.await;
-            (submit.await, next)
+        let block_probe = probe.as_ref().map(|p| p.probe());
+        // A long sequence on the backend block runs row-chunked (its whole-row
+        // intermediates do not fit next to the weights), streaming the next
+        // block's weights meanwhile.
+        // The accelerated generic block chunks its own rows in one deferred
+        // sequence; only the backend block needs the row-chunked scopes.
+        // A dense VSA plan (INT8 / FP8 attention) is still dense attention.
+        let chunked = vsa_plan
+            .as_ref()
+            .is_none_or(|p| p.dense_shape(cfg).is_some())
+            && block_probe.is_none()
+            && shape.rows as u32 > super::dit::GENERIC_CHUNK_ROWS
+            && !super::dit::generic_accel_ok(
+                backend.accelerator(),
+                backend.pipeline_gemm(&pipelines.block.matmul_module),
+                pipelines,
+                shape,
+                &bufs,
+                handles.blocks[idx].kinds(),
+                &segments,
+                vsa_plan.as_ref(),
+            );
+        let (submit_res, next_res) = if chunked {
+            let fwd = super::dit::forward_block_chunked(
+                workspace,
+                pipelines,
+                shape,
+                x_ref,
+                freqs_ref,
+                &bufs,
+                handles.blocks[idx].kinds(),
+                table,
+                idx,
+                &segments,
+            );
+            // Which side of the overlap bounds the block: its row-chunked
+            // forward or the next block's weight stream.
+            let t0 = trace::Instant::now();
+            let ms = move || t0.elapsed().as_secs_f64() * 1e3;
+            let ((fwd_res, fwd_ms), (acq_res, acq_ms)) =
+                futures::join!(async { (fwd.await, ms()) }, async {
+                    (next_acquire.await, ms())
+                });
+            tracing::debug!(target: PHASE, idx, fwd_ms, acq_ms, "minimax.dit.chunked_block");
+            (fwd_res, acq_res)
         } else {
-            futures::join!(submit, next_acquire)
+            let scope = workspace.batch();
+            forward_block(
+                &scope,
+                pipelines,
+                shape,
+                scope.import(&x_ref),
+                scope.import(&freqs_ref),
+                &bufs,
+                handles.blocks[idx].kinds(),
+                table,
+                idx,
+                &segments,
+                vsa_plan.as_ref(),
+                block_probe.as_ref(),
+            )?;
+            // A block that ran as one deferred accelerator sequence is still in
+            // flight: stream the next block's weights NOW, overlapping it, and
+            // only then let the submit wait for it (and release its buffers).
+            let deferred = scope.is_deferred();
+            let submit = scope
+                .submit_void()
+                .instrument(tracing::debug_span!(target: PHASE, "minimax.dit.submit", idx));
+            if deferred {
+                let next = next_acquire.await;
+                (submit.await, next)
+            } else {
+                futures::join!(submit, next_acquire)
+            }
         };
         submit_res?;
         match carry.as_deref_mut().filter(|_| wraps) {
@@ -1229,12 +1306,14 @@ mod tests {
     fn native_canvas_needs_the_chunked_block() {
         // 1344x768 -> latent 84x48 -> patch (1,2,2) -> 1008 rows/frame.
         let native_rows = 37 * 1008 + 414 + 64;
-        let check = |rows, accel| {
-            check_sequence_budget::<std::convert::Infallible>(rows, max_packed_rows(accel))
+        let check = |rows, path| {
+            check_sequence_budget::<std::convert::Infallible>(rows, max_packed_rows(path))
         };
-        assert!(check(native_rows, false).is_err());
-        assert!(check(native_rows, true).is_ok());
-        assert!(check(4600, false).is_ok());
+        assert!(check(native_rows, BlockPath::Backend).is_err());
+        assert!(check(native_rows, BlockPath::Fasth3Accel).is_ok());
+        assert!(check(4600, BlockPath::Backend).is_ok());
+        // 10s at 832x480 on the accelerated GGUF block.
+        assert!(check(29016, BlockPath::GenericAccel).is_ok());
     }
 
     /// Timestep segments must collapse contiguous equal timesteps, or the final
@@ -1242,7 +1321,7 @@ mod tests {
     #[test]
     fn timestep_segments_collapse_runs() {
         let plan = ModulationPlan {
-            timesteps: vec![0.0, 1.0],
+            timesteps: vec![TimeKey::single(0.0), TimeKey::single(1.0)],
             // rows = timestep * 3 + tag: [t0/text, t0/audio, t1/video, t1/text]
             per_step_row_index: vec![vec![1, 2, 3, 4]],
             layout: super::super::adaln::ModulationLayout::new(2, 8),

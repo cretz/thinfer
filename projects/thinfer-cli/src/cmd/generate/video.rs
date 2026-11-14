@@ -1,5 +1,5 @@
-//! `thinfer generate video` (FastWan / LongLive t2v). Thin clap adapter over
-//! `thinfer_app::VideoRequest`; the shot-plan resolution, denoise, and MP4
+//! `thinfer generate video`. Thin clap adapter over
+//! `thinfer_app::VideoRequest`; the frame-plan resolution, denoise, and MP4
 //! encode all live in `thinfer-app`.
 
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::{
-    AttnPrecision, EncoderQuant, RefImageSize, RewriteQuality, VaeChoice, VideoModelId,
+    AttnPrecision, EncoderQuant, RefImageSize, RewriteQuality, SuperRes, VaeChoice, VideoModelId,
     VideoSampler,
 };
 use thinfer_app::request::{ImageBytes, VideoFormat, VideoRequest};
@@ -25,8 +25,8 @@ pub struct GenerateVideo {
     /// 960x544, no prompt rewrite; the e2e-validated path).
     #[arg(long, default_value_t = VideoModelId::DEFAULT, value_enum)]
     pub model: VideoModelId,
-    /// Text prompt. Repeat `--prompt` for a multi-shot video (LongLive only):
-    /// each prompt is one shot, with a scene cut between shots. Required.
+    /// Text prompt. Repeat `--prompt` for chained clips (fasth3-trim,
+    /// minimax-h3): each prompt drives one clip. Required.
     #[arg(long)]
     pub prompt: Vec<String>,
     /// fasth3-omni only: a reference image (PNG/JPEG) the prompt can name as
@@ -46,18 +46,17 @@ pub struct GenerateVideo {
     /// Output format. Defaults to inferring from the `--output` extension.
     #[arg(long, value_enum)]
     pub output_format: Option<VideoFormat>,
-    /// Frame width in pixels. Defaults per model (FastWan/LongLive 960, LTX
-    /// 256). FastWan/LongLive need a multiple of 32; LTX a multiple of 64.
+    /// Frame width in pixels. Defaults per model (FastWan 960, LTX 256).
+    /// FastWan needs a multiple of 32; LTX a multiple of 64.
     #[arg(long)]
     pub width: Option<u32>,
-    /// Frame height in pixels. Defaults per model (FastWan/LongLive 544, LTX
-    /// 256). FastWan/LongLive need a multiple of 32; LTX a multiple of 64.
+    /// Frame height in pixels. Defaults per model (FastWan 544, LTX 256).
+    /// FastWan needs a multiple of 32; LTX a multiple of 64.
     #[arg(long)]
     pub height: Option<u32>,
-    /// Output frame count. Must be `4 * k + 1`; LongLive additionally needs
-    /// `(frames-1)/4+1` divisible by 8 (29, 61, 93, ...). Mutually exclusive
-    /// with `--duration`. One value splits a multi-shot clip evenly; one per
-    /// `--prompt` sizes each shot.
+    /// Output frame count. Must be `4 * k + 1` (LTX `8 * k + 1`). Mutually
+    /// exclusive with `--duration`. Chained clips take one value for the whole
+    /// video or one per `--prompt`.
     #[arg(long, conflicts_with = "duration")]
     pub frames: Vec<u32>,
     /// Target clip length in seconds (mutually exclusive with `--frames`):
@@ -73,7 +72,7 @@ pub struct GenerateVideo {
     pub seed: Option<u64>,
     /// Denoise sampler: `unipc` (multistep, `--steps` configurable) or `dmd`
     /// (fixed 3-step byte-parity path). Unset -> the model default (`dmd` for
-    /// fastwan2.1-t2v-1.3b, else `unipc`). Ignored on the AR (LongLive) path.
+    /// fastwan2.1-t2v-1.3b, else `unipc`).
     #[arg(long, value_enum)]
     pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8). Ignored when
@@ -118,7 +117,8 @@ pub struct GenerateVideo {
     /// `nvfp4-fast` = 8 layers, fastest, softer.
     #[arg(long, value_enum)]
     pub vae: Option<VaeChoice>,
-    /// FastH3 sparse-attention precision. Default `int8-fp8` (SageAttention2-
+    /// MiniMax-H3 family attention precision (FastH3's sparse attention, the
+    /// GGUF models' dense attention). Default `int8-fp8` (SageAttention2-
     /// style INT8 QK^T + FP8 P.V, no visible quality change; GPUs below sm_89
     /// run `int8`); `int8` keeps P.V in bf16 (~10% slower overall); `bf16` is
     /// the reference path. Each is a different sample per seed.
@@ -142,6 +142,11 @@ pub struct GenerateVideo {
     /// res. Default off = single-stage denoise at the target res. Ignored by Wan.
     #[arg(long)]
     pub upscale: bool,
+    /// MiniMax-H3 / FastH3: RelayVSR super-resolution of the finished video,
+    /// 2x (LightX2V's retrain for H3 output) or 4x. Runs after generation,
+    /// before encoding; default off (native resolution).
+    #[arg(long, value_enum)]
+    pub super_res: Option<SuperRes>,
     /// LTX joint-AV: refine the denoise schedule for better audio. The distilled
     /// 8-step table under-resolves the delicate audio residual (speech drifts to
     /// gibberish); this subdivides the coarse sigma jumps into more Euler
@@ -155,6 +160,14 @@ pub struct GenerateVideo {
     /// precision the reference runs that encoder in (~3x faster encode).
     #[arg(long)]
     pub vae_encode_f32: bool,
+    /// MiniMax-H3 GGUF models (minimax-h3, minimax-h3-turbo(-ref),
+    /// hyperflow-flash(-ref)): run every block GEMM in bf16 with unfolded
+    /// adapters, the exact path. By default each block's sites run as 8-bit
+    /// tensor-core GEMMs (INT8 qkv/fc1, FP8 out/fc2) and turbo / LoRA adapters
+    /// fold into the bf16 weights (~30% faster steps, a different but equally
+    /// good sample).
+    #[arg(long)]
+    pub bf16_gemm: bool,
     /// HunyuanVideo 1.5 only: skip prompt rewriting and send the raw prompt. By
     /// default a short prompt is expanded into a detailed, structured caption by
     /// the on-device Qwen3-VL rewriter (the model is trained on long captions;
@@ -185,16 +198,14 @@ pub struct GenerateVideo {
 /// Read a file and base64-encode it for a remote job spec, or `None` when the
 /// path is absent.
 fn base64_of(path: Option<&std::path::Path>) -> Result<Option<String>, String> {
+    path.map(base64_file).transpose()
+}
+
+/// Read a file and base64-encode it for a remote job spec.
+pub(super) fn base64_file(path: &std::path::Path) -> Result<String, String> {
     use base64::Engine;
-    match path {
-        Some(p) => {
-            let bytes = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
-            Ok(Some(
-                base64::engine::general_purpose::STANDARD.encode(bytes),
-            ))
-        }
-        None => Ok(None),
-    }
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
@@ -243,8 +254,10 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             i8_matmul: Some(!args.no_i8_matmul),
             audio: Some(!args.no_audio),
             upscale: Some(args.upscale || args.model.two_stage_default()),
+            super_res: args.super_res,
             audio_hq: Some(args.audio_hq),
             vae_encode_f32: Some(args.vae_encode_f32),
+            bf16_gemm: Some(args.bf16_gemm),
             rewrite: Some(!args.no_rewrite),
             rewrite_quality: Some(args.rewrite_quality),
             // Remote path defers coopmat to the server default; local runs read
@@ -307,8 +320,10 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
         // 8GB and low-res single-stage is OOD); `--upscale` is store-true, so OR
         // with the model default. Wan ignores upscale.
         upscale: args.upscale || args.model.two_stage_default(),
+        super_res: args.super_res,
         audio_hq: args.audio_hq,
         vae_encode_f32: args.vae_encode_f32,
+        bf16_gemm: args.bf16_gemm,
         rewrite: !args.no_rewrite,
         rewrite_quality: args.rewrite_quality,
         lora,

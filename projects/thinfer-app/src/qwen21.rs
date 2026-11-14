@@ -22,8 +22,12 @@ use thinfer_core::residency::WeightResidency;
 use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::workspace::Workspace;
 use thinfer_models::common::block::BlockPipelines;
+#[cfg(feature = "vault")]
+use thinfer_models::common::lora::{LoraFoldSource, discover_specs};
 use thinfer_models::minimax::vision::{self, VisionOutput};
 use thinfer_models::qwen_image21::config;
+#[cfg(feature = "vault")]
+use thinfer_models::qwen_image21::lora::{self as qwen21_lora, AdaptedLora};
 use thinfer_models::qwen_image21::manifest::role;
 use thinfer_models::qwen_image21::pipeline::{
     ConditionImage, ProgressEvent, Qwen21Pipeline, Request,
@@ -48,17 +52,12 @@ const VISION_END: &str = "<|vision_end|>";
 /// per-step streaming); Q8_0 is the parity canary.
 pub const DIT_ROLE: &str = role::DIT_GGUF_Q4_K_M;
 
-/// A decoded, resized condition image: RGBA8 `[h, w, 4]`.
+/// A decoded, resized condition image: RGBA8 `[h, w, 4]`. User media, so
+/// page-locked on a server and zeroed on drop.
 struct Prepared {
-    rgba: Vec<u8>,
+    rgba: thinfer_core::secmem::Locked<u8>,
     height: usize,
     width: usize,
-}
-
-impl Drop for Prepared {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.rgba);
-    }
 }
 
 /// Python's `round` (half to even).
@@ -90,7 +89,7 @@ fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
         img.resize_exact(tw, th, FilterType::Lanczos3)
     };
     Ok(Prepared {
-        rgba: img.to_rgba8().into_raw(),
+        rgba: img.to_rgba8().into_raw().into(),
         height: th as usize,
         width: tw as usize,
     })
@@ -256,7 +255,7 @@ pub async fn run(
 ) -> Result<JobSummary, String> {
     let manifest = req.model.manifest();
     let images: Vec<Prepared> = req
-        .input_image
+        .input_images
         .iter()
         .map(|b| prepare(&b.0))
         .collect::<Result<_, _>>()?;
@@ -324,42 +323,149 @@ pub async fn run(
     let vae = SafetensorsSource::open(open_mmap(&resolve_role(manifest, role::VAE)?).await?)
         .await
         .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
-    let residency = WeightResidency::new(UnionSource::new(UnionSource::new(dit, enc), vae), budget);
-    let pipeline = Qwen21Pipeline::load(Arc::clone(backend), residency)
-        .await
-        .map_err(|e| format!("model load: {e:?}"))?;
-    let progress = |ev: ProgressEvent| {
-        if let Some(s) = map_progress(ev) {
-            sink.stage(s);
-        } else {
-            sink.note("Encoding input image(s)");
-        }
+    let job = Job {
+        backend,
+        req,
+        budget,
+        sink,
+        prompt: &prompt,
+        conditions: &conditions,
+        size: (width, height),
+        seed,
     };
-    let rgba = pipeline
-        .generate(
-            &Request {
-                token_ids: &prompt.ids,
-                drop: prompt.drop,
-                images: &conditions,
-                height,
-                width,
-                seed,
-            },
-            Some(&progress),
-        )
+    // Vault adapters fold into the DiT (a distinct source type, hence the two
+    // calls into the shared generic finish).
+    #[cfg(feature = "vault")]
+    if !req.lora.is_empty() {
+        let folded = fold_adapters(dit, req, sink).await?;
+        return job
+            .finish(UnionSource::new(UnionSource::new(folded, enc), vae))
+            .await;
+    }
+    #[cfg(not(feature = "vault"))]
+    if !req.lora.is_empty() {
+        return Err("this build has no adapter (vault) support".into());
+    }
+    job.finish(UnionSource::new(UnionSource::new(dit, enc), vae))
         .await
-        .map_err(|e| format!("generate: {e:?}"))?;
-    let png = encode_png(&rgba, width, height)?;
-    crate::progress::write_artifact(sink, &req.output, &png)?;
-    tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
-    Ok(JobSummary {
-        output: req.output.clone(),
-        width,
-        height,
-        frames: 1,
-        fps: None,
-        seed: Some(seed),
-    })
+}
+
+/// Everything [`Job::finish`] needs besides the weight source.
+struct Job<'a> {
+    backend: &'a Arc<WgpuBackend>,
+    req: &'a ImageRequest,
+    budget: ResidencyBudget,
+    sink: &'a dyn ProgressSink,
+    prompt: &'a Prompt,
+    conditions: &'a [ConditionImage],
+    size: (u32, u32),
+    seed: u64,
+}
+
+impl Job<'_> {
+    async fn finish<S: thinfer_core::weight::WeightSource>(
+        self,
+        source: S,
+    ) -> Result<JobSummary, String> {
+        let Job {
+            backend,
+            req,
+            budget,
+            sink,
+            prompt,
+            conditions,
+            size: (width, height),
+            seed,
+        } = self;
+        let residency = WeightResidency::new(source, budget);
+        let pipeline = Qwen21Pipeline::load(Arc::clone(backend), residency)
+            .await
+            .map_err(|e| format!("model load: {e:?}"))?;
+        let progress = |ev: ProgressEvent| {
+            if let Some(s) = map_progress(ev) {
+                sink.stage(s);
+            } else {
+                sink.note("Encoding input image(s)");
+            }
+        };
+        let rgba = pipeline
+            .generate(
+                &Request {
+                    token_ids: &prompt.ids,
+                    drop: prompt.drop,
+                    images: conditions,
+                    height,
+                    width,
+                    seed,
+                },
+                Some(&progress),
+            )
+            .await
+            .map_err(|e| format!("generate: {e:?}"))?;
+        let png = encode_png(&rgba, width, height)?;
+        let bytes = png.len();
+        crate::progress::write_artifact(sink, &req.output, png)?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
+        Ok(JobSummary {
+            output: req.output.clone(),
+            width,
+            height,
+            frames: 1,
+            fps: None,
+            seed: Some(seed),
+        })
+    }
+}
+
+/// Decrypt this request's vault adapters, normalize each onto the GGUF's keys
+/// (any of the community layouts, split MLP halves merged into the fused
+/// `gate_up`), and wrap `base` in the generic fold. The password is re-derived
+/// here and never logged; plaintext adapter bytes live only for the fold.
+#[cfg(feature = "vault")]
+async fn fold_adapters<B: thinfer_core::weight::WeightSource>(
+    base: B,
+    req: &ImageRequest,
+    sink: &dyn ProgressSink,
+) -> Result<LoraFoldSource<B, AdaptedLora>, String> {
+    use thinfer_core::format::safetensors::ShardedSafetensorsSource;
+    let password = req
+        .vault_password
+        .as_ref()
+        .ok_or("a vault password is required to use adapters")?;
+    let vault = crate::vault::Vault::new(&req.vault_dir);
+    let model = req.model.to_string();
+    let mut stacks = Vec::with_capacity(req.lora.len());
+    for l in &req.lora {
+        let bytes = vault
+            .open(password.expose(), &model, &l.id)
+            .map_err(|e| e.to_string())?;
+        let raw = ShardedSafetensorsSource::open(vec![crate::executor::BytesOpener::new(bytes)])
+            .await
+            .map_err(|e| format!("parse adapter {}: {e:?}", l.id))?;
+        let adapted = qwen21_lora::adapt(&raw)
+            .await
+            .map_err(|e| format!("adapter {}: {e}", l.id))?;
+        let specs = discover_specs(&base, &adapted)
+            .await
+            .map_err(|e| format!("discover adapter {} sites: {e:?}", l.id))?;
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            sites = specs.len(), strength = l.weight, "adapter sites discovered",
+        );
+        stacks.push((adapted, l.weight, specs));
+    }
+    let sites: usize = stacks.iter().map(|(_, _, s)| s.len()).sum();
+    if sites == 0 {
+        return Err(format!(
+            "adapter(s) folded 0 sites into {model} -- the LoRA keys match no Qwen-Image-2.1 \
+             DiT tensor (is this a LoRA for a different model?)"
+        ));
+    }
+    sink.note(&format!(
+        "Folding {} adapter(s) into {model} ({sites} sites); first-touch quantizes each site",
+        stacks.len(),
+    ));
+    LoraFoldSource::new(base, stacks).map_err(|e| format!("build adapter fold: {e}"))
 }
 
 #[cfg(test)]

@@ -355,6 +355,62 @@ extern "C" __global__ void __launch_bounds__(256) silu_f16(
     const float v = h2f(x[i]);
     out[i] = f2h(v / (1.f + expf(-v)));
 }
+// `ops::hadamard`: each 256-wide group of a row times the normalized regular
+// Hadamard kron(H4, H4, H4, H4) / 16, the WGSL kernel's radix-4 stages (one
+// per base-4 digit: out_j = s - 2 * in_(3 - j)). One 64-thread block per
+// (row, group), f32 in shared memory.
+extern "C" __global__ void __launch_bounds__(64) hadamard_f16(
+    const unsigned short* x, unsigned short* out)
+{
+    __shared__ float gs[256];
+    const size_t base = (size_t)blockIdx.x * 256;
+    const unsigned t = threadIdx.x;
+    for (unsigned i = t; i < 256; i += 64) gs[i] = h2f(x[base + i]);
+    __syncthreads();
+    for (unsigned s = 0; s < 4; ++s) {
+        const unsigned stride = 1u << (2u * s);
+        const unsigned i0 = (t / stride) * stride * 4u + t % stride;
+        const float v0 = gs[i0], v1 = gs[i0 + stride], v2 = gs[i0 + 2u * stride], v3 = gs[i0 + 3u * stride];
+        const float sum = v0 + v1 + v2 + v3;
+        __syncthreads();
+        gs[i0] = sum - 2.f * v3;
+        gs[i0 + stride] = sum - 2.f * v2;
+        gs[i0 + 2u * stride] = sum - 2.f * v1;
+        gs[i0 + 3u * stride] = sum - 2.f * v0;
+        __syncthreads();
+    }
+    for (unsigned i = t; i < 256; i += 64) out[base + i] = f2h(gs[i] * (1.f / 16.f));
+}
+// out = f16(silu(g) * u).
+extern "C" __global__ void __launch_bounds__(256) silu_mul_f16(
+    const unsigned short* __restrict__ g, const unsigned short* __restrict__ u,
+    unsigned short* __restrict__ out, unsigned n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = h2f(g[i]);
+    out[i] = f2h(v / (1.f + expf(-v)) * h2f(u[i]));
+}
+// [rows, cols] 16-bit -> [cols, rows]: 32x32 tiles through smem (padded
+// against bank conflicts), grid (ceil(cols / 32), ceil(rows / 32)), 256
+// threads as 8 rows of 32.
+extern "C" __global__ void __launch_bounds__(256) transpose16(
+    const unsigned short* __restrict__ x, unsigned short* __restrict__ out,
+    unsigned rows, unsigned cols)
+{
+    __shared__ unsigned short tile[32][33];
+    const unsigned c0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    const unsigned tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    for (unsigned j = ty; j < 32; j += 8) {
+        const unsigned r = r0 + j, c = c0 + tx;
+        if (r < rows && c < cols) tile[j][tx] = x[(size_t)r * cols + c];
+    }
+    __syncthreads();
+    for (unsigned j = ty; j < 32; j += 8) {
+        const unsigned c = c0 + j, r = r0 + tx;
+        if (r < rows && c < cols) out[(size_t)c * rows + r] = tile[tx][j];
+    }
+}
 // Time concat over [bc, t, hw]: frame `to` from a (or zero) then b.
 struct ConcatT { unsigned bc, hw, a_t, b_t, a_start, a_count, b_start, b_count, a_zero; };
 extern "C" __global__ void __launch_bounds__(256) concat_time_f16(
@@ -383,6 +439,96 @@ extern "C" __global__ void __launch_bounds__(256) gate_add_f16(
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * dim) return;
     out[i] = f2h(fmaf(h2f(gate[i % dim]), h2f(y[i]), h2f(x[i])));
+}
+
+// GGUF block dequant into a bf16 N-major `[N, K]` image: row n's blocks are
+// contiguous, so block `blk = n * K/BS + kb` lands at `out[blk * BS ..]`. The
+// arithmetic is the llama.cpp reference (`thinfer_core::quant`'s CPU port)
+// with every product and difference rounded on its own (`__fmul_rn` /
+// `__fsub_rn`: no fused multiply-add), then one bf16 rounding.
+__device__ __forceinline__ float f16_at(const unsigned char* p) {
+    return __half2float(__ushort_as_half((unsigned short)(p[0] | (p[1] << 8))));
+}
+__device__ __forceinline__ void scale_min_k4(unsigned j, const unsigned char* q, unsigned& d, unsigned& m) {
+    if (j < 4) {
+        d = q[j] & 63u;
+        m = q[j + 4] & 63u;
+    } else {
+        d = (q[j + 4] & 0xFu) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+// One 256-thread block per 256-element K-quant block; thread = element.
+extern "C" __global__ void __launch_bounds__(256) dequant_q4_k(
+    const unsigned char* __restrict__ src, unsigned short* __restrict__ out, unsigned blocks)
+{
+    const size_t blk = blockIdx.x;
+    if (blk >= blocks) return;
+    const unsigned char* b = src + blk * 144;
+    const unsigned e = threadIdx.x, sub = e >> 5, r = e & 31;
+    unsigned sc, mn;
+    scale_min_k4(sub, b + 4, sc, mn);
+    const unsigned q = b[16 + (sub >> 1) * 32 + r];
+    const unsigned nib = (sub & 1) ? (q >> 4) : (q & 15u);
+    const float dsc = __fmul_rn(f16_at(b), (float)sc), dmm = __fmul_rn(f16_at(b + 2), (float)mn);
+    out[blk * 256 + e] = rn(__fsub_rn(__fmul_rn(dsc, (float)nib), dmm));
+}
+extern "C" __global__ void __launch_bounds__(256) dequant_q5_k(
+    const unsigned char* __restrict__ src, unsigned short* __restrict__ out, unsigned blocks)
+{
+    const size_t blk = blockIdx.x;
+    if (blk >= blocks) return;
+    const unsigned char* b = src + blk * 176;
+    const unsigned e = threadIdx.x, sub = e >> 5, r = e & 31;
+    unsigned sc, mn;
+    scale_min_k4(sub, b + 4, sc, mn);
+    const unsigned q = b[48 + (sub >> 1) * 32 + r];
+    const unsigned nib = ((sub & 1) ? (q >> 4) : (q & 15u)) | (((b[16 + r] >> sub) & 1u) << 4);
+    const float dsc = __fmul_rn(f16_at(b), (float)sc), dmm = __fmul_rn(f16_at(b + 2), (float)mn);
+    out[blk * 256 + e] = rn(__fsub_rn(__fmul_rn(dsc, (float)nib), dmm));
+}
+extern "C" __global__ void __launch_bounds__(256) dequant_q6_k(
+    const unsigned char* __restrict__ src, unsigned short* __restrict__ out, unsigned blocks)
+{
+    const size_t blk = blockIdx.x;
+    if (blk >= blocks) return;
+    const unsigned char* b = src + blk * 210;
+    const unsigned e = threadIdx.x, half_ = e >> 7, w = e & 127, quarter = w >> 5, j = w & 31;
+    const unsigned char* ql = b + half_ * 64;
+    const unsigned qh = b[128 + half_ * 32 + j];
+    const unsigned l0 = ql[j], l1 = ql[32 + j];
+    unsigned q;
+    switch (quarter) {
+        case 0: q = (l0 & 15u) | ((qh & 3u) << 4); break;
+        case 1: q = (l1 & 15u) | ((qh & 12u) << 2); break;
+        case 2: q = (l0 >> 4) | (qh & 48u); break;
+        default: q = (l1 >> 4) | ((qh & 192u) >> 2); break;
+    }
+    const float sc = (float)(signed char)b[192 + half_ * 8 + (j >> 4) + 2 * quarter];
+    out[blk * 256 + e] = rn(__fmul_rn(__fmul_rn(f16_at(b + 208), sc), (float)((int)q - 32)));
+}
+// Eight 32-element Q8_0 blocks per 256-thread block.
+extern "C" __global__ void __launch_bounds__(256) dequant_q8_0(
+    const unsigned char* __restrict__ src, unsigned short* __restrict__ out, unsigned blocks)
+{
+    const size_t blk = (size_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (blk >= blocks) return;
+    const unsigned char* b = src + blk * 34;
+    const unsigned e = threadIdx.x & 31;
+    out[blk * 32 + e] = rn(__fmul_rn((float)(signed char)b[2 + e], f16_at(b)));
+}
+// In-place-safe dtype casts (each thread reads, then writes, its own element).
+extern "C" __global__ void __launch_bounds__(256) bf16_to_f16(
+    const unsigned short* x, unsigned short* out, unsigned n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half_as_ushort(__float2half_rn(bf(x[i])));
+}
+extern "C" __global__ void __launch_bounds__(256) f16_to_bf16(
+    const unsigned short* x, unsigned short* out, unsigned n)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = rn(__half2float(__ushort_as_half(x[i])));
 }
 "#;
 
@@ -422,6 +568,9 @@ pub struct ElementwiseKernels {
     add_f16: sys::CUfunction,
     rms_norm3d_f16: sys::CUfunction,
     silu_f16: sys::CUfunction,
+    silu_mul_f16: sys::CUfunction,
+    hadamard_f16: sys::CUfunction,
+    transpose16: sys::CUfunction,
     concat_time_f16: sys::CUfunction,
     ln_f16: sys::CUfunction,
     modulate_f16: sys::CUfunction,
@@ -432,6 +581,12 @@ pub struct ElementwiseKernels {
     gn_stats: sys::CUfunction,
     gn_apply: sys::CUfunction,
     add_f32: sys::CUfunction,
+    dequant_q4_k: sys::CUfunction,
+    dequant_q5_k: sys::CUfunction,
+    dequant_q6_k: sys::CUfunction,
+    dequant_q8_0: sys::CUfunction,
+    bf16_to_f16: sys::CUfunction,
+    f16_to_bf16: sys::CUfunction,
 }
 
 // The source's `GN_PART` mirrors the core constant.
@@ -459,6 +614,9 @@ impl ElementwiseKernels {
             add_f16: module.function(c"add_f16", 0)?,
             rms_norm3d_f16: module.function(c"rms_norm3d_f16", 0)?,
             silu_f16: module.function(c"silu_f16", 0)?,
+            silu_mul_f16: module.function(c"silu_mul_f16", 0)?,
+            hadamard_f16: module.function(c"hadamard_f16", 0)?,
+            transpose16: module.function(c"transpose16", 0)?,
             concat_time_f16: module.function(c"concat_time_f16", 0)?,
             ln_f16: module.function(c"ln_f16", 0)?,
             modulate_f16: module.function(c"modulate_f16", 0)?,
@@ -469,6 +627,12 @@ impl ElementwiseKernels {
             gn_stats: module.function(c"gn_stats", 0)?,
             gn_apply: module.function(c"gn_apply", 0)?,
             add_f32: module.function(c"add_f32", 0)?,
+            dequant_q4_k: module.function(c"dequant_q4_k", 0)?,
+            dequant_q5_k: module.function(c"dequant_q5_k", 0)?,
+            dequant_q6_k: module.function(c"dequant_q6_k", 0)?,
+            dequant_q8_0: module.function(c"dequant_q8_0", 0)?,
+            bf16_to_f16: module.function(c"bf16_to_f16", 0)?,
+            f16_to_bf16: module.function(c"f16_to_bf16", 0)?,
             module,
         })
     }
@@ -965,6 +1129,56 @@ impl ElementwiseKernels {
                     "silu_f16",
                 )?;
             }
+            ElementwiseOp::SiluMulF16 { g, u, out, n } => {
+                let (mut a0, mut a1, mut a2, mut a3) = (g, u, out, n);
+                let mut a: [*mut c_void; 4] = [
+                    (&raw mut a0).cast(),
+                    (&raw mut a1).cast(),
+                    (&raw mut a2).cast(),
+                    (&raw mut a3).cast(),
+                ];
+                self.module.launch(
+                    self.silu_mul_f16,
+                    (blocks(n as u64), 1, 1),
+                    256,
+                    0,
+                    &mut a,
+                    "silu_mul_f16",
+                )?;
+            }
+            ElementwiseOp::Transpose16 { x, out, rows, cols } => {
+                let (mut a0, mut a1, mut a2, mut a3) = (x, out, rows, cols);
+                let mut a: [*mut c_void; 4] = [
+                    (&raw mut a0).cast(),
+                    (&raw mut a1).cast(),
+                    (&raw mut a2).cast(),
+                    (&raw mut a3).cast(),
+                ];
+                self.module.launch(
+                    self.transpose16,
+                    (cols.div_ceil(32), rows.div_ceil(32), 1),
+                    256,
+                    0,
+                    &mut a,
+                    "transpose16",
+                )?;
+            }
+            ElementwiseOp::HadamardF16 { x, out, rows, k } => {
+                if !k.is_multiple_of(256) {
+                    return Ok(false);
+                }
+                let groups = rows * (k / 256);
+                let (mut a0, mut a1) = (x, out);
+                let mut a: [*mut c_void; 2] = [(&raw mut a0).cast(), (&raw mut a1).cast()];
+                self.module.launch(
+                    self.hadamard_f16,
+                    (groups, 1, 1),
+                    64,
+                    0,
+                    &mut a,
+                    "hadamard_f16",
+                )?;
+            }
             ElementwiseOp::ConcatTimeF16 {
                 a,
                 b,
@@ -1041,6 +1255,51 @@ impl ElementwiseKernels {
                     &mut a,
                     "gate_add_f16",
                 )?;
+            }
+            ElementwiseOp::Dequant {
+                kind,
+                src,
+                out,
+                n,
+                k,
+            } => {
+                use thinfer_core::quant::QuantKind;
+                if !k.is_multiple_of(kind.block_size()) {
+                    return Ok(false);
+                }
+                let blocks = n as u64 * (k / kind.block_size()) as u64;
+                let (mut src, mut out, mut nb) = (src, out, blocks as u32);
+                let (f, grid, name) = match kind {
+                    QuantKind::Q4_K => (self.dequant_q4_k, blocks, "dequant_q4_k"),
+                    QuantKind::Q5_K => (self.dequant_q5_k, blocks, "dequant_q5_k"),
+                    QuantKind::Q6_K => (self.dequant_q6_k, blocks, "dequant_q6_k"),
+                    QuantKind::Q8_0 => (self.dequant_q8_0, blocks.div_ceil(8), "dequant_q8_0"),
+                    QuantKind::Q4_0 => return Ok(false),
+                };
+                if grid > i32::MAX as u64 || blocks > u32::MAX as u64 {
+                    return Ok(false);
+                }
+                let mut a: [*mut c_void; 3] = [
+                    (&raw mut src).cast(),
+                    (&raw mut out).cast(),
+                    (&raw mut nb).cast(),
+                ];
+                self.module
+                    .launch(f, (grid as u32, 1, 1), 256, 0, &mut a, name)?;
+            }
+            ElementwiseOp::Bf16ToF16 { x, out, n } | ElementwiseOp::F16ToBf16 { x, out, n } => {
+                let f = match op {
+                    ElementwiseOp::Bf16ToF16 { .. } => self.bf16_to_f16,
+                    _ => self.f16_to_bf16,
+                };
+                let (mut x, mut out, mut n_) = (x, out, n);
+                let mut a: [*mut c_void; 3] = [
+                    (&raw mut x).cast(),
+                    (&raw mut out).cast(),
+                    (&raw mut n_).cast(),
+                ];
+                self.module
+                    .launch(f, (blocks(n as u64), 1, 1), 256, 0, &mut a, "cast")?;
             }
             ElementwiseOp::Copy { src, dst, bytes } => {
                 // SAFETY: device addresses of live buffers the caller owns,

@@ -3112,6 +3112,13 @@ impl<'wsp> ActBuf<'wsp> {
             scale: Some(scale),
         }
     }
+    /// Last use: see [`BatchScope::recycle`].
+    pub fn recycle(self, scope: &BatchScope<'wsp, WgpuBackend>) {
+        scope.recycle(self.data);
+        if let Some(s) = self.scale {
+            scope.recycle(s);
+        }
+    }
     /// Push the data and (if i8) scale BatchBufs of this ActBuf into a packer
     /// carry vec, in that order. Inverse of `pop_act`.
     fn push_carry(self, carry: &mut Vec<BatchBuf<'wsp>>) {

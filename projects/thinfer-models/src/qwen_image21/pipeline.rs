@@ -24,7 +24,7 @@ use crate::wan::vae::{
 };
 
 use super::config;
-use super::dit::{DitError, PrefixPart, Qwen21Dit, Qwen21DitPipelines};
+use super::dit::{DitError, KvPlacement, PrefixPart, Qwen21Dit, Qwen21DitPipelines};
 use super::loader::{Qwen21DitHandles, register_handles as register_dit};
 use super::scheduler::turbo_steps;
 use super::vae::{PIXEL_CHANNELS, qwen_image21_vae};
@@ -366,6 +366,12 @@ impl<S: WeightSource> Qwen21Pipeline<S> {
         let lc = config::LATENT_CH;
         let mut tokens = pack(&gaussian_noise(lc * hw, req.seed), lc, hw);
         {
+            let kv = KvPlacement::for_budget(
+                &self.dit_pipelines,
+                parts.iter().map(|p| p.rows()).sum(),
+                self.dit_handles.blocks.len(),
+                self.residency.budget().vram_bytes,
+            );
             let prefix = {
                 let _s = trace::scope!("qwen21.prefill").entered();
                 self.dit
@@ -379,6 +385,7 @@ impl<S: WeightSource> Qwen21Pipeline<S> {
                         &cond,
                         &parts,
                         (lat_h, lat_w),
+                        kv,
                     )
                     .await
                     .map_err(GenerateError::Dit)?
@@ -387,6 +394,7 @@ impl<S: WeightSource> Qwen21Pipeline<S> {
                 target: trace::DIAG,
                 prefix_rows = prefix.rows(),
                 target_rows = hw,
+                spilled = prefix.spilled(),
                 "qwen-image-2.1 prefix cached",
             );
             let steps = turbo_steps();

@@ -1,8 +1,13 @@
 //! Host-side input preparation for the Qwen-Image-Edit path. The engine's
 //! `generate_edit_rgb` consumes preprocessed tensors; this module derives them
-//! from a single source image + the edit prompt, mirroring `diffusers`
-//! `pipeline_qwenimage_edit.py` (VAE-side `calculate_dimensions`, 32-grid) and
-//! `transformers` `Qwen2VLImageProcessor` (ViT-side `smart_resize`, 28-grid).
+//! from a single source image + the edit prompt.
+//!
+//! Qwen-Image-Edit-Rapid-AIO is an Edit-2509 ("Edit Plus") merge whose model
+//! card prescribes Phr00t's fixed ComfyUI `TextEncodeQwenImageEditPlus` node,
+//! so this mirrors that node: the Plus system prompt, a `Picture 1: ` label
+//! before the vision block, the VL image at a 384^2 area (then the
+//! `Qwen2VLImageProcessor` `smart_resize`, 28-grid) and the VAE reference at
+//! the node's default 896^2 area (floored to the 32-grid, lanczos).
 //!
 //! Two conditioning channels share the SAME source image at DIFFERENT
 //! resolutions:
@@ -52,11 +57,19 @@ const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 const T2I_TEMPLATE_PREFIX: &str = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n";
 const T2I_TEMPLATE_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
 
-/// The edit chat template (`pipeline_qwenimage_edit.py`, drop_idx 64). The
-/// single `<|image_pad|>` expands to `n_img` placeholders before tokenization.
-const EDIT_TEMPLATE_PREFIX: &str = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|>";
+/// The Edit Plus chat template (the ComfyUI node's `llama_template`). The
+/// encoder output drops everything through the user header (ComfyUI's
+/// template-end scan), so the conditioning starts at `Picture 1: `. The single
+/// `<|image_pad|>` expands to `n_img` placeholders before tokenization.
+const EDIT_SYSTEM: &str = "<|im_start|>system\nDescribe key details of the input image (including any objects, characters, poses, facial features, clothing, setting, textures and style), then explain how the user's text instruction should alter, modify or recreate the image. Generate a new image that meets the user's requirements, which can vary from a small change to a completely new image using inputs as a guide.<|im_end|>\n<|im_start|>user\n";
+const EDIT_PICTURE: &str = "Picture 1: <|vision_start|>";
 const EDIT_TEMPLATE_MID: &str = "<|vision_end|>";
 const EDIT_TEMPLATE_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+
+/// The VL image's target area (the node's `384 * 384`).
+const VIT_AREA: f64 = 384.0 * 384.0;
+/// The VAE reference's target area (the node's default `target_size` 896).
+const VAE_AREA: f64 = 896.0 * 896.0;
 
 /// Everything the edit pipeline needs from the host. Layouts match
 /// `generate_edit_rgb`'s parameters exactly.
@@ -66,6 +79,8 @@ pub struct EditInputs {
     pub token_ids: Vec<u32>,
     /// Index of the first `<|image_pad|>` token (the contiguous run start).
     pub image_pad_start: usize,
+    /// Leading template tokens the conditioning drops (system + user header).
+    pub drop: usize,
     /// ViT patches `[N=gh*gw, 1176]`, merge-unit-major, CLIP-normalized.
     pub vit_pixels: Vec<f32>,
     /// ViT grid `(gh, gw)` (raw patches: H/14, W/14).
@@ -76,17 +91,26 @@ pub struct EditInputs {
     pub vae_dims: (usize, usize),
 }
 
-/// VAE-side target dimensions for a `in_w x in_h` source: `diffusers`
-/// `calculate_dimensions(1024*1024, in_w/in_h)`, each rounded to a multiple of
-/// 32. Returns `(Hv, Wv)`.
+/// `in_w x in_h` scaled to `area` (aspect kept), as unrounded `(w, h)`.
+fn scaled_to_area(in_w: u32, in_h: u32, area: f64) -> (f64, f64) {
+    let s = (area / (in_w as f64 * in_h as f64)).sqrt();
+    (in_w as f64 * s, in_h as f64 * s)
+}
+
+/// VAE-side target dimensions: the source scaled to [`VAE_AREA`], each side
+/// floored to a multiple of 32 (the node's `int(x / 32) * 32`). Returns
+/// `(Hv, Wv)`.
 pub fn calc_vae_dims(in_w: u32, in_h: u32) -> (usize, usize) {
-    const TARGET_AREA: f64 = 1024.0 * 1024.0;
-    let ratio = in_w as f64 / in_h as f64;
-    let width = (TARGET_AREA * ratio).sqrt();
-    let height = width / ratio;
-    let wv = (((width / 32.0).round() as usize) * 32).max(32);
-    let hv = (((height / 32.0).round() as usize) * 32).max(32);
-    (hv, wv)
+    let (w, h) = scaled_to_area(in_w, in_h, VAE_AREA);
+    let floor32 = |x: f64| (((x / 32.0) as usize) * 32).max(32);
+    (floor32(h), floor32(w))
+}
+
+/// The VL image before the processor: the source scaled to [`VIT_AREA`],
+/// sides rounded (the node's `round`). Returns `(w, h)`.
+pub fn calc_vl_image_dims(in_w: u32, in_h: u32) -> (u32, u32) {
+    let (w, h) = scaled_to_area(in_w, in_h, VIT_AREA);
+    ((w.round() as u32).max(1), (h.round() as u32).max(1))
 }
 
 /// ViT-side target dimensions (`smart_resize`, factor 28, CLIP min/max px).
@@ -117,8 +141,11 @@ pub fn prepare_edit_inputs(
 ) -> Result<EditInputs, String> {
     let (in_w, in_h) = (rgb.width(), rgb.height());
 
-    // --- ViT channel ---
-    let (hp, wp) = calc_vit_dims(in_w, in_h);
+    // --- ViT channel: area-resize to the VL area, then the processor's own
+    // smart_resize + bicubic ---
+    let (vl_w, vl_h) = calc_vl_image_dims(in_w, in_h);
+    let vl_img = DynamicImage::ImageRgb8(area_resize(rgb, vl_w, vl_h));
+    let (hp, wp) = calc_vit_dims(vl_w, vl_h);
     let gh = hp / PATCH;
     let gw = wp / PATCH;
     if !gh.is_multiple_of(MERGE) || !gw.is_multiple_of(MERGE) {
@@ -127,17 +154,17 @@ pub fn prepare_edit_inputs(
         ));
     }
     // PIL default resample is BICUBIC; `CatmullRom` is image-rs's bicubic.
-    let vit_img = DynamicImage::ImageRgb8(rgb.clone())
+    let vit_img = vl_img
         .resize_exact(wp as u32, hp as u32, FilterType::CatmullRom)
         .to_rgb8();
     let vit_pixels = patchify(&vit_img, gh, gw);
 
-    // --- VAE channel ---
+    // --- VAE channel: center-crop to the floored grid's aspect (the node's
+    // `"center"` crop), then lanczos (`Lanczos3` = image-rs's match to PIL's) ---
     let (hv, wv) = calc_vae_dims(in_w, in_h);
-    // Diffusers `VaeImageProcessor` default resample is lanczos; `Lanczos3` is
-    // image-rs's closest match (resampling-filter differences are within the
-    // parity band).
+    let (cw, ch) = center_crop_dims(in_w, in_h, wv as f64 / hv as f64);
     let vae_img = DynamicImage::ImageRgb8(rgb.clone())
+        .crop_imm((in_w - cw) / 2, (in_h - ch) / 2, cw, ch)
         .resize_exact(wv as u32, hv as u32, FilterType::Lanczos3)
         .to_rgb8();
     let vae_image = to_vae_cthw(&vae_img, hv, wv);
@@ -145,15 +172,62 @@ pub fn prepare_edit_inputs(
     // --- tokens ---
     let n_img = (gh / MERGE) * (gw / MERGE);
     let (token_ids, image_pad_start) = tokenize_edit(prompt, n_img, tokenizer)?;
+    let drop = tokenizer
+        .encode(EDIT_SYSTEM, false)
+        .map_err(|e| format!("tokenize edit template: {e:?}"))?
+        .len();
 
     Ok(EditInputs {
         token_ids,
         image_pad_start,
+        drop,
         vit_pixels,
         vit_grid: (gh, gw),
         vae_image,
         vae_dims: (hv, wv),
     })
+}
+
+/// torch `interpolate(mode="area")` (= `adaptive_avg_pool2d`): output pixel
+/// `i` averages source rows/cols `floor(i * in / out) .. ceil((i + 1) * in /
+/// out)`, rounded back to 8 bits. ComfyUI's `"area"` upscale method.
+fn area_resize(img: &RgbImage, out_w: u32, out_h: u32) -> RgbImage {
+    let bounds = |n_in: u32, n_out: u32| -> Vec<(usize, usize)> {
+        (0..n_out as usize)
+            .map(|i| {
+                let (n_in, n_out) = (n_in as usize, n_out as usize);
+                (i * n_in / n_out, ((i + 1) * n_in).div_ceil(n_out))
+            })
+            .collect()
+    };
+    let (cols, rows) = (bounds(img.width(), out_w), bounds(img.height(), out_h));
+    RgbImage::from_fn(out_w, out_h, |x, y| {
+        let ((x0, x1), (y0, y1)) = (cols[x as usize], rows[y as usize]);
+        let mut sum = [0u32; 3];
+        for sy in y0..y1 {
+            for sx in x0..x1 {
+                let p = img.get_pixel(sx as u32, sy as u32);
+                for (s, v) in sum.iter_mut().zip(p.0) {
+                    *s += v as u32;
+                }
+            }
+        }
+        let n = ((x1 - x0) * (y1 - y0)) as f32;
+        image::Rgb(sum.map(|s| (s as f32 / n).round() as u8))
+    })
+}
+
+/// The centered crop of `in_w x in_h` with aspect `aspect` (w / h): ComfyUI
+/// `common_upscale(.., "center")`. Returns `(w, h)`.
+fn center_crop_dims(in_w: u32, in_h: u32, aspect: f64) -> (u32, u32) {
+    let old = in_w as f64 / in_h as f64;
+    if old > aspect {
+        (((in_w as f64 * aspect / old).round() as u32).max(1), in_h)
+    } else if old < aspect {
+        (in_w, ((in_h as f64 * old / aspect).round() as u32).max(1))
+    } else {
+        (in_w, in_h)
+    }
 }
 
 /// Patchify `[3, H, W]` -> `[N=gh*gw, 1176]` merge-unit-major (HF processor
@@ -242,8 +316,9 @@ fn tokenize_edit(
     tokenizer: &impl Tokenizer,
 ) -> Result<(Vec<u32>, usize), String> {
     let pads = IMAGE_PAD.repeat(n_img);
-    let text =
-        format!("{EDIT_TEMPLATE_PREFIX}{pads}{EDIT_TEMPLATE_MID}{prompt}{EDIT_TEMPLATE_SUFFIX}");
+    let text = format!(
+        "{EDIT_SYSTEM}{EDIT_PICTURE}{pads}{EDIT_TEMPLATE_MID}{prompt}{EDIT_TEMPLATE_SUFFIX}"
+    );
     let ids = tokenizer
         .encode(&text, false)
         .map_err(|e| format!("tokenize edit prompt: {e:?}"))?;
@@ -274,19 +349,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vae_dims_square_1024() {
-        // 512x512 -> ratio 1 -> width=height=1024, rounded /32 = 1024.
-        assert_eq!(calc_vae_dims(512, 512), (1024, 1024));
+    fn vae_dims_square_896() {
+        // ratio 1 -> 896 per side, already a multiple of 32.
+        assert_eq!(calc_vae_dims(512, 512), (896, 896));
     }
 
     #[test]
-    fn vae_dims_preserve_aspect_and_mult32() {
-        let (hv, wv) = calc_vae_dims(1024, 512); // ratio 2 (landscape)
-        assert!(hv.is_multiple_of(32) && wv.is_multiple_of(32));
-        assert!(wv > hv, "landscape stays wider");
-        // area near 1024*1024.
-        let area = hv * wv;
-        assert!((area as f64 - 1024.0 * 1024.0).abs() / (1024.0 * 1024.0) < 0.05);
+    fn vae_dims_floor_to_32() {
+        // 2:1 -> 1267.1 x 633.6, floored: 1248 x 608 (the node's int(x/32)*32).
+        assert_eq!(calc_vae_dims(1024, 512), (608, 1248));
+    }
+
+    #[test]
+    fn vl_image_dims_round_to_384_area() {
+        assert_eq!(calc_vl_image_dims(1024, 1024), (384, 384));
+        // 2:1 -> 543.06 x 271.53.
+        assert_eq!(calc_vl_image_dims(2048, 1024), (543, 272));
+    }
+
+    #[test]
+    fn center_crop_keeps_the_target_aspect() {
+        assert_eq!(center_crop_dims(1000, 500, 2.0), (1000, 500));
+        assert_eq!(center_crop_dims(1000, 500, 1.0), (500, 500));
+        assert_eq!(center_crop_dims(500, 1000, 1.0), (500, 500));
     }
 
     #[test]

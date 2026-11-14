@@ -1,6 +1,7 @@
 // thinfer-native: desktop/native impls of thinfer-core IO traits.
 
 pub mod cache;
+pub mod harden;
 pub mod prefetch;
 pub mod sources;
 pub mod tokenizer;
@@ -287,10 +288,10 @@ mod read_bench {
 }
 
 /// Smoke-test the `.pt` reader against a real `torch.save` checkpoint (e.g.
-/// LongLive `model_bf16.pt`). Gated on `THINFER_PT_PATH` (skips when unset).
+/// the DreamID-V `.pth`). Gated on `THINFER_PT_PATH` (skips when unset).
 /// Parses the ZIP64 directory + pickle index, then prints every tensor name,
-/// shape and dtype - both proof the parser handles a 10GB real file and the
-/// source of truth for the DiT rename map.
+/// shape and dtype - proof the parser handles a real file and the source
+/// of truth for a DiT rename map.
 #[cfg(test)]
 mod pt_smoke {
     use super::*;

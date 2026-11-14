@@ -32,6 +32,7 @@ pub mod gated_head_mul;
 pub mod gelu;
 pub mod gelu_mul;
 pub mod group_norm;
+pub mod hadamard;
 pub mod hunyuan_upsample3d;
 pub mod layernorm;
 pub mod leaky_relu;
@@ -66,6 +67,7 @@ pub mod tanh;
 pub mod transpose12;
 pub mod upsample2d_nearest;
 pub mod weight_prep;
+pub mod window_attn;
 
 pub use add::AddF32;
 pub(crate) use avgdown3d::dispatch_avgdown3d;

@@ -3066,6 +3066,7 @@ dependencies = [
  "bytemuck",
  "futures-channel",
  "half",
+ "libc",
  "pollster",
  "safetensors",
  "serde",
@@ -3074,6 +3075,8 @@ dependencies = [
  "tracing-subscriber",
  "web-time",
  "wgpu",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3082,6 +3085,7 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "cudarc",
+ "futures-channel",
  "half",
  "libloading 0.8.9",
  "pollster",
@@ -3111,6 +3115,7 @@ dependencies = [
  "futures-channel",
  "half",
  "hf-hub",
+ "libc",
  "memmap2",
  "pollster",
  "safetensors",
@@ -3140,6 +3145,7 @@ dependencies = [
  "serde_json",
  "thinfer-app",
  "thinfer-core",
+ "thinfer-native",
  "tokio",
  "tokio-util",
  "toml",

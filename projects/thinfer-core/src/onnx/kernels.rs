@@ -322,10 +322,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// `oc - begin[k]`; out-of-range coords take `val`. `begin` is the per-axis
 /// leading pad. Bindings: 0=x, 1=out, 2=uniform.
 pub const PAD: &str = r#"
-struct U { total: u32, val: f32, _p0: u32, _p1: u32, id: vec4<u32>, od: vec4<u32>, begin: vec4<u32> };
+struct U { total: u32, val: f32, mode: u32, _p1: u32, id: vec4<u32>, od: vec4<u32>, begin: vec4<u32> };
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> u: U;
+// mode 1 reflect (no edge repeat), 2 edge (clamp); in-range coords unchanged.
+fn wrap(c: i32, n: u32) -> i32 {
+  let m = i32(n);
+  if (u.mode == 1u) {
+    var r = c;
+    if (r < 0) { r = -r; }
+    if (r >= m) { r = 2 * (m - 1) - r; }
+    return r;
+  }
+  return clamp(c, 0, m - 1);
+}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ng: vec3<u32>) {
   let i = gid.y * (ng.x * 64u) + gid.x;
@@ -335,10 +346,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
   let oc1 = (i / (u.od.w * u.od.z)) % u.od.y;
   let oc0 = i / (u.od.w * u.od.z * u.od.y);
   // Signed input coord = out coord - leading pad; out-of-range -> constant.
-  let ic0 = i32(oc0) - i32(u.begin.x);
-  let ic1 = i32(oc1) - i32(u.begin.y);
-  let ic2 = i32(oc2) - i32(u.begin.z);
-  let ic3 = i32(oc3) - i32(u.begin.w);
+  var ic0 = i32(oc0) - i32(u.begin.x);
+  var ic1 = i32(oc1) - i32(u.begin.y);
+  var ic2 = i32(oc2) - i32(u.begin.z);
+  var ic3 = i32(oc3) - i32(u.begin.w);
+  if (u.mode != 0u) {
+    ic0 = wrap(ic0, u.id.x);
+    ic1 = wrap(ic1, u.id.y);
+    ic2 = wrap(ic2, u.id.z);
+    ic3 = wrap(ic3, u.id.w);
+  }
   if (ic0 < 0 || ic0 >= i32(u.id.x) || ic1 < 0 || ic1 >= i32(u.id.y) ||
       ic2 < 0 || ic2 >= i32(u.id.z) || ic3 < 0 || ic3 >= i32(u.id.w)) {
     out[i] = u.val;
@@ -396,7 +413,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// has that axis collapsed to 1. One thread per output element. Bindings: 0=x,
 /// 1=out, 2=uniform.
 pub const REDUCE_SUM: &str = r#"
-struct U { total: u32, alen: u32, astride: u32, _p: u32 };
+struct U { total: u32, alen: u32, astride: u32, mode: u32 };
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> u: U;
@@ -409,7 +426,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
   let outer = i / u.astride;
   let base = outer * u.alen * u.astride + inner;
   var s: f32 = 0.0;
+  // mode 0 sum, 1 mean, 2 L2 norm.
+  if (u.mode == 2u) {
+    for (var j: u32 = 0u; j < u.alen; j = j + 1u) { let v = x[base + j * u.astride]; s = s + v * v; }
+    out[i] = sqrt(s);
+    return;
+  }
   for (var j: u32 = 0u; j < u.alen; j = j + 1u) { s = s + x[base + j * u.astride]; }
+  if (u.mode == 1u) { s = s / f32(u.alen); }
   out[i] = s;
 }
 "#;

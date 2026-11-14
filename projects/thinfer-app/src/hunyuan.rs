@@ -345,7 +345,7 @@ pub async fn run(
         ));
     }
     let wan_video = WanVideo {
-        frames: video,
+        frames: video.into(),
         num_frames: f_px,
         height: h_px,
         width: w_px,
@@ -358,7 +358,7 @@ pub async fn run(
             crate::progress::write_artifact(
                 sink,
                 &req.output,
-                &crate::codec::encode_mp4(&wan_video, plan.fps)?,
+                crate::codec::encode_mp4(&wan_video, plan.fps)?,
             )?;
         }
         VideoFormat::PngFrames => {
@@ -781,7 +781,7 @@ pub async fn run_i2v(
         ));
     }
     let wan_video = WanVideo {
-        frames: video,
+        frames: video.into(),
         num_frames: f_px,
         height: h_px,
         width: w_px,
@@ -792,7 +792,7 @@ pub async fn run_i2v(
             crate::progress::write_artifact(
                 sink,
                 &req.output,
-                &crate::codec::encode_mp4(&wan_video, plan.fps)?,
+                crate::codec::encode_mp4(&wan_video, plan.fps)?,
             )?;
         }
         VideoFormat::PngFrames => {

@@ -359,6 +359,69 @@ pub fn round_f32_to_bf16(x: f32) -> u16 {
     }
 }
 
+/// `(0..n).map(f)` with one scoped thread per item on native, in order;
+/// serial on wasm (single-threaded). Host-side work only: identical results.
+pub fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if n > 1 {
+        return std::thread::scope(|s| {
+            let f = &f;
+            let workers: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+    }
+    (0..n).map(f).collect()
+}
+
+/// Run `f` on a worker thread and await its result without blocking the
+/// engine thread, so the other legs of a `join!` (weight streaming, the
+/// next block's encode) keep running meanwhile. Inline on wasm
+/// (single-threaded). A panic in `f` resumes on the awaiting thread.
+pub async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    #[cfg(target_arch = "wasm32")]
+    {
+        f()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::{Arc, Mutex};
+        use std::task::{Poll, Waker};
+        type Outcome<T> = std::thread::Result<T>;
+        struct Slot<T> {
+            done: Option<Outcome<T>>,
+            waker: Option<Waker>,
+        }
+        let slot = Arc::new(Mutex::new(Slot::<T> {
+            done: None,
+            waker: None,
+        }));
+        let worker = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let mut s = worker.lock().unwrap_or_else(|p| p.into_inner());
+            s.done = Some(r);
+            if let Some(w) = s.waker.take() {
+                w.wake();
+            }
+        });
+        let out = std::future::poll_fn(|cx| {
+            let mut s = slot.lock().unwrap_or_else(|p| p.into_inner());
+            match s.done.take() {
+                Some(r) => Poll::Ready(r),
+                None => {
+                    s.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
+        out.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,21 +495,4 @@ mod tests {
             }
         }
     }
-}
-
-/// `(0..n).map(f)` with one scoped thread per item on native, in order;
-/// serial on wasm (single-threaded). Host-side work only: identical results.
-pub fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    #[cfg(not(target_arch = "wasm32"))]
-    if n > 1 {
-        return std::thread::scope(|s| {
-            let f = &f;
-            let workers: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
-            workers
-                .into_iter()
-                .map(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                .collect()
-        });
-    }
-    (0..n).map(f).collect()
 }

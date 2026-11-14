@@ -66,6 +66,12 @@ impl GpuBuf {
             len: bytes,
         })
     }
+    /// A buffer the accelerator never touches (uniforms, per-run uploads):
+    /// never exported, so it stays cheap to allocate per run.
+    fn new_plain(backend: &Arc<WgpuBackend>, bytes: u64) -> Result<Self, WgpuError> {
+        let _plain = backend.plain_allocations();
+        Self::new(backend, bytes)
+    }
     fn binding(&self, slot: u32) -> Binding {
         Binding {
             slot,
@@ -318,8 +324,38 @@ pub struct OnnxModel {
     /// Per-conv-node i8-quantized weights, present only when the i8 gate is on
     /// and the conv is eligible (group=1, dil=1). Keyed by node index.
     i8_weights: HashMap<usize, I8Weights>,
+    /// Per step, the activation names whose last reader is that step (dropped
+    /// from the run's value map after it, so their buffers become reusable).
+    frees: Vec<Vec<String>>,
+    /// Every activation buffer this model allocated, reused by exact size once
+    /// nothing but the pool holds it. Within a run, one encoder records every
+    /// dispatch in order (wgpu orders the hazards), so a buffer whose values
+    /// are all dead may be rewritten by a later op. Kept across runs.
+    pool: std::cell::RefCell<Vec<Rc<GpuBuf>>>,
+    /// Convs routed to the accelerator's bf16 tensor-core conv (opt-in
+    /// [`LoadOptions::accel_conv`]), keyed by node index.
+    accel_convs: HashMap<usize, AccelConv>,
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
+}
+
+/// Per-model load opt-ins. Both change the numerics (validate per model).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadOptions {
+    /// i8 DP4A conv (wgpu).
+    pub i8_conv: bool,
+    /// Plain convs on the backend's accelerator in bf16 on tensor cores (f32
+    /// activations, bf16 weights, f32 accumulate) when it has one; others
+    /// and anything it declines run the wgpu op.
+    pub accel_conv: bool,
+}
+
+/// An accelerator conv: bf16 weight `[cout, cin*k*k]` and bias, resident and
+/// exported, plus its per-image geometry (batch looped at dispatch).
+struct AccelConv {
+    w: Rc<GpuBuf>,
+    bias: Rc<GpuBuf>,
+    shape: crate::backend::Conv2dShape,
 }
 
 /// Load-time i8-quantized conv weight: packed weights `[Cout, ceil(K/4)]` (4 i8
@@ -353,18 +389,19 @@ impl OnnxModel {
         onnx_bytes: &[u8],
         input_shapes: &HashMap<String, Vec<i64>>,
     ) -> Result<Self, OnnxError> {
-        Self::load_i8(backend, onnx_bytes, input_shapes, false).await
+        Self::load_with(backend, onnx_bytes, input_shapes, LoadOptions::default()).await
     }
 
-    /// As [`load`], with an explicit opt-in to the i8 DP4A conv path. Caller-
-    /// scoped (not a process-wide env) so it can be enabled for HyperSwap alone
-    /// and never for the detector/embedder, whose i8 error is unvalidated.
-    pub async fn load_i8(
+    /// As [`load`], with per-model opt-ins (see [`LoadOptions`]). Caller-
+    /// scoped (not a process-wide env) so a fast path can be enabled for one
+    /// model and never for the detector/embedder, whose error is unvalidated.
+    pub async fn load_with(
         backend: Arc<WgpuBackend>,
         onnx_bytes: &[u8],
         input_shapes: &HashMap<String, Vec<i64>>,
-        i8_conv: bool,
+        opts: LoadOptions,
     ) -> Result<Self, OnnxError> {
+        let i8_conv = opts.i8_conv;
         let graph =
             super::proto::parse_model(onnx_bytes).map_err(|e| OnnxError::Io(e.to_string()))?;
         let plan = super::shape::plan(&graph, input_shapes)?;
@@ -395,6 +432,7 @@ impl OnnxModel {
             .map(|vi| vi.name.clone())
             .collect();
         let output_names: Vec<String> = graph.outputs.iter().map(|o| o.name.clone()).collect();
+        let frees = last_uses(&graph, &plan, &fusion, &output_names);
 
         let mut model = OnnxModel {
             backend,
@@ -405,6 +443,9 @@ impl OnnxModel {
             fused_pipelines,
             consts: HashMap::new(),
             i8_weights: HashMap::new(),
+            frees,
+            pool: std::cell::RefCell::new(Vec::new()),
+            accel_convs: HashMap::new(),
             input_names,
             output_names,
         };
@@ -412,11 +453,14 @@ impl OnnxModel {
         if model.pipelines.conv_i8.is_some() {
             model.quantize_i8_conv_weights()?;
         }
+        if opts.accel_conv {
+            model.prepare_accel_convs()?;
+        }
         Ok(model)
     }
 
     fn upload_f32(&self, _name: &str, data: &[f32]) -> Result<Rc<GpuBuf>, WgpuError> {
-        let buf = GpuBuf::new(&self.backend, (data.len() * 4) as u64)?;
+        let buf = GpuBuf::new_plain(&self.backend, (data.len() * 4) as u64)?;
         self.backend
             .write_buffer(buf.id, 0, bytemuck::cast_slice(data))?;
         Ok(Rc::new(buf))
@@ -625,6 +669,153 @@ impl OnnxModel {
         Ok(())
     }
 
+    /// Build [`AccelConv`]s for every plain conv the accelerator can run:
+    /// group 1, no dilation, square kernel, one stride, symmetric zero pads,
+    /// const weight / bias, `cin*k*k % 8 == 0` (the bf16 tensor-core form).
+    fn prepare_accel_convs(&mut self) -> Result<(), OnnxError> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(());
+        };
+        if !acc.accepts_conv2d() {
+            return Ok(());
+        }
+        let to_bf16 = |v: &[f32]| -> Vec<u16> {
+            v.iter()
+                .map(|&x| half::bf16::from_f32(x).to_bits())
+                .collect()
+        };
+        let mut convs = HashMap::new();
+        for step in &self.plan.steps {
+            let Step::Compute { node_idx } = step else {
+                continue;
+            };
+            let node = &self.graph.nodes[*node_idx];
+            if node.op_type != "Conv"
+                || node.attr_i("group", 1) != 1
+                || node.attr_ints("dilations").is_some_and(|d| d != [1, 1])
+                || self.fusion.skip.contains(node_idx)
+            {
+                continue;
+            }
+            let (Ok(xs), Ok(ws), Ok(os)) = (
+                self.plan.shape_of(&node.inputs[0]),
+                self.plan.shape_of(&node.inputs[1]),
+                self.plan.shape_of(&node.outputs[0]),
+            ) else {
+                continue;
+            };
+            let strides = node.attr_ints("strides").unwrap_or(&[1, 1]);
+            let pads = node.attr_ints("pads").unwrap_or(&[0, 0, 0, 0]);
+            let (cin, k) = (ws[1] as u32, ws[2] as u32);
+            if ws[2] != ws[3]
+                || strides[0] != strides[1]
+                || pads.iter().any(|&p| p != pads[0])
+                || !(cin * k * k).is_multiple_of(8)
+            {
+                continue;
+            }
+            let Some(w) = self.plan.consts.get(&node.inputs[1]) else {
+                continue;
+            };
+            let cout = ws[0] as usize;
+            let bias = match node.inputs.get(2).filter(|s| !s.is_empty()) {
+                Some(b) => match self.plan.consts.get(b) {
+                    Some(d) => d.to_f32().into_owned(),
+                    None => continue,
+                },
+                None => vec![0.0; cout],
+            };
+            let upload = |v: Vec<u16>| -> Result<Rc<GpuBuf>, OnnxError> {
+                let mut bytes: Vec<u8> = bytemuck::cast_slice(&v).to_vec();
+                bytes.resize(bytes.len().next_multiple_of(4).max(4), 0);
+                let b = GpuBuf::new(&self.backend, bytes.len() as u64)?;
+                self.backend.write_buffer(b.id, 0, &bytes)?;
+                Ok(Rc::new(b))
+            };
+            let (wb, bb) = (upload(to_bf16(&w.to_f32()))?, upload(to_bf16(&bias))?);
+            if self.backend.external_address(wb.id).is_none() {
+                // Plain allocations (no accelerator memory): nothing to run.
+                return Ok(());
+            }
+            let shape = crate::backend::Conv2dShape {
+                cin,
+                cout: cout as u32,
+                h: xs[2] as u32,
+                w: xs[3] as u32,
+                h_out: os[2] as u32,
+                w_out: os[3] as u32,
+                k,
+                stride: strides[0] as u32,
+                pad: pads[0] as u32,
+                reflect: false,
+                bf16: true,
+            };
+            convs.insert(
+                *node_idx,
+                AccelConv {
+                    w: wb,
+                    bias: bb,
+                    shape,
+                },
+            );
+        }
+        self.accel_convs = convs;
+        Ok(())
+    }
+
+    /// Run node `idx` on the accelerator if it is an [`AccelConv`] and its
+    /// activations are exported: drain the wgpu work recorded so far, enqueue
+    /// one conv per batch image, wait. `false` = not taken (run the wgpu op).
+    fn try_accel_conv(
+        &self,
+        idx: usize,
+        acts: &mut HashMap<String, Rc<GpuBuf>>,
+        encoder: &mut crate::backend::CommandEncoderState,
+        keepalive: &mut Vec<Rc<GpuBuf>>,
+    ) -> Result<bool, OnnxError> {
+        let (Some(ac), Some(acc)) = (self.accel_convs.get(&idx), self.backend.accelerator()) else {
+            return Ok(false);
+        };
+        let node = &self.graph.nodes[idx];
+        let x = self.value_buf(acts, &node.inputs[0])?;
+        let out_shape = self.plan.shape_of(&node.outputs[0])?.to_vec();
+        let out = self.alloc_out(&out_shape, keepalive)?;
+        let addr = |b: &GpuBuf| self.backend.external_address(b.id);
+        let (Some(xa), Some(oa), Some(wa), Some(ba)) =
+            (addr(&x), addr(&out), addr(&ac.w), addr(&ac.bias))
+        else {
+            return Ok(false);
+        };
+        let enc = std::mem::replace(encoder, self.backend.create_command_encoder());
+        self.backend.flush_encoder(enc)?;
+        self.backend.wait_idle();
+        let s = ac.shape;
+        let (x_img, o_img) = (
+            (s.cin * s.h * s.w) as u64 * 4,
+            (s.cout * s.h_out * s.w_out) as u64 * 4,
+        );
+        let ran = (0..out_shape[0] as u64).try_fold(true, |all, b| {
+            acc.conv2d(&crate::backend::Conv2dAddrs {
+                x: xa + b * x_img,
+                w: wa,
+                bias: ba,
+                out: oa + b * o_img,
+                shape: s,
+            })
+            .map(|r| all && r)
+        });
+        let ran = ran
+            .and_then(|r| acc.sync().map(|()| r))
+            .map_err(OnnxError::Unsupported)?;
+        if !ran {
+            return Err(OnnxError::Unsupported(
+                "accelerator declined a prepared conv".into(),
+            ));
+        }
+        acts.insert(node.outputs[0].clone(), out);
+        Ok(true)
+    }
+
     fn const_f32(&self, name: &str) -> Result<Vec<f32>, OnnxError> {
         self.plan
             .consts
@@ -641,13 +832,16 @@ impl OnnxModel {
     ) -> Result<HashMap<String, (Vec<i64>, Vec<f32>)>, OnnxError> {
         // Per-run activation buffers (Rc so View aliases share one allocation).
         let mut acts: HashMap<String, Rc<GpuBuf>> = HashMap::new();
+        // Keep inputs + uniforms alive until submit completes (activations live
+        // in `pool`).
+        let mut keepalive: Vec<Rc<GpuBuf>> = Vec::new();
         for (name, data) in inputs {
-            acts.insert(name.clone(), self.upload_f32(name, data)?);
+            let b = self.upload_f32(name, data)?;
+            keepalive.push(Rc::clone(&b));
+            acts.insert(name.clone(), b);
         }
 
         let mut encoder = self.backend.create_command_encoder();
-        // Keep uniforms + intermediate buffers alive until submit completes.
-        let mut keepalive: Vec<Rc<GpuBuf>> = Vec::new();
 
         // Diagnostic: when set, submit+await after each compute op and tally GPU
         // wall time per op type. Adds per-submit overhead, so it's for relative
@@ -659,7 +853,7 @@ impl OnnxModel {
         let mut prof: std::collections::BTreeMap<String, (f64, u32)> =
             std::collections::BTreeMap::new();
 
-        for step in &self.plan.steps {
+        for (si, step) in self.plan.steps.iter().enumerate() {
             match step {
                 Step::View { out, src, .. } => {
                     let b = self.value_buf(&acts, src)?;
@@ -671,7 +865,12 @@ impl OnnxModel {
                         self.dispatch_fused(chain_idx, &mut acts, &mut encoder, &mut keepalive)?;
                     } else if self.fusion.skip.contains(node_idx) {
                         // Subsumed by a fused chain (dispatched at its tail); skip.
-                    } else {
+                    } else if !self.try_accel_conv(
+                        *node_idx,
+                        &mut acts,
+                        &mut encoder,
+                        &mut keepalive,
+                    )? {
                         self.dispatch_node(*node_idx, &mut acts, &mut encoder, &mut keepalive)?;
                     }
                     if opprof {
@@ -693,6 +892,9 @@ impl OnnxModel {
                         e.1 += 1;
                     }
                 }
+            }
+            for name in &self.frees[si] {
+                acts.remove(name);
             }
         }
 
@@ -767,18 +969,27 @@ impl OnnxModel {
         shape: &[i64],
         keepalive: &mut Vec<Rc<GpuBuf>>,
     ) -> Result<Rc<GpuBuf>, WgpuError> {
-        let buf = Rc::new(GpuBuf::new(&self.backend, numel(shape) * 4)?);
-        keepalive.push(Rc::clone(&buf));
-        Ok(buf)
+        self.alloc_bytes(numel(shape) * 4, keepalive)
     }
 
+    /// An activation buffer of exactly `bytes` (min 4): a dead pooled one if
+    /// any, else a new one added to the pool. Contents are stale, so every op
+    /// writes its whole output.
     fn alloc_bytes(
         &self,
         bytes: u64,
-        keepalive: &mut Vec<Rc<GpuBuf>>,
+        _keepalive: &mut Vec<Rc<GpuBuf>>,
     ) -> Result<Rc<GpuBuf>, WgpuError> {
+        let bytes = bytes.max(4);
+        let mut pool = self.pool.borrow_mut();
+        if let Some(b) = pool
+            .iter()
+            .find(|b| b.len == bytes && Rc::strong_count(b) == 1)
+        {
+            return Ok(Rc::clone(b));
+        }
         let buf = Rc::new(GpuBuf::new(&self.backend, bytes)?);
-        keepalive.push(Rc::clone(&buf));
+        pool.push(Rc::clone(&buf));
         Ok(buf)
     }
 
@@ -890,7 +1101,7 @@ impl OnnxModel {
         bytes: Vec<u8>,
         keepalive: &mut Vec<Rc<GpuBuf>>,
     ) -> Result<Rc<GpuBuf>, WgpuError> {
-        let u = Rc::new(GpuBuf::new(&self.backend, bytes.len() as u64)?);
+        let u = Rc::new(GpuBuf::new_plain(&self.backend, bytes.len() as u64)?);
         self.backend.write_buffer(u.id, 0, &bytes)?;
         keepalive.push(Rc::clone(&u));
         Ok(u)
@@ -1630,7 +1841,15 @@ impl OnnxModel {
                 }
                 let id = pad4(&xs);
                 let od = pad4(&out_shape);
-                let mut u = Uni::default().u32(total).f32(val).u32(0).u32(0);
+                let mode = match node.attr_s("mode").unwrap_or("constant") {
+                    "constant" => 0u32,
+                    "reflect" => 1,
+                    "edge" => 2,
+                    other => {
+                        return Err(OnnxError::Unsupported(format!("Pad mode '{other}'")));
+                    }
+                };
+                let mut u = Uni::default().u32(total).f32(val).u32(mode).u32(0);
                 for v in id.iter().chain(od.iter()).chain(begin.iter()) {
                     u = u.u32(*v);
                 }
@@ -1685,9 +1904,11 @@ impl OnnxModel {
                 let outer: u32 = ds[..axis].iter().product::<i64>().max(1) as u32;
                 let inner: u32 = ds[axis + 1..].iter().product::<i64>().max(1) as u32;
                 let n_idx = idx_u32.len().max(1) as u32;
-                let idx_buf = self.alloc_bytes((idx_u32.len().max(1) * 4) as u64, keepalive)?;
-                self.backend
-                    .write_buffer(idx_buf.id, 0, bytemuck::cast_slice(&idx_u32))?;
+                // A queue write lands before the whole encoder runs, so it goes
+                // to a fresh buffer (like a uniform), never a pooled one.
+                let mut idx_bytes: Vec<u8> = bytemuck::cast_slice(&idx_u32).to_vec();
+                idx_bytes.resize(idx_bytes.len().max(4), 0);
+                let idx_buf = self.write_uniform(idx_bytes, keepalive)?;
                 let u = Uni::default()
                     .u32(total)
                     .u32(outer)
@@ -1770,7 +1991,12 @@ impl OnnxModel {
                 )?;
                 acts.insert(out_name.clone(), out);
             }
-            "ReduceSum" => {
+            "ReduceSum" | "ReduceMean" | "ReduceL2" => {
+                let mode: u32 = match op {
+                    "ReduceSum" => 0,
+                    "ReduceMean" => 1,
+                    _ => 2,
+                };
                 let x = self.value_buf(acts, &node.inputs[0])?;
                 let xs = in_shape(0)?.to_vec();
                 let rank = xs.len() as i64;
@@ -1807,7 +2033,7 @@ impl OnnxModel {
                     .u32(total)
                     .u32(alen)
                     .u32(astride)
-                    .u32(0)
+                    .u32(mode)
                     .finish();
                 let uni = self.write_uniform(u, keepalive)?;
                 let out = self.alloc_out(&out_shape, keepalive)?;
@@ -1956,7 +2182,7 @@ impl OnnxModel {
         n: usize,
         keepalive: &mut Vec<Rc<GpuBuf>>,
     ) -> Result<Rc<GpuBuf>, WgpuError> {
-        let buf = Rc::new(GpuBuf::new(&self.backend, (n.max(1) * 4) as u64)?);
+        let buf = Rc::new(GpuBuf::new_plain(&self.backend, (n.max(1) * 4) as u64)?);
         self.backend
             .write_buffer(buf.id, 0, &vec![0u8; n.max(1) * 4])?;
         keepalive.push(Rc::clone(&buf));
@@ -2044,8 +2270,8 @@ fn data_operands<'a>(op: &str, inputs: &'a [String]) -> Vec<&'a str> {
         // x + shape/param input(s) -> only the data tensor. (Slice starts/ends/
         // axes/steps, Split sizes, ReduceSum axes, Clip min/max are const params
         // read at plan/dispatch time, never uploaded as buffers.)
-        "Resize" | "Expand" | "Slice" | "Split" | "ReduceSum" | "Clip" | "Pad" | "Tile"
-        | "Gather" => take(1),
+        "Resize" | "Expand" | "Slice" | "Split" | "ReduceSum" | "ReduceMean" | "ReduceL2"
+        | "Clip" | "Pad" | "Tile" | "Gather" => take(1),
         // Shape-only input (consumed at plan time); no data operand to upload.
         "ConstantOfShape" => take(0),
         // All inputs are data operands.
@@ -2055,4 +2281,44 @@ fn data_operands<'a>(op: &str, inputs: &'a [String]) -> Vec<&'a str> {
             .filter(|s| !s.is_empty())
             .collect(),
     }
+}
+
+/// Per plan step, the activation names last read there (graph outputs never).
+/// A fused chain reads its primary + sides at its tail step; its skipped
+/// member nodes read nothing themselves.
+fn last_uses(
+    graph: &Graph,
+    plan: &Plan,
+    fusion: &super::fusion::Fusion,
+    outputs: &[String],
+) -> Vec<Vec<String>> {
+    let mut last: HashMap<&str, usize> = HashMap::new();
+    for (si, step) in plan.steps.iter().enumerate() {
+        match step {
+            Step::View { src, .. } => {
+                last.insert(src.as_str(), si);
+            }
+            Step::Compute { node_idx } => {
+                if let Some(&c) = fusion.tail_of.get(node_idx) {
+                    let chain = &fusion.chains[c];
+                    for n in std::iter::once(&chain.primary).chain(&chain.sides) {
+                        last.insert(n.as_str(), si);
+                    }
+                } else if !fusion.skip.contains(node_idx) {
+                    for n in &graph.nodes[*node_idx].inputs {
+                        if !n.is_empty() {
+                            last.insert(n.as_str(), si);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut frees = vec![Vec::new(); plan.steps.len()];
+    for (name, si) in last {
+        if !outputs.iter().any(|o| o == name) {
+            frees[si].push(name.to_string());
+        }
+    }
+    frees
 }

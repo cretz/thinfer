@@ -52,14 +52,14 @@ pub fn spec_into_request(
         JobSpec::Image(s) => {
             let model = s.model.unwrap_or(ImageModelId::DEFAULT);
             let d = model.defaults();
-            // Image-edit reference image: base64-decode and hold in RAM
-            // ([`ImageBytes`]); a decrypted image never touches disk.
-            // `ImageRequest::validate` enforces the present/required-by-kind
-            // rules (400 on mismatch).
-            let input_image = match s.input_image {
-                Some(b64) => Some(ImageBytes(b64_decode("input_image", &b64)?)),
-                None => None,
-            };
+            // Input images: base64-decode and hold in RAM ([`ImageBytes`]); a
+            // decrypted image never touches disk. `ImageRequest::validate`
+            // enforces the per-kind counts (400 on mismatch).
+            let input_images = s
+                .input_images
+                .iter()
+                .map(|b64| b64_decode("input_images", b64).map(ImageBytes))
+                .collect::<Result<Vec<_>, String>>()?;
             let req = ImageRequest {
                 model,
                 prompt: s.prompt,
@@ -69,7 +69,7 @@ pub fn spec_into_request(
                 seed: s.seed,
                 i8_matmul: s.i8_matmul.unwrap_or(true),
                 full_precision: s.full_precision.unwrap_or(false),
-                input_image,
+                input_images,
                 lora: s
                     .lora
                     .into_iter()
@@ -128,8 +128,10 @@ pub fn spec_into_request(
                 attn: s.attn.unwrap_or(model.default_attn()),
                 audio: s.audio.unwrap_or(true),
                 upscale: s.upscale.unwrap_or(model.two_stage_default()),
+                super_res: s.super_res,
                 audio_hq: s.audio_hq.unwrap_or(false),
                 vae_encode_f32: s.vae_encode_f32.unwrap_or(false),
+                bf16_gemm: s.bf16_gemm.unwrap_or(false),
                 rewrite: s.rewrite.unwrap_or(true),
                 rewrite_quality: s.rewrite_quality.unwrap_or_default(),
                 lora: s

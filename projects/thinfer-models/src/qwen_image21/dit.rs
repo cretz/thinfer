@@ -494,12 +494,28 @@ pub enum PrefixPart {
     Image { start: usize, h: usize, w: usize },
 }
 
+impl PrefixPart {
+    /// Its rows in the joint sequence.
+    pub fn rows(self) -> usize {
+        match self {
+            Self::Text { len, .. } => len,
+            Self::Image { h, w, .. } => h * w,
+        }
+    }
+}
+
+/// One block's prefix `(K, V)` `[rows, DIM]` (post norm + rope).
+enum CachedKv {
+    Device(WsBuf<WgpuBackend>, WsBuf<WgpuBackend>),
+    /// Spilled: uploaded into a per-step staging pair before the block runs.
+    Host(Vec<u8>, Vec<u8>),
+}
+
 /// The prefix pass's output, reused by every step of the request.
 pub struct Prefix {
     /// Prefix rows (text + condition tokens).
     rows: u32,
-    /// Per block `(K, V)` `[rows, DIM]` (post norm + rope).
-    cache: Vec<(WsBuf<WgpuBackend>, WsBuf<WgpuBackend>)>,
+    cache: Vec<CachedKv>,
     /// RoPE freqs over `[prefix ; target]` (the target rows' slice is per step).
     freqs: WsBuf<WgpuBackend>,
     zero: WsBuf<WgpuBackend>,
@@ -509,6 +525,46 @@ impl Prefix {
     pub fn rows(&self) -> usize {
         self.rows as usize
     }
+
+    /// Whether the K / V live on the host (several condition images).
+    pub fn spilled(&self) -> bool {
+        matches!(self.cache.first(), Some(CachedKv::Host(..)))
+    }
+}
+
+/// Where the prefix K / V live between steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPlacement {
+    Device,
+    /// On the host; each step re-uploads them block by block (cheap next to
+    /// the block's GEMMs).
+    Host,
+}
+
+impl KvPlacement {
+    /// On the device while the cache takes at most half the VRAM budget, else
+    /// the host (several condition images: ~2 GB each at 1024^2), leaving the
+    /// rest for streamed weights + activations.
+    pub fn for_budget(
+        pipes: &Qwen21DitPipelines,
+        prefix_rows: usize,
+        layers: usize,
+        vram_bytes: u64,
+    ) -> Self {
+        let per_block = 2 * pipes
+            .block
+            .act_bytes(kv_rows(prefix_rows) * config::DIM as u32);
+        if per_block * layers as u64 > vram_bytes / 2 {
+            Self::Host
+        } else {
+            Self::Device
+        }
+    }
+}
+
+/// Cached K / V rows: the prefix plus its even-pad row.
+fn kv_rows(prefix_rows: usize) -> u32 {
+    (prefix_rows as u32).next_multiple_of(2)
 }
 
 /// The step-invariant modulation inputs of one `t`, on the host.
@@ -687,7 +743,7 @@ impl Qwen21Dit {
     /// keep each block's K / V. `encoder` = the conditioner rows `[n, TEXT_DIM]`
     /// (system rows already dropped), `cond` = the condition images' latent
     /// tokens `[m, LATENT_CH]`, `parts` = the prefix in sequence order,
-    /// `target` = the target's latent grid.
+    /// `target` = the target's latent grid, `kv` = where the cache lives.
     #[allow(clippy::too_many_arguments)]
     pub async fn prefill<S: WeightSource>(
         &self,
@@ -700,6 +756,7 @@ impl Qwen21Dit {
         cond: &[f32],
         parts: &[PrefixPart],
         target: (usize, usize),
+        kv: KvPlacement,
     ) -> Result<Prefix, DitError<S::Error>> {
         let bp = &pipes.block;
         let dim = config::DIM as u32;
@@ -841,6 +898,7 @@ impl Qwen21Dit {
             start += seg.len();
         }
 
+        let kv_bytes = bp.act_bytes(padded * dim);
         let mut cache = Vec::with_capacity(h.blocks.len());
         let mut pending = match h.blocks.first() {
             Some(b) => Some(BlockViews::acquire(b, res, backend).await?),
@@ -901,7 +959,13 @@ impl Qwen21Dit {
             s?;
             pending = n?;
             drop(views);
-            cache.push((ck, cv));
+            cache.push(match kv {
+                KvPlacement::Device => CachedKv::Device(ck, cv),
+                KvPlacement::Host => CachedKv::Host(
+                    backend.read_buffer(ck.id(), 0, kv_bytes).await?,
+                    backend.read_buffer(cv.id(), 0, kv_bytes).await?,
+                ),
+            });
             hidden = out;
         }
         Ok(Prefix {
@@ -962,6 +1026,14 @@ impl Qwen21Dit {
             scope.submit_void().await?;
         }
 
+        // A spilled cache uploads each block's K / V into one staging pair (the
+        // previous block's submit has completed before the next write lands).
+        let staging = if prefix.spilled() {
+            let kv_bytes = bp.act_bytes(kv_rows(prefix.rows()) * dim);
+            Some((ws.alloc(kv_bytes)?, ws.alloc(kv_bytes)?))
+        } else {
+            None
+        };
         let mut pending = match h.blocks.first() {
             Some(b) => Some(BlockViews::acquire(b, res, backend).await?),
             None => None,
@@ -971,7 +1043,15 @@ impl Qwen21Dit {
             let views = pending.take().expect("pending block acquire");
             let bufs = views.bufs(bh);
             let out = ws.alloc(bp.act_bytes(rows * dim))?;
-            let (ck, cv) = &prefix.cache[i];
+            let (ck, cv) = match &prefix.cache[i] {
+                CachedKv::Device(k, v) => (k, v),
+                CachedKv::Host(k, v) => {
+                    let (sk, sv) = staging.as_ref().expect("staging for a spilled cache");
+                    backend.write_buffer(sk.id(), 0, k)?;
+                    backend.write_buffer(sv.id(), 0, v)?;
+                    (sk, sv)
+                }
+            };
             let scope = ws.batch();
             let freqs = scope.subview(
                 &scope.import_copy(prefix.freqs.as_buf_ref()),

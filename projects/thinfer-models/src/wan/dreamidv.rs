@@ -245,6 +245,7 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
                 false,
             ),
             false,
+            false,
         )
         .await?;
 
@@ -443,6 +444,7 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
                     timestep: t,
                     r_timestep: None,
                     attn_window: None,
+                    token_add: None,
                 };
                 let guided = i % cfg_every == 0;
                 let mut ins = vec![input(&image_lat)];
@@ -519,7 +521,7 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
     /// mask[16]); `img_ref` is the z16 source-face latent `[out_channels, 1, h,
     /// w]`; the baked context is the pipeline's own padded `self.context`. Drives
     /// the torch Stage-A parity gate (`dreamidv_dit_parity`), mirroring the
-    /// LongLive `forward_velocity_at` accessor. Reuses `forward_with_taps`.
+    /// `forward_velocity_at` accessor. Reuses `forward_with_taps`.
     pub async fn dit_forward_parity(
         &self,
         f_lat: usize,
@@ -542,6 +544,7 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
             timestep,
             r_timestep: None,
             attn_window: None,
+            token_add: None,
         };
         let mut per_block: Vec<Vec<f32>> = Vec::new();
         let taps = WanDitTaps {

@@ -258,6 +258,16 @@ extern "C" __global__ void __launch_bounds__(256) sdpa_f16_d64(
 extern "C" __global__ void __launch_bounds__(256) sdpa_f16_d128(
     const half* q, const half* k, const half* v, const half* mask, half* out, const SdpaU* u)
 { sdpa_impl<128>(q, k, v, mask, out, u); }
+
+// The same with the shapes by value, for launches enqueued with no uniform
+// buffer behind them (deferred mode).
+extern "C" __global__ void __launch_bounds__(256) sdpa_f16_d64_v(
+    const half* q, const half* k, const half* v, const half* mask, half* out, SdpaU u)
+{ sdpa_impl<64>(q, k, v, mask, out, &u); }
+
+extern "C" __global__ void __launch_bounds__(256) sdpa_f16_d128_v(
+    const half* q, const half* k, const half* v, const half* mask, half* out, SdpaU u)
+{ sdpa_impl<128>(q, k, v, mask, out, &u); }
 "#;
 
 /// Dynamic shared memory for head dim `d` (must match the kernel's carve-up:
@@ -287,6 +297,8 @@ pub struct SdpaKernels {
     module: Module,
     d64: sys::CUfunction,
     d128: sys::CUfunction,
+    d64_v: sys::CUfunction,
+    d128_v: sys::CUfunction,
 }
 
 // SAFETY: function handles are plain driver handles; every use binds the
@@ -300,7 +312,15 @@ impl SdpaKernels {
         let module = Module::compile(ctx, SOURCE, "thinfer_sdpa.cu", sm)?;
         let d64 = module.function(c"sdpa_f16_d64", smem_bytes(64))?;
         let d128 = module.function(c"sdpa_f16_d128", smem_bytes(128))?;
-        Ok(Self { module, d64, d128 })
+        let d64_v = module.function(c"sdpa_f16_d64_v", smem_bytes(64))?;
+        let d128_v = module.function(c"sdpa_f16_d128_v", smem_bytes(128))?;
+        Ok(Self {
+            module,
+            d64,
+            d128,
+            d64_v,
+            d128_v,
+        })
     }
 
     /// Run on device addresses with shapes `u`. `Ok(false)` = unsupported
@@ -337,6 +357,52 @@ impl SdpaKernels {
             (&raw mut uniform).cast(),
         ];
         self.module.launch_sync(
+            f,
+            (u.s_q.div_ceil(BR), u.h_q, u.b),
+            THREADS,
+            smem_bytes(u.d),
+            &mut args,
+            "sdpa",
+        )?;
+        Ok(true)
+    }
+
+    /// [`Self::run`] without a mask, the shapes by value, enqueued on the
+    /// stream (no wait): deferred mode's attention.
+    pub fn enqueue(
+        &self,
+        u: &SdpaUniform,
+        q: u64,
+        k: u64,
+        v: u64,
+        out: u64,
+    ) -> Result<bool, String> {
+        let f = match u.d {
+            64 => self.d64_v,
+            128 => self.d128_v,
+            _ => return Ok(false),
+        };
+        let aligned = [q, k, v, out].iter().all(|a| a % 16 == 0);
+        if !aligned
+            || u.has_mask != 0
+            || u.h_kv == 0
+            || !u.h_q.is_multiple_of(u.h_kv)
+            || u.s_q == 0
+            || u.s_k == 0
+        {
+            return Ok(false);
+        }
+        self.module.bind()?;
+        let (mut q, mut k, mut v, mut mask, mut out, mut u_) = (q, k, v, 0u64, out, *u);
+        let mut args: [*mut c_void; 6] = [
+            (&raw mut q).cast(),
+            (&raw mut k).cast(),
+            (&raw mut v).cast(),
+            (&raw mut mask).cast(),
+            (&raw mut out).cast(),
+            (&raw mut u_).cast(),
+        ];
+        self.module.launch(
             f,
             (u.s_q.div_ceil(BR), u.h_q, u.b),
             THREADS,

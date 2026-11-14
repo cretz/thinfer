@@ -52,17 +52,11 @@ const VISION_END: (&str, u32) = ("<|vision_end|>", 151_653);
 const IMAGE_PAD: (&str, u32) = ("<|image_pad|>", 151_655);
 
 /// One reference image, prepared: RGB8 `[height, width, 3]`. User media, so
-/// zeroed on drop like the request's [`crate::request::ImageBytes`].
+/// page-locked on a server and zeroed on drop.
 pub struct Prepared {
-    pub rgb: Vec<u8>,
+    pub rgb: thinfer_core::secmem::Locked<u8>,
     pub height: usize,
     pub width: usize,
-}
-
-impl Drop for Prepared {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.rgb);
-    }
 }
 
 /// Python's `round` (half to even), as the reference sizes with it.
@@ -103,7 +97,7 @@ pub fn prepare_keyframe(bytes: &[u8], height: usize, width: usize) -> Result<Pre
         );
     }
     Ok(Prepared {
-        rgb: img.to_rgb8().into_raw(),
+        rgb: img.to_rgb8().into_raw().into(),
         height,
         width,
     })
@@ -132,7 +126,7 @@ pub fn prepare(
         img = img.resize_exact(tw as u32, th as u32, image::imageops::FilterType::Lanczos3);
     }
     Ok(Prepared {
-        rgb: img.to_rgb8().into_raw(),
+        rgb: img.to_rgb8().into_raw().into(),
         height: th,
         width: tw,
     })

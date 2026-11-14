@@ -13,8 +13,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SwapModel, VaeChoice,
-    VideoModelId, VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SuperRes, SwapModel,
+    VaeChoice, VideoModelId, VideoSampler,
 };
 use crate::progress::Stage;
 
@@ -97,11 +97,11 @@ pub struct ImageSpec {
     /// precision). Default false. No effect on GGUF variants / other models.
     #[serde(default)]
     pub full_precision: Option<bool>,
-    /// Base64-encoded reference image bytes (PNG/JPEG). REQUIRED for
-    /// qwen-image-edit, ignored otherwise. The server decodes it to a temp file
-    /// under the job dir and feeds it to the image-edit path.
+    /// Base64-encoded input images (PNG/JPEG), in prompt order: exactly one
+    /// for qwen-image-edit-rapid, up to 10 condition images for
+    /// qwen-image-2.1-turbo, rejected otherwise. Held in RAM server-side.
     #[serde(default)]
-    pub input_image: Option<String>,
+    pub input_images: Vec<String>,
     /// Opt out of the cooperative-matrix (tensor-core) path; see
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
@@ -134,19 +134,19 @@ pub struct LoraSpec {
 #[serde(rename_all = "camelCase")]
 pub struct VideoSpec {
     pub model: Option<VideoModelId>,
-    /// One prompt, or several for a multi-shot clip (LongLive only).
+    /// One prompt, or several for chained FastH3 / MiniMax-H3 clips.
     pub prompts: Vec<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// Frame counts (one to split evenly, or one per prompt). Mutually exclusive
-    /// with `durations`.
+    /// Frame counts (one for the whole clip, or one per chained-clip prompt).
+    /// Mutually exclusive with `durations`.
     pub frames: Option<Vec<u32>>,
     pub durations: Option<Vec<f32>>,
     pub fps: Option<u32>,
     pub seed: Option<u64>,
     /// FastWan denoise sampler. Unset -> the model default (UniPC, matching the
     /// public Spaces; DMD for FastWan2.1-1.3B, its card's 3-step regime). DMD is
-    /// also the byte-parity reference path. Ignored on the AR (LongLive) path.
+    /// also the byte-parity reference path.
     pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8, default 4). DMD ignores it.
     pub steps: Option<u32>,
@@ -187,8 +187,8 @@ pub struct VideoSpec {
     /// to all LTX models; ignored by Wan.
     pub encoder: Option<EncoderQuant>,
     pub i8_matmul: Option<bool>,
-    /// FastH3 sparse-attention precision: `bf16` (default) or `int8`
-    /// (SageAttention-style QK^T: faster, same quality, different sample).
+    /// MiniMax-H3 family attention precision: `int8-fp8` (default), `int8`
+    /// or `bf16` (the reference: slower, same quality, different sample).
     pub attn: Option<AttnPrecision>,
     /// Decode + mux an audio track. Joint-AV models only (LTX and MiniMax-H3;
     /// the silent Wan models ignore it). Defaults to `true`; `false` skips the
@@ -198,6 +198,9 @@ pub struct VideoSpec {
     /// (half-res denoise -> latent upscale -> refine). Defaults to `false` =
     /// single-stage denoise at the target res. Ignored by the Wan models.
     pub upscale: Option<bool>,
+    /// MiniMax-H3 / FastH3: RelayVSR super-resolution of the finished video,
+    /// `2x` or `4x`. Absent = native resolution.
+    pub super_res: Option<SuperRes>,
     /// LTX joint-AV: opt in to a finer denoise schedule for better audio
     /// (subdivides the coarse distilled sigma jumps into more Euler substeps).
     /// Honored on every LTX path: the single-stage schedule (ltx2-rapid always,
@@ -211,6 +214,11 @@ pub struct VideoSpec {
     /// precision, ~3x faster). Defaults to `false`.
     #[serde(default)]
     pub vae_encode_f32: Option<bool>,
+    /// MiniMax-H3 GGUF models: every block GEMM in bf16 with unfolded adapters
+    /// (the exact path) instead of the default 8-bit GEMMs and folded
+    /// adapters. Defaults to `false`.
+    #[serde(default)]
+    pub bf16_gemm: Option<bool>,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed caption via
     /// the rewrite endpoint before encoding. Defaults to `true` (the model needs
     /// detailed captions); `false` sends the raw prompt. Other models ignore it.

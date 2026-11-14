@@ -273,6 +273,236 @@ GEMM(gemm_ab_bb_n, true, true, true, false)
 GEMM(gemm_a16_b16_k_o32, false, false, false, true)
 GEMM(gemm_a16_b16_n_o32, false, false, true, true)
 
+// 8-bit tensor-core GEMM: out[m, n] = bf16(acc * sa[m] * sb[n] + bias[n]),
+// acc = A[m, :] . B[n, :] over per-row quantized operands: INT8 in int32
+// (exact), or FP8 e4m3 (`F8`) in f32. FP8 MMAs accumulate in f16 partials
+// that are added into the f32 total every F8_PROMOTE_TILES k-tiles (k = 128):
+// GeForce parts run the f16-accumulate FP8 MMA at twice the f32-accumulate
+// rate, and with operands quantized to |q| <= F8_RANGE (16) a 128-term partial
+// is bounded by 16 * 16 * 128 = 32768 < 65504, so it cannot overflow, and its
+// f16 rounding (~2^-11 per add) stays far inside e4m3's 3-bit mantissa. A
+// `[m, K]`, B n-major `[n, K]`, K a multiple of 16; `d.k` counts K in BYTE
+// PAIRS: an m16n8k32 8-bit fragment has exactly the byte layout of an
+// m16n8k16 b16 fragment, so the tiling, staging and ldmatrix addressing are
+// gemm_impl's (n-major B) as is. FP8 needs sm_89+ (the body traps below).
+__device__ __forceinline__ void mma_s8(int (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+#define F8_PROMOTE_TILES 2
+// One MMA into the running accumulator: INT8 straight into the int32 total;
+// FP8 into the f16x2 partial `h` (h[0] = row g cols 2t, 2t+1; h[1] = row g+8).
+__device__ __forceinline__ void mma_q8(int (&d)[4], unsigned (&)[2], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    mma_s8(d, a, b0, b1);
+}
+__device__ __forceinline__ void mma_q8(float (&)[4], unsigned (&h)[2], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 890
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(h[0]), "+r"(h[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+// Fold the f16 partial into the f32 total and restart it (INT8: nothing).
+__device__ __forceinline__ void promote_q8(int (&)[4], unsigned (&)[2]) {}
+__device__ __forceinline__ void promote_q8(float (&d)[4], unsigned (&h)[2]) {
+    const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&h[0]));
+    const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&h[1]));
+    d[0] += lo.x; d[1] += lo.y; d[2] += hi.x; d[3] += hi.y;
+    h[0] = h[1] = 0u;
+}
+template <bool F> struct Q8Acc { typedef int T; };
+template <> struct Q8Acc<true> { typedef float T; };
+
+template <bool F8>
+__device__ __forceinline__ void gemm_q8_impl(
+    const unsigned short* __restrict__ a, const float* __restrict__ sa,
+    const unsigned short* __restrict__ b, const float* __restrict__ sb,
+    unsigned short* __restrict__ out, const Dims d, const unsigned short* __restrict__ bias)
+{
+    constexpr int A_TILE = BM * LDA;
+    constexpr int B_TILE = BN * LDBN;
+    __shared__ __align__(16) unsigned short as[2][A_TILE];
+    __shared__ __align__(16) unsigned short bs[2][B_TILE];
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int wm0 = (warp >> 2) * 64, wn0 = (warp & 3) * 32;
+    const unsigned mt = (d.m + BM - 1) / BM, nt = (d.n + BN - 1) / BN;
+    const unsigned per_group = GROUP_M * nt, pid = blockIdx.x;
+    const unsigned first_m = (pid / per_group) * GROUP_M;
+    const unsigned gsize = min(mt - first_m, (unsigned)GROUP_M);
+    const unsigned m0 = (first_m + (pid % per_group) % gsize) * BM;
+    const unsigned n0 = ((pid % per_group) / gsize) * BN;
+    const unsigned ntiles = (d.k + BK - 1) / BK;
+
+    uint4 ra[2], rb[2];
+    auto fetch = [&](unsigned kt) {
+        const unsigned k0 = kt * BK;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int i = tid + j * 256;
+            const int r = i >> 2, c = (i & 3) * 8;
+            const unsigned gr = m0 + r, gn = n0 + r, gc = k0 + c;
+            ra[j] = (gr < d.m && gc < d.k)
+                ? *reinterpret_cast<const uint4*>(a + (size_t)gr * d.k + gc) : make_uint4(0, 0, 0, 0);
+            rb[j] = (gn < d.n && gc < d.k)
+                ? *reinterpret_cast<const uint4*>(b + (size_t)gn * d.k + gc) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto stage = [&](int buf) {
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int i = tid + j * 256;
+            *reinterpret_cast<uint4*>(&as[buf][(i >> 2) * LDA + (i & 3) * 8]) = ra[j];
+            *reinterpret_cast<uint4*>(&bs[buf][(i >> 2) * LDBN + (i & 3) * 8]) = rb[j];
+        }
+    };
+
+    typename Q8Acc<F8>::T acc[4][4][4];
+    unsigned part[4][4][2];
+    #pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+        #pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0;
+            part[mi][ni][0] = part[mi][ni][1] = 0u;
+        }
+
+    fetch(0);
+    stage(0);
+    __syncthreads();
+    for (unsigned kt = 0; kt < ntiles; ++kt) {
+        const int buf = kt & 1;
+        if (kt + 1 < ntiles) fetch(kt + 1);
+        #pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) {
+            unsigned af[4][4];
+            #pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+                ldsm_x4(af[mi], &as[buf][(wm0 + mi * 16 + (lane & 15)) * LDA + kk * 16 + (lane >> 4) * 8]);
+            unsigned bf[4][2];
+            #pragma unroll
+            for (int nj = 0; nj < 2; ++nj) {
+                unsigned r[4];
+                ldsm_x4(r, &bs[buf][(wn0 + nj * 16 + (lane & 7) + ((lane >> 4) << 3)) * LDBN
+                                    + kk * 16 + ((lane >> 3) & 1) * 8]);
+                bf[2 * nj][0] = r[0]; bf[2 * nj][1] = r[1];
+                bf[2 * nj + 1][0] = r[2]; bf[2 * nj + 1][1] = r[3];
+            }
+            #pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+                #pragma unroll
+                for (int ni = 0; ni < 4; ++ni)
+                    mma_q8(acc[mi][ni], part[mi][ni], af[mi], bf[ni][0], bf[ni][1]);
+        }
+        if (F8 && ((kt + 1) % F8_PROMOTE_TILES == 0 || kt + 1 == ntiles)) {
+            #pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+                #pragma unroll
+                for (int ni = 0; ni < 4; ++ni)
+                    promote_q8(acc[mi][ni], part[mi][ni]);
+        }
+        if (kt + 1 < ntiles) stage(buf ^ 1);
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int mi = 0; mi < 4; ++mi) {
+        #pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            const unsigned col = n0 + wn0 + ni * 8 + 2 * t;
+            if (col >= d.n) continue;
+            const float s0 = sb[col], s1 = sb[col + 1];
+            float b0 = 0.f, b1 = 0.f;
+            if (bias) {
+                const unsigned bv = *reinterpret_cast<const unsigned*>(bias + col);
+                b0 = bf_lo(bv); b1 = bf_hi(bv);
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const unsigned row = m0 + wm0 + mi * 16 + g + h * 8;
+                if (row >= d.m) continue;
+                const float r = sa[row];
+                // Explicit roundings (no FMA contraction): acc * r * s + b.
+                const float x = __fadd_rn(__fmul_rn(__fmul_rn((float)acc[mi][ni][2 * h], r), s0), b0);
+                const float y = __fadd_rn(__fmul_rn(__fmul_rn((float)acc[mi][ni][2 * h + 1], r), s1), b1);
+                __nv_bfloat162 v = __floats2bfloat162_rn(x, y);
+                *reinterpret_cast<unsigned*>(out + (size_t)row * d.n + col) = *reinterpret_cast<unsigned*>(&v);
+            }
+        }
+    }
+}
+
+#define GEMM_Q8(NAME, F8) \
+extern "C" __global__ void __launch_bounds__(256) NAME( \
+    const unsigned short* __restrict__ a, const float* __restrict__ sa, \
+    const unsigned short* __restrict__ b, const float* __restrict__ sb, \
+    unsigned short* __restrict__ out, const Dims d, const unsigned short* __restrict__ bias) \
+{ gemm_q8_impl<F8>(a, sa, b, sb, out, d, bias); }
+GEMM_Q8(gemm_i8, false)
+GEMM_Q8(gemm_f8, true)
+
+// Per row of a bf16 `[rows, k]`: the row's max |x| and its 256 threads'
+// share of the row (one block per row).
+__device__ __forceinline__ float row_absmax(const unsigned short* __restrict__ x, size_t base, unsigned k) {
+    __shared__ float red[8];
+    float m = 0.f;
+    for (unsigned i = threadIdx.x; i < k; i += 256) m = fmaxf(m, fabsf(__uint_as_float((unsigned)x[base + i] << 16)));
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    m = red[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) m = fmaxf(m, red[w]);
+    return m;
+}
+
+// The FP8 operands' range: |q| <= 16 keeps gemm_f8's f16 MMA partials finite
+// (see gemm_q8_impl). e4m3 is floating point, so the range only shifts which
+// tiny values go subnormal (below max|x| / 1024), not the relative precision.
+#define F8_RANGE 16.f
+
+// Per row of a bf16 `[rows, k]`: q = e4m3(x * F8_RANGE / max|x|) (round to
+// nearest), scale = max|x| / F8_RANGE (an all-zero row: q 0, scale 0). One
+// block per row; sm_89+.
+extern "C" __global__ void __launch_bounds__(256) quant_rows_f8(
+    const unsigned short* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ scale, unsigned k)
+{
+#if __CUDA_ARCH__ >= 890
+    const size_t base = (size_t)blockIdx.x * k;
+    const float m = row_absmax(x, base, k);
+    const float inv = m > 0.f ? F8_RANGE / m : 0.f;
+    for (unsigned i = threadIdx.x; i < k; i += 256) {
+        unsigned short r;
+        const float v = __uint_as_float((unsigned)x[base + i] << 16) * inv;
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(v));
+        q[base + i] = (unsigned char)r;
+    }
+    if (threadIdx.x == 0) scale[blockIdx.x] = m / F8_RANGE;
+#else
+    __trap();
+#endif
+}
+
+// Per row of a bf16 `[rows, k]`: q = round(x * 127 / max|x|) as int8, scale =
+// max|x| / 127 (an all-zero row: q 0, scale 0). One block per row.
+extern "C" __global__ void __launch_bounds__(256) quant_rows_i8(
+    const unsigned short* __restrict__ x, signed char* __restrict__ q, float* __restrict__ scale, unsigned k)
+{
+    const size_t base = (size_t)blockIdx.x * k;
+    const float m = row_absmax(x, base, k);
+    const float inv = m > 0.f ? 127.f / m : 0.f;
+    for (unsigned i = threadIdx.x; i < k; i += 256) {
+        const float v = __uint_as_float((unsigned)x[base + i] << 16) * inv;
+        q[base + i] = (signed char)max(-127, min(127, __float2int_rn(v)));
+    }
+    if (threadIdx.x == 0) scale[blockIdx.x] = m / 127.f;
+}
+
 // f32 acts x the bf16 n-major dequant workspace, f32 out, for M <= SK_M (a
 // short prompt through an f32 encoder): memory-bound on B, so plain f32 FMA,
 // each output summed in K order. A block owns SK_M rows x SK_BN columns, a
@@ -850,6 +1080,8 @@ const CONV_MIN_BIG_TILES: u32 = 128;
 const SKINNY_M: u32 = 64;
 const SKINNY_BN: u32 = 64;
 
+pub use thinfer_core::backend::{GemmQ8Addrs, Q8};
+
 /// The dims uniform (`(m, n, k, _)`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -872,9 +1104,70 @@ pub struct GemmKernels {
     conv3d_f16: sys::CUfunction,
     conv3d_f16_small: sys::CUfunction,
     conv3d_f16tc: sys::CUfunction,
+    /// `[I8, E4m3]` kernels of the 8-bit GEMM and its row quantizer; E4m3
+    /// `None` below sm_89.
+    gemm_q8: [Option<sys::CUfunction>; 2],
+    quant_rows_q8: [Option<sys::CUfunction>; 2],
     overflow: sys::CUdeviceptr,
     /// An unchecked narrowing GEMM ran since the overflow flag was last read.
     unchecked: std::sync::atomic::AtomicBool,
+    /// Where [`Self::probe_unchecked_overflow`] copies the flag.
+    probe: Arc<OverflowProbe>,
+}
+
+/// A pinned host copy of the GEMM overflow flag, written by an async copy
+/// enqueued ahead of a fence and read once the fence completes. Shared with
+/// the fence futures, which may outlive a scope.
+pub struct OverflowProbe {
+    host: *mut u32,
+    /// An overflow was reported: the device flag is still set and must be
+    /// cleared before it is read again.
+    reset_due: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: `host` is a pinned allocation owned by this probe; the device only
+// writes it through copies the fence orders before any read.
+unsafe impl Send for OverflowProbe {}
+unsafe impl Sync for OverflowProbe {}
+
+impl OverflowProbe {
+    fn new() -> Result<Self, String> {
+        let mut host = std::ptr::null_mut();
+        // SAFETY: allocates 4 pinned bytes on the bound context.
+        crate::nvrtc::drv(
+            unsafe { sys::cuMemAllocHost_v2(&mut host, std::mem::size_of::<u32>()) },
+            "cuMemAllocHost",
+        )?;
+        let host = host.cast::<u32>();
+        // SAFETY: freshly allocated, 4-byte aligned, no copy in flight.
+        unsafe { host.write_volatile(0) };
+        Ok(Self {
+            host,
+            reset_due: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// After the fence that followed the copy: whether the copied flag was
+    /// set. A set flag is consumed (cleared here, and on the device before
+    /// the next read).
+    pub fn take(&self) -> bool {
+        // SAFETY: the copy that writes `host` completed before the fence.
+        let over = unsafe { self.host.read_volatile() } != 0;
+        if over {
+            // SAFETY: as above; no copy is in flight for a completed fence.
+            unsafe { self.host.write_volatile(0) };
+            self.reset_due
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        over
+    }
+}
+
+impl Drop for OverflowProbe {
+    fn drop(&mut self) {
+        // SAFETY: allocated by cuMemAllocHost; nothing reads it any more.
+        let _ = unsafe { sys::cuMemFreeHost(self.host.cast()) };
+    }
 }
 
 // SAFETY: function handles are plain driver handles; every use binds the
@@ -936,7 +1229,18 @@ impl GemmKernels {
         let conv3d_f16 = module.function(c"conv3d_f16", 0)?;
         let conv3d_f16_small = module.function(c"conv3d_f16_small", 0)?;
         let conv3d_f16tc = module.function(c"conv3d_f16tc", 0)?;
+        let fp8 = sm >= (8, 9);
+        let gemm_q8 = [
+            Some(module.function(c"gemm_i8", 0)?),
+            fp8.then(|| module.function(c"gemm_f8", 0)).transpose()?,
+        ];
+        let quant_rows_q8 = [
+            Some(module.function(c"quant_rows_i8", 0)?),
+            fp8.then(|| module.function(c"quant_rows_f8", 0))
+                .transpose()?,
+        ];
         let overflow = module.global(c"g_overflow")?;
+        let probe = Arc::new(OverflowProbe::new()?);
         Ok(Self {
             module,
             funcs,
@@ -947,8 +1251,11 @@ impl GemmKernels {
             conv3d_f16,
             conv3d_f16_small,
             conv3d_f16tc,
+            gemm_q8,
+            quant_rows_q8,
             overflow,
             unchecked: std::sync::atomic::AtomicBool::new(false),
+            probe,
         })
     }
 
@@ -1175,14 +1482,125 @@ impl GemmKernels {
         Ok(true)
     }
 
+    /// Enqueue the 8-bit GEMM `out = bf16(acc * sa[m] * sb[n] + bias[n])`
+    /// on device addresses (see [`GemmQ8Addrs`]). `Ok(false)` = shape or
+    /// format (FP8 below sm_89) not covered.
+    pub fn run_q8(&self, p: &GemmQ8Addrs, m: u32, n: u32, k: u32) -> Result<bool, String> {
+        let Some(f) = self.gemm_q8[p.format as usize] else {
+            return Ok(false);
+        };
+        if m < MIN_M || n == 0 || !n.is_multiple_of(8) || k == 0 || !k.is_multiple_of(16) {
+            return Ok(false);
+        }
+        let mut dims = GemmDims {
+            m,
+            n,
+            k: k / 2,
+            pad: 0,
+        };
+        let (mut a, mut sa, mut b, mut sb, mut out, mut bias) =
+            (p.a, p.sa, p.b, p.sb, p.out, p.bias);
+        let mut args: [*mut c_void; 7] = [
+            (&raw mut a).cast(),
+            (&raw mut sa).cast(),
+            (&raw mut b).cast(),
+            (&raw mut sb).cast(),
+            (&raw mut out).cast(),
+            (&raw mut dims).cast(),
+            (&raw mut bias).cast(),
+        ];
+        self.module.bind()?;
+        self.module.launch(
+            f,
+            (n.div_ceil(BN) * m.div_ceil(BM), 1, 1),
+            THREADS,
+            0,
+            &mut args,
+            "gemm_q8",
+        )?;
+        Ok(true)
+    }
+
+    /// Enqueue the per-row 8-bit quantization of a bf16 `[rows, k]` (`x`)
+    /// into `q` (`[rows, k]` in `format`) and `scale` (f32 `[rows]`): int8 `q
+    /// = round(x * 127 / max|row|)`, `scale = max|row| / 127`; e4m3 the same
+    /// over 16 (`F8_RANGE`: keeps the f16-accumulate MMA partials finite).
+    /// `Ok(false)` = FP8 below sm_89.
+    pub fn quant_rows_q8(
+        &self,
+        format: Q8,
+        x: u64,
+        q: u64,
+        scale: u64,
+        rows: u32,
+        k: u32,
+    ) -> Result<bool, String> {
+        let Some(f) = self.quant_rows_q8[format as usize] else {
+            return Ok(false);
+        };
+        let (mut x, mut q, mut scale, mut k) = (x, q, scale, k);
+        let mut args: [*mut c_void; 4] = [
+            (&raw mut x).cast(),
+            (&raw mut q).cast(),
+            (&raw mut scale).cast(),
+            (&raw mut k).cast(),
+        ];
+        self.module.bind()?;
+        self.module
+            .launch(f, (rows, 1, 1), THREADS, 0, &mut args, "quant_rows_q8")?;
+        Ok(true)
+    }
+
     /// Whether a narrowing GEMM overflowed since the last call (a blocking
     /// read), clearing the flag.
     pub fn take_overflow(&self) -> Result<bool, String> {
+        self.clear_reported()?;
         let over = self.module.read::<u32>(self.overflow)? != 0;
         if over {
             self.module.write(self.overflow, 0u32)?;
         }
         Ok(over)
+    }
+
+    /// Without waiting: enqueue a copy of the flag for the unchecked GEMMs
+    /// since the last call into the pinned probe, to read (with
+    /// [`OverflowProbe::take`]) once a later fence completes. `None` with no
+    /// copy when none ran.
+    pub fn probe_unchecked_overflow(&self) -> Result<Option<Arc<OverflowProbe>>, String> {
+        if !self
+            .unchecked
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(None);
+        }
+        self.clear_reported()?;
+        self.module.bind()?;
+        // SAFETY: a 4-byte copy into the probe's pinned word on the default
+        // stream, ordered after every GEMM enqueued so far.
+        crate::nvrtc::drv(
+            unsafe {
+                sys::cuMemcpyDtoHAsync_v2(
+                    self.probe.host.cast(),
+                    self.overflow,
+                    std::mem::size_of::<u32>(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuMemcpyDtoHAsync",
+        )?;
+        Ok(Some(Arc::clone(&self.probe)))
+    }
+
+    /// Clear the device flag once a probe has reported it.
+    fn clear_reported(&self) -> Result<(), String> {
+        if self
+            .probe
+            .reset_due
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.module.write(self.overflow, 0u32)?;
+        }
+        Ok(())
     }
 
     /// [`Self::take_overflow`] for the unchecked GEMMs since the last call;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, sys};
 use half::{bf16, f16};
+use thinfer_core::backend::GemmAddrs;
 use thinfer_core::ops::{GemmDesc, GemmType};
 use thinfer_cuda::gemm::{GemmDims, GemmKernels};
 
@@ -107,14 +108,17 @@ fn run(ctx: &Arc<CudaContext>, kernels: &GemmKernels, c: &Case, rng: &mut Rng) -
     let ran = kernels
         .run(
             &c.desc,
-            pa,
-            pb,
-            po,
-            pd,
-            m as u32,
-            n as u32,
-            0,
-            Default::default(),
+            &GemmAddrs {
+                a: pa,
+                b: pb,
+                out: po,
+                dims: pd,
+                m: m as u32,
+                n: n as u32,
+                k: 0,
+                epilogue: Default::default(),
+                checked: true,
+            },
         )
         .unwrap();
     let mut raw = vec![0u8; m * n * out_bytes];
@@ -268,14 +272,17 @@ fn cuda_gemm_f32_acts() {
         let ran = kernels
             .run(
                 &desc,
-                pa,
-                pb,
-                po,
-                pd,
-                m as u32,
-                n as u32,
-                0,
-                Default::default(),
+                &GemmAddrs {
+                    a: pa,
+                    b: pb,
+                    out: po,
+                    dims: pd,
+                    m: m as u32,
+                    n: n as u32,
+                    k: 0,
+                    epilogue: Default::default(),
+                    checked: true,
+                },
             )
             .unwrap();
         assert_eq!(ran, thinfer_cuda::gemm::accepts(&desc, m as u32, n as u32));
@@ -371,7 +378,20 @@ fn cuda_gemm_fused_epilogue() {
             gate: pgate,
         };
         let ran = kernels
-            .run(&desc, pa, pb, po, 0, m as u32, n as u32, k as u32, epi)
+            .run(
+                &desc,
+                &GemmAddrs {
+                    a: pa,
+                    b: pb,
+                    out: po,
+                    dims: 0,
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    epilogue: epi,
+                    checked: true,
+                },
+            )
             .unwrap();
         assert!(ran, "fused epilogue declined (in_place {in_place})");
         let mut raw = vec![0u8; m * n * 2];
@@ -398,21 +418,35 @@ fn cuda_gemm_fused_epilogue() {
             unsafe { sys::cuMemFree_v2(p) }.result().unwrap();
         }
     }
-    // f16 output: a non-empty epilogue is declined, never silently dropped.
+    // f16 output takes a bias-only epilogue; a residual or gate is declined
+    // (before any launch: the addresses are fake), never silently dropped.
     let f16_desc = GemmDesc {
         a: GemmType::F16,
         ..desc
     };
     let epi = thinfer_core::backend::GemmEpilogue {
         bias: 16,
-        residual: 0,
+        residual: 16,
         gate: 0,
     };
     assert!(
         !kernels
-            .run(&f16_desc, 16, 16, 16, 0, 128, 64, 64, epi)
+            .run(
+                &f16_desc,
+                &GemmAddrs {
+                    a: 16,
+                    b: 16,
+                    out: 16,
+                    dims: 0,
+                    m: 128,
+                    n: 64,
+                    k: 64,
+                    epilogue: epi,
+                    checked: true,
+                },
+            )
             .unwrap(),
-        "f16 output took an epilogue"
+        "f16 output took a residual epilogue"
     );
 }
 
@@ -557,5 +591,68 @@ fn cuda_conv2d_is_bit_exact() {
             .count();
         eprintln!("cuda conv2d {shape:?}: {bad} of {} differ", want.len());
         assert_eq!(bad, 0, "{shape:?}");
+    }
+}
+
+/// Throughput at the MiniMax-H3 generic-block site shapes (bf16 x bf16
+/// N-major), per row-chunk size. Opt-in (`THINFER_GEMM_BENCH=1`); garbage
+/// operands, timing only.
+#[test]
+fn cuda_gemm_bench() {
+    if std::env::var_os("THINFER_GEMM_BENCH").is_none() || !thinfer_cuda::driver_present() {
+        return;
+    }
+    let ctx = CudaContext::new(0).unwrap();
+    let sm = ctx.compute_capability().unwrap();
+    let kernels = GemmKernels::new(ctx.clone(), sm).unwrap();
+    let desc = GemmDesc {
+        a: GemmType::Bf16,
+        b: GemmType::Bf16,
+        b_nmajor: true,
+        out_f32: false,
+    };
+    let (max_m, max_n, max_k) = (8192usize, 28672usize, 14336usize);
+    let pa = upload(&ctx, &vec![0x3cu8; max_m * max_k * 2]);
+    let pb = upload(&ctx, &vec![0x3cu8; max_n * max_k * 2]);
+    let po = upload(&ctx, &vec![0u8; max_m * max_n * 2]);
+    for (n, k) in [
+        (21504usize, 5376usize),
+        (5376, 5376),
+        (28672, 5376),
+        (5376, 14336),
+        (512, 5376),
+        (5376, 512),
+    ] {
+        for m in [1024usize, 2048, 4096, 8192] {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                assert!(
+                    kernels
+                        .run(
+                            &desc,
+                            &GemmAddrs {
+                                a: pa,
+                                b: pb,
+                                out: po,
+                                dims: 0,
+                                m: m as u32,
+                                n: n as u32,
+                                k: k as u32,
+                                epilogue: Default::default(),
+                                checked: true,
+                            },
+                        )
+                        .unwrap()
+                );
+                unsafe { sys::cuCtxSynchronize() }.result().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let tf = 2.0 * (m * n * k) as f64 / best / 1e9;
+            eprintln!("gemm m={m} n={n} k={k}: {best:.2} ms ({tf:.1} TFLOP/s)");
+        }
+    }
+    for p in [pa, pb, po] {
+        unsafe { sys::cuMemFree_v2(p) }.result().unwrap();
     }
 }
