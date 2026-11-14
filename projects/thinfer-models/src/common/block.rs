@@ -3939,6 +3939,7 @@ fn dispatch_sdpa_dense<'wsp>(
     head_dim: u32,
 ) -> Result<(), WgpuError> {
     if let Some(sdpa_large_d) = pipelines.sdpa_large_d.as_ref().filter(|_| head_dim > 128) {
+        SdpaF32LargeD::assert_fits(head_dim);
         scope.sdpa::<SdpaF32LargeD>(sdpa_large_d, q, k, v, mask, u, out, b, s_q, h_q)
     } else if let Some(sdpa_sg) = pipelines.sdpa_sg.as_ref().filter(|_| {
         // f16-reading kernel: native-act F16 blocks only (see `op_sdpa_impl`).

@@ -2403,6 +2403,7 @@ fn mid_attention_forward<'wsp>(
     let attn = scope.alloc(block_bytes)?;
     let scale = 1.0_f32 / (c as f32).sqrt();
     let u = sdpa_uniform(scope, 1, 1, 1, hw, hw, c, scale)?;
+    SdpaF32LargeD::assert_fits(c);
     scope.sdpa::<SdpaF32LargeD>(&pl.sdpa_large_d, q, k, v, mask, u, attn, 1, hw, 1)?;
 
     // [1, H*W, C] -> [1, C, H*W] -> NCTHW, then proj (1x1) + residual.

@@ -262,13 +262,11 @@ pub fn catalog_from(h: &GgufHeader, file_size: Option<u64>) -> WeightCatalog {
             t.encoding,
             Some(StorageEncoding::F32 | StorageEncoding::F16 | StorageEncoding::Bf16)
         );
+        // Checked: the metadata is untrusted, and a wrapped product could
+        // falsely match the stored count.
+        let numel = |s: &Shape| s.0.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
         let shape = match &t.orig_shape {
-            Some(o)
-                if float
-                    && o.0.iter().product::<usize>() == t.shape.0.iter().product::<usize>() =>
-            {
-                o.clone()
-            }
+            Some(o) if float && numel(o).is_some_and(|n| Some(n) == numel(&t.shape)) => o.clone(),
             _ => Shape(t.shape.0.iter().rev().copied().collect()),
         };
         entries.insert(
