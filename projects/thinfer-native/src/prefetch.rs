@@ -54,20 +54,27 @@ pub struct Prefetch {
 }
 
 impl Prefetch {
-    /// Start reading `paths` unless their total plus [`RESERVE`] exceeds the
-    /// available RAM (then the bytes would only evict each other).
-    pub fn start(paths: Vec<PathBuf>) -> Option<Self> {
-        let total: u64 = paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .sum();
+    /// Start reading the longest prefix of `paths` (most wanted first) whose
+    /// total plus [`RESERVE`] fits the available RAM: past that the bytes
+    /// would only evict each other.
+    pub fn start(mut paths: Vec<PathBuf>) -> Option<Self> {
         let avail = available_ram()?;
-        if total + RESERVE > avail {
+        let mut total = 0u64;
+        let fits = paths
+            .iter()
+            .take_while(|p| {
+                total += std::fs::metadata(p).map_or(0, |m| m.len());
+                total + RESERVE <= avail
+            })
+            .count();
+        if fits < paths.len() {
             tracing::info!(
                 target: thinfer_core::trace::DIAG,
-                total, avail, "prefetch skipped: not enough free RAM",
+                fits, of = paths.len(), avail, "prefetch: not enough free RAM for every file",
             );
+        }
+        paths.truncate(fits);
+        if paths.is_empty() {
             return None;
         }
         let stop = Arc::new(AtomicBool::new(false));

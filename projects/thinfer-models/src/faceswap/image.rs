@@ -67,6 +67,17 @@ impl Image {
     }
 
     /// Bilinear resize to `(nw, nh)`.
+    /// The `w x h` region at `(x, y)` (must lie inside the image).
+    pub fn crop(&self, x: usize, y: usize, w: usize, h: usize) -> Image {
+        assert!(x + w <= self.w && y + h <= self.h, "crop outside the image");
+        let mut data = Vec::with_capacity(w * h * 3);
+        for r in y..y + h {
+            let row = (r * self.w + x) * 3;
+            data.extend_from_slice(&self.data[row..row + w * 3]);
+        }
+        Image { w, h, data }
+    }
+
     pub fn resize(&self, nw: usize, nh: usize) -> Image {
         let mut out = Image::new(nw, nh);
         // Map output pixel centers back to input (align_corners=false style:

@@ -1,14 +1,17 @@
-//! Qwen3-VL-32B vision tower (mmproj), the image half of MiniMax-H3's
-//! conditioner for reference images (Ref2VA) and keyframes (FL2VA). Ground
-//! truth: `transformers/models/qwen3_vl::Qwen3VLVisionModel`.
+//! Qwen3-VL vision tower (mmproj), the image half of MiniMax-H3's conditioner
+//! for reference images (Ref2VA) and keyframes (FL2VA), and of Qwen-Image-2.1's
+//! for condition images. Ground truth:
+//! `transformers/models/qwen3_vl::Qwen3VLVisionModel`. The tower is the same
+//! for every Qwen3-VL size; only the merger's LLM width differs (5120 for 32B,
+//! 4096 for 8B), read from the mmproj (`VisionHandles::projection_dim`).
 //!
 //! patch embed (Conv3d k = s = (2,16,16) with bias; both temporal slabs see the
 //! same frame, so it is two 768-wide Linears summed) + a learned 48x48 position
 //! table bilinearly resampled to the patch grid -> 27 pre-LayerNorm blocks (fused
 //! `[q | k | v]` with bias, 2D half-rot rope, full attention over the image,
 //! gelu-tanh MLP) -> merger (per-patch LayerNorm, 2x2 concat, fc1, GELU, fc2 ->
-//! 5120). After blocks 8, 16 and 24 a deepstack merger (concat FIRST, then a
-//! 4608-wide LayerNorm) emits a second 5120-d stream that the LLM adds into the
+//! LLM width). After blocks 8, 16 and 24 a deepstack merger (concat FIRST, then
+//! a 4608-wide LayerNorm) emits a second LLM-width stream that the LLM adds into the
 //! image rows after its decoder layers 0, 1 and 2.
 //!
 //! Patches are merge-unit-major (each 2x2 unit's four patches contiguous, units
@@ -55,8 +58,6 @@ pub mod config {
     pub const MERGE_UNIT: usize = SPATIAL_MERGE * SPATIAL_MERGE;
     /// Merger width: four patches concatenated.
     pub const MERGER_HIDDEN: usize = HIDDEN * MERGE_UNIT; // 4608
-    /// The LLM width the mergers project to.
-    pub const PROJECTION_DIM: usize = 5120;
     /// Side of the learned position table (`num_position_embeddings` 2304).
     pub const POS_GRID: usize = 48;
     /// Blocks whose outputs feed the deepstack mergers (0-based).
@@ -88,6 +89,8 @@ struct MergerHandles {
     norm: Norm,
     fc1: LinearBiasHandles,
     fc2: LinearBiasHandles,
+    /// Output (LLM) width.
+    proj: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +102,8 @@ pub struct VisionHandles {
     blocks: Vec<BlockHandles>,
     merger: MergerHandles,
     deepstack: [MergerHandles; 3],
+    /// The LLM width the mergers project to (`mm.2` rows).
+    pub projection_dim: usize,
 }
 
 fn lin_bias<S: WeightSource>(
@@ -167,12 +172,23 @@ pub fn register_handles<S: WeightSource>(
             })
         })
         .collect::<Result<Vec<_>, LoadError>>()?;
+    // The LLM width, from the merger's last projection (`[proj, 4608]`).
+    let proj = {
+        let id = WeightId("mm.2.weight".into());
+        let e = residency
+            .source()
+            .catalog()
+            .get(&id)
+            .ok_or_else(|| LoadError::UnknownWeight(id.clone()))?;
+        e.shape.elements() / config::MERGER_HIDDEN
+    };
     let deepstack = |i: usize| -> Result<MergerHandles, LoadError> {
         let p = format!("v.deepstack.{}", config::DEEPSTACK[i]);
         Ok(MergerHandles {
             norm: norm(residency, &format!("{p}.norm"))?,
             fc1: lin_bias(residency, &format!("{p}.fc1"))?,
             fc2: lin_bias(residency, &format!("{p}.fc2"))?,
+            proj,
         })
     };
     Ok(VisionHandles {
@@ -187,8 +203,10 @@ pub fn register_handles<S: WeightSource>(
             norm: norm(residency, "v.post_ln")?,
             fc1: lin_bias(residency, "mm.0")?,
             fc2: lin_bias(residency, "mm.2")?,
+            proj,
         },
         deepstack: [deepstack(0)?, deepstack(1)?, deepstack(2)?],
+        projection_dim: proj,
     })
 }
 
@@ -455,9 +473,10 @@ impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for VisionError<S
 /// One image's LLM-side features, merged tokens row-major over `(gh/2, gw/2)`.
 #[derive(Clone, Debug)]
 pub struct VisionOutput {
-    /// `[tokens, 5120]`: what replaces the `<|image_pad|>` embeddings.
+    /// `[tokens, projection_dim]`: what replaces the `<|image_pad|>` embeddings.
     pub embeds: Vec<f32>,
-    /// `[tokens, 5120]` each: added to the image rows after LLM layers 0, 1, 2.
+    /// `[tokens, projection_dim]` each: added to the image rows after LLM
+    /// layers 0, 1, 2.
     pub deepstack: [Vec<f32>; 3],
     pub tokens: usize,
     /// Merged grid `(gh/2, gw/2)`.
@@ -596,7 +615,7 @@ fn upload(
     Ok(buf)
 }
 
-/// A merger over `rows` patch rows -> `[rows / 4, 5120]` read back to the host.
+/// A merger over `rows` patch rows -> `[rows / 4, proj]` read back to the host.
 /// `post_shuffle` = deepstack form (LayerNorm over the 4608-wide concat).
 #[allow(clippy::too_many_arguments)]
 async fn merge<S: WeightSource>(
@@ -610,7 +629,7 @@ async fn merge<S: WeightSource>(
     post_shuffle: bool,
 ) -> Result<Vec<f32>, VisionError<S::Error>> {
     let (hid, mh) = (config::HIDDEN as u32, config::MERGER_HIDDEN as u32);
-    let proj = config::PROJECTION_DIM as u32;
+    let proj = h.proj as u32;
     let merged = rows / config::MERGE_UNIT as u32;
     let norm = h.norm.acquire(residency, backend).await?;
     let fc1 = h.fc1.acquire(residency, backend).await?;

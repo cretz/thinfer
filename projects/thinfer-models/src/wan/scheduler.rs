@@ -1,5 +1,5 @@
 //! DMD (Distribution Matching Distillation) few-step sampler for the distilled
-//! Wan2.2 line (FastWan, LongLive). Replaces the SkyReels-DF UniPC multistep
+//! Wan2.2 line (FastWan). Replaces the SkyReels-DF UniPC multistep
 //! solver: a DMD-distilled generator predicts the flow velocity at a small set
 //! of fixed timesteps and is re-noised between them, so there is no multistep
 //! corrector/predictor state and no CFG.
@@ -27,7 +27,7 @@
 //! submits.
 
 /// Per-model DMD schedule. Lives on the model side (`manifest`) so each distilled
-/// variant (FastWan 3-step, LongLive 4-step, ...) supplies its own steps without
+/// variant (FastWan 3-step, ...) supplies its own steps without
 /// touching the sampler.
 #[derive(Clone, Debug)]
 pub struct DmdConfig {

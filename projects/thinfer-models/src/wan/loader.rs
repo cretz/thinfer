@@ -415,7 +415,7 @@ fn register_condition_embedder<S: WeightSource>(
 
 /// Module-level linear+bias: weight stays dense bf16 (`Linear2D [K, N]`), run on
 /// the `matmul_module` pipeline. F16/F32 sources narrow to bf16 at upload.
-fn register_linear_bias<S: WeightSource>(
+pub(crate) fn register_linear_bias<S: WeightSource>(
     residency: &WeightResidency<S>,
     weight: &WeightId,
     bias: &WeightId,
@@ -430,7 +430,7 @@ fn register_linear_bias<S: WeightSource>(
 /// 2-D linear by collapsing the trailing dims to `[inner, patch_in]`. The bytes
 /// are row-major `(inner, ic, kt, kh, kw)`, so the collapse is a pure shape
 /// reinterpret; `Linear2D` then transposes to the `[patch_in, inner]` B-side.
-fn register_conv_as_linear_bias<S: WeightSource>(
+pub(crate) fn register_conv_as_linear_bias<S: WeightSource>(
     residency: &WeightResidency<S>,
     weight: &WeightId,
     bias: &WeightId,
@@ -468,7 +468,7 @@ fn register_conv_as_linear_bias<S: WeightSource>(
 /// requantized to the GGUF block layout when `transcode` is set, or file-native
 /// quant (already `[N, K]` N-major, no transpose). Mirrors
 /// `common::loader::register_linear_transcode`.
-fn register_linear<S: WeightSource>(
+pub(crate) fn register_linear<S: WeightSource>(
     residency: &WeightResidency<S>,
     id: &WeightId,
     transcode: Option<thinfer_core::quant::QuantKind>,
@@ -531,7 +531,7 @@ fn linear_layout(
     })
 }
 
-fn register_passthrough<S: WeightSource>(
+pub(crate) fn register_passthrough<S: WeightSource>(
     residency: &WeightResidency<S>,
     id: &WeightId,
 ) -> Result<WeightHandle, LoadError> {

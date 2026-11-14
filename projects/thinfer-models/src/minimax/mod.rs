@@ -23,6 +23,7 @@ pub mod adaln;
 pub mod audio_vae;
 pub mod dit;
 pub mod fasth3;
+pub mod hyperflow;
 pub mod loader;
 pub mod lora;
 pub mod manifest;
@@ -79,9 +80,26 @@ pub struct DitConfig {
     pub vsa_tiling: vsa::VsaTiling,
     /// VSA's QK^T in INT8 (SageAttention-style; P.V stays bf16).
     pub vsa_int8_qk: bool,
+    /// With `vsa_int8_qk`: P.V in FP8 too (SageAttention2-style).
+    pub vsa_fp8_pv: bool,
+    /// The GGUF block's unfactored sites as 8-bit tensor-core GEMMs over
+    /// per-row quantized weights and activations: the normed inputs (qkv,
+    /// fc1) INT8 (int32 accumulate), the attention / SwiGLU outputs (out,
+    /// fc2) FP8 e4m3 (f32 accumulate; bf16 below sm_89).
+    pub gemm_q8: bool,
+    /// The GGUF block folds each quant site's runtime adapter into its bf16
+    /// weight image per pass (`W += B @ A`, the ComfyUI bf16 merge) instead of
+    /// two thin GEMMs per row chunk. The merge rounds the small adapter delta
+    /// to bf16, so it gives a different (equally good) sample than the exact
+    /// unfolded form.
+    pub fold_adapters: bool,
     /// Blocks of the released 50-block H3 that a trimmed checkpoint removed
     /// (the rest are renumbered densely). Maps base-H3 adapters onto it.
     pub dropped_blocks: &'static [usize],
+    /// HyperFlow two-time conditioning: the AdaLN reads
+    /// `temb(t) + gate * (temb_r(r) - temb(t))` (`endpoint_time_embedder`,
+    /// `hyperflow_gate` from the checkpoint) with `r` each row's step endpoint.
+    pub two_time: bool,
     /// How the checkpoint's NVFP4 linears quantize their activations.
     pub nvfp4_format: thinfer_core::backend::Nvfp4Format,
     /// Frequencies per rotary axis. Three axes share one `inv_freq` buffer.
@@ -131,7 +149,11 @@ impl DitConfig {
             vsa_gate: true,
             vsa_tiling: vsa::VsaTiling::T64,
             vsa_int8_qk: false,
+            vsa_fp8_pv: false,
+            gemm_q8: false,
+            fold_adapters: false,
             dropped_blocks: &[],
+            two_time: false,
             nvfp4_format: thinfer_core::backend::Nvfp4Format {
                 dynamic_act_scale: false,
                 hi_first: false,
@@ -177,6 +199,30 @@ impl DitConfig {
             dynamic_act_scale: true,
             hi_first: true,
         };
+        c
+    }
+
+    /// FastVideo FastH3 V2 (the full-depth 8-step distill) as the Comfy NVFP4
+    /// file ships it: Omni's layout (rank-8 AdaLN curve table, Comfy NVFP4)
+    /// with one output head, attention as FastVideo distilled it
+    /// (`fastvideo_inference.json`: tile 64, sparsity 0.8).
+    pub const fn fasth3_v2() -> Self {
+        let mut c = Self::fasth3_omni();
+        c.pdd = None;
+        c.vsa_sparsity = Some(0.8);
+        c.vsa_tiling = vsa::VsaTiling::T64;
+        c
+    }
+
+    /// HyperFlow H3 Flash (see [`hyperflow`]): the H3 topology with
+    /// `n_layers` blocks kept (the GGUF drops and renumbers the rest: FL2VA
+    /// 47, Ref2VA 49), a 16-wide time embedding read by the full-width AdaLN
+    /// projections, and two-time `(t, r)` conditioning. Dense attention.
+    pub const fn hyperflow(n_layers: usize) -> Self {
+        let mut c = Self::h3_33b();
+        c.n_layers = n_layers;
+        c.time_embed_dim = 16;
+        c.two_time = true;
         c
     }
 

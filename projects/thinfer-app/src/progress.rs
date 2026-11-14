@@ -14,8 +14,8 @@ pub enum Stage {
     TextEncode,
     /// Single-shot denoise step `i` of `n` (image, FastWan video).
     Step { i: u32, n: u32 },
-    /// AR/chunked denoise: `step` of `num_steps` within `chunk` of `num_chunks`
-    /// (LongLive).
+    /// Chunked denoise: `step` of `num_steps` within `chunk` of `num_chunks`
+    /// (HunyuanVideo causal I2V).
     ChunkStep {
         chunk: u32,
         num_chunks: u32,
@@ -59,12 +59,15 @@ pub trait ProgressSink {
 pub fn write_artifact(
     sink: &dyn ProgressSink,
     path: &std::path::Path,
-    bytes: &[u8],
+    bytes: Vec<u8>,
 ) -> Result<(), String> {
-    if sink.artifact(path, bytes)? {
+    // The finished output is job plaintext until the sink seals it: locked
+    // while it is sealed, zeroized after.
+    let bytes = thinfer_core::secmem::Locked::new(bytes);
+    if sink.artifact(path, &bytes)? {
         return Ok(());
     }
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(path, &*bytes).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// A sink that drops everything. Useful for non-interactive callers and tests.

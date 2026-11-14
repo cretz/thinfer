@@ -20,6 +20,14 @@ serde_json = "1"
 # measures instead of panicking (`std::time::Instant::now` aborts on wasm32).
 web-time = "1"
 safetensors = { version = "0.4", optional = true }
+# `secmem`: zeroize-on-drop job plaintext, page-locked on native targets.
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_Foundation"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Drives async backend futures to completion in native integration tests.

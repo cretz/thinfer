@@ -31,6 +31,40 @@ pub fn router(web_dir: Option<&Path>) -> Router {
     }
 }
 
+/// Content-Security-Policy for every response. The UI is one same-origin
+/// module script and stylesheet with no inline code; results and input
+/// thumbnails display from `blob:` URLs the page decrypts into; every request
+/// (API, `EventSource`) is same-origin. Nothing else may load, connect, frame
+/// the page or be framed: injected markup cannot run script or ship plaintext
+/// (prompts, decrypted results) anywhere.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+    img-src 'self' blob:; media-src 'self' blob:; connect-src 'self'; \
+    form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+/// Security headers on every response (UI and API), applied as the outermost
+/// layer: the CSP above, no MIME sniffing, no referrer to other origins, an
+/// isolated browsing context group, and no device / sensor permissions.
+pub async fn security_headers(mut res: axum::response::Response) -> axum::response::Response {
+    use axum::http::HeaderValue;
+    let h = res.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_SECURITY_POLICY, CSP),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (
+            header::HeaderName::from_static("cross-origin-opener-policy"),
+            "same-origin",
+        ),
+        (
+            header::HeaderName::from_static("permissions-policy"),
+            "camera=(), microphone=(), geolocation=(), usb=(), payment=()",
+        ),
+    ] {
+        h.insert(name, HeaderValue::from_static(value));
+    }
+    res
+}
+
 async fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
     // no-store so a redeploy's HTML/JS/CSS is never served stale from cache
     // (otherwise an old app.js lingers and mis-reads new event fields).

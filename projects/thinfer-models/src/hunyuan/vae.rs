@@ -802,6 +802,10 @@ fn mid_attention<'w>(
     // causal frame cutoff stays exact) and flushes to land in its own submit.
     let row_bytes = c as u64 * asz;
     let chunk = vae_mid_chunk_rows(n);
+    assert!(
+        c <= <SdpaF32LargeDCausal as SdpaOp>::MAX_D,
+        "sdpa_large_d_causal: head dim {c} exceeds the kernel's per-thread state"
+    );
     let mut r0 = 0u32;
     while r0 < n {
         let cr = (n - r0).min(chunk);

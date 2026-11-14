@@ -149,6 +149,22 @@ fn cuda_sdpa_matches_reference() {
         unsafe { sys::cuMemcpyDtoH_v2(got.as_mut_ptr().cast(), po, want.len() * 2) }
             .result()
             .unwrap();
+        if has_mask == 0 {
+            // The deferred-mode entry (shapes by value) is the same kernel.
+            let po2 = upload(&ctx, &vec![0u8; want.len() * 2]);
+            assert!(kernels.enqueue(&u, pq, pk, pv, po2).unwrap());
+            unsafe { sys::cuCtxSynchronize() }.result().unwrap();
+            let mut got2 = vec![f16::ZERO; want.len()];
+            unsafe { sys::cuMemcpyDtoH_v2(got2.as_mut_ptr().cast(), po2, want.len() * 2) }
+                .result()
+                .unwrap();
+            assert!(
+                got.iter()
+                    .zip(&got2)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+            unsafe { sys::cuMemFree_v2(po2) }.result().unwrap();
+        }
         let (mut num, mut den, mut max_abs) = (0f64, 0f64, 0f32);
         for (g, w) in got.iter().zip(&want) {
             let e = g.to_f32() - w;
@@ -165,4 +181,81 @@ fn cuda_sdpa_matches_reference() {
     }
     // f16 inputs/outputs and f16 P: ~1e-3 relative is the expected floor.
     assert!(worst < 5e-3, "worst rel_l2 {worst:.2e}");
+}
+
+/// Throughput at the MiniMax-H3 832x480 5 s self-attention shape. Opt-in
+/// (`THINFER_SDPA_BENCH=1`), bounded to one ~2.5 TFLOP call per iteration.
+#[test]
+fn cuda_sdpa_bench() {
+    if std::env::var_os("THINFER_SDPA_BENCH").is_none() || !thinfer_cuda::driver_present() {
+        return;
+    }
+    let ctx = CudaContext::new(0).unwrap();
+    let sm = ctx.compute_capability().unwrap();
+    let kernels = SdpaKernels::new(ctx.clone(), sm).unwrap();
+    let (s, h, d) = (10795u32, 42u32, 128u32);
+    let u = SdpaUniform {
+        b: 1,
+        h_q: h,
+        h_kv: h,
+        s_q: s,
+        s_k: s,
+        d,
+        scale: 1.0 / (d as f32).sqrt(),
+        has_mask: 0,
+    };
+    let n = (s * h * d) as usize;
+    let mut rng = Rng(3);
+    let (q, k, v) = (rng.vec(n, 1.0), rng.vec(n, 1.0), rng.vec(n, 1.0));
+    let (pq, pk, pv) = (
+        upload(&ctx, bytes(&q)),
+        upload(&ctx, bytes(&k)),
+        upload(&ctx, bytes(&v)),
+    );
+    let pm = upload(&ctx, &[0u8; 16]);
+    let pu = upload(&ctx, bytes(std::slice::from_ref(&u)));
+    let po = upload(&ctx, &vec![0u8; n * 2]);
+    for it in 0..4 {
+        let t = std::time::Instant::now();
+        assert!(kernels.run(&u, pq, pk, pv, pm, po, pu).unwrap());
+        unsafe { sys::cuCtxSynchronize() }.result().unwrap();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let flops = 4.0 * (s as f64).powi(2) * (h * d) as f64;
+        eprintln!(
+            "h3 480p sdpa it{it}: {ms:.1} ms ({:.1} TFLOP/s)",
+            flops / ms / 1e9
+        );
+    }
+    // The same work as the wgpu path issues it: 1792-row query chunks.
+    for it in 0..3 {
+        let t = std::time::Instant::now();
+        let mut r0 = 0u32;
+        let mut ups = Vec::new();
+        while r0 < s {
+            let rows = (s - r0).min(1792);
+            let uc = SdpaUniform { s_q: rows, ..u };
+            let puc = upload(&ctx, bytes(std::slice::from_ref(&uc)));
+            let off = (r0 * h * d * 2) as u64;
+            assert!(
+                kernels
+                    .run(&uc, pq + off, pk, pv, pm, po + off, puc)
+                    .unwrap()
+            );
+            unsafe { sys::cuCtxSynchronize() }.result().unwrap();
+            ups.push(puc);
+            r0 += rows;
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let flops = 4.0 * (s as f64).powi(2) * (h * d) as f64;
+        eprintln!(
+            "h3 480p sdpa chunked it{it}: {ms:.1} ms ({:.1} TFLOP/s)",
+            flops / ms / 1e9
+        );
+        for p in ups {
+            unsafe { sys::cuMemFree_v2(p) }.result().unwrap();
+        }
+    }
+    for p in [pq, pk, pv, pm, pu, po] {
+        unsafe { sys::cuMemFree_v2(p) }.result().unwrap();
+    }
 }

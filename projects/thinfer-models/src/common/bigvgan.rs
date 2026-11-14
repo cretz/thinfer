@@ -839,7 +839,6 @@ impl BigVgan {
                 scope.submit_void().await?;
                 p
             };
-            workspace.drain_pool();
 
             for (i, &cout) in cfg.channels().iter().enumerate() {
                 let rate = cfg.up_rates[i] as u32;
@@ -866,7 +865,6 @@ impl BigVgan {
                     p
                 };
                 drop(cur);
-                workspace.drain_pool();
                 // Each kernel-size resblock reads the SAME `xt`; persisted for the mean.
                 let mut ys: Vec<Persisted> = Vec::with_capacity(RESBLOCK_KERNELS.len());
                 for (kidx, &kernel) in RESBLOCK_KERNELS.iter().enumerate() {
@@ -877,10 +875,8 @@ impl BigVgan {
                     let p = persist_cl(&scope, workspace, y)?;
                     scope.submit_void().await?;
                     ys.push(p);
-                    workspace.drain_pool();
                 }
                 drop(xt);
-                workspace.drain_pool();
                 cur = {
                     let scope = workspace.batch();
                     let mut acc: Option<Cl> = None;
@@ -902,7 +898,6 @@ impl BigVgan {
                     p
                 };
                 drop(ys);
-                workspace.drain_pool();
             }
 
             // act_post Activation1d -> conv_post (no bias) -> readback.
@@ -934,6 +929,9 @@ impl BigVgan {
             }
             drop(cur);
         }
+        // Stage buffers stay pooled across scopes (each resblock rents ~100,
+        // and its siblings and the next channel reuse them); the arbiter
+        // reclaims idle ones under budget pressure. Free them all at the end.
         workspace.drain_pool();
         drop(filter_pins);
         drop(act_held);

@@ -41,6 +41,9 @@ const VAE_W: usize = 64;
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
 const STEPS: u32 = 4;
+/// The preamble the diffusers edit template (`gen_edit_inputs.py`) drops
+/// (`prompt_template_encode_start_idx`).
+const DIFFUSERS_EDIT_DROP: usize = 64;
 
 #[tokio::test(flavor = "current_thread")]
 async fn edit_e2e_health() {
@@ -74,7 +77,10 @@ async fn edit_e2e_health() {
     run_inputs(tok_path.parent().expect("tok dir"), &tmp);
 
     let token_ids = read_u32(&tmp.join("token_ids.bin"));
-    assert!(token_ids.len() > 64, "need > edit drop_idx tokens");
+    assert!(
+        token_ids.len() > DIFFUSERS_EDIT_DROP,
+        "need > edit drop_idx tokens"
+    );
     let meta = std::fs::read_to_string(tmp.join("meta.txt")).expect("meta.txt");
     let m: Vec<usize> = meta
         .split_whitespace()
@@ -152,6 +158,7 @@ async fn edit_e2e_health() {
         .generate_edit_rgb(
             &token_ids,
             pad_start,
+            DIFFUSERS_EDIT_DROP,
             &pixel_values,
             (gh, gw),
             &vae_image,

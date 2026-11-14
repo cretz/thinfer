@@ -15,6 +15,7 @@ pub mod quant;
 pub mod residency;
 pub mod runtime;
 pub mod sanity;
+pub mod secmem;
 pub mod tensor;
 pub mod tokenizer;
 pub mod trace;

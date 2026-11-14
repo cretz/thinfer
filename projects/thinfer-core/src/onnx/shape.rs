@@ -519,16 +519,70 @@ fn try_fold(node: &Node, vals: &mut HashMap<String, Val>) -> Result<Option<()>, 
         }
         "Slice" => {
             let data = ints!(&node.inputs[0]);
+            let shape = get(vals, &node.inputs[0])?.shape.clone();
             let starts = ints!(&node.inputs[1]);
             let ends = ints!(&node.inputs[2]);
-            // axes/steps optional; for a 1-D shape vector assume axis 0, step 1.
-            let n = data.len() as i64;
-            let clamp = |x: i64| if x < 0 { (x + n).max(0) } else { x.min(n) };
-            let s = clamp(starts[0]) as usize;
-            let e = clamp(ends[0]) as usize;
-            let out: Vec<i64> = data[s.min(data.len())..e.max(s).min(data.len())].to_vec();
-            let len = out.len() as i64;
-            set_const(vals, &node.outputs[0], vec![len], TensorData::I64(out));
+            let opt = |i: usize| node.inputs.get(i).filter(|s| !s.is_empty());
+            let axes = match opt(3) {
+                Some(n) => ints!(n),
+                None => (0..starts.len() as i64).collect(),
+            };
+            let steps = match opt(4) {
+                Some(n) => ints!(n),
+                None => vec![1; starts.len()],
+            };
+            let (out_shape, out) = slice_ints(&data, &shape, &starts, &ends, &axes, &steps)?;
+            set_const(vals, &node.outputs[0], out_shape, TensorData::I64(out));
+            Ok(Some(()))
+        }
+        // Small int tensors in the shape subgraph (e.g. PyTorch's `F.pad` export:
+        // ConstantOfShape -> Concat -> Reshape [-1,2] -> Slice step -1 ->
+        // Transpose -> Reshape -> Cast builds the ONNX `pads`). Float constants
+        // fall through (`None`): they stay weights / views.
+        "ConstantOfShape" => {
+            let fill = match node.attr_t("value").map(|t| &t.data) {
+                Some(TensorData::I64(v)) => v.first().copied().unwrap_or(0),
+                _ => return Ok(None),
+            };
+            let dims = ints!(&node.inputs[0]);
+            let n: i64 = dims.iter().product();
+            set_const(
+                vals,
+                &node.outputs[0],
+                dims,
+                TensorData::I64(vec![fill; n as usize]),
+            );
+            Ok(Some(()))
+        }
+        "Reshape" => {
+            let v = get(vals, &node.inputs[0])?;
+            let Some(TensorData::I64(data)) = v.data.clone() else {
+                return Ok(None);
+            };
+            let in_shape = v.shape.clone();
+            let target = ints!(&node.inputs[1]);
+            let shape = resolve_target(&target, &in_shape, node.attr_i("allowzero", 0) != 0)?;
+            set_const(vals, &node.outputs[0], shape, TensorData::I64(data));
+            Ok(Some(()))
+        }
+        "Transpose" => {
+            let v = get(vals, &node.inputs[0])?;
+            let Some(TensorData::I64(data)) = v.data.clone() else {
+                return Ok(None);
+            };
+            let shape = v.shape.clone();
+            let perm = node.attr_ints("perm").map(|p| p.to_vec());
+            if shape.len() != 2 || perm.as_deref().is_some_and(|p| p != [1, 0]) {
+                return Ok(None);
+            }
+            let (r, c) = (shape[0] as usize, shape[1] as usize);
+            let out: Vec<i64> = (0..r * c).map(|i| data[(i % r) * c + i / r]).collect();
+            set_const(
+                vals,
+                &node.outputs[0],
+                vec![shape[1], shape[0]],
+                TensorData::I64(out),
+            );
             Ok(Some(()))
         }
         "Cast" | "Identity" => {
@@ -566,6 +620,70 @@ fn try_fold(node: &Node, vals: &mut HashMap<String, Val>) -> Result<Option<()>, 
         // Not a foldable kind (e.g. Reshape: handled as a view by caller).
         _ => Ok(None),
     }
+}
+
+/// ONNX Slice over a small constant int tensor (any rank, negative steps).
+fn slice_ints(
+    data: &[i64],
+    shape: &[i64],
+    starts: &[i64],
+    ends: &[i64],
+    axes: &[i64],
+    steps: &[i64],
+) -> Result<(Vec<i64>, Vec<i64>), PlanError> {
+    let rank = shape.len();
+    // Per-axis (start, step, len); untouched axes take the whole extent.
+    let mut sel: Vec<(i64, i64, i64)> = shape.iter().map(|&d| (0, 1, d)).collect();
+    for (i, &a) in axes.iter().enumerate() {
+        let ax = (if a < 0 { a + rank as i64 } else { a }) as usize;
+        let d = shape[ax];
+        let step = steps[i];
+        if step == 0 {
+            return Err(PlanError::Shape("Slice step 0".into()));
+        }
+        if d == 0 {
+            // Empty axis: empty slice (the clamps below need d >= 1).
+            sel[ax] = (0, step, 0);
+            continue;
+        }
+        let norm = |x: i64| if x < 0 { x + d } else { x };
+        let (s, e) = if step > 0 {
+            (norm(starts[i]).clamp(0, d), norm(ends[i]).clamp(0, d))
+        } else {
+            (
+                norm(starts[i]).clamp(0, d - 1),
+                norm(ends[i]).clamp(-1, d - 1),
+            )
+        };
+        // In i128: `step` may be any i64 (e.g. i64::MIN), which overflows
+        // `-step` and the rounding sums. The count fits i64 (at most `d`).
+        let (s_w, e_w, st) = (s as i128, e as i128, step as i128);
+        let len = if step > 0 {
+            (e_w - s_w + st - 1).div_euclid(st).max(0)
+        } else {
+            (s_w - e_w - st - 1).div_euclid(-st).max(0)
+        } as i64;
+        sel[ax] = (s, step, len);
+    }
+    let out_shape: Vec<i64> = sel.iter().map(|s| s.2).collect();
+    let n: i64 = out_shape.iter().product();
+    let mut strides = vec![1i64; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    let out = (0..n)
+        .map(|mut o| {
+            let mut src = 0;
+            for ax in (0..rank).rev() {
+                let (s, step, len) = sel[ax];
+                let k = o % len;
+                o /= len;
+                src += (s + k * step) * strides[ax];
+            }
+            data[src as usize]
+        })
+        .collect();
+    Ok((out_shape, out))
 }
 
 /// Infer the output shape(s) of a compute node and record them.
@@ -733,7 +851,7 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
             let out = vec![x[0], x[1], 1, 1];
             set_shape(vals, &node.outputs[0], out);
         }
-        "ReduceSum" | "ReduceMean" => {
+        "ReduceSum" | "ReduceMean" | "ReduceL2" => {
             let x = in_shape(0)?;
             let rank = x.len() as i64;
             let keepdims = node.attr_i("keepdims", 1) != 0;
@@ -749,7 +867,19 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
                         .and_then(|v| v.data.as_ref())
                         .map(|d| d.as_i64().to_vec())
                 })
-                .unwrap_or_else(|| (0..rank).collect());
+                .unwrap_or_default();
+            // Missing or empty axes: every axis, unless noop_with_empty_axes
+            // (identity), which nothing here needs.
+            let axes = if !axes.is_empty() {
+                axes
+            } else if node.attr_i("noop_with_empty_axes", 0) != 0 {
+                return Err(PlanError::Unsupported(format!(
+                    "{} with noop_with_empty_axes",
+                    node.op_type
+                )));
+            } else {
+                (0..rank).collect()
+            };
             let axset: std::collections::HashSet<i64> = axes
                 .iter()
                 .map(|&a| if a < 0 { a + rank } else { a })
@@ -879,4 +1009,29 @@ fn infer_compute(node: &Node, vals: &mut HashMap<String, Val>) -> Result<(), Pla
         other => return Err(PlanError::Unsupported(format!("op '{other}'"))),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slice_ints;
+
+    fn slice(data: &[i64], shape: &[i64], s: i64, e: i64, step: i64) -> (Vec<i64>, Vec<i64>) {
+        slice_ints(data, shape, &[s], &[e], &[0], &[step]).expect("slice")
+    }
+
+    /// Extreme steps (any i64 is legal ONNX) and empty axes neither overflow
+    /// nor panic, and match numpy-style slicing.
+    #[test]
+    fn slice_ints_extreme_steps_and_empty_axes() {
+        let x = [10, 20, 30];
+        assert_eq!(slice(&x, &[3], 0, i64::MAX, i64::MAX), (vec![1], vec![10]));
+        assert_eq!(slice(&x, &[3], -1, i64::MIN, i64::MIN), (vec![1], vec![30]));
+        assert_eq!(
+            slice(&x, &[3], -1, i64::MIN, -1),
+            (vec![3], vec![30, 20, 10])
+        );
+        assert_eq!(slice(&x, &[3], 0, i64::MAX, 2), (vec![2], vec![10, 30]));
+        assert_eq!(slice(&[], &[0], -1, i64::MIN, -1), (vec![0], vec![]));
+        assert_eq!(slice(&[], &[0], 0, i64::MAX, 1), (vec![0], vec![]));
+    }
 }

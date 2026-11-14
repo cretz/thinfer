@@ -1,4 +1,5 @@
-//! MiniMax-H3's Qwen3-VL-32B conditioner.
+//! MiniMax-H3's Qwen3-VL-32B conditioner, also Qwen-Image-2.1's Qwen3-VL-8B
+//! one (same decoder, [`LmDims`] per checkpoint; 2.1 reads all 36 layers).
 //!
 //! H3 does NOT use Qwen3-VL as a language model. It reads the **unnormalized**
 //! hidden state after the 50th of its 64 decoder layers (`hidden_states[50]`,
@@ -62,6 +63,40 @@ pub mod config {
     pub const ROPE_THETA: f32 = 5_000_000.0;
     /// Interleaved M-RoPE frequency slots per `(t, h, w)` axis.
     pub const MROPE_SECTION: [usize; 3] = [24, 20, 20];
+}
+
+/// A Qwen3-VL language model's geometry and the depth the conditioner reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LmDims {
+    /// Decoder layers evaluated (`hidden_states[n_layers]` is returned).
+    pub n_layers: usize,
+    pub hidden: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub ffn_hidden: usize,
+}
+
+impl LmDims {
+    /// Qwen3-VL-32B truncated to the 50 layers MiniMax-H3 reads.
+    pub const H3: Self = Self {
+        n_layers: config::N_LAYERS,
+        hidden: config::HIDDEN,
+        n_heads: config::N_HEADS,
+        n_kv_heads: config::N_KV_HEADS,
+        head_dim: config::HEAD_DIM,
+        ffn_hidden: config::FFN_HIDDEN,
+    };
+    /// Qwen3-VL-8B, all 36 layers (Qwen-Image-2.1 reads the last layer's
+    /// output before the final norm).
+    pub const QWEN3_VL_8B: Self = Self {
+        n_layers: 36,
+        hidden: 4096,
+        n_heads: 32,
+        n_kv_heads: 8,
+        head_dim: 128,
+        ffn_hidden: 12288,
+    };
 }
 
 /// One image's `<|image_pad|>` block in the token sequence: rows
@@ -223,6 +258,7 @@ impl BlockViews<'_> {
 #[derive(Clone, Debug)]
 pub struct EncoderHandles {
     layers: Vec<BlockHandles>,
+    dims: LmDims,
 }
 
 impl EncoderHandles {
@@ -256,7 +292,7 @@ pub fn check_depth(available: usize) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// Register the 50 decoder layers H3 evaluates.
+/// Register the `dims.n_layers` decoder layers the conditioner evaluates.
 ///
 /// `model.embed_tokens.weight` is deliberately NOT registered: a prompt indexes
 /// a few hundred of its 151936 rows, so rows are gathered straight from the
@@ -264,6 +300,7 @@ pub fn check_depth(available: usize) -> Result<(), LoadError> {
 pub fn register_handles<S: WeightSource>(
     residency: &WeightResidency<S>,
     transcode: Option<QuantKind>,
+    dims: LmDims,
 ) -> Result<EncoderHandles, LoadError> {
     let lin = |id: &WeightId| register_one(residency, id, TransposePolicy::Linear2D, transcode);
     let dense = |id: &WeightId| register_one(residency, id, TransposePolicy::None, None);
@@ -281,8 +318,8 @@ pub fn register_handles<S: WeightSource>(
         })
     };
 
-    let mut layers = Vec::with_capacity(config::N_LAYERS);
-    for b in (0..config::N_LAYERS).map(Qwen3BlockWeights::new) {
+    let mut layers = Vec::with_capacity(dims.n_layers);
+    for b in (0..dims.n_layers).map(Qwen3BlockWeights::new) {
         layers.push(BlockHandles {
             input_layernorm: dense(&b.input_layernorm)?,
             post_attention_layernorm: dense(&b.post_attention_layernorm)?,
@@ -307,7 +344,7 @@ pub fn register_handles<S: WeightSource>(
             },
         });
     }
-    Ok(EncoderHandles { layers })
+    Ok(EncoderHandles { layers, dims })
 }
 
 /// Encoder pipeline cfgs. F32 acts: this is a conditioning tower and the
@@ -585,18 +622,18 @@ impl DecoderBlock {
     }
 }
 
-/// The conditioning hidden state, `[seq, HIDDEN]` row-major f32.
+/// The conditioning hidden state, `[seq, hidden]` row-major f32.
 #[derive(Clone, Debug)]
 pub struct EncoderOutput {
     pub hidden: Vec<f32>,
     pub seq: usize,
 }
 
-/// Qwen3-VL-32B conditioner truncated to the layers H3 reads.
+/// The Qwen3-VL conditioner, run to the depth its handles were registered at.
 pub struct MiniMaxTextEncoder;
 
 impl MiniMaxTextEncoder {
-    /// Run the embedding + 50 decoder layers and return the LAST layer's output
+    /// Run the embedding + the registered decoder layers and return the LAST layer's output
     /// WITHOUT the final norm. Real tokens only, plain causal mask. `images`
     /// (sequence order) replace their `<|image_pad|>` rows' embeddings, move
     /// those rows onto 3-D M-RoPE positions, and add their deepstack streams
@@ -623,13 +660,14 @@ impl MiniMaxTextEncoder {
         }
         let seq_pad = ids.len();
         let bp = &pipelines.block;
+        let dims = handles.dims;
 
         // No embed scale: that is a Gemma detail, not a Qwen3 one.
-        let mut embeds = embed_lookup_hidden(source, &ids, config::HIDDEN)
+        let mut embeds = embed_lookup_hidden(source, &ids, dims.hidden)
             .instrument(tracing::debug_span!(target: PHASE, "minimax.embed_lookup", seq))
             .await
             .map_err(ForwardError::Embed)?;
-        let d = config::HIDDEN;
+        let d = dims.hidden;
         let rows_of = |img: &ImageRows<'_>| img.start * d..(img.start + img.vision.tokens) * d;
         for img in images {
             assert!(
@@ -640,16 +678,16 @@ impl MiniMaxTextEncoder {
         }
 
         let shape = BlockShape {
-            dim: config::HIDDEN,
-            n_heads: config::N_HEADS,
-            n_kv_heads: config::N_KV_HEADS,
-            head_dim: config::HEAD_DIM,
-            ffn_hidden: config::FFN_HIDDEN,
+            dim: dims.hidden,
+            n_heads: dims.n_heads,
+            n_kv_heads: dims.n_kv_heads,
+            head_dim: dims.head_dim,
+            ffn_hidden: dims.ffn_hidden,
             seq: seq_pad,
             norm_eps: config::EPS,
         };
         let block = DecoderBlock { shape };
-        let act_bytes = bp.act_bytes((seq_pad * config::HIDDEN) as u32);
+        let act_bytes = bp.act_bytes((seq_pad * dims.hidden) as u32);
 
         let x_buf = scratch.alloc(act_bytes)?;
         let embed_bytes = seq::act_upload_bytes(bp.act_dtype, &embeds);
@@ -659,7 +697,7 @@ impl MiniMaxTextEncoder {
         // gives every axis the same position, i.e. plain 1-axis rope.
         let freqs = crate::ideogram4::mrope::build_freqs(
             &mrope_positions(seq_pad, images),
-            config::HEAD_DIM,
+            dims.head_dim,
             config::ROPE_THETA,
             config::MROPE_SECTION,
         );
@@ -734,7 +772,7 @@ impl MiniMaxTextEncoder {
                     handles.layers[idx].kinds,
                 )?,
                 Some(ds) => {
-                    let out = alloc_act(&scope, bp, seq_pad as u32, config::HIDDEN as u32)?;
+                    let out = alloc_act(&scope, bp, seq_pad as u32, dims.hidden as u32)?;
                     block.forward(
                         &scope,
                         pipelines,
@@ -780,8 +818,8 @@ impl MiniMaxTextEncoder {
         // Read back ONLY the final state. No `model.norm`: H3 conditions on the
         // unnormalized hidden state.
         let bytes = backend.read_buffer(cur.id(), 0, act_bytes).await?;
-        let mut hidden = seq::act_readback_to_f32(bp.act_dtype, &bytes, seq_pad * config::HIDDEN);
-        hidden.truncate(seq * config::HIDDEN);
+        let mut hidden = seq::act_readback_to_f32(bp.act_dtype, &bytes, seq_pad * dims.hidden);
+        hidden.truncate(seq * dims.hidden);
         Ok(EncoderOutput { hidden, seq })
     }
 }

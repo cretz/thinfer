@@ -44,8 +44,11 @@ pub fn linfit(x: &[f32], y: &[f32]) -> (f64, f64, f64, usize) {
     (slope, bias, (resid_sq / nf).sqrt(), cnt)
 }
 
-/// Relative rmse: `rmse(exp,got) / mean(|exp|)`, plus the linfit slope.
-/// Prints a one-line report and returns `(slope, rel)`.
+/// Relative rmse of the DIRECT elementwise error, `rmse(got - exp) /
+/// mean(|exp|)`, plus the linfit slope (the fit's bias and residual are
+/// printed as diagnostics only, so a constant offset still fails). Panics on
+/// any non-finite value in either side. Prints a one-line report and returns
+/// `(slope, rel)`.
 pub fn report(label: &str, exp: &[f32], got: &[f32]) -> (f64, f64) {
     assert_eq!(
         exp.len(),
@@ -54,11 +57,26 @@ pub fn report(label: &str, exp: &[f32], got: &[f32]) -> (f64, f64) {
         exp.len(),
         got.len()
     );
-    let (slope, bias, rmse, cnt) = linfit(exp, got);
-    let mean_abs = exp.iter().map(|x| x.abs() as f64).sum::<f64>() / (exp.len().max(1) as f64);
+    let bad = |v: &[f32]| v.iter().filter(|x| !x.is_finite()).count();
+    let (bad_exp, bad_got) = (bad(exp), bad(got));
+    assert!(
+        bad_exp == 0 && bad_got == 0,
+        "[{label}] non-finite values: exp {bad_exp}, got {bad_got} of {}",
+        exp.len()
+    );
+    let (slope, bias, fit_rmse, cnt) = linfit(exp, got);
+    let n = exp.len().max(1) as f64;
+    let rmse = (exp
+        .iter()
+        .zip(got)
+        .map(|(&e, &g)| (g as f64 - e as f64).powi(2))
+        .sum::<f64>()
+        / n)
+        .sqrt();
+    let mean_abs = exp.iter().map(|x| x.abs() as f64).sum::<f64>() / n;
     let rel = if mean_abs > 0.0 { rmse / mean_abs } else { 0.0 };
     eprintln!(
-        "[{label}] slope={slope:.6} bias={bias:+.4e} rmse={rmse:.4e} rel={:.3}% n={cnt}",
+        "[{label}] slope={slope:.6} bias={bias:+.4e} fit_rmse={fit_rmse:.4e} rmse={rmse:.4e} rel={:.3}% n={cnt}",
         rel * 100.0
     );
     (slope, rel)

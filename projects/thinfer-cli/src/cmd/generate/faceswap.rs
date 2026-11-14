@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::SwapModel;
-use thinfer_app::request::{FaceSwapOptions, FaceSwapRequest, ImageBytes, VideoInput};
+use thinfer_app::request::{
+    DiffusionSwapOptions, FaceSwapOptions, FaceSwapRequest, ImageBytes, VideoInput,
+};
 use thinfer_app::{JobRequest, parse_budget};
 
 #[derive(Args)]
@@ -20,9 +22,36 @@ pub struct GenerateFaceSwap {
     /// Output video file (.mp4).
     #[arg(long)]
     pub output: PathBuf,
-    /// Swap model checkpoint.
+    /// Swap model: a HyperSwap checkpoint (fast, per-frame paste) or
+    /// `dreamid-v` (diffusion; slow, holds identity through hard poses).
     #[arg(long, value_enum, default_value_t = SwapModel::DEFAULT)]
     pub model: SwapModel,
+    /// dreamid-v: denoise steps (the distill is authored for 16).
+    #[arg(long)]
+    pub steps: Option<u32>,
+    /// dreamid-v: image-CFG guidance scale on the source face (default 4).
+    #[arg(long)]
+    pub guide_scale: Option<f32>,
+    /// dreamid-v: seed (default random).
+    #[arg(long)]
+    pub seed: Option<u64>,
+    /// dreamid-v: working width; the clip is resized toward width x height
+    /// pixels, its own aspect kept (default 832x480, multiples of 16).
+    #[arg(long)]
+    pub width: Option<u32>,
+    /// dreamid-v: working height (see `--width`).
+    #[arg(long)]
+    pub height: Option<u32>,
+    /// dreamid-v opt-in: run the unguided forward only every N steps and
+    /// reuse its guidance in between (1 = every step, the reference; 2 cuts
+    /// denoise ~25%).
+    #[arg(long)]
+    pub cfg_every: Option<u32>,
+    /// dreamid-v opt-in: run on the face region only (the face masks' union
+    /// with context, at up to its native size) and paste it back into the
+    /// full-resolution frames. Far faster; the output keeps the source size.
+    #[arg(long)]
+    pub face_crop: bool,
     /// Intersect the paste mask with an XSeg occlusion mask so occluders (hands,
     /// hair, glasses, mics) crossing the face show the original frame through
     /// instead of swapped pixels. Adds one ONNX forward per face.
@@ -95,6 +124,18 @@ pub async fn run_faceswap(args: GenerateFaceSwap) -> Result<(), String> {
             bitrate_scale: args.bitrate_scale,
             start_secs: args.start,
             end_secs: args.end,
+            diffusion: {
+                let d = DiffusionSwapOptions::default();
+                DiffusionSwapOptions {
+                    steps: args.steps.unwrap_or(d.steps),
+                    guide_scale: args.guide_scale.unwrap_or(d.guide_scale),
+                    seed: args.seed,
+                    width: args.width.unwrap_or(d.width),
+                    height: args.height.unwrap_or(d.height),
+                    cfg_every: args.cfg_every.unwrap_or(d.cfg_every),
+                    face_crop: args.face_crop,
+                }
+            },
         },
     };
     req.validate()?;

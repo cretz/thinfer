@@ -147,6 +147,10 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
         None => tracing::info!("no --config; using built-in defaults"),
     }
     let config = ServeConfig::load(config_path.as_deref().map(std::path::Path::new))?;
+    // Job plaintext stays in RAM (never swapped) and this process's memory is
+    // closed to other ordinary processes.
+    thinfer_core::secmem::enforce();
+    thinfer_native::harden::harden_process();
     std::fs::create_dir_all(&config.artifact_dir)
         .map_err(|e| format!("create {}: {e}", config.artifact_dir.display()))?;
 
@@ -206,7 +210,9 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
         vault: Arc::new(thinfer_app::vault::Vault::new(vault_dir)),
         uploads,
     };
-    let app = api::router(state).merge(web);
+    let app = api::router(state)
+        .merge(web)
+        .layer(axum::middleware::map_response(web::security_headers));
 
     match tls_config(&config).await? {
         Some(tls) => {

@@ -13,8 +13,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelId, RewriteQuality, SwapModel, VaeChoice, VideoModelId,
-    VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SuperRes, SwapModel,
+    VaeChoice, VideoModelId, VideoSampler,
 };
 use crate::progress::Stage;
 
@@ -27,11 +27,12 @@ use crate::progress::Stage;
 #[serde(rename_all = "camelCase")]
 pub struct SealedJob {
     pub sealed: String,
-    /// The one scheduling hint the server needs before it can decrypt: a
-    /// large-input job (face-swap video) runs now-or-rejects instead of
-    /// queuing. See [`JobSpec::is_large_input`].
+    /// `POST /uploads` ids the sealed spec references, in the clear so the
+    /// server can hold them for this job while it waits in the queue (exempt
+    /// from the upload TTL). Opaque ids the server issued; they reveal nothing
+    /// about the content. See [`JobSpec::upload_ids`].
     #[serde(default)]
-    pub large_input: bool,
+    pub uploads: Vec<String>,
 }
 
 /// `POST /jobs/{id}/key` body: the base64 job key, sent only in answer to
@@ -56,10 +57,14 @@ pub enum JobSpec {
 }
 
 impl JobSpec {
-    /// True if this reads a large local input (face-swap video): a server runs
-    /// it now-or-rejects rather than queuing.
-    pub fn is_large_input(&self) -> bool {
-        matches!(self, JobSpec::FaceSwap(_))
+    /// The `POST /uploads` ids this spec references (sent in the clear beside
+    /// the sealed spec; see [`SealedJob::uploads`]).
+    pub fn upload_ids(&self) -> Vec<String> {
+        let id = match self {
+            JobSpec::Image(_) | JobSpec::Video(_) => None,
+            JobSpec::FaceSwap(s) => s.input_video_upload.as_ref(),
+        };
+        id.into_iter().cloned().collect()
     }
 
     /// Per-request opt-out of the cooperative-matrix (tensor-core) path. `None`
@@ -92,11 +97,11 @@ pub struct ImageSpec {
     /// precision). Default false. No effect on GGUF variants / other models.
     #[serde(default)]
     pub full_precision: Option<bool>,
-    /// Base64-encoded reference image bytes (PNG/JPEG). REQUIRED for
-    /// qwen-image-edit, ignored otherwise. The server decodes it to a temp file
-    /// under the job dir and feeds it to the image-edit path.
+    /// Base64-encoded input images (PNG/JPEG), in prompt order: exactly one
+    /// for qwen-image-edit-rapid, up to 10 condition images for
+    /// qwen-image-2.1-turbo, rejected otherwise. Held in RAM server-side.
     #[serde(default)]
-    pub input_image: Option<String>,
+    pub input_images: Vec<String>,
     /// Opt out of the cooperative-matrix (tensor-core) path; see
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
@@ -129,19 +134,19 @@ pub struct LoraSpec {
 #[serde(rename_all = "camelCase")]
 pub struct VideoSpec {
     pub model: Option<VideoModelId>,
-    /// One prompt, or several for a multi-shot clip (LongLive only).
+    /// One prompt, or several for chained FastH3 / MiniMax-H3 clips.
     pub prompts: Vec<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// Frame counts (one to split evenly, or one per prompt). Mutually exclusive
-    /// with `durations`.
+    /// Frame counts (one for the whole clip, or one per chained-clip prompt).
+    /// Mutually exclusive with `durations`.
     pub frames: Option<Vec<u32>>,
     pub durations: Option<Vec<f32>>,
     pub fps: Option<u32>,
     pub seed: Option<u64>,
     /// FastWan denoise sampler. Unset -> the model default (UniPC, matching the
     /// public Spaces; DMD for FastWan2.1-1.3B, its card's 3-step regime). DMD is
-    /// also the byte-parity reference path. Ignored on the AR (LongLive) path.
+    /// also the byte-parity reference path.
     pub sampler: Option<VideoSampler>,
     /// UniPC denoise steps (1..=8, default 4). DMD ignores it.
     pub steps: Option<u32>,
@@ -166,38 +171,24 @@ pub struct VideoSpec {
     /// drift. Used only with `input_image` on ltx2-rapid; ignored otherwise.
     #[serde(default)]
     pub strength: Option<f32>,
-    /// Base64-encoded source FACE image bytes (PNG/JPEG). DreamID-V only
-    /// (required there): the face to swap into the target video. The server
-    /// decodes it to a temp file under the job dir.
-    #[serde(default)]
-    pub source_image: Option<String>,
     /// Base64-encoded reference images (PNG/JPEG). FastH3-Omni only (at most
     /// 9): the prompt names them `<Picture 1>`, `<Picture 2>`, ... in order.
     /// Held in RAM by the server, never written to disk.
     #[serde(default)]
     pub ref_images: Option<Vec<String>>,
-    /// Base64-encoded target VIDEO bytes (mp4). DreamID-V only (required there):
-    /// the clip to swap a face into. Held RAM-first; a large upload spills to an
-    /// encrypted on-disk blob under a per-request ephemeral key (never plaintext
-    /// on disk). Rejected by every other model. Prefer `input_video_upload` for
-    /// large clips (this base64-in-JSON field inflates the body ~33%).
+    /// FastH3-Omni: how each reference image is sized. `match` (default, as in
+    /// ComfyUI: the canvas's pixel area, never upscaled), `max` (short edge
+    /// capped at 2048) or `diffusers` (short edge exactly 2048, the reference;
+    /// ~2.4x slower with one reference).
     #[serde(default)]
-    pub input_video: Option<String>,
-    /// Id of a video previously streamed to `POST /uploads` (DreamID-V). Takes
-    /// precedence over `input_video`; the raw mp4 never rides in the JSON body.
-    #[serde(default)]
-    pub input_video_upload: Option<String>,
-    /// DreamID-V image-CFG guidance scale on the source-face reference. Omitted =
-    /// the model default (4.0). Ignored by the other (CFG-free) video models.
-    #[serde(default)]
-    pub guide_scale: Option<f32>,
+    pub ref_image_size: Option<RefImageSize>,
     /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
     /// baseline) or `q4` (Q4_K_M, ~2.8x faster encode, lower precision). Applies
     /// to all LTX models; ignored by Wan.
     pub encoder: Option<EncoderQuant>,
     pub i8_matmul: Option<bool>,
-    /// FastH3 sparse-attention precision: `bf16` (default) or `int8`
-    /// (SageAttention-style QK^T: faster, same quality, different sample).
+    /// MiniMax-H3 family attention precision: `int8-fp8` (default), `int8`
+    /// or `bf16` (the reference: slower, same quality, different sample).
     pub attn: Option<AttnPrecision>,
     /// Decode + mux an audio track. Joint-AV models only (LTX and MiniMax-H3;
     /// the silent Wan models ignore it). Defaults to `true`; `false` skips the
@@ -207,6 +198,9 @@ pub struct VideoSpec {
     /// (half-res denoise -> latent upscale -> refine). Defaults to `false` =
     /// single-stage denoise at the target res. Ignored by the Wan models.
     pub upscale: Option<bool>,
+    /// MiniMax-H3 / FastH3: RelayVSR super-resolution of the finished video,
+    /// `2x` or `4x`. Absent = native resolution.
+    pub super_res: Option<SuperRes>,
     /// LTX joint-AV: opt in to a finer denoise schedule for better audio
     /// (subdivides the coarse distilled sigma jumps into more Euler substeps).
     /// Honored on every LTX path: the single-stage schedule (ltx2-rapid always,
@@ -215,6 +209,16 @@ pub struct VideoSpec {
     /// `false`.
     #[serde(default)]
     pub audio_hq: Option<bool>,
+    /// MiniMax-H3 / FastH3: the reference / first-frame VAE encode in f32
+    /// (the exact path) instead of bf16 on tensor cores (the reference's
+    /// precision, ~3x faster). Defaults to `false`.
+    #[serde(default)]
+    pub vae_encode_f32: Option<bool>,
+    /// MiniMax-H3 GGUF models: every block GEMM in bf16 with unfolded adapters
+    /// (the exact path) instead of the default 8-bit GEMMs and folded
+    /// adapters. Defaults to `false`.
+    #[serde(default)]
+    pub bf16_gemm: Option<bool>,
     /// HunyuanVideo 1.5 only: expand a short prompt into a detailed caption via
     /// the rewrite endpoint before encoding. Defaults to `true` (the model needs
     /// detailed captions); `false` sends the raw prompt. Other models ignore it.
@@ -303,6 +307,28 @@ pub struct FaceSwapSpec {
     /// clip end.
     #[serde(default)]
     pub end_secs: Option<f32>,
+    /// dreamid-v: denoise steps (default 16).
+    #[serde(default)]
+    pub steps: Option<u32>,
+    /// dreamid-v: image-CFG guidance scale on the source face (default 4).
+    #[serde(default)]
+    pub guide_scale: Option<f32>,
+    /// dreamid-v: seed (default random).
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// dreamid-v: working size; the clip is resized toward this pixel area,
+    /// its aspect kept (default 832x480, multiples of 16).
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// dreamid-v opt-in: the unguided forward every N steps (default 1).
+    #[serde(default)]
+    pub cfg_every: Option<u32>,
+    /// dreamid-v opt-in: run on the face region only, pasted back at the
+    /// source resolution.
+    #[serde(default)]
+    pub face_crop: Option<bool>,
 }
 
 /// The `POST /jobs` response.

@@ -18,6 +18,8 @@ path = "src/main.rs"
 [dependencies]
 thinfer-app = { path = "../thinfer-app", features = ["serve"] }
 thinfer-core = { path = "../thinfer-core" }
+# Process hardening at startup (`harden`).
+thinfer-native = { path = "../thinfer-native" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "signal"] }

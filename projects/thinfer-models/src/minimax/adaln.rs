@@ -117,10 +117,31 @@ pub fn timestep_embedding(timesteps: &[f32], dim: usize) -> Vec<f32> {
 ///
 /// The transformer is handed the SAME table at every step, so a single
 /// modulation table covers the whole run.
+/// One modulation-table key: a row's timestep `t` and its step endpoint `r`
+/// (two-time checkpoints; `r == t` everywhere else, see [`Self::single`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimeKey {
+    pub t: f32,
+    pub r: f32,
+}
+
+impl TimeKey {
+    pub fn single(t: f32) -> Self {
+        Self { t, r: t }
+    }
+
+    /// Total order on finite keys: by `t`, then `r`.
+    pub fn order(&self, other: &Self) -> core::cmp::Ordering {
+        (self.t, self.r)
+            .partial_cmp(&(other.t, other.r))
+            .expect("timesteps are finite")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ModulationPlan {
-    /// Distinct timesteps, sorted. The table is built over exactly these.
-    pub timesteps: Vec<f32>,
+    /// Distinct keys, sorted. The table is built over exactly these.
+    pub timesteps: Vec<TimeKey>,
     /// Per step, the table row index of every packed-sequence row.
     pub per_step_row_index: Vec<Vec<u32>>,
     pub layout: ModulationLayout,
@@ -130,12 +151,12 @@ impl ModulationPlan {
     /// Build the plan from each step's `(distinct, per-row index)` pair as
     /// produced by [`super::packing::build_row_timesteps`], remapping every
     /// step's local indices onto one global timestep table.
-    pub fn build(cfg: &DitConfig, per_step: &[(Vec<f32>, Vec<u32>)]) -> Self {
-        let mut timesteps: Vec<f32> = per_step
+    pub fn build(cfg: &DitConfig, per_step: &[(Vec<TimeKey>, Vec<u32>)]) -> Self {
+        let mut timesteps: Vec<TimeKey> = per_step
             .iter()
             .flat_map(|(d, _)| d.iter().copied())
             .collect();
-        timesteps.sort_by(|a, b| a.partial_cmp(b).expect("timesteps are finite"));
+        timesteps.sort_by(TimeKey::order);
         timesteps.dedup();
 
         let per_step_row_index = per_step
@@ -145,7 +166,7 @@ impl ModulationPlan {
                     .iter()
                     .map(|v| {
                         timesteps
-                            .binary_search_by(|p| p.partial_cmp(v).expect("finite"))
+                            .binary_search_by(|p| p.order(v))
                             .expect("every local timestep is in the global table")
                             as u32
                     })
@@ -297,11 +318,20 @@ mod tests {
         // Two steps with different local distinct sets must land on one global
         // table, and each step's rows must resolve back to their own values.
         let per_step = vec![
-            (vec![0.2f32, 0.6], vec![0u32, 1, 1, 0]),
-            (vec![0.4f32, 0.8], vec![0u32, 1, 1, 0]),
+            (
+                vec![TimeKey::single(0.2), TimeKey::single(0.6)],
+                vec![0u32, 1, 1, 0],
+            ),
+            (
+                vec![TimeKey::single(0.4), TimeKey::single(0.8)],
+                vec![0u32, 1, 1, 0],
+            ),
         ];
         let plan = ModulationPlan::build(&cfg(), &per_step);
-        assert_eq!(plan.timesteps, vec![0.2, 0.4, 0.6, 0.8]);
+        assert_eq!(
+            plan.timesteps.iter().map(|k| k.t).collect::<Vec<_>>(),
+            vec![0.2, 0.4, 0.6, 0.8]
+        );
         assert_eq!(plan.per_step_row_index[0], vec![0, 2, 2, 0]);
         assert_eq!(plan.per_step_row_index[1], vec![1, 3, 3, 1]);
         assert_eq!(plan.layout.num_timesteps, 4);
@@ -309,7 +339,10 @@ mod tests {
 
     #[test]
     fn adaln_row_combines_timestep_and_tag() {
-        let per_step = vec![(vec![0.2f32, 0.6], vec![0u32, 1, 1])];
+        let per_step = vec![(
+            vec![TimeKey::single(0.2), TimeKey::single(0.6)],
+            vec![0u32, 1, 1],
+        )];
         let plan = ModulationPlan::build(&cfg(), &per_step);
         let rows = plan.adaln_row_indices(0, &[TAG_VIDEO, TAG_AUDIO, TAG_TEXT]);
         // row = timestep_index * MODALITY_NUM + tag:
@@ -326,7 +359,13 @@ mod tests {
         use crate::minimax::packing::{build_packed_sequence, build_row_timesteps};
 
         let layout = build_packed_sequence(&[TAG_TEXT; 6], 3, 4, 4, 5, (1, 2, 2), &[]);
-        let per_step = vec![build_row_timesteps(&layout, 0.7, 0.4, 0.999, 1.0)];
+        let per_step = vec![build_row_timesteps(
+            &layout,
+            TimeKey::single(0.7),
+            TimeKey::single(0.4),
+            TimeKey::single(0.999),
+            TimeKey::single(1.0),
+        )];
         let plan = ModulationPlan::build(&cfg(), &per_step);
         let segs = plan.segments(0, &layout.token_tags);
 
@@ -353,7 +392,13 @@ mod tests {
         use crate::minimax::packing::{build_packed_sequence, build_row_timesteps};
 
         let layout = build_packed_sequence(&[TAG_TEXT; 4], 2, 4, 4, 3, (1, 2, 2), &[]);
-        let per_step = vec![build_row_timesteps(&layout, 0.7, 0.4, 0.999, 1.0)];
+        let per_step = vec![build_row_timesteps(
+            &layout,
+            TimeKey::single(0.7),
+            TimeKey::single(0.4),
+            TimeKey::single(0.999),
+            TimeKey::single(1.0),
+        )];
         let plan = ModulationPlan::build(&cfg(), &per_step);
         let rows = plan.adaln_row_indices(0, &layout.token_tags);
         for s in plan.segments(0, &layout.token_tags) {

@@ -31,7 +31,8 @@ use crate::{act_bf16_prelude, act_f16_prelude, wgsl_with_bf16_variant};
 /// - Out `[B, S_q, H_q,  D]`
 ///
 /// `SdpaF32` requires `D <= 128`; `SdpaF32LargeD` requires `D` divisible by
-/// `WG=128` and `D <= 1024` (e.g. the Hunyuan VAE mid-attn single head, D=1024).
+/// `WG=128` and `D <= 2048` (e.g. the Hunyuan VAE mid-attn single head, D=1024;
+/// the Qwen-Image-2.1 VAE decoder, D=1152).
 /// Caller provides a zero-filled mask when none.
 ///
 /// Layout: 0=Q, 1=K, 2=V, 3=Mask, 4=Out, 5=Uniform
@@ -958,8 +959,10 @@ pub(crate) fn dispatch_sdpa_f16_sg<B: Backend>(
 // - Dot products parallel-reduce across the workgroup; m/l/p_j/alpha scalars
 //   are broadcast via `var<workgroup>` after a single-thread softmax update.
 //
-// Constraints: `D % WG == 0`, `D <= WG * MAX_LOCAL_D` (== 1024 for WG=128,
-// MAX_LOCAL_D=8). Asserted at dispatch time.
+// Constraints: `D % WG == 0`, `D <= WG * MAX_LOCAL_D` (== 2048 for WG=128,
+// MAX_LOCAL_D=16; the Qwen-Image-2.1 VAE decoder runs D=1152). Callers check
+// with `SdpaF32LargeD::assert_fits`: a larger D silently clamps the private
+// arrays' indices and computes wrong attention.
 
 wgsl_with_bf16_variant!(
     WGSL_LARGE_D_F32,
@@ -977,7 +980,7 @@ struct U {
 @group(0) @binding(5) var<uniform> u: U;
 
 const WG: u32 = 128u;
-const MAX_LOCAL_D: u32 = 8u; // supports D up to WG*MAX_LOCAL_D = 1024.
+const MAX_LOCAL_D: u32 = 16u; // supports D up to WG*MAX_LOCAL_D = 2048.
 
 var<workgroup> shared_red: array<f32, 128>;
 // 0=m, 1=l, 2=p_j, 3=alpha. Written by thread 0, read by all threads.
@@ -1012,11 +1015,11 @@ fn main(
     let d_off = t * d_per;
 
     // Load this thread's slice of q into registers.
-    var q_local: array<f32, 8>;
+    var q_local: array<f32, MAX_LOCAL_D>;
     for (var i = 0u; i < d_per; i = i + 1u) {
         q_local[i] = q[q_off + d_off + i];
     }
-    var o_local: array<f32, 8>;
+    var o_local: array<f32, MAX_LOCAL_D>;
     for (var i = 0u; i < d_per; i = i + 1u) {
         o_local[i] = 0.0;
     }
@@ -1101,7 +1104,7 @@ struct U {
 @group(0) @binding(5) var<uniform> u: U;
 
 const WG: u32 = 128u;
-const MAX_LOCAL_D: u32 = 8u;
+const MAX_LOCAL_D: u32 = 16u; // 2 * ceil(D / 2 / WG) values: D up to 2048.
 
 var<workgroup> shared_red: array<f32, 128>;
 var<workgroup> shared_scalar: array<f32, 4>;
@@ -1131,20 +1134,24 @@ fn main(
     let mask_row = select(bb * u.s_q + sq, (bb * u.h_q + hq) * u.s_q + sq, u.has_mask == 2u);
     let mask_w_base = (mask_row * u.s_k) >> 1u;
 
-    // d_per (in elements) must be even since D is even and WG divides D.
-    // d_per_w (in words) = d_per / 2.
-    let d_per = u.d / WG;
-    let d_per_w = d_per >> 1u;
-    let d_off_w = t * d_per_w;
+    // Each thread owns up to `n_w` of the D/2 packed words: a contiguous run
+    // when WG divides D/2, else every WG-th word (D = 384: the Wan VAE mid
+    // block; a contiguous `(D / WG) / 2` words per thread would drop a third
+    // of the channels from every dot product and never write them out).
+    let wpt = d_w / WG;
+    let strided = (d_w % WG) != 0u;
+    let n_w = (d_w + WG - 1u) / WG;
 
-    var q_local: array<f32, 8>;
-    for (var i = 0u; i < d_per_w; i = i + 1u) {
-        let qv: vec2<f32> = vec2<f32>(q[q_w_off + d_off_w + i]);
+    var q_local: array<f32, MAX_LOCAL_D>;
+    for (var i = 0u; i < n_w; i = i + 1u) {
+        let w = select(t * wpt + i, t + i * WG, strided);
+        var qv: vec2<f32> = vec2<f32>(0.0, 0.0);
+        if (w < d_w) { qv = vec2<f32>(q[q_w_off + w]); }
         q_local[i * 2u]      = qv.x;
         q_local[i * 2u + 1u] = qv.y;
     }
-    var o_local: array<f32, 8>;
-    for (var i = 0u; i < d_per; i = i + 1u) {
+    var o_local: array<f32, MAX_LOCAL_D>;
+    for (var i = 0u; i < 2u * n_w; i = i + 1u) {
         o_local[i] = 0.0;
     }
 
@@ -1157,9 +1164,12 @@ fn main(
     for (var j = 0u; j < u.s_k; j = j + 1u) {
         let kj_w = kv_b0_w + j * kv_step_w;
         var partial: f32 = 0.0;
-        for (var i = 0u; i < d_per_w; i = i + 1u) {
-            let kv: vec2<f32> = vec2<f32>(k[kj_w + d_off_w + i]);
-            partial = partial + q_local[i * 2u] * kv.x + q_local[i * 2u + 1u] * kv.y;
+        for (var i = 0u; i < n_w; i = i + 1u) {
+            let w = select(t * wpt + i, t + i * WG, strided);
+            if (w < d_w) {
+                let kv: vec2<f32> = vec2<f32>(k[kj_w + w]);
+                partial = partial + q_local[i * 2u] * kv.x + q_local[i * 2u + 1u] * kv.y;
+            }
         }
         shared_red[t] = partial;
         workgroupBarrier();
@@ -1196,18 +1206,24 @@ fn main(
 
         let alpha = shared_scalar[3];
         let p_j   = shared_scalar[2];
-        for (var i = 0u; i < d_per_w; i = i + 1u) {
-            let vv: vec2<f32> = vec2<f32>(v[kj_w + d_off_w + i]);
-            o_local[i * 2u]      = o_local[i * 2u]      * alpha + p_j * vv.x;
-            o_local[i * 2u + 1u] = o_local[i * 2u + 1u] * alpha + p_j * vv.y;
+        for (var i = 0u; i < n_w; i = i + 1u) {
+            let w = select(t * wpt + i, t + i * WG, strided);
+            if (w < d_w) {
+                let vv: vec2<f32> = vec2<f32>(v[kj_w + w]);
+                o_local[i * 2u]      = o_local[i * 2u]      * alpha + p_j * vv.x;
+                o_local[i * 2u + 1u] = o_local[i * 2u + 1u] * alpha + p_j * vv.y;
+            }
         }
     }
 
     let inv_l = 1.0 / shared_scalar[1];
-    for (var i = 0u; i < d_per_w; i = i + 1u) {
-        out[q_w_off + d_off_w + i] = vec2<f16>(vec2<f32>(
-            o_local[i * 2u] * inv_l, o_local[i * 2u + 1u] * inv_l
-        ));
+    for (var i = 0u; i < n_w; i = i + 1u) {
+        let w = select(t * wpt + i, t + i * WG, strided);
+        if (w < d_w) {
+            out[q_w_off + w] = vec2<f16>(vec2<f32>(
+                o_local[i * 2u] * inv_l, o_local[i * 2u + 1u] * inv_l
+            ));
+        }
     }
 }
 "#
@@ -1244,7 +1260,7 @@ struct U {
 @group(0) @binding(5) var<uniform> u: U;
 
 const WG: u32 = 128u;
-const MAX_LOCAL_D: u32 = 8u; // supports D up to WG*MAX_LOCAL_D = 1024.
+const MAX_LOCAL_D: u32 = 16u; // supports D up to WG*MAX_LOCAL_D = 2048.
 
 var<workgroup> shared_red: array<f32, 128>;
 // 0=m, 1=l, 2=p_j, 3=alpha. Written by thread 0, read by all threads.
@@ -1282,11 +1298,11 @@ fn main(
     let d_per = u.d / WG;
     let d_off = t * d_per;
 
-    var q_local: array<f32, 8>;
+    var q_local: array<f32, MAX_LOCAL_D>;
     for (var i = 0u; i < d_per; i = i + 1u) {
         q_local[i] = q[q_off + d_off + i];
     }
-    var o_local: array<f32, 8>;
+    var o_local: array<f32, MAX_LOCAL_D>;
     for (var i = 0u; i < d_per; i = i + 1u) {
         o_local[i] = 0.0;
     }
@@ -1361,7 +1377,7 @@ impl SdpaOp for SdpaF32LargeDCausal {
     const MASK: &'static str = "sdpa/mask";
     const DIMS: &'static str = "sdpa/dims";
     const OUTPUT: &'static str = "sdpa/out";
-    const MAX_D: u32 = 1024;
+    const MAX_D: u32 = 2048;
 
     fn wgsl(cfg: &WgslConfig) -> &'static str {
         match cfg.act_dtype {
@@ -1380,6 +1396,18 @@ impl SdpaOp for SdpaF32LargeDCausal {
 
 pub struct SdpaF32LargeD;
 
+impl SdpaF32LargeD {
+    /// Panic unless head dim `d` fits the large-D kernels' per-thread state
+    /// (otherwise they silently compute wrong attention).
+    pub fn assert_fits(d: u32) {
+        assert!(
+            d <= <Self as SdpaOp>::MAX_D,
+            "sdpa_large_d: head dim {d} exceeds {}",
+            <Self as SdpaOp>::MAX_D
+        );
+    }
+}
+
 impl SdpaOp for SdpaF32LargeD {
     const KERNEL_ID: &'static str = "sdpa_large_d.f32";
     type Dtype = F32;
@@ -1389,7 +1417,7 @@ impl SdpaOp for SdpaF32LargeD {
     const MASK: &'static str = "sdpa/mask";
     const DIMS: &'static str = "sdpa/dims";
     const OUTPUT: &'static str = "sdpa/out";
-    const MAX_D: u32 = 1024;
+    const MAX_D: u32 = 2048;
 
     fn wgsl(cfg: &WgslConfig) -> &'static str {
         match cfg.act_dtype {
@@ -1445,6 +1473,20 @@ impl OpTest for SdpaF32LargeD {
                     t("q", [1, 2, 1, 512], linspace(-1.0, 1.0, false)),
                     t("k", [1, 2, 1, 512], linspace(-0.5, 1.5, false)),
                     t("v", [1, 2, 1, 512], linspace(-1.25, 0.75, true)),
+                    t("mask", [1, 2, 2], linspace(0.0, 0.0, false)),
+                ],
+            },
+            // Qwen-Image-2.1 VAE decoder width (144 * 8): 9 values per
+            // thread, past the old 8-slot per-thread state.
+            TestCase {
+                name: "sdpa_large_d_d1152",
+                op: OpSpec::Sdpa {
+                    scale: 1.0_f32 / 1152.0_f32.sqrt(),
+                },
+                inputs: vec![
+                    t("q", [1, 2, 1, 1152], linspace(-1.0, 1.0, false)),
+                    t("k", [1, 2, 1, 1152], linspace(-0.5, 1.5, false)),
+                    t("v", [1, 2, 1, 1152], linspace(-1.25, 0.75, true)),
                     t("mask", [1, 2, 2], linspace(0.0, 0.0, false)),
                 ],
             },

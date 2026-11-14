@@ -43,6 +43,8 @@ pub struct WgpuBackend {
     /// back to `ActDtype::F32`. Bf16-weight production path is unaffected
     /// either way.
     shader_f16: bool,
+    /// The adapter is a CPU rasterizer (WARP, lavapipe, SwiftShader).
+    is_software: bool,
     /// True when the WebGPU/WGSL `packed_4x8_integer_dot_product` language
     /// extension is available (queried via `Instance::wgsl_language_features`).
     /// Gates the DP4A matmul path (int8 acts + int8 weights + `dot4I8Packed`
@@ -606,6 +608,7 @@ impl WgpuBackend {
             uncaptured,
             timestamps,
             shader_f16: adapter_has_f16,
+            is_software: info.device_type == wgpu::DeviceType::Cpu,
             packed_int_dot,
             subgroups: adapter_has_subgroups,
             subgroup_min_size,
@@ -631,6 +634,12 @@ impl WgpuBackend {
     /// activation dtype choice on this.
     pub fn supports_shader_f16(&self) -> bool {
         self.shader_f16
+    }
+
+    /// Whether the adapter is a CPU rasterizer (WARP, lavapipe). Tests whose
+    /// kernels are impractical there (shader compile or run time) skip on it.
+    pub fn is_software(&self) -> bool {
+        self.is_software
     }
 
     /// Whether the device was created with `Features::SUBGROUP` (WGSL

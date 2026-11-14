@@ -17,7 +17,7 @@
 //! computed in f64 (matching diffusers' float64 path) then cast.
 //!
 //! No `fps`/`inject_sample_info` (SkyReels-V2-DF only) and no `image_embedder`
-//! (I2V only): the FastWan/LongLive base is T2V, time + text only.
+//! (I2V only): the FastWan base is T2V, time + text only.
 
 use thinfer_core::backend::{WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::ops::{GeluF32, SiluF32};

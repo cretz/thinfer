@@ -26,6 +26,8 @@ mod nvrtc;
 pub mod sdpa;
 #[cfg(not(target_os = "macos"))]
 pub mod vsa;
+#[cfg(not(target_os = "macos"))]
+pub mod window;
 
 #[cfg(not(target_os = "macos"))]
 pub use accel::CudaAccel;

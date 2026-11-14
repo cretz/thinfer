@@ -14,6 +14,7 @@
 use thinfer_core::format::gguf;
 use thinfer_models::minimax::DitConfig;
 use thinfer_models::minimax::adaln::PARAMS_PER_BLOCK;
+use thinfer_models::minimax::adaln::TimeKey;
 use thinfer_models::minimax::loader::build_modulation_tables;
 use thinfer_models::minimax::manifest::{self, role};
 use thinfer_native::MmapFileOpener;
@@ -44,7 +45,8 @@ async fn adaln_precompute() {
         .expect("parse dit gguf");
 
     let started = std::time::Instant::now();
-    let tables = build_modulation_tables(&cfg, &src, &TIMESTEPS)
+    let keys: Vec<_> = TIMESTEPS.iter().map(|&t| TimeKey::single(t)).collect();
+    let tables = build_modulation_tables(&cfg, &src, &keys, None)
         .await
         .expect("build modulation tables");
     let elapsed = started.elapsed().as_secs_f64();

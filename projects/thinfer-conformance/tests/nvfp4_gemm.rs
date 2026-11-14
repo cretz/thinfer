@@ -9,10 +9,20 @@
 #![cfg(not(target_os = "macos"))]
 
 use thinfer_core::backend::{
-    Backend, BufRef, GemmNvfp4Addrs, Nvfp4Format, Nvfp4GateAdd, Nvfp4Rows, PowerPreference,
-    RowSegments, WgpuBackend, WgpuConfig,
+    Backend, BufRef, ElementwiseOp, GemmNvfp4Addrs, Nvfp4Epilogue, Nvfp4Format, Nvfp4GateAdd,
+    Nvfp4QkNormRope, Nvfp4Rows, PowerPreference, RowSegments, WgpuBackend, WgpuConfig,
 };
 use thinfer_core::ops::nvfp4::{self, E2M1, Nvfp4Layout};
+use thinfer_cuda::gemm_fp4;
+
+/// The quantizer's scratch as (codes `[M,K/2]`, scales row-major `[M,K/16]`).
+fn scratch_codes_scales(raw: &[u8], m: usize, k: usize) -> (&[u8], Vec<u8>) {
+    let (codes, tiled) = raw.split_at(m * k / 2);
+    let scales = (0..m * k / 16)
+        .map(|i| tiled[gemm_fp4::act_scale_index(i / (k / 16), i % (k / 16), k)])
+        .collect();
+    (codes, scales)
+}
 
 struct Rng(u64);
 impl Rng {
@@ -199,7 +209,8 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                 lora: Default::default(),
                 format: Default::default(),
                 rows: None,
-                gate_add: None,
+                bias: 0,
+                epilogue: Nvfp4Epilogue::Store,
             };
             let ran = acc.gemm_nvfp4(&full).expect("gemm");
             assert!(ran, "gemm declined {m}x{n}x{k}");
@@ -269,7 +280,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                 let ran = acc
                     .gemm_nvfp4(&GemmNvfp4Addrs {
                         out: addr(&gated),
-                        gate_add: Some(Nvfp4GateAdd {
+                        epilogue: Nvfp4Epilogue::GateAdd(Nvfp4GateAdd {
                             residual: addr(&r_buf),
                             seg,
                         }),
@@ -306,7 +317,7 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                 .read_buffer(scratch.id, 0, scratch_len)
                 .await
                 .expect("read scratch");
-            let (gq, gs) = raw.split_at(m * k / 2);
+            let (gq, gs) = scratch_codes_scales(&raw, m, k);
             let (cq, cs) = quantize(&x, m, k, gsf);
             let code_diff = (0..m * k).filter(|&i| code(gq, i) != code(&cq, i)).count();
             let scale_diff = gs.iter().zip(&cs).filter(|(a, b)| a != b).count();
@@ -400,7 +411,8 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                         hi_first: true,
                     },
                     rows: None,
-                    gate_add: None,
+                    bias: 0,
+                    epilogue: Nvfp4Epilogue::Store,
                 })
                 .expect("gemm comfy");
             assert!(ran, "comfy gemm declined {m}x{n}x{k}");
@@ -409,12 +421,12 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                 .read_buffer(scratch.id, 0, scratch_len)
                 .await
                 .expect("read scratch");
-            let slot = (m * k / 2 + m * k / 16).next_multiple_of(16);
+            let slot = gemm_fp4::slot_offset(m as u32, k as u32) as usize;
             let dyn_gsf = f32::from_le_bytes(raw[slot + 4..slot + 8].try_into().unwrap());
             let amax = x.iter().fold(0f32, |a, v| a.max(v.abs()));
             let want_gsf = 1.0 / half::bf16::from_f32(amax / 2688.0).to_f32();
             assert_eq!(dyn_gsf, want_gsf, "dynamic activation scale");
-            let (hq, hs) = raw.split_at(m * k / 2);
+            let (hq, hs) = scratch_codes_scales(&raw, m, k);
             let hi = |packed: &[u8], i: usize| code(packed, i ^ 1);
             let got = backend
                 .read_buffer(out_hi.id, 0, out_len)
@@ -492,7 +504,8 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                     },
                     format: Default::default(),
                     rows: None,
-                    gate_add: None,
+                    bias: 0,
+                    epilogue: Nvfp4Epilogue::Store,
                 })
                 .expect("gemm lora");
             assert!(ran, "fused-lora gemm declined {m}x{n}x{k}");
@@ -546,7 +559,8 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
                         hi_first: true,
                     },
                     rows: None,
-                    gate_add: None,
+                    bias: 0,
+                    epilogue: Nvfp4Epilogue::Store,
                 })
                 .expect("gemm comfy lora");
             assert!(ran, "comfy fused-lora gemm declined {m}x{n}x{k}");
@@ -572,6 +586,313 @@ fn nvfp4_w4a4_gemm_matches_cpu_reference() {
             let rel3 = (e3 / r3).sqrt();
             eprintln!("{m}x{n}x{k}: comfy fused lora rel_rms {rel3:.3e}");
             assert!(rel3 < 4e-3, "comfy fused lora rel_rms {rel3}");
+
+            // (4) The SwiGLU epilogue over the composite as `[gate; value]`
+            // halves = the `[m, n]` product (plain, then with the adapter)
+            // through the separate `SiluMulFused` pass, bit for bit.
+            let h = n / 2;
+            if h % 128 == 0 {
+                let glu_len = (m * h * 2) as u64;
+                for (label, product, lora) in [
+                    ("plain", &out_buf, Default::default()),
+                    (
+                        "fused lora",
+                        &out2,
+                        thinfer_core::backend::Nvfp4Lora {
+                            mid: addr(&mid_buf),
+                            bt: addr(&bt_buf),
+                            rank: rank as u32,
+                        },
+                    ),
+                ] {
+                    let glu = BufRef::new(backend.allocate(glu_len).expect("glu"), glu_len);
+                    let sep = BufRef::new(backend.allocate(glu_len).expect("sep"), glu_len);
+                    let ran = acc
+                        .gemm_nvfp4(&GemmNvfp4Addrs {
+                            a: addr(&a_buf),
+                            w: addr(&w_buf),
+                            out: addr(&glu),
+                            scratch: addr(&scratch),
+                            m: m as u32,
+                            n: h as u32,
+                            k: k as u32,
+                            lora,
+                            format: Default::default(),
+                            rows: None,
+                            bias: 0,
+                            epilogue: Nvfp4Epilogue::SwiGlu,
+                        })
+                        .expect("gemm swiglu");
+                    assert!(ran, "swiglu gemm declined {m}x{h}x{k}");
+                    let ran = acc
+                        .elementwise(&ElementwiseOp::SiluMulFused {
+                            x: addr(product),
+                            out: addr(&sep),
+                            rows: m as u32,
+                            h: h as u32,
+                        })
+                        .expect("silu mul");
+                    assert!(ran, "silu_mul_fused declined");
+                    acc.sync().expect("sync");
+                    let have = backend.read_buffer(glu.id, 0, glu_len).await.expect("read");
+                    let want = backend.read_buffer(sep.id, 0, glu_len).await.expect("read");
+                    if let Some(i) =
+                        (0..m * h).find(|&i| have[2 * i..2 * i + 2] != want[2 * i..2 * i + 2])
+                    {
+                        panic!(
+                            "{m}x{h}x{k}: {label} swiglu differs at ({}, {})",
+                            i / h,
+                            i % h
+                        );
+                    }
+                    eprintln!("{m}x{h}x{k}: {label} swiglu epilogue bit-identical");
+                }
+
+                // (5) A fused bias = the product then the separate `AddBias`
+                // pass (then `SiluMulFused` for the SwiGLU), bit for bit.
+                let bias: Vec<f32> = (0..n).map(|_| rng.unit() * 2.0).collect();
+                let bias_buf = upload(&to_bytes(&bias));
+                let biased = BufRef::new(backend.allocate(out_len).expect("biased"), out_len);
+                let sep = BufRef::new(backend.allocate(out_len).expect("sep"), out_len);
+                let glu = BufRef::new(backend.allocate(glu_len).expect("glu"), glu_len);
+                let glu_sep = BufRef::new(backend.allocate(glu_len).expect("glu sep"), glu_len);
+                backend
+                    .submit(backend.create_command_encoder())
+                    .await
+                    .expect("flush writes");
+                backend.wait_idle();
+                let with_bias = GemmNvfp4Addrs {
+                    a: addr(&a_buf),
+                    w: addr(&w_buf),
+                    out: addr(&biased),
+                    scratch: addr(&scratch),
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    lora: Default::default(),
+                    format: Default::default(),
+                    rows: None,
+                    bias: addr(&bias_buf),
+                    epilogue: Nvfp4Epilogue::Store,
+                };
+                let glu_bias = GemmNvfp4Addrs {
+                    out: addr(&glu),
+                    n: h as u32,
+                    epilogue: Nvfp4Epilogue::SwiGlu,
+                    ..with_bias
+                };
+                for g in [with_bias, glu_bias] {
+                    assert!(
+                        acc.gemm_nvfp4(&g).expect("gemm bias"),
+                        "biased gemm declined"
+                    );
+                }
+                let ops = [
+                    ElementwiseOp::AddBias {
+                        x: addr(&out_buf),
+                        bias: addr(&bias_buf),
+                        out: addr(&sep),
+                        rows: m as u32,
+                        dim: n as u32,
+                    },
+                    ElementwiseOp::SiluMulFused {
+                        x: addr(&sep),
+                        out: addr(&glu_sep),
+                        rows: m as u32,
+                        h: h as u32,
+                    },
+                ];
+                for op in &ops {
+                    assert!(
+                        acc.elementwise(op).expect("elementwise"),
+                        "elementwise declined"
+                    );
+                }
+                acc.sync().expect("sync");
+                for (label, have, want, len) in [
+                    ("bias", &biased, &sep, out_len),
+                    ("bias + swiglu", &glu, &glu_sep, glu_len),
+                ] {
+                    let have = backend.read_buffer(have.id, 0, len).await.expect("read");
+                    let want = backend.read_buffer(want.id, 0, len).await.expect("read");
+                    assert!(have == want, "{m}x{n}x{k}: {label} epilogue differs");
+                    eprintln!("{m}x{n}x{k}: {label} epilogue bit-identical");
+                }
+            }
+        }
+    });
+}
+
+/// The qk-norm + rope epilogue = the plain product through the separate
+/// `QkNormRope` pass (slab layout, 128-channel heads, all 64 pairs rotated or
+/// H3's partial 48), bit for bit: the whole `[q; k; v]` projection, then its
+/// q rows alone.
+#[test]
+fn nvfp4_qk_norm_rope_epilogue_matches_separate_pass() {
+    for rot_pairs in [64u32, 48] {
+        qk_norm_rope_case(rot_pairs);
+    }
+}
+
+fn qk_norm_rope_case(rot_pairs: u32) {
+    let rp = rot_pairs as usize;
+    pollster::block_on(async {
+        let Ok(backend) = WgpuBackend::new_with_config(WgpuConfig {
+            power_preference: PowerPreference::HighPerformance,
+            timestamps: false,
+            disable_coopmat: false,
+        })
+        .await
+        else {
+            eprintln!("SKIP: no wgpu adapter");
+            return;
+        };
+        if let Err(e) = thinfer_cuda::install(&backend) {
+            eprintln!("SKIP: no CUDA ({e})");
+            return;
+        }
+        let acc = backend.accelerator().expect("accelerator installed");
+        // Two heads per projection; 300 rows end mid-tile.
+        let (m, heads, k) = (300usize, 2usize, 256usize);
+        let inner = heads * 128;
+        let n = 3 * inner;
+        if acc
+            .accepts_gemm_nvfp4(m as u32, n as u32, k as u32)
+            .is_none()
+        {
+            eprintln!("SKIP: device declines nvfp4 gemm");
+            return;
+        }
+        let mut rng = Rng(7);
+        let w = composite(Nvfp4Layout::new(n, k), 90.0, &mut rng);
+        let bf =
+            |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| bf16_bits(*x).to_le_bytes()).collect() };
+        let x: Vec<f32> = (0..m * k).map(|_| rng.unit() * 4.0).collect();
+        let norm = |rng: &mut Rng| {
+            (0..128)
+                .map(|_| 1.0 + rng.unit() * 0.5)
+                .collect::<Vec<f32>>()
+        };
+        let (qn, kn) = (norm(&mut rng), norm(&mut rng));
+        let freqs: Vec<f32> = (0..m * rp)
+            .flat_map(|i| {
+                let a = (i % rp) as f32 * 0.1 + (i / rp) as f32 * 0.01;
+                [a.cos(), a.sin()]
+            })
+            .collect();
+        let upload = |b: &[u8]| -> BufRef {
+            let id = backend.allocate(b.len() as u64).expect("allocate");
+            backend.write_buffer(id, 0, b).expect("write");
+            BufRef::new(id, b.len() as u64)
+        };
+        let alloc =
+            |len: usize| BufRef::new(backend.allocate(len as u64).expect("alloc"), len as u64);
+        let (a_buf, w_buf) = (upload(&bf(&x)), upload(&w));
+        let (qn_buf, kn_buf, f_buf) = (upload(&bf(&qn)), upload(&bf(&kn)), upload(&bf(&freqs)));
+        let side = m * inner * 2;
+        let product = alloc(m * n * 2);
+        let [q0, k0, v0, q1, k1, v1, q2] = [(); 7].map(|_| alloc(side));
+        let scratch_len = acc
+            .accepts_gemm_nvfp4(m as u32, n as u32, k as u32)
+            .unwrap();
+        let scratch = alloc(scratch_len as usize);
+        backend
+            .submit(backend.create_command_encoder())
+            .await
+            .expect("flush writes");
+        backend.wait_idle();
+        let addr = |b: &BufRef| backend.device_address(b).expect("cuda-addressable");
+        let plain = GemmNvfp4Addrs {
+            a: addr(&a_buf),
+            w: addr(&w_buf),
+            out: addr(&product),
+            scratch: addr(&scratch),
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            lora: Default::default(),
+            format: Default::default(),
+            rows: None,
+            bias: 0,
+            epilogue: Nvfp4Epilogue::Store,
+        };
+        assert!(acc.gemm_nvfp4(&plain).expect("gemm"), "gemm declined");
+        let separate = ElementwiseOp::QkNormRope {
+            headwise: false,
+            q_only: false,
+            qkv: addr(&product),
+            q_norm: addr(&qn_buf),
+            k_norm: addr(&kn_buf),
+            freqs: addr(&f_buf),
+            q: addr(&q0),
+            k: addr(&k0),
+            v: addr(&v0),
+            rows: m as u32,
+            heads: heads as u32,
+            head_dim: 128,
+            rot_pairs,
+            eps: 1e-6,
+        };
+        assert!(
+            acc.elementwise(&separate).expect("qk norm"),
+            "qk norm declined"
+        );
+        let qk = Nvfp4QkNormRope {
+            q_norm: addr(&qn_buf),
+            k_norm: addr(&kn_buf),
+            freqs: addr(&f_buf),
+            q: addr(&q1),
+            k: addr(&k1),
+            v: addr(&v1),
+            inner: inner as u32,
+            rot_pairs,
+            eps: 1e-6,
+        };
+        let fused = GemmNvfp4Addrs {
+            epilogue: Nvfp4Epilogue::QkNormRope(qk),
+            ..plain
+        };
+        assert!(
+            acc.gemm_nvfp4(&fused).expect("gemm qk"),
+            "qk epilogue declined"
+        );
+        let q_only = GemmNvfp4Addrs {
+            n: inner as u32,
+            rows: Some(Nvfp4Rows {
+                base: 0,
+                total: n as u32,
+            }),
+            epilogue: Nvfp4Epilogue::QkNormRope(Nvfp4QkNormRope {
+                k_norm: 0,
+                q: addr(&q2),
+                k: 0,
+                v: 0,
+                ..qk
+            }),
+            ..plain
+        };
+        assert!(
+            acc.gemm_nvfp4(&q_only).expect("gemm q"),
+            "q-only epilogue declined"
+        );
+        acc.sync().expect("sync");
+        let read = |b: &BufRef| backend.read_buffer(b.id, 0, side as u64);
+        for (label, want, have) in [
+            ("q", &q0, &q1),
+            ("k", &k0, &k1),
+            ("v", &v0, &v1),
+            ("q-only q", &q0, &q2),
+        ] {
+            let (want, have) = (
+                read(want).await.expect("read"),
+                read(have).await.expect("read"),
+            );
+            if let Some(i) =
+                (0..m * inner).find(|&i| want[2 * i..2 * i + 2] != have[2 * i..2 * i + 2])
+            {
+                panic!("{label} differs at ({}, {})", i / inner, i % inner);
+            }
+            eprintln!("rot_pairs {rot_pairs} {label}: qk-norm rope epilogue bit-identical");
         }
     });
 }

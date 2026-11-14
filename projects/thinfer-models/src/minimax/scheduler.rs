@@ -153,6 +153,12 @@ impl Scheduler {
         Ok(s)
     }
 
+    /// Step `i`'s endpoint on the timestep axis, `1 - sigmas[i + 1]` (where
+    /// a two-time checkpoint aims the step; HyperFlow's `r`).
+    pub fn endpoint(&self, i: usize) -> f32 {
+        1.0 - self.sigmas[i + 1]
+    }
+
     /// The first sigma: the initial noise is scaled by it (the rung grid does
     /// not start at exactly 1).
     pub fn initial_sigma(&self) -> f32 {
@@ -219,6 +225,21 @@ impl JointSchedule {
         Ok(Self {
             video: Scheduler::new(super::SIGMA_SHIFT_VIDEO, num_inference_steps)?,
             audio: Scheduler::new(super::SIGMA_SHIFT_AUDIO, num_inference_steps)?,
+        })
+    }
+
+    /// A raw sigma grid (strictly decreasing, ending at 0) under H3's video
+    /// and audio shifts (`s * x / (1 + (s - 1) * x)`), e.g. HyperFlow's
+    /// fixed few-step grids.
+    pub fn from_grid(grid: &[f32]) -> Result<Self, SchedulerError> {
+        let shift = |s: f32| -> Vec<f32> {
+            grid.iter()
+                .map(|&x| s * x / (1.0 + (s - 1.0) * x))
+                .collect()
+        };
+        Ok(Self {
+            video: Scheduler::from_sigmas(shift(super::SIGMA_SHIFT_VIDEO))?,
+            audio: Scheduler::from_sigmas(shift(super::SIGMA_SHIFT_AUDIO))?,
         })
     }
 

@@ -67,7 +67,7 @@ impl RemoteExecutor {
         );
         let sealed = SealedJob {
             sealed: base64::engine::general_purpose::STANDARD.encode(key.seal(&spec_json)),
-            large_input: spec.is_large_input(),
+            uploads: spec.upload_ids(),
         };
         drop(spec_json);
         let created: CreateResponse = self

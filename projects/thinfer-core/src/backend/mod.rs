@@ -275,6 +275,53 @@ pub trait Accelerator: Send + Sync {
     /// Inputs must be complete in VRAM (the caller drained the GPU).
     fn sdpa_f16(&self, a: &SdpaAddrs) -> Result<bool, String>;
 
+    /// Window attention with exactly the `ops::window_attn` contract on f16
+    /// Q/K/V/out (shapes in `u`). Inputs must be complete in VRAM (the caller
+    /// drained the GPU). Enqueued in stream order without a wait: outside a
+    /// deferred scope the caller syncs before reading `out`. `Ok(false)` =
+    /// declined.
+    fn window_attn_f16(
+        &self,
+        _u: &crate::ops::window_attn::WindowAttnUniform,
+        _a: &WindowAttnAddrs,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// 8-bit tensor-core GEMM `out = bf16(acc * sa[m] * sb[n] + bias[n])`
+    /// over per-row quantized operands ([`GemmQ8Addrs`], `[m, k]` x n-major
+    /// `[n, k]`), enqueued in stream order. `Ok(false)` = declined.
+    fn gemm_q8(&self, _a: &GemmQ8Addrs, _m: u32, _n: u32, _k: u32) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Per-row 8-bit quantization of a bf16 `[rows, k]` `x` into `q` and
+    /// `scale` (f32 `[rows]`, `max|row|` over the format's max), enqueued in
+    /// stream order. `Ok(false)` = declined.
+    fn quant_rows_q8(
+        &self,
+        _format: Q8,
+        _x: u64,
+        _q: u64,
+        _scale: u64,
+        _rows: u32,
+        _k: u32,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Unmasked f16 attention ([`DenseAttention`]) enqueued in stream order,
+    /// for deferred mode: no wait before or after. `Ok(false)` = declined
+    /// (nothing enqueued).
+    fn dense_attention_f16(&self, _a: &DenseAttention) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Host-side precheck for [`Self::dense_attention_f16`] at `head_dim`.
+    fn accepts_dense_attention(&self, _head_dim: u32) -> bool {
+        false
+    }
+
     /// Cheap host-side precheck for [`Self::gemm`] (before the flush + drain).
     fn accepts_gemm(&self, desc: &crate::ops::GemmDesc, m: u32, n: u32) -> bool;
 
@@ -327,6 +374,25 @@ pub trait Accelerator: Send + Sync {
         Ok(false)
     }
 
+    /// One-image 2D convolution with exactly the f32-act `conv3d` op's
+    /// contract at `T = 1` (see [`Conv2dAddrs`]). Enqueued only, like
+    /// [`Self::vsa`]. `Ok(false)` = not covered (the caller runs the op).
+    fn conv2d(&self, _a: &Conv2dAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::conv2d`] covers every valid shape (kernels compiled),
+    /// so a caller may enqueue a whole conv network deferred.
+    fn accepts_conv2d(&self) -> bool {
+        false
+    }
+
+    /// A 3D convolution with exactly the f16-act `conv3d` op's contract (see
+    /// [`Conv3dAddrs`]). Enqueued only. `Ok(false)` = not covered.
+    fn conv3d_f16(&self, _a: &Conv3dAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Whether [`Self::elementwise`] is available at all (kernels compiled).
     fn accepts_elementwise(&self) -> bool {
         false
@@ -337,6 +403,13 @@ pub trait Accelerator: Send + Sync {
         Ok(false)
     }
 
+    /// Without blocking: a future that resolves once everything enqueued so
+    /// far has run, reporting what [`Self::sync`] would. `None` = not
+    /// supported (the caller syncs).
+    fn fence(&self) -> Result<Option<AccelFence>, String> {
+        Ok(None)
+    }
+
     /// Wait for every op this accelerator has enqueued. [`Self::gemm_nvfp4`],
     /// [`Self::vsa`] and [`Self::elementwise`] only ENQUEUE (in order, on one
     /// stream); the caller syncs before anything else reads their outputs or
@@ -345,6 +418,9 @@ pub trait Accelerator: Send + Sync {
         Ok(())
     }
 }
+
+/// See [`Accelerator::fence`].
+pub type AccelFence = core::pin::Pin<Box<dyn Future<Output = Result<(), String>>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TileAttnShape {
@@ -367,6 +443,73 @@ pub struct TileAttnAddrs {
     pub lists: u64,
 }
 
+/// [`Accelerator::conv2d`]: `out[co, ho, wo] = bias[co] + sum over (ci, dh,
+/// dw) of w[co, ci, dh, dw] * x[ci, hi, wi]`, `hi = ho * stride + dh - pad`
+/// (likewise `wi`), out-of-range indices reflected (`-i`, `2n - 2 - i`) when
+/// `reflect`, else zero. `x` / `out` f32 `[c, h, w]`, `w` / `bias` bf16
+/// (`w` as `[cout, cin * k * k]`). Each output sums its terms in that index
+/// order with fused multiply-adds, then adds the bias, as the WGSL op does.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv2dAddrs {
+    pub x: u64,
+    pub w: u64,
+    pub bias: u64,
+    pub out: u64,
+    pub shape: Conv2dShape,
+}
+
+/// [`Accelerator::conv3d_f16`]: `out[b, co, to, ho, wo] = bias[co] + sum over
+/// (ci, dt, dh, dw) of w[co, ci, dt, dh, dw] * x[b, ci, ti, hi, wi]`, with
+/// `ti = to * stride_t + dt - pad_t` (likewise `hi`, `wi`), out-of-range
+/// indices zero. `x` / `out` f16 NCTHW, `w` / `bias` bf16 (`w` as
+/// `[cout, cin * kt * kh * kw]`). Each output sums its terms in that index order with fused
+/// multiply-adds in f32, adds the bias, then stores f16 (clamped to the f16
+/// range, round to nearest even), as the WGSL op does.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv3dAddrs {
+    pub x: u64,
+    pub w: u64,
+    pub bias: u64,
+    pub out: u64,
+    pub shape: Conv3dShape,
+}
+
+/// The geometry of a [`Conv3dAddrs`] convolution, `[kernel]`/`[pad]`/`[stride]`
+/// as `(t, h, w)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv3dShape {
+    pub b: u32,
+    pub cin: u32,
+    pub cout: u32,
+    pub t: u32,
+    pub h: u32,
+    pub w: u32,
+    pub t_out: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kernel: [u32; 3],
+    pub pad: [u32; 3],
+    pub stride: [u32; 3],
+}
+
+/// The geometry of a [`Conv2dAddrs`] convolution.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv2dShape {
+    pub cin: u32,
+    pub cout: u32,
+    pub h: u32,
+    pub w: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub k: u32,
+    pub stride: u32,
+    pub pad: u32,
+    pub reflect: bool,
+    /// Multiply in bf16 on tensor cores (input rounded to bf16, f32
+    /// accumulate): an opt-in faster form, not the WGSL op's bits.
+    pub bf16: bool,
+}
+
 /// Row segments for the per-segment ops in [`ElementwiseOp`]: rows
 /// `[end[i-1], end[i])` read the i-th `a` / `b` vectors. A reference-image
 /// request splits its text span by tag (labels vs vision blocks) and adds a
@@ -382,9 +525,20 @@ pub struct RowSegments {
     pub b: [u64; MAX_SEGMENTS],
 }
 
+/// Elements of one [`ElementwiseOp::GroupNormF32`] partial-statistics part.
+pub const GROUP_NORM_PART: u32 = 4096;
+
+/// Scratch bytes of [`ElementwiseOp::GroupNormF32`]: per (group, part) mean
+/// and M2, then per group mean and inverse std (f32 pairs).
+pub fn group_norm_scratch_bytes(c: u32, hw: u32, groups: u32) -> u64 {
+    let parts = (c / groups * hw).div_ceil(GROUP_NORM_PART) as u64;
+    8 * groups as u64 * (parts + 1)
+}
+
 /// The non-matmul ops of a MiniMax-H3 block, on bf16 activations (device
 /// addresses), each matching the wgpu op it replaces including its bf16
-/// rounding points.
+/// rounding points; and the f32 ones of the H3 VAE encoder (same math as
+/// their WGSL ops, not bit-identical: reduction order and `exp` differ).
 #[derive(Clone, Copy, Debug)]
 pub enum ElementwiseOp {
     /// `out = bf16(bf16(rmsnorm(x) * w) * (1 + a[seg]) + b[seg])` over
@@ -440,6 +594,174 @@ pub enum ElementwiseOp {
     },
     /// `out[r, c] = silu(x[r, c]) * x[r, h + c]` for `x` `[rows, 2h]`.
     SiluMulFused { x: u64, out: u64, rows: u32, h: u32 },
+    /// GroupNorm of f32 `[c, hw]` over `groups` contiguous channel groups
+    /// (biased variance), bf16 affine `w` / `bias` per channel, then SiLU
+    /// when `silu`. `scratch` holds [`group_norm_scratch_bytes`].
+    GroupNormF32 {
+        x: u64,
+        w: u64,
+        bias: u64,
+        out: u64,
+        scratch: u64,
+        c: u32,
+        hw: u32,
+        groups: u32,
+        eps: f32,
+        silu: bool,
+    },
+    /// `out = x + y` over `n` f32.
+    AddF32 { x: u64, y: u64, out: u64, n: u32 },
+    /// The Wan DiT's f16 norm + AdaLN: `n = f16(layernorm(x))` (no affine,
+    /// biased variance) then `out = f16(n * (1 + scale[c]) + shift[c])`, over
+    /// `[rows, dim]`; `scale` / `shift` f16 `[dim]` activations.
+    LayerNormModulateF16 {
+        x: u64,
+        scale: u64,
+        shift: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// The Wan DiT's f16 interleaved-pair RoPE: per row and head, pair
+    /// `(x[2p], x[2p+1])` rotates by the row's f16 `(cos, sin)` pair `p`
+    /// (`freqs` `[rows, pairs]` pairs), in f16 arithmetic like the WGSL op.
+    RopeF16 {
+        x: u64,
+        freqs: u64,
+        out: u64,
+        rows: u32,
+        heads: u32,
+        pairs: u32,
+    },
+    /// The Wan DiT's f16 RMSNorm with a bf16 gain `w` `[dim]`:
+    /// `out = f16(x * rsqrt(mean(x^2) + eps) * w)` over `[rows, dim]`.
+    RmsNormF16 {
+        x: u64,
+        w: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// The Wan DiT's f16 affine LayerNorm (bf16 `w` / `b`), `[rows, dim]`.
+    LayerNormAffineF16 {
+        x: u64,
+        w: u64,
+        b: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// `out = f16(x + bias[c])`, f16 `x`, bf16 `bias` `[dim]`.
+    AddBiasF16 {
+        x: u64,
+        bias: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `out = f16(layernorm(x))` (no affine, biased variance), `[rows, dim]`.
+    LayerNormF16 {
+        x: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
+    /// `out = f16(x * (1 + scale[c]) + shift[c])`, f16 `[dim]` `scale` /
+    /// `shift` activations, over `[rows, dim]`.
+    ModulateF16 {
+        x: u64,
+        scale: u64,
+        shift: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `out = f16(x * w[c])`, bf16 `w` `[dim]`, over `[rows, dim]`.
+    MulWeightF16 {
+        x: u64,
+        w: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `out = f16(x + y)` over `n` f16.
+    AddF16 { x: u64, y: u64, out: u64, n: u32 },
+    /// The Wan VAE's f16 channel RMSNorm over `[b, channels, stride]`:
+    /// `out = f16(x * (sqrt(channels) / max(|x|, 1e-12)) * gamma[c])`, the
+    /// norm over each position's channels (bf16 `gamma` `[channels]`).
+    RmsNorm3dF16 {
+        x: u64,
+        gamma: u64,
+        out: u64,
+        n_pos: u32,
+        channels: u32,
+        stride: u32,
+    },
+    /// `out = f16(x / (1 + exp(-x)))` over `n` f16.
+    SiluF16 { x: u64, out: u64, n: u32 },
+    /// `out = f16(silu(g) * u)` over `n` f16 (separate gate / up buffers).
+    SiluMulF16 { g: u64, u: u64, out: u64, n: u32 },
+    /// `crate::ops::hadamard` out of place: every 256-wide group of the f16
+    /// `[rows, k]` `x` becomes `group @ H` (normalized regular Hadamard,
+    /// f32 math, one rounding) in `out`. `out` may alias `x`.
+    HadamardF16 { x: u64, out: u64, rows: u32, k: u32 },
+    /// The Wan VAE's f16 time concat over `[b, c, t, hw]`: output frame `to`
+    /// is `a[a_start + to]` (zero with `a_zero`) for `to < a_count`, else
+    /// `b[b_start + to - a_count]`; `a` / `b` hold `a_t` / `b_t` frames.
+    ConcatTimeF16 {
+        a: u64,
+        b: u64,
+        out: u64,
+        bc: u32,
+        hw: u32,
+        a_t: u32,
+        b_t: u32,
+        a_start: u32,
+        a_count: u32,
+        b_start: u32,
+        b_count: u32,
+        a_zero: u32,
+    },
+    /// `out = f16(gelu_tanh(x))` over `n` f16.
+    GeluTanhF16 { x: u64, out: u64, n: u32 },
+    /// The Wan DiT's f16 gated residual `out = f16(x + gate[c] * y)` over
+    /// `[rows, dim]`; `gate` an f16 `[dim]` activation.
+    GateAddF16 {
+        x: u64,
+        gate: u64,
+        y: u64,
+        out: u64,
+        rows: u32,
+        dim: u32,
+    },
+    /// `bytes` from `src` to `dst` (non-overlapping), in stream order.
+    Copy { src: u64, dst: u64, bytes: u64 },
+    /// A GGUF block-quant `[n, k]` weight (row-contiguous blocks) into its
+    /// bf16 N-major image, with the arithmetic of `crate::quant`'s CPU
+    /// reference and one bf16 rounding.
+    Dequant {
+        kind: crate::quant::QuantKind,
+        src: u64,
+        out: u64,
+        n: u32,
+        k: u32,
+    },
+    /// A 16-bit `[rows, cols]` matrix into `out` as `[cols, rows]` (no
+    /// aliasing).
+    Transpose16 {
+        x: u64,
+        out: u64,
+        rows: u32,
+        cols: u32,
+    },
+    /// `out = f16(x)` over `n` bf16; `out` may alias `x`.
+    Bf16ToF16 { x: u64, out: u64, n: u32 },
+    /// `out = bf16(x)` over `n` f16; `out` may alias `x`.
+    F16ToBf16 { x: u64, out: u64, n: u32 },
 }
 
 /// Shapes for [`Accelerator::vsa`]. Tiles are 64 rows: the first `n_prefix`
@@ -455,6 +777,9 @@ pub struct VsaShape {
     /// QK^T in INT8 (K smoothed by its per-head mean, per-tile scales; P.V
     /// stays bf16): SageAttention-style, not bit-identical to the bf16 path.
     pub int8_qk: bool,
+    /// With [`Self::int8_qk`]: P.V in FP8 e4m3 too (SageAttention2-style:
+    /// P scaled by 448, V per-tile scales, f32 accumulate across stages).
+    pub fp8_pv: bool,
     pub n_tiles: u32,
     pub n_prefix: u32,
     pub topk: u32,
@@ -540,8 +865,52 @@ pub struct GemmNvfp4Addrs {
     /// `total` rows (`base` a multiple of 128); `None` = the whole composite
     /// (`n` rows). The low-rank `bt` is then `[rank, total]`, read at `base`.
     pub rows: Option<Nvfp4Rows>,
-    /// Optional gated residual on the bf16 product (see [`Nvfp4GateAdd`]).
-    pub gate_add: Option<Nvfp4GateAdd>,
+    /// Optional bf16 bias per composite row (0 = none), added to the product
+    /// as [`ElementwiseOp::AddBias`] would (bit-identical), before the
+    /// epilogue.
+    pub bias: u64,
+    pub epilogue: Nvfp4Epilogue,
+}
+
+/// What the NVFP4 GEMM stores.
+#[derive(Clone, Copy, Debug, Default)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a per-call stack value inside the Copy GemmNvfp4Addrs"
+)]
+pub enum Nvfp4Epilogue {
+    /// The bf16 product.
+    #[default]
+    Store,
+    /// A gated residual on the bf16 product (see [`Nvfp4GateAdd`]).
+    GateAdd(Nvfp4GateAdd),
+    /// `w` is a `[gate; value]` composite of `2n` rows and `out[m, n] =
+    /// bf16(silu(gate) * value)` of the bf16 products: bit-identical to the
+    /// `[m, 2n]` GEMM then [`ElementwiseOp::SiluMulFused`], without that
+    /// intermediate. The low-rank `bt` is `[rank, 2n]`. Not with `rows`.
+    SwiGlu,
+    /// The product's per-head norm + rope (see [`Nvfp4QkNormRope`]); `out`
+    /// is not written.
+    QkNormRope(Nvfp4QkNormRope),
+}
+
+/// [`ElementwiseOp::QkNormRope`] (slab layout, not `headwise`) of a `[q; k;
+/// v]` composite's product, bit-identical to the GEMM then that op, without
+/// the `[m, n]` product round trip. Covers head_dim 128 with up to 64 pairs
+/// rotated; the call's weight rows (its [`Nvfp4Rows`] range, which may be
+/// the q rows alone) start on a 256-row boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct Nvfp4QkNormRope {
+    pub q_norm: u64,
+    pub k_norm: u64,
+    pub freqs: u64,
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    /// Width of one projection (`heads * 128`).
+    pub inner: u32,
+    pub rot_pairs: u32,
+    pub eps: f32,
 }
 
 /// `out = bf16(residual + a[seg] * bf16(acc))`: [`ElementwiseOp::GateAdd`]
@@ -594,6 +963,30 @@ pub fn nvfp4_fuses_lora_rank(rank: u32) -> bool {
     rank > 0 && rank.is_multiple_of(16) && rank <= NVFP4_FUSED_LORA_MAX_RANK
 }
 
+/// The 8-bit format of a [`Accelerator::gemm_q8`]'s operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q8 {
+    /// int8, `max|row| / 127` scales, int32 accumulate (exact).
+    I8,
+    /// FP8 e4m3, `max|row| / 16` scales, k-128 partials in f16 then summed in
+    /// f32 (sm_89+).
+    E4m3,
+}
+
+/// Device addresses of one [`Accelerator::gemm_q8`]: 8-bit `a` `[m, k]` with
+/// f32 per-row scales `sa` `[m]`, 8-bit n-major `b` `[n, k]` with `sb` `[n]`,
+/// bf16 `out` `[m, n]`, bf16 `bias` `[n]` (0 = none), both in `format`.
+#[derive(Clone, Copy, Debug)]
+pub struct GemmQ8Addrs {
+    pub format: Q8,
+    pub a: u64,
+    pub sa: u64,
+    pub b: u64,
+    pub sb: u64,
+    pub out: u64,
+    pub bias: u64,
+}
+
 /// Device addresses + launch shape for [`Accelerator::gemm`] (same roles as
 /// `MatmulBufs`).
 #[derive(Clone, Copy, Debug)]
@@ -608,6 +1001,10 @@ pub struct GemmAddrs {
     pub n: u32,
     pub k: u32,
     pub epilogue: GemmEpilogue,
+    /// Verify an f16 narrowing of the B operand per call (a blocking read;
+    /// an overflow declines the call). Unchecked calls (deferred scopes)
+    /// leave an overflow for [`Accelerator::sync`] to report as an error.
+    pub checked: bool,
 }
 
 /// Fused GEMM epilogue on device addresses, each part optional (0 = absent):
@@ -626,6 +1023,34 @@ impl GemmEpilogue {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// [`Accelerator::dense_attention_f16`]: the `sdpa_sg` math with no mask on
+/// one batch of BSHD f16 tensors, `q` / `out` `[s_q, heads, head_dim]` (a row
+/// range of a longer sequence when offset), `k` / `v` `[s_k, kv_heads,
+/// head_dim]`. `out` may alias `q`: each query tile reads its rows before it
+/// writes them, and no other tile reads them.
+#[derive(Clone, Copy, Debug)]
+pub struct DenseAttention {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub out: u64,
+    pub s_q: u32,
+    pub s_k: u32,
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub scale: f32,
+}
+
+/// Device addresses for [`Accelerator::window_attn_f16`].
+#[derive(Clone, Copy, Debug)]
+pub struct WindowAttnAddrs {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub out: u64,
 }
 
 /// Device addresses for [`Accelerator::sdpa_f16`] (same roles as `SdpaBufs`).

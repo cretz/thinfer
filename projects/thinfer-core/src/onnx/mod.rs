@@ -14,7 +14,7 @@ pub mod kernels;
 pub mod proto;
 pub mod shape;
 
-pub use exec::{OnnxError, OnnxModel};
+pub use exec::{LoadOptions, OnnxError, OnnxModel};
 
 #[cfg(test)]
 mod proto_tests {

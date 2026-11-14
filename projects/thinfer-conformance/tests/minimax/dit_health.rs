@@ -132,7 +132,7 @@ async fn dit_health() {
     // The table is built over exactly the plan's distinct timesteps, in the
     // plan's order: the block stack indexes it by that position.
     let started = std::time::Instant::now();
-    let tables = build_modulation_tables(&cfg, &src, &plan.modulation.timesteps)
+    let tables = build_modulation_tables(&cfg, &src, &plan.modulation.timesteps, None)
         .await
         .expect("build modulation tables");
     eprintln!(

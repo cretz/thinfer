@@ -22,7 +22,7 @@ use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::workspace::Workspace;
 use thinfer_models::minimax::manifest::{self, role};
 use thinfer_models::minimax::text_encoder::{
-    EncoderPipelines, MiniMaxTextEncoder, config, encoder_cfgs, register_handles,
+    EncoderPipelines, LmDims, MiniMaxTextEncoder, config, encoder_cfgs, register_handles,
 };
 use thinfer_native::MmapFileOpener;
 use thinfer_native::cache;
@@ -91,7 +91,7 @@ async fn encoder_parity() {
         .chain(PROBES.iter().map(|&i| (i + 1, format!("layer{i}"))))
         .chain([(config::N_LAYERS, "hidden".to_string())]);
     for (depth, name) in stages {
-        let mut handles = register_handles(&residency, None).expect("register encoder");
+        let mut handles = register_handles(&residency, None, LmDims::H3).expect("register encoder");
         handles.truncate(depth);
         let got = MiniMaxTextEncoder
             .forward(

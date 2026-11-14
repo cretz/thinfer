@@ -1,6 +1,7 @@
 // thinfer-native: desktop/native impls of thinfer-core IO traits.
 
 pub mod cache;
+pub mod harden;
 pub mod prefetch;
 pub mod sources;
 pub mod tokenizer;
@@ -63,6 +64,71 @@ pub struct MmapFile {
     file: Arc<std::fs::File>,
 }
 
+/// Reads at least this large are split into [`READ_PARTS`] concurrent
+/// positioned reads: one request at a time leaves an NVMe at queue depth 1
+/// (measured cold: 3.1 GB/s at one reader, 4.8 GB/s at four).
+const SPLIT_READ_MIN: usize = 8 << 20;
+const READ_PARTS: usize = 4;
+
+/// [`read_exact_at`] on worker threads, as [`READ_PARTS`] concurrent reads
+/// when `dst` is at least [`SPLIT_READ_MIN`], awaited without blocking the
+/// calling thread: the engine runs its legs on one thread, and a read held
+/// there stalls every `join!`ed sibling (the GPU submits of the block whose
+/// next weights are streaming idle the device for the read's duration).
+async fn read_exact_at_split(
+    file: &Arc<std::fs::File>,
+    offset: u64,
+    dst: &mut [u8],
+) -> io::Result<()> {
+    let part = if dst.len() < SPLIT_READ_MIN {
+        dst.len()
+    } else {
+        dst.len().div_ceil(READ_PARTS)
+    };
+    let mut workers = Workers(Vec::new());
+    let mut done = Vec::new();
+    for (i, chunk) in dst.chunks_mut(part).enumerate() {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        let (file, at) = (Arc::clone(file), offset + (i * part) as u64);
+        let chunk = RawChunk(chunk.as_mut_ptr(), chunk.len());
+        workers.0.push(std::thread::spawn(move || {
+            // SAFETY: `dst` outlives this thread: `Workers` joins it before the
+            // borrow ends, even when the future is dropped mid-read.
+            let _ = tx.send(read_exact_at(&file, at, unsafe { chunk.slice() }));
+        }));
+        done.push(rx);
+    }
+    for rx in done {
+        rx.await
+            .map_err(|_| io::Error::other("read worker panicked"))??;
+    }
+    Ok(())
+}
+
+/// One worker's slice of the destination buffer.
+struct RawChunk(*mut u8, usize);
+// SAFETY: each worker gets a disjoint slice; `Workers` bounds its lifetime.
+unsafe impl Send for RawChunk {}
+
+impl RawChunk {
+    /// # Safety
+    /// The slice must still be live and written by no one else.
+    unsafe fn slice<'a>(self) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.0, self.1) }
+    }
+}
+
+/// Joins the read workers on drop, so none outlives the buffer it writes.
+struct Workers(Vec<std::thread::JoinHandle<()>>);
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        for w in self.0.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
 /// Fill `dst` from `file` at `offset` without touching a shared file cursor.
 fn read_exact_at(file: &std::fs::File, mut offset: u64, mut dst: &mut [u8]) -> io::Result<()> {
     while !dst.is_empty() {
@@ -99,7 +165,7 @@ impl WeightReader for MmapFile {
             ));
         }
         if dst.len() >= DIRECT_READ_MIN {
-            return read_exact_at(&self.file, offset, dst);
+            return read_exact_at_split(&self.file, offset, dst).await;
         }
         dst.copy_from_slice(&self.mmap[off..end]);
         Ok(())
@@ -110,6 +176,9 @@ impl WeightReader for MmapFile {
     /// memcpy hits resident pages instead of fault-per-page at disk latency
     /// (measured: cold Gemma stream read_at ~1GB/s = 12.5s of a 15s encode).
     /// Best-effort: a failed or ignored hint only costs speed, never bytes.
+    /// The OS call blocks while it issues the IO (~60 ms per 276 MB encoder
+    /// layer), so a range of at least [`BACKGROUND_HINT_MIN`] is hinted from
+    /// a detached thread that holds the mapping.
     fn will_read(&mut self, offset: u64, len: u64) {
         let off = offset as usize;
         let Some(end) = off.checked_add(len as usize) else {
@@ -118,26 +187,39 @@ impl WeightReader for MmapFile {
         if len == 0 || end > self.mmap.len() {
             return;
         }
-        #[cfg(unix)]
-        {
-            let _ = self
-                .mmap
-                .advise_range(memmap2::Advice::WillNeed, off, len as usize);
+        if (len as usize) < BACKGROUND_HINT_MIN {
+            prefetch(&self.mmap, off, len as usize);
+            return;
         }
-        #[cfg(windows)]
-        // SAFETY: the range is inside the live mapping (bounds-checked above);
-        // PrefetchVirtualMemory only initiates paging, it does not mutate.
-        unsafe {
-            use windows_sys::Win32::System::Memory::{
-                PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY,
-            };
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            let entry = WIN32_MEMORY_RANGE_ENTRY {
-                VirtualAddress: self.mmap.as_ptr().add(off) as *mut core::ffi::c_void,
-                NumberOfBytes: len as usize,
-            };
-            let _ = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
-        }
+        let mmap = Arc::clone(&self.mmap);
+        // A hint that cannot get a thread is dropped, as any failed hint is.
+        let _ = std::thread::Builder::new()
+            .name("thinfer-prefetch".into())
+            .spawn(move || prefetch(&mmap, off, len as usize));
+    }
+}
+
+/// Hints at least this large page in from their own thread (see
+/// [`MmapFile::will_read`]).
+const BACKGROUND_HINT_MIN: usize = 16 << 20;
+
+/// Start paging in `mmap[off..off + len]` (in bounds, checked by the caller).
+fn prefetch(mmap: &memmap2::Mmap, off: usize, len: usize) {
+    #[cfg(unix)]
+    {
+        let _ = mmap.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+    #[cfg(windows)]
+    // SAFETY: the range is inside the live mapping (bounds-checked by the
+    // caller); PrefetchVirtualMemory only initiates paging, it does not mutate.
+    unsafe {
+        use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let entry = WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: mmap.as_ptr().add(off) as *mut core::ffi::c_void,
+            NumberOfBytes: len,
+        };
+        let _ = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
     }
 }
 
@@ -206,10 +288,10 @@ mod read_bench {
 }
 
 /// Smoke-test the `.pt` reader against a real `torch.save` checkpoint (e.g.
-/// LongLive `model_bf16.pt`). Gated on `THINFER_PT_PATH` (skips when unset).
+/// the DreamID-V `.pth`). Gated on `THINFER_PT_PATH` (skips when unset).
 /// Parses the ZIP64 directory + pickle index, then prints every tensor name,
-/// shape and dtype - both proof the parser handles a 10GB real file and the
-/// source of truth for the DiT rename map.
+/// shape and dtype - proof the parser handles a real file and the source
+/// of truth for a DiT rename map.
 #[cfg(test)]
 mod pt_smoke {
     use super::*;

@@ -11,6 +11,7 @@ use thinfer_models::krea::manifest as kreamf;
 use thinfer_models::ltx::manifest as ltxmf;
 use thinfer_models::minimax::manifest as mmmf;
 use thinfer_models::qwen_image::manifest as qimf;
+use thinfer_models::qwen_image21::manifest as qi21mf;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::z_image::manifest as zmf;
 
@@ -38,8 +39,9 @@ pub const VIDEO_MAX_STEPS: u32 = 8;
 /// string), so they take a plain model string and validate it against this set
 /// instead of a typed enum. Keep in sync with the typed
 /// `ImageModelId::supports_adapters` / `VideoModelId::supports_adapters` predicates.
-pub const ADAPTER_MODEL_IDS: [&str; 9] = [
+pub const ADAPTER_MODEL_IDS: [&str; 11] = [
     "krea-2-turbo",
+    "qwen-image-2.1-turbo",
     "qwen-image-rapid",
     "qwen-image-edit-rapid",
     "anyflow-t2v-14b",
@@ -47,6 +49,7 @@ pub const ADAPTER_MODEL_IDS: [&str; 9] = [
     "wan2.1-t2v-1.3b",
     "minimax-h3",
     "fasth3-trim",
+    "fasth3-v2",
     "fasth3-omni",
 ];
 
@@ -107,6 +110,12 @@ pub enum ImageModelId {
     #[cfg_attr(feature = "cli", value(name = "krea-2-turbo"))]
     #[cfg_attr(feature = "serde", serde(rename = "krea-2-turbo"))]
     Krea2Turbo,
+    /// Qwen-Image-2.1-Turbo: a 7B single-stream DiT, 8 CFG-free steps, text to
+    /// image or editing / composing from `--input-image` (optional). Qwen3-VL-8B
+    /// encoder; 2K native. Qwen Research License (non-commercial).
+    #[cfg_attr(feature = "cli", value(name = "qwen-image-2.1-turbo"))]
+    #[cfg_attr(feature = "serde", serde(rename = "qwen-image-2.1-turbo"))]
+    QwenImage21Turbo,
 }
 
 /// Which engine pipeline an image id drives. The executor branches on this:
@@ -121,6 +130,8 @@ pub enum ImageKind {
     QwenImage,
     /// Krea 2 Turbo (text->image; Qwen3-VL encoder + single-stream DiT).
     Krea2,
+    /// Qwen-Image-2.1 (text->image, or image->image with optional inputs).
+    QwenImage21,
 }
 
 impl ImageModelId {
@@ -138,6 +149,7 @@ impl ImageModelId {
             Self::QwenImageEditRapid => "Qwen-Image Edit Rapid, 4-step (edits --input-image)",
             Self::QwenImageRapid => "Qwen-Image Rapid, 4-step",
             Self::Krea2Turbo => "Krea 2 Turbo, 8-step, aesthetic",
+            Self::QwenImage21Turbo => "Qwen-Image 2.1 Turbo, 8-step (optional --input-image)",
         }
     }
 
@@ -148,6 +160,7 @@ impl ImageModelId {
             ImageModelId::QwenImageEditRapid => ImageKind::QwenImageEdit,
             ImageModelId::QwenImageRapid => ImageKind::QwenImage,
             ImageModelId::Krea2Turbo => ImageKind::Krea2,
+            ImageModelId::QwenImage21Turbo => ImageKind::QwenImage21,
             _ => ImageKind::ZImage,
         }
     }
@@ -158,6 +171,7 @@ impl ImageModelId {
             ImageKind::Ideogram4 => &idmf::MANIFEST,
             ImageKind::QwenImageEdit | ImageKind::QwenImage => &qimf::MANIFEST,
             ImageKind::Krea2 => &kreamf::MANIFEST,
+            ImageKind::QwenImage21 => &qi21mf::MANIFEST,
         }
     }
 
@@ -167,7 +181,10 @@ impl ImageModelId {
     pub fn supports_adapters(self) -> bool {
         matches!(
             self.kind(),
-            ImageKind::Krea2 | ImageKind::QwenImage | ImageKind::QwenImageEdit
+            ImageKind::Krea2
+                | ImageKind::QwenImage
+                | ImageKind::QwenImageEdit
+                | ImageKind::QwenImage21
         )
     }
 
@@ -190,6 +207,7 @@ impl ImageModelId {
             ImageModelId::QwenImageRapid => qimf::RUNTIME_ROLES_T2I_Q8,
             // Krea sources by role (Q8_0 canary DiT + Qwen3-VL encoder + VAE).
             ImageModelId::Krea2Turbo => kreamf::RUNTIME_ROLES_Q8,
+            ImageModelId::QwenImage21Turbo => qi21mf::RUNTIME_ROLES_Q4,
             // Z-Image uses the variant registry, not roles.
             _ => &[],
         }
@@ -223,6 +241,13 @@ impl ImageModelId {
                 height: 1024,
                 steps: 8,
             },
+            // Qwen-Image-2.1-Turbo: the checkpoint's own 8-sigma schedule (the
+            // step count is fixed); 1024 is the reference's default size.
+            ImageKind::QwenImage21 => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 8,
+            },
         }
     }
 }
@@ -237,6 +262,7 @@ impl std::fmt::Display for ImageModelId {
             ImageModelId::QwenImageEditRapid => "qwen-image-edit-rapid",
             ImageModelId::QwenImageRapid => "qwen-image-rapid",
             ImageModelId::Krea2Turbo => "krea-2-turbo",
+            ImageModelId::QwenImage21Turbo => "qwen-image-2.1-turbo",
         })
     }
 }
@@ -251,11 +277,6 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "fastwan-ti2v-5b"))]
     #[cfg_attr(feature = "serde", serde(rename = "fastwan-ti2v-5b"))]
     FastwanTi2v5b,
-    /// LongLive-2.0-5B: causal/AR long-video finetune of the FastWan base.
-    /// 4-step FlowUniPC per chunk over a windowed KV cache.
-    #[cfg_attr(feature = "cli", value(name = "longlive-2.0-5b"))]
-    #[cfg_attr(feature = "serde", serde(rename = "longlive-2.0-5b"))]
-    Longlive205b,
     /// nvidia AnyFlow-Wan2.1-T2V-14B: any-step flow-map distill (the step
     /// count is a user option, `--steps`; 2-step is the fast play). T2V only.
     /// NVIDIA NSCLv1 license (noncommercial).
@@ -353,17 +374,6 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "hunyuan-video-1.5-ti2v"))]
     #[cfg_attr(feature = "serde", serde(rename = "hunyuan-video-1.5-ti2v"))]
     Hunyuan15I2v,
-    /// DreamID-V-Wan-1.3B-Faster: a diffusion VIDEO FACE-SWAP DiT on the Wan2.1
-    /// backbone (16-step image-CFG, FastWan-speed class). NOT a text-prompt
-    /// model: it consumes a target VIDEO + a source FACE image (the umT5 context
-    /// is baked in). Its own pipeline (`wan::dreamidv`): the target video +
-    /// live-generated DWPose face-mask + source-face image are VAE-encoded, the
-    /// mask conditions a 48-channel DiT input, and a ref-conv prefix injects the
-    /// source face; none of the Wan variant/sampler/prompt machinery applies.
-    /// 832x480, 81f @ 16fps default. Apache-2.0.
-    #[cfg_attr(feature = "cli", value(name = "dreamid-v"))]
-    #[cfg_attr(feature = "serde", serde(rename = "dreamid-v"))]
-    DreamIdV,
     /// MiniMax-H3 (FL2VA): a 33B dense SINGLE-STREAM joint audio-video DiT. One
     /// packed 1-D sequence carries text, audio and video rows under full
     /// self-attention, so there is no cross-attention and no conditioning tail.
@@ -379,6 +389,18 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "minimax-h3"))]
     #[cfg_attr(feature = "serde", serde(rename = "minimax-h3"))]
     MinimaxH3,
+    /// MiniMax-H3 33B (the same Q4 base) under larryvrh's v4 turbo LoRA (AdaLN
+    /// pairs folded into the modulation table): 6 steps (4-8 via `--steps`),
+    /// video + audio, first frame and chained clips.
+    #[cfg_attr(feature = "cli", value(name = "minimax-h3-turbo"))]
+    #[cfg_attr(feature = "serde", serde(rename = "minimax-h3-turbo"))]
+    MinimaxH3Turbo,
+    /// The same v4 turbo LoRA on the Q4 Ref2VA base: text to video + audio
+    /// conditioned on reference images the prompt can name. The LoRA was
+    /// trained on FL2VA only, so references hold a bit less well.
+    #[cfg_attr(feature = "cli", value(name = "minimax-h3-turbo-ref"))]
+    #[cfg_attr(feature = "serde", serde(rename = "minimax-h3-turbo-ref"))]
+    MinimaxH3TurboRef,
     /// FastVideo FastH3-Trim: the 8-step DMD distillation of MiniMax-H3 (42
     /// blocks, rank-16 AdaLN, NVFP4 block linears). Same conditioner, VAEs and
     /// packed pipeline as `minimax-h3`; a fixed 8-step schedule, no turbo LoRA.
@@ -386,22 +408,40 @@ pub enum VideoModelId {
     #[cfg_attr(feature = "cli", value(name = "fasth3-trim"))]
     #[cfg_attr(feature = "serde", serde(rename = "fasth3-trim"))]
     Fasth3Trim,
+    /// FastVideo FastH3 V2: the full-depth (50-block) 8-step DMD distillation
+    /// of MiniMax-H3, Comfy NVFP4. Trim's higher-quality sibling: same
+    /// schedule and surface (first frame, chained clips), ~1.2x Trim's blocks.
+    #[cfg_attr(feature = "cli", value(name = "fasth3-v2"))]
+    #[cfg_attr(feature = "serde", serde(rename = "fasth3-v2"))]
+    Fasth3V2,
     /// FastVideo FastH3-Omni: the 8-step distillation of the Ref2VA
     /// checkpoint (all 50 blocks, PDD heads, Comfy NVFP4). Text to video+audio,
     /// optionally conditioned on reference images the prompt can name.
     #[cfg_attr(feature = "cli", value(name = "fasth3-omni"))]
     #[cfg_attr(feature = "serde", serde(rename = "fasth3-omni"))]
     Fasth3Omni,
+    /// Video Rebirth HyperFlow H3 Flash (FL2VA): MiniMax-H3 compressed to 47
+    /// blocks (low-rank linears, two-time conditioning), 6 CFG-free steps (4 or
+    /// 8 via `--steps`). Text, first frame and chained clips, video + audio.
+    #[cfg_attr(feature = "cli", value(name = "hyperflow-flash"))]
+    #[cfg_attr(feature = "serde", serde(rename = "hyperflow-flash"))]
+    HyperflowFlash,
+    /// HyperFlow H3 Flash Ref2VA (49 blocks): text to video + audio
+    /// conditioned on reference images the prompt can name.
+    #[cfg_attr(feature = "cli", value(name = "hyperflow-flash-ref"))]
+    #[cfg_attr(feature = "serde", serde(rename = "hyperflow-flash-ref"))]
+    HyperflowFlashRef,
 }
 
 impl VideoModelId {
     pub const DEFAULT: VideoModelId = VideoModelId::FastwanTi2v5b;
 
-    /// The attention precision a request gets without `--attn`: INT8 on the
-    /// FastH3 models (same quality, faster), bf16 elsewhere (no INT8 path).
+    /// The attention precision a request gets without `--attn`: INT8 QK^T +
+    /// FP8 P.V on the MiniMax-H3 family (no visible quality change, faster;
+    /// GPUs below sm_89 run `int8`), bf16 elsewhere (no INT8 path).
     pub fn default_attn(self) -> AttnPrecision {
-        if self.is_fasth3() {
-            AttnPrecision::Int8
+        if self.is_minimax() {
+            AttnPrecision::Int8Fp8
         } else {
             AttnPrecision::Bf16
         }
@@ -422,7 +462,6 @@ impl VideoModelId {
     pub fn title(self) -> &'static str {
         match self {
             Self::FastwanTi2v5b => "FastWan2.2 TI2V 5B, 3-step",
-            Self::Longlive205b => "LongLive 2.0 5B, long clips",
             Self::AnyflowT2v14b => "AnyFlow Wan2.1 14B, any step count",
             Self::Mobilewan => "MobileWan, pruned 5B",
             Self::Fastwan21T2v13b => "FastWan2.1 1.3B, 3-step",
@@ -435,9 +474,15 @@ impl VideoModelId {
             Self::Wan22T2vA14b => "Wan2.2 A14B MoE, 4-step",
             Self::Hunyuan15T2v => "HunyuanVideo 1.5, 4-step",
             Self::Hunyuan15I2v => "HunyuanVideo 1.5 image-to-video (--input-image)",
-            Self::DreamIdV => "DreamID-V video face swap (--input-video, --source-image)",
             Self::MinimaxH3 => "MiniMax-H3 33B + turbo LoRA, video + audio",
+            Self::MinimaxH3Turbo => "MiniMax-H3 33B + larryvrh turbo v4, 6-step, video + audio",
+            Self::MinimaxH3TurboRef => {
+                "MiniMax-H3 33B Ref2VA + larryvrh turbo v4, 6-step, video + audio, --ref-image"
+            }
             Self::Fasth3Trim => "FastH3-Trim, 8-step, video + audio",
+            Self::Fasth3V2 => "FastH3 V2 (50 blocks), 8-step, video + audio",
+            Self::HyperflowFlash => "HyperFlow H3 Flash, 6-step, video + audio",
+            Self::HyperflowFlashRef => "HyperFlow H3 Flash Ref2VA, references, video + audio",
             Self::Fasth3Omni => "FastH3-Omni, 8-step, video + audio, --ref-image",
         }
     }
@@ -448,9 +493,14 @@ impl VideoModelId {
             VideoModelId::Ltx23Dev | VideoModelId::Ltx23DevQ4 => &ltxmf::DEV_MANIFEST,
             VideoModelId::Ltx2Rapid => &ltxmf::LTX2_RAPID_MANIFEST,
             VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v => &hunmf::MANIFEST,
-            VideoModelId::MinimaxH3 | VideoModelId::Fasth3Trim | VideoModelId::Fasth3Omni => {
-                &mmmf::MANIFEST
-            }
+            VideoModelId::MinimaxH3
+            | VideoModelId::MinimaxH3Turbo
+            | VideoModelId::MinimaxH3TurboRef
+            | VideoModelId::Fasth3Trim
+            | VideoModelId::Fasth3V2
+            | VideoModelId::Fasth3Omni
+            | VideoModelId::HyperflowFlash
+            | VideoModelId::HyperflowFlashRef => &mmmf::MANIFEST,
             _ => &wanmf::MANIFEST,
         }
     }
@@ -514,11 +564,6 @@ impl VideoModelId {
         wanmf::variant(&self.to_string()).expect("VideoModelId missing from VARIANTS registry")
     }
 
-    /// AR (LongLive) path: the `.pt` DiT + windowed-KV-cache chunk loop.
-    pub fn is_ar(self) -> bool {
-        matches!(self, VideoModelId::Longlive205b)
-    }
-
     /// HunyuanVideo 1.5 path: its own Qwen2.5-VL-encoder + dual-stream-MMDiT +
     /// causal-conv-VAE pipeline (`crate::hunyuan`); none of the Wan/LTX variant,
     /// sampler, or VAE-choice machinery applies. Covers the T2V and causal I2V
@@ -537,25 +582,68 @@ impl VideoModelId {
         matches!(self, VideoModelId::Hunyuan15I2v)
     }
 
-    /// DreamID-V video face-swap path: its own `wan::dreamidv` pipeline (target
-    /// video + source-face image + live DWPose mask, image-CFG denoise), NOT a
-    /// text-prompt Wan model. It reuses the Wan variant registry only for the
-    /// shared Wan2.1 VAE file; everything else (no prompt, no sampler choice, the
-    /// source-image + video inputs) is dispatched separately.
-    pub fn is_dreamidv(self) -> bool {
-        matches!(self, VideoModelId::DreamIdV)
-    }
-
     /// MiniMax-H3 and its distillations: their own single-stream packed-sequence
     /// pipeline + audio tail. None of the Wan/LTX machinery applies.
     pub fn is_minimax(self) -> bool {
-        self == VideoModelId::MinimaxH3 || self.is_fasth3()
+        matches!(self, VideoModelId::MinimaxH3)
+            || self.is_turbo()
+            || self.is_fasth3()
+            || self.is_hyperflow()
+    }
+
+    /// HyperFlow H3 Flash: its fixed 4/6/8-step two-time grid on the backend
+    /// block (GGUF, dense attention).
+    pub fn is_hyperflow(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::HyperflowFlash | VideoModelId::HyperflowFlashRef
+        )
+    }
+
+    /// larryvrh's v4 turbo LoRA on the Q4 base (FL2VA or Ref2VA).
+    pub fn is_turbo(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::MinimaxH3Turbo | VideoModelId::MinimaxH3TurboRef
+        )
+    }
+
+    /// The MiniMax-family ids on the Ref2VA checkpoint line (reference images).
+    pub fn takes_refs(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::Fasth3Omni
+                | VideoModelId::HyperflowFlashRef
+                | VideoModelId::MinimaxH3TurboRef
+        )
+    }
+
+    /// The MiniMax-family ids on the FL2VA checkpoint line (first-frame
+    /// keyframes, and with them chained clips); FastH3-Omni is the Ref2VA one.
+    pub fn minimax_fl2va(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::MinimaxH3
+                | VideoModelId::MinimaxH3Turbo
+                | VideoModelId::Fasth3Trim
+                | VideoModelId::Fasth3V2
+                | VideoModelId::HyperflowFlash
+        )
     }
 
     /// FastVideo's 8-step H3 distills: fixed schedules, NVFP4 block linears on
     /// the accelerated row-chunked block.
     pub fn is_fasth3(self) -> bool {
-        matches!(self, VideoModelId::Fasth3Trim | VideoModelId::Fasth3Omni)
+        matches!(
+            self,
+            VideoModelId::Fasth3Trim | VideoModelId::Fasth3V2 | VideoModelId::Fasth3Omni
+        )
+    }
+
+    /// The MiniMax-family ids on the GGUF block (everything but FastH3's NVFP4
+    /// checkpoints): the opt-in INT8 GEMMs apply to these.
+    pub fn is_minimax_gguf(self) -> bool {
+        self.is_minimax() && !self.is_fasth3()
     }
 
     /// The roles a MiniMax-family t2va generate downloads and opens.
@@ -563,9 +651,25 @@ impl VideoModelId {
         use thinfer_models::minimax::manifest as m;
         match self {
             VideoModelId::Fasth3Trim => m::RUNTIME_ROLES_T2VA_FASTH3_TRIM,
+            VideoModelId::Fasth3V2 => m::RUNTIME_ROLES_T2VA_FASTH3_V2,
             VideoModelId::Fasth3Omni => m::RUNTIME_ROLES_REF2VA_FASTH3_OMNI,
+            VideoModelId::HyperflowFlash => m::RUNTIME_ROLES_T2VA_HYPERFLOW,
+            VideoModelId::HyperflowFlashRef => m::RUNTIME_ROLES_REF2VA_HYPERFLOW,
+            VideoModelId::MinimaxH3Turbo => m::RUNTIME_ROLES_T2VA_TURBO_V4,
+            VideoModelId::MinimaxH3TurboRef => m::RUNTIME_ROLES_REF2VA_TURBO_V4,
             _ => m::RUNTIME_ROLES_T2VA_Q4,
         }
+    }
+
+    /// The packed-row limit of a MiniMax-family run: FastH3's NVFP4 block or
+    /// the GGUF block when `accelerated`, else the backend block's.
+    pub fn minimax_row_limit(self, accelerated: bool) -> usize {
+        use thinfer_models::minimax::pipeline::{BlockPath, max_packed_rows};
+        max_packed_rows(match (accelerated, self.is_fasth3()) {
+            (false, _) => BlockPath::Backend,
+            (true, true) => BlockPath::Fasth3Accel,
+            (true, false) => BlockPath::GenericAccel,
+        })
     }
 
     /// The DiT a MiniMax-family id runs.
@@ -573,13 +677,16 @@ impl VideoModelId {
         use thinfer_models::minimax::DitConfig;
         match self {
             VideoModelId::Fasth3Trim => DitConfig::fasth3_trim(),
+            VideoModelId::Fasth3V2 => DitConfig::fasth3_v2(),
             VideoModelId::Fasth3Omni => DitConfig::fasth3_omni(),
+            VideoModelId::HyperflowFlash => DitConfig::hyperflow(47),
+            VideoModelId::HyperflowFlashRef => DitConfig::hyperflow(49),
             _ => DitConfig::h3_33b(),
         }
     }
 
     /// LTX-2.3 joint audio-video path: its own two-stage pipeline + audio tail,
-    /// none of the FastWan/LongLive (Wan-base) machinery applies.
+    /// none of the FastWan (Wan-base) machinery applies.
     pub fn is_ltx(self) -> bool {
         matches!(
             self,
@@ -616,7 +723,7 @@ impl VideoModelId {
         matches!(self, VideoModelId::Ltx23Dev | VideoModelId::Ltx23DevQ4)
     }
 
-    /// Default frame dims for this model. FastWan/LongLive ship the 960x544
+    /// Default frame dims for this model. FastWan ships the 960x544
     /// e2e baseline; LTX ships 768x512 (see the arm for the measurement behind
     /// that number and the quality cliff just below it).
     ///
@@ -662,11 +769,6 @@ impl VideoModelId {
             // `MAX_PACKED_ROWS` until the row-independent sites are chunked over
             // rows. Smaller canvases are off-distribution (faces and fine detail
             // fall apart), so the ladder does not go below this by default.
-            (832, 480)
-        } else if self.is_dreamidv() {
-            // 832x480: DreamID-V's default face-swap resolution (the reference
-            // `size = (832, 480)`; the NaResize downsamples the target clip toward
-            // this area). /16 grid (Wan2.1 VAE 8x + patch 2).
             (832, 480)
         } else if self.is_hunyuan() {
             // 832x480: HunyuanVideo 1.5's native 480p T2V regime (the res the
@@ -827,7 +929,6 @@ impl VideoModelId {
                 | VideoModelId::Fastwan21T2v13b
                 | VideoModelId::Wan21T2v13b
         ) || self.is_hunyuan()
-            || self.is_dreamidv()
         {
             16
         } else {
@@ -836,17 +937,20 @@ impl VideoModelId {
     }
 
     /// Default denoise step count when the caller leaves `--steps` unset. Most
-    /// video models share [`VIDEO_DEFAULT_STEPS`]; DreamID-V's faster distill is
-    /// authored for 16 (`wan::dreamidv::DEFAULT_STEPS`).
+    /// video models share [`VIDEO_DEFAULT_STEPS`].
     pub fn default_steps(self) -> u32 {
         match self {
-            _ if self.is_dreamidv() => thinfer_models::wan::dreamidv::DEFAULT_STEPS,
             // AnyFlow is an any-step flow map: an eyeball sweep at 832x480 showed 2
             // steps holds 4-step quality (the flow map jumps in one displacement per
             // step). Each step re-streams the whole 15GB DiT (it does not fit the 8GB
             // card), so halving steps ~halves wall time -- 2 is the quality-neutral
             // fast default. More steps stay available via `--steps`.
             VideoModelId::AnyflowT2v14b => 2,
+            VideoModelId::HyperflowFlash | VideoModelId::HyperflowFlashRef => {
+                thinfer_models::minimax::hyperflow::DEFAULT_STEPS as u32
+            }
+            // larryvrh: 4 is the floor, 6-8 noticeably better (less ghosting).
+            VideoModelId::MinimaxH3Turbo | VideoModelId::MinimaxH3TurboRef => 6,
             _ => VIDEO_DEFAULT_STEPS,
         }
     }
@@ -861,12 +965,6 @@ impl VideoModelId {
             VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b => VideoSampler::Dmd,
             _ => VideoSampler::UniPc,
         }
-    }
-
-    /// DreamID-V image-CFG guidance scale on the source-face reference when the
-    /// caller leaves `--guide-scale` unset (`wan::dreamidv::DEFAULT_GUIDE_SCALE`).
-    pub fn default_guide_scale(self) -> f32 {
-        thinfer_models::wan::dreamidv::DEFAULT_GUIDE_SCALE
     }
 
     /// Whether request-time user adapters (the vault LoRA fold) apply to this
@@ -884,14 +982,12 @@ impl VideoModelId {
     }
 
     /// Default clip length in seconds when neither frames nor duration is
-    /// given. 5s is the Wan2.2-TI2V-5B design point; LongLive (same base) is
-    /// happy at the same length, just on a coarser grid.
+    /// given. 5s is the Wan2.2-TI2V-5B design point.
     pub const DEFAULT_DURATION_SECS: u32 = 5;
 
     /// Default clip length (frames) when neither frames nor duration is given:
     /// [`Self::DEFAULT_DURATION_SECS`] at the model fps, snapped to its legal
-    /// grid. Same target seconds for both Wan models; the snap lands FastWan at
-    /// 121 and LongLive at 125 (its chunk-of-8 grid is coarser). LTX overrides
+    /// grid (FastWan lands at 121). LTX overrides
     /// this with a short default ([`Self::LTX_DEFAULT_FRAMES`]): the full chain
     /// (single-submit VAE decode) fits only modest lengths on thin hardware.
     pub fn default_frames(self) -> u32 {
@@ -903,10 +999,6 @@ impl VideoModelId {
             Self::MINIMAX_DEFAULT_FRAMES
         } else if matches!(self, VideoModelId::Wan22T2vA14b) {
             Self::WAN22_DEFAULT_FRAMES
-        } else if self.is_dreamidv() {
-            // 81 frames (4k+1), the DreamID-V reference default clip length. The
-            // executor clamps this to the actual decoded length of the target clip.
-            81
         } else {
             self.snap_frames(Self::DEFAULT_DURATION_SECS * self.fps())
         }
@@ -971,8 +1063,8 @@ impl VideoModelId {
     }
 
     /// The per-resolution VRAM activation-envelope cap, in latent cells, or `None`
-    /// for models that fit at every legal dim on the 8GB card (FastWan/LongLive
-    /// ship low-res defaults well inside the envelope). LTX and Wan2.2-A14B run
+    /// for models that fit at every legal dim on the 8GB card (FastWan
+    /// ships low-res defaults well inside the envelope). LTX and Wan2.2-A14B run
     /// the DiT at full res over a large token grid and need an explicit cap.
     fn max_latent_cells(self) -> Option<u32> {
         if self.is_ltx() {
@@ -1021,18 +1113,13 @@ impl VideoModelId {
     }
 
     /// Snap a raw frame count to this model's legal temporal grid. FastWan needs
-    /// `4k+1` (causal-VAE grid); LongLive additionally needs latent frame count
-    /// `(frames-1)/4+1` a positive multiple of 8 -> frames in {29, 61, 93, ...}.
+    /// `4k+1` (causal-VAE grid).
     /// LTX needs `8k+1` (its VAE has temporal factor 8).
     pub fn snap_frames(self, raw: u32) -> u32 {
         let raw = raw.max(1);
         if self.is_ltx() {
             let k = ((raw - 1) as f32 / 8.0).round() as u32;
             8 * k + 1
-        } else if self.is_ar() {
-            let f_lat = (raw as f32 + 3.0) / 4.0;
-            let f_lat8 = ((f_lat / 8.0).round().max(1.0) as u32) * 8;
-            4 * f_lat8 - 3
         } else if self.is_hunyuan_i2v() {
             // Causal I2V chunks 4 latent frames at a time: latent frame count
             // (frames-1)/4+1 must be a positive multiple of 4 -> frames in
@@ -1062,32 +1149,7 @@ impl VideoModelId {
                 "--frames must be 4*k + 1 (got {frames}); e.g. 1, 5, 9, ..., 97"
             ));
         }
-        if self.is_ar() {
-            let f_lat = (frames - 1) / 4 + 1;
-            if !f_lat.is_multiple_of(8) {
-                return Err(format!(
-                    "--frames for {self} must have latent frame count (frames-1)/4+1 \
-                     divisible by 8 (got {frames} -> {f_lat}); e.g. 29, 61, 93, 125"
-                ));
-            }
-        }
         Ok(())
-    }
-
-    /// AR chunk size in latent frames (`num_frame_per_block`). Multi-shot
-    /// lengths split in chunk units (a scene cut lands on a chunk boundary).
-    pub const AR_CHUNK_FLAT: u32 = 8;
-
-    /// AR-grid frame count -> whole AR chunks. Validates the grid first.
-    pub fn frames_to_chunks(self, frames: u32) -> Result<usize, String> {
-        self.validate_frames(frames)?;
-        let f_lat = (frames - 1) / 4 + 1;
-        Ok((f_lat / Self::AR_CHUNK_FLAT) as usize)
-    }
-
-    /// Whole AR chunks -> the continuous clip's frame count.
-    pub fn chunks_to_frames(self, chunks: usize) -> u32 {
-        4 * (chunks as u32 * Self::AR_CHUNK_FLAT) - 3
     }
 }
 
@@ -1095,7 +1157,6 @@ impl std::fmt::Display for VideoModelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             VideoModelId::FastwanTi2v5b => "fastwan-ti2v-5b",
-            VideoModelId::Longlive205b => "longlive-2.0-5b",
             VideoModelId::AnyflowT2v14b => "anyflow-t2v-14b",
             VideoModelId::Mobilewan => "mobilewan",
             VideoModelId::Fastwan21T2v13b => "fastwan2.1-t2v-1.3b",
@@ -1108,11 +1169,41 @@ impl std::fmt::Display for VideoModelId {
             VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
             VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",
             VideoModelId::Hunyuan15I2v => "hunyuan-video-1.5-ti2v",
-            VideoModelId::DreamIdV => "dreamid-v",
             VideoModelId::MinimaxH3 => "minimax-h3",
+            VideoModelId::MinimaxH3Turbo => "minimax-h3-turbo",
+            VideoModelId::MinimaxH3TurboRef => "minimax-h3-turbo-ref",
             VideoModelId::Fasth3Trim => "fasth3-trim",
+            VideoModelId::Fasth3V2 => "fasth3-v2",
             VideoModelId::Fasth3Omni => "fasth3-omni",
+            VideoModelId::HyperflowFlash => "hyperflow-flash",
+            VideoModelId::HyperflowFlashRef => "hyperflow-flash-ref",
         })
+    }
+}
+
+/// RelayVSR super-resolution of a generated video (`Comfy-Org/RelayVSR`):
+/// every frame upscaled by the factor after generation, before encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub enum SuperRes {
+    /// 2x (LightX2V's retrain for H3 output; 480p -> 960p).
+    #[cfg_attr(feature = "cli", value(name = "2x"))]
+    #[cfg_attr(feature = "serde", serde(rename = "2x"))]
+    X2,
+    /// 4x (480p -> 1920p).
+    #[cfg_attr(feature = "cli", value(name = "4x"))]
+    #[cfg_attr(feature = "serde", serde(rename = "4x"))]
+    X4,
+}
+
+impl SuperRes {
+    pub fn factor(self) -> usize {
+        match self {
+            SuperRes::X2 => 2,
+            SuperRes::X4 => 4,
+        }
     }
 }
 
@@ -1127,9 +1218,21 @@ pub enum AttnPrecision {
     Bf16,
     /// INT8 QK^T (SageAttention-style: K smoothed by its mean, per-tile
     /// scales; P.V stays bf16). Same quality, but a different sample per seed
-    /// than bf16; ~1.2x faster attention (~1.35x with reference images). The
-    /// FastH3 default.
+    /// than bf16; ~1.2x faster attention (~1.35x with reference images).
     Int8,
+    /// INT8 QK^T plus FP8 (e4m3) P.V (SageAttention2-style: P scaled by
+    /// 448, V per-tile scales, f32 accumulate across key stages). Faster
+    /// attention again; lower attention precision than `int8` with no
+    /// visible change in the output. The FastH3 default; needs an sm_89+
+    /// NVIDIA GPU (older ones run `int8`).
+    Int8Fp8,
+}
+
+impl AttnPrecision {
+    /// INT8 QK^T (`int8` and `int8-fp8`).
+    pub fn int8_qk(self) -> bool {
+        matches!(self, AttnPrecision::Int8 | AttnPrecision::Int8Fp8)
+    }
 }
 
 impl std::fmt::Display for AttnPrecision {
@@ -1137,6 +1240,62 @@ impl std::fmt::Display for AttnPrecision {
         f.write_str(match self {
             AttnPrecision::Bf16 => "bf16",
             AttnPrecision::Int8 => "int8",
+            AttnPrecision::Int8Fp8 => "int8-fp8",
+        })
+    }
+}
+
+/// How FastH3-Omni sizes each reference image before the vision tower and the
+/// VAE encoder, ComfyUI's `ref_image_size` modes. Every mode keeps the aspect
+/// ratio and rounds both sides to multiples of 32. The reference's rows are
+/// attended densely by every block, so their count drives Omni's step time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum RefImageSize {
+    /// The pixel area of the output canvas, never upscaled. The default, as in
+    /// ComfyUI (lightx2v trained its Ref2VA distill this way): identity held
+    /// as well as `diffusers` in A/B, at ~2.4x the speed with one reference.
+    #[default]
+    Match,
+    /// Short edge capped at 2048, never upscaled.
+    Max,
+    /// Short edge exactly 2048, the Diffusers reference (~5.4k dense rows and
+    /// as many vision tokens per portrait reference at 832x480).
+    Diffusers,
+}
+
+impl RefImageSize {
+    /// The resize factor for a `width x height` reference on a
+    /// `canvas_width x canvas_height` output, before rounding to 32.
+    pub fn scale(
+        self,
+        width: usize,
+        height: usize,
+        canvas_width: usize,
+        canvas_height: usize,
+    ) -> f64 {
+        const SHORT_EDGE: f64 = 2048.0;
+        let short = width.min(height) as f64;
+        match self {
+            RefImageSize::Match => {
+                let area = (canvas_width * canvas_height) as f64 / (width * height) as f64;
+                area.sqrt().min(1.0)
+            }
+            RefImageSize::Max => (SHORT_EDGE / short).min(1.0),
+            RefImageSize::Diffusers => SHORT_EDGE / short,
+        }
+    }
+}
+
+impl std::fmt::Display for RefImageSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RefImageSize::Match => "match",
+            RefImageSize::Max => "max",
+            RefImageSize::Diffusers => "diffusers",
         })
     }
 }
@@ -1279,7 +1438,7 @@ impl std::fmt::Display for RewriteQuality {
 /// the clap/`ToSchema` derives live on a type we own). The step count travels
 /// alongside on the request, not in the enum, so it stays a plain UI number.
 /// `UniPc` is the serve/UI default (matches the public FastWan Spaces); `Dmd` is
-/// the byte-parity reference path. Ignored on the AR (LongLive) path.
+/// the byte-parity reference path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1312,8 +1471,11 @@ impl std::fmt::Display for VideoSampler {
     }
 }
 
-/// HyperSwap checkpoint (FaceFusion `models-3.3.0`). 1a/1b/1c share architecture
-/// and speed; different visual character.
+/// Face-swap model. HyperSwap 1a/1b/1c (FaceFusion `models-3.3.0`) paste a
+/// swapped face per frame: same architecture and speed, different visual
+/// character. AlphaFace 256 (FaceFusion `models-3.9.0`) is the same per-frame
+/// form, pose-robust and ~20x the compute. DreamID-V is a diffusion video face
+/// swap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1328,6 +1490,21 @@ pub enum SwapModel {
     #[cfg_attr(feature = "cli", value(name = "hyperswap-1c"))]
     #[cfg_attr(feature = "serde", serde(rename = "hyperswap-1c"))]
     Hyperswap1c,
+    /// AlphaFace 256 (arXiv 2601.16429): a per-frame swapper trained for
+    /// extreme head poses. Same crop, masks and enhancer as HyperSwap;
+    /// non-commercial license.
+    #[cfg_attr(feature = "cli", value(name = "alphaface"))]
+    #[cfg_attr(feature = "serde", serde(rename = "alphaface"))]
+    AlphaFace,
+    /// DreamID-V-Wan-1.3B-Faster: a diffusion VIDEO face swap on the Wan2.1
+    /// backbone (16-step image-CFG; the umT5 context is baked in). Its own
+    /// pipeline (`wan::dreamidv`): the target clip, a live DWPose face mask and
+    /// the source face are VAE-encoded, the mask conditions a 48-channel DiT
+    /// input and a ref-conv prefix injects the source face. Holds identity
+    /// through hard poses; far slower than HyperSwap. Apache-2.0.
+    #[cfg_attr(feature = "cli", value(name = "dreamid-v"))]
+    #[cfg_attr(feature = "serde", serde(rename = "dreamid-v"))]
+    DreamIdV,
 }
 
 impl SwapModel {
@@ -1339,17 +1516,49 @@ impl SwapModel {
             Self::Hyperswap1a => "HyperSwap 1a",
             Self::Hyperswap1b => "HyperSwap 1b",
             Self::Hyperswap1c => "HyperSwap 1c",
+            Self::AlphaFace => "AlphaFace 256 (pose-robust, slower)",
+            Self::DreamIdV => "DreamID-V diffusion face swap (slow, holds hard poses)",
         }
     }
 
-    /// The HyperSwap weight file for this checkpoint.
-    pub fn file(self) -> thinfer_core::manifest::FileRef {
-        let path = match self {
-            SwapModel::Hyperswap1a => "hyperswap_1a_256.onnx",
-            SwapModel::Hyperswap1b => "hyperswap_1b_256.onnx",
-            SwapModel::Hyperswap1c => "hyperswap_1c_256.onnx",
+    /// The diffusion face swap (its own pipeline), not a HyperSwap checkpoint.
+    pub fn is_dreamidv(self) -> bool {
+        matches!(self, SwapModel::DreamIdV)
+    }
+
+    /// The per-frame swapper network; `None` for DreamID-V.
+    pub fn swapper(self) -> Option<thinfer_models::faceswap::SwapperKind> {
+        use thinfer_models::faceswap::SwapperKind;
+        match self {
+            SwapModel::Hyperswap1a | SwapModel::Hyperswap1b | SwapModel::Hyperswap1c => {
+                Some(SwapperKind::HyperSwap)
+            }
+            SwapModel::AlphaFace => Some(SwapperKind::AlphaFace),
+            SwapModel::DreamIdV => None,
+        }
+    }
+
+    /// The per-frame swapper's weight file; `None` for DreamID-V (its files
+    /// come from [`Self::dreamidv_files`]).
+    pub fn file(self) -> Option<thinfer_core::manifest::FileRef> {
+        let (repo, path) = match self {
+            SwapModel::Hyperswap1a => ("facefusion/models-3.3.0", "hyperswap_1a_256.onnx"),
+            SwapModel::Hyperswap1b => ("facefusion/models-3.3.0", "hyperswap_1b_256.onnx"),
+            SwapModel::Hyperswap1c => ("facefusion/models-3.3.0", "hyperswap_1c_256.onnx"),
+            SwapModel::AlphaFace => ("facefusion/models-3.9.0", "alphaface_256.onnx"),
+            SwapModel::DreamIdV => return None,
         };
-        thinfer_core::manifest::FileRef::new("facefusion/models-3.3.0", path)
+        Some(thinfer_core::manifest::FileRef::new(repo, path))
+    }
+
+    /// DreamID-V's whole fetch set: the DiT `.pth`, the Wan2.1 VAE and the two
+    /// DWPose ONNX nets (the Wan manifest's `dreamid-v` variant).
+    pub fn dreamidv_files() -> Vec<thinfer_core::manifest::FileRef> {
+        wanmf::variant("dreamid-v")
+            .expect("dreamid-v missing from the Wan VARIANTS registry")
+            .files()
+            .map(|(_, f)| *f)
+            .collect()
     }
 }
 
@@ -1359,6 +1568,8 @@ impl std::fmt::Display for SwapModel {
             SwapModel::Hyperswap1a => "hyperswap-1a",
             SwapModel::Hyperswap1b => "hyperswap-1b",
             SwapModel::Hyperswap1c => "hyperswap-1c",
+            SwapModel::AlphaFace => "alphaface",
+            SwapModel::DreamIdV => "dreamid-v",
         })
     }
 }

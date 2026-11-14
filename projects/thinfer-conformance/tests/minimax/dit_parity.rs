@@ -320,7 +320,7 @@ where
     );
 
     // --- modulation tables (host) ---
-    let tables = build_modulation_tables(cfg, src, &plan.modulation.timesteps)
+    let tables = build_modulation_tables(cfg, src, &plan.modulation.timesteps, None)
         .await
         .expect("build modulation tables");
     for (i, got) in tables.blocks.iter().enumerate() {

@@ -9,9 +9,14 @@
 //! - through the video VAE encoder (tiled, posterior sampled at seed 42,
 //!   f16-rounded) as clean conditioning rows the DiT attends to.
 //!
-//! Both see the same prepared image: EXIF-oriented RGB, Lanczos-resized so the
-//! short edge is 2048 and both sides are multiples of 32 (no area cap; the
-//! vision processor's own resize is then the identity).
+//! Both see the same prepared image: EXIF-oriented RGB, Lanczos-resized per
+//! [`RefImageSize`] (the reference: short edge 2048) with both sides multiples
+//! of 32 (the vision processor's own resize is then the identity).
+//!
+//! An FL2VA keyframe (fasth3-trim / minimax-h3 first frame, or a chained
+//! clip's handoff) takes the same two paths, prepared at the target canvas
+//! instead (`prepare_keyframe_image`, stretched as the reference does its
+//! first keyframe) and pinned at the clip start rather than given a time slot.
 
 use std::sync::Arc;
 
@@ -23,7 +28,7 @@ use thinfer_core::weight::{WeightId, WeightReader, WeightSource, decode_into};
 use thinfer_core::workspace::Workspace;
 use thinfer_models::common::block::BlockPipelines;
 use thinfer_models::minimax::manifest::role;
-use thinfer_models::minimax::packing::{self, Condition};
+use thinfer_models::minimax::packing::{self, Condition, KeyframeAnchor};
 use thinfer_models::minimax::vae_encoder::{
     EncodeOptions, EncoderPipelines, EncoderSource, H3VaeEncoder,
 };
@@ -32,9 +37,9 @@ use thinfer_models::minimax::{DitConfig, TAG_TEXT, TAG_VIDEO};
 
 use crate::config::ResidencyBudget;
 use crate::minimax::{open_mmap, open_st};
+use crate::model::RefImageSize;
 
-/// Short edge every reference is resized to, and the side multiple.
-const SHORT_EDGE: f64 = 2048.0;
+/// The side multiple every reference is resized to.
 const SIDE_MULTIPLE: usize = 32;
 /// The reference rejects anything flatter than 4:1 either way.
 const MAX_ASPECT: usize = 4;
@@ -47,17 +52,11 @@ const VISION_END: (&str, u32) = ("<|vision_end|>", 151_653);
 const IMAGE_PAD: (&str, u32) = ("<|image_pad|>", 151_655);
 
 /// One reference image, prepared: RGB8 `[height, width, 3]`. User media, so
-/// zeroed on drop like the request's [`crate::request::ImageBytes`].
+/// page-locked on a server and zeroed on drop.
 pub struct Prepared {
-    pub rgb: Vec<u8>,
+    pub rgb: thinfer_core::secmem::Locked<u8>,
     pub height: usize,
     pub width: usize,
-}
-
-impl Drop for Prepared {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.rgb);
-    }
 }
 
 /// Python's `round` (half to even), as the reference sizes with it.
@@ -70,27 +69,56 @@ fn round_half_even(x: f64) -> f64 {
     }
 }
 
-/// Decode, orient and resize one reference image.
-pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
+/// Decode one user image, EXIF-oriented.
+fn decode_oriented(bytes: &[u8], what: &str) -> Result<image::DynamicImage, String> {
     use image::ImageDecoder;
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|e| format!("reference image: {e}"))?
+        .map_err(|e| format!("{what}: {e}"))?
         .into_decoder()
-        .map_err(|e| format!("reference image: {e}"))?;
+        .map_err(|e| format!("{what}: {e}"))?;
     let orientation = decoder
         .orientation()
-        .map_err(|e| format!("reference image orientation: {e}"))?;
-    let mut img =
-        image::DynamicImage::from_decoder(decoder).map_err(|e| format!("reference image: {e}"))?;
+        .map_err(|e| format!("{what} orientation: {e}"))?;
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| format!("{what}: {e}"))?;
     img.apply_orientation(orientation);
+    Ok(img)
+}
+
+/// Decode, orient and stretch an FL2VA first frame to the `width x height`
+/// canvas (Lanczos), as the reference prepares its first keyframe.
+pub fn prepare_keyframe(bytes: &[u8], height: usize, width: usize) -> Result<Prepared, String> {
+    let mut img = decode_oriented(bytes, "input image")?;
+    if (img.width() as usize, img.height() as usize) != (width, height) {
+        img = img.resize_exact(
+            width as u32,
+            height as u32,
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
+    Ok(Prepared {
+        rgb: img.to_rgb8().into_raw().into(),
+        height,
+        width,
+    })
+}
+
+/// Decode, orient and resize one reference image for a `width x height`
+/// canvas.
+pub fn prepare(
+    bytes: &[u8],
+    size: RefImageSize,
+    width: usize,
+    height: usize,
+) -> Result<Prepared, String> {
+    let mut img = decode_oriented(bytes, "reference image")?;
     let (w, h) = (img.width() as usize, img.height() as usize);
     if w > MAX_ASPECT * h || h > MAX_ASPECT * w {
         return Err(format!(
             "reference image {w}x{h} is flatter than {MAX_ASPECT}:1"
         ));
     }
-    let scale = SHORT_EDGE / w.min(h) as f64;
+    let scale = size.scale(w, h, width, height);
     let m = SIDE_MULTIPLE as f64;
     let side = |x: usize| (round_half_even(x as f64 * scale / m) * m).max(m) as usize;
     let (tw, th) = (side(w), side(h));
@@ -98,7 +126,7 @@ pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
         img = img.resize_exact(tw as u32, th as u32, image::imageops::FilterType::Lanczos3);
     }
     Ok(Prepared {
-        rgb: img.to_rgb8().into_raw(),
+        rgb: img.to_rgb8().into_raw().into(),
         height: th,
         width: tw,
     })
@@ -182,14 +210,17 @@ pub async fn vision_features(
     Ok(out)
 }
 
-/// VAE-encode every reference (the reference's recipe) into DiT conditioning
-/// blocks and their patchified rows, in order.
+/// VAE-encode every image (the reference's recipe) into DiT conditioning
+/// blocks and their patchified rows, in order: references (`anchor` `None`)
+/// or keyframes pinned at `anchor`.
 pub async fn latent_conditions(
     backend: &Arc<WgpuBackend>,
     cfg: &DitConfig,
     vae_path: &std::path::Path,
     budget: ResidencyBudget,
     refs: &[Prepared],
+    anchor: Option<KeyframeAnchor>,
+    bf16_conv: bool,
 ) -> Result<(Vec<Condition>, Vec<f32>), String> {
     let raw = open_st(vae_path).await?;
     let channels = cfg.latents_dim;
@@ -220,7 +251,10 @@ pub async fn latent_conditions(
                 r.height,
                 r.width,
                 (&mean, &std),
-                EncodeOptions::REFERENCE,
+                EncodeOptions {
+                    bf16_conv,
+                    ..EncodeOptions::REFERENCE
+                },
                 None,
             )
             .await
@@ -236,9 +270,12 @@ pub async fn latent_conditions(
             )
             .map_err(|e| format!("patchify reference: {e:?}"))?,
         );
-        conditions.push(Condition::Reference {
-            latent_height: frame.height,
-            latent_width: frame.width,
+        conditions.push(match anchor {
+            Some(a) => Condition::Keyframe(a),
+            None => Condition::Reference {
+                latent_height: frame.height,
+                latent_width: frame.width,
+            },
         });
     }
     residency.evict_all_and_free(&**backend);
@@ -277,16 +314,31 @@ mod tests {
         assert_eq!(round_half_even(-2.5), -2.0);
     }
 
-    /// The spec's worked size: 1024x1536 -> 2048x3072 (6144 vision tokens).
-    #[test]
-    fn prepare_scales_the_short_edge_to_2048() {
-        let img = image::RgbImage::new(1024, 1536);
+    fn png(width: u32, height: u32) -> Vec<u8> {
         let mut png = Vec::new();
-        image::DynamicImage::ImageRgb8(img)
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let p = prepare(&png).unwrap();
+        png
+    }
+
+    /// The spec's worked size: 1024x1536 -> 2048x3072 (6144 vision tokens).
+    #[test]
+    fn diffusers_scales_the_short_edge_to_2048() {
+        let p = prepare(&png(1024, 1536), RefImageSize::Diffusers, 832, 480).unwrap();
         assert_eq!((p.width, p.height), (2048, 3072));
         assert_eq!(p.rgb.len(), 2048 * 3072 * 3);
+    }
+
+    /// `match` takes the canvas area (sqrt(832*480 / (1024*1536)) = 0.504:
+    /// 516x774 -> 512x768); `max` never upscales.
+    #[test]
+    fn match_and_max_never_upscale() {
+        let p = prepare(&png(1024, 1536), RefImageSize::Match, 832, 480).unwrap();
+        assert_eq!((p.width, p.height), (512, 768));
+        let p = prepare(&png(320, 480), RefImageSize::Match, 832, 480).unwrap();
+        assert_eq!((p.width, p.height), (320, 480));
+        let p = prepare(&png(1024, 1536), RefImageSize::Max, 832, 480).unwrap();
+        assert_eq!((p.width, p.height), (1024, 1536));
     }
 }

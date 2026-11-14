@@ -15,6 +15,7 @@ bytemuck = { version = "1", features = ["derive"] }
 safetensors = "0.4"
 tokio = { version = "1", features = ["fs", "io-util", "rt"] }
 memmap2 = "0.9"
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 # User weight sources file (`sources.rs`).
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -26,8 +27,13 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 [target.'cfg(windows)'.dependencies]
 # PrefetchVirtualMemory for MmapFile::will_read (memmap2's advise_range is
 # unix-only), GlobalMemoryStatusEx for `prefetch::available_ram`. Version
-# pinned to one already in the workspace graph.
-windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Foundation"] }
+# pinned to one already in the workspace graph. Security: `harden` (the
+# process DACL).
+windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+
+[target.'cfg(unix)'.dependencies]
+# `harden`: prctl (Linux) / ptrace (macOS).
+libc = "0.2"
 
 [dev-dependencies]
 half = { version = "2", features = ["bytemuck"] }

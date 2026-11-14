@@ -38,6 +38,7 @@ fn video_input(bytes: Vec<u8>, dir: &std::path::Path) -> Result<VideoInput, Stri
 /// format). Returns the request + the per-request coopmat opt-out.
 pub fn spec_into_request(
     spec: JobSpec,
+    job_id: &str,
     dir: &Path,
     key: &JobKey,
     config: &ServeConfig,
@@ -52,14 +53,14 @@ pub fn spec_into_request(
         JobSpec::Image(s) => {
             let model = s.model.unwrap_or(ImageModelId::DEFAULT);
             let d = model.defaults();
-            // Image-edit reference image: base64-decode and hold in RAM
-            // ([`ImageBytes`]); a decrypted image never touches disk.
-            // `ImageRequest::validate` enforces the present/required-by-kind
-            // rules (400 on mismatch).
-            let input_image = match s.input_image {
-                Some(b64) => Some(ImageBytes(b64_decode("input_image", &b64)?)),
-                None => None,
-            };
+            // Input images: base64-decode and hold in RAM ([`ImageBytes`]); a
+            // decrypted image never touches disk. `ImageRequest::validate`
+            // enforces the per-kind counts (400 on mismatch).
+            let input_images = s
+                .input_images
+                .iter()
+                .map(|b64| b64_decode("input_images", b64).map(ImageBytes))
+                .collect::<Result<Vec<_>, String>>()?;
             let req = ImageRequest {
                 model,
                 prompt: s.prompt,
@@ -69,7 +70,7 @@ pub fn spec_into_request(
                 seed: s.seed,
                 i8_matmul: s.i8_matmul.unwrap_or(true),
                 full_precision: s.full_precision.unwrap_or(false),
-                input_image,
+                input_images,
                 lora: s
                     .lora
                     .into_iter()
@@ -99,29 +100,13 @@ pub fn spec_into_request(
                 Some(b64) => Some(ImageBytes(b64_decode("input_image", &b64)?)),
                 None => None,
             };
-            // DreamID-V source FACE image: small, held in RAM only (never on
-            // disk), matching the target video's RAM-first privacy.
-            let source_image = match s.source_image {
-                Some(b64) => Some(ImageBytes(b64_decode("source_image", &b64)?)),
-                None => None,
-            };
-            // FastH3-Omni reference images: RAM only, like the source face.
+            // FastH3-Omni reference images: RAM only, never on disk.
             let ref_images = s
                 .ref_images
                 .unwrap_or_default()
                 .iter()
                 .map(|b64| b64_decode("ref_images", b64).map(ImageBytes))
                 .collect::<Result<Vec<_>, String>>()?;
-            // DreamID-V target VIDEO: a streamed upload id (preferred; the
-            // client sealed it under the job key, so it stays ciphertext until
-            // the frames are decoded) is consumed into the job dir; else a
-            // base64 payload is decoded RAM-first with an encrypted spill for
-            // large clips. Either way, raw plaintext never lands on disk.
-            let input_video = match (s.input_video_upload, s.input_video) {
-                (Some(uid), _) => Some(uploads.consume(&uid, dir, key)?),
-                (None, Some(b64)) => Some(video_input(b64_decode("input_video", &b64)?, dir)?),
-                (None, None) => None,
-            };
             let req = VideoRequest {
                 model,
                 prompts: s.prompts,
@@ -133,10 +118,8 @@ pub fn spec_into_request(
                 seed: s.seed,
                 input_image,
                 strength: s.strength.unwrap_or(1.0),
-                source_image,
                 ref_images,
-                input_video,
-                guide_scale: s.guide_scale,
+                ref_image_size: s.ref_image_size.unwrap_or_default(),
                 sampler: s.sampler.unwrap_or(model.default_sampler()),
                 steps: s.steps.unwrap_or(model.default_steps()),
                 attn_window: s.attn_window,
@@ -146,7 +129,10 @@ pub fn spec_into_request(
                 attn: s.attn.unwrap_or(model.default_attn()),
                 audio: s.audio.unwrap_or(true),
                 upscale: s.upscale.unwrap_or(model.two_stage_default()),
+                super_res: s.super_res,
                 audio_hq: s.audio_hq.unwrap_or(false),
+                vae_encode_f32: s.vae_encode_f32.unwrap_or(false),
+                bf16_gemm: s.bf16_gemm.unwrap_or(false),
                 rewrite: s.rewrite.unwrap_or(true),
                 rewrite_quality: s.rewrite_quality.unwrap_or_default(),
                 lora: s
@@ -177,7 +163,7 @@ pub fn spec_into_request(
                 return Err("server-side input paths are not accepted; upload the media".into());
             }
             let input_video = match (s.input_video_upload, s.input_video_b64) {
-                (Some(uid), _) => uploads.consume(&uid, dir, key)?,
+                (Some(uid), _) => uploads.consume(&uid, job_id, dir, key)?,
                 (None, Some(b64)) => video_input(b64_decode("input_video_b64", &b64)?, dir)?,
                 (None, None) => return Err("face-swap requires an input video".into()),
             };
@@ -200,6 +186,18 @@ pub fn spec_into_request(
                     bitrate_scale: s.bitrate_scale.unwrap_or(1.15),
                     start_secs: s.start_secs,
                     end_secs: s.end_secs,
+                    diffusion: {
+                        let d = thinfer_app::request::DiffusionSwapOptions::default();
+                        thinfer_app::request::DiffusionSwapOptions {
+                            steps: s.steps.unwrap_or(d.steps),
+                            guide_scale: s.guide_scale.unwrap_or(d.guide_scale),
+                            seed: s.seed,
+                            width: s.width.unwrap_or(d.width),
+                            height: s.height.unwrap_or(d.height),
+                            cfg_every: s.cfg_every.unwrap_or(d.cfg_every),
+                            face_crop: s.face_crop.unwrap_or(d.face_crop),
+                        }
+                    },
                 },
             };
             req.validate()?;

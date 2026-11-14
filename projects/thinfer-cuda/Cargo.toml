@@ -22,6 +22,8 @@ ash = "0.38"
 cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13020"] }
 # Preloading the CUDA DLLs by full path (see `libs.rs`); already in the graph via cudarc.
 libloading = "0.8"
+# The accelerator fence's completion channel (already in the graph via thinfer-core).
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 # CloseHandle for the exported Vulkan memory handle (version already in the graph).

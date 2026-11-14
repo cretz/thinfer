@@ -3003,11 +3003,13 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "fdk-aac",
+ "futures-channel",
  "futures-util",
  "image",
  "mp4",
  "openh264",
  "openh264-sys2",
+ "pollster",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -3064,6 +3066,7 @@ dependencies = [
  "bytemuck",
  "futures-channel",
  "half",
+ "libc",
  "pollster",
  "safetensors",
  "serde",
@@ -3072,6 +3075,8 @@ dependencies = [
  "tracing-subscriber",
  "web-time",
  "wgpu",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3080,6 +3085,7 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "cudarc",
+ "futures-channel",
  "half",
  "libloading 0.8.9",
  "pollster",
@@ -3106,8 +3112,10 @@ name = "thinfer-native"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
+ "futures-channel",
  "half",
  "hf-hub",
+ "libc",
  "memmap2",
  "pollster",
  "safetensors",
@@ -3137,6 +3145,7 @@ dependencies = [
  "serde_json",
  "thinfer-app",
  "thinfer-core",
+ "thinfer-native",
  "tokio",
  "tokio-util",
  "toml",

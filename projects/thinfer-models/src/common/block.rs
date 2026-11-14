@@ -3112,6 +3112,13 @@ impl<'wsp> ActBuf<'wsp> {
             scale: Some(scale),
         }
     }
+    /// Last use: see [`BatchScope::recycle`].
+    pub fn recycle(self, scope: &BatchScope<'wsp, WgpuBackend>) {
+        scope.recycle(self.data);
+        if let Some(s) = self.scale {
+            scope.recycle(s);
+        }
+    }
     /// Push the data and (if i8) scale BatchBufs of this ActBuf into a packer
     /// carry vec, in that order. Inverse of `pop_act`.
     fn push_carry(self, carry: &mut Vec<BatchBuf<'wsp>>) {
@@ -3807,6 +3814,28 @@ fn op_sdpa_impl<'wsp>(
         && head_dim.is_multiple_of(32)
         && head_dim <= 128
         && pipelines.sdpa_sg_win.is_some();
+    // The accelerator's sdpa (plain uniform only) is several times the WGSL
+    // kernel's rate and each call costs a drain and a uniform readback, so
+    // its calls get their own, larger watchdog budget.
+    let max_rows = if uses_sg
+        && !windowed
+        && b == 1
+        && has_mask == 0
+        && scope
+            .accelerator()
+            .is_some_and(|a| a.accepts_sdpa_f16(SDPA_UNIFORM_BYTES))
+    {
+        const MAX_ACCEL_WORK: u64 = 2_000_000_000_000;
+        let per_row = s_k.max(1) as u64 * row_elems as u64;
+        let rows = MAX_ACCEL_WORK / per_row;
+        if rows >= s_q as u64 {
+            s_q.max(1)
+        } else {
+            (rows as u32 / 64 * 64).max(64)
+        }
+    } else {
+        max_rows
+    };
     // When we split, the OS GPU watchdog (a per-submit timer) is only respected
     // if each heavy chunk lands in its OWN submit: dispatches inside one command
     // buffer are not preempted, so 4 chunks in one submit still trips the 2s TDR.
@@ -3910,6 +3939,7 @@ fn dispatch_sdpa_dense<'wsp>(
     head_dim: u32,
 ) -> Result<(), WgpuError> {
     if let Some(sdpa_large_d) = pipelines.sdpa_large_d.as_ref().filter(|_| head_dim > 128) {
+        SdpaF32LargeD::assert_fits(head_dim);
         scope.sdpa::<SdpaF32LargeD>(sdpa_large_d, q, k, v, mask, u, out, b, s_q, h_q)
     } else if let Some(sdpa_sg) = pipelines.sdpa_sg.as_ref().filter(|_| {
         // f16-reading kernel: native-act F16 blocks only (see `op_sdpa_impl`).
@@ -4147,6 +4177,9 @@ fn rmsnorm_uniform<'wsp>(
     scope.write_uniform(&bytes)
 }
 
+/// The plain sdpa uniform's size ([`sdpa_uniform`]).
+const SDPA_UNIFORM_BYTES: u64 = 32;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sdpa_uniform<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
@@ -4159,7 +4192,7 @@ pub(crate) fn sdpa_uniform<'wsp>(
     scale: f32,
     has_mask: u32,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; SDPA_UNIFORM_BYTES as usize];
     bytes[0..4].copy_from_slice(&b.to_le_bytes());
     bytes[4..8].copy_from_slice(&h_q.to_le_bytes());
     bytes[8..12].copy_from_slice(&h_kv.to_le_bytes());

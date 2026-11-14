@@ -19,6 +19,7 @@
 //! the tail as a separate attention document; a padless sequence needs no
 //! attention mask at all, which keeps the fast unmasked sdpa path available.
 
+use super::adaln::TimeKey;
 use super::{DitConfig, MODALITY_NUM, TAG_AUDIO, TAG_VIDEO};
 
 /// MiniMax-H3 generates at a fixed 24 fps.
@@ -33,6 +34,11 @@ pub const MIN_ASPECT_RATIO: f64 = 0.25;
 pub const MAX_ASPECT_RATIO: f64 = 4.0;
 pub const MIN_DURATION: f64 = 5.0;
 pub const MAX_DURATION: f64 = 15.0;
+
+/// The longest trained clip on the `17n + 5` grid (15 s rounds up to 362).
+pub fn max_clip_frames() -> usize {
+    align_num_frames((MAX_DURATION * FPS as f64) as usize).expect("a positive frame count")
+}
 
 /// The video VAE encodes 17 pixel frames per chunk and drops the 3 trailing
 /// latent frames of every chunk, so `17n + 5` pixel frames map to `5n + 2`
@@ -411,11 +417,11 @@ pub fn build_packed_sequence(
 /// inherit the video timestep.
 pub fn build_row_timesteps(
     layout: &PackedSequence,
-    video_timestep: f32,
-    audio_timestep: f32,
-    condition_video_timestep: f32,
-    condition_audio_timestep: f32,
-) -> (Vec<f32>, Vec<u32>) {
+    video_timestep: TimeKey,
+    audio_timestep: TimeKey,
+    condition_video_timestep: TimeKey,
+    condition_audio_timestep: TimeKey,
+) -> (Vec<TimeKey>, Vec<u32>) {
     let mut rows = vec![video_timestep; layout.seq_len];
     let n_cond_v = layout.num_condition_video_rows;
     let n_cond_a = layout.num_condition_audio_rows;
@@ -430,14 +436,14 @@ pub fn build_row_timesteps(
         rows[i as usize] = condition_audio_timestep;
     }
 
-    let mut distinct: Vec<f32> = rows.clone();
-    distinct.sort_by(|a, b| a.partial_cmp(b).expect("timesteps are finite"));
+    let mut distinct: Vec<TimeKey> = rows.clone();
+    distinct.sort_by(TimeKey::order);
     distinct.dedup();
     let index: Vec<u32> = rows
         .iter()
         .map(|t| {
             distinct
-                .binary_search_by(|p| p.partial_cmp(t).expect("timesteps are finite"))
+                .binary_search_by(|p| p.order(t))
                 .expect("every row timestep is in the distinct set") as u32
         })
         .collect();
@@ -735,19 +741,25 @@ mod tests {
     #[test]
     fn row_timesteps_collapse_to_distinct_levels() {
         let l = tiny_layout(2);
-        let (distinct, index) = build_row_timesteps(&l, 0.7, 0.4, 0.999, 1.0);
+        let (distinct, index) = build_row_timesteps(
+            &l,
+            TimeKey::single(0.7),
+            TimeKey::single(0.4),
+            TimeKey::single(0.999),
+            TimeKey::single(1.0),
+        );
         // No conditioning rows: only the video (text inherits it) and audio levels.
-        assert_eq!(distinct, vec![0.4, 0.7]);
+        assert_eq!(distinct, vec![TimeKey::single(0.4), TimeKey::single(0.7)]);
         assert_eq!(index.len(), l.seq_len);
         for &i in &l.audio_indices {
-            assert_eq!(distinct[index[i as usize] as usize], 0.4);
+            assert_eq!(distinct[index[i as usize] as usize].t, 0.4);
         }
         for &i in &l.video_indices {
-            assert_eq!(distinct[index[i as usize] as usize], 0.7);
+            assert_eq!(distinct[index[i as usize] as usize].t, 0.7);
         }
         for &i in &l.text_indices {
             assert_eq!(
-                distinct[index[i as usize] as usize], 0.7,
+                distinct[index[i as usize] as usize].t, 0.7,
                 "text inherits video"
             );
         }

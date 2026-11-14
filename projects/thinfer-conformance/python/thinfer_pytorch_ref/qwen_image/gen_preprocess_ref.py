@@ -2,21 +2,25 @@
 
 The engine's edit path consumes host-prepared tensors (ViT patches, VAE image,
 edit-templated tokens). `thinfer-app`'s `preprocess.rs` builds those in Rust;
-this module builds the SAME tensors from a real PNG via the AUTHORITATIVE HF /
-diffusers code paths, so the Rust output can be checked against ground truth.
+this module builds the SAME tensors from a real PNG the way the checkpoint's
+prescribed conditioning does: Phr00t's fixed ComfyUI
+`TextEncodeQwenImageEditPlus` node (Qwen-Image-Edit-Rapid-AIO is an Edit-2509
+merge), with the VL image then run through the `Qwen2VLImageProcessor` steps.
 
-  * ViT channel: the real `Qwen2VLImageProcessor` (smart_resize to a mult of 28,
-    BICUBIC, CLIP normalize, merge-unit-major patchify) -> `pixel_values
-    [N, 1176]` + `image_grid_thw`.
-  * VAE channel: the diffusers `VaeImageProcessor` (resize to a mult of 32 via
-    `calculate_dimensions`, lanczos, normalize to [-1, 1]) -> `[3, 1, Hv, Wv]`.
-  * Tokens: the edit chat template (drop_idx 64) with `<|image_pad|>` expanded
-    to `n_img = (gh/2)*(gw/2)`, tokenized with the real tokenizer.
+  * ViT channel: `common_upscale(.., "area")` to a 384^2 area (torch area
+    interpolate, rounded sides), then smart_resize to a mult of 28, BICUBIC,
+    CLIP normalize, merge-unit-major patchify -> `pixel_values [N, 1176]`.
+  * VAE channel: an 896^2 area with sides floored to a mult of 32,
+    `common_upscale(.., "lanczos", "center")` (center crop to that aspect, PIL
+    LANCZOS), normalized to [-1, 1] -> `[3, 1, Hv, Wv]`.
+  * Tokens: the node's Plus `llama_template` with `Picture 1: ` + the vision
+    block (`<|image_pad|>` expanded to `n_img = (gh/2)*(gw/2)`) before the
+    prompt; `drop` = the system + user-header tokens ComfyUI strips.
 
   pixel_values.bin f32 LE [N, 1176]
   vae_image.bin    f32 LE [3, 1, Hv, Wv] in [-1, 1]
   token_ids.bin    u32 LE
-  meta.txt         "gh gw n_img image_pad_start Hv Wv"
+  meta.txt         "gh gw n_img image_pad_start Hv Wv drop"
 
 Usage:
 
@@ -33,8 +37,22 @@ from pathlib import Path
 
 import numpy as np
 
-from thinfer_pytorch_ref.qwen_image.gen_encoder_edit_ref import EDIT_TEMPLATE, IMAGE_PAD
+from thinfer_pytorch_ref.qwen_image.gen_encoder_edit_ref import IMAGE_PAD
 from thinfer_pytorch_ref.qwen_image.gen_vision_ref import MERGE
+
+PLUS_SYSTEM = (
+    "<|im_start|>system\nDescribe key details of the input image (including any objects, "
+    "characters, poses, facial features, clothing, setting, textures and style), then explain "
+    "how the user's text instruction should alter, modify or recreate the image. Generate a new "
+    "image that meets the user's requirements, which can vary from a small change to a "
+    "completely new image using inputs as a guide.<|im_end|>\n<|im_start|>user\n"
+)
+PLUS_TEMPLATE = (
+    PLUS_SYSTEM
+    + "Picture 1: <|vision_start|>{img}<|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n"
+)
+VL_AREA = 384 * 384
+VAE_TARGET_SIZE = 896
 
 IMAGE_TOKEN_ID = 151655  # <|image_pad|>
 PATCH = 14
@@ -80,13 +98,37 @@ def _vit_pixels(img, gh: int, gw: int) -> np.ndarray:
     return np.ascontiguousarray(flat.astype("float32"))
 
 
-def _calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
-    """diffusers `pipeline_qwenimage_edit.calculate_dimensions` (width, height)."""
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-    width = round(width / 32) * 32
-    height = round(height / 32) * 32
-    return width, height
+def _area_resize(img, area: int):
+    """The node's VL resize: scale to `area`, sides rounded, ComfyUI
+    `common_upscale(.., "area")` = torch area interpolation."""
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image as _Im
+
+    w, h = img.size
+    s = math.sqrt(area / (w * h))
+    nw, nh = round(w * s), round(h * s)
+    t = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)[None]
+    out = F.interpolate(t, size=(nh, nw), mode="area")[0].permute(1, 2, 0).numpy()
+    return _Im.fromarray(np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8))
+
+
+def _vae_resize(img):
+    """The node's VAE resize: `target_size`^2 area, sides floored to /32, then
+    `common_upscale(.., "lanczos", "center")` (center crop, PIL LANCZOS)."""
+    from PIL import Image as _Im
+
+    w, h = img.size
+    s = math.sqrt(VAE_TARGET_SIZE * VAE_TARGET_SIZE / (w * h))
+    vw, vh = int(w * s / 32) * 32, int(h * s / 32) * 32
+    old, new = w / h, vw / vh
+    cw, ch = w, h
+    if old > new:
+        cw = round(w * new / old)
+    elif old < new:
+        ch = round(h * old / new)
+    x, y = (w - cw) // 2, (h - ch) // 2
+    return img.crop((x, y, x + cw, y + ch)).resize((vw, vh), resample=_Im.LANCZOS), vh, vw
 
 
 def main() -> int:
@@ -101,36 +143,31 @@ def main() -> int:
 
     from PIL import Image
     from transformers import AutoTokenizer
-    from diffusers.image_processor import VaeImageProcessor
 
     img = Image.open(args.image).convert("RGB")
     in_w, in_h = img.size
 
-    # --- ViT channel: replicate Qwen2VLImageProcessor (torchvision-free) ---
-    gh_px, gw_px = _smart_resize(in_h, in_w)
+    # --- ViT channel: the node's area resize, then Qwen2VLImageProcessor ---
+    vl = _area_resize(img, VL_AREA)
+    gh_px, gw_px = _smart_resize(vl.size[1], vl.size[0])
     gh, gw = gh_px // PATCH, gw_px // PATCH
     n = gh * gw
-    pixel_values = _vit_pixels(img, gh, gw)
+    pixel_values = _vit_pixels(vl, gh, gw)
     assert pixel_values.shape == (n, 1176), pixel_values.shape
     pixel_values.astype("<f4").tofile(str(args.out / "pixel_values.bin"))
 
-    # --- VAE channel: diffusers preprocess (calculate_dimensions + normalize) ---
-    vae_w, vae_h = _calculate_dimensions(1024 * 1024, in_w / in_h)
-    multiple_of = 8 * 2  # vae_scale_factor (8) * 2
-    vae_w = vae_w // multiple_of * multiple_of
-    vae_h = vae_h // multiple_of * multiple_of
-    vip = VaeImageProcessor(vae_scale_factor=8)
-    resized = vip.resize(img, vae_h, vae_w)
-    vae_t = vip.preprocess(resized, vae_h, vae_w)  # [1, 3, H, W] in [-1, 1]
-    vae_np = vae_t.detach().cpu().numpy().astype("float32")
-    vae_np = vae_np.reshape(3, 1, vae_h, vae_w)  # CTHW (T=1)
+    # --- VAE channel: the node's reference-latent image, in [-1, 1] ---
+    resized, vae_h, vae_w = _vae_resize(img)
+    vae_np = np.asarray(resized, dtype=np.float32) / 127.5 - 1.0
+    vae_np = vae_np.transpose(2, 0, 1).reshape(3, 1, vae_h, vae_w)  # CTHW (T=1)
     np.ascontiguousarray(vae_np).astype("<f4").tofile(str(args.out / "vae_image.bin"))
 
     # --- tokens: edit template, image_pad expanded to n_img ---
     mgh, mgw = gh // MERGE, gw // MERGE
     n_img = mgh * mgw
     tokenizer = AutoTokenizer.from_pretrained(str(args.tokenizer_dir))
-    text = EDIT_TEMPLATE.format(img=IMAGE_PAD * n_img, prompt=args.prompt)
+    text = PLUS_TEMPLATE.format(img=IMAGE_PAD * n_img, prompt=args.prompt)
+    drop = len(tokenizer(PLUS_SYSTEM, add_special_tokens=False)["input_ids"])
     enc = tokenizer(text, return_tensors="np", add_special_tokens=False)
     ids = enc["input_ids"][0].astype(np.int64)
     pad_positions = [i for i, t in enumerate(ids.tolist()) if t == IMAGE_TOKEN_ID]
@@ -140,7 +177,7 @@ def main() -> int:
     ids.astype("<u4").tofile(str(args.out / "token_ids.bin"))
 
     (args.out / "meta.txt").write_text(
-        f"{gh} {gw} {n_img} {pad_start} {vae_h} {vae_w}\n"
+        f"{gh} {gw} {n_img} {pad_start} {vae_h} {vae_w} {drop}\n"
     )
     print(
         f"[py-qwen-preprocess] in={in_w}x{in_h} ViT={gh}x{gw} N={n} n_img={n_img} "

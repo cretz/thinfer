@@ -167,25 +167,32 @@ pub fn act_upload_bytes(act: ActDtype, slice: &[f32]) -> Vec<u8> {
 /// of `n_elems`. Bf16 path zero-extends the 2-byte half to f32 via `(h << 16)`.
 pub fn act_readback_to_f32(act: ActDtype, bytes: &[u8], n_elems: usize) -> Vec<f32> {
     let mut out = vec![0f32; n_elems];
+    act_readback_into_f32(act, bytes, &mut out);
+    out
+}
+
+/// [`act_readback_to_f32`] into `out` (`bytes` holds exactly `out.len()`
+/// elements).
+pub fn act_readback_into_f32(act: ActDtype, bytes: &[u8], out: &mut [f32]) {
     match act {
         ActDtype::F32 => {
-            debug_assert_eq!(bytes.len(), n_elems * 4);
-            for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-                out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            debug_assert_eq!(bytes.len(), out.len() * 4);
+            for (o, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                *o = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             }
         }
         ActDtype::Bf16 => {
-            debug_assert_eq!(bytes.len(), n_elems * 2);
-            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+            debug_assert_eq!(bytes.len(), out.len() * 2);
+            for (o, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
                 let half = u16::from_le_bytes([chunk[0], chunk[1]]);
-                out[i] = f32::from_bits((half as u32) << 16);
+                *o = f32::from_bits((half as u32) << 16);
             }
         }
         ActDtype::F16 => {
-            debug_assert_eq!(bytes.len(), n_elems * 2);
-            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+            debug_assert_eq!(bytes.len(), out.len() * 2);
+            for (o, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
                 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                out[i] = half::f16::from_bits(bits).to_f32();
+                *o = half::f16::from_bits(bits).to_f32();
             }
         }
         ActDtype::I8 => {
@@ -194,7 +201,6 @@ pub fn act_readback_to_f32(act: ActDtype, bytes: &[u8], n_elems: usize) -> Vec<f
             )
         }
     }
-    out
 }
 
 /// Decode paired I8 bytes (packed i8 data + per-32-block vec2<f16> params)
@@ -350,6 +356,69 @@ pub fn round_f32_to_bf16(x: f32) -> u16 {
     } else {
         let rounding = 0x7fff + ((bits >> 16) & 1);
         ((bits.wrapping_add(rounding)) >> 16) as u16
+    }
+}
+
+/// `(0..n).map(f)` with one scoped thread per item on native, in order;
+/// serial on wasm (single-threaded). Host-side work only: identical results.
+pub fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if n > 1 {
+        return std::thread::scope(|s| {
+            let f = &f;
+            let workers: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+    }
+    (0..n).map(f).collect()
+}
+
+/// Run `f` on a worker thread and await its result without blocking the
+/// engine thread, so the other legs of a `join!` (weight streaming, the
+/// next block's encode) keep running meanwhile. Inline on wasm
+/// (single-threaded). A panic in `f` resumes on the awaiting thread.
+pub async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    #[cfg(target_arch = "wasm32")]
+    {
+        f()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::{Arc, Mutex};
+        use std::task::{Poll, Waker};
+        type Outcome<T> = std::thread::Result<T>;
+        struct Slot<T> {
+            done: Option<Outcome<T>>,
+            waker: Option<Waker>,
+        }
+        let slot = Arc::new(Mutex::new(Slot::<T> {
+            done: None,
+            waker: None,
+        }));
+        let worker = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let mut s = worker.lock().unwrap_or_else(|p| p.into_inner());
+            s.done = Some(r);
+            if let Some(w) = s.waker.take() {
+                w.wake();
+            }
+        });
+        let out = std::future::poll_fn(|cx| {
+            let mut s = slot.lock().unwrap_or_else(|p| p.into_inner());
+            match s.done.take() {
+                Some(r) => Poll::Ready(r),
+                None => {
+                    s.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
+        out.unwrap_or_else(|p| std::panic::resume_unwind(p))
     }
 }
 

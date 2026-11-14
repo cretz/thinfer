@@ -38,7 +38,7 @@ use thinfer_core::residency::{
 };
 use thinfer_core::tensor::StorageEncoding;
 use thinfer_core::weight::{WeightId, WeightSource};
-use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi};
+use thinfer_core::workspace::{BatchBuf, BatchScope, GemmEpi, Nvfp4Epi};
 
 use std::collections::HashMap;
 
@@ -119,20 +119,20 @@ pub struct SiteLora {
 /// qkv, 128 elsewhere, against a 385M-MAC block), needs no requantization, and
 /// so is also exact where a refold would not be.
 #[derive(Clone, Copy, Debug)]
-pub struct BlockLora<T> {
+pub struct BlockSites<T> {
     qkv: Option<T>,
     out: Option<T>,
     fc1: Option<T>,
     fc2: Option<T>,
 }
 
-impl<T> BlockLora<T> {
+impl<T> BlockSites<T> {
     fn sites(&self) -> [&Option<T>; 4] {
         [&self.qkv, &self.out, &self.fc1, &self.fc2]
     }
 
-    fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> BlockLora<U> {
-        BlockLora {
+    fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> BlockSites<U> {
+        BlockSites {
             qkv: self.qkv.as_ref().map(&mut f),
             out: self.out.as_ref().map(&mut f),
             fc1: self.fc1.as_ref().map(&mut f),
@@ -141,9 +141,23 @@ impl<T> BlockLora<T> {
     }
 }
 
-pub type BlockLoraHandles = BlockLora<SiteLora>;
-pub type BlockLoraViews<'a> = BlockLora<SiteLoraViews<'a>>;
-pub type BlockLoraBufs = BlockLora<SiteLoraBufs>;
+pub type BlockLoraHandles = BlockSites<SiteLora>;
+pub type BlockLoraViews<'a> = BlockSites<SiteLoraViews<'a>>;
+pub type BlockLoraBufs = BlockSites<SiteLoraBufs>;
+
+/// A FACTORED site's second factor (HyperFlow H3 Flash low-rank linears):
+/// `y = up(down(x))`, the site's own weight being `down` (`[K, rank]` after the
+/// upload transpose) and `up` the `[rank, N]` operand. `kind` is `up`'s
+/// resident dequant scheme.
+#[derive(Clone, Copy, Debug)]
+pub struct SiteUp<T> {
+    up: T,
+    rank: u32,
+    kind: Option<DequantScheme>,
+}
+
+pub type BlockUpHandles = BlockSites<SiteUp<WeightHandle>>;
+pub type BlockUpBufs = BlockSites<SiteUp<BufRef>>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SiteLoraBufs {
@@ -172,6 +186,8 @@ pub struct BlockHandles {
     gate: Option<WeightHandle>,
     kinds: MatmulKinds,
     lora: Option<BlockLoraHandles>,
+    /// Factored sites' second factors; `None` on a dense block.
+    up: Option<BlockUpHandles>,
 }
 
 pub struct BlockViews<'a> {
@@ -185,6 +201,7 @@ pub struct BlockViews<'a> {
     fc2: GpuView<'a>,
     gate: Option<GpuView<'a>>,
     lora: Option<BlockLoraViews<'a>>,
+    up: Option<BlockSites<SiteUp<GpuView<'a>>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -199,6 +216,7 @@ pub struct BlockBufs {
     fc2: BufRef,
     gate: Option<BufRef>,
     lora: Option<BlockLoraBufs>,
+    up: Option<BlockUpBufs>,
 }
 
 impl BlockHandles {
@@ -214,9 +232,14 @@ impl BlockHandles {
         &self,
         residency: &WeightResidency<S>,
     ) -> Result<(), S::Error> {
+        let ups = self
+            .up
+            .map(|u| u.sites().map(|s| s.map(|s| s.up)))
+            .unwrap_or_default();
         for h in [self.qkv_proj, self.out_proj, self.fc1, self.fc2]
             .into_iter()
             .chain(self.gate)
+            .chain(ups.into_iter().flatten())
         {
             residency.hint_read(h).await?;
         }
@@ -230,14 +253,24 @@ impl BlockHandles {
     ) -> Result<BlockViews<'a>, ResidencyError<S::Error, WgpuError>> {
         let lora = match self.lora {
             None => None,
-            Some(l) => Some(BlockLoraViews {
+            Some(l) => Some(BlockSites {
                 qkv: SiteLora::acquire_opt(l.qkv, residency, backend).await?,
                 out: SiteLora::acquire_opt(l.out, residency, backend).await?,
                 fc1: SiteLora::acquire_opt(l.fc1, residency, backend).await?,
                 fc2: SiteLora::acquire_opt(l.fc2, residency, backend).await?,
             }),
         };
+        let up = match self.up {
+            None => None,
+            Some(u) => Some(BlockSites {
+                qkv: SiteUp::acquire_opt(u.qkv, residency, backend).await?,
+                out: SiteUp::acquire_opt(u.out, residency, backend).await?,
+                fc1: SiteUp::acquire_opt(u.fc1, residency, backend).await?,
+                fc2: SiteUp::acquire_opt(u.fc2, residency, backend).await?,
+            }),
+        };
         Ok(BlockViews {
+            up,
             norm1: residency.acquire(self.norm1, backend).await?,
             norm2: residency.acquire(self.norm2, backend).await?,
             qkv_proj: residency.acquire(self.qkv_proj, backend).await?,
@@ -252,6 +285,23 @@ impl BlockHandles {
             },
             lora,
         })
+    }
+}
+
+impl SiteUp<WeightHandle> {
+    async fn acquire_opt<'a, S: WeightSource>(
+        site: Option<Self>,
+        residency: &'a WeightResidency<S>,
+        backend: &WgpuBackend,
+    ) -> Result<Option<SiteUp<GpuView<'a>>>, ResidencyError<S::Error, WgpuError>> {
+        match site {
+            None => Ok(None),
+            Some(s) => Ok(Some(SiteUp {
+                up: residency.acquire(s.up, backend).await?,
+                rank: s.rank,
+                kind: s.kind,
+            })),
+        }
     }
 }
 
@@ -303,6 +353,13 @@ impl BlockViews<'_> {
             fc2: self.fc2.buf(),
             gate: self.gate.as_ref().map(|g| g.buf()),
             lora: self.lora.as_ref().map(|l| l.map(SiteLoraViews::bufs)),
+            up: self.up.as_ref().map(|u| {
+                u.map(|s| SiteUp {
+                    up: s.up.buf(),
+                    rank: s.rank,
+                    kind: s.kind,
+                })
+            }),
         }
     }
 }
@@ -422,11 +479,47 @@ pub fn register_handles<S: WeightSource>(
         Ok(l.sites().iter().any(|s| s.is_some()).then_some(l))
     };
 
+    // A factored site (HyperFlow) ships `<site>.down` + `<site>.up` instead of
+    // `<site>.weight`; `down` takes the site's slot, `up` rides alongside.
+    let cat = residency.source().catalog();
+    let site_id = |dense: &WeightId| -> WeightId {
+        if cat.get(dense).is_some() {
+            return dense.clone();
+        }
+        WeightId(dense.0.replace(".weight", ".down.weight"))
+    };
+    let reg_up =
+        |dense: &WeightId, wide: bool| -> Result<Option<SiteUp<WeightHandle>>, LoadError> {
+            if cat.get(dense).is_some() {
+                return Ok(None);
+            }
+            let up = WeightId(dense.0.replace(".weight", ".up.weight"));
+            let rank = cat.get(&up).map_or(0, |e| e.shape.0[1]) as u32;
+            // ffn_down's factors stay untranscoded like the dense site.
+            let tc = if wide { transcode } else { None };
+            Ok(Some(SiteUp {
+                up: register_one(residency, &up, TransposePolicy::Linear2D, tc)?,
+                rank,
+                kind: kind(&up, tc),
+            }))
+        };
     let reg_block = |prefix: String| -> Result<BlockHandles, LoadError> {
-        let b = BlockWeights::new(&prefix);
+        let mut b = BlockWeights::new(&prefix);
         let lora = reg_lora(&prefix)?;
+        let ups = BlockSites {
+            qkv: reg_up(&b.qkv_proj, true)?,
+            out: reg_up(&b.out_proj, true)?,
+            fc1: reg_up(&b.fc1, true)?,
+            fc2: reg_up(&b.fc2, false)?,
+        };
+        let up = ups.sites().iter().any(|s| s.is_some()).then_some(ups);
+        b.qkv_proj = site_id(&b.qkv_proj);
+        b.out_proj = site_id(&b.out_proj);
+        b.fc1 = site_id(&b.fc1);
+        b.fc2 = site_id(&b.fc2);
         Ok(BlockHandles {
             lora,
+            up,
             norm1: dense(&b.norm1)?,
             norm2: dense(&b.norm2)?,
             qkv_proj: lin(&b.qkv_proj)?,
@@ -839,7 +932,8 @@ fn block_forward_accel<'wsp>(
     vsa: &'wsp VsaPlan,
 ) -> Result<bool, WgpuError> {
     use thinfer_core::backend::{
-        ElementwiseOp, MAX_SEGMENTS, Nvfp4Rows, RowSegments, VsaAddrs, VsaPart, VsaShape, VsaSlab,
+        ElementwiseOp, MAX_SEGMENTS, Nvfp4QkNormRope, Nvfp4Rows, RowSegments, VsaAddrs, VsaPart,
+        VsaShape, VsaSlab,
     };
     let p = &pipelines.block;
     let c = shape.cfg;
@@ -911,6 +1005,9 @@ fn block_forward_accel<'wsp>(
     };
     // An adapter site adds `x @ A^T` (N = rank) then `@ B^T` on the dense
     // module pipeline, as `block_forward` does.
+    if bufs.up.is_some() {
+        return Ok(false);
+    }
     let lora_ok = bufs.lora.is_none_or(|l| {
         [
             (l.qkv, 3 * inner),
@@ -1004,7 +1101,14 @@ fn block_forward_accel<'wsp>(
     // of the two, so the INT8 path's peak is a max, not a sum. (Slabbed
     // queries interleave the arena's work with attention: their INT8 Q/K get
     // a region of their own below.)
-    let chunk_bytes = [dim, 3 * inner, dim, dim, 2 * ffn, ffn, max_rank]
+    // fc1 stores its SwiGLU directly unless an unfused adapter must land in
+    // the `[gate; value]` product first.
+    let fc1_product = bufs
+        .lora
+        .and_then(|l| l.fc1)
+        .is_some_and(|l| !nvfp4_fuses_lora_rank(l.rank));
+    let product = if fc1_product { 2 * ffn } else { 0 };
+    let chunk_bytes = [dim, 3 * inner, dim, dim, product, ffn, max_rank]
         .map(|w| (max_chunk * w) as u64 * elem_bytes);
     let at = |i: usize| -> u64 {
         chunk_bytes[..i]
@@ -1200,9 +1304,53 @@ fn block_forward_accel<'wsp>(
     };
     // The whole qkv projection of chunk `[r0, r0 + n)` (from its normed
     // `h1`), normed and rotated into q (query side) and k / v.
+    // The qk-norm + rope epilogue of chunk `[r0, r0 + n)` (q alone for a
+    // slab's q-row pass), when the shape is the kernel's.
+    let qk_epi = |r0: u32, n: u32, q_only: bool| {
+        (hd == 128).then(|| {
+            let kv = |b: BatchBuf<'wsp>| {
+                if q_only {
+                    0
+                } else {
+                    addr(rows_of(b, r0, n, inner))
+                }
+            };
+            Nvfp4Epi::QkNormRope(Nvfp4QkNormRope {
+                q_norm: weight(&bufs.q_norm),
+                k_norm: if q_only { 0 } else { weight(&bufs.k_norm) },
+                freqs: addr(rows_of(freqs, r0, n, 2 * rot_pairs)),
+                q: addr(q_side(q, r0, n)),
+                k: kv(k),
+                v: kv(v),
+                inner,
+                rot_pairs,
+                eps: c.qk_norm_eps,
+            })
+        })
+    };
+    let fusable = |t: Option<Term<'wsp>>| t.is_none_or(|(_, _, r)| nvfp4_fuses_lora_rank(r));
     let qkv_proj = |h1: BatchBuf<'wsp>, r0: u32, n: u32| -> Result<(), WgpuError> {
         let qkv = rows_of(qkv, 0, n, 3 * inner);
         let lt = lora_head(h1, n, dim, site(|l| l.qkv))?;
+        if let Some(epi) = qk_epi(r0, n, false).filter(|_| fusable(lt)) {
+            let w = scope.import(&bufs.qkv_proj);
+            let (fmt, total) = (c.nvfp4_format, 3 * inner);
+            if scope.try_gemm_nvfp4_epi(
+                h1,
+                w,
+                qkv,
+                n,
+                total,
+                dim,
+                fused(lt),
+                fmt,
+                None,
+                None,
+                epi,
+            )? {
+                return Ok(());
+            }
+        }
         ran(
             scope.try_gemm_nvfp4_lora(
                 h1,
@@ -1274,42 +1422,63 @@ fn block_forward_accel<'wsp>(
             if q_rows_only {
                 let qp = rows_of(qkv, 0, n, inner);
                 let lt = lora_head(h1, n, dim, site(|l| l.qkv))?;
-                ran(
-                    scope.try_gemm_nvfp4_rows(
+                let q_rows = Some(Nvfp4Rows {
+                    base: 0,
+                    total: 3 * inner,
+                });
+                let w = scope.import(&bufs.qkv_proj);
+                let fmt = c.nvfp4_format;
+                let fused_qk = match qk_epi(r0, n, true).filter(|_| fusable(lt)) {
+                    Some(epi) => scope.try_gemm_nvfp4_epi(
                         h1,
-                        scope.import(&bufs.qkv_proj),
+                        w,
                         qp,
                         n,
                         inner,
                         dim,
                         fused(lt),
-                        c.nvfp4_format,
-                        Some(Nvfp4Rows {
-                            base: 0,
-                            total: 3 * inner,
-                        }),
+                        fmt,
+                        q_rows,
+                        None,
+                        epi,
                     )?,
-                    "q",
-                )?;
-                ran(
-                    scope.accel_elementwise(&ElementwiseOp::QkNormRope {
-                        headwise: false,
-                        q_only: true,
-                        qkv: addr(qp),
-                        q_norm: weight(&bufs.q_norm),
-                        k_norm: 0,
-                        freqs: addr(rows_of(freqs, r0, n, 2 * rot_pairs)),
-                        q: addr(q_side(q, r0, n)),
-                        k: 0,
-                        v: 0,
-                        rows: n,
-                        heads,
-                        head_dim: hd,
-                        rot_pairs,
-                        eps: c.qk_norm_eps,
-                    }),
-                    "q norm + rope",
-                )?;
+                    None => false,
+                };
+                if !fused_qk {
+                    ran(
+                        scope.try_gemm_nvfp4_rows(
+                            h1,
+                            w,
+                            qp,
+                            n,
+                            inner,
+                            dim,
+                            fused(lt),
+                            fmt,
+                            q_rows,
+                        )?,
+                        "q",
+                    )?;
+                    ran(
+                        scope.accel_elementwise(&ElementwiseOp::QkNormRope {
+                            headwise: false,
+                            q_only: true,
+                            qkv: addr(qp),
+                            q_norm: weight(&bufs.q_norm),
+                            k_norm: 0,
+                            freqs: addr(rows_of(freqs, r0, n, 2 * rot_pairs)),
+                            q: addr(q_side(q, r0, n)),
+                            k: 0,
+                            v: 0,
+                            rows: n,
+                            heads,
+                            head_dim: hd,
+                            rot_pairs,
+                            eps: c.qk_norm_eps,
+                        }),
+                        "q norm + rope",
+                    )?;
+                }
             } else {
                 qkv_proj(h1, r0, n)?;
             }
@@ -1338,32 +1507,49 @@ fn block_forward_accel<'wsp>(
             }),
             "norm2",
         )?;
-        let fused_c = rows_of(fused_buf, 0, n, 2 * ffn);
         let lt = lora_head(h2, n, dim, site(|l| l.fc1))?;
-        ran(
-            scope.try_gemm_nvfp4_lora(
-                h2,
-                scope.import(&bufs.fc1),
-                fused_c,
-                n,
-                2 * ffn,
-                dim,
-                fused(lt),
-                c.nvfp4_format,
-            )?,
-            "fc1",
-        )?;
-        lora_tail(lt, fused_c, n, 2 * ffn)?;
         let gu = rows_of(gu, 0, n, ffn);
-        ran(
-            scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
-                x: addr(fused_c),
-                out: addr(gu),
-                rows: n,
-                h: ffn,
-            }),
-            "swiglu",
-        )?;
+        if lt.is_none_or(|(_, _, r)| nvfp4_fuses_lora_rank(r)) {
+            ran(
+                scope.try_gemm_nvfp4_swiglu(
+                    h2,
+                    scope.import(&bufs.fc1),
+                    gu,
+                    n,
+                    ffn,
+                    dim,
+                    fused(lt),
+                    c.nvfp4_format,
+                )?,
+                "fc1 + swiglu",
+            )?;
+        } else {
+            // An unfused adapter lands in the `[gate; value]` product first.
+            let fused_c = rows_of(fused_buf, 0, n, 2 * ffn);
+            ran(
+                scope.try_gemm_nvfp4_lora(
+                    h2,
+                    scope.import(&bufs.fc1),
+                    fused_c,
+                    n,
+                    2 * ffn,
+                    dim,
+                    None,
+                    c.nvfp4_format,
+                )?,
+                "fc1",
+            )?;
+            lora_tail(lt, fused_c, n, 2 * ffn)?;
+            ran(
+                scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
+                    x: addr(fused_c),
+                    out: addr(gu),
+                    rows: n,
+                    h: ffn,
+                }),
+                "swiglu",
+            )?;
+        }
         gated(
             gu,
             &bufs.fc2,
@@ -1372,6 +1558,759 @@ fn block_forward_accel<'wsp>(
             (after, rows_of(y_out, r0, n, dim)),
             (r0, n, GATE_MLP),
             "fc2 + mlp gate",
+        )?;
+    }
+    Ok(true)
+}
+
+/// One matmul site of the generic accelerated block: its weight and quant kind,
+/// its `up` factor (a HyperFlow low-rank site), and the runtime adapter on it.
+#[derive(Clone, Copy)]
+struct AccelSite {
+    w: BufRef,
+    kind: Option<DequantScheme>,
+    n: u32,
+    k: u32,
+    up: Option<SiteUp<BufRef>>,
+    lora: Option<SiteLoraBufs>,
+}
+
+impl AccelSite {
+    /// The GEMMs the site runs, `(weight, kind, n, k)`: `down` then `up` when
+    /// factored.
+    fn gemms(&self) -> Vec<(BufRef, Option<DequantScheme>, u32, u32)> {
+        match self.up {
+            None => vec![(self.w, self.kind, self.n, self.k)],
+            Some(u) => vec![
+                (self.w, self.kind, u.rank, self.k),
+                (u.up, u.kind, self.n, u.rank),
+            ],
+        }
+    }
+
+    /// Bytes of the bf16 images its quant GEMMs dequantize into.
+    fn image_bytes(&self, elem_bytes: u64) -> u64 {
+        self.gemms()
+            .iter()
+            .filter(|g| g.1.is_some())
+            .map(|g| (g.2 as u64 * g.3 as u64 * elem_bytes).next_multiple_of(256))
+            .sum()
+    }
+}
+
+fn accel_sites(c: &DitConfig, bufs: &BlockBufs) -> [AccelSite; 4] {
+    let (dim, inner, ffn) = (c.hidden as u32, c.inner_dim() as u32, c.ffn_hidden as u32);
+    let site = |w: BufRef, n: u32, k: u32, up: Option<SiteUp<BufRef>>, lora| AccelSite {
+        w,
+        kind: None,
+        n,
+        k,
+        up,
+        lora,
+    };
+    let up = |pick: fn(BlockUpBufs) -> Option<SiteUp<BufRef>>| bufs.up.and_then(pick);
+    let lora = |pick: fn(BlockLoraBufs) -> Option<SiteLoraBufs>| bufs.lora.and_then(pick);
+    [
+        site(
+            bufs.qkv_proj,
+            3 * inner,
+            dim,
+            up(|u| u.qkv),
+            lora(|l| l.qkv),
+        ),
+        site(bufs.out_proj, dim, inner, up(|u| u.out), lora(|l| l.out)),
+        site(bufs.fc1, 2 * ffn, dim, up(|u| u.fc1), lora(|l| l.fc1)),
+        site(bufs.fc2, dim, ffn, up(|u| u.fc2), lora(|l| l.fc2)),
+    ]
+}
+
+/// The row chunks of the generic accelerated block: as even as possible, at
+/// most [`GENERIC_CHUNK_ROWS`] each, so no chunk falls under the tensor-core
+/// GEMM's minimum rows.
+fn generic_chunks(rows: u32) -> Vec<(u32, u32)> {
+    let count = rows.div_ceil(GENERIC_CHUNK_ROWS).max(1);
+    let size = rows.div_ceil(count).next_multiple_of(16);
+    (0..rows)
+        .step_by(size as usize)
+        .map(|r0| (r0, size.min(rows - r0)))
+        .collect()
+}
+
+/// Query rows per attention launch: bounds one launch's QK work (~0.2 s on a
+/// laptop GPU) far under the OS GPU watchdog at any sequence length.
+fn attention_rows_per_launch(s_k: u32) -> u32 {
+    const MAX_QK: u64 = 64 << 20;
+    ((MAX_QK / s_k.max(1) as u64) as u32 / 128 * 128).max(128)
+}
+
+/// Whether [`block_forward_generic_accel`] runs this block: a bf16 GGUF (or
+/// dense) block attending densely (no VSA plan, or a dense one for INT8 /
+/// FP8 attention; a checkpoint's VSA gate goes unused, as on the backend
+/// block), every GEMM, the attention and the small ops on the accelerator.
+/// Host-side only; `module` is the dense-weight (adapter) pipeline's GEMM
+/// contract.
+#[allow(clippy::too_many_arguments)]
+pub fn generic_accel_ok(
+    acc: Option<&dyn thinfer_core::backend::Accelerator>,
+    module: Option<thinfer_core::ops::GemmDesc>,
+    pipelines: &DitPipelines,
+    shape: DitShape,
+    bufs: &BlockBufs,
+    kinds: MatmulKinds,
+    segments: &[ModSegment],
+    vsa: Option<&VsaPlan>,
+) -> bool {
+    let declined =
+        generic_accel_declined(acc, module, pipelines, shape, bufs, kinds, segments, vsa);
+    if let Some(why) = declined {
+        tracing::debug!(target: thinfer_core::trace::DIAG, why, "minimax generic accel block declined");
+    }
+    declined.is_none()
+}
+
+/// Why [`generic_accel_ok`] declines, `None` when it does not.
+#[allow(clippy::too_many_arguments)]
+fn generic_accel_declined(
+    acc: Option<&dyn thinfer_core::backend::Accelerator>,
+    module: Option<thinfer_core::ops::GemmDesc>,
+    pipelines: &DitPipelines,
+    shape: DitShape,
+    bufs: &BlockBufs,
+    kinds: MatmulKinds,
+    segments: &[ModSegment],
+    vsa: Option<&VsaPlan>,
+) -> Option<&'static str> {
+    use thinfer_core::backend::MAX_SEGMENTS;
+    let Some(acc) = acc else {
+        return Some("no accelerator");
+    };
+    let c = shape.cfg;
+    let rows = shape.rows as u32;
+    let tiles = segments.len() <= MAX_SEGMENTS
+        && segments
+            .iter()
+            .try_fold(0u32, |at, s| (s.start == at).then_some(at + s.len))
+            == Some(rows);
+    let unmet = [
+        (
+            pipelines.block.act_dtype == thinfer_core::ops::ActDtype::Bf16,
+            "act dtype",
+        ),
+        (tiles, "segments"),
+        (acc.accepts_elementwise(), "elementwise"),
+        match vsa {
+            None => (acc.accepts_dense_attention(c.head_dim as u32), "attention"),
+            Some(plan) => (
+                plan.dense_shape(&c)
+                    .is_some_and(|s| acc.accepts_vsa(&s).is_some()),
+                "dense vsa attention",
+            ),
+        },
+    ];
+    if let Some(&(_, why)) = unmet.iter().find(|(ok, _)| !ok) {
+        return Some(why);
+    }
+    let ms: Vec<u32> = {
+        let mut m: Vec<u32> = generic_chunks(rows).iter().map(|&(_, n)| n).collect();
+        m.dedup();
+        m
+    };
+    let module_ok = |n: u32| {
+        ms.iter()
+            .all(|&m| module.is_some_and(|d| acc.accepts_gemm(&d, m, n)))
+    };
+    let gemm_ok = |kind: Option<DequantScheme>, n: u32, k: u32| match kind {
+        None => module_ok(n),
+        Some(DequantScheme::Block(q)) => {
+            matches!(
+                q,
+                QuantKind::Q4_K | QuantKind::Q5_K | QuantKind::Q6_K | QuantKind::Q8_0
+            ) && k.is_multiple_of(q.block_size())
+                && ms.iter().all(|&m| acc.accepts_gemm(&QUANT_SITE_GEMM, m, n))
+        }
+        Some(DequantScheme::Nvfp4) => false,
+    };
+    let mut sites = accel_sites(&c, bufs);
+    for (s, kind) in sites
+        .iter_mut()
+        .zip([kinds.qkv, kinds.out, kinds.fc1, kinds.fc2])
+    {
+        s.kind = kind;
+    }
+    for s in &sites {
+        if !s.gemms().iter().all(|&(_, kind, n, k)| gemm_ok(kind, n, k)) {
+            return Some("site gemm");
+        }
+        if !s
+            .lora
+            .is_none_or(|l| l.rank.is_multiple_of(8) && module_ok(l.rank) && module_ok(s.n))
+        {
+            return Some("adapter gemm");
+        }
+    }
+    None
+}
+
+/// [`block_forward`] for a GGUF (or dense) main-stack block as ONE deferred
+/// accelerator sequence: each quant site dequantized once into a bf16 image
+/// and run on the tensor-core GEMM (row chunks of [`generic_chunks`]), the
+/// norms / modulation / rope / SwiGLU / gated residuals as the CUDA ops the
+/// FastH3 block uses, and the attention dense over every row. No backend
+/// round trip between ops, so the caller overlaps the next block's weight
+/// upload with it. Same math and bf16 rounding points as [`block_forward`]
+/// (attention in f16 like its subgroup path). `false` = not covered
+/// ([`generic_accel_ok`]): nothing was enqueued.
+#[allow(clippy::too_many_arguments)]
+fn block_forward_generic_accel<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    pipelines: &DitPipelines,
+    shape: DitShape,
+    x_in: BatchBuf<'wsp>,
+    freqs: BatchBuf<'wsp>,
+    y_out: BatchBuf<'wsp>,
+    bufs: &'wsp BlockBufs,
+    kinds: MatmulKinds,
+    (table, block_idx, segments): (&ModulationTable, usize, &[ModSegment]),
+    vsa: Option<&'wsp VsaPlan>,
+) -> Result<bool, WgpuError> {
+    use thinfer_core::backend::{DenseAttention, ElementwiseOp, Q8, RowSegments};
+    let p = &pipelines.block;
+    if !generic_accel_ok(
+        scope.accelerator(),
+        scope.pipeline_gemm(&p.matmul_module),
+        pipelines,
+        shape,
+        bufs,
+        kinds,
+        segments,
+        vsa,
+    ) || !scope.accel_begin()?
+    {
+        return Ok(false);
+    }
+    let c = shape.cfg;
+    let rows = shape.rows as u32;
+    let (dim, inner, ffn) = (c.hidden as u32, c.inner_dim() as u32, c.ffn_hidden as u32);
+    let (heads, hd) = (c.n_heads as u32, c.head_dim as u32);
+    let rot_pairs = (c.rotary_dim() / 2) as u32;
+    let eb = p.act_bytes(1);
+    let mut sites = accel_sites(&c, bufs);
+    for (s, kind) in sites
+        .iter_mut()
+        .zip([kinds.qkv, kinds.out, kinds.fc1, kinds.fc2])
+    {
+        s.kind = kind;
+    }
+    let [qkv_site, out_site, fc1_site, fc2_site] = sites;
+
+    // Past this point work is enqueued, so a decline fails the run.
+    let ran = |ok: bool, what: &str| match ok {
+        true => Ok(()),
+        false => Err(WgpuError::AcceleratorDeclined { op: what.into() }),
+    };
+    let addr = |b: BatchBuf<'wsp>| {
+        scope
+            .accel_addr(b)
+            .expect("workspace and weights are accelerator-addressable")
+    };
+    let weight = |r: &'wsp BufRef| addr(scope.import(r));
+    let rows_of = |b: BatchBuf<'wsp>, r0: u32, n: u32, width: u32| {
+        scope.subview(
+            &b,
+            r0 as u64 * width as u64 * eb,
+            n as u64 * width as u64 * eb,
+        )
+    };
+    let seg = |a: usize, b: Option<usize>, r0: u32, n: u32| -> RowSegments {
+        let mut s = RowSegments::default();
+        let param = |row: u32, param: usize| {
+            addr(scope.import_copy(table.param(block_idx, row, param, eb)))
+        };
+        for sg in segments {
+            let (lo, hi) = (sg.start.max(r0), (sg.start + sg.len).min(r0 + n));
+            if lo >= hi {
+                continue;
+            }
+            let i = s.n as usize;
+            s.end[i] = hi - r0;
+            s.a[i] = param(sg.table_row, a);
+            if let Some(b) = b {
+                s.b[i] = param(sg.table_row, b);
+            }
+            s.n += 1;
+        }
+        s
+    };
+
+    // --- buffers ---
+    // Sequence-wide q / k / v: bf16 from the qk-norm + rope, cast to f16 in
+    // place for the attention, whose output overwrites q (then cast back).
+    let seq = || scope.alloc(rows as u64 * inner as u64 * eb);
+    let (q, k, v) = (seq()?, seq()?, seq()?);
+    // One image arena per pass, reused: stream order puts pass B's dequants
+    // after pass A's last GEMM read.
+    let image_arena = scope.alloc(
+        qkv_site
+            .image_bytes(eb)
+            .max(
+                [out_site, fc1_site, fc2_site]
+                    .iter()
+                    .map(|s| s.image_bytes(eb))
+                    .sum(),
+            )
+            .max(256),
+    )?;
+    let chunks = generic_chunks(rows);
+    let max_chunk = chunks.iter().map(|&(_, n)| n).max().unwrap_or(0);
+    let max_mid = sites
+        .iter()
+        .flat_map(|s| [s.up.map_or(0, |u| u.rank), s.lora.map_or(0, |l| l.rank)])
+        .max()
+        .unwrap_or(0);
+    // Chunk scratch: `h` (normed input), `wide` (qkv in pass A, the fused
+    // SwiGLU input in pass B), `t` (a site's product), `after` (the attention
+    // residual), `gu` (SwiGLU out), `mid` / `lmid` (factor / adapter ranks).
+    let chunk_bytes = [
+        dim,
+        (3 * inner).max(2 * ffn),
+        dim,
+        dim,
+        ffn,
+        max_mid,
+        max_mid,
+    ]
+    .map(|w| (max_chunk as u64 * w as u64 * eb).next_multiple_of(256));
+    let at = |i: usize| -> u64 { chunk_bytes[..i].iter().sum() };
+    let arena = scope.alloc(at(chunk_bytes.len()).max(256))?;
+    let part = |i: usize| scope.subview(&arena, at(i), chunk_bytes[i].max(256));
+    let (h, wide, t, after, gu, mid, lmid) = (
+        part(0),
+        part(1),
+        part(2),
+        part(3),
+        part(4),
+        part(5),
+        part(6),
+    );
+
+    // 8-bit sites (`gemm_q8`, unfactored sites): the normed inputs (qkv,
+    // fc1) as INT8, the attention and SwiGLU outputs (out, fc2), whose outlier
+    // channels a fixed int8 step crushes, as FP8 e4m3. Each copy is `[rows,
+    // k]` 8-bit + f32 `[rows]` scales: the weights of a pass laid out in one
+    // arena (pass A's qkv, then pass B's three, in stream order), the
+    // activation chunk's in another.
+    let q8_of = |s: &AccelSite, format: Q8| (c.gemm_q8 && s.up.is_none()).then_some(format);
+    let qkv_q8 = q8_of(&qkv_site, Q8::I8);
+    let out_q8 = q8_of(&out_site, Q8::E4m3);
+    let fc1_q8 = q8_of(&fc1_site, Q8::I8);
+    let fc2_q8 = q8_of(&fc2_site, Q8::E4m3);
+    let q8_bytes = |rows: u32, k: u32| {
+        (rows as u64 * k as u64).next_multiple_of(256) + (rows as u64 * 4).next_multiple_of(256)
+    };
+    let site_q8 = |s: &AccelSite, f: Option<Q8>| f.map_or(0, |_| q8_bytes(s.n, s.k));
+    let q8_weight_bytes = site_q8(&qkv_site, qkv_q8)
+        .max(site_q8(&out_site, out_q8) + site_q8(&fc1_site, fc1_q8) + site_q8(&fc2_site, fc2_q8));
+    let q8_act_k = [
+        (&qkv_site, qkv_q8),
+        (&out_site, out_q8),
+        (&fc1_site, fc1_q8),
+        (&fc2_site, fc2_q8),
+    ]
+    .iter()
+    .filter(|(_, f)| f.is_some())
+    .map(|(s, _)| s.k)
+    .max();
+    let (q8_weights, q8_acts) = match q8_act_k {
+        Some(k) => (
+            Some(scope.alloc(q8_weight_bytes.max(256))?),
+            Some(scope.alloc(q8_bytes(max_chunk, k).max(256))?),
+        ),
+        None => (None, None),
+    };
+    // A quant site's adapter folds into its bf16 image once per pass, `W +=
+    // B @ A` (the ComfyUI bf16 LoRA merge, one rounding), instead of two
+    // thin GEMMs per row chunk: its stacked `B^T` `[rank, n]` transposes into
+    // `fold_b` (`B`, `[n, rank]`), then the site GEMM's residual epilogue adds
+    // `B @ A` (`A^T` `[k, rank]` is that GEMM's N-major operand) onto the image.
+    let acc = scope.accelerator().expect("checked by generic_accel_ok");
+    let folds = |s: &AccelSite| {
+        c.fold_adapters
+            && s.up.is_none()
+            && s.kind.and_then(DequantScheme::block).is_some()
+            && s.lora
+                .is_some_and(|l| acc.accepts_gemm(&QUANT_SITE_GEMM, s.n, s.k) && l.rank > 0)
+    };
+    let fold_b = match [&qkv_site, &out_site, &fc1_site, &fc2_site]
+        .iter()
+        .filter(|s| folds(s))
+        .map(|s| s.n as u64 * s.lora.map_or(0, |l| l.rank) as u64 * eb)
+        .max()
+    {
+        Some(bytes) => Some(scope.alloc(bytes.max(256))?),
+        None => None,
+    };
+    // `(codes, scales)` views of an 8-bit arena for `[rows, k]` at `at`.
+    let q8_parts = |arena: BatchBuf<'wsp>, at: u64, rows: u32, k: u32| {
+        let codes = (rows as u64 * k as u64).next_multiple_of(256);
+        (
+            scope.subview(&arena, at, codes),
+            scope.subview(&arena, at + codes, rows as u64 * 4),
+        )
+    };
+
+    // --- a site's GEMMs over a chunk ---
+    // The B operand of each of a site's GEMMs: its bf16 image (quant) or the
+    // dense weight on the module pipeline, plus the image's 8-bit copy on an
+    // 8-bit site (`(codes, scales, format)`; `None` where the format is
+    // declined, e.g. FP8 below sm_89).
+    #[derive(Clone, Copy)]
+    struct Operand<'a> {
+        b: BatchBuf<'a>,
+        image: bool,
+        q8: Option<(BatchBuf<'a>, BatchBuf<'a>, Q8)>,
+    }
+    let dequant_site = |s: &AccelSite,
+                        (at, q8_at): (&mut u64, &mut u64),
+                        format: Option<Q8>|
+     -> Result<Vec<Operand<'wsp>>, WgpuError> {
+        let mut ops = Vec::new();
+        for (w, kind, n, kk) in s.gemms() {
+            match kind.and_then(DequantScheme::block) {
+                Some(q) => {
+                    let bytes = n as u64 * kk as u64 * eb;
+                    let img = scope.subview(&image_arena, *at, bytes);
+                    *at += bytes.next_multiple_of(256);
+                    ran(
+                        scope.accel_elementwise(&ElementwiseOp::Dequant {
+                            kind: q,
+                            src: addr(scope.import_copy(w)),
+                            out: addr(img),
+                            n,
+                            k: kk,
+                        }),
+                        "dequant",
+                    )?;
+                    if let (Some(l), Some(fb), true) = (s.lora, fold_b, folds(s)) {
+                        let b = scope.subview(&fb, 0, n as u64 * l.rank as u64 * eb);
+                        ran(
+                            scope.accel_elementwise(&ElementwiseOp::Transpose16 {
+                                x: addr(scope.import_copy(l.b)),
+                                out: addr(b),
+                                rows: l.rank,
+                                cols: n,
+                            }),
+                            "adapter B transpose",
+                        )?;
+                        let epi = GemmEpi {
+                            residual: Some(img),
+                            ..Default::default()
+                        };
+                        ran(
+                            scope.try_gemm_desc_fused(
+                                &QUANT_SITE_GEMM,
+                                b,
+                                scope.import_copy(l.a),
+                                img,
+                                n,
+                                kk,
+                                l.rank,
+                                epi,
+                            )?,
+                            "adapter fold",
+                        )?;
+                    }
+                    let q8 = match (q8_weights, format) {
+                        (Some(arena), Some(f)) => {
+                            let (codes, scales) = q8_parts(arena, *q8_at, n, kk);
+                            *q8_at += q8_bytes(n, kk);
+                            scope
+                                .accel_quant_rows_q8(f, addr(img), addr(codes), addr(scales), n, kk)
+                                .then_some((codes, scales, f))
+                        }
+                        _ => None,
+                    };
+                    ops.push(Operand {
+                        b: img,
+                        image: true,
+                        q8,
+                    });
+                }
+                None => ops.push(Operand {
+                    b: scope.import_copy(w),
+                    image: false,
+                    q8: None,
+                }),
+            }
+        }
+        Ok(ops)
+    };
+    let gemm = |op: Operand<'wsp>,
+                src: BatchBuf<'wsp>,
+                dst: BatchBuf<'wsp>,
+                m: u32,
+                n: u32,
+                kk: u32|
+     -> Result<(), WgpuError> {
+        if let (Some((codes, scales, format)), Some(arena)) = (op.q8, q8_acts) {
+            let (qa, sa) = q8_parts(arena, 0, m, kk);
+            ran(
+                scope.accel_quant_rows_q8(format, addr(src), addr(qa), addr(sa), m, kk),
+                "act q8",
+            )?;
+            let a = thinfer_core::backend::GemmQ8Addrs {
+                format,
+                a: addr(qa),
+                sa: addr(sa),
+                b: addr(codes),
+                sb: addr(scales),
+                out: addr(dst),
+                bias: 0,
+            };
+            // A declined shape (a tail chunk under the tile minimum) runs
+            // the bf16 GEMM on the same image instead.
+            if scope.accel_gemm_q8(&a, m, n, kk) {
+                return Ok(());
+            }
+        }
+        let done = if op.image {
+            scope.try_gemm_desc(&QUANT_SITE_GEMM, src, op.b, dst, m, n, kk)?
+        } else {
+            scope.try_gemm(&p.matmul_module, src, op.b, dst, m, n, kk)?
+        };
+        ran(done, "gemm")
+    };
+    // `dst = src @ W^T` (through the rank for a factored site), then the
+    // adapter's `(src @ A^T) @ B^T` accumulated in the second GEMM's epilogue.
+    let site_mm = |s: &AccelSite,
+                   ops: &[Operand<'wsp>],
+                   src: BatchBuf<'wsp>,
+                   dst: BatchBuf<'wsp>,
+                   m: u32|
+     -> Result<(), WgpuError> {
+        match s.up {
+            None => gemm(ops[0], src, dst, m, s.n, s.k)?,
+            Some(u) => {
+                let mid = rows_of(mid, 0, m, u.rank);
+                gemm(ops[0], src, mid, m, u.rank, s.k)?;
+                gemm(ops[1], mid, dst, m, s.n, u.rank)?;
+            }
+        }
+        if let Some(l) = s.lora.filter(|_| !folds(s)) {
+            let lm = rows_of(lmid, 0, m, l.rank);
+            ran(
+                scope.try_gemm(
+                    &p.matmul_module,
+                    src,
+                    scope.import_copy(l.a),
+                    lm,
+                    m,
+                    l.rank,
+                    s.k,
+                )?,
+                "adapter A",
+            )?;
+            let epi = GemmEpi {
+                residual: Some(dst),
+                ..Default::default()
+            };
+            ran(
+                scope.try_gemm_fused(
+                    &p.matmul_module,
+                    lm,
+                    scope.import_copy(l.b),
+                    dst,
+                    m,
+                    s.n,
+                    l.rank,
+                    epi,
+                )?,
+                "adapter B",
+            )?;
+        }
+        Ok(())
+    };
+    let norm_mod = |x: BatchBuf<'wsp>,
+                    w: &'wsp BufRef,
+                    out: BatchBuf<'wsp>,
+                    (r0, n): (u32, u32),
+                    (scale, shift): (usize, usize),
+                    what: &str| {
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::NormModulate {
+                x: addr(x),
+                w: weight(w),
+                out: addr(out),
+                rows: n,
+                dim,
+                eps: c.norm_eps,
+                seg: seg(scale, Some(shift), r0, n),
+            }),
+            what,
+        )
+    };
+    let gate_add = |x: BatchBuf<'wsp>,
+                    y: BatchBuf<'wsp>,
+                    out: BatchBuf<'wsp>,
+                    (r0, n): (u32, u32),
+                    gate: usize,
+                    what: &str| {
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::GateAdd {
+                x: addr(x),
+                y: addr(y),
+                out: addr(out),
+                rows: n,
+                dim,
+                seg: seg(gate, None, r0, n),
+            }),
+            what,
+        )
+    };
+
+    // --- pass A: norm1 -> qkv -> qk norm + rope, per chunk ---
+    let (mut img_at, mut q8_at) = (0u64, 0u64);
+    let qkv_ops = dequant_site(&qkv_site, (&mut img_at, &mut q8_at), qkv_q8)?;
+    for &(r0, n) in &chunks {
+        let h1 = rows_of(h, 0, n, dim);
+        norm_mod(
+            rows_of(x_in, r0, n, dim),
+            &bufs.norm1,
+            h1,
+            (r0, n),
+            (SCALE_MSA, SHIFT_MSA),
+            "norm1",
+        )?;
+        let qkv = rows_of(wide, 0, n, 3 * inner);
+        site_mm(&qkv_site, &qkv_ops, h1, qkv, n)?;
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::QkNormRope {
+                headwise: false,
+                q_only: false,
+                qkv: addr(qkv),
+                q_norm: weight(&bufs.q_norm),
+                k_norm: weight(&bufs.k_norm),
+                freqs: addr(rows_of(freqs, r0, n, 2 * rot_pairs)),
+                q: addr(rows_of(q, r0, n, inner)),
+                k: addr(rows_of(k, r0, n, inner)),
+                v: addr(rows_of(v, r0, n, inner)),
+                rows: n,
+                heads,
+                head_dim: hd,
+                rot_pairs,
+                eps: c.qk_norm_eps,
+            }),
+            "qk norm + rope",
+        )?;
+    }
+
+    // --- attention over every row, out over q: INT8 QK^T (+ FP8 P.V) on the
+    // VSA kernel at full density, its INT8 / FP8 copies in the image arena
+    // (dead between pass A's last GEMM and pass B's first dequant), or f16 ---
+    if let Some(plan) = vsa {
+        let dense = plan.dense_shape(&c).expect("checked by generic_accel_ok");
+        ran(
+            scope.try_vsa(
+                &dense,
+                q,
+                k,
+                v,
+                None,
+                q,
+                scope.import(&plan.geometry),
+                Some(image_arena),
+            )?,
+            "dense vsa attention",
+        )?;
+    } else {
+        let elems = rows * inner;
+        for b in [q, k, v] {
+            ran(
+                scope.accel_elementwise(&ElementwiseOp::Bf16ToF16 {
+                    x: addr(b),
+                    out: addr(b),
+                    n: elems,
+                }),
+                "attention cast",
+            )?;
+        }
+        let per = attention_rows_per_launch(rows);
+        let mut r0 = 0;
+        while r0 < rows {
+            let n = per.min(rows - r0);
+            let qc = addr(rows_of(q, r0, n, inner));
+            ran(
+                scope.accel_dense_attention(&DenseAttention {
+                    q: qc,
+                    k: addr(k),
+                    v: addr(v),
+                    out: qc,
+                    s_q: n,
+                    s_k: rows,
+                    heads,
+                    kv_heads: heads,
+                    head_dim: hd,
+                    scale: shape.sdpa_scale(),
+                }),
+                "attention",
+            )?;
+            r0 += n;
+        }
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::F16ToBf16 {
+                x: addr(q),
+                out: addr(q),
+                n: elems,
+            }),
+            "attention cast",
+        )?;
+    }
+
+    // --- pass B: out proj + gate -> norm2 -> fc1 + SwiGLU -> fc2 + gate ---
+    let (mut img_at, mut q8_at) = (0u64, 0u64);
+    let out_ops = dequant_site(&out_site, (&mut img_at, &mut q8_at), out_q8)?;
+    let fc1_ops = dequant_site(&fc1_site, (&mut img_at, &mut q8_at), fc1_q8)?;
+    let fc2_ops = dequant_site(&fc2_site, (&mut img_at, &mut q8_at), fc2_q8)?;
+    for &(r0, n) in &chunks {
+        let prod = rows_of(t, 0, n, dim);
+        site_mm(&out_site, &out_ops, rows_of(q, r0, n, inner), prod, n)?;
+        let after = rows_of(after, 0, n, dim);
+        gate_add(
+            rows_of(x_in, r0, n, dim),
+            prod,
+            after,
+            (r0, n),
+            GATE_MSA,
+            "attn gate",
+        )?;
+        let h2 = rows_of(h, 0, n, dim);
+        norm_mod(
+            after,
+            &bufs.norm2,
+            h2,
+            (r0, n),
+            (SCALE_MLP, SHIFT_MLP),
+            "norm2",
+        )?;
+        let fused = rows_of(wide, 0, n, 2 * ffn);
+        site_mm(&fc1_site, &fc1_ops, h2, fused, n)?;
+        let gu = rows_of(gu, 0, n, ffn);
+        ran(
+            scope.accel_elementwise(&ElementwiseOp::SiluMulFused {
+                x: addr(fused),
+                out: addr(gu),
+                rows: n,
+                h: ffn,
+            }),
+            "swiglu",
+        )?;
+        site_mm(&fc2_site, &fc2_ops, gu, prod, n)?;
+        gate_add(
+            after,
+            prod,
+            rows_of(y_out, r0, n, dim),
+            (r0, n),
+            GATE_MLP,
+            "mlp gate",
         )?;
     }
     Ok(true)
@@ -1387,6 +2326,477 @@ pub const ROW_CHUNK: usize = 4096;
 /// slab to keep two `rows x inner` buffers out of VRAM (~0.9 GB each at a 15s
 /// clip with two references), which shorter sequences do not need.
 pub const QUERY_SLAB_ROWS: usize = 24 * 1024;
+
+/// The backend block's matmul sites and modulated ops over `rows` rows: the
+/// whole sequence, or one row chunk (its modulation segments rebased to it).
+struct GenericBlock<'a, 'wsp> {
+    scope: &'a BatchScope<'wsp, WgpuBackend>,
+    pipelines: &'a DitPipelines,
+    c: DitConfig,
+    rows: u32,
+    bufs: &'wsp BlockBufs,
+    kinds: MatmulKinds,
+    modulation: Option<(&'a ModulationTable, usize, &'a [ModSegment])>,
+}
+
+/// A block intermediate copied out for a parity probe (`stage`, buffer).
+type Capture<'c, 'wsp> = &'c dyn Fn(usize, BatchBuf<'wsp>) -> Result<(), WgpuError>;
+
+impl<'a, 'wsp> GenericBlock<'a, 'wsp> {
+    fn p(&self) -> &'a BlockPipelines {
+        &self.pipelines.block
+    }
+
+    fn elem_bytes(&self) -> u64 {
+        self.p().act_bytes(1)
+    }
+
+    /// A dense bf16 matmul with no i8 path and no dequant: the adapter tensors
+    /// are bf16 already, and the rank-side intermediate is NOT normed, so
+    /// quantizing its activations would reintroduce exactly the outlier
+    /// problem the i8 siting rules exist to avoid.
+    fn dense_mm(
+        &self,
+        src: ActBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        dst: BatchBuf<'wsp>,
+        out_w: u32,
+        in_w: u32,
+    ) -> Result<(), WgpuError> {
+        let p = self.p();
+        let dims = self.scope.u32x4_uniform(self.rows, out_w, in_w, 0)?;
+        Block::dispatch_matmul_site(
+            self.scope,
+            p,
+            src,
+            w,
+            dst,
+            dims,
+            None,
+            None,
+            None,
+            // Dense bf16 adapter weights: the MODULE pipeline, which reads a
+            // `Linear2D [K, N]` weight directly. The block pipeline expects the
+            // N-major workspace the per-site dequant produces, so feeding it a
+            // dense weight would transpose it silently.
+            &p.matmul_module,
+            &p.matmuls.module,
+            self.rows,
+            out_w,
+            in_w,
+        )
+    }
+
+    /// `src @ A^T` then `@ B^T`, added to the site's base output. The sum
+    /// lands in a THIRD buffer: one buffer cannot be both the read and the
+    /// read_write operand of a single dispatch.
+    fn add_lora(
+        &self,
+        src: ActBuf<'wsp>,
+        base: BatchBuf<'wsp>,
+        out_w: u32,
+        in_w: u32,
+        lora: Option<SiteLoraBufs>,
+    ) -> Result<BatchBuf<'wsp>, WgpuError> {
+        let Some(l) = lora else {
+            return Ok(base);
+        };
+        let (scope, p, rows) = (self.scope, self.p(), self.rows);
+        let mid = alloc_matmul_out_buf(scope, p, rows * l.rank)?;
+        self.dense_mm(src, scope.import_copy(l.a), mid, l.rank, in_w)?;
+        let delta = alloc_matmul_out_buf(scope, p, rows * out_w)?;
+        self.dense_mm(
+            ActBuf::dense(mid),
+            scope.import_copy(l.b),
+            delta,
+            out_w,
+            l.rank,
+        )?;
+        let sum = alloc_matmul_out_buf(scope, p, rows * out_w)?;
+        op_add(
+            scope,
+            p,
+            ActBuf::dense(base),
+            ActBuf::dense(delta),
+            ActBuf::dense(sum),
+        )?;
+        Ok(sum)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mm(
+        &self,
+        src: ActBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out_w: u32,
+        in_w: u32,
+        kind: Option<DequantScheme>,
+        coopmat_ok: bool,
+        wide_out: bool,
+        lora: Option<SiteLoraBufs>,
+    ) -> Result<BatchBuf<'wsp>, WgpuError> {
+        let (scope, p, rows, pipelines) = (self.scope, self.p(), self.rows, self.pipelines);
+        let scratch = alloc_matmul_out_buf(scope, p, rows * out_w)?;
+        // NVFP4 runs natively (W4A4, the checkpoint's own numerics) when the
+        // accelerator takes it; everything else, and any declined shape,
+        // dequantizes below.
+        if kind == Some(DequantScheme::Nvfp4)
+            && src.scale.is_none()
+            && scope.try_gemm_nvfp4(src.data, w, scratch, rows, out_w, in_w, self.c.nvfp4_format)?
+        {
+            return self.add_lora(src, scratch, out_w, in_w, lora);
+        }
+        let dims = scope.u32x4_uniform(rows, out_w, in_w, 0)?;
+        // Tensor cores when this tensor's quant kind has a coopmat step, the
+        // dense per-kind dequant otherwise. `dispatch_matmul_site_coopmat`
+        // itself falls back for a sub-WM dispatch (which device-loses).
+        Block::dispatch_matmul_site_coopmat(
+            scope,
+            p,
+            src,
+            w,
+            scratch,
+            dims,
+            None,
+            pipelines.coopmat_for(kind, coopmat_ok, wide_out),
+            p.matmul_i8_qkv.as_ref(),
+            p.dequant_i8_qkv.as_ref(),
+            pipelines.dequant_for(kind),
+            // The B-operand layout follows the site, not the model: a QUANT
+            // site pre-dequants to an N-major workspace (the block pipeline),
+            // while an unquantized one (the F16 token refiner, and the F16
+            // patch/head projections) is read as a dense `Linear2D [K, N]`
+            // (the module pipeline). Using one pipeline for both transposes
+            // half the weights with no NaN to show for it.
+            if kind.is_some() {
+                &p.matmul_qkv
+            } else {
+                &p.matmul_module
+            },
+            if kind.is_some() {
+                &p.matmuls.qkv
+            } else {
+                &p.matmuls.module
+            },
+            rows,
+            out_w,
+            in_w,
+        )?;
+        self.add_lora(src, scratch, out_w, in_w, lora)
+    }
+
+    /// One site: dense [`Self::mm`], or `down` to the rank then `up` (a
+    /// factored HyperFlow site; the tensor-core options ride the `up`, an
+    /// adapter adds its delta from the site input).
+    #[allow(clippy::too_many_arguments)]
+    fn site_mm(
+        &self,
+        src: ActBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        out_w: u32,
+        in_w: u32,
+        kind: Option<DequantScheme>,
+        coopmat_ok: bool,
+        wide_out: bool,
+        lora: Option<SiteLoraBufs>,
+        up: Option<SiteUp<BufRef>>,
+    ) -> Result<BatchBuf<'wsp>, WgpuError> {
+        let Some(u) = up else {
+            return self.mm(src, w, out_w, in_w, kind, coopmat_ok, wide_out, lora);
+        };
+        let mid = self.mm(src, w, u.rank, in_w, kind, false, false, None)?;
+        let y = self.mm(
+            ActBuf::dense(mid),
+            self.scope.import_copy(u.up),
+            out_w,
+            u.rank,
+            u.kind,
+            coopmat_ok,
+            wide_out,
+            None,
+        )?;
+        self.add_lora(src, y, out_w, in_w, lora)
+    }
+
+    fn up(&self, pick: fn(BlockUpBufs) -> Option<SiteUp<BufRef>>) -> Option<SiteUp<BufRef>> {
+        self.bufs.up.and_then(pick)
+    }
+
+    /// Apply `x * (1 + scale[seg]) + shift[seg]` per contiguous segment.
+    fn modulate(
+        &self,
+        src: &ActBuf<'wsp>,
+        dst: &ActBuf<'wsp>,
+        scale_param: usize,
+        shift_param: usize,
+    ) -> Result<(), WgpuError> {
+        let Some((table, block_idx, segments)) = self.modulation else {
+            return Ok(());
+        };
+        let (scope, p, dim, eb) = (
+            self.scope,
+            self.p(),
+            self.c.hidden as u32,
+            self.elem_bytes(),
+        );
+        for seg in segments {
+            let off = seg.start as u64 * dim as u64 * eb;
+            let len = seg.len as u64 * dim as u64 * eb;
+            let (x_r, o_r) = (src.data.sub(off, len), dst.data.sub(off, len));
+            let s_r = table.param(block_idx, seg.table_row, scale_param, eb);
+            let t_r = table.param(block_idx, seg.table_row, shift_param, eb);
+            let x = scope.import_copy(x_r);
+            let o = scope.import_copy(o_r);
+            let s = scope.import_copy(s_r);
+            let t = scope.import_copy(t_r);
+            // bias = 1.0 folds the `(1 + scale)` of AdaLN into the kernel.
+            let u = scope.u32x4_uniform(dim, 1.0_f32.to_bits(), 0, 0)?;
+            scope.bcast_modulate::<BcastModulateF32>(
+                &p.bcast_modulate,
+                x,
+                s,
+                t,
+                u,
+                o,
+                seg.len * dim,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Apply `x + gate[seg] * y` per contiguous segment.
+    fn gate_add(
+        &self,
+        x: &ActBuf<'wsp>,
+        y: &ActBuf<'wsp>,
+        dst: &ActBuf<'wsp>,
+        gate_param: usize,
+    ) -> Result<(), WgpuError> {
+        let (scope, p, dim, eb) = (
+            self.scope,
+            self.p(),
+            self.c.hidden as u32,
+            self.elem_bytes(),
+        );
+        let Some((table, block_idx, segments)) = self.modulation else {
+            return op_add(scope, p, *x, *y, *dst);
+        };
+        for seg in segments {
+            let off = seg.start as u64 * dim as u64 * eb;
+            let len = seg.len as u64 * dim as u64 * eb;
+            let xb = scope.import_copy(x.data.sub(off, len));
+            let yb = scope.import_copy(y.data.sub(off, len));
+            let ob = scope.import_copy(dst.data.sub(off, len));
+            let g = scope.import_copy(table.param(block_idx, seg.table_row, gate_param, eb));
+            let u = scope.u32x4_uniform(dim, 0, 0, 0)?;
+            scope.bcast_fma::<BcastFmaF32>(&p.bcast_fma, xb, g, yb, u, ob, seg.len * dim)?;
+        }
+        Ok(())
+    }
+
+    /// norm1 -> modulate -> qkv -> split -> qk-norm -> rope. Returns
+    /// `(attn_in, q, k, v)`, `q`/`k` roped when `freqs` is given; with `dst`
+    /// the roped q / k and the split v land there (a row chunk's slices of
+    /// sequence-wide buffers).
+    #[allow(clippy::type_complexity)]
+    fn attn_in(
+        &self,
+        x_in: ActBuf<'wsp>,
+        freqs: Option<BatchBuf<'wsp>>,
+        dst: Option<[ActBuf<'wsp>; 3]>,
+        capture: Capture<'_, 'wsp>,
+    ) -> Result<(ActBuf<'wsp>, ActBuf<'wsp>, ActBuf<'wsp>, ActBuf<'wsp>), WgpuError> {
+        let (scope, p, c, rows) = (self.scope, self.p(), self.c, self.rows);
+        let (dim, inner, hd, heads) = (
+            c.hidden as u32,
+            c.inner_dim() as u32,
+            c.head_dim as u32,
+            c.n_heads as u32,
+        );
+        let n1 = alloc_act(scope, p, rows, dim)?;
+        op_rmsnorm(
+            scope,
+            p,
+            x_in,
+            scope.import(&self.bufs.norm1),
+            n1,
+            rows,
+            dim,
+            c.norm_eps,
+        )?;
+        let h1 = if self.modulation.is_some() {
+            let h = alloc_act(scope, p, rows, dim)?;
+            self.modulate(&n1, &h, SCALE_MSA, SHIFT_MSA)?;
+            h
+        } else {
+            n1
+        };
+        capture(0, h1.data)?;
+
+        let qkv = self.site_mm(
+            h1,
+            scope.import(&self.bufs.qkv_proj),
+            3 * inner,
+            dim,
+            self.kinds.qkv,
+            self.pipelines.coopmat_sites.qkv,
+            false,
+            self.bufs.lora.and_then(|l| l.qkv),
+            self.up(|u| u.qkv),
+        )?;
+        capture(1, qkv)?;
+        let q = alloc_act(scope, p, rows, inner)?;
+        let k = alloc_act(scope, p, rows, inner)?;
+        let v = match dst {
+            Some([_, _, v]) => v,
+            None => alloc_act(scope, p, rows, inner)?,
+        };
+        op_qkv_split(scope, p, ActBuf::dense(qkv), q, k, v, rows, inner)?;
+
+        // Per-head RMSNorm over head_dim, before rope.
+        let qn = alloc_act(scope, p, rows * heads, hd)?;
+        op_rmsnorm(
+            scope,
+            p,
+            q,
+            scope.import(&self.bufs.q_norm),
+            qn,
+            rows * heads,
+            hd,
+            c.qk_norm_eps,
+        )?;
+        let kn = alloc_act(scope, p, rows * heads, hd)?;
+        op_rmsnorm(
+            scope,
+            p,
+            k,
+            scope.import(&self.bufs.k_norm),
+            kn,
+            rows * heads,
+            hd,
+            c.qk_norm_eps,
+        )?;
+        capture(2, qn.data)?;
+
+        let (qr, kr) = match freqs {
+            None => (qn, kn),
+            Some(freqs) => {
+                // Partial half-rot: 96 of 128 channels rotate, the rest pass
+                // through. `rot_pairs` rides in the uniform's fourth slot.
+                let rot_pairs = (c.rotary_dim() / 2) as u32;
+                let (qr, kr) = match dst {
+                    Some([q, k, _]) => (q, k),
+                    None => (
+                        alloc_act(scope, p, rows, heads * hd)?,
+                        alloc_act(scope, p, rows, heads * hd)?,
+                    ),
+                };
+                for (src, out) in [(qn, qr), (kn, kr)] {
+                    let u = scope.u32x4_uniform(rows, heads, hd / 2, rot_pairs)?;
+                    scope.rope::<RopeF32HalfRotPartial>(
+                        &self.pipelines.rope_partial,
+                        src.data,
+                        freqs,
+                        u,
+                        out.data,
+                        rows,
+                        heads,
+                        hd / 2,
+                    )?;
+                }
+                (qr, kr)
+            }
+        };
+        Ok((h1, qr, kr, v))
+    }
+
+    /// Out projection -> gated residual -> norm2 -> modulate -> SwiGLU FFN ->
+    /// gated residual into `y_out`.
+    fn attn_out(
+        &self,
+        x_in: ActBuf<'wsp>,
+        sa: ActBuf<'wsp>,
+        y_out: ActBuf<'wsp>,
+        capture: Capture<'_, 'wsp>,
+    ) -> Result<(), WgpuError> {
+        let (scope, p, c, rows) = (self.scope, self.p(), self.c, self.rows);
+        let (dim, inner, ffn) = (c.hidden as u32, c.inner_dim() as u32, c.ffn_hidden as u32);
+        let proj = self.site_mm(
+            sa,
+            scope.import(&self.bufs.out_proj),
+            dim,
+            inner,
+            self.kinds.out,
+            self.pipelines.coopmat_sites.proj,
+            false,
+            self.bufs.lora.and_then(|l| l.out),
+            self.up(|u| u.out),
+        )?;
+        let after_attn = alloc_act(scope, p, rows, dim)?;
+        self.gate_add(&x_in, &ActBuf::dense(proj), &after_attn, GATE_MSA)?;
+        capture(4, proj)?;
+        capture(5, after_attn.data)?;
+
+        // --- feed-forward ---
+        let n2 = alloc_act(scope, p, rows, dim)?;
+        op_rmsnorm(
+            scope,
+            p,
+            after_attn,
+            scope.import(&self.bufs.norm2),
+            n2,
+            rows,
+            dim,
+            c.norm_eps,
+        )?;
+        let h2 = if self.modulation.is_some() {
+            let h = alloc_act(scope, p, rows, dim)?;
+            self.modulate(&n2, &h, SCALE_MLP, SHIFT_MLP)?;
+            h
+        } else {
+            n2
+        };
+
+        // fc1 emits the fused [gate; value]; the SwiGLU reads it in place.
+        let fused = self.site_mm(
+            h2,
+            scope.import(&self.bufs.fc1),
+            2 * ffn,
+            dim,
+            self.kinds.fc1,
+            self.pipelines.coopmat_sites.ffn_up,
+            true,
+            self.bufs.lora.and_then(|l| l.fc1),
+            self.up(|u| u.fc1),
+        )?;
+        capture(6, fused)?;
+        let gu = alloc_act(scope, p, rows, ffn)?;
+        {
+            let u = scope.u32x4_uniform(rows, ffn, 0, 0)?;
+            scope.silu_mul_fused::<SiluMulFusedF32>(
+                &self.pipelines.silu_mul_fused,
+                fused,
+                u,
+                gu.data,
+                rows * ffn,
+            )?;
+        }
+        let down = self.site_mm(
+            gu,
+            scope.import(&self.bufs.fc2),
+            dim,
+            ffn,
+            self.kinds.fc2,
+            self.pipelines.coopmat_sites.ffn_down,
+            false,
+            self.bufs.lora.and_then(|l| l.fc2),
+            self.up(|u| u.fc2),
+        )?;
+        capture(7, gu.data)?;
+        capture(8, down)?;
+        self.gate_add(&after_attn, &ActBuf::dense(down), &y_out, GATE_MLP)
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn block_forward<'wsp>(
@@ -1412,11 +2822,9 @@ fn block_forward<'wsp>(
     let p = &pipelines.block;
     let c = shape.cfg;
     let rows = shape.rows as u32;
-    let dim = c.hidden as u32;
     let inner = c.inner_dim() as u32;
     let hd = c.head_dim as u32;
     let heads = c.n_heads as u32;
-    let ffn = c.ffn_hidden as u32;
     let elem_bytes = p.act_bytes(1);
     let layout = probe_layout(shape);
     let capture = |stage: usize, src: BatchBuf<'wsp>| -> Result<(), WgpuError> {
@@ -1426,281 +2834,28 @@ fn block_forward<'wsp>(
         let dst = scope.import_copy(pr.bufs[stage]);
         scope.copy_buffer_to_buffer(src, 0, dst, 0, layout[stage].1 as u64 * elem_bytes)
     };
-
+    let g = GenericBlock {
+        scope,
+        pipelines,
+        c,
+        rows,
+        bufs,
+        kinds,
+        modulation,
+    };
     let x_in = ActBuf::dense(x_in);
-    let y_out = ActBuf::dense(y_out);
-    let norm1_w = scope.import(&bufs.norm1);
-    let norm2_w = scope.import(&bufs.norm2);
-    let qkv_w = scope.import(&bufs.qkv_proj);
-    let qn_w = scope.import(&bufs.q_norm);
-    let kn_w = scope.import(&bufs.k_norm);
-    let out_w = scope.import(&bufs.out_proj);
-    let fc1_w = scope.import(&bufs.fc1);
-    let fc2_w = scope.import(&bufs.fc2);
-
-    // A dense bf16 matmul with no i8 path and no dequant: the adapter tensors
-    // are bf16 already, and the rank-side intermediate is NOT normed, so
-    // quantizing its activations would reintroduce exactly the outlier problem
-    // the i8 siting rules exist to avoid.
-    let dense_mm = |src: ActBuf<'wsp>,
-                    w: BatchBuf<'wsp>,
-                    dst: BatchBuf<'wsp>,
-                    out_w: u32,
-                    in_w: u32|
-     -> Result<(), WgpuError> {
-        let dims = scope.u32x4_uniform(rows, out_w, in_w, 0)?;
-        Block::dispatch_matmul_site(
-            scope,
-            p,
-            src,
-            w,
-            dst,
-            dims,
-            None,
-            None,
-            None,
-            // Dense bf16 adapter weights: the MODULE pipeline, which reads a
-            // `Linear2D [K, N]` weight directly. The block pipeline expects the
-            // N-major workspace the per-site dequant produces, so feeding it a
-            // dense weight would transpose it silently.
-            &p.matmul_module,
-            &p.matmuls.module,
-            rows,
-            out_w,
-            in_w,
-        )
-    };
-
-    // `src @ A^T` then `@ B^T`, added to the site's base output. The sum lands
-    // in a THIRD buffer: one buffer cannot be both the read and the read_write
-    // operand of a single dispatch.
-    let add_lora = |src: ActBuf<'wsp>,
-                    base: BatchBuf<'wsp>,
-                    out_w: u32,
-                    in_w: u32,
-                    lora: Option<SiteLoraBufs>|
-     -> Result<BatchBuf<'wsp>, WgpuError> {
-        let Some(l) = lora else {
-            return Ok(base);
-        };
-        let mid = alloc_matmul_out_buf(scope, p, rows * l.rank)?;
-        dense_mm(src, scope.import_copy(l.a), mid, l.rank, in_w)?;
-        let delta = alloc_matmul_out_buf(scope, p, rows * out_w)?;
-        dense_mm(
-            ActBuf::dense(mid),
-            scope.import_copy(l.b),
-            delta,
-            out_w,
-            l.rank,
-        )?;
-        let sum = alloc_matmul_out_buf(scope, p, rows * out_w)?;
-        op_add(
-            scope,
-            p,
-            ActBuf::dense(base),
-            ActBuf::dense(delta),
-            ActBuf::dense(sum),
-        )?;
-        Ok(sum)
-    };
-
-    let mm = |src: ActBuf<'wsp>,
-              w,
-              out_w: u32,
-              in_w: u32,
-              kind: Option<DequantScheme>,
-              coopmat_ok: bool,
-              wide_out: bool,
-              lora: Option<SiteLoraBufs>|
-     -> Result<BatchBuf<'wsp>, WgpuError> {
-        let scratch = alloc_matmul_out_buf(scope, p, rows * out_w)?;
-        // NVFP4 runs natively (W4A4, the checkpoint's own numerics) when the
-        // accelerator takes it; everything else, and any declined shape,
-        // dequantizes below.
-        if kind == Some(DequantScheme::Nvfp4)
-            && src.scale.is_none()
-            && scope.try_gemm_nvfp4(src.data, w, scratch, rows, out_w, in_w, c.nvfp4_format)?
-        {
-            return add_lora(src, scratch, out_w, in_w, lora);
-        }
-        let dims = scope.u32x4_uniform(rows, out_w, in_w, 0)?;
-        // Tensor cores when this tensor's quant kind has a coopmat step, the
-        // dense per-kind dequant otherwise. `dispatch_matmul_site_coopmat`
-        // itself falls back for a sub-WM dispatch (which device-loses).
-        Block::dispatch_matmul_site_coopmat(
-            scope,
-            p,
-            src,
-            w,
-            scratch,
-            dims,
-            None,
-            pipelines.coopmat_for(kind, coopmat_ok, wide_out),
-            p.matmul_i8_qkv.as_ref(),
-            p.dequant_i8_qkv.as_ref(),
-            pipelines.dequant_for(kind),
-            // The B-operand layout follows the site, not the model: a QUANT
-            // site pre-dequants to an N-major workspace (the block pipeline),
-            // while an unquantized one (the F16 token refiner, and the F16
-            // patch/head projections) is read as a dense `Linear2D [K, N]` (the
-            // module pipeline). Using one pipeline for both transposes half the
-            // weights with no NaN to show for it.
-            if kind.is_some() {
-                &p.matmul_qkv
-            } else {
-                &p.matmul_module
-            },
-            if kind.is_some() {
-                &p.matmuls.qkv
-            } else {
-                &p.matmuls.module
-            },
-            rows,
-            out_w,
-            in_w,
-        )?;
-        add_lora(src, scratch, out_w, in_w, lora)
-    };
-
-    // Apply `x * (1 + scale[seg]) + shift[seg]` per contiguous segment.
-    let modulate = |src: &ActBuf<'wsp>,
-                    dst: &ActBuf<'wsp>,
-                    scale_param: usize,
-                    shift_param: usize|
-     -> Result<(), WgpuError> {
-        let Some((table, block_idx, segments)) = modulation else {
-            return Ok(());
-        };
-        for seg in segments {
-            let off = seg.start as u64 * dim as u64 * elem_bytes;
-            let len = seg.len as u64 * dim as u64 * elem_bytes;
-            let (x_r, o_r) = (src.data.sub(off, len), dst.data.sub(off, len));
-            let s_r = table.param(block_idx, seg.table_row, scale_param, elem_bytes);
-            let t_r = table.param(block_idx, seg.table_row, shift_param, elem_bytes);
-            let x = scope.import(&x_r);
-            let o = scope.import(&o_r);
-            let s = scope.import(&s_r);
-            let t = scope.import(&t_r);
-            // bias = 1.0 folds the `(1 + scale)` of AdaLN into the kernel.
-            let u = scope.u32x4_uniform(dim, 1.0_f32.to_bits(), 0, 0)?;
-            scope.bcast_modulate::<BcastModulateF32>(
-                &p.bcast_modulate,
-                x,
-                s,
-                t,
-                u,
-                o,
-                seg.len * dim,
-            )?;
-        }
-        Ok(())
-    };
-
-    // Apply `x + gate[seg] * y` per contiguous segment.
-    let gate_add = |x: &ActBuf<'wsp>,
-                    y: &ActBuf<'wsp>,
-                    dst: &ActBuf<'wsp>,
-                    gate_param: usize|
-     -> Result<(), WgpuError> {
-        let Some((table, block_idx, segments)) = modulation else {
-            return op_add(scope, p, *x, *y, *dst);
-        };
-        for seg in segments {
-            let off = seg.start as u64 * dim as u64 * elem_bytes;
-            let len = seg.len as u64 * dim as u64 * elem_bytes;
-            let x_r = x.data.sub(off, len);
-            let y_r = y.data.sub(off, len);
-            let o_r = dst.data.sub(off, len);
-            let g_r = table.param(block_idx, seg.table_row, gate_param, elem_bytes);
-            let xb = scope.import(&x_r);
-            let yb = scope.import(&y_r);
-            let ob = scope.import(&o_r);
-            let g = scope.import(&g_r);
-            let u = scope.u32x4_uniform(dim, 0, 0, 0)?;
-            scope.bcast_fma::<BcastFmaF32>(&p.bcast_fma, xb, g, yb, u, ob, seg.len * dim)?;
-        }
-        Ok(())
-    };
-
-    // --- attention ---
-    let n1 = alloc_act(scope, p, rows, dim)?;
-    op_rmsnorm(scope, p, x_in, norm1_w, n1, rows, dim, c.norm_eps)?;
-    let h1 = if modulation.is_some() {
-        let h = alloc_act(scope, p, rows, dim)?;
-        modulate(&n1, &h, SCALE_MSA, SHIFT_MSA)?;
-        h
-    } else {
-        n1
-    };
-    capture(0, h1.data)?;
-
-    let qkv = mm(
-        h1,
-        qkv_w,
-        3 * inner,
-        dim,
-        kinds.qkv,
-        pipelines.coopmat_sites.qkv,
-        false,
-        bufs.lora.and_then(|l| l.qkv),
-    )?;
-    capture(1, qkv)?;
-    let q = alloc_act(scope, p, rows, inner)?;
-    let k = alloc_act(scope, p, rows, inner)?;
-    let v = alloc_act(scope, p, rows, inner)?;
-    op_qkv_split(scope, p, ActBuf::dense(qkv), q, k, v, rows, inner)?;
-
-    // Per-head RMSNorm over head_dim, before rope.
-    let qn = alloc_act(scope, p, rows * heads, hd)?;
-    op_rmsnorm(scope, p, q, qn_w, qn, rows * heads, hd, c.qk_norm_eps)?;
-    let kn = alloc_act(scope, p, rows * heads, hd)?;
-    op_rmsnorm(scope, p, k, kn_w, kn, rows * heads, hd, c.qk_norm_eps)?;
-    capture(2, qn.data)?;
-
-    let (qr, kr) = match freqs_in {
-        None => (qn, kn),
-        Some(freqs) => {
-            // Partial half-rot: 96 of 128 channels rotate, the rest pass
-            // through. `rot_pairs` rides in the uniform's fourth slot.
-            let rot_pairs = (c.rotary_dim() / 2) as u32;
-            let qr = alloc_act(scope, p, rows, heads * hd)?;
-            let u = scope.u32x4_uniform(rows, heads, hd / 2, rot_pairs)?;
-            scope.rope::<RopeF32HalfRotPartial>(
-                &pipelines.rope_partial,
-                qn.data,
-                freqs,
-                u,
-                qr.data,
-                rows,
-                heads,
-                hd / 2,
-            )?;
-            let kr = alloc_act(scope, p, rows, heads * hd)?;
-            let u2 = scope.u32x4_uniform(rows, heads, hd / 2, rot_pairs)?;
-            scope.rope::<RopeF32HalfRotPartial>(
-                &pipelines.rope_partial,
-                kn.data,
-                freqs,
-                u2,
-                kr.data,
-                rows,
-                heads,
-                hd / 2,
-            )?;
-            (qr, kr)
-        }
-    };
+    let (h1, qr, kr, v) = g.attn_in(x_in, freqs_in, None, &capture)?;
 
     let sa = alloc_act(scope, p, rows, heads * hd)?;
     // Video sparse attention where the checkpoint was trained with it: the
     // learned compression gate reads the same normed input as q/k/v.
     let sparse = match (vsa, bufs.gate.as_ref()) {
         (Some(plan), Some(gate_w)) if c.vsa_gate => {
-            let gate = mm(
+            let gate = g.mm(
                 h1,
                 scope.import(gate_w),
                 inner,
-                dim,
+                c.hidden as u32,
                 kinds.gate,
                 false,
                 false,
@@ -1720,95 +2875,197 @@ fn block_forward<'wsp>(
         _ => false,
     };
     if !sparse {
-        // Padless sequence -> no mask. The dummy binding is never read.
-        let dummy_mask = scope.alloc(elem_bytes.max(4))?;
-        // The `_f16` entry is what `fast_sdpa` was compiled for: it casts
-        // Q/K/V to f16 for the subgroup kernel. Plain `op_sdpa` on this bf16
-        // block once fed that f16 kernel raw bf16 bits (the noise bug). V is
-        // not normed here, but the parity gate measures it O(100) at most, far
-        // inside f16.
-        op_sdpa_f16(
-            scope,
-            p,
-            qr,
-            kr,
-            v,
-            dummy_mask,
-            sa,
-            1,
-            rows,
-            rows,
-            heads,
-            heads,
-            hd,
-            shape.sdpa_scale(),
-            0,
-        )?;
+        dense_attention(scope, p, shape, rows, qr, kr, v, sa)?;
     }
     capture(3, sa.data)?;
+    g.attn_out(x_in, sa, ActBuf::dense(y_out), &capture)
+}
 
-    let proj = mm(
+/// Dense self-attention over all `rows` (padless: no mask).
+#[allow(clippy::too_many_arguments)]
+fn dense_attention<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    p: &BlockPipelines,
+    shape: DitShape,
+    rows: u32,
+    qr: ActBuf<'wsp>,
+    kr: ActBuf<'wsp>,
+    v: ActBuf<'wsp>,
+    sa: ActBuf<'wsp>,
+) -> Result<(), WgpuError> {
+    let c = shape.cfg;
+    // The dummy binding is never read.
+    let dummy_mask = scope.alloc(p.act_bytes(1).max(4))?;
+    // The `_f16` entry is what `fast_sdpa` was compiled for: it casts Q/K/V to
+    // f16 for the subgroup kernel. Plain `op_sdpa` on this bf16 block once fed
+    // that f16 kernel raw bf16 bits (the noise bug). V is not normed here, but
+    // the parity gate measures it O(100) at most, far inside f16.
+    op_sdpa_f16(
+        scope,
+        p,
+        qr,
+        kr,
+        v,
+        dummy_mask,
         sa,
-        out_w,
-        dim,
-        inner,
-        kinds.out,
-        pipelines.coopmat_sites.proj,
-        false,
-        bufs.lora.and_then(|l| l.out),
-    )?;
-    let after_attn = alloc_act(scope, p, rows, dim)?;
-    gate_add(&x_in, &ActBuf::dense(proj), &after_attn, GATE_MSA)?;
-    capture(4, proj)?;
-    capture(5, after_attn.data)?;
+        1,
+        rows,
+        rows,
+        c.n_heads as u32,
+        c.n_heads as u32,
+        c.head_dim as u32,
+        shape.sdpa_scale(),
+        0,
+    )
+}
 
-    // --- feed-forward ---
-    let n2 = alloc_act(scope, p, rows, dim)?;
-    op_rmsnorm(scope, p, after_attn, norm2_w, n2, rows, dim, c.norm_eps)?;
-    let h2 = if modulation.is_some() {
-        let h = alloc_act(scope, p, rows, dim)?;
-        modulate(&n2, &h, SCALE_MLP, SHIFT_MLP)?;
-        h
-    } else {
-        n2
+/// The accelerator contract of a generic-block quant site: bf16 acts against
+/// the bf16 N-major image the per-kind dequant writes.
+const QUANT_SITE_GEMM: thinfer_core::ops::GemmDesc = thinfer_core::ops::GemmDesc {
+    a: thinfer_core::ops::GemmType::Bf16,
+    b: thinfer_core::ops::GemmType::Bf16,
+    b_nmajor: true,
+    out_f32: false,
+};
+
+/// Rows per chunk of [`forward_block_chunked`]: bounds the widest
+/// intermediates (the fused SwiGLU input is `chunk x 2 * ffn`) and the
+/// per-site dequant workspaces' lifetime to one chunk's scope.
+pub const GENERIC_CHUNK_ROWS: u32 = 2048;
+
+/// [`forward_block`] for a long sequence on the backend block: row-local work
+/// in [`GENERIC_CHUNK_ROWS`] chunks, each its own scope (pass A: norm ->
+/// qkv -> rope into sequence-wide q / k / v; global attention; pass B: out
+/// projection -> FFN, written back into `x` in place). Every op but attention
+/// is row-local, so this is exact; only the dequant workspaces are rebuilt per
+/// chunk. Updates `x` in place.
+#[allow(clippy::too_many_arguments)]
+pub async fn forward_block_chunked(
+    workspace: &thinfer_core::workspace::Workspace<WgpuBackend>,
+    pipelines: &DitPipelines,
+    shape: DitShape,
+    x: BufRef,
+    freqs: BufRef,
+    bufs: &BlockBufs,
+    kinds: MatmulKinds,
+    table: &ModulationTable,
+    block_idx: usize,
+    segments: &[ModSegment],
+) -> Result<(), WgpuError> {
+    let p = &pipelines.block;
+    let c = shape.cfg;
+    let rows = shape.rows as u32;
+    let (dim, inner) = (c.hidden as u32, c.inner_dim() as u32);
+    let rot = super::rope3d::freqs_row_width(&c) as u32;
+    let eb = p.act_bytes(1);
+    let seq = |w: u32| workspace.alloc(rows as u64 * w as u64 * eb);
+    let (qr, kr, v, sa) = (seq(inner)?, seq(inner)?, seq(inner)?, seq(inner)?);
+    let slice = |b: BufRef, r0: u32, n: u32, w: u32| {
+        BufRef::view(
+            b.id,
+            b.offset + r0 as u64 * w as u64 * eb,
+            n as u64 * w as u64 * eb,
+        )
     };
-
-    // fc1 emits the fused [gate; value]; the SwiGLU reads it in place.
-    let fused = mm(
-        h2,
-        fc1_w,
-        2 * ffn,
-        dim,
-        kinds.fc1,
-        pipelines.coopmat_sites.ffn_up,
-        true,
-        bufs.lora.and_then(|l| l.fc1),
-    )?;
-    capture(6, fused)?;
-    let gu = alloc_act(scope, p, rows, ffn)?;
-    {
-        let u = scope.u32x4_uniform(rows, ffn, 0, 0)?;
-        scope.silu_mul_fused::<SiluMulFusedF32>(
-            &pipelines.silu_mul_fused,
-            fused,
-            u,
-            gu.data,
-            rows * ffn,
+    // The segments over rows `[r0, r0 + n)`, rebased to the chunk.
+    let chunk_segments = |r0: u32, n: u32| -> Vec<ModSegment> {
+        segments
+            .iter()
+            .filter_map(|s| {
+                let (lo, hi) = (s.start.max(r0), (s.start + s.len).min(r0 + n));
+                (lo < hi).then_some(ModSegment {
+                    start: lo - r0,
+                    len: hi - lo,
+                    table_row: s.table_row,
+                })
+            })
+            .collect()
+    };
+    let no_capture = |_: usize, _: BatchBuf<'_>| Ok(());
+    let chunks: Vec<(u32, u32)> = (0..rows)
+        .step_by(GENERIC_CHUNK_ROWS as usize)
+        .map(|r0| (r0, GENERIC_CHUNK_ROWS.min(rows - r0)))
+        .collect();
+    // Wall time per pass (each ends on an awaited submit, so this is GPU
+    // time plus encode), to localize the block's cost.
+    let t0 = thinfer_core::trace::Instant::now();
+    // Pass A.
+    for &(r0, n) in &chunks {
+        let segs = chunk_segments(r0, n);
+        let scope = workspace.batch();
+        let g = GenericBlock {
+            scope: &scope,
+            pipelines,
+            c,
+            rows: n,
+            bufs,
+            kinds,
+            modulation: Some((table, block_idx, &segs)),
+        };
+        let dst = [qr.as_buf_ref(), kr.as_buf_ref(), v.as_buf_ref()]
+            .map(|b| ActBuf::dense(scope.import_copy(slice(b, r0, n, inner))));
+        g.attn_in(
+            ActBuf::dense(scope.import_copy(slice(x, r0, n, dim))),
+            Some(scope.import_copy(slice(freqs, r0, n, rot))),
+            Some(dst),
+            &no_capture,
         )?;
+        scope.submit_void().await?;
     }
-    let down = mm(
-        gu,
-        fc2_w,
-        dim,
-        ffn,
-        kinds.fc2,
-        pipelines.coopmat_sites.ffn_down,
-        false,
-        bufs.lora.and_then(|l| l.fc2),
-    )?;
-    capture(7, gu.data)?;
-    capture(8, down)?;
-    gate_add(&after_attn, &ActBuf::dense(down), &y_out, GATE_MLP)?;
+    let t_a = t0.elapsed();
+    // Attention over the whole sequence.
+    {
+        let scope = workspace.batch();
+        let act = |b: &thinfer_core::workspace::WsBuf<WgpuBackend>| {
+            ActBuf::dense(scope.import_copy(b.as_buf_ref()))
+        };
+        dense_attention(
+            &scope,
+            p,
+            shape,
+            rows,
+            act(&qr),
+            act(&kr),
+            act(&v),
+            act(&sa),
+        )?;
+        scope.submit_void().await?;
+    }
+    let t_attn = t0.elapsed();
+    // Pass B, in place: a chunk's rows of `x` are read before they are
+    // written, and no other chunk reads them any more.
+    for &(r0, n) in &chunks {
+        let segs = chunk_segments(r0, n);
+        let scope = workspace.batch();
+        let g = GenericBlock {
+            scope: &scope,
+            pipelines,
+            c,
+            rows: n,
+            bufs,
+            kinds,
+            modulation: Some((table, block_idx, &segs)),
+        };
+        let x_c = ActBuf::dense(scope.import_copy(slice(x, r0, n, dim)));
+        let y = alloc_act(&scope, p, n, dim)?;
+        g.attn_out(
+            x_c,
+            ActBuf::dense(scope.import_copy(slice(sa.as_buf_ref(), r0, n, inner))),
+            y,
+            &no_capture,
+        )?;
+        scope.copy_buffer_to_buffer(y.data, 0, x_c.data, 0, n as u64 * dim as u64 * eb)?;
+        scope.submit_void().await?;
+    }
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    tracing::debug!(
+        target: thinfer_core::trace::PHASE,
+        block_idx,
+        pass_a_ms = ms(t_a),
+        attn_ms = ms(t_attn - t_a),
+        pass_b_ms = ms(t0.elapsed() - t_attn),
+        "minimax.dit.chunked_passes"
+    );
     Ok(())
 }
 
@@ -1836,6 +3093,13 @@ pub fn forward_block<'wsp>(
     if let (Some(plan), None) = (vsa, probe)
         && block_forward_accel(
             scope, pipelines, shape, x, freqs_in, x, bufs, kinds, modulation, plan,
+        )?
+    {
+        return Ok(());
+    }
+    if probe.is_none()
+        && block_forward_generic_accel(
+            scope, pipelines, shape, x, freqs_in, x, bufs, kinds, modulation, vsa,
         )?
     {
         return Ok(());
@@ -1869,6 +3133,21 @@ pub struct VsaPlan {
     /// Hold queries (and the gate) one slab at a time instead of for every
     /// row (see `block_forward_accel`); `shape.slab_tiles` is sized for it.
     pub query_slabs: bool,
+}
+
+impl VsaPlan {
+    /// The plan as exact dense attention (every query tile keeps every key
+    /// tile, no compression gate): the generic block's INT8 / FP8 attention.
+    /// `Some(shape)` with one slab spanning every tile (it holds every q row).
+    pub fn dense_shape(&self, cfg: &DitConfig) -> Option<thinfer_core::backend::VsaShape> {
+        let s = self.shape;
+        (!cfg.vsa_gate && s.topk == s.n_tiles - s.n_prefix).then_some(
+            thinfer_core::backend::VsaShape {
+                slab_tiles: s.n_tiles,
+                ..s
+            },
+        )
+    }
 }
 
 /// One token-refiner block: same shape, no AdaLN and no rotary.

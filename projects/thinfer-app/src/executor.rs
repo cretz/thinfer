@@ -12,7 +12,6 @@ use std::sync::Arc;
 use thinfer_core::backend::WgpuBackend;
 use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::format::safetensors::SafetensorsSource;
-#[cfg(feature = "vault")]
 use thinfer_core::format::safetensors::ShardedSafetensorsSource;
 use thinfer_core::format::union::{RenamedSource, UnionSource};
 use thinfer_core::residency::WeightResidency;
@@ -20,8 +19,8 @@ use thinfer_core::tokenizer::Tokenizer;
 #[cfg(feature = "vault")]
 use thinfer_core::weight::WeightId;
 use thinfer_core::weight::WeightSource;
-#[cfg(feature = "vault")]
 use thinfer_models::common::lora as vault_lora;
+use thinfer_models::faceswap::image::Image;
 use thinfer_models::ideogram4::lora::LoraFoldSource;
 use thinfer_models::ideogram4::manifest::role as idrole;
 use thinfer_models::ideogram4::pipeline::{
@@ -34,11 +33,9 @@ use thinfer_models::qwen_image::pipeline::{self as qpipe, QwenImagePipeline};
 use thinfer_models::qwen_image::text_encoder::qwen2vl_gguf_renames;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::wan::pipeline::{
-    self as wanpipe, GenerationParams as WanParams, Shot, VaeChoice, WanModel, WanVariant, WanVideo,
+    self as wanpipe, GenerationParams as WanParams, VaeChoice, WanModel, WanVariant, WanVideo,
 };
-use thinfer_models::wan::source::{
-    dit_gguf_renames, open_dreamidv_source, open_longlive_source, open_wan22_source,
-};
+use thinfer_models::wan::source::{dit_gguf_renames, open_dreamidv_source, open_wan22_source};
 use thinfer_models::z_image::manifest::role as zrole;
 use thinfer_models::z_image::pipeline::{self as zpipe, GenerationParams as ZParams, ZImageModel};
 use thinfer_models::z_image::qwen3_gguf_renames;
@@ -120,6 +117,9 @@ impl LocalExecutor {
             crate::model::ImageKind::QwenImageEdit => self.run_qwen_image_edit(req, sink).await,
             crate::model::ImageKind::QwenImage => self.run_qwen_image(req, sink).await,
             crate::model::ImageKind::Krea2 => self.run_krea(req, sink).await,
+            crate::model::ImageKind::QwenImage21 => {
+                crate::qwen21::run(&self.backend, req, image_budget(req.budget), sink).await
+            }
         }
     }
 
@@ -192,8 +192,9 @@ impl LocalExecutor {
             .generate(&params, Some(&progress))
             .await
             .map_err(|e| format!("generate: {e:?}"))?;
-        crate::progress::write_artifact(sink, &req.output, &png)?;
-        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+        let bytes = png.len();
+        crate::progress::write_artifact(sink, &req.output, png)?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
             output: req.output.clone(),
@@ -278,8 +279,9 @@ impl LocalExecutor {
             .generate(&params, None, Some(&progress))
             .await
             .map_err(|e| format!("generate: {e:?}"))?;
-        crate::progress::write_artifact(sink, &req.output, &png)?;
-        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+        let bytes = png.len();
+        crate::progress::write_artifact(sink, &req.output, png)?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
             output: req.output.clone(),
@@ -302,10 +304,9 @@ impl LocalExecutor {
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         let manifest = req.model.manifest();
-        let input_image = req
-            .input_image
-            .as_ref()
-            .ok_or("--input-image is required for qwen-image-edit-rapid")?;
+        let [input_image] = req.input_images.as_slice() else {
+            return Err("qwen-image-edit-rapid edits exactly one --input-image".into());
+        };
 
         // --- 4-source union: dit(1:1) + encoder(renamed) + mmproj(native) + vae ---
         let dit = open_mmap(&resolve_role(manifest, qrole::DIT_GGUF_Q8_0)?).await?;
@@ -348,7 +349,7 @@ impl LocalExecutor {
             target: thinfer_core::trace::DIAG,
             model = %req.model, width = req.width, height = req.height,
             steps = req.steps, seed, tokens = inputs.token_ids.len(),
-            image_pad_start = inputs.image_pad_start,
+            image_pad_start = inputs.image_pad_start, drop = inputs.drop,
             vit_grid = ?inputs.vit_grid, vae_dims = ?inputs.vae_dims,
             adapters = req.lora.len(), "qwen-image-edit generate start",
         );
@@ -426,6 +427,7 @@ impl LocalExecutor {
             .generate_edit_rgb(
                 &inputs.token_ids,
                 inputs.image_pad_start,
+                inputs.drop,
                 &inputs.vit_pixels,
                 inputs.vit_grid,
                 &inputs.vae_image,
@@ -440,8 +442,9 @@ impl LocalExecutor {
             .map_err(|e| format!("generate: {e:?}"))?;
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
-        crate::progress::write_artifact(sink, &req.output, &png)?;
-        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+        let bytes = png.len();
+        crate::progress::write_artifact(sink, &req.output, png)?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
             output: req.output.clone(),
@@ -568,8 +571,9 @@ impl LocalExecutor {
             .map_err(|e| format!("generate: {e:?}"))?;
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
-        crate::progress::write_artifact(sink, &req.output, &png)?;
-        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+        let bytes = png.len();
+        crate::progress::write_artifact(sink, &req.output, png)?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
             output: req.output.clone(),
@@ -694,8 +698,9 @@ impl LocalExecutor {
             .map_err(|e| format!("generate: {e:?}"))?;
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
-        crate::progress::write_artifact(sink, &req.output, &png)?;
-        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes = png.len(), "wrote output");
+        let bytes = png.len();
+        crate::progress::write_artifact(sink, &req.output, png)?;
+        tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
             output: req.output.clone(),
@@ -806,12 +811,6 @@ impl LocalExecutor {
         if req.model.is_hunyuan() {
             return crate::hunyuan::run(&self.backend, req, sink).await;
         }
-        // DreamID-V video face-swap: its own wan::dreamidv pipeline (target video +
-        // live DWPose mask + source-face image, image-CFG denoise), no Wan
-        // variant/sampler/prompt machinery. Dispatch before any Wan lookup.
-        if req.model.is_dreamidv() {
-            return self.run_dreamidv(req, sink).await;
-        }
         let plan = req.resolve()?;
         for w in &plan.warnings {
             tracing::warn!(target: thinfer_core::trace::DIAG, "{w}");
@@ -847,19 +846,18 @@ impl LocalExecutor {
         let seed = req.seed.unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
-            model = %req.model, shots = plan.shots.len().max(1),
+            model = %req.model,
             width = req.width, height = req.height, frames = plan.frames, fps = plan.fps,
             seed, ram_budget = req.budget.ram_bytes, vram_budget = req.budget.vram_bytes,
             "generate video start",
         );
         sink.note(&format!(
-            "Generating {}x{} video, {} frames, {} fps (~{:.1}s), {} shot(s), seed {} ({})",
+            "Generating {}x{} video, {} frames, {} fps (~{:.1}s), seed {} ({})",
             req.width,
             req.height,
             plan.frames,
             plan.fps,
             plan.frames as f32 / plan.fps as f32,
-            plan.shots.len().max(1),
             seed,
             req.model,
         ));
@@ -867,8 +865,6 @@ impl LocalExecutor {
         let progress = |ev: wanpipe::ProgressEvent| sink.stage(map_wan(ev));
         let cancel = || sink.cancelled();
         let params = WanParams {
-            // Single-shot reads this; multi-shot reads `shots` and ignores it
-            // (kept = the first shot's caption for logging consistency).
             prompt: req.prompts[0].clone(),
             height: req.height,
             width: req.width,
@@ -884,27 +880,7 @@ impl LocalExecutor {
             steps: Some(req.steps),
         };
 
-        let video = if req.model.is_ar() {
-            let dit_opener = open_mmap(&resolve_role(manifest, wanmf::role::LONGLIVE_DIT)?).await?;
-            let num_layers =
-                thinfer_models::wan::dit_block::WanDitConfig::longlive_2_0_5b().num_layers;
-            let source = open_longlive_source(dit_opener, weight_openers, num_layers)
-                .await
-                .map_err(|e| format!("parse LongLive weights: {e:?}"))?;
-            self.run_wan(
-                source,
-                req,
-                tokenizer,
-                &params,
-                &plan.shots,
-                vae,
-                true,
-                WanVariant::longlive_2_0_5b(),
-                &progress,
-                &cancel,
-            )
-            .await?
-        } else if matches!(req.model, VideoModelId::Wan22T2vA14b) {
+        let video = if matches!(req.model, VideoModelId::Wan22T2vA14b) {
             // Wan2.2-A14B MoE: two folded GGUF experts + the safetensors tail
             // (umT5 reused from the FastWan bundle + the Wan2.1 VAE; both already in
             // `weight_openers` from the variant tail roles).
@@ -932,9 +908,7 @@ impl LocalExecutor {
                 req,
                 tokenizer,
                 &params,
-                &plan.shots,
                 vae,
-                false,
                 WanVariant::wan22_t2v_a14b(),
                 &progress,
                 &cancel,
@@ -993,9 +967,7 @@ impl LocalExecutor {
                 req,
                 tokenizer,
                 &params,
-                &plan.shots,
                 vae,
-                false,
                 wan_variant,
                 &progress,
                 &cancel,
@@ -1009,7 +981,7 @@ impl LocalExecutor {
                 crate::progress::write_artifact(
                     sink,
                     &req.output,
-                    &codec::encode_mp4(&video, plan.fps)?,
+                    codec::encode_mp4(&video, plan.fps)?,
                 )?;
             }
             VideoFormat::PngFrames => {
@@ -1029,9 +1001,9 @@ impl LocalExecutor {
         })
     }
 
-    /// Load + denoise a Wan model from `source` (FastWan DMD or LongLive AR).
-    /// Generic over the weight source so safetensors and `.pt`-backed paths
-    /// share the load/generate/error tail.
+    /// Load + denoise a Wan model from `source`. Generic over the weight source
+    /// so the safetensors and GGUF-backed paths share the load/generate/error
+    /// tail.
     #[allow(clippy::too_many_arguments)]
     async fn run_wan<S: thinfer_core::weight::WeightSource>(
         &self,
@@ -1039,9 +1011,7 @@ impl LocalExecutor {
         req: &VideoRequest,
         tokenizer: HfTokenizer,
         params: &WanParams,
-        shots: &[Shot],
         vae: VaeChoice,
-        ar: bool,
         variant: WanVariant,
         progress: &dyn Fn(wanpipe::ProgressEvent),
         cancel: &dyn Fn() -> bool,
@@ -1063,18 +1033,11 @@ impl LocalExecutor {
         };
         // Cooperative cancellation: the denoise loop polls `cancel` between steps
         // and aborts with GenerateError::Cancelled, which the worker maps to a
-        // cancelled job state (the AR path is not yet cancel-wired).
-        if ar {
-            model
-                .generate_ar(params, shots, vae, Some(progress))
-                .await
-                .map_err(|e| format!("generate: {e:?}"))
-        } else {
-            model
-                .generate(params, vae, Some(progress), Some(&cancel))
-                .await
-                .map_err(|e| format!("generate: {e:?}"))
-        }
+        // cancelled job state.
+        model
+            .generate(params, vae, Some(progress), Some(&cancel))
+            .await
+            .map_err(|e| format!("generate: {e:?}"))
     }
 
     async fn run_faceswap(
@@ -1083,15 +1046,24 @@ impl LocalExecutor {
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         req.validate()?;
-        // The ONNX runtime runs no accelerator op and reallocates per frame:
-        // exportable (CUDA-shared) buffers would cost ~3x the whole swap.
-        let _plain = self.backend.plain_allocations();
+        if req.model.is_dreamidv() {
+            return self.run_dreamidv(req, sink).await;
+        }
+        // HyperSwap runs no accelerator op: plain buffers (exporting costs per
+        // allocation). AlphaFace's convs run on the accelerator, so its
+        // activations and weights must be exportable.
+        let _plain = (req.model.swapper()
+            != Some(thinfer_models::faceswap::SwapperKind::AlphaFace))
+        .then(|| self.backend.plain_allocations());
         let scrfd = std::fs::read(resolve_file(&crate::model::SCRFD)?)
             .map_err(|e| format!("read scrfd: {e}"))?;
         let arcface = std::fs::read(resolve_file(&crate::model::ARCFACE)?)
             .map_err(|e| format!("read arcface: {e}"))?;
-        let hyperswap = std::fs::read(resolve_file(&req.model.file())?)
-            .map_err(|e| format!("read hyperswap: {e}"))?;
+        let (Some(swap_file), Some(swapper_kind)) = (req.model.file(), req.model.swapper()) else {
+            return Err("not a per-frame swap model".into());
+        };
+        let swapper_onnx =
+            std::fs::read(resolve_file(&swap_file)?).map_err(|e| format!("read swapper: {e}"))?;
         let xseg = if req.options.occlusion {
             Some(
                 std::fs::read(resolve_file(&crate::model::XSEG)?)
@@ -1122,8 +1094,9 @@ impl LocalExecutor {
             self.backend.clone(),
             &scrfd,
             &arcface,
-            &hyperswap,
+            &swapper_onnx,
             thinfer_models::faceswap::SwapOptions {
+                swapper: swapper_kind,
                 hyperswap_mask: req.options.hyperswap_mask,
                 occlusion: req.options.occlusion,
                 enhance: req.options.enhance,
@@ -1177,27 +1150,29 @@ impl LocalExecutor {
     /// constant ([`baked_context`]).
     async fn run_dreamidv(
         &self,
-        req: &VideoRequest,
+        req: &FaceSwapRequest,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         use thinfer_models::wan::dreamidv::{DreamIdvInputs, DreamIdvPipeline, RgbFrames};
 
-        let plan = req.resolve()?; // validates the source image + target video + dims
-        let manifest = req.model.manifest();
+        let manifest = &wanmf::MANIFEST;
+        let opts = &req.options;
+        let d = &opts.diffusion;
 
         // --- 1. decode the target video into RAM frames ---
-        let input_video = req
-            .input_video
-            .as_ref()
-            .ok_or("dreamid-v requires a target video")?;
-        let video_bytes = resolve_video_bytes(input_video)?;
+        let video_bytes = resolve_video_bytes(&req.input_video)?;
         sink.note("Decoding target video");
-        let (mut frames, _src_fps) = codec::decode_mp4_frames(video_bytes.as_ref())?;
+        let (mut frames, fps) = codec::decode_mp4_frames(video_bytes.as_ref())?;
         drop(video_bytes);
+        // The optional [start, end) window, in source seconds.
+        let at = |secs: f32| (secs * fps as f32).round() as usize;
+        let first = opts.start_secs.map_or(0, at).min(frames.len());
+        let last = opts.end_secs.map_or(frames.len(), at).min(frames.len());
+        frames.truncate(last);
+        frames.drain(..first);
 
-        // Clamp to the requested target on the 4k+1 grid, bounded by the actual
-        // decoded length (the pipeline needs `frames == 4k + 1`).
-        let cap = largest_4k_plus_1((plan.frames as usize).min(frames.len()));
+        // The pipeline runs `4k + 1` frames: the largest that fits the window.
+        let cap = largest_4k_plus_1(frames.len());
         if cap == 0 {
             return Err("target video is too short (need at least 1 frame)".into());
         }
@@ -1205,11 +1180,7 @@ impl LocalExecutor {
         let (fw, fh) = (frames[0].w, frames[0].h);
 
         // --- 2. source face image (small; RAM only, never on disk) ---
-        let source_face = req
-            .source_image
-            .as_ref()
-            .ok_or("dreamid-v requires a source face image")?;
-        let source_img = codec::load_image_bytes(&source_face.0)?;
+        let source_img = codec::load_image_bytes(&req.source_image.0)?;
         sink.note(&format!(
             "Loaded source face {}x{}",
             source_img.w, source_img.h
@@ -1224,23 +1195,51 @@ impl LocalExecutor {
             "Generating face masks for {} frames (DWPose)",
             cap
         ));
-        let masks = thinfer_models::faceswap::dwpose::face_mask_video(
-            self.backend.clone(),
-            &yolox,
-            &dwpose,
-            &frames,
-        )
-        .await
-        .map_err(|e| format!("face-mask (DWPose): {e:?}"))?;
+        // DWPose runs no accelerator op: plain buffers, not the costly
+        // exportable ones (its executor allocates per run; ~3x slower).
+        let masks = {
+            let _plain = self.backend.plain_allocations();
+            thinfer_models::faceswap::dwpose::face_mask_video(
+                self.backend.clone(),
+                &yolox,
+                &dwpose,
+                &frames,
+            )
+            .await
+            .map_err(|e| format!("face-mask (DWPose): {e:?}"))?
+        };
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
             "dreamid-v masks done",
         );
 
+        // Opt-in face crop: the pipeline sees only the face region.
+        let crop = if d.face_crop {
+            let r = face_crop_rect(&masks);
+            if r.is_none() {
+                sink.note("No face in the masks: running on the whole frame");
+            }
+            r
+        } else {
+            None
+        };
+        let cropped = crop.map(|r| {
+            let cut = |v: &[Image]| -> Vec<Image> {
+                v.iter().map(|i| i.crop(r.x, r.y, r.w, r.h)).collect()
+            };
+            (cut(&frames), cut(&masks))
+        });
+        let (src_w, src_h) = (fw, fh);
+        let (vframes, vmasks): (&[Image], &[Image]) = match &cropped {
+            Some((f, m)) => (f, m),
+            None => (&frames, &masks),
+        };
+        let (fw, fh) = (vframes[0].w, vframes[0].h);
+
         // --- 4. flatten to interleaved RGB [n, h, w, 3] the pipeline expects ---
         let mut video_rgb = Vec::with_capacity(cap * fh * fw * 3);
-        for f in &frames {
+        for f in vframes {
             if (f.w, f.h) == (fw, fh) {
                 video_rgb.extend_from_slice(&f.to_rgb8());
             } else {
@@ -1248,7 +1247,7 @@ impl LocalExecutor {
             }
         }
         let mut mask_rgb = Vec::with_capacity(cap * fh * fw * 3);
-        for m in &masks {
+        for m in vmasks {
             if (m.w, m.h) == (fw, fh) {
                 mask_rgb.extend_from_slice(&m.to_rgb8());
             } else {
@@ -1256,6 +1255,18 @@ impl LocalExecutor {
             }
         }
         let src_rgb = source_img.to_rgb8();
+        // Run-to-run determinism probe: identical inputs must hash identically.
+        let digest = |b: &[u8]| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            b.hash(&mut h);
+            h.finish()
+        };
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            video = digest(&video_rgb), mask = digest(&mask_rgb),
+            "dreamid-v inputs digest",
+        );
 
         // --- 5. resolve the downloaded DiT `.pth` + Wan2.1 VAE (baked context is
         //         an in-tree model constant, not a download) ---
@@ -1269,12 +1280,13 @@ impl LocalExecutor {
             .await
             .map_err(|e| format!("open dreamidv source: {e:?}"))?;
 
-        let seed = req.seed.unwrap_or_else(random_seed);
-        let guide_scale = req
-            .guide_scale
-            .unwrap_or_else(|| req.model.default_guide_scale());
-        let steps = req.steps;
-        let target_area = req.width as f64 * req.height as f64;
+        let seed = d.seed.unwrap_or_else(random_seed);
+        let (guide_scale, steps) = (d.guide_scale, d.steps);
+        // A crop runs at up to its native size (never upscaled).
+        let target_area = match crop {
+            Some(r) => ((r.w * r.h) as f64).min(d.width as f64 * d.height as f64),
+            None => d.width as f64 * d.height as f64,
+        };
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model, frames = cap, width = fw, height = fh,
@@ -1321,6 +1333,7 @@ impl LocalExecutor {
             steps,
             guide_scale,
             seed,
+            cfg_every: d.cfg_every,
         };
         sink.stage(Stage::VaeDecode);
         let out = pipeline.generate(&inputs, None).await.map_err(|e| {
@@ -1333,26 +1346,139 @@ impl LocalExecutor {
         })?;
 
         // --- 7. encode the swapped clip -> MP4 ---
-        let video = WanVideo {
-            frames: out.frames,
-            num_frames: out.num_frames,
-            height: out.height,
-            width: out.width,
+        let video = match crop {
+            Some(r) => WanVideo {
+                frames: paste_crop(&frames, &out, r).into(),
+                num_frames: out.num_frames,
+                height: src_h,
+                width: src_w,
+            },
+            None => WanVideo {
+                frames: out.frames.into(),
+                num_frames: out.num_frames,
+                height: out.height,
+                width: out.width,
+            },
         };
-        let fps = plan.fps;
         sink.note("Encoding MP4 (H.264)");
-        crate::progress::write_artifact(sink, &req.output, &codec::encode_mp4(&video, fps)?)?;
+        crate::progress::write_artifact(sink, &req.output, codec::encode_mp4(&video, fps)?)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
         Ok(JobSummary {
             output: req.output.clone(),
-            width: out.width as u32,
-            height: out.height as u32,
-            frames: out.num_frames as u32,
+            width: video.width as u32,
+            height: video.height as u32,
+            frames: video.num_frames as u32,
             fps: Some(fps),
             seed: Some(seed),
         })
     }
+}
+
+/// A face-crop window in source pixels.
+#[derive(Clone, Copy, Debug)]
+struct CropRect {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
+/// The DreamID-V face crop: the union of every frame's face mask, grown to a
+/// square of twice its longer side (hair, neck and some background for
+/// context), clamped to the frame, sides multiples of 16. `None` when no
+/// mask has a face.
+fn face_crop_rect(masks: &[Image]) -> Option<CropRect> {
+    let (w, h) = (masks[0].w, masks[0].h);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for m in masks {
+        for y in 0..h {
+            for x in 0..w {
+                if m.data[(y * w + x) * 3] > 127.0 {
+                    (x0, y0) = (x0.min(x), y0.min(y));
+                    (x1, y1) = (x1.max(x + 1), y1.max(y + 1));
+                }
+            }
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let side = |n: usize, lim: usize| (n.min(lim) / 16 * 16).max(16.min(lim));
+    let s = 2 * (x1 - x0).max(y1 - y0);
+    let (cw, ch) = (side(s, w), side(s, h));
+    let place = |c: usize, len: usize, lim: usize| c.saturating_sub(len / 2).min(lim - len);
+    Some(CropRect {
+        x: place((x0 + x1) / 2, cw, w),
+        y: place((y0 + y1) / 2, ch, h),
+        w: cw,
+        h: ch,
+    })
+}
+
+/// The full-resolution clip with the decoded crop resized back into `r`:
+/// CTHW `[3, n, h, w]` in `[-1, 1]`. The crop's inner edges feather over an
+/// eighth of its shorter side so the seam does not show (frame borders take
+/// the crop as is).
+fn paste_crop(
+    frames: &[Image],
+    out: &thinfer_models::wan::dreamidv::DreamIdvVideo,
+    r: CropRect,
+) -> Vec<f32> {
+    let (w, h) = (frames[0].w, frames[0].h);
+    let (n, oh, ow) = (out.num_frames, out.height, out.width);
+    let feather = (r.w.min(r.h) / 8).max(1) as f32;
+    let ramp = |p: usize, lo: usize, len: usize, edge_lo: bool, edge_hi: bool| {
+        let a = if edge_lo {
+            f32::MAX
+        } else {
+            (p - lo) as f32 + 0.5
+        };
+        let b = if edge_hi {
+            f32::MAX
+        } else {
+            (lo + len - p) as f32 - 0.5
+        };
+        (a.min(b) / feather).min(1.0)
+    };
+    let mut video = vec![0f32; 3 * n * h * w];
+    for (t, frame) in frames.iter().enumerate().take(n) {
+        let mut crop = vec![0f32; oh * ow * 3];
+        for c in 0..3 {
+            for i in 0..oh * ow {
+                crop[i * 3 + c] = (out.frames[(c * n + t) * oh * ow + i] + 1.0) * 127.5;
+            }
+        }
+        let crop = Image {
+            w: ow,
+            h: oh,
+            data: crop,
+        }
+        .resize(r.w, r.h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut px = [0f32; 3];
+                px.copy_from_slice(&frame.data[(y * w + x) * 3..][..3]);
+                if (r.x..r.x + r.w).contains(&x) && (r.y..r.y + r.h).contains(&y) {
+                    let a = ramp(x, r.x, r.w, r.x == 0, r.x + r.w == w).min(ramp(
+                        y,
+                        r.y,
+                        r.h,
+                        r.y == 0,
+                        r.y + r.h == h,
+                    ));
+                    let q = &crop.data[((y - r.y) * r.w + x - r.x) * 3..][..3];
+                    for c in 0..3 {
+                        px[c] += a * (q[c] - px[c]);
+                    }
+                }
+                for c in 0..3 {
+                    video[(c * n + t) * h * w + y * w + x] = px[c] / 127.5 - 1.0;
+                }
+            }
+        }
+    }
+    video
 }
 
 /// Largest `4k + 1` not exceeding `n` (the DreamID-V temporal grid), or 0 when
@@ -1361,19 +1487,35 @@ fn largest_4k_plus_1(n: usize) -> usize {
     if n == 0 { 0 } else { 4 * ((n - 1) / 4) + 1 }
 }
 
+/// A target video's bytes: a RAM upload borrowed as is, or a decrypted spill
+/// (page-locked on a server, zeroized on drop).
+enum VideoBytes<'a> {
+    Ram(&'a [u8]),
+    Decrypted(thinfer_core::secmem::Locked<u8>),
+}
+
+impl AsRef<[u8]> for VideoBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            VideoBytes::Ram(b) => b,
+            VideoBytes::Decrypted(b) => b,
+        }
+    }
+}
+
 /// Materialize a target video's bytes in RAM. A `Ram` upload is borrowed
 /// directly; an `Encrypted` spill is read + decrypted with its RAM-held ephemeral
 /// key (the plaintext lives only for the decode, and is never logged).
-fn resolve_video_bytes(input: &VideoInput) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+fn resolve_video_bytes(input: &VideoInput) -> Result<VideoBytes<'_>, String> {
     match input {
-        VideoInput::Ram(b) => Ok(std::borrow::Cow::Borrowed(b)),
+        VideoInput::Ram(b) => Ok(VideoBytes::Ram(b)),
         VideoInput::Encrypted { path, key, nonce } => {
             #[cfg(feature = "vault")]
             {
                 let ct = std::fs::read(path).map_err(|e| format!("read encrypted upload: {e}"))?;
                 let pt = crate::vault::ephemeral_unseal(key, nonce, &ct)
                     .map_err(|e| format!("decrypt upload: {e}"))?;
-                Ok(std::borrow::Cow::Owned(pt))
+                Ok(VideoBytes::Decrypted(pt.into()))
             }
             #[cfg(not(feature = "vault"))]
             {
@@ -1533,17 +1675,6 @@ fn map_wan(ev: wanpipe::ProgressEvent) -> Stage {
     match ev {
         wanpipe::ProgressEvent::TextEncode => Stage::TextEncode,
         wanpipe::ProgressEvent::Step { i, n } => Stage::Step { i, n },
-        wanpipe::ProgressEvent::ChunkStep {
-            chunk,
-            num_chunks,
-            step,
-            num_steps,
-        } => Stage::ChunkStep {
-            chunk,
-            num_chunks,
-            step,
-            num_steps,
-        },
         wanpipe::ProgressEvent::VaeDecode => Stage::VaeDecode,
     }
 }

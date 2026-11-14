@@ -180,14 +180,16 @@ fn vsa_matches_cpu_reference() {
             let out_len = (rows * H * D * 2) as u64;
             let out = BufRef::new(backend.allocate(out_len).expect("out"), out_len);
 
-            // INT8 QK^T is SageAttention-style lossy: judged against the
-            // same exact reference at a looser bound.
-            for (topk, with_gate, int8_qk) in [
-                (g.topk(0.8), true, false),
-                (g.topk(0.8), false, false),
-                (g.n_video(), true, false),
-                (g.topk(0.8), true, true),
-                (g.n_video(), true, true),
+            // INT8 QK^T (and FP8 P.V) are SageAttention-style lossy: judged
+            // against the same exact reference at looser bounds.
+            for (topk, with_gate, int8_qk, fp8_pv) in [
+                (g.topk(0.8), true, false, false),
+                (g.topk(0.8), false, false, false),
+                (g.n_video(), true, false, false),
+                (g.topk(0.8), true, true, false),
+                (g.n_video(), true, true, false),
+                (g.topk(0.8), true, true, true),
+                (g.n_video(), false, true, true),
             ] {
                 let shape = VsaShape {
                     rows: rows as u32,
@@ -195,6 +197,7 @@ fn vsa_matches_cpu_reference() {
                     head_dim: D as u32,
                     tile: tiling.rows as u32,
                     int8_qk,
+                    fp8_pv,
                     n_tiles: g.n_tiles() as u32,
                     n_prefix: g.n_prefix as u32,
                     topk: topk as u32,
@@ -301,12 +304,17 @@ fn vsa_matches_cpu_reference() {
                 }
                 let rel = (e2 / r2).sqrt();
                 eprintln!(
-                    "tile {} topk {topk}/{} gate {with_gate} int8 {int8_qk}: rel_rms {rel:.3e}",
+                    "tile {} topk {topk}/{} gate {with_gate} int8 {int8_qk} fp8 {fp8_pv}: rel_rms {rel:.3e}",
                     tiling.rows,
                     g.n_video()
                 );
-                // f16 probabilities + bf16 output rounding (+ INT8 Q/K).
-                let bound = if int8_qk { 2e-2 } else { 5e-3 };
+                // f16 probabilities + bf16 output rounding (+ INT8 Q/K, + e4m3
+                // P / V: 3 mantissa bits each).
+                let bound = match (int8_qk, fp8_pv) {
+                    (_, true) => 1.5e-2,
+                    (true, false) => 2e-2,
+                    _ => 5e-3,
+                };
                 assert!(rel < bound, "vsa rel_rms {rel}");
             }
         }

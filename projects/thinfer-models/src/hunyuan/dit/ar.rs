@@ -12,7 +12,7 @@
 //! - **Chunk forwards**: each chunk of `CHUNK_LATENT_FRAMES` latent frames runs
 //!   img-only block passes; per block the SDPA reads `kv = [txt ; committed
 //!   vision ; this chunk]` (dense, no mask: causality is the cache contents,
-//!   the LongLive scheme). RoPE at ABSOLUTE frame positions. 4 flow-match Euler
+//!   the causal-cache scheme). RoPE at ABSOLUTE frame positions. 4 flow-match Euler
 //!   steps (shift 5.0) + one t=0 recache forward that commits the chunk's
 //!   post-rope K/V to the cache.
 //! - **KV cache** is host-staged (54 layers x K+V x bf16 = ~442KB/latent-token;

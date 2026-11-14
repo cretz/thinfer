@@ -20,13 +20,15 @@ mod minimax_ref;
 pub mod model;
 pub mod preprocess;
 pub mod progress;
+mod qwen21;
 #[cfg(feature = "remote")]
 pub mod remote;
 pub mod request;
-#[cfg(feature = "rewrite")]
+// Always compiled: `maybe_rewrite_prompt` gates its body on the feature itself.
 pub mod rewrite;
 #[cfg(feature = "vault")]
 pub mod vault;
+pub mod vsr;
 #[cfg(feature = "serde")]
 pub mod wire;
 

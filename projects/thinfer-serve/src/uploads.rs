@@ -3,20 +3,23 @@
 //! so the server only ever stores ciphertext and holds no key for it: the bytes
 //! are written to disk as-is. When the job runs (and its key has arrived), the
 //! upload is consumed into the job dir as a decrypt-on-read input, so the frames
-//! stay ciphertext until the decoder reads them. Anything never consumed is
-//! reaped after `ttl`.
+//! stay ciphertext until the decoder reads them. A queued job claims its
+//! uploads at submit, so they wait as long as the job does; anything unclaimed
+//! is reaped after `ttl`, and a claim ends when its job finishes or is cancelled.
 //!
 //! [`seal_video`] remains for the inline path: a base64 clip inside an already
 //! decrypted spec is held in RAM, or spilled under a fresh ephemeral key.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
 use thinfer_app::jobkey::{self, JobKey};
 use thinfer_app::request::VideoInput;
+
+use crate::job::JobHandle;
 
 /// Above this size an inline (base64-in-spec) clip spills to an encrypted
 /// on-disk blob rather than staying in RAM.
@@ -47,6 +50,18 @@ struct Entry {
     /// The upload's own dir. Removed on consume or reap.
     dir: PathBuf,
     created: Instant,
+    /// The queued job holding this upload (see [`UploadStore::claim`]): while
+    /// it may still consume it, the TTL does not apply.
+    owner: Option<Weak<JobHandle>>,
+}
+
+impl Entry {
+    fn expired(&self, ttl: Duration) -> bool {
+        match &self.owner {
+            Some(job) => !job.upgrade().is_some_and(|j| j.may_consume()),
+            None => self.created.elapsed() >= ttl,
+        }
+    }
 }
 
 /// Registry of pending sealed uploads keyed by opaque id, reaped by TTL.
@@ -80,22 +95,56 @@ impl UploadStore {
                 nonce,
                 dir,
                 created: Instant::now(),
+                owner: None,
             },
         );
         Ok((id, sealed.len()))
     }
 
+    /// Hold uploads `ids` for `job` until it consumes them, finishes, or is
+    /// cancelled, so a long queue wait cannot outlive the TTL. All or nothing:
+    /// errors if any id is unknown, expired, or already claimed.
+    pub fn claim(&self, ids: &[String], job: &Arc<JobHandle>) -> Result<(), String> {
+        let mut entries = self.entries.lock().unwrap();
+        for id in ids {
+            match entries.get(id) {
+                None => return Err(format!("upload {id} not found (expired or never uploaded)")),
+                Some(e) if e.owner.is_some() => {
+                    return Err(format!("upload {id} is already claimed by another job"));
+                }
+                Some(_) => {}
+            }
+        }
+        for id in ids {
+            entries.get_mut(id).unwrap().owner = Some(Arc::downgrade(job));
+        }
+        Ok(())
+    }
+
     /// Consume upload `id` into a job whose dir is `job_dir`, under the job's
     /// `key`: the ciphertext moves into the job dir (delete-on-fetch / the job
     /// reaper govern it from here) and becomes a decrypt-on-read input. Errors
-    /// if the id is unknown or already expired/consumed.
-    pub fn consume(&self, id: &str, job_dir: &Path, key: &JobKey) -> Result<VideoInput, String> {
-        let entry = self
-            .entries
-            .lock()
-            .unwrap()
-            .remove(id)
-            .ok_or("upload not found (expired, already used, or never uploaded)")?;
+    /// if the id is unknown, already expired/consumed, or claimed by a job
+    /// other than `job_id` (left in place for its owner).
+    pub fn consume(
+        &self,
+        id: &str,
+        job_id: &str,
+        job_dir: &Path,
+        key: &JobKey,
+    ) -> Result<VideoInput, String> {
+        let entry = {
+            let mut entries = self.entries.lock().unwrap();
+            let e = entries
+                .get(id)
+                .ok_or("upload not found (expired, already used, or never uploaded)")?;
+            if let Some(owner) = &e.owner
+                && owner.upgrade().is_none_or(|j| j.id != job_id)
+            {
+                return Err(format!("upload {id} is claimed by another job"));
+            }
+            entries.remove(id).expect("present under the lock")
+        };
         std::fs::create_dir_all(job_dir)
             .map_err(|e| format!("create {}: {e}", job_dir.display()))?;
         let dest = job_dir.join("input_video.enc");
@@ -108,14 +157,15 @@ impl UploadStore {
         })
     }
 
-    /// Drop every entry older than `ttl`, deleting its dir. Returns the count
+    /// Drop every unclaimed entry older than `ttl` and every claimed one whose
+    /// job can no longer consume it, deleting its dir. Returns the count
     /// reaped. Cheap when nothing is expired (a single map scan).
     pub fn reap(&self, ttl: Duration) -> usize {
         let mut reaped = Vec::new();
         {
             let mut entries = self.entries.lock().unwrap();
             entries.retain(|_, e| {
-                let keep = e.created.elapsed() < ttl;
+                let keep = !e.expired(ttl);
                 if !keep {
                     reaped.push(e.dir.clone());
                 }
@@ -183,7 +233,7 @@ mod tests {
         );
 
         let job_dir = tmp.join("job");
-        let input = store.consume(&id, &job_dir, &key).unwrap();
+        let input = store.consume(&id, "job", &job_dir, &key).unwrap();
         let (path, raw_key, nonce) = match &input {
             VideoInput::Encrypted { path, key, nonce } => (path.clone(), *key, nonce.clone()),
             VideoInput::Ram(_) => panic!("expected a decrypt-on-read input"),
@@ -192,7 +242,10 @@ mod tests {
         let ct = std::fs::read(&path).unwrap();
         let opened = thinfer_app::vault::ephemeral_unseal(&raw_key, &nonce, &ct).unwrap();
         assert_eq!(opened, plaintext);
-        assert!(store.consume(&id, &job_dir, &key).is_err(), "consumed once");
+        assert!(
+            store.consume(&id, "job", &job_dir, &key).is_err(),
+            "consumed once"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -206,7 +259,52 @@ mod tests {
         assert_eq!(store.reap(Duration::from_secs(3600)), 0);
         assert_eq!(store.reap(Duration::ZERO), 1);
         assert!(!tmp.join(&id).exists(), "reaped dir should be gone");
-        assert!(store.consume(&id, &tmp.join("job"), &key).is_err());
+        assert!(store.consume(&id, "job", &tmp.join("job"), &key).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn claimed_upload_outlives_ttl_until_its_job_ends() {
+        let tmp = std::env::temp_dir().join(format!("thinfer_up_claim_{}", random_id()));
+        let store = UploadStore::new(tmp.clone());
+        let jobs = crate::job::JobStore::default();
+        let key = JobKey::generate();
+        let (id, _) = store.put(&key.seal(b"queued clip")).unwrap();
+        let job = jobs.create(&tmp, Vec::new());
+        let ids = vec![id.clone()];
+        assert!(store.claim(&["missing".into()], &job).is_err());
+        store.claim(&ids, &job).unwrap();
+        let other = jobs.create(&tmp, Vec::new());
+        assert!(store.claim(&ids, &other).is_err(), "one owner per upload");
+        assert!(
+            store
+                .consume(&id, &other.id, &tmp.join("other"), &key)
+                .is_err(),
+            "only the claimant consumes"
+        );
+        assert!(
+            tmp.join(&id).exists(),
+            "a refused consume leaves the upload"
+        );
+
+        assert_eq!(store.reap(Duration::ZERO), 0, "claim overrides the TTL");
+        job.request_cancel();
+        assert_eq!(
+            store.reap(Duration::from_secs(3600)),
+            1,
+            "cancel ends the claim"
+        );
+        assert!(!tmp.join(&id).exists());
+
+        let (id, _) = store.put(&key.seal(b"dropped job")).unwrap();
+        let job = jobs.create(&tmp, Vec::new());
+        store.claim(std::slice::from_ref(&id), &job).unwrap();
+        drop(job);
+        assert_eq!(
+            store.reap(Duration::from_secs(3600)),
+            1,
+            "a dropped job ends the claim"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

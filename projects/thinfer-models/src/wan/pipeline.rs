@@ -10,10 +10,8 @@
 //!
 //! DMD distillation: a fixed handful of timesteps (3 for FastWan), CFG-free, one
 //! DiT forward per step over the whole `[48, f_lat, h, w]` latent with a single
-//! scalar timestep, renoised between steps. LongLive (4-step, autoregressive)
-//! reuses this backbone with its own `DmdConfig` and an AR path.
+//! scalar timestep, renoised between steps.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use thinfer_core::arbiter::RECLAIM_EVICTABLE_WEIGHTS;
@@ -32,7 +30,6 @@ use crate::wan::dit::{
     WanDitTaps, read_into_f32,
 };
 use crate::wan::dit_block::{WanDitBlockTaps, WanDitConfig, WanDitPipelines, config as dit_config};
-use crate::wan::kv_cache::{KvCacheConfig, KvWindowCache, RamKvStore};
 use crate::wan::loader::{WanI8Sites, register_wan_dit_handles};
 use crate::wan::manifest::RECIPE;
 use crate::wan::scheduler::{
@@ -66,18 +63,11 @@ const TEMPORAL_SCALE: usize = 4;
 /// the `join!` in `WanDit::forward`), so up to this many whole-tensor upload
 /// stagings overlap in VRAM at once.
 const PREFETCH_STAGING_DEPTH: u64 = 2;
-/// VRAM headroom held for the DiT forward's activation workspace, on top of the
-/// prefetch staging envelope (see `set_transient_reserve`). Calibrated at the
-/// e2e gate dims (32x32x5, workspace ~46 MiB); larger resolutions grow the
-/// workspace and rely on the budget-tier / activation-tiling path, not this
-/// fixed pad.
-const DIT_WORKSPACE_RESERVE: u64 = 64 * 1024 * 1024;
 
-/// FastWan (non-AR) denoise sampler. Both run the SAME DiT forward CFG-free; only
+/// FastWan denoise sampler. Both run the SAME DiT forward CFG-free; only
 /// the schedule around it differs. `Dmd` is the few-step renoise schedule the DMD
 /// distillation bakes (the parity default); `UniPc` is the plain UniPC multistep
 /// solver the public HF Spaces use (`flow_shift=8.0`), with a user step count.
-/// Ignored on the AR path ([`WanModel::generate_ar`] drives its own UniPC).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VideoSampler {
     /// DMD 3-step renoise. The byte-parity reference path.
@@ -103,7 +93,7 @@ pub struct GenerationParams {
     pub num_frames: u32,
     /// Deterministic seed for the initial latent noise (and per-step renoise).
     pub seed: u64,
-    /// Denoise sampler (FastWan path only; AR ignores it).
+    /// Denoise sampler (FastWan path only).
     pub sampler: VideoSampler,
     /// Temporal self-attention window radius in latent frames. `Some(W)`
     /// restricts DiT self-attention to keys within `±W` latent frames (breaks
@@ -142,45 +132,12 @@ fn step_attn_window(requested: Option<u32>, step: usize, default_from: usize) ->
     if step < from { None } else { requested }
 }
 
-/// One shot of a multi-shot LongLive AR generation: a prompt that holds for
-/// `chunks` consecutive AR chunks (each chunk = `num_frame_per_block` latent
-/// frames). A scene cut between shots is signalled to the model in-band by
-/// prepending [`SCENE_CUT_PREFIX`] to the first chunk of every shot after the
-/// first (mirrors upstream `MultiTextConcatDataset._apply_shot_durations`), and
-/// in the cache by advancing the RoPE phase + pinning the new shot's sink. A
-/// single-shot long video is the empty-shots path ([`WanModel::denoise_ar`]).
-#[derive(Clone)]
-pub struct Shot {
-    pub prompt: String,
-    /// Length of this shot in AR chunks (>= 1). The sum across shots must equal
-    /// the run's total chunk count (`f_lat / num_frame_per_block`).
-    pub chunks: usize,
-}
-
-// The prompt is user content: never rendered by `Debug`.
-impl std::fmt::Debug for Shot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Shot")
-            .field(
-                "prompt",
-                &format_args!("<{} chars redacted>", self.prompt.len()),
-            )
-            .field("chunks", &self.chunks)
-            .finish()
-    }
-}
-
-/// In-band scene-cut marker prepended to the first chunk's prompt of every shot
-/// after the first. The model was trained with this exact string as the cut
-/// signal (upstream `DEFAULT_SCENE_CUT_PREFIX`), so it is part of the umT5 text,
-/// not just a host-side flag.
-pub const SCENE_CUT_PREFIX: &str = "The scene transitions. ";
-
 /// Decoded video: CTHW f32 in `[-1, 1]` plus dims, ready for the caller's
 /// staging (per-frame PNG sequence + contact sheet). No codec here.
 pub struct WanVideo {
     /// `[3, num_frames, height, width]` row-major f32, clamped to `[-1, 1]`.
-    pub frames: Vec<f32>,
+    /// Job plaintext: page-locked on a server, zeroized on drop.
+    pub frames: thinfer_core::secmem::Locked<f32>,
     pub num_frames: usize,
     pub height: usize,
     pub width: usize,
@@ -214,19 +171,7 @@ pub struct WanStepDiag {
 #[derive(Clone, Copy, Debug)]
 pub enum ProgressEvent {
     TextEncode,
-    Step {
-        i: u32,
-        n: u32,
-    },
-    /// AR (LongLive) per-chunk denoise step: `chunk`/`num_chunks` and the 1-based
-    /// `step`/`num_steps` within that chunk (the FlowUniPC schedule). The clean
-    /// recache forward is not reported (it is not a scheduler step).
-    ChunkStep {
-        chunk: u32,
-        num_chunks: u32,
-        step: u32,
-        num_steps: u32,
-    },
+    Step { i: u32, n: u32 },
     VaeDecode,
 }
 
@@ -330,12 +275,6 @@ pub enum GenerateError<SE: core::fmt::Debug> {
         tokens: usize,
         max: usize,
     },
-    /// Multi-shot plan invalid: the shot chunk counts do not sum to the run's
-    /// total chunk count, or a shot has zero chunks. (AR path only.)
-    InvalidShots {
-        shot_chunks: usize,
-        num_chunks: usize,
-    },
     /// The caller's [`Cancel`] hook asked the in-flight generate to stop; the
     /// denoise loop bailed at a step boundary. Not an error condition -- the
     /// front end maps it to a "cancelled" job state, not a failure.
@@ -426,20 +365,9 @@ impl WanVariant {
         }
     }
 
-    /// LongLive-2.0-5B: FastWan geometry + VAE, but the source bf16 encoding
-    /// (no block transcode) until the AR path gets its own Q8 parity gate --
-    /// its KV-cache commit reads block outputs that the longlive_parity bands
-    /// pin against bf16 today.
-    pub fn longlive_2_0_5b() -> Self {
-        Self {
-            block_transcode: None,
-            ..Self::fastwan_ti2v_5b()
-        }
-    }
-
     /// Qualcomm-AI-Research/mobilewan: the FastWan2.2-TI2V-5B backbone with
     /// per-block PRUNED self-attention heads (`cfg.rehyat`), FastWan VAE + umT5.
-    /// No block transcode (bf16, parity-first like LongLive): the pruned
+    /// No block transcode (bf16, parity-first): the pruned
     /// self-attention runs the untiled DENSE per-block-N path, so its qkv/proj
     /// weights must stay bf16 (the i8/coopmat prepared-weight shapes assume the
     /// full N). Bf16 acts (f32 exponent range) keep the novel variable-head path
@@ -529,7 +457,7 @@ impl WanVariant {
 impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
     /// Build the model: register every umT5 + DiT + VAE handle with residency
     /// and compile every WGSL kernel once. No bytes flow until `generate`.
-    /// Single-expert FastWan/LongLive 5B; probe-driven act dtype.
+    /// Single-expert FastWan 5B; probe-driven act dtype.
     pub async fn load(
         backend: Arc<WgpuBackend>,
         residency: WeightResidency<S>,
@@ -551,7 +479,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
 
     /// Diagnostic [`load`] that forces the block activation dtype instead of
     /// probing device f16 support (the fp32-acts e2e, to separate amplified-bf16
-    /// rounding from algorithmic error). FastWan/LongLive 5B variant.
+    /// rounding from algorithmic error). FastWan 5B variant.
     pub async fn load_with_act(
         backend: Arc<WgpuBackend>,
         residency: WeightResidency<S>,
@@ -741,6 +669,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                 i8_sdpa,
             ),
             cfg.rehyat,
+            cfg.relay.is_some(),
         )
         .await?;
         let umt5_pipelines = Umt5Pipelines::compile(
@@ -888,7 +817,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             TEMPORAL_SCALE * f_lat - 3
         };
         Ok(WanVideo {
-            frames,
+            frames: frames.into(),
             num_frames,
             height: h_lat * self.vae_scale,
             width: w_lat * self.vae_scale,
@@ -926,390 +855,6 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
     ) -> Result<Vec<f32>, GenerateError<S::Error>> {
         self.decode_video(vae, workspace, latent, f_lat, h_lat, w_lat, tiny_chunk)
             .await
-    }
-
-    /// LongLive-2.0-5B AR generate: the autoregressive/causal long-video path.
-    /// Same backbone + umT5 + VAE as [`Self::generate`]; the denoise is the AR
-    /// chunk loop ([`Self::denoise_ar`]) instead of the FastWan DMD loop. Load the
-    /// model from a `LongLiveSource` (the `.pt` DiT renamed to canonical) for the
-    /// causal weights; the geometry is identical to FastWan so nothing else here
-    /// changes.
-    ///
-    /// `shots`: multi-shot scene plan. Empty = single-shot long video from
-    /// `params.prompt` (the parity path). Non-empty = a prompt per shot with a
-    /// scene cut at each shot boundary (see [`Shot`] / [`WanModel::denoise_ar`]).
-    pub async fn generate_ar(
-        &self,
-        params: &GenerationParams,
-        shots: &[Shot],
-        vae: VaeChoice,
-        progress: ProgressFn<'_>,
-    ) -> Result<WanVideo, GenerateError<S::Error>> {
-        let mut workspace = Workspace::new(
-            Arc::clone(&self.backend),
-            Arc::clone(self.residency.arbiter()),
-        );
-        let (latent, f_lat, h_lat, w_lat) = self
-            .denoise_ar(
-                params,
-                shots,
-                None,
-                &mut workspace,
-                None,
-                None,
-                None,
-                progress,
-            )
-            .await?;
-
-        if let Some(p) = progress {
-            p(ProgressEvent::VaeDecode);
-        }
-        let frames = self
-            .decode_video(vae, &mut workspace, &latent, f_lat, h_lat, w_lat, None)
-            .await?;
-        self.residency.evict_all_and_free(&*self.backend);
-
-        let num_frames = if f_lat == 0 {
-            0
-        } else {
-            TEMPORAL_SCALE * f_lat - 3
-        };
-        Ok(WanVideo {
-            frames,
-            num_frames,
-            height: h_lat * self.vae_scale,
-            width: w_lat * self.vae_scale,
-        })
-    }
-
-    /// AR (LongLive) denoise: tokenize -> umT5 encode -> per-chunk FlowUniPC
-    /// denoise over a windowed KV cache -> assembled pre-VAE latent (CTHW f32).
-    /// Each chunk runs 4 UniPC steps over `[committed window ++ this chunk]`, then
-    /// a clean-context timestep-0 pass commits the chunk's K/V into the cache for
-    /// future chunks (the streaming core). `f_lat` must be a multiple of the chunk
-    /// size (`num_frame_per_block`, 8). `initial_noise`: full `[C, f_lat, h, w]`
-    /// noise used verbatim when `Some` (parity byte-load), else seed-derived.
-    ///
-    /// `shots`: multi-shot plan. Empty = one shot spanning all chunks with
-    /// `params.prompt` (bit-identical to the single-prompt parity path). Non-empty
-    /// = `Shot{prompt, chunks}` list whose chunk counts sum to the run's total;
-    /// the first chunk of every shot after the first carries [`SCENE_CUT_PREFIX`]
-    /// into umT5 and, in the cache, advances the multi-shot RoPE phase before the
-    /// chunk and pins the chunk as the new shot's attention sink after its clean
-    /// commit (release `shot_clean_recache=False`, so no cache zeroing). Mirrors
-    /// upstream `causal_diffusion_inference.py` (shot-boundary branch) +
-    /// `MultiTextConcatDataset._apply_shot_durations`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn denoise_ar(
-        &self,
-        params: &GenerationParams,
-        shots: &[Shot],
-        initial_noise: Option<&[f32]>,
-        workspace: &mut Workspace<WgpuBackend>,
-        mut chunk_diag: Option<&mut Vec<Vec<f32>>>,
-        mut vel_diag: Option<&mut Vec<Vec<f32>>>,
-        mut block_res_diag: Option<&mut Vec<Vec<f32>>>,
-        progress: ProgressFn<'_>,
-    ) -> Result<(Vec<f32>, usize, usize, usize), GenerateError<S::Error>> {
-        if let Some(sink) = chunk_diag.as_deref_mut() {
-            sink.clear();
-        }
-        if let Some(sink) = vel_diag.as_deref_mut() {
-            sink.clear();
-        }
-        if let Some(sink) = block_res_diag.as_deref_mut() {
-            sink.clear();
-        }
-        let div = (self.vae_scale * dit_config::PATCH_H) as u32;
-        if params.height == 0
-            || params.width == 0
-            || !params.height.is_multiple_of(div)
-            || !params.width.is_multiple_of(div)
-        {
-            return Err(GenerateError::InvalidDims {
-                height: params.height,
-                width: params.width,
-            });
-        }
-        if params.num_frames == 0 || params.num_frames % TEMPORAL_SCALE as u32 != 1 {
-            return Err(GenerateError::InvalidFrames {
-                num_frames: params.num_frames,
-            });
-        }
-        let h_lat = (params.height as usize) / self.vae_scale;
-        let w_lat = (params.width as usize) / self.vae_scale;
-        let f_lat = (params.num_frames as usize - 1) / TEMPORAL_SCALE + 1;
-
-        let _denoise = trace::scope!("denoise_ar").entered();
-
-        // --- AR geometry (needed before the shot plan: chunk count) ---
-        let act_bytes = self.dit.block.act_dtype.bytes_per_elem() as usize;
-        let frame_seq_len = (h_lat / dit_config::PATCH_H) * (w_lat / dit_config::PATCH_W);
-        let kv_cfg = KvCacheConfig::longlive_runtime(
-            self.cfg.num_layers,
-            frame_seq_len,
-            self.cfg.inner(),
-            act_bytes,
-        );
-        let chunk_frames = kv_cfg.chunk_frames();
-        if !f_lat.is_multiple_of(chunk_frames) {
-            // The release T2V path requires the latent frame count to tile the
-            // chunk size exactly (no independent-first-frame here).
-            return Err(GenerateError::InvalidFrames {
-                num_frames: params.num_frames,
-            });
-        }
-        let num_chunks = f_lat / chunk_frames;
-
-        // --- 1. shot plan: per-chunk prompt text + boundary flags ---
-        // Build the `num_chunks`-long block-prompt list exactly as upstream
-        // `MultiTextConcatDataset._apply_shot_durations`: each shot contributes
-        // `chunks` consecutive entries; the first entry of every shot after the
-        // first is `SCENE_CUT_PREFIX + caption`, the rest are the plain caption.
-        // Empty `shots` collapses to one shot over all chunks => the single
-        // prompt is reused unchanged (the parity path).
-        let plan_shots: Vec<Shot> = if shots.is_empty() {
-            vec![Shot {
-                prompt: params.prompt.clone(),
-                chunks: num_chunks,
-            }]
-        } else {
-            shots.to_vec()
-        };
-        let total_shot_chunks: usize = plan_shots.iter().map(|s| s.chunks).sum();
-        if total_shot_chunks != num_chunks || plan_shots.iter().any(|s| s.chunks == 0) {
-            return Err(GenerateError::InvalidShots {
-                shot_chunks: total_shot_chunks,
-                num_chunks,
-            });
-        }
-        let mut chunk_prompt: Vec<String> = Vec::with_capacity(num_chunks);
-        let mut chunk_is_boundary: Vec<bool> = Vec::with_capacity(num_chunks);
-        for (shot_idx, shot) in plan_shots.iter().enumerate() {
-            for block_in_shot in 0..shot.chunks {
-                let boundary = shot_idx > 0 && block_in_shot == 0;
-                chunk_prompt.push(if boundary {
-                    format!("{SCENE_CUT_PREFIX}{}", shot.prompt)
-                } else {
-                    shot.prompt.clone()
-                });
-                chunk_is_boundary.push(boundary);
-            }
-        }
-
-        // --- 2. tokenize + umT5 encode each UNIQUE block prompt once ---
-        if let Some(p) = progress {
-            p(ProgressEvent::TextEncode);
-        }
-        // Each unique prompt gets an id; the per-prompt cross-attention K/V
-        // cache (filled lazily inside `forward_ar`) is keyed by it.
-        let mut text_by_prompt: HashMap<&str, (usize, Arc<Vec<f32>>)> = HashMap::new();
-        for prompt in &chunk_prompt {
-            if text_by_prompt.contains_key(prompt.as_str()) {
-                continue;
-            }
-            let token_ids = self
-                .tokenizer
-                .encode(prompt, true)
-                .map_err(GenerateError::Tokenizer)?;
-            if token_ids.len() > MAX_PROMPT_TOKENS {
-                return Err(GenerateError::PromptTooLong {
-                    tokens: token_ids.len(),
-                    max: MAX_PROMPT_TOKENS,
-                });
-            }
-            let qout = self
-                .umt5
-                .forward(
-                    &self.backend,
-                    &self.umt5_pipelines,
-                    &self.residency,
-                    &*workspace,
-                    &self.umt5_handles,
-                    self.residency.source(),
-                    &token_ids,
-                )
-                .await?;
-            let padded = pad_text(&qout.hidden, qout.seq, dit_config::TEXT_DIM, TEXT_SEQ);
-            let id = text_by_prompt.len();
-            text_by_prompt.insert(prompt.as_str(), (id, Arc::new(padded)));
-        }
-        // Per-chunk text handles (cheap Arc clones; one encoded tensor per unique
-        // prompt, shared across the chunks that use it) + the prompt id each
-        // chunk resolves to.
-        let chunk_text: Vec<Arc<Vec<f32>>> = chunk_prompt
-            .iter()
-            .map(|p| Arc::clone(&text_by_prompt[p.as_str()].1))
-            .collect();
-        let chunk_prompt_id: Vec<usize> = chunk_prompt
-            .iter()
-            .map(|p| text_by_prompt[p.as_str()].0)
-            .collect();
-        // One cross-attention K/V cache per unique prompt: the text K/V each
-        // block projects is constant across every forward that shares the
-        // prompt, so `forward_ar` computes it once and replays the bytes.
-        let mut cross_kv: Vec<WanCrossKvCache> = (0..text_by_prompt.len())
-            .map(|_| WanCrossKvCache::new(self.cfg.num_layers))
-            .collect();
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 3. windowed KV cache (host-resident) ---
-        let mut cache = KvWindowCache::new(kv_cfg);
-        let mut store = RamKvStore::new(kv_cfg.num_layers, kv_cfg.bytes_per_layer());
-
-        // --- 4. initial noise [C, f_lat, h, w] ---
-        let n_lat = self.cfg.in_channels * f_lat * h_lat * w_lat;
-        let full_noise: Vec<f32> = match initial_noise {
-            Some(buf) => {
-                assert_eq!(
-                    buf.len(),
-                    n_lat,
-                    "initial_noise len {} != {n_lat}",
-                    buf.len()
-                );
-                buf.to_vec()
-            }
-            None => gaussian_noise(n_lat, params.seed),
-        };
-
-        // --- 5. AR chunk loop ---
-        let chunk_shape =
-            WanDitShape::new(self.cfg.in_channels, chunk_frames, h_lat, w_lat, TEXT_SEQ);
-        let dit = WanDit::assemble(self.dit_handles.clone(), chunk_shape, self.cfg);
-        let mut unipc = FlowUniPc::new(&UniPcConfig::longlive());
-        let n_steps = unipc.num_steps();
-
-        self.residency.set_transient_reserve(
-            self.residency.vram_staging_reserve_bytes() + DIT_WORKSPACE_RESERVE,
-        );
-
-        let c = self.cfg.in_channels;
-        let hw = h_lat * w_lat;
-        let chunk_len = c * chunk_frames * hw;
-        let num_layers = self.cfg.num_layers;
-        let mut output = vec![0.0_f32; n_lat];
-
-        for chunk in 0..num_chunks {
-            let _cs = trace::scope!("ar_chunk", chunk = chunk).entered();
-            let f0 = chunk * chunk_frames;
-            let current_start = chunk * chunk_frames * frame_seq_len;
-            // Scene cut: advance the multi-shot RoPE temporal phase BEFORE the
-            // window is planned, so this chunk's q/k rotate at the new shot's
-            // offset (`begin_chunk` folds the cached `temporal_offset` into the
-            // returned plan). Release order mirrors upstream: advance, denoise,
-            // clean recache, pin.
-            if chunk_is_boundary[chunk] {
-                cache.advance_shot();
-            }
-            let plan = cache.begin_chunk(&mut store, current_start, chunk_frames);
-            let text = chunk_text[chunk].as_slice();
-            let chunk_cross_kv = &mut cross_kv[chunk_prompt_id[chunk]];
-
-            let mut latents = slice_chunk(&full_noise, c, f_lat, f0, chunk_frames, hw);
-
-            unipc.reset();
-            for step in 0..n_steps {
-                if let Some(p) = progress {
-                    p(ProgressEvent::ChunkStep {
-                        chunk: chunk as u32 + 1,
-                        num_chunks: num_chunks as u32,
-                        step: step as u32 + 1,
-                        num_steps: n_steps as u32,
-                    });
-                }
-                let inputs = WanDitInputs {
-                    image: &latents,
-                    img_ref: None,
-                    text,
-                    timestep: unipc.timestep(step),
-                    r_timestep: None,
-                    // AR self-attention uses its own windowed KV cache, not the
-                    // dense self-SDPA window.
-                    attn_window: None,
-                };
-                // Per-block residual taps only on the very first forward (chunk 0,
-                // step 0): isolates where the AR forward first diverges from the
-                // pyref without flooding readbacks across every step.
-                let bd = if chunk == 0 && step == 0 {
-                    block_res_diag.as_deref_mut()
-                } else {
-                    None
-                };
-                let out = dit
-                    .forward_ar(
-                        &self.backend,
-                        &self.dit,
-                        &self.residency,
-                        &*workspace,
-                        &inputs,
-                        &store,
-                        &plan,
-                        chunk_cross_kv,
-                        None,
-                        bd,
-                    )
-                    .await?;
-                // Raw DiT velocity (CTHW [c, chunk_frames, hw]) before the
-                // scheduler step; matches the pyref `py_c{c}_s{s}_vel` dump and
-                // isolates the DiT forward from the UniPC sampler.
-                if let Some(sink) = vel_diag.as_deref_mut() {
-                    sink.push(out.image.clone());
-                }
-                latents = unipc.step(&out.image, &latents);
-            }
-
-            // Record the denoised chunk, then run the clean-context recache pass
-            // (timestep 0) whose K/V are committed into the cache tail.
-            scatter_chunk(&mut output, &latents, c, f_lat, f0, chunk_frames, hw);
-            // Per-chunk post latent (CTHW [c, chunk_frames, hw]) for parity
-            // localization; matches the pyref `py_chunk{c}_post` dump.
-            if let Some(sink) = chunk_diag.as_deref_mut() {
-                sink.push(latents.clone());
-            }
-
-            let mut k_commit: Vec<Vec<u8>> = vec![Vec::new(); num_layers];
-            let mut v_commit: Vec<Vec<u8>> = vec![Vec::new(); num_layers];
-            let clean_inputs = WanDitInputs {
-                image: &latents,
-                img_ref: None,
-                text,
-                timestep: 0.0,
-                r_timestep: None,
-                attn_window: None,
-            };
-            dit.forward_ar(
-                &self.backend,
-                &self.dit,
-                &self.residency,
-                &*workspace,
-                &clean_inputs,
-                &store,
-                &plan,
-                chunk_cross_kv,
-                Some((&mut k_commit, &mut v_commit)),
-                None,
-            )
-            .await?;
-            let k_refs: Vec<&[u8]> = k_commit.iter().map(|v| v.as_slice()).collect();
-            let v_refs: Vec<&[u8]> = v_commit.iter().map(|v| v.as_slice()).collect();
-            cache.commit_chunk(&mut store, &plan, &k_refs, &v_refs);
-
-            // Scene cut: pin this just-committed chunk as the new shot's
-            // attention sink (release `multi_shot_sink=true`, `sink_size>0`, so a
-            // shot boundary is always a scene cut). The next roll keeps it and
-            // relocates rolling data around it; no bytes move here.
-            if chunk_is_boundary[chunk] {
-                cache.pin_current_chunk(chunk_frames);
-            }
-
-            debug_assert_eq!(chunk_len, latents.len());
-        }
-
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-        Ok((output, f_lat, h_lat, w_lat))
     }
 
     /// Tokenize -> umT5 encode -> DMD few-step denoise loop. Returns the final
@@ -1532,6 +1077,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     // Wan2.2 keeps its shipped all-steps window (default_from 0)
                     // until its own hybrid eyeball.
                     attn_window: step_attn_window(params.attn_window, i, 0),
+                    token_add: None,
                 };
                 let out = dit
                     .forward_cached(
@@ -1594,6 +1140,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                     // AnyFlow default: step 0 runs FULL attention, the window
                     // applies from step 1 (hybrid schedule; A/B-proven above).
                     attn_window: step_attn_window(params.attn_window, i, 1),
+                    token_add: None,
                 };
                 // Diag taps (the anyflow embedder-parity test): temb here is the
                 // BLENDED rt_emb, the only AnyFlow-specific math in the forward.
@@ -1675,6 +1222,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         timestep: t,
                         r_timestep: None,
                         attn_window: params.attn_window,
+                        token_add: None,
                     };
                     // Diag path captures per-block + final-stage taps via forward_with_taps;
                     // prod takes the plain forward.
@@ -1787,6 +1335,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         timestep: unipc.timestep(i),
                         r_timestep: None,
                         attn_window: params.attn_window,
+                        token_add: None,
                     };
                     let out = dit
                         .forward_cached(
@@ -1899,6 +1448,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             r_timestep: None,
             // Parity/bisection diagnostic: always full attention.
             attn_window: None,
+            token_add: None,
         };
 
         // Per-op sinks for block `tap_block`: the driver only fills these GPU
@@ -2071,6 +1621,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             timestep: sampler.timestep(step_index),
             r_timestep: None,
             attn_window: None,
+            token_add: None,
         };
         let out = dit
             .forward(
@@ -2219,37 +1770,6 @@ pub(crate) fn block_cfgs(
         large_d_sdpa: false,
         fast_sdpa,
         decode_sdpa: false,
-    }
-}
-
-/// Extract chunk frames `[f0, f0 + cf)` from a CTHW latent `[c, f_lat, hw]` into
-/// a contiguous `[c, cf, hw]` chunk. Per channel the frame block is contiguous,
-/// so this is `c` slice copies.
-fn slice_chunk(full: &[f32], c: usize, f_lat: usize, f0: usize, cf: usize, hw: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; c * cf * hw];
-    for ch in 0..c {
-        let src = ch * f_lat * hw + f0 * hw;
-        let dst = ch * cf * hw;
-        out[dst..dst + cf * hw].copy_from_slice(&full[src..src + cf * hw]);
-    }
-    out
-}
-
-/// Inverse of [`slice_chunk`]: write a `[c, cf, hw]` chunk back into frames
-/// `[f0, f0 + cf)` of the CTHW latent `[c, f_lat, hw]`.
-fn scatter_chunk(
-    full: &mut [f32],
-    chunk: &[f32],
-    c: usize,
-    f_lat: usize,
-    f0: usize,
-    cf: usize,
-    hw: usize,
-) {
-    for ch in 0..c {
-        let dst = ch * f_lat * hw + f0 * hw;
-        let src = ch * cf * hw;
-        full[dst..dst + cf * hw].copy_from_slice(&chunk[src..src + cf * hw]);
     }
 }
 

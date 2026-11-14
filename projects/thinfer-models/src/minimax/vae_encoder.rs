@@ -21,14 +21,19 @@
 //! deterministic choice (the logvar of a VAE posterior is small).
 //!
 //! Every tensor is served in bf16, the dtype the reference runs the whole
-//! model in. One GPU scope per resnet / downsampler keeps the activation peak
-//! to a few full-resolution buffers.
+//! model in. With an accelerator covering conv + GroupNorm + add, the whole
+//! frame (tile) runs as one deferred accelerator sequence; otherwise one GPU
+//! scope per resnet / downsampler keeps the activation peak to a few
+//! full-resolution buffers.
 
 use std::collections::HashMap;
 
 use half::{bf16, f16};
 
-use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError, WgpuPipeline};
+use thinfer_core::backend::{
+    Backend, BufRef, Conv2dShape, ElementwiseOp, WgpuBackend, WgpuError, WgpuPipeline,
+    group_norm_scratch_bytes,
+};
 use thinfer_core::ops::{
     ActDtype, AddF32, Conv3dConfig, Conv3dF32, Conv3dOp, GroupNormF32, GroupNormOp, Op, SiluF32,
     WeightDtype, WgslConfig,
@@ -382,6 +387,7 @@ fn conv2d<'w>(
     k: u32,
     stride: u32,
     pad: u32,
+    bf16: bool,
 ) -> Result<(BatchBuf<'w>, Dims), WgpuError> {
     let extra = stride - 1;
     let out_d = Dims {
@@ -389,19 +395,39 @@ fn conv2d<'w>(
         h: (d.h + 2 * pad + extra - k) / stride + 1,
         w: (d.w + 2 * pad + extra - k) / stride + 1,
     };
+    let out = scope.alloc(out_d.bytes())?;
+    let (w, b) = (scope.import_copy(c.w), scope.import_copy(c.b));
+    let shape = Conv2dShape {
+        cin: d.c,
+        cout,
+        h: d.h,
+        w: d.w,
+        h_out: out_d.h,
+        w_out: out_d.w,
+        k,
+        stride,
+        pad,
+        reflect: true,
+        bf16,
+    };
+    if scope.try_conv2d(&shape, x, w, b, out)? {
+        return Ok((out, out_d));
+    }
+    if scope.is_deferred() {
+        return Err(declined("conv2d"));
+    }
     let fields: [u32; 20] = [
         1, d.c, cout, 1, d.h, d.w, 1, out_d.h, out_d.w, 1, k, k, 0, pad, pad, 1, stride, stride,
         REFLECT, 0,
     ];
     let bytes: Vec<u8> = fields.iter().flat_map(|v| v.to_le_bytes()).collect();
     let u = scope.write_uniform(&bytes)?;
-    let out = scope.alloc(out_d.bytes())?;
     scope.conv3d(
         &pl.conv3d_pipeline,
         &pl.conv3d,
         x,
-        scope.import_copy(c.w),
-        scope.import_copy(c.b),
+        w,
+        b,
         u,
         out,
         cout,
@@ -411,6 +437,25 @@ fn conv2d<'w>(
     Ok((out, out_d))
 }
 
+/// An accelerator op refused after the scope went deferred: there is no
+/// backend fallback for work that reads enqueued accelerator output.
+fn declined(op: &str) -> WgpuError {
+    WgpuError::AcceleratorDeclined { op: op.into() }
+}
+
+/// Enqueue a deferred accelerator op over scope buffers.
+fn accel_op<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    what: &str,
+    op: impl FnOnce(&dyn Fn(BatchBuf<'w>) -> Option<u64>) -> Option<ElementwiseOp>,
+) -> Result<(), WgpuError> {
+    let op = op(&|b| scope.accel_addr(b)).ok_or_else(|| declined(what))?;
+    match scope.accel_elementwise(&op) {
+        true => Ok(()),
+        false => Err(declined(what)),
+    }
+}
+
 fn group_norm_silu<'w>(
     scope: &BatchScope<'w, WgpuBackend>,
     pl: &EncoderPipelines,
@@ -418,6 +463,26 @@ fn group_norm_silu<'w>(
     d: Dims,
     n: NormBufs,
 ) -> Result<BatchBuf<'w>, WgpuError> {
+    if scope.is_deferred() {
+        let out = scope.alloc(d.bytes())?;
+        let scratch = scope.alloc(group_norm_scratch_bytes(d.c, d.h * d.w, GROUPS))?;
+        let (w, b) = (scope.import_copy(n.w), scope.import_copy(n.b));
+        accel_op(scope, "group_norm", |a| {
+            Some(ElementwiseOp::GroupNormF32 {
+                x: a(x)?,
+                w: a(w)?,
+                bias: a(b)?,
+                out: a(out)?,
+                scratch: a(scratch)?,
+                c: d.c,
+                hw: d.h * d.w,
+                groups: GROUPS,
+                eps: EPS,
+                silu: true,
+            })
+        })?;
+        return Ok(out);
+    }
     let mut bytes = Vec::with_capacity(32);
     for v in [1, d.c, GROUPS, d.h, d.w] {
         bytes.extend_from_slice(&v.to_le_bytes());
@@ -513,6 +578,29 @@ async fn acq_norm<'r, S: WeightSource>(
     Ok(NormBufs { w, b })
 }
 
+fn add<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &EncoderPipelines,
+    x: BatchBuf<'w>,
+    y: BatchBuf<'w>,
+    d: Dims,
+) -> Result<BatchBuf<'w>, WgpuError> {
+    let out = scope.alloc(d.bytes())?;
+    if scope.is_deferred() {
+        accel_op(scope, "add", |a| {
+            Some(ElementwiseOp::AddF32 {
+                x: a(x)?,
+                y: a(y)?,
+                out: a(out)?,
+                n: d.elems(),
+            })
+        })?;
+    } else {
+        scope.dispatch_op::<AddF32>(&pl.add, &[x, y], out)?;
+    }
+    Ok(out)
+}
+
 /// Copy a scope activation into a workspace buffer that outlives the submit.
 fn persist<'w>(
     scope: &BatchScope<'w, WgpuBackend>,
@@ -522,8 +610,90 @@ fn persist<'w>(
 ) -> Result<WsBuf<WgpuBackend>, WgpuError> {
     let out = ws.alloc(d.bytes())?;
     let dst = scope.import_copy(out.as_buf_ref());
-    scope.copy_buffer_to_buffer(x, 0, dst, 0, d.bytes())?;
+    if scope.is_deferred() {
+        accel_op(scope, "copy", |a| {
+            Some(ElementwiseOp::Copy {
+                src: a(x)?,
+                dst: a(dst)?,
+                bytes: d.bytes(),
+            })
+        })?;
+    } else {
+        scope.copy_buffer_to_buffer(x, 0, dst, 0, d.bytes())?;
+    }
     Ok(out)
+}
+
+/// One step of the graph, its weights acquired.
+enum Stage {
+    ConvIn(ConvBufs),
+    Resnet {
+        norm1: NormBufs,
+        conv1: ConvBufs,
+        norm2: NormBufs,
+        conv2: ConvBufs,
+        shortcut: Option<ConvBufs>,
+        cout: u32,
+    },
+    Down(ConvBufs),
+    /// norm_out + silu + conv_out + quant_conv.
+    Head {
+        norm: NormBufs,
+        conv_out: ConvBufs,
+        quant: ConvBufs,
+    },
+}
+
+/// Which [`EncodeTaps`] field a stage's output feeds.
+#[derive(Clone, Copy)]
+enum Tap {
+    ConvIn,
+    Level,
+}
+
+impl Stage {
+    fn run<'w>(
+        &self,
+        scope: &BatchScope<'w, WgpuBackend>,
+        pl: &EncoderPipelines,
+        x: BatchBuf<'w>,
+        d: Dims,
+        bf16: bool,
+    ) -> Result<(BatchBuf<'w>, Dims), WgpuError> {
+        let conv =
+            |x, d, c, cout, k, stride, pad| conv2d(scope, pl, x, d, c, cout, k, stride, pad, bf16);
+        match *self {
+            Stage::ConvIn(c) => conv(x, d, c, CHANNELS[0], 3, 1, 1),
+            Stage::Resnet {
+                norm1,
+                conv1,
+                norm2,
+                conv2,
+                shortcut,
+                cout,
+            } => {
+                let h = group_norm_silu(scope, pl, x, d, norm1)?;
+                let (h, hd) = conv(h, d, conv1, cout, 3, 1, 1)?;
+                let h = group_norm_silu(scope, pl, h, hd, norm2)?;
+                let (h, hd) = conv(h, hd, conv2, cout, 3, 1, 1)?;
+                let skip = match shortcut {
+                    Some(s) => conv(x, d, s, cout, 1, 1, 0)?.0,
+                    None => x,
+                };
+                Ok((add(scope, pl, skip, h, hd)?, hd))
+            }
+            Stage::Down(c) => conv(x, d, c, d.c, 3, 2, 0),
+            Stage::Head {
+                norm,
+                conv_out,
+                quant,
+            } => {
+                let h = group_norm_silu(scope, pl, x, d, norm)?;
+                let (h, hd) = conv(h, d, conv_out, MOMENTS, 3, 1, 1)?;
+                conv(h, hd, quant, MOMENTS, 1, 1, 0)
+            }
+        }
+    }
 }
 
 async fn read(
@@ -546,6 +716,9 @@ pub struct EncodeOptions {
     /// least 64 px overlap, blended on the moments). Off = one pass.
     pub tiled: bool,
     pub posterior: Posterior,
+    /// Convolutions in bf16 on the accelerator's tensor cores (opt-in; the
+    /// reference's precision, not the f32 path's bits). Ignored without one.
+    pub bf16_conv: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -562,6 +735,7 @@ impl EncodeOptions {
     pub const REFERENCE: Self = Self {
         tiled: true,
         posterior: Posterior::Sample { seed: 42 },
+        bf16_conv: false,
     };
 }
 
@@ -605,7 +779,7 @@ impl H3VaeEncoder {
             )));
         }
         let (moments, h, w) = if opts.tiled {
-            self.tiled_moments(backend, res, ws, pl, rgb, height, width)
+            self.tiled_moments(backend, res, ws, pl, rgb, height, width, opts.bf16_conv)
                 .await?
         } else {
             self.moments(
@@ -616,6 +790,7 @@ impl H3VaeEncoder {
                 rgb,
                 height,
                 width,
+                opts.bf16_conv,
                 taps.as_deref_mut(),
             )
             .await?
@@ -663,6 +838,7 @@ impl H3VaeEncoder {
         rgb: &[f32],
         height: usize,
         width: usize,
+        bf16: bool,
     ) -> Result<(Vec<f32>, usize, usize), EncodeError<S::Error>> {
         use crate::minimax::video_vae::{PixelBlock, split_tiles};
         let (ys, ths, y_ov) = split_tiles(height, TILE_PIXELS, TILE_OVERLAP, SPATIAL_RATIO);
@@ -680,7 +856,7 @@ impl H3VaeEncoder {
                     }
                 }
                 let (m, h, w) = self
-                    .moments(backend, res, ws, pl, &tile, th, tw, None)
+                    .moments(backend, res, ws, pl, &tile, th, tw, bf16, None)
                     .await?;
                 // Channels-last, one frame: the decoder's stitch block.
                 let mut data = vec![0.0f32; m.len()];
@@ -743,6 +919,7 @@ impl H3VaeEncoder {
         rgb: &[f32],
         height: usize,
         width: usize,
+        bf16: bool,
         mut taps: Option<&mut EncodeTaps>,
     ) -> Result<(Vec<f32>, usize, usize), EncodeError<S::Error>> {
         let plane = height * width;
@@ -760,102 +937,86 @@ impl H3VaeEncoder {
         let mut cur = ws.alloc(up.len() as u64)?;
         backend.write_buffer(cur.id(), 0, &up)?;
 
-        // conv_in.
-        {
-            let mut pins = Vec::new();
-            let c = acq_conv(res, backend, self.conv_in, &mut pins).await?;
+        let mut pins = Vec::new();
+        let stages = self.stages(res, backend, &mut pins).await?;
+        // With an accelerator covering every op, the whole graph is one
+        // deferred scope (no drain or sync per conv); else one scope per stage
+        // keeps the activation peak to a few full-resolution buffers.
+        let deferred = backend
+            .accelerator()
+            .is_some_and(|a| a.accepts_conv2d() && a.accepts_elementwise());
+        let chunk = if deferred { stages.len() } else { 1 };
+        for group in stages.chunks(chunk) {
             let scope = ws.batch();
-            let (y, nd) = conv2d(
-                &scope,
-                pl,
-                scope.import_copy(cur.as_buf_ref()),
-                d,
-                c,
-                CHANNELS[0],
-                3,
-                1,
-                1,
-            )?;
-            let next = persist(&scope, ws, y, nd)?;
+            if deferred {
+                scope.accel_begin()?;
+            }
+            let mut x = scope.import_copy(cur.as_buf_ref());
+            let mut tapped = Vec::new();
+            for (stage, tap) in group {
+                (x, d) = stage.run(&scope, pl, x, d, bf16)?;
+                if let (Some(tap), true) = (tap, taps.is_some()) {
+                    tapped.push((*tap, persist(&scope, ws, x, d)?, d));
+                }
+            }
+            let next = persist(&scope, ws, x, d)?;
             scope.submit_void().await?;
             cur = next;
-            d = nd;
             if let Some(t) = taps.as_deref_mut() {
-                t.conv_in = read(backend, &cur, d).await?;
+                for (tap, buf, td) in tapped {
+                    let v = read(backend, &buf, td).await?;
+                    match tap {
+                        Tap::ConvIn => t.conv_in = v,
+                        Tap::Level => t.levels.push(v),
+                    }
+                }
             }
         }
+        let moments = read(backend, &cur, d).await?;
+        Ok((moments, d.h as usize, d.w as usize))
+    }
 
-        // Levels: resnets, then the stride-2 downsampler.
+    /// The graph in order, weights acquired (pinned in `pins`), each stage
+    /// with the tap its output feeds.
+    async fn stages<'r, S: WeightSource>(
+        &self,
+        res: &'r WeightResidency<S>,
+        backend: &WgpuBackend,
+        pins: &mut Vec<GpuView<'r>>,
+    ) -> Result<Vec<(Stage, Option<Tap>)>, ResidencyError<S::Error, WgpuError>> {
+        let mut out = vec![(
+            Stage::ConvIn(acq_conv(res, backend, self.conv_in, pins).await?),
+            Some(Tap::ConvIn),
+        )];
         for (li, level) in self.levels.iter().enumerate() {
             for r in &level.resnets {
-                let mut pins = Vec::new();
-                let norm1 = acq_norm(res, backend, r.norm1, &mut pins).await?;
-                let conv1 = acq_conv(res, backend, r.conv1, &mut pins).await?;
-                let norm2 = acq_norm(res, backend, r.norm2, &mut pins).await?;
-                let conv2 = acq_conv(res, backend, r.conv2, &mut pins).await?;
-                let shortcut = match r.shortcut {
-                    Some(s) => Some(acq_conv(res, backend, s, &mut pins).await?),
-                    None => None,
+                let stage = Stage::Resnet {
+                    norm1: acq_norm(res, backend, r.norm1, pins).await?,
+                    conv1: acq_conv(res, backend, r.conv1, pins).await?,
+                    norm2: acq_norm(res, backend, r.norm2, pins).await?,
+                    conv2: acq_conv(res, backend, r.conv2, pins).await?,
+                    shortcut: match r.shortcut {
+                        Some(s) => Some(acq_conv(res, backend, s, pins).await?),
+                        None => None,
+                    },
+                    cout: CHANNELS[li],
                 };
-                let cout = CHANNELS[li];
-                let scope = ws.batch();
-                let x = scope.import_copy(cur.as_buf_ref());
-                let h = group_norm_silu(&scope, pl, x, d, norm1)?;
-                let (h, hd) = conv2d(&scope, pl, h, d, conv1, cout, 3, 1, 1)?;
-                let h = group_norm_silu(&scope, pl, h, hd, norm2)?;
-                let (h, hd) = conv2d(&scope, pl, h, hd, conv2, cout, 3, 1, 1)?;
-                let skip = match shortcut {
-                    Some(s) => conv2d(&scope, pl, x, d, s, cout, 1, 1, 0)?.0,
-                    None => x,
-                };
-                let sum = scope.alloc(hd.bytes())?;
-                scope.dispatch_op::<AddF32>(&pl.add, &[skip, h], sum)?;
-                let next = persist(&scope, ws, sum, hd)?;
-                scope.submit_void().await?;
-                cur = next;
-                d = hd;
+                out.push((stage, None));
             }
             if let Some(down) = level.down {
-                let mut pins = Vec::new();
-                let c = acq_conv(res, backend, down, &mut pins).await?;
-                let scope = ws.batch();
-                let (y, nd) = conv2d(
-                    &scope,
-                    pl,
-                    scope.import_copy(cur.as_buf_ref()),
-                    d,
-                    c,
-                    d.c,
-                    3,
-                    2,
-                    0,
-                )?;
-                let next = persist(&scope, ws, y, nd)?;
-                scope.submit_void().await?;
-                cur = next;
-                d = nd;
+                out.push((Stage::Down(acq_conv(res, backend, down, pins).await?), None));
             }
-            if let Some(t) = taps.as_deref_mut() {
-                t.levels.push(read(backend, &cur, d).await?);
-            }
+            // A level's tap is its last stage's output.
+            out.last_mut().expect("a level has stages").1 = Some(Tap::Level);
         }
-
-        // norm_out + silu + conv_out + quant_conv.
-        let moments = {
-            let mut pins = Vec::new();
-            let n = acq_norm(res, backend, self.norm_out, &mut pins).await?;
-            let co = acq_conv(res, backend, self.conv_out, &mut pins).await?;
-            let qc = acq_conv(res, backend, self.quant_conv, &mut pins).await?;
-            let scope = ws.batch();
-            let x = scope.import_copy(cur.as_buf_ref());
-            let h = group_norm_silu(&scope, pl, x, d, n)?;
-            let (h, hd) = conv2d(&scope, pl, h, d, co, MOMENTS, 3, 1, 1)?;
-            let (m, md) = conv2d(&scope, pl, h, hd, qc, MOMENTS, 1, 1, 0)?;
-            let out = persist(&scope, ws, m, md)?;
-            scope.submit_void().await?;
-            d = md;
-            read(backend, &out, md).await?
-        };
-        Ok((moments, d.h as usize, d.w as usize))
+        out.push((
+            Stage::Head {
+                norm: acq_norm(res, backend, self.norm_out, pins).await?,
+                conv_out: acq_conv(res, backend, self.conv_out, pins).await?,
+                quant: acq_conv(res, backend, self.quant_conv, pins).await?,
+            },
+            None,
+        ));
+        Ok(out)
     }
 }

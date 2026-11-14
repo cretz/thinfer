@@ -182,6 +182,20 @@ fn gfpgan_parity() {
     }
 }
 
+/// AlphaFace 256 swapper parity (FaceFusion `alphaface_256.onnx`). Exercises its
+/// AdaIN / L2-norm chain (ReduceMean, ReduceL2, Pow/Sqrt/Div). Golden from
+/// `scratch/faceswap/gen_golden_alphaface.py`.
+#[test]
+fn alphaface_parity() {
+    let ran = pollster::block_on(async {
+        let backend = std::sync::Arc::new(WgpuBackend::new().await.expect("wgpu"));
+        run_model(backend, "THINFER_FS_ALPHAFACE", "alphaface", 2e-2).await
+    });
+    if !ran {
+        eprintln!("alphaface_parity skipped");
+    }
+}
+
 #[test]
 fn arcface_parity() {
     let ran = pollster::block_on(async {
@@ -392,9 +406,17 @@ fn hyperswap_i8_ab() {
         }
         let t_f32 = t.elapsed().as_secs_f64() * 1e3 / 20.0;
 
-        let m_i8 = OnnxModel::load_i8(std::sync::Arc::clone(&backend), &onnx, &shapes, true)
-            .await
-            .unwrap();
+        let m_i8 = OnnxModel::load_with(
+            std::sync::Arc::clone(&backend),
+            &onnx,
+            &shapes,
+            thinfer_core::onnx::LoadOptions {
+                i8_conv: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let o_i8 = m_i8.run(&feeds).await.unwrap();
         for _ in 0..3 {
             m_i8.run(&feeds).await.unwrap();
@@ -435,21 +457,36 @@ fn hyperswap_i8_ab() {
 /// batching crops is numerically identical and measures the occupancy win.
 #[test]
 fn hyperswap_batch_spike() {
+    batch_spike("THINFER_FS_HYPERSWAP", "hyperswap");
+}
+
+/// AlphaFace through the same batched form the pipeline uses.
+#[test]
+fn alphaface_batch_spike() {
+    batch_spike("THINFER_FS_ALPHAFACE", "alphaface");
+}
+
+fn batch_spike(env: &str, tag: &str) {
     let ran = pollster::block_on(async {
-        let (Ok(model_path), Ok(golden_dir)) = (
-            std::env::var("THINFER_FS_HYPERSWAP"),
-            std::env::var("THINFER_FS_GOLDEN"),
-        ) else {
+        let (Ok(model_path), Ok(golden_dir)) =
+            (std::env::var(env), std::env::var("THINFER_FS_GOLDEN"))
+        else {
             return false;
         };
         let g = PathBuf::from(golden_dir);
-        let (t_shape, t_data) = read_npy_f32(&g.join("hyperswap_in_target.npy"));
-        let (s_shape, s_data) = read_npy_f32(&g.join("hyperswap_in_source.npy"));
-        let (_o_shape, o_data) = read_npy_f32(&g.join("hyperswap_out_output.npy"));
+        let (t_shape, t_data) = read_npy_f32(&g.join(format!("{tag}_in_target.npy")));
+        let (s_shape, s_data) = read_npy_f32(&g.join(format!("{tag}_in_source.npy")));
+        let (_o_shape, o_data) = read_npy_f32(&g.join(format!("{tag}_out_output.npy")));
         let onnx = std::fs::read(&model_path).unwrap();
         let backend = std::sync::Arc::new(WgpuBackend::new().await.expect("wgpu"));
 
-        const B: i64 = 8;
+        // `THINFER_FS_BATCH` overrides (the pipeline runs SWAP_BATCH = 4).
+        let b: i64 = std::env::var("THINFER_FS_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        #[allow(non_snake_case)]
+        let B = b;
         let per = t_data.len();
         // Names from a batch-1 load.
         let m1 = OnnxModel::load(std::sync::Arc::clone(&backend), &onnx, &{
@@ -532,7 +569,7 @@ fn hyperswap_batch_spike() {
         true
     });
     if !ran {
-        eprintln!("hyperswap_batch_spike skipped");
+        eprintln!("{tag} batch_spike skipped");
     }
 }
 

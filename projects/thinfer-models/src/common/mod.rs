@@ -11,6 +11,7 @@
 pub mod autoencoder_kl;
 pub mod bigvgan;
 pub mod block;
+pub mod convrot;
 pub mod embedders;
 pub mod loader;
 pub mod lora;

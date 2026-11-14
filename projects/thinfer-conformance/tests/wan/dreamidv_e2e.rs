@@ -594,6 +594,7 @@ async fn dreamidv_health() {
         steps,
         guide_scale: thinfer_models::wan::dreamidv::DEFAULT_GUIDE_SCALE,
         seed: SEED,
+        cfg_every: 1,
     };
     let mut diag = DreamIdvDiag::default();
     let video_out = pipeline

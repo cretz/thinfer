@@ -13,8 +13,9 @@ use thinfer_models::z_image::pipeline::encode_png;
 
 use crate::progress::{ProgressSink, Stage};
 
-// visually near-lossless H.264 at our dims.
-const BITS_PER_PIXEL: f64 = 0.2;
+// Visually near-lossless H.264 at our dims (~3.8 Mbps at 832x480x24). 0.2
+// visibly smeared fine skin texture (freckles, pores) on generated faces.
+const BITS_PER_PIXEL: f64 = 0.4;
 
 /// Decode a PNG/JPEG source image into an RGB [`Image`].
 pub fn load_image(path: &Path) -> Result<Image, String> {
@@ -80,46 +81,188 @@ impl H264Stream {
 }
 
 pub fn encode_h264(video: &WanVideo, fps: u32) -> Result<H264Stream, String> {
-    use openh264::OpenH264API;
-    use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
+    let mut enc = H264Encoder::new(video.width, video.height, fps)?;
+    enc.push(video, 0..video.num_frames)?;
+    enc.finish()
+}
+
+/// Frames below which a push encodes on one thread (each extra segment
+/// restarts on an IDR frame).
+const ENCODE_SEGMENT_MIN_FRAMES: usize = 32;
+/// Parallel encode segments at most (the machine is shared).
+const ENCODE_THREADS: usize = 4;
+
+/// Encode `frames` of `video` on `enc` into `out` as AVCC samples, capturing
+/// the parameter sets the first time they appear.
+fn encode_range(
+    enc: &mut openh264::encoder::Encoder,
+    video: &dyn RgbFrames,
+    frames: std::ops::Range<usize>,
+    rgb: &mut [u8],
+    (sps, pps): (&mut Option<Vec<u8>>, &mut Option<Vec<u8>>),
+    out: &mut Vec<(bool, Vec<u8>)>,
+) -> Result<(), String> {
     use openh264::formats::{RgbSliceU8, YUVBuffer};
-
-    let (w, h, n) = (video.width, video.height, video.num_frames);
-    // openh264 wants even dims for 4:2:0; ours are /16. The default config
-    // (120 kbps, frame-skip on) is built for low-bandwidth camera streams and
-    // would drop frames -- our muxer emits one sample per encode(), so a drop
-    // becomes a broken sample. Configure for offline archival quality.
-    let bitrate = ((w as f64) * (h as f64) * (fps as f64) * BITS_PER_PIXEL).max(1_000_000.0) as u32;
-    let cfg = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(bitrate))
-        .skip_frames(false)
-        .max_frame_rate(FrameRate::from_hz(fps as f32));
-    let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)
-        .map_err(|e| format!("openh264 init: {e}"))?;
-
-    let mut samples: Vec<(bool, Vec<u8>)> = Vec::with_capacity(n);
-    let mut sps: Option<Vec<u8>> = None;
-    let mut pps: Option<Vec<u8>> = None;
-    let mut rgb = vec![0u8; w * h * 3];
-
-    for t in 0..n {
-        frame_to_rgb(video, t, &mut rgb);
-        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (w, h)));
+    let (h, w, _) = video.dims();
+    for t in frames {
+        video.rgb8(t, rgb);
+        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(rgb, (w, h)));
         let bitstream = enc
             .encode(&yuv)
             .map_err(|e| format!("openh264 encode frame {t}: {e}"))?;
-        let (sample, is_key) = annexb_to_avcc(&bitstream.to_vec(), &mut sps, &mut pps);
-        samples.push((is_key, sample));
+        let (sample, is_key) = annexb_to_avcc(&bitstream.to_vec(), sps, pps);
+        out.push((is_key, sample));
+    }
+    Ok(())
+}
+
+/// An H.264 encode fed in order, clip by clip (chained clips share one track).
+pub struct H264Encoder {
+    enc: openh264::encoder::Encoder,
+    width: usize,
+    height: usize,
+    fps: u32,
+    samples: Vec<(bool, Vec<u8>)>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    rgb: Vec<u8>,
+}
+
+impl H264Encoder {
+    pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, String> {
+        Ok(Self {
+            enc: Self::encoder(width, height, fps)?,
+            width,
+            height,
+            fps,
+            samples: Vec::new(),
+            sps: None,
+            pps: None,
+            rgb: vec![0u8; width * height * 3],
+        })
     }
 
-    Ok(H264Stream {
-        width: w,
-        height: h,
-        fps,
-        sps: sps.ok_or("openh264 produced no SPS")?,
-        pps: pps.ok_or("openh264 produced no PPS")?,
-        samples,
-    })
+    fn encoder(
+        width: usize,
+        height: usize,
+        fps: u32,
+    ) -> Result<openh264::encoder::Encoder, String> {
+        use openh264::OpenH264API;
+        use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
+        // openh264 wants even dims for 4:2:0; ours are /16. The default config
+        // (120 kbps, frame-skip on) is built for low-bandwidth camera streams
+        // and would drop frames -- our muxer emits one sample per encode(), so
+        // a drop becomes a broken sample. Configure for offline archival quality.
+        let bitrate = ((width as f64) * (height as f64) * (fps as f64) * BITS_PER_PIXEL)
+            .max(1_000_000.0) as u32;
+        let cfg = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(bitrate))
+            .skip_frames(false)
+            .max_frame_rate(FrameRate::from_hz(fps as f32));
+        Encoder::with_api_config(OpenH264API::from_source(), cfg)
+            .map_err(|e| format!("openh264 init: {e}"))
+    }
+
+    /// Encode `frames` of `video` (same dims as the encoder) after everything
+    /// pushed so far. A long range splits into contiguous segments encoded in
+    /// parallel, each from an IDR on its own encoder (openh264 threads only
+    /// across slices, and one slice per frame keeps it single-threaded); the
+    /// track's own encoder takes the first segment and restarts with an IDR
+    /// after, so a later push never predicts across a segment it did not see.
+    pub fn push(
+        &mut self,
+        video: &dyn RgbFrames,
+        frames: std::ops::Range<usize>,
+    ) -> Result<(), String> {
+        let (h, w, _) = video.dims();
+        if (w, h) != (self.width, self.height) {
+            return Err(format!(
+                "h264: clip is {w}x{h}, the track {}x{}",
+                self.width, self.height
+            ));
+        }
+        let parts = (frames.len() / ENCODE_SEGMENT_MIN_FRAMES).clamp(1, ENCODE_THREADS);
+        if parts == 1 {
+            let mut out = Vec::new();
+            encode_range(
+                &mut self.enc,
+                video,
+                frames,
+                &mut self.rgb,
+                (&mut self.sps, &mut self.pps),
+                &mut out,
+            )?;
+            self.samples.extend(out);
+            return Ok(());
+        }
+        let per = frames.len().div_ceil(parts);
+        let segments: Vec<std::ops::Range<usize>> = frames
+            .clone()
+            .step_by(per)
+            .map(|t0| t0..(t0 + per).min(frames.end))
+            .collect();
+        let (width, height, fps) = (self.width, self.height, self.fps);
+        let (head, rest) = segments.split_first().expect("parts > 1");
+        let mut first = Vec::new();
+        let rest_out = std::thread::scope(|s| {
+            let workers: Vec<_> = rest
+                .iter()
+                .map(|seg| {
+                    let seg = seg.clone();
+                    s.spawn(move || -> Result<_, String> {
+                        let mut enc = Self::encoder(width, height, fps)?;
+                        let mut rgb = vec![0u8; width * height * 3];
+                        let (mut sps, mut pps) = (None, None);
+                        let mut out = Vec::new();
+                        encode_range(
+                            &mut enc,
+                            video,
+                            seg,
+                            &mut rgb,
+                            (&mut sps, &mut pps),
+                            &mut out,
+                        )?;
+                        Ok((out, sps, pps))
+                    })
+                })
+                .collect();
+            let head_res = encode_range(
+                &mut self.enc,
+                video,
+                head.clone(),
+                &mut self.rgb,
+                (&mut self.sps, &mut self.pps),
+                &mut first,
+            );
+            let rest: Vec<_> = workers
+                .into_iter()
+                .map(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect();
+            head_res.map(|()| rest)
+        })?;
+        self.samples.extend(first);
+        for r in rest_out {
+            let (out, sps, pps) = r?;
+            // Same config, same parameter sets: the track carries one pair.
+            if (sps.is_some() && sps != self.sps) || (pps.is_some() && pps != self.pps) {
+                return Err("h264: segment encoders disagree on SPS/PPS".into());
+            }
+            self.samples.extend(out);
+        }
+        self.enc.force_intra_frame();
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<H264Stream, String> {
+        Ok(H264Stream {
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            sps: self.sps.ok_or("openh264 produced no SPS")?,
+            pps: self.pps.ok_or("openh264 produced no PPS")?,
+            samples: self.samples,
+        })
+    }
 }
 
 /// Encode planar stereo f32 PCM `[2, n]` (channel-major, `[-1, 1]`) to AAC-LC
@@ -213,26 +356,73 @@ fn freq_index_for(sample_rate: u32) -> Result<mp4::SampleFreqIndex, String> {
 /// Write each decoded frame as `frame{n:03}.png` into directory `dir`. The
 /// codec-free view of the raw decode.
 pub fn write_png_frames(video: &WanVideo, dir: &Path) -> Result<(), String> {
-    let (w, h, n) = (video.width, video.height, video.num_frames);
+    write_png_frames_from(video, 0..video.num_frames, dir, 0)
+}
+
+/// [`write_png_frames`] of `frames` only, numbered from `first_index` (chained
+/// clips continue one sequence).
+pub fn write_png_frames_from(
+    video: &dyn RgbFrames,
+    frames: std::ops::Range<usize>,
+    dir: &Path,
+    first_index: usize,
+) -> Result<(), String> {
+    let (h, w, _) = video.dims();
     let per = h * w;
-    let plane = n * per;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let mut rgb = vec![0u8; 3 * per];
     let mut chw = vec![0.0f32; 3 * per];
-    for t in 0..n {
-        let base = t * per;
-        for c in 0..3 {
-            chw[c * per..(c + 1) * per]
-                .copy_from_slice(&video.frames[c * plane + base..c * plane + base + per]);
+    for (i, t) in frames.enumerate() {
+        video.rgb8(t, &mut rgb);
+        for (px, p) in rgb.chunks_exact(3).enumerate() {
+            for c in 0..3 {
+                chw[c * per + px] = p[c] as f32 / 255.0 * 2.0 - 1.0;
+            }
         }
         let png = encode_png(&chw, w as u32, h as u32)?;
-        let p = dir.join(format!("frame{t:03}.png"));
+        let p = dir.join(format!("frame{:03}.png", first_index + i));
         std::fs::write(&p, &png).map_err(|e| format!("write {}: {e}", p.display()))?;
     }
     Ok(())
 }
 
+/// Frame `t` of `video` as RGB8 `[h, w, 3]` (the H.264 encode's quantization).
+/// Video frames the encoders read as RGB8: the decoders' f32 CTHW output or
+/// the RelayVSR u8 output.
+pub trait RgbFrames: Sync {
+    /// `(height, width, frames)`.
+    fn dims(&self) -> (usize, usize, usize);
+    /// Frame `t` into `out` (`w * h * 3`).
+    fn rgb8(&self, t: usize, out: &mut [u8]);
+}
+
+impl RgbFrames for WanVideo {
+    fn dims(&self) -> (usize, usize, usize) {
+        (self.height, self.width, self.num_frames)
+    }
+    fn rgb8(&self, t: usize, out: &mut [u8]) {
+        frame_to_rgb(self, t, out);
+    }
+}
+
+impl RgbFrames for thinfer_models::wan::relayvsr::UpscaledVideo {
+    fn dims(&self) -> (usize, usize, usize) {
+        (self.height, self.width, self.num_frames)
+    }
+    fn rgb8(&self, t: usize, out: &mut [u8]) {
+        let n = self.height * self.width * 3;
+        out.copy_from_slice(&self.frames[t * n..][..n]);
+    }
+}
+
+pub fn frame_rgb8(video: &WanVideo, t: usize) -> Vec<u8> {
+    let mut out = vec![0u8; video.width * video.height * 3];
+    frame_to_rgb(video, t, &mut out);
+    out
+}
+
 /// Fill `out` (RGB8, `w*h*3`) from frame `t` of the CTHW `[-1, 1]` tensor.
-fn frame_to_rgb(video: &WanVideo, t: usize, out: &mut [u8]) {
+pub(crate) fn frame_to_rgb(video: &WanVideo, t: usize, out: &mut [u8]) {
     let (w, h, n) = (video.width, video.height, video.num_frames);
     let plane = n * h * w;
     let base = t * h * w;
@@ -1480,7 +1670,7 @@ pub async fn swap_video_streaming(
         if audio.is_some() { " + audio" } else { "" }
     ));
     let mp4 = mux_mp4(out_w, out_h, fps, &enc_sps, &enc_pps, &samples, audio)?;
-    crate::progress::write_artifact(sink, output, &mp4)?;
+    crate::progress::write_artifact(sink, output, mp4)?;
     Ok((out_w, out_h, fps, n))
 }
 
@@ -1807,6 +1997,63 @@ mod tests {
         assert_eq!(got_fps, fps);
         assert_eq!(frames.len(), n, "all encoded frames decode back (no drops)");
         assert_eq!((frames[0].w, frames[0].h), (ow, oh));
+    }
+
+    /// A moving bar over a per-frame tint.
+    struct BarVideo {
+        w: usize,
+        h: usize,
+        n: usize,
+    }
+
+    impl RgbFrames for BarVideo {
+        fn dims(&self) -> (usize, usize, usize) {
+            (self.h, self.w, self.n)
+        }
+        fn rgb8(&self, t: usize, out: &mut [u8]) {
+            for y in 0..self.h {
+                for x in 0..self.w {
+                    let p = (y * self.w + x) * 3;
+                    out[p] = if (x / 4) == (t % (self.w / 4)) {
+                        240
+                    } else {
+                        16
+                    };
+                    out[p + 1] = ((t * 7) % 200 + 16) as u8;
+                    out[p + 2] = 128;
+                }
+            }
+        }
+    }
+
+    // A push long enough to split into parallel segments, then a chained push
+    // continuing on the track's encoder: every frame decodes back, close to
+    // its source.
+    #[test]
+    fn segmented_encode_roundtrips_with_a_chained_push() {
+        let v = BarVideo {
+            w: 64,
+            h: 48,
+            n: 80,
+        };
+        let mut enc = H264Encoder::new(v.w, v.h, 24).expect("encoder");
+        enc.push(&v, 0..70).expect("segmented push");
+        enc.push(&v, 70..80).expect("chained push");
+        let bytes = enc.finish().expect("finish").mux(None).expect("mux");
+        let (frames, _) = decode_mp4_frames(&bytes).expect("decode");
+        assert_eq!(frames.len(), v.n);
+        let mut src = vec![0u8; v.w * v.h * 3];
+        for (t, f) in frames.iter().enumerate() {
+            v.rgb8(t, &mut src);
+            let got = f.to_rgb8();
+            let mad = got
+                .iter()
+                .zip(&src)
+                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
+                .sum::<u64>() as f64
+                / src.len() as f64;
+            assert!(mad < 12.0, "frame {t}: mean abs diff {mad:.1}");
+        }
     }
 
     // ftyp|mdat|moov (moov last) -> ftyp|moov|mdat, with the single stco chunk
