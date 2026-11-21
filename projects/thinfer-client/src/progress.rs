@@ -4,6 +4,9 @@
 /// SSE `progress` payload; map every front end off this, never off stdout text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stage {
+    /// The job has a worker and is loading what it runs (weights, kernels);
+    /// the next stage says it has started computing.
+    Loading,
     /// Text encoder pass (umT5 / Qwen) over the prompt.
     TextEncode,
     /// Single-shot denoise step `i` of `n` (image, FastWan video).

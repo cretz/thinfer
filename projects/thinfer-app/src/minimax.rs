@@ -54,8 +54,8 @@ use thinfer_models::minimax::manifest as mmf;
 use thinfer_models::minimax::manifest::role;
 use thinfer_models::minimax::packing::{self, KeyframeAnchor};
 use thinfer_models::minimax::pipeline::{
-    DenoisePlan, LONG_SEQUENCE_WEIGHT_BUDGET, Latents, MAX_PACKED_ROWS, audio_rows_to_latents,
-    denoise, upload_modulation_tables, video_rows_to_latents,
+    DenoisePlan, DenoiseState, Denoised, LONG_SEQUENCE_WEIGHT_BUDGET, Latents, MAX_PACKED_ROWS,
+    audio_rows_to_latents, denoise, upload_modulation_tables, video_rows_to_latents,
 };
 use thinfer_models::minimax::scheduler::JointSchedule;
 use thinfer_models::minimax::text_encoder::{
@@ -70,6 +70,7 @@ use thinfer_models::wan::pipeline::WanVideo;
 use thinfer_native::MmapFileOpener;
 use thinfer_native::tokenizer::HfTokenizer;
 
+use crate::checkpoint::{self, Reader, Writer};
 use crate::config::{ResidencyBudget, random_seed};
 use crate::download::resolve_role;
 use crate::executor::BytesOpener;
@@ -119,7 +120,22 @@ pub async fn run(
             .map(|c| (c.prompt.as_str(), c.frames))
             .collect()
     };
-    let seed = req.seed.unwrap_or_else(random_seed);
+    // A resumed run: the seed it drew, the clips it finished, and where the
+    // clip in flight stood.
+    let resume = sink.take_resume().map(|b| Paused::read(&b)).transpose()?;
+    let seed = resume
+        .as_ref()
+        .map(|p| p.seed)
+        .or(req.seed)
+        .unwrap_or_else(random_seed);
+    let (finished, mut current) = match resume {
+        Some(p) => (p.done, p.current),
+        None => (Vec::new(), None),
+    };
+    if finished.len() + usize::from(current.is_some()) > clips.len() {
+        return Err(PAUSED_MISMATCH.into());
+    }
+    let mut finished = finished.into_iter();
     let mut keyframe = req
         .input_image
         .as_ref()
@@ -128,6 +144,8 @@ pub async fn run(
     let output = Output::start(req.format, req.output.clone(), req.super_res.is_some())?;
     // Planar stereo, per channel across the clips.
     let (mut left, mut right) = (Vec::new(), Vec::new());
+    // What a pause keeps of the finished clips.
+    let mut done: Vec<DoneClip> = Vec::new();
     for (k, &(prompt, frames)) in clips.iter().enumerate() {
         if clips.len() > 1 {
             sink.note(&format!(
@@ -141,13 +159,21 @@ pub async fn run(
                 }
             ));
         }
-        let clip = run_clip(
+        // A clip a paused run finished is decoded again (its audio was kept).
+        let (start, kept_wav) = match finished.next() {
+            Some(d) => (ClipStart::Decode(d.video), d.wav),
+            None => match current.take() {
+                Some(at) => (ClipStart::Resume(at), None),
+                None => (ClipStart::Fresh(keyframe.take()), None),
+            },
+        };
+        let (clip, video) = match run_clip(
             backend,
             req,
             row_limit,
             prompt,
             frames,
-            keyframe.take(),
+            start,
             seed,
             &output,
             ClipLink {
@@ -156,9 +182,14 @@ pub async fn run(
             },
             sink,
         )
-        .await?;
+        .await?
+        {
+            ClipRun::Done { out, video } => (out, video),
+            ClipRun::Stopped(at) => return Err(pause(sink, seed, &done, Some(&at))),
+        };
         keyframe = clip.last_frame;
-        if let Some(wav) = clip.wav {
+        let wav = clip.wav.or(kept_wav);
+        if let Some(wav) = &wav {
             let n = wav.len() / 2;
             // A chained clip repeats its keyframe: drop that frame's audio too.
             let skip = if k > 0 {
@@ -169,6 +200,12 @@ pub async fn run(
             left.extend_from_slice(&wav[skip..n]);
             right.extend_from_slice(&wav[n + skip..]);
         }
+        done.push(DoneClip { video, wav });
+        // Between clips, and before the super-resolution pass: a step
+        // boundary.
+        if (k + 1 < clips.len() || req.super_res.is_some()) && checkpoint::stop_here(sink) {
+            return Err(pause(sink, seed, &done, None));
+        }
     }
     let wav = req.audio.then(|| [left, right].concat());
     let ((h_px, w_px, f_px), video) = match output.finish()? {
@@ -178,7 +215,14 @@ pub async fn run(
             let sr = req
                 .super_res
                 .expect("frames are collected for --super-res only");
-            let up = crate::vsr::upscale(backend, &frames, sr, seed, req.budget, sink).await?;
+            // A pause mid-pass keeps the finished clips; the pass runs again.
+            let up = match crate::vsr::upscale(backend, &frames, sr, seed, req.budget, sink).await {
+                Ok(up) => up,
+                Err(_) if !sink.cancelled() && sink.pause().is_some() => {
+                    return Err(pause(sink, seed, &done, None));
+                }
+                Err(e) => return Err(e),
+            };
             check_cancel(sink)?;
             encode_frames(req.format, &up, &req.output)?
         }
@@ -233,6 +277,199 @@ struct ClipOut {
     last_frame: Option<minimax_ref::Prepared>,
 }
 
+/// Where a clip's run starts.
+enum ClipStart {
+    /// From the prompt; an FL2VA keyframe pins its first frame.
+    Fresh(Option<minimax_ref::Prepared>),
+    /// Where a paused run left it.
+    Resume(ClipAt),
+    /// A clip a paused run finished: its video latents, decoded again (its
+    /// audio was kept).
+    Decode(Vec<f32>),
+}
+
+/// How a clip's run ended.
+enum ClipRun {
+    /// With its output and its video latents (what a later pause keeps).
+    Done { out: ClipOut, video: Vec<f32> },
+    /// Stopped (paused or cancelled) at a step boundary.
+    Stopped(ClipAt),
+}
+
+/// A clip between steps: what its remaining steps need.
+enum ClipAt {
+    /// After the encode.
+    Encoded(Conditioned),
+    /// Mid-denoise.
+    Denoising(Conditioned, DenoiseState),
+    /// Denoised, before the decode.
+    Denoised(Latents),
+}
+
+/// What the encode step produced: every denoise step reads it.
+struct Conditioned {
+    /// The conditioner's hidden rows.
+    text: Vec<f32>,
+    cond: Conditioning,
+    /// The packed sequence's rows.
+    rows: usize,
+}
+
+/// A finished clip, as a pause keeps it.
+struct DoneClip {
+    video: Vec<f32>,
+    wav: Option<Vec<f32>>,
+}
+
+/// A paused run (see [`crate::checkpoint`]).
+struct Paused {
+    seed: u64,
+    done: Vec<DoneClip>,
+    current: Option<ClipAt>,
+}
+
+/// The checkpoint layout; bump on any change.
+const PAUSED_TAG: &str = "minimax-h3/1";
+const PAUSED_MISMATCH: &str = "the paused job's checkpoint does not match its request";
+
+/// Stop the run: paused with its finished clips and where the clip in flight
+/// stood, or cancelled.
+fn pause(
+    sink: &dyn ProgressSink,
+    seed: u64,
+    done: &[DoneClip],
+    current: Option<&ClipAt>,
+) -> String {
+    checkpoint::stop(sink, PAUSED_TAG, |w| write_paused(w, seed, done, current))
+}
+
+fn write_paused(w: &mut Writer<'_>, seed: u64, done: &[DoneClip], current: Option<&ClipAt>) {
+    w.u64(seed);
+    w.usize(done.len());
+    for d in done {
+        w.f32s(&d.video);
+        w.opt_f32s(d.wav.as_deref());
+    }
+    match current {
+        None => w.u64(0),
+        Some(ClipAt::Encoded(e)) => {
+            w.u64(1);
+            write_encoded(w, e);
+        }
+        Some(ClipAt::Denoising(e, at)) => {
+            w.u64(2);
+            write_encoded(w, e);
+            w.usize(at.step);
+            write_latents(w, &at.latents);
+        }
+        Some(ClipAt::Denoised(l)) => {
+            w.u64(3);
+            write_latents(w, l);
+        }
+    }
+}
+
+fn write_encoded(w: &mut Writer<'_>, e: &Conditioned) {
+    w.f32s(&e.text);
+    w.usize(e.rows);
+    w.i32s(&e.cond.text_tags);
+    w.usize(e.cond.conditions.len());
+    for c in &e.cond.conditions {
+        match *c {
+            packing::Condition::Keyframe(KeyframeAnchor::First) => w.u64(0),
+            packing::Condition::Keyframe(KeyframeAnchor::Last) => w.u64(1),
+            packing::Condition::Reference {
+                latent_height,
+                latent_width,
+            } => {
+                w.u64(2);
+                w.usize(latent_height);
+                w.usize(latent_width);
+            }
+        }
+    }
+    w.f32s(&e.cond.cond_rows);
+}
+
+fn write_latents(w: &mut Writer<'_>, l: &Latents) {
+    w.f32s(&l.video);
+    w.f32s(&l.audio);
+}
+
+fn read_encoded(r: &mut Reader<'_>) -> Result<Conditioned, String> {
+    let text = r.f32s()?;
+    let rows = r.usize()?;
+    let text_tags = r.i32s()?;
+    let conditions = (0..r.usize()?)
+        .map(|_| {
+            Ok(match r.u64()? {
+                0 => packing::Condition::Keyframe(KeyframeAnchor::First),
+                1 => packing::Condition::Keyframe(KeyframeAnchor::Last),
+                2 => packing::Condition::Reference {
+                    latent_height: r.usize()?,
+                    latent_width: r.usize()?,
+                },
+                _ => return Err(PAUSED_MISMATCH.to_string()),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    let cond_rows = r.f32s()?;
+    Ok(Conditioned {
+        text,
+        cond: Conditioning {
+            text_tags,
+            conditions,
+            cond_rows,
+        },
+        rows,
+    })
+}
+
+fn read_latents(r: &mut Reader<'_>) -> Result<Latents, String> {
+    Ok(Latents {
+        video: r.f32s()?,
+        audio: r.f32s()?,
+    })
+}
+
+impl Paused {
+    fn read(buf: &[u8]) -> Result<Self, String> {
+        let mut r = Reader::open(buf, PAUSED_TAG)?;
+        let seed = r.u64()?;
+        let done = (0..r.usize()?)
+            .map(|_| {
+                Ok(DoneClip {
+                    video: r.f32s()?,
+                    wav: r.opt_f32s()?,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let current = match r.u64()? {
+            0 => None,
+            1 => Some(ClipAt::Encoded(read_encoded(&mut r)?)),
+            2 => {
+                let e = read_encoded(&mut r)?;
+                let step = r.usize()?;
+                Some(ClipAt::Denoising(
+                    e,
+                    DenoiseState {
+                        step,
+                        latents: read_latents(&mut r)?,
+                    },
+                ))
+            }
+            3 => Some(ClipAt::Denoised(read_latents(&mut r)?)),
+            _ => return Err(PAUSED_MISMATCH.into()),
+        };
+        r.finish()?;
+        Ok(Self {
+            seed,
+            done,
+            current,
+        })
+    }
+}
+
 /// One clip: conditioner (+ the keyframe or reference images) -> DiT -> video
 /// VAE (frames out through `output`) -> audio VAE.
 #[allow(clippy::too_many_arguments)]
@@ -242,12 +479,12 @@ async fn run_clip(
     row_limit: usize,
     prompt: &str,
     frames: u32,
-    keyframe: Option<minimax_ref::Prepared>,
+    start: ClipStart,
     seed: u64,
     output: &Output,
     link: ClipLink,
     sink: &dyn ProgressSink,
-) -> Result<ClipOut, String> {
+) -> Result<ClipRun, String> {
     let fasth3 = req.model.is_fasth3();
     let manifest = req.model.manifest();
     let gguf = req.model.is_minimax_gguf();
@@ -290,55 +527,19 @@ async fn run_clip(
         width / vae_cfg.spatial_compression,
     );
     let audio_latents = packing::audio_latent_num_frames(frames);
-
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        return Err("empty prompt produced no tokens".into());
-    }
+    let geometry = Geometry {
+        width,
+        height,
+        frames,
+        latent_frames,
+        lat_h,
+        lat_w,
+        audio_latents,
+    };
 
     // --- resolve every weight file (caller ensured they are cached) ---
-    let enc_path = resolve_role(manifest, role::ENCODER_GGUF)?;
-    let tok_path = resolve_role(manifest, role::TOKENIZER)?;
     let vae_path = resolve_role(manifest, role::VIDEO_VAE)?;
     let audio_vae_path = resolve_role(manifest, role::AUDIO_VAE)?;
-
-    // --- tokenize. NO chat template and NO special tokens: H3 conditions on
-    //     the prompt verbatim (the same finding as LTX). Adding a BOS shifts
-    //     every text row's rotary position and with it the whole media clock.
-    let tokenizer = HfTokenizer::from_path(&tok_path)
-        .await
-        .map_err(|e| format!("load tokenizer {}: {e:?}", tok_path.display()))?;
-    // Reference images (FastH3-Omni): each adds a labelled vision block to the
-    // prompt and one merged token per 32x32 pixels, and as many DiT rows.
-    if !req.ref_images.is_empty() && !req.model.takes_refs() {
-        return Err(format!("{} does not take reference images", req.model));
-    }
-    // An FL2VA keyframe takes the same two paths as a reference, pinned at
-    // the clip start (the request rejects both together).
-    let (refs, anchor) = match keyframe {
-        Some(k) => (vec![k], Some(KeyframeAnchor::First)),
-        None => (prepare_refs(backend, req).await?, None),
-    };
-    let ref_tokens: Vec<usize> = refs
-        .iter()
-        .map(|r| (r.height / 32) * (r.width / 32))
-        .collect();
-    let prompt_in = minimax_ref::assemble(&tokenizer, prompt, &ref_tokens)?;
-    let ids = prompt_in.ids;
-    if ids.len() == ref_tokens.iter().map(|n| n + 2).sum::<usize>() {
-        return Err("empty prompt produced no tokens".into());
-    }
-    let num_text = ids.len();
-
-    // Refuse a canvas we cannot run BEFORE loading 13.6 GiB of conditioner.
-    let rows = packing::sequence_rows(&cfg, num_text, latent_frames, lat_h, lat_w, audio_latents)
-        + ref_tokens.iter().sum::<usize>();
-    if rows > row_limit {
-        return Err(format!(
-            "{width}x{height} at {frames} frames packs {rows} rows, over the {row_limit}-row \
-             limit: one block's activations would not fit. Reduce the resolution or the duration."
-        ));
-    }
 
     // FastH3 runs its trained rungs; HyperFlow one of its fixed grids; the
     // base runs `steps` turbo evaluations.
@@ -383,18 +584,6 @@ async fn run_clip(
         vram_bytes: req.budget.vram_bytes.min(VRAM_BUDGET_CAP),
         ..req.budget
     };
-    tracing::info!(
-        target: thinfer_core::trace::DIAG,
-        model = %req.model, width, height, frames, latent_frames, audio_latents,
-        rows, steps, seed, tokens = num_text,
-        ram_budget = budget.ram_bytes, vram_budget = budget.vram_bytes,
-        "minimax-h3 generate start",
-    );
-    sink.note(&format!(
-        "Generating {width}x{height} joint AV, {frames} frames @ {FPS} fps (~{:.1}s), \
-         {rows} packed rows, seed {seed}",
-        frames as f32 / FPS as f32,
-    ));
 
     // The conditioner leaves the disk mostly idle: warm the DiT's files (then
     // the video VAE's) in the page cache meanwhile, so the first denoise step
@@ -415,6 +604,427 @@ async fn run_clip(
         .collect::<Result<Vec<_>, _>>()?;
     warm.push(vae_path.clone());
     let _prefetch = thinfer_native::prefetch::Prefetch::start(warm);
+
+    // Where the clip starts (see [`ClipStart`]).
+    let decode_only = matches!(start, ClipStart::Decode(_));
+    let mut fresh_pipelines = None;
+    let (encoded, dit_start, latents) = match start {
+        ClipStart::Fresh(keyframe) => {
+            let (encoded, pipelines) = encode_clip(
+                backend, req, &cfg, geometry, prompt, keyframe, row_limit, steps, seed, budget,
+                sink,
+            )
+            .await?;
+            fresh_pipelines = Some(pipelines);
+            // After the encode: a step boundary.
+            if checkpoint::stop_here(sink) {
+                return Ok(ClipRun::Stopped(ClipAt::Encoded(encoded)));
+            }
+            (Some(encoded), None, None)
+        }
+        ClipStart::Resume(ClipAt::Encoded(e)) => (Some(e), None, None),
+        ClipStart::Resume(ClipAt::Denoising(e, at)) => (Some(e), Some(at), None),
+        ClipStart::Resume(ClipAt::Denoised(l)) => (None, None, Some(l)),
+        ClipStart::Decode(video) => (
+            None,
+            None,
+            Some(Latents {
+                video,
+                audio: Vec::new(),
+            }),
+        ),
+    };
+    if fresh_pipelines.is_none() {
+        tracing::info!(
+            target: thinfer_core::trace::DIAG,
+            model = %req.model, width, height, frames, steps, seed,
+            from_step = dit_start.as_ref().map(|s| s.step),
+            denoised = latents.is_some(),
+            "minimax-h3 clip resumed",
+        );
+    }
+    let latents = match (latents, encoded) {
+        (Some(latents), _) => latents,
+        (None, None) => unreachable!("a clip starts encoded or with its latents"),
+        (None, Some(e)) => {
+            let dit_pipelines = match fresh_pipelines.take() {
+                Some(p) => p,
+                None => compile_dit_pipelines(backend)
+                    .await
+                    .unwrap_or_else(|_| Err("dit pipeline compile thread panicked".to_string()))?,
+            };
+            check_cancel(sink)?;
+            // === Phase B: the DiT ===
+            let dims = PlanDims {
+                rows: e.rows,
+                row_limit,
+                latent_frames,
+                lat_h,
+                lat_w,
+                audio_latents,
+            };
+            let denoised = if let Some(comfy_role) = comfy_role {
+                let file = open_st(&resolve_role(manifest, comfy_role)?).await?;
+                let src = FastH3Source::comfy(&cfg, file)
+                    .map_err(|e| format!("map {} checkpoint: {e:?}", req.model))?;
+                let schedule = match &cfg.pdd {
+                    Some(pdd) => JointSchedule::from_pdd(pdd),
+                    None => JointSchedule::from_rungs(
+                        &mmf::FASTH3_RUNGS,
+                        mmf::FASTH3_SHIFT_VIDEO,
+                        mmf::FASTH3_SHIFT_AUDIO,
+                    ),
+                }
+                .map_err(|e| format!("{} schedule: {e}", req.model))?;
+                let users = user_adapters(req).await?;
+                run_dit_users(
+                    backend,
+                    &dit_pipelines,
+                    &cfg,
+                    src,
+                    users,
+                    schedule,
+                    dims,
+                    &e.text,
+                    &e.cond,
+                    seed,
+                    dit_start,
+                    budget,
+                    sink,
+                )
+                .await?
+            } else if req.model.is_hyperflow() {
+                let base =
+                    GgufSource::open(open_mmap(&resolve_role(manifest, hyperflow_role)?).await?)
+                        .await
+                        .map_err(|e| format!("parse hyperflow gguf: {e:?}"))?;
+                let src = HyperFlowSource::new(base)
+                    .map_err(|e| format!("map hyperflow checkpoint: {e:?}"))?;
+                let grid = hyperflow::sigma_grid(steps).expect("checked above");
+                let schedule = JointSchedule::from_grid(grid)
+                    .map_err(|e| format!("hyperflow schedule: {e}"))?;
+                let users = user_adapters(req).await?;
+                run_dit_users(
+                    backend,
+                    &dit_pipelines,
+                    &cfg,
+                    src,
+                    users,
+                    schedule,
+                    dims,
+                    &e.text,
+                    &e.cond,
+                    seed,
+                    dit_start,
+                    budget,
+                    sink,
+                )
+                .await?
+            } else if fasth3 {
+                let nvfp4 = open_st(&resolve_role(manifest, role::FASTH3_TRIM_NVFP4)?).await?;
+                let rest = open_st(&resolve_role(manifest, role::FASTH3_TRIM_REST)?).await?;
+                let src = FastH3Source::new(&cfg, UnionSource::new(nvfp4, rest))
+                    .map_err(|e| format!("map fasth3 checkpoint: {e:?}"))?;
+                let schedule = JointSchedule::from_rungs(
+                    &mmf::FASTH3_RUNGS,
+                    mmf::FASTH3_SHIFT_VIDEO,
+                    mmf::FASTH3_SHIFT_AUDIO,
+                )
+                .map_err(|e| format!("fasth3 schedule: {e}"))?;
+                let users = user_adapters(req).await?;
+                run_dit_users(
+                    backend,
+                    &dit_pipelines,
+                    &cfg,
+                    src,
+                    users,
+                    schedule,
+                    dims,
+                    &e.text,
+                    &e.cond,
+                    seed,
+                    dit_start,
+                    budget,
+                    sink,
+                )
+                .await?
+            } else {
+                let opener = open_mmap(&resolve_role(manifest, base_role)?).await?;
+                let base = GgufSource::open(opener)
+                    .await
+                    .map_err(|e| format!("parse dit gguf: {e:?}"))?;
+                let turbo_path = resolve_role(manifest, turbo_role)?;
+                // `steps` is model evaluations; the grid adds the terminal sigma.
+                let schedule =
+                    JointSchedule::new(steps + 1).map_err(|e| format!("schedule: {e}"))?;
+                let users = user_adapters(req).await?;
+                let turbo = SafetensorsSource::open(open_mmap(&turbo_path).await?)
+                    .await
+                    .map_err(|e| format!("parse turbo lora: {e:?}"))?;
+                let adaln = read_adaln_lora(&cfg, &turbo, 1.0)
+                    .await
+                    .map_err(|e| format!("turbo lora adaln: {e:?}"))?;
+                if users.is_empty() {
+                    let lora = LoraSource::new(
+                        &cfg,
+                        vec![Adapter {
+                            source: turbo,
+                            strength: 1.0,
+                            alpha: turbo_alpha,
+                        }],
+                    )
+                    .await
+                    .map_err(|e| format!("turbo lora: {e:?}"))?;
+                    let src = MergedSource::new(base, lora);
+                    run_dit(
+                        backend,
+                        &dit_pipelines,
+                        &cfg,
+                        src,
+                        schedule,
+                        dims,
+                        &e.text,
+                        &e.cond,
+                        seed,
+                        dit_start,
+                        budget,
+                        sink,
+                        true,
+                        adaln.as_ref(),
+                    )
+                    .await?
+                } else {
+                    // Stacked with user adapters, the turbo shares their in-RAM type.
+                    let bytes = std::fs::read(&turbo_path)
+                        .map_err(|e| format!("read {}: {e}", turbo_path.display()))?;
+                    let turbo = SafetensorsSource::open(BytesOpener::new(bytes))
+                        .await
+                        .map_err(|e| format!("parse turbo lora: {e:?}"))?;
+                    let adapters = std::iter::once(Adapter {
+                        source: turbo,
+                        strength: 1.0,
+                        alpha: turbo_alpha,
+                    })
+                    .chain(users)
+                    .collect();
+                    let src = MergedSource::new(base, lora_source(&cfg, adapters, sink).await?);
+                    run_dit(
+                        backend,
+                        &dit_pipelines,
+                        &cfg,
+                        src,
+                        schedule,
+                        dims,
+                        &e.text,
+                        &e.cond,
+                        seed,
+                        dit_start,
+                        budget,
+                        sink,
+                        true,
+                        adaln.as_ref(),
+                    )
+                    .await?
+                }
+            };
+            match denoised {
+                Denoised::Done(latents) => latents,
+                Denoised::Stopped(at) => return Ok(ClipRun::Stopped(ClipAt::Denoising(e, at))),
+            }
+        }
+    };
+    // Before the decode: a step boundary.
+    if !decode_only && checkpoint::stop_here(sink) {
+        return Ok(ClipRun::Stopped(ClipAt::Denoised(latents)));
+    }
+
+    check_cancel(sink)?;
+    // === Phase C: video VAE (a 36-layer ViT, tiled) ===
+    sink.stage(Stage::VaeDecode);
+    let grid = (latent_frames, lat_h, lat_w);
+    // The NVFP4 decoders need the accelerator's FP4 GEMM (NVIDIA Blackwell);
+    // elsewhere the fp16 decoder runs instead (they share the latent space).
+    let fp4 = backend
+        .accelerator()
+        .and_then(|a| a.accepts_gemm_nvfp4(128, 2048, 2048))
+        .is_some();
+    let nvfp4 = req.vae.minimax_nvfp4().filter(|_| fp4);
+    if req.vae.minimax_nvfp4().is_some() && !fp4 {
+        sink.note("NVFP4 decoder needs an NVIDIA Blackwell GPU with CUDA; using the fp16 decoder");
+    }
+    let decoded = match nvfp4 {
+        None => {
+            let src = open_st(&vae_path).await?;
+            decode_video(backend, src, &vae_cfg, &cfg, &latents.video, grid, budget).await?
+        }
+        // FastVideo's NVFP4 decoder over the fp16 VAE (latent stats, mask
+        // token).
+        Some((role, layers)) => {
+            let vae_cfg = VideoVaeConfig {
+                decoder_layers: layers,
+                ..vae_cfg
+            };
+            let decoder = open_st(&resolve_role(manifest, role)?).await?;
+            let host = open_st(&vae_path).await?;
+            let src = FastH3Source::vae_decoder(&vae_cfg, UnionSource::new(decoder, host))
+                .map_err(|e| format!("map nvfp4 video decoder: {e:?}"))?;
+            decode_video(backend, src, &vae_cfg, &cfg, &latents.video, grid, budget).await?
+        }
+    };
+    tracing::info!(target: thinfer_core::trace::DIAG, "video vae done");
+    // The stitch is host-only: it runs on a worker while the audio VAE has the
+    // GPU, then hands the frames to the output's encode.
+    let tx = output.sender();
+    let stitcher = std::thread::Builder::new()
+        .name("h3-vae-stitch".into())
+        .spawn(move || -> Result<_, String> {
+            let video = clip_frames(decoded.stitch(), frames)?;
+            tracing::info!(target: thinfer_core::trace::DIAG, "video frames ready");
+            let last = link.hands_off.then(|| minimax_ref::Prepared {
+                rgb: crate::codec::frame_rgb8(&video, video.num_frames - 1).into(),
+                height: video.height,
+                width: video.width,
+            });
+            let n = video.num_frames;
+            tx.send((video, usize::from(link.repeats_keyframe)..n))
+                .map_err(|_| "video output worker stopped".to_string())?;
+            Ok(last)
+        })
+        .map_err(|e| format!("spawn vae stitch: {e}"))?;
+
+    check_cancel(sink)?;
+    // === Phase D: audio VAE (the BigVGAN family we already have) ===
+    // A clip decoded again kept its audio.
+    let wav = if req.audio && !decode_only {
+        sink.note("Decoding audio");
+        let src = open_st(&audio_vae_path).await?;
+        let residency = WeightResidency::new(src, budget);
+        let vae = AudioVae::new(backend, &residency, AudioVaeConfig::h3())
+            .await
+            .map_err(|e| format!("build audio vae: {e:?}"))?;
+        let pipelines = AudioVae::compile(backend)
+            .await
+            .map_err(|e| format!("compile audio vae: {e:?}"))?;
+        let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+        let z = audio_rows_to_latents(&cfg, &latents.audio, audio_latents);
+        let wav = vae
+            .decode(backend, &residency, &ws, &pipelines, &z, audio_latents)
+            .await
+            .map_err(|e| format!("audio vae decode: {e:?}"))?;
+        residency.evict_all_and_free(&**backend);
+        if !wav.iter().all(|v| v.is_finite()) {
+            return Err("audio decode produced non-finite output".into());
+        }
+        Some(wav)
+    } else {
+        None
+    };
+    tracing::info!(target: thinfer_core::trace::DIAG, "audio vae done");
+    let last_frame = stitcher
+        .join()
+        .map_err(|_| "vae stitch panicked".to_string())??;
+    Ok(ClipRun::Done {
+        out: ClipOut { wav, last_frame },
+        video: latents.video,
+    })
+}
+
+/// A clip's geometry: the pixel canvas and its latent grid.
+#[derive(Clone, Copy)]
+struct Geometry {
+    width: usize,
+    height: usize,
+    frames: usize,
+    latent_frames: usize,
+    lat_h: usize,
+    lat_w: usize,
+    audio_latents: usize,
+}
+
+/// The encode step: tokenize, the conditioner (+ any keyframe or reference
+/// images), and the reference latents. The DiT's pipelines compile meanwhile.
+#[allow(clippy::too_many_arguments)]
+async fn encode_clip(
+    backend: &Arc<WgpuBackend>,
+    req: &VideoRequest,
+    cfg: &DitConfig,
+    geometry: Geometry,
+    prompt: &str,
+    keyframe: Option<minimax_ref::Prepared>,
+    row_limit: usize,
+    steps: usize,
+    seed: u64,
+    budget: ResidencyBudget,
+    sink: &dyn ProgressSink,
+) -> Result<(Conditioned, DitPipelines), String> {
+    let Geometry {
+        width,
+        height,
+        frames,
+        latent_frames,
+        lat_h,
+        lat_w,
+        audio_latents,
+    } = geometry;
+    let manifest = req.model.manifest();
+    let enc_path = resolve_role(manifest, role::ENCODER_GGUF)?;
+    let tok_path = resolve_role(manifest, role::TOKENIZER)?;
+    let vae_path = resolve_role(manifest, role::VIDEO_VAE)?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("empty prompt produced no tokens".into());
+    }
+
+    // --- tokenize. NO chat template and NO special tokens: H3 conditions on
+    //     the prompt verbatim (the same finding as LTX). Adding a BOS shifts
+    //     every text row's rotary position and with it the whole media clock.
+    let tokenizer = HfTokenizer::from_path(&tok_path)
+        .await
+        .map_err(|e| format!("load tokenizer {}: {e:?}", tok_path.display()))?;
+    // Reference images (FastH3-Omni): each adds a labelled vision block to the
+    // prompt and one merged token per 32x32 pixels, and as many DiT rows.
+    if !req.ref_images.is_empty() && !req.model.takes_refs() {
+        return Err(format!("{} does not take reference images", req.model));
+    }
+    // An FL2VA keyframe takes the same two paths as a reference, pinned at
+    // the clip start (the request rejects both together).
+    let (refs, anchor) = match keyframe {
+        Some(k) => (vec![k], Some(KeyframeAnchor::First)),
+        None => (prepare_refs(backend, req).await?, None),
+    };
+    let ref_tokens: Vec<usize> = refs
+        .iter()
+        .map(|r| (r.height / 32) * (r.width / 32))
+        .collect();
+    let prompt_in = minimax_ref::assemble(&tokenizer, prompt, &ref_tokens)?;
+    let ids = prompt_in.ids;
+    if ids.len() == ref_tokens.iter().map(|n| n + 2).sum::<usize>() {
+        return Err("empty prompt produced no tokens".into());
+    }
+    let num_text = ids.len();
+
+    // Refuse a canvas we cannot run BEFORE loading 13.6 GiB of conditioner.
+    let rows = packing::sequence_rows(cfg, num_text, latent_frames, lat_h, lat_w, audio_latents)
+        + ref_tokens.iter().sum::<usize>();
+    if rows > row_limit {
+        return Err(format!(
+            "{width}x{height} at {frames} frames packs {rows} rows, over the {row_limit}-row \
+             limit: one block's activations would not fit. Reduce the resolution or the duration."
+        ));
+    }
+
+    tracing::info!(
+        target: thinfer_core::trace::DIAG,
+        model = %req.model, width, height, frames, latent_frames, audio_latents,
+        rows, steps, seed, tokens = num_text,
+        ram_budget = budget.ram_bytes, vram_budget = budget.vram_bytes,
+        "minimax-h3 generate start",
+    );
+    sink.note(&format!(
+        "Generating {width}x{height} joint AV, {frames} frames @ {FPS} fps (~{:.1}s), \
+         {rows} packed rows, seed {seed}",
+        frames as f32 / FPS as f32,
+    ));
 
     // === Phase A: the truncated Qwen3-VL-32B conditioner ===
     sink.stage(Stage::TextEncode);
@@ -482,7 +1092,7 @@ async fn run_clip(
     } else {
         minimax_ref::latent_conditions(
             backend,
-            &cfg,
+            cfg,
             &vae_path,
             budget,
             &refs,
@@ -497,261 +1107,7 @@ async fn run_clip(
         conditions,
         cond_rows,
     };
-
-    check_cancel(sink)?;
-    // === Phase B: the DiT ===
-    let dims = PlanDims {
-        rows,
-        row_limit,
-        latent_frames,
-        lat_h,
-        lat_w,
-        audio_latents,
-    };
-    let latents = if let Some(comfy_role) = comfy_role {
-        let file = open_st(&resolve_role(manifest, comfy_role)?).await?;
-        let src = FastH3Source::comfy(&cfg, file)
-            .map_err(|e| format!("map {} checkpoint: {e:?}", req.model))?;
-        let schedule = match &cfg.pdd {
-            Some(pdd) => JointSchedule::from_pdd(pdd),
-            None => JointSchedule::from_rungs(
-                &mmf::FASTH3_RUNGS,
-                mmf::FASTH3_SHIFT_VIDEO,
-                mmf::FASTH3_SHIFT_AUDIO,
-            ),
-        }
-        .map_err(|e| format!("{} schedule: {e}", req.model))?;
-        let users = user_adapters(req).await?;
-        run_dit_users(
-            backend,
-            &dit_pipelines,
-            &cfg,
-            src,
-            users,
-            schedule,
-            dims,
-            &text,
-            &cond,
-            seed,
-            budget,
-            sink,
-        )
-        .await?
-    } else if req.model.is_hyperflow() {
-        let base = GgufSource::open(open_mmap(&resolve_role(manifest, hyperflow_role)?).await?)
-            .await
-            .map_err(|e| format!("parse hyperflow gguf: {e:?}"))?;
-        let src =
-            HyperFlowSource::new(base).map_err(|e| format!("map hyperflow checkpoint: {e:?}"))?;
-        let grid = hyperflow::sigma_grid(steps).expect("checked above");
-        let schedule =
-            JointSchedule::from_grid(grid).map_err(|e| format!("hyperflow schedule: {e}"))?;
-        let users = user_adapters(req).await?;
-        run_dit_users(
-            backend,
-            &dit_pipelines,
-            &cfg,
-            src,
-            users,
-            schedule,
-            dims,
-            &text,
-            &cond,
-            seed,
-            budget,
-            sink,
-        )
-        .await?
-    } else if fasth3 {
-        let nvfp4 = open_st(&resolve_role(manifest, role::FASTH3_TRIM_NVFP4)?).await?;
-        let rest = open_st(&resolve_role(manifest, role::FASTH3_TRIM_REST)?).await?;
-        let src = FastH3Source::new(&cfg, UnionSource::new(nvfp4, rest))
-            .map_err(|e| format!("map fasth3 checkpoint: {e:?}"))?;
-        let schedule = JointSchedule::from_rungs(
-            &mmf::FASTH3_RUNGS,
-            mmf::FASTH3_SHIFT_VIDEO,
-            mmf::FASTH3_SHIFT_AUDIO,
-        )
-        .map_err(|e| format!("fasth3 schedule: {e}"))?;
-        let users = user_adapters(req).await?;
-        run_dit_users(
-            backend,
-            &dit_pipelines,
-            &cfg,
-            src,
-            users,
-            schedule,
-            dims,
-            &text,
-            &cond,
-            seed,
-            budget,
-            sink,
-        )
-        .await?
-    } else {
-        let opener = open_mmap(&resolve_role(manifest, base_role)?).await?;
-        let base = GgufSource::open(opener)
-            .await
-            .map_err(|e| format!("parse dit gguf: {e:?}"))?;
-        let turbo_path = resolve_role(manifest, turbo_role)?;
-        // `steps` is model evaluations; the grid adds the terminal sigma.
-        let schedule = JointSchedule::new(steps + 1).map_err(|e| format!("schedule: {e}"))?;
-        let users = user_adapters(req).await?;
-        let turbo = SafetensorsSource::open(open_mmap(&turbo_path).await?)
-            .await
-            .map_err(|e| format!("parse turbo lora: {e:?}"))?;
-        let adaln = read_adaln_lora(&cfg, &turbo, 1.0)
-            .await
-            .map_err(|e| format!("turbo lora adaln: {e:?}"))?;
-        if users.is_empty() {
-            let lora = LoraSource::new(
-                &cfg,
-                vec![Adapter {
-                    source: turbo,
-                    strength: 1.0,
-                    alpha: turbo_alpha,
-                }],
-            )
-            .await
-            .map_err(|e| format!("turbo lora: {e:?}"))?;
-            let src = MergedSource::new(base, lora);
-            run_dit(
-                backend,
-                &dit_pipelines,
-                &cfg,
-                src,
-                schedule,
-                dims,
-                &text,
-                &cond,
-                seed,
-                budget,
-                sink,
-                true,
-                adaln.as_ref(),
-            )
-            .await?
-        } else {
-            // Stacked with user adapters, the turbo shares their in-RAM type.
-            let bytes = std::fs::read(&turbo_path)
-                .map_err(|e| format!("read {}: {e}", turbo_path.display()))?;
-            let turbo = SafetensorsSource::open(BytesOpener::new(bytes))
-                .await
-                .map_err(|e| format!("parse turbo lora: {e:?}"))?;
-            let adapters = std::iter::once(Adapter {
-                source: turbo,
-                strength: 1.0,
-                alpha: turbo_alpha,
-            })
-            .chain(users)
-            .collect();
-            let src = MergedSource::new(base, lora_source(&cfg, adapters, sink).await?);
-            run_dit(
-                backend,
-                &dit_pipelines,
-                &cfg,
-                src,
-                schedule,
-                dims,
-                &text,
-                &cond,
-                seed,
-                budget,
-                sink,
-                true,
-                adaln.as_ref(),
-            )
-            .await?
-        }
-    };
-    drop(text);
-
-    check_cancel(sink)?;
-    // === Phase C: video VAE (a 36-layer ViT, tiled) ===
-    sink.stage(Stage::VaeDecode);
-    let grid = (latent_frames, lat_h, lat_w);
-    // The NVFP4 decoders need the accelerator's FP4 GEMM (NVIDIA Blackwell);
-    // elsewhere the fp16 decoder runs instead (they share the latent space).
-    let fp4 = backend
-        .accelerator()
-        .and_then(|a| a.accepts_gemm_nvfp4(128, 2048, 2048))
-        .is_some();
-    let nvfp4 = req.vae.minimax_nvfp4().filter(|_| fp4);
-    if req.vae.minimax_nvfp4().is_some() && !fp4 {
-        sink.note("NVFP4 decoder needs an NVIDIA Blackwell GPU with CUDA; using the fp16 decoder");
-    }
-    let decoded = match nvfp4 {
-        None => {
-            let src = open_st(&vae_path).await?;
-            decode_video(backend, src, &vae_cfg, &cfg, &latents.video, grid, budget).await?
-        }
-        // FastVideo's NVFP4 decoder over the fp16 VAE (latent stats, mask
-        // token).
-        Some((role, layers)) => {
-            let vae_cfg = VideoVaeConfig {
-                decoder_layers: layers,
-                ..vae_cfg
-            };
-            let decoder = open_st(&resolve_role(manifest, role)?).await?;
-            let host = open_st(&vae_path).await?;
-            let src = FastH3Source::vae_decoder(&vae_cfg, UnionSource::new(decoder, host))
-                .map_err(|e| format!("map nvfp4 video decoder: {e:?}"))?;
-            decode_video(backend, src, &vae_cfg, &cfg, &latents.video, grid, budget).await?
-        }
-    };
-    tracing::info!(target: thinfer_core::trace::DIAG, "video vae done");
-    // The stitch is host-only: it runs on a worker while the audio VAE has the
-    // GPU, then hands the frames to the output's encode.
-    let tx = output.sender();
-    let stitcher = std::thread::Builder::new()
-        .name("h3-vae-stitch".into())
-        .spawn(move || -> Result<_, String> {
-            let video = clip_frames(decoded.stitch(), frames)?;
-            tracing::info!(target: thinfer_core::trace::DIAG, "video frames ready");
-            let last = link.hands_off.then(|| minimax_ref::Prepared {
-                rgb: crate::codec::frame_rgb8(&video, video.num_frames - 1).into(),
-                height: video.height,
-                width: video.width,
-            });
-            let n = video.num_frames;
-            tx.send((video, usize::from(link.repeats_keyframe)..n))
-                .map_err(|_| "video output worker stopped".to_string())?;
-            Ok(last)
-        })
-        .map_err(|e| format!("spawn vae stitch: {e}"))?;
-
-    check_cancel(sink)?;
-    // === Phase D: audio VAE (the BigVGAN family we already have) ===
-    let wav = if req.audio {
-        sink.note("Decoding audio");
-        let src = open_st(&audio_vae_path).await?;
-        let residency = WeightResidency::new(src, budget);
-        let vae = AudioVae::new(backend, &residency, AudioVaeConfig::h3())
-            .await
-            .map_err(|e| format!("build audio vae: {e:?}"))?;
-        let pipelines = AudioVae::compile(backend)
-            .await
-            .map_err(|e| format!("compile audio vae: {e:?}"))?;
-        let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
-        let z = audio_rows_to_latents(&cfg, &latents.audio, audio_latents);
-        let wav = vae
-            .decode(backend, &residency, &ws, &pipelines, &z, audio_latents)
-            .await
-            .map_err(|e| format!("audio vae decode: {e:?}"))?;
-        residency.evict_all_and_free(&**backend);
-        if !wav.iter().all(|v| v.is_finite()) {
-            return Err("audio decode produced non-finite output".into());
-        }
-        Some(wav)
-    } else {
-        None
-    };
-    tracing::info!(target: thinfer_core::trace::DIAG, "audio vae done");
-    let last_frame = stitcher
-        .join()
-        .map_err(|_| "vae stitch panicked".to_string())??;
-    Ok(ClipOut { wav, last_frame })
+    Ok((Conditioned { text, cond, rows }, dit_pipelines))
 }
 
 /// A clip's frames for the output, and which of them to keep.
@@ -996,21 +1352,24 @@ async fn run_dit_users<S: WeightSource>(
     text: &[f32],
     cond: &Conditioning,
     seed: u64,
+    start: Option<DenoiseState>,
     budget: ResidencyBudget,
     sink: &dyn ProgressSink,
-) -> Result<Latents, String>
+) -> Result<Denoised, String>
 where
     S::Error: core::fmt::Debug,
 {
     if users.is_empty() {
         return run_dit(
-            backend, pipelines, cfg, src, schedule, d, text, cond, seed, budget, sink, false, None,
+            backend, pipelines, cfg, src, schedule, d, text, cond, seed, start, budget, sink,
+            false, None,
         )
         .await;
     }
     let src = MergedSource::new(src, lora_source(cfg, users, sink).await?);
     run_dit(
-        backend, pipelines, cfg, src, schedule, d, text, cond, seed, budget, sink, false, None,
+        backend, pipelines, cfg, src, schedule, d, text, cond, seed, start, budget, sink, false,
+        None,
     )
     .await
 }
@@ -1053,11 +1412,12 @@ async fn run_dit<S: WeightSource>(
     text: &[f32],
     cond: &Conditioning,
     seed: u64,
+    start: Option<DenoiseState>,
     budget: ResidencyBudget,
     sink: &dyn ProgressSink,
     turbo: bool,
     adaln: Option<&AdalnLora>,
-) -> Result<Latents, String>
+) -> Result<Denoised, String>
 where
     S::Error: core::fmt::Debug,
 {
@@ -1126,13 +1486,15 @@ where
         &cond.cond_rows,
         text,
         seed,
+        start,
         |step, total| {
             sink.stage(Stage::Step {
                 i: step as u32,
                 n: total as u32,
             })
         },
-        Some(&|| sink.cancelled()),
+        Some(&|| checkpoint::stop_here(sink)),
+        Some(&|| checkpoint::interrupted(sink)),
     )
     .await
     .map_err(|e| format!("denoise: {e:?}"))?;
@@ -1250,6 +1612,101 @@ async fn prepare_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conditioned() -> Conditioned {
+        Conditioned {
+            text: vec![0.5, -1.25, 3.0e-20],
+            cond: Conditioning {
+                text_tags: vec![0, 2, 2, 1],
+                conditions: vec![
+                    packing::Condition::Keyframe(KeyframeAnchor::First),
+                    packing::Condition::Keyframe(KeyframeAnchor::Last),
+                    packing::Condition::Reference {
+                        latent_height: 24,
+                        latent_width: 40,
+                    },
+                ],
+                cond_rows: vec![7.0; 5],
+            },
+            rows: 1234,
+        }
+    }
+
+    fn latents(v: f32) -> Latents {
+        Latents {
+            video: vec![v, -v, f32::MIN_POSITIVE],
+            audio: vec![v * 2.0],
+        }
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Every place a clip can stand, with finished clips before it, reads
+    /// back field for field and bit for bit.
+    #[test]
+    fn paused_state_round_trips() {
+        let done = vec![
+            DoneClip {
+                video: vec![1.0, 2.0],
+                wav: Some(vec![0.25; 4]),
+            },
+            DoneClip {
+                video: vec![3.0],
+                wav: None,
+            },
+        ];
+        let at = [
+            None,
+            Some(ClipAt::Encoded(conditioned())),
+            Some(ClipAt::Denoising(
+                conditioned(),
+                DenoiseState {
+                    step: 5,
+                    latents: latents(0.75),
+                },
+            )),
+            Some(ClipAt::Denoised(latents(-2.5))),
+        ];
+        for current in &at {
+            let buf = checkpoint::encode(PAUSED_TAG, |w| {
+                write_paused(w, 0xfeed, &done, current.as_ref())
+            });
+            let p = Paused::read(&buf).unwrap();
+            assert_eq!(p.seed, 0xfeed);
+            assert_eq!(p.done.len(), 2);
+            assert_eq!(bits(&p.done[0].video), bits(&done[0].video));
+            assert_eq!(p.done[0].wav.as_deref(), done[0].wav.as_deref());
+            assert!(p.done[1].wav.is_none());
+            let same_cond = |a: &Conditioned, b: &Conditioned| {
+                bits(&a.text) == bits(&b.text)
+                    && a.rows == b.rows
+                    && a.cond.text_tags == b.cond.text_tags
+                    && a.cond.conditions == b.cond.conditions
+                    && bits(&a.cond.cond_rows) == bits(&b.cond.cond_rows)
+            };
+            let same_latents = |a: &Latents, b: &Latents| {
+                bits(&a.video) == bits(&b.video) && bits(&a.audio) == bits(&b.audio)
+            };
+            match (current, &p.current) {
+                (None, None) => {}
+                (Some(ClipAt::Encoded(a)), Some(ClipAt::Encoded(b))) => assert!(same_cond(a, b)),
+                (Some(ClipAt::Denoising(a, sa)), Some(ClipAt::Denoising(b, sb))) => {
+                    assert!(same_cond(a, b));
+                    assert_eq!(sa.step, sb.step);
+                    assert!(same_latents(&sa.latents, &sb.latents));
+                }
+                (Some(ClipAt::Denoised(a)), Some(ClipAt::Denoised(b))) => {
+                    assert!(same_latents(a, b))
+                }
+                _ => panic!("the clip came back at another step"),
+            }
+        }
+        // Another layout version is refused rather than misread.
+        let buf = checkpoint::encode("minimax-h3/0", |w| write_paused(w, 1, &[], None));
+        assert!(Paused::read(&buf).is_err());
+    }
 
     /// The manifest must carry every role the driver resolves, or a generate
     /// fails only after the download step has already "succeeded".

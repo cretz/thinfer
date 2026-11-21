@@ -7,7 +7,7 @@
 /// and not counted). The residency manager evicts weights to keep the total
 /// under `vram_bytes`, using *current* live workspace + staging as the
 /// dynamic floor (no static reserve carve-out).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidencyBudget {
     pub ram_bytes: u64,
     pub vram_bytes: u64,

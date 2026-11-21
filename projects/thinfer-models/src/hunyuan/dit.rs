@@ -1080,6 +1080,8 @@ pub enum HunyuanDitError<SE: core::fmt::Debug> {
     /// The caller's `cancel` predicate returned true at a step boundary; denoise
     /// aborted cooperatively (the partial latent is discarded).
     Cancelled,
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
 }
 impl<SE: core::fmt::Debug> From<WgpuError> for HunyuanDitError<SE> {
     fn from(e: WgpuError) -> Self {
@@ -1906,17 +1908,77 @@ impl HunyuanDit {
         // `HunyuanDitError::Cancelled` before the next forward.
         cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Vec<f32>, HunyuanDitError<S::Error>> {
+        match self
+            .denoise_ctl(
+                backend,
+                residency,
+                ws,
+                text,
+                seq,
+                init_latent,
+                grid,
+                schedule,
+                window,
+                progress,
+                cancel,
+                crate::common::StepControl::default(),
+            )
+            .await?
+        {
+            crate::common::Generated::Done(x) => Ok(x),
+            crate::common::Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::denoise`] that can stop at a step boundary (`ctl.stop_here`,
+    /// polled between steps and after the last) and resume there
+    /// (`ctl.resume`: its latent replaces `init_latent`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn denoise_ctl<S: WeightSource>(
+        &self,
+
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        ws: &Workspace<WgpuBackend>,
+        text: &[f32],
+        seq: usize,
+        init_latent: &[f32],
+        grid: (usize, usize, usize),
+        schedule: &crate::hunyuan::scheduler::FlowMatchSchedule,
+        window: u32,
+        progress: Option<&dyn Fn(u32, u32)>,
+        // Cooperative cancellation: polled at each step boundary (a step is
+        // ~minutes at 480p). `Some(c)` returning true aborts with
+        // `HunyuanDitError::Cancelled` before the next forward.
+        cancel: Option<&dyn Fn() -> bool>,
+        ctl: crate::common::StepControl<'_>,
+    ) -> Result<crate::common::Generated<Vec<f32>>, HunyuanDitError<S::Error>> {
         let (gt, gh, gw) = grid;
         let thw = gt * gh * gw;
         let lat = cfg::LATENT_CHANNELS;
         let conv_in = cfg::CONV_IN_CHANNELS;
         assert_eq!(init_latent.len(), lat * thw, "init latent size");
         let n_steps = schedule.steps() as u32;
-        let mut x = init_latent.to_vec(); // [c, t, h, w] = c*thw + n
-        for i in 0..schedule.steps() {
+        // A resumed run starts at its step, from its latent.
+        let (first, mut x) = match ctl.resume {
+            Some(st) => {
+                if st.step > schedule.steps() || st.latent.len() != lat * thw {
+                    return Err(HunyuanDitError::ResumeMismatch);
+                }
+                (st.step, st.latent)
+            }
+            None => (0, init_latent.to_vec()), // [c, t, h, w] = c*thw + n
+        };
+        for i in first..schedule.steps() {
             // Stop before the (expensive) forward if the user cancelled.
             if cancel.is_some_and(|c| c()) {
                 return Err(HunyuanDitError::Cancelled);
+            }
+            // Between steps: a step boundary.
+            if i > first && ctl.stop_here.is_some_and(|c| c()) {
+                return Ok(crate::common::Generated::Stopped(
+                    crate::common::StepState::at(i, x),
+                ));
             }
             // Report the 1-based step about to run (each ~minutes at 480p, so the
             // UI must advance per step, not just once before the loop).
@@ -1952,7 +2014,13 @@ impl HunyuanDit {
                 }
             }
         }
-        Ok(x)
+        // Before the decode: a step boundary.
+        if ctl.stop_here.is_some_and(|c| c()) {
+            return Ok(crate::common::Generated::Stopped(
+                crate::common::StepState::at(schedule.steps(), x),
+            ));
+        }
+        Ok(crate::common::Generated::Done(x))
     }
 
     async fn acquire_top<'r, S: WeightSource>(

@@ -214,6 +214,29 @@ pub fn render(
     thinking: bool,
     bos: &str,
 ) -> Result<String, String> {
+    render_with(template, messages, tools, true, thinking, bos)
+}
+
+/// [`render`] without the generation prompt: a prefix that later requests
+/// continue (a session's prefix-only node).
+pub fn render_prefix(
+    template: &str,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking: bool,
+    bos: &str,
+) -> Result<String, String> {
+    render_with(template, messages, tools, false, thinking, bos)
+}
+
+fn render_with(
+    template: &str,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    generation: bool,
+    thinking: bool,
+    bos: &str,
+) -> Result<String, String> {
     // HF's `{% generation %}` marks assistant spans for training masks; it is
     // not Jinja and renders as its body.
     let src = strip_tag(&strip_tag(template, "generation"), "endgeneration");
@@ -239,7 +262,7 @@ pub fn render(
                 context! {
                     messages => msgs,
                     tools => tools,
-                    add_generation_prompt => true,
+                    add_generation_prompt => generation,
                     enable_thinking => thinking,
                     bos_token => bos,
                 },
@@ -259,6 +282,87 @@ pub fn render(
 /// real message, untouched by templates' `trim`).
 const PRIOR_USER: &str = "\u{e000}thinfer-prior-user\u{e000}";
 const PRIOR_REPLY: &str = "\u{e000}thinfer-prior-reply\u{e000}";
+/// Marks every stand-in: a cut that leaves one in the output is wrong.
+const STAND_IN: char = '\u{e000}';
+
+/// How a session node's state ends, which decides how the next request's
+/// turns render after it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Tail {
+    /// After an assistant reply (what a generating request leaves).
+    #[default]
+    Reply,
+    /// After `roles` turns (`system` / `user`) rendered with no generation
+    /// prompt: a prefix-only request. `after_reply`: they followed an
+    /// assistant reply (the node continued a [`Tail::Reply`] chain).
+    Open {
+        roles: Vec<String>,
+        after_reply: bool,
+    },
+}
+
+/// The template text that continues a session whose state ends as `tail`
+/// with `messages`, ending with the generation prompt when `generation`
+/// (else a prefix for later requests to continue).
+///
+/// After a reply see [`continuation`]. After open turns, the state holds
+/// the render of those turns without a generation prompt: stand-ins for
+/// them are rendered alone and with `messages`, and the output is what the
+/// second adds past the first. A template that renders earlier turns
+/// differently once more follow (or folds them into a later turn) is
+/// refused rather than continued wrongly.
+#[allow(clippy::too_many_arguments)]
+pub fn resume(
+    template: &str,
+    tail: &Tail,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    call_close: &str,
+    generation: bool,
+    thinking: bool,
+    bos: &str,
+) -> Result<String, String> {
+    let (roles, after_reply) = match tail {
+        Tail::Reply => {
+            return continuation_with(
+                template, messages, tools, call_close, generation, thinking, bos,
+            );
+        }
+        Tail::Open { roles, after_reply } => (roles, *after_reply),
+    };
+    let mut stand: Vec<ChatMessage> = Vec::new();
+    if after_reply {
+        stand.push(ChatMessage::new("user", PRIOR_USER));
+        stand.push(ChatMessage::new("assistant", PRIOR_REPLY));
+    }
+    stand.extend(
+        roles.iter().enumerate().map(|(i, r)| {
+            ChatMessage::new(r, format!("{STAND_IN}thinfer-prior-{r}-{i}{STAND_IN}"))
+        }),
+    );
+    let head = zeroize::Zeroizing::new(render_with(template, &stand, tools, false, thinking, bos)?);
+    // Clones are wiped on drop (`ChatMessage`), and so is the full render.
+    stand.extend(messages.iter().cloned());
+    let mut full = zeroize::Zeroizing::new(render_with(
+        template, &stand, tools, generation, thinking, bos,
+    )?);
+    if !full.starts_with(head.as_str()) {
+        return Err(
+            "chat template renders the prefix differently once turns follow it; \
+                    send the whole conversation instead"
+                .into(),
+        );
+    }
+    let out = full.split_off(head.len());
+    if out.contains(STAND_IN) {
+        let mut out = out;
+        out.zeroize();
+        return Err("chat template moves the prefix into a later turn; \
+                    send the whole conversation instead"
+            .into());
+    }
+    Ok(out)
+}
 
 /// The template text that continues a conversation whose last turn was an
 /// assistant reply (already in the model's state) with `messages`: the
@@ -279,6 +383,18 @@ pub fn continuation(
     thinking: bool,
     bos: &str,
 ) -> Result<String, String> {
+    continuation_with(template, messages, tools, call_close, true, thinking, bos)
+}
+
+fn continuation_with(
+    template: &str,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    call_close: &str,
+    generation: bool,
+    thinking: bool,
+    bos: &str,
+) -> Result<String, String> {
     let results: Vec<&ChatMessage> = messages.iter().take_while(|m| m.role == "tool").collect();
     let mut prior = ChatMessage::new("assistant", PRIOR_REPLY);
     if !results.is_empty() {
@@ -296,7 +412,9 @@ pub fn continuation(
     // Clones are wiped on drop (`ChatMessage`), and so is the full render.
     let mut all = vec![ChatMessage::new("user", PRIOR_USER), prior];
     all.extend(messages.iter().cloned());
-    let mut full = zeroize::Zeroizing::new(render(template, &all, tools, thinking, bos)?);
+    let mut full = zeroize::Zeroizing::new(render_with(
+        template, &all, tools, generation, thinking, bos,
+    )?);
     let user = full
         .find(PRIOR_USER)
         .ok_or("chat template dropped the prior turn")?;
@@ -394,6 +512,83 @@ mod tests {
             out,
             "[tools:roll]<|user|>roll<|end|><|assistant|><call>roll{\"sides\":6}</call><|end|><result>4</result><|assistant|>"
         );
+    }
+
+    /// A template in the ChatML shape (system rendered as its own turn).
+    const CHATML: &str = "{{ bos_token }}{%- for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content.strip() }}<|im_end|>\n{%- endfor %}{%- if add_generation_prompt %}<|im_start|>assistant\n{%- endif %}";
+
+    #[test]
+    fn prefix_then_resume_equals_the_full_render() {
+        let m = |r: &str, c: &str| ChatMessage::new(r, c);
+        // A root prefix (system only), then a beat.
+        let prefix = render_prefix(CHATML, &[m("system", "S")], &[], false, "<s>").unwrap();
+        let open = Tail::Open {
+            roles: vec!["system".into()],
+            after_reply: false,
+        };
+        let next = resume(
+            CHATML,
+            &open,
+            &[m("user", "U")],
+            &[],
+            "",
+            true,
+            false,
+            "<s>",
+        )
+        .unwrap();
+        let full = render(
+            CHATML,
+            &[m("system", "S"), m("user", "U")],
+            &[],
+            false,
+            "<s>",
+        )
+        .unwrap();
+        assert_eq!(format!("{prefix}{next}"), full);
+
+        // A prefix after a reply (no generation prompt), then a beat.
+        let tail = resume(
+            CHATML,
+            &Tail::Reply,
+            &[m("user", "U2")],
+            &[],
+            "",
+            false,
+            false,
+            "",
+        )
+        .unwrap();
+        // (`{%-` strips the newlines between turns.)
+        assert_eq!(tail, "<|im_end|><|im_start|>user\nU2<|im_end|>");
+        let open = Tail::Open {
+            roles: vec!["user".into()],
+            after_reply: true,
+        };
+        let next = resume(CHATML, &open, &[m("user", "U3")], &[], "", true, false, "").unwrap();
+        assert_eq!(next, "<|im_start|>user\nU3<|im_end|><|im_start|>assistant");
+    }
+
+    #[test]
+    fn resume_refuses_a_template_that_folds_the_prefix_forward() {
+        // Gemma-3 style: the system prompt is prepended to the first user turn.
+        let fold = "{%- if messages[0].role == 'system' %}{% set sys = messages[0].content + ' ' %}{% set rest = messages[1:] %}{% else %}{% set sys = '' %}{% set rest = messages %}{% endif %}{%- for m in rest %}[{{ m.role }}:{% if loop.first %}{{ sys }}{% endif %}{{ m.content }}]{%- endfor %}{%- if add_generation_prompt %}[assistant:{%- endif %}";
+        let open = Tail::Open {
+            roles: vec!["system".into()],
+            after_reply: false,
+        };
+        let err = resume(
+            fold,
+            &open,
+            &[ChatMessage::new("user", "U")],
+            &[],
+            "",
+            true,
+            false,
+            "",
+        )
+        .unwrap_err();
+        assert!(err.contains("later turn"), "{err}");
     }
 
     #[test]

@@ -122,7 +122,7 @@ async fn dit_parity() {
         .expect("compile dit pipelines");
 
     let scratch = Workspace::new(Arc::clone(&backend), Arc::clone(residency.arbiter()));
-    let dit = QwenImageDit::new();
+    let dit = QwenImageDit::new(false);
     let mut taps = DitTaps::default();
     let out = dit
         .forward(

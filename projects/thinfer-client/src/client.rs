@@ -11,8 +11,8 @@ use crate::progress::Stage;
 use crate::tools::{FinishReason, ToolCall};
 use crate::wire::{
     Capabilities, CreateResponse, CreateSession, JobEvent, JobKeyDelivery, JobList, JobPatch,
-    JobResult, JobSpec, JobStatus, SealedJob, SessionInfo, SessionPatch, TextSessionRef,
-    UploadResponse,
+    JobPause, JobResult, JobResume, JobSpec, JobStatus, ModelList, PauseMode, SealedJob,
+    SessionInfo, SessionPatch, TextSessionRef, UploadResponse,
 };
 use crate::{Error, sse};
 
@@ -128,6 +128,9 @@ impl Job {
 pub struct SubmitOptions {
     /// Higher runs first (default 0).
     pub priority: i32,
+    /// Run next, pausing a running job this way when no worker is free (see
+    /// [`SealedJob::preempt`]).
+    pub preempt: Option<PauseMode>,
 }
 
 /// A live update while a job runs. Text is decrypted; it borrows a buffer
@@ -144,6 +147,11 @@ pub enum Update<'a> {
     Log(&'a str),
     /// A piece of a text job's reply.
     Text(&'a str),
+    /// The job paused; it resumes from its last finished step (`held`: once
+    /// [`Client::resume`] is called).
+    Paused {
+        held: bool,
+    },
 }
 
 /// How a job ended: the server's result, plus a text reply's tool calls
@@ -344,6 +352,7 @@ impl Client {
             uploads: spec.upload_ids(),
             priority: opts.priority,
             key_proof: Some(key.proof_b64()),
+            preempt: opts.preempt,
         };
         let created: CreateResponse =
             Self::json(self.req(reqwest::Method::POST, "/jobs").json(&sealed)).await?;
@@ -430,6 +439,7 @@ impl Client {
                     JobEvent::Done { result } => return Ok(Some(result)),
                     JobEvent::Error { message } => return Err(Error::JobFailed(message)),
                     JobEvent::Cancelled => return Err(Error::Cancelled),
+                    JobEvent::Paused { held } => on(Update::Paused { held }),
                 }
             }
         }
@@ -467,6 +477,11 @@ impl Client {
     }
 
     /// Every job the server holds (structural fields only).
+    /// Every model the server runs (see [`ModelList`]).
+    pub async fn models(&self) -> Result<ModelList, Error> {
+        Self::json(self.req(reqwest::Method::GET, "/models")).await
+    }
+
     pub async fn list_jobs(&self) -> Result<JobList, Error> {
         Self::json(self.req(reqwest::Method::GET, "/jobs")).await
     }
@@ -486,6 +501,28 @@ impl Client {
             self.req(reqwest::Method::PATCH, &format!("/jobs/{}", job.id))
                 .header(JOB_PROOF, job.key.proof_b64())
                 .json(&JobPatch { priority }),
+        )
+        .await
+    }
+
+    /// Pause a job: a running one stops at a checkpoint (see [`PauseMode`])
+    /// and goes back in the queue, or waits for [`Self::resume`] with
+    /// `hold`; a queued one is held. [`Self::follow`] keeps following it.
+    pub async fn pause(&self, job: &Job, pause: &JobPause) -> Result<JobStatus, Error> {
+        Self::json(
+            self.req(reqwest::Method::POST, &format!("/jobs/{}/pause", job.id))
+                .header(JOB_PROOF, job.key.proof_b64())
+                .json(pause),
+        )
+        .await
+    }
+
+    /// Queue a held job again.
+    pub async fn resume(&self, job: &Job, resume: &JobResume) -> Result<JobStatus, Error> {
+        Self::json(
+            self.req(reqwest::Method::POST, &format!("/jobs/{}/resume", job.id))
+                .header(JOB_PROOF, job.key.proof_b64())
+                .json(resume),
         )
         .await
     }

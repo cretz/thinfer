@@ -66,7 +66,9 @@ pub async fn upscale(
         video.width * up,
         video.height * up
     ));
-    let cancelled = || sink.cancelled();
+    // A pause that does not wait stops the pass too (its caller keeps the
+    // state from before it).
+    let cancelled = || crate::checkpoint::interrupted(sink);
     pipe.upscale(
         &UpscaleInputs {
             frames: &video.frames,

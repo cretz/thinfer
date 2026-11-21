@@ -21,14 +21,20 @@ use thinfer_core::weight::WeightId;
 
 use crate::qwen_image::config;
 
-/// The four LoRA half-suffixes across the two conventions the fold understands.
-/// Renaming preserves the suffix; only the module prefix changes.
-const LORA_SUFFIXES: [&str; 4] = [
+/// The four LoRA half-suffixes across the two conventions the fold understands,
+/// plus the per-site `.alpha` (its `alpha / rank` scale). Renaming preserves the
+/// suffix; only the module prefix changes.
+const LORA_SUFFIXES: [&str; 5] = [
     ".lora_A.weight",
     ".lora_B.weight",
     ".lora_down.weight",
     ".lora_up.weight",
+    ".alpha",
 ];
+
+/// Module prefixes a community adapter ships its keys under: PEFT/diffusers
+/// `transformer.{X}`, or bare `{X}` (LightX2V's Lightning LoRAs).
+const LORA_PREFIXES: [&str; 2] = ["transformer.", ""];
 
 /// Every linear submodule inside a Qwen-Image dual-stream block, relative to the
 /// `transformer_blocks.N` prefix (see `loader::register_block`). The four norms
@@ -61,20 +67,24 @@ const TOP_LINEARS: [&str; 6] = [
     "proj_out",
 ];
 
-/// `transformer.{X}{suffix}` -> `diffusion_model.{X}{suffix}` for every base
-/// linear site and both half-conventions. The module path `{X}` is preserved
+/// `transformer.{X}{suffix}` / bare `{X}{suffix}` -> `diffusion_model.{X}{suffix}`
+/// for every base linear site, both half-conventions and the `.alpha`. The module path `{X}` is preserved
 /// (the base already uses diffusers naming); only the prefix is swapped. Pass to
 /// `RenamedSource::with_passthrough` before `discover_specs`.
 pub fn lora_key_renames() -> HashMap<WeightId, WeightId> {
     let mut out = HashMap::with_capacity(
-        (config::N_LAYERS * BLOCK_LINEARS.len() + TOP_LINEARS.len()) * LORA_SUFFIXES.len(),
+        (config::N_LAYERS * BLOCK_LINEARS.len() + TOP_LINEARS.len())
+            * LORA_SUFFIXES.len()
+            * LORA_PREFIXES.len(),
     );
     let mut insert_module = |module: &str| {
-        for suffix in LORA_SUFFIXES {
-            out.insert(
-                WeightId(format!("transformer.{module}{suffix}")),
-                WeightId(format!("diffusion_model.{module}{suffix}")),
-            );
+        for prefix in LORA_PREFIXES {
+            for suffix in LORA_SUFFIXES {
+                out.insert(
+                    WeightId(format!("{prefix}{module}{suffix}")),
+                    WeightId(format!("diffusion_model.{module}{suffix}")),
+                );
+            }
         }
     };
     for i in 0..config::N_LAYERS {
@@ -130,13 +140,27 @@ mod tests {
             "transformer.proj_out.lora_B.weight",
             "diffusion_model.proj_out.lora_B.weight",
         );
+        // Bare keys (LightX2V Lightning) + the per-site alpha, both prefixes.
+        check(
+            "transformer_blocks.0.attn.add_k_proj.lora_down.weight",
+            "diffusion_model.transformer_blocks.0.attn.add_k_proj.lora_down.weight",
+        );
+        check(
+            "transformer_blocks.0.attn.add_k_proj.alpha",
+            "diffusion_model.transformer_blocks.0.attn.add_k_proj.alpha",
+        );
+        check(
+            "transformer.transformer_blocks.3.img_mod.1.alpha",
+            "diffusion_model.transformer_blocks.3.img_mod.1.alpha",
+        );
     }
 
     #[test]
-    fn count_is_every_site_times_four_halves() {
-        // 60*14 block linears + 6 top-level, times the four half-suffixes.
-        let expect = (config::N_LAYERS * BLOCK_LINEARS.len() + TOP_LINEARS.len()) * 4;
+    fn count_is_every_site_times_suffixes_and_prefixes() {
+        // 60*14 block linears + 6 top-level, times the four half-suffixes +
+        // alpha, times the two prefixes.
+        let expect = (config::N_LAYERS * BLOCK_LINEARS.len() + TOP_LINEARS.len()) * 5 * 2;
         assert_eq!(lora_key_renames().len(), expect);
-        assert_eq!(expect, 3384);
+        assert_eq!(expect, 8460);
     }
 }

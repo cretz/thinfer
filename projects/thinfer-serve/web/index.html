@@ -253,6 +253,10 @@
                 <input id="face-crop" type="checkbox" />
                 <label for="face-crop" title="Swap on the face region only, pasted back at full resolution">Face crop (fast)</label>
               </div>
+              <div class="check" id="input-aspect-row" hidden>
+                <input id="input-aspect" type="checkbox" />
+                <label for="input-aspect" title="With input images, take the last input's aspect ratio at the pixel area of the width x height set here, instead of rendering exactly that size.">Use the input's aspect (at this pixel area)</label>
+              </div>
               <div class="check" id="full-precision-row" hidden>
                 <input id="full-precision" type="checkbox" />
                 <label for="full-precision" title="Run the bf16 Z-Image DiT at full precision instead of the default load-time Q8 transcode. Max precision but ~6x slower per step; the default Q8 already matches zimage-turbo-q8 quality.">Full precision (bf16, slow)</label>
@@ -388,7 +392,7 @@
             <div class="grid">
               <div class="field">
                 <label for="priority">Queue priority</label>
-                <input id="priority" type="number" step="1" value="0" title="Higher runs first. Waiting raises a job's priority over time, so background work still runs." />
+                <input id="priority" type="number" step="1" value="0" title="Higher runs first. Waiting raises a job's priority over time, so background work still runs. Also the priority a held job resumes at." />
               </div>
               <div class="field" id="attn-window-row" hidden>
                 <label for="attn-window">Attention window (frames)</label>
@@ -399,6 +403,10 @@
               <div class="check" id="coopmat-row">
                 <input id="coopmat" type="checkbox" checked />
                 <label for="coopmat">Tensor-core (coopmat)</label>
+              </div>
+              <div class="check">
+                <input id="preempt" type="checkbox" />
+                <label for="preempt" title="Run ahead of the queue. When every worker is busy, the lowest-priority running job that can pause pauses after its current step and resumes after this one.">Run next (pause a running job)</label>
               </div>
             </div>
           </details>
@@ -411,7 +419,12 @@
 
       <section class="card output" aria-live="polite">
         <p id="status">Idle.</p>
-        <button id="cancel" type="button" class="danger" hidden>Cancel</button>
+        <div class="job-actions">
+          <button id="pause" type="button" class="secondary" hidden title="Stop after the current step and hold the job (its state stays sealed under its key). Resume continues from there with the same result.">Pause</button>
+          <button id="pause-now" type="button" class="secondary" hidden title="Stop as soon as possible and hold the job; the step in flight runs again on resume.">Pause now</button>
+          <button id="resume" type="button" class="primary" hidden title="Queue the held job again, at the queue priority set under Advanced.">Resume</button>
+          <button id="cancel" type="button" class="danger" hidden>Cancel</button>
+        </div>
         <div id="chat-out" class="chat text-only"></div>
         <div class="media">
           <img id="image-out" alt="Generated image" hidden />

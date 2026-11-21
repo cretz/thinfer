@@ -32,7 +32,7 @@ pub enum LoadError {
 /// Dense-consumed linear: the matmul site reads bf16 `[K, N]` regardless of
 /// file encoding. Quant files (GGUF checkpoints quantize the AdaLN
 /// modulation weights) dequant to dense bf16 at upload (`encoding Quant +
-/// TransposePolicy::Linear2D`, see `WeightMeta::gpu_encoding`); bf16/F32
+/// TransposePolicy::Linear2D`, see `WeightMeta::gpu_encoding`); bf16/F16/F32
 /// files ride the plain `Linear2D` path. Never registers a quant GPU
 /// layout: the adaln matmul pipeline compiles `WeightDtype::Bf16`
 /// unconditionally (M=1 modulation matmul).
@@ -52,7 +52,8 @@ pub(crate) fn register_linear_dense_opt_ring<S: WeightSource>(
         label: entry.encoding_label.clone(),
     })?;
     match encoding {
-        StorageEncoding::Bf16 | StorageEncoding::F32 => {}
+        // F16 narrows to bf16 on upload (residency `read_for_gpu` F16 arm).
+        StorageEncoding::Bf16 | StorageEncoding::F32 | StorageEncoding::F16 => {}
         StorageEncoding::Quant(k) => {
             assert_eq!(entry.shape.0.len(), 2, "dense-linear quant must be 2-D");
             assert_eq!(

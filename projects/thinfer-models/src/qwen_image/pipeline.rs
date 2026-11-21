@@ -8,6 +8,7 @@
 //! the text-only path. `generate` takes `token_ids` (the CLI supplies the
 //! Qwen2.5-VL chat-template tokenizer).
 
+use crate::common::{Generated, StepControl, StepState};
 use std::sync::Arc;
 
 use thinfer_core::backend::WgpuBackend;
@@ -145,13 +146,32 @@ impl From<thinfer_core::backend::WgpuError> for LoadError {
 #[derive(Debug)]
 pub enum GenerateError<SE: core::fmt::Debug> {
     EmptyPrompt,
-    InvalidDims { height: u32, width: u32 },
+    InvalidDims {
+        height: u32,
+        width: u32,
+    },
     Encode(crate::qwen_image::text_encoder::ForwardError<SE>),
     Vision(crate::qwen_image::vision::VisionError<SE>),
     VaeEncode(crate::wan::vae::WanVaeEncodeError<SE>),
     Dit(crate::qwen_image::dit::DitError<SE>),
     Vae(crate::wan::vae::WanVaeDecodeError<SE>),
     Png(String),
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
+}
+
+/// One input image of an edit, preprocessed (see `thinfer_app::preprocess`).
+pub struct EditImage<'a> {
+    /// Its `<|image_pad|>` run start in the edit tokens.
+    pub pad_start: usize,
+    /// ViT patches `[gh * gw, 1176]`.
+    pub vit_pixels: &'a [f32],
+    /// ViT grid `(gh, gw)`.
+    pub vit_grid: (usize, usize),
+    /// VAE image CTHW `[3, 1, Hv, Wv]` in `[-1, 1]`.
+    pub vae_image: &'a [f32],
+    /// `(Hv, Wv)`, multiples of 32.
+    pub vae_dims: (usize, usize),
 }
 
 pub struct QwenImagePipeline<S: WeightSource> {
@@ -204,6 +224,15 @@ impl<S: WeightSource> QwenImagePipeline<S> {
         // `i8_matmul` gates the Q/K/V-only f16 subgroup SDPA (fast-attention
         // path); the residual + all matmuls stay bf16/Q8_0 either way.
         let dit_handles = register_dit_handles(&residency, config::N_LAYERS)?;
+        // Edit-2511 family: the checkpoint's marker tensor selects
+        // reference-at-timestep-0 modulation (as ComfyUI detects it).
+        let zero_cond_t = residency
+            .source()
+            .catalog()
+            .get(&thinfer_core::weight::WeightId(
+                crate::qwen_image::dit::ZERO_COND_T_MARKER.into(),
+            ))
+            .is_some();
         let dit_cfgs = crate::qwen_image::dit::block_cfgs();
         let dit_pipelines = QwenImageDitPipelines::compile(&backend, &dit_cfgs, i8_matmul).await?;
 
@@ -261,7 +290,7 @@ impl<S: WeightSource> QwenImagePipeline<S> {
             encoder: TextEncoder::new(max_seq),
             encoder_handles,
             encoder_pipelines,
-            dit: QwenImageDit::new(),
+            dit: QwenImageDit::new(zero_cond_t),
             dit_handles,
             dit_pipelines,
             vae: WanVaeDecoder {
@@ -276,6 +305,7 @@ impl<S: WeightSource> QwenImagePipeline<S> {
 
     /// Encode -> denoise -> VAE decode. Returns RGB CHW f32 in `[-1, 1]`,
     /// `[3, height, width]`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_rgb(
         &self,
         token_ids: &[u32],
@@ -285,6 +315,36 @@ impl<S: WeightSource> QwenImagePipeline<S> {
         seed: u64,
         progress: ProgressFn<'_>,
     ) -> Result<Vec<f32>, GenerateError<S::Error>> {
+        match self
+            .generate_rgb_ctl(
+                token_ids,
+                height,
+                width,
+                steps,
+                seed,
+                progress,
+                StepControl::default(),
+            )
+            .await?
+        {
+            Generated::Done(rgb) => Ok(rgb),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate_rgb`] that can stop at a step boundary (`ctl`) and
+    /// resume there; the encode is recomputed on resume (deterministic).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_rgb_ctl(
+        &self,
+        token_ids: &[u32],
+        height: u32,
+        width: u32,
+        steps: u32,
+        seed: u64,
+        progress: ProgressFn<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated<Vec<f32>>, GenerateError<S::Error>> {
         if token_ids.is_empty() {
             return Err(GenerateError::EmptyPrompt);
         }
@@ -307,78 +367,108 @@ impl<S: WeightSource> QwenImagePipeline<S> {
         );
 
         // --- 1. encode (bf16) -> drop the template preamble ---
-        if let Some(p) = progress {
-            p(ProgressEvent::TextEncode);
-        }
-        let enc = {
-            let _s = trace::scope!("qwen_image.encode", tokens = token_ids.len()).entered();
-            self.encoder
-                .forward(
-                    &self.backend,
-                    &self.encoder_pipelines,
-                    &self.residency,
-                    &workspace,
-                    &self.encoder_handles,
-                    self.residency.source(),
-                    token_ids,
-                    false,
-                )
-                .await
-                .map_err(GenerateError::Encode)?
-        };
-        let hd = enc_config::HIDDEN;
-        let drop = DROP_IDX.min(enc.seq.saturating_sub(1));
-        let txt_embeds: Vec<f32> = enc.hidden[drop * hd..].to_vec();
-        debug_assert_eq!(txt_embeds.len() % config::JOINT_ATTENTION_DIM, 0);
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 2. FlowMatchEuler denoise (CFG-free) ---
         let steps_plan = build_steps(steps as usize, img_seq);
-        let mut z = gaussian_noise(config::OUT_CHANNELS * lat_h * lat_w, seed);
-        // pack [16, lat_h, lat_w] -> [img_seq, 64]
-        let mut tokens = pack_latents(&z, lat_h, lat_w);
-        {
-            let _s = trace::scope!("qwen_image.denoise", steps = steps).entered();
-            for (i, step) in steps_plan.iter().enumerate() {
-                if let Some(p) = progress {
-                    p(ProgressEvent::Step {
-                        i: i as u32 + 1,
-                        n: steps,
-                    });
+
+        // A resumed run starts at its step, from its latent.
+        let (first, mut tokens) = match ctl.resume {
+            Some(st) => {
+                if st.step > steps_plan.len()
+                    || st.latent.len() != config::OUT_CHANNELS * lat_h * lat_w
+                {
+                    return Err(GenerateError::ResumeMismatch);
                 }
-                let out = self
-                    .dit
+                (st.step, st.latent)
+            }
+            None => (
+                0,
+                pack_latents(
+                    &gaussian_noise(config::OUT_CHANNELS * lat_h * lat_w, seed),
+                    lat_h,
+                    lat_w,
+                ),
+            ),
+        };
+        // Denoised already: straight to the decode.
+        if first < steps_plan.len() {
+            if let Some(p) = progress {
+                p(ProgressEvent::TextEncode);
+            }
+            let enc = {
+                let _s = trace::scope!("qwen_image.encode", tokens = token_ids.len()).entered();
+                self.encoder
                     .forward(
                         &self.backend,
-                        &self.dit_pipelines,
+                        &self.encoder_pipelines,
                         &self.residency,
                         &workspace,
-                        &self.dit_handles,
-                        &tokens,
-                        &txt_embeds,
-                        step.t,
-                        1,
-                        gh,
-                        gw,
-                        None,
+                        &self.encoder_handles,
+                        self.residency.source(),
+                        token_ids,
+                        false,
                     )
                     .await
-                    .map_err(GenerateError::Dit)?;
-                debug_assert_eq!(out.velocity.len(), tokens.len());
-                for (zi, &v) in tokens.iter_mut().zip(out.velocity.iter()) {
-                    *zi += v * step.delta;
+                    .map_err(GenerateError::Encode)?
+            };
+            let hd = enc_config::HIDDEN;
+            let drop = DROP_IDX.min(enc.seq.saturating_sub(1));
+            let txt_embeds: Vec<f32> = enc.hidden[drop * hd..].to_vec();
+            debug_assert_eq!(txt_embeds.len() % config::JOINT_ATTENTION_DIM, 0);
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+
+            // --- 2. FlowMatchEuler denoise (CFG-free) ---
+            {
+                let _s = trace::scope!("qwen_image.denoise", steps = steps).entered();
+                for (i, step) in steps_plan.iter().enumerate().skip(first) {
+                    // Between steps: a step boundary.
+                    if i > first && ctl.stop_here.is_some_and(|c| c()) {
+                        self.residency.evict_all_and_free(&*self.backend);
+                        return Ok(Generated::Stopped(StepState::at(i, tokens)));
+                    }
+                    if let Some(p) = progress {
+                        p(ProgressEvent::Step {
+                            i: i as u32 + 1,
+                            n: steps,
+                        });
+                    }
+                    let out = self
+                        .dit
+                        .forward(
+                            &self.backend,
+                            &self.dit_pipelines,
+                            &self.residency,
+                            &workspace,
+                            &self.dit_handles,
+                            &tokens,
+                            &txt_embeds,
+                            step.t,
+                            1,
+                            gh,
+                            gw,
+                            None,
+                        )
+                        .await
+                        .map_err(GenerateError::Dit)?;
+                    debug_assert_eq!(out.velocity.len(), tokens.len());
+                    for (zi, &v) in tokens.iter_mut().zip(out.velocity.iter()) {
+                        *zi += v * step.delta;
+                    }
                 }
             }
-        }
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
 
-        // --- 3. unpack -> VAE decode ---
+            // --- 3. unpack -> VAE decode ---
+            // Before the decode: a step boundary.
+            if ctl.stop_here.is_some_and(|c| c()) {
+                return Ok(Generated::Stopped(StepState::at(steps_plan.len(), tokens)));
+            }
+        }
+
         if let Some(p) = progress {
             p(ProgressEvent::VaeDecode);
         }
-        z = unpack_latents(&tokens, lat_h, lat_w);
+        let z = unpack_latents(&tokens, lat_h, lat_w);
         let rgb = self
             .vae
             .decode(
@@ -394,7 +484,7 @@ impl<S: WeightSource> QwenImagePipeline<S> {
             .map_err(GenerateError::Vae)?;
         self.residency.evict_all_and_free(&*self.backend);
         // decode returns CTHW [3, 1, lat_h*8, lat_w*8] = [3, height, width].
-        Ok(rgb)
+        Ok(Generated::Done(rgb))
     }
 
     /// Image-to-image edit: vision-tower + edit-encoder text conditioning, plus a
@@ -425,6 +515,49 @@ impl<S: WeightSource> QwenImagePipeline<S> {
         seed: u64,
         progress: ProgressFn<'_>,
     ) -> Result<Vec<f32>, GenerateError<S::Error>> {
+        let image = EditImage {
+            pad_start: image_pad_start,
+            vit_pixels,
+            vit_grid,
+            vae_image,
+            vae_dims,
+        };
+        match self
+            .generate_edit_rgb_ctl(
+                token_ids,
+                drop,
+                std::slice::from_ref(&image),
+                height,
+                width,
+                steps,
+                seed,
+                progress,
+                StepControl::default(),
+            )
+            .await?
+        {
+            Generated::Done(rgb) => Ok(rgb),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate_edit_rgb`] over one or more input images (in prompt
+    /// order: each its own vision block and reference latent), that can stop
+    /// at a step boundary (`ctl`) and resume there; the encodes are
+    /// recomputed on resume (deterministic).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_edit_rgb_ctl(
+        &self,
+        token_ids: &[u32],
+        drop: usize,
+        images: &[EditImage<'_>],
+        height: u32,
+        width: u32,
+        steps: u32,
+        seed: u64,
+        progress: ProgressFn<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated<Vec<f32>>, GenerateError<S::Error>> {
         if token_ids.is_empty() {
             return Err(GenerateError::EmptyPrompt);
         }
@@ -436,19 +569,15 @@ impl<S: WeightSource> QwenImagePipeline<S> {
             return Err(GenerateError::InvalidDims { height, width });
         }
         let edit = self.edit.as_ref().expect("generate_edit_rgb on a t2i load");
-        let (gh_vit, gw_vit) = vit_grid;
-        let (hv, wv) = vae_dims;
+        if images.is_empty() {
+            return Err(GenerateError::EmptyPrompt);
+        }
         // Noise (target) geometry: DiT patch grid = pixels / (8 * patch 2) = /16.
         let gh_noise = height as usize / config::PIXELS_PER_TOKEN;
         let gw_noise = width as usize / config::PIXELS_PER_TOKEN;
         let lat_h = gh_noise * 2;
         let lat_w = gw_noise * 2;
         let noise_seq = gh_noise * gw_noise;
-        // Reference geometry from the VAE-side resolution: latent /8, DiT grid /16.
-        let lat_hv = hv / 8;
-        let lat_wv = wv / 8;
-        let cgh = hv / config::PIXELS_PER_TOKEN;
-        let cgw = wv / config::PIXELS_PER_TOKEN;
 
         let mut workspace = Workspace::new(
             Arc::clone(&self.backend),
@@ -456,135 +585,195 @@ impl<S: WeightSource> QwenImagePipeline<S> {
         );
 
         // --- 1. vision tower: patches -> LM embeds (bf16 block matmuls) ---
-        if let Some(p) = progress {
-            p(ProgressEvent::TextEncode);
-        }
-        let vision = {
-            let _s = trace::scope!("qwen_image.vision", grid = gh_vit * gw_vit).entered();
-            edit.vision
-                .forward(
-                    &self.backend,
-                    &edit.vision_pipelines,
-                    &self.residency,
-                    &workspace,
-                    &edit.vision_handles,
-                    vit_pixels,
-                    gh_vit,
-                    gw_vit,
-                )
-                .await
-                .map_err(GenerateError::Vision)?
-        };
-        let merged_grid = (gh_vit / 2, gw_vit / 2);
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 2. edit encode (LM + MRoPE + vision scatter) -> drop preamble ---
-        let enc = {
-            let _s = trace::scope!("qwen_image.encode_edit", tokens = token_ids.len()).entered();
-            self.encoder
-                .forward_edit(
-                    &self.backend,
-                    &edit.edit_encoder_pipelines,
-                    &self.residency,
-                    &workspace,
-                    &self.encoder_handles,
-                    self.residency.source(),
-                    token_ids,
-                    image_pad_start,
-                    &vision.embeds,
-                    merged_grid,
-                    false,
-                )
-                .await
-                .map_err(GenerateError::Encode)?
-        };
-        let hd = enc_config::HIDDEN;
-        let drop = drop.min(enc.seq.saturating_sub(1));
-        let txt_embeds: Vec<f32> = enc.hidden[drop * hd..].to_vec();
-        debug_assert_eq!(txt_embeds.len() % config::JOINT_ATTENTION_DIM, 0);
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 3. reference VAE latent: encode -> mode -> normalize -> pack ---
-        let ref_tokens = {
-            let _s = trace::scope!("qwen_image.ref_latent", h = hv, w = wv).entered();
-            let moments = edit
-                .vae_encoder
-                .encode(
-                    &self.backend,
-                    &self.residency,
-                    &mut workspace,
-                    vae_image,
-                    1,
-                    hv,
-                    wv,
-                )
-                .await
-                .map_err(GenerateError::VaeEncode)?;
-            let ref_latent = normalize_ref_latent(&moments, &edit.vae_encoder.cfg, lat_hv, lat_wv);
-            pack_latents(&ref_latent, lat_hv, lat_wv)
-        };
-        debug_assert_eq!(ref_tokens.len(), cgh * cgw * config::IN_CHANNELS);
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 4. FlowMatchEuler denoise (CFG-free), [noise ++ ref] image stream ---
         let steps_plan = build_steps(steps as usize, noise_seq);
-        let z = gaussian_noise(config::OUT_CHANNELS * lat_h * lat_w, seed);
-        let mut noise_tokens = pack_latents(&z, lat_h, lat_w);
-        debug_assert_eq!(noise_tokens.len(), noise_seq * config::IN_CHANNELS);
-        let grids = [(1, gh_noise, gw_noise), (1, cgh, cgw)];
-        if std::env::var_os("THINFER_VAE_MEM").is_some() {
-            use thinfer_core::backend::Backend;
-            let mem = self.backend.mem_account();
-            eprintln!(
-                "[vae_mem] DENOISE_EDIT noise_seq={} ref_seq={} total_img={} vram_total={}MiB",
-                noise_seq,
-                cgh * cgw,
-                noise_seq + cgh * cgw,
-                mem.vram_total_current() / (1024 * 1024),
-            );
-        }
-        {
-            let _s = trace::scope!("qwen_image.denoise_edit", steps = steps).entered();
-            for (i, step) in steps_plan.iter().enumerate() {
-                if let Some(p) = progress {
-                    p(ProgressEvent::Step {
-                        i: i as u32 + 1,
-                        n: steps,
-                    });
+
+        // A resumed run starts at its step, from its latent.
+        let (first, mut noise_tokens) = match ctl.resume {
+            Some(st) => {
+                if st.step > steps_plan.len()
+                    || st.latent.len() != config::OUT_CHANNELS * lat_h * lat_w
+                {
+                    return Err(GenerateError::ResumeMismatch);
                 }
-                let mut img_tokens = Vec::with_capacity(noise_tokens.len() + ref_tokens.len());
-                img_tokens.extend_from_slice(&noise_tokens);
-                img_tokens.extend_from_slice(&ref_tokens);
-                let out = self
-                    .dit
-                    .forward_multi(
+                (st.step, st.latent)
+            }
+            None => (
+                0,
+                pack_latents(
+                    &gaussian_noise(config::OUT_CHANNELS * lat_h * lat_w, seed),
+                    lat_h,
+                    lat_w,
+                ),
+            ),
+        };
+        // Denoised already: straight to the decode.
+        if first < steps_plan.len() {
+            if let Some(p) = progress {
+                p(ProgressEvent::TextEncode);
+            }
+            // One vision-tower pass per image (its attention never crosses
+            // images, so this is the batched pass).
+            let mut visions = Vec::with_capacity(images.len());
+            for img in images {
+                let (gh_vit, gw_vit) = img.vit_grid;
+                let _s = trace::scope!("qwen_image.vision", grid = gh_vit * gw_vit).entered();
+                let v = edit
+                    .vision
+                    .forward(
                         &self.backend,
-                        &self.dit_pipelines,
+                        &edit.vision_pipelines,
                         &self.residency,
                         &workspace,
-                        &self.dit_handles,
-                        &img_tokens,
-                        &txt_embeds,
-                        step.t,
-                        &grids,
-                        noise_seq,
-                        None,
+                        &edit.vision_handles,
+                        img.vit_pixels,
+                        gh_vit,
+                        gw_vit,
                     )
                     .await
-                    .map_err(GenerateError::Dit)?;
-                debug_assert_eq!(out.velocity.len(), noise_tokens.len());
-                for (zi, &v) in noise_tokens.iter_mut().zip(out.velocity.iter()) {
-                    *zi += v * step.delta;
+                    .map_err(GenerateError::Vision)?;
+                visions.push((v, (gh_vit / 2, gw_vit / 2)));
+            }
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+
+            // --- 2. edit encode (LM + MRoPE + vision scatter) -> drop preamble ---
+            let enc = {
+                let _s =
+                    trace::scope!("qwen_image.encode_edit", tokens = token_ids.len()).entered();
+                self.encoder
+                    .forward_edit_multi(
+                        &self.backend,
+                        &edit.edit_encoder_pipelines,
+                        &self.residency,
+                        &workspace,
+                        &self.encoder_handles,
+                        self.residency.source(),
+                        token_ids,
+                        &images
+                            .iter()
+                            .zip(&visions)
+                            .map(
+                                |(img, (v, grid))| crate::qwen_image::text_encoder::EditVision {
+                                    pad_start: img.pad_start,
+                                    embeds: &v.embeds,
+                                    merged_grid: *grid,
+                                },
+                            )
+                            .collect::<Vec<_>>(),
+                        false,
+                    )
+                    .await
+                    .map_err(GenerateError::Encode)?
+            };
+            let hd = enc_config::HIDDEN;
+            let drop = drop.min(enc.seq.saturating_sub(1));
+            let txt_embeds: Vec<f32> = enc.hidden[drop * hd..].to_vec();
+            debug_assert_eq!(txt_embeds.len() % config::JOINT_ATTENTION_DIM, 0);
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+
+            // --- 3. reference VAE latent: encode -> mode -> normalize -> pack ---
+            // The image stream's grids: the target's, then each reference's
+            // (latent /8, DiT grid /16), packed in that order.
+            let mut grids = vec![(1, gh_noise, gw_noise)];
+            let mut ref_tokens = Vec::new();
+            for img in images {
+                let (hv, wv) = img.vae_dims;
+                let (lat_hv, lat_wv) = (hv / 8, wv / 8);
+                let _s = trace::scope!("qwen_image.ref_latent", h = hv, w = wv).entered();
+                let moments = edit
+                    .vae_encoder
+                    .encode(
+                        &self.backend,
+                        &self.residency,
+                        &mut workspace,
+                        img.vae_image,
+                        1,
+                        hv,
+                        wv,
+                    )
+                    .await
+                    .map_err(GenerateError::VaeEncode)?;
+                let ref_latent =
+                    normalize_ref_latent(&moments, &edit.vae_encoder.cfg, lat_hv, lat_wv);
+                ref_tokens.extend(pack_latents(&ref_latent, lat_hv, lat_wv));
+                grids.push((
+                    1,
+                    hv / config::PIXELS_PER_TOKEN,
+                    wv / config::PIXELS_PER_TOKEN,
+                ));
+            }
+            let ref_seq: usize = grids[1..].iter().map(|&(f, h, w)| f * h * w).sum();
+            debug_assert_eq!(ref_tokens.len(), ref_seq * config::IN_CHANNELS);
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+
+            // --- 4. FlowMatchEuler denoise (CFG-free), [noise ++ ref] image stream ---
+            debug_assert_eq!(noise_tokens.len(), noise_seq * config::IN_CHANNELS);
+            if std::env::var_os("THINFER_VAE_MEM").is_some() {
+                use thinfer_core::backend::Backend;
+                let mem = self.backend.mem_account();
+                eprintln!(
+                    "[vae_mem] DENOISE_EDIT noise_seq={} ref_seq={} total_img={} vram_total={}MiB",
+                    noise_seq,
+                    ref_seq,
+                    noise_seq + ref_seq,
+                    mem.vram_total_current() / (1024 * 1024),
+                );
+            }
+            {
+                let _s = trace::scope!("qwen_image.denoise_edit", steps = steps).entered();
+                for (i, step) in steps_plan.iter().enumerate().skip(first) {
+                    // Between steps: a step boundary.
+                    if i > first && ctl.stop_here.is_some_and(|c| c()) {
+                        self.residency.evict_all_and_free(&*self.backend);
+                        return Ok(Generated::Stopped(StepState::at(i, noise_tokens)));
+                    }
+                    if let Some(p) = progress {
+                        p(ProgressEvent::Step {
+                            i: i as u32 + 1,
+                            n: steps,
+                        });
+                    }
+                    let mut img_tokens = Vec::with_capacity(noise_tokens.len() + ref_tokens.len());
+                    img_tokens.extend_from_slice(&noise_tokens);
+                    img_tokens.extend_from_slice(&ref_tokens);
+                    let out = self
+                        .dit
+                        .forward_multi(
+                            &self.backend,
+                            &self.dit_pipelines,
+                            &self.residency,
+                            &workspace,
+                            &self.dit_handles,
+                            &img_tokens,
+                            &txt_embeds,
+                            step.t,
+                            &grids,
+                            noise_seq,
+                            None,
+                        )
+                        .await
+                        .map_err(GenerateError::Dit)?;
+                    debug_assert_eq!(out.velocity.len(), noise_tokens.len());
+                    for (zi, &v) in noise_tokens.iter_mut().zip(out.velocity.iter()) {
+                        *zi += v * step.delta;
+                    }
                 }
             }
-        }
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
 
-        // --- 5. unpack -> VAE decode ---
+            // --- 5. unpack -> VAE decode ---
+            // Before the decode: a step boundary.
+            if ctl.stop_here.is_some_and(|c| c()) {
+                return Ok(Generated::Stopped(StepState::at(
+                    steps_plan.len(),
+                    noise_tokens,
+                )));
+            }
+        }
+
         if let Some(p) = progress {
             p(ProgressEvent::VaeDecode);
         }
@@ -603,7 +792,7 @@ impl<S: WeightSource> QwenImagePipeline<S> {
             .await
             .map_err(GenerateError::Vae)?;
         self.residency.evict_all_and_free(&*self.backend);
-        Ok(rgb)
+        Ok(Generated::Done(rgb))
     }
 
     /// `generate_rgb` + PNG encode.

@@ -1019,6 +1019,51 @@ impl HunyuanArDit {
         progress: Option<&dyn Fn(u32, u32, u32, u32)>,
         cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Vec<f32>, HunyuanDitError<S::Error>> {
+        match self
+            .generate_ctl(
+                backend,
+                residency,
+                ws,
+                text,
+                seq,
+                vision,
+                cond0,
+                init_noise,
+                grid,
+                schedule,
+                progress,
+                cancel,
+                crate::common::StepControl::default(),
+            )
+            .await?
+        {
+            crate::common::Generated::Done(x) => Ok(x),
+            crate::common::Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate`] that can stop at a step boundary (`ctl.stop_here`,
+    /// polled between steps, between chunks and after the last) and resume
+    /// there. The state is the whole latent plus `[chunk, step]`; a resumed run
+    /// rebuilds the KV cache by re-running each finished chunk's recache pass
+    /// (deterministic), so it matches an uninterrupted run.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_ctl<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        residency: &WeightResidency<S>,
+        ws: &Workspace<WgpuBackend>,
+        text: &[f32],
+        seq: usize,
+        vision: Option<&[f32]>,
+        cond0: Option<&[f32]>,
+        init_noise: &[f32],
+        grid: (usize, usize, usize),
+        schedule: &crate::hunyuan::scheduler::FlowMatchSchedule,
+        progress: Option<&dyn Fn(u32, u32, u32, u32)>,
+        cancel: Option<&dyn Fn() -> bool>,
+        ctl: crate::common::StepControl<'_>,
+    ) -> Result<crate::common::Generated<Vec<f32>>, HunyuanDitError<S::Error>> {
         let (gt, gh, gw) = grid;
         let chunk_t = arcfg::CHUNK_LATENT_FRAMES;
         assert_eq!(gt % chunk_t, 0, "latent frames must chunk evenly");
@@ -1042,7 +1087,28 @@ impl HunyuanArDit {
         let asz = self.pipelines.act_size();
         let dim = cfg::HIDDEN as u64;
         let rows = (chunk_t * gh * gw) as u32;
-        let mut x = init_noise.to_vec();
+        // A resumed run: its latent, and the chunk and step it stopped at.
+        let (mut x, at) = match ctl.resume {
+            Some(st) => {
+                let [c, i] = st.solver.ints[..] else {
+                    return Err(HunyuanDitError::ResumeMismatch);
+                };
+                let (c, i) = (c as usize, i as usize);
+                if st.latent.len() != lat * thw || c > n_chunks || i >= steps.max(1) {
+                    return Err(HunyuanDitError::ResumeMismatch);
+                }
+                (st.latent, (c, i))
+            }
+            None => (init_noise.to_vec(), (0, 0)),
+        };
+        if at.0 == n_chunks {
+            return Ok(crate::common::Generated::Done(x));
+        }
+        let stop = |x: Vec<f32>, chunk: usize, i: usize| {
+            let mut st = crate::common::StepState::at(chunk * steps + i, x);
+            st.solver.ints = vec![chunk as u64, i as u64];
+            crate::common::Generated::Stopped(st)
+        };
 
         for chunk in 0..n_chunks {
             let start_t = chunk * chunk_t;
@@ -1055,9 +1121,19 @@ impl HunyuanArDit {
                 (ws.alloc(s_k * dim * asz)?, ws.alloc(s_k * dim * asz)?),
             ];
 
-            for i in 0..steps {
+            // A chunk a resumed run already denoised only re-commits its K/V.
+            let first = match chunk.cmp(&at.0) {
+                std::cmp::Ordering::Less => steps,
+                std::cmp::Ordering::Equal => at.1,
+                std::cmp::Ordering::Greater => 0,
+            };
+            for i in first..steps {
                 if cancel.is_some_and(|c| c()) {
                     return Err(HunyuanDitError::Cancelled);
+                }
+                // Between steps (and chunks): a step boundary.
+                if (chunk, i) > at && ctl.stop_here.is_some_and(|c| c()) {
+                    return Ok(stop(x, chunk, i));
                 }
                 if let Some(p) = progress {
                     p(chunk as u32 + 1, n_chunks as u32, i as u32 + 1, n_steps);
@@ -1133,6 +1209,10 @@ impl HunyuanArDit {
                 eprintln!("[ar diag] chunk {chunk} denoised latent absmax={amax:.4}");
             }
         }
-        Ok(x)
+        // Before the decode: a step boundary.
+        if ctl.stop_here.is_some_and(|c| c()) {
+            return Ok(stop(x, n_chunks, 0));
+        }
+        Ok(crate::common::Generated::Done(x))
     }
 }

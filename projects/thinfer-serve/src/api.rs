@@ -17,8 +17,9 @@ use axum::routing::{get, post};
 use base64::Engine;
 use thinfer_app::jobkey::JobKey;
 use thinfer_app::wire::{
-    Capabilities, CreateResponse, CreateSession, JobKeyDelivery, JobList, JobPatch, JobStateKind,
-    JobStatus, SealedJob, SessionInfo, SessionPatch, UploadResponse,
+    Capabilities, CreateResponse, CreateSession, JobKeyDelivery, JobList, JobPatch, JobPause,
+    JobResume, JobStateKind, JobStatus, ModelInfo, ModelList, SealedJob, SessionInfo, SessionPatch,
+    UploadResponse,
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -49,6 +50,46 @@ pub struct AppState {
     pub uploads: Arc<UploadStore>,
     /// Opt-in text sessions (sealed state trees, RAM only).
     pub sessions: Arc<crate::sessions::SessionStore>,
+}
+
+/// Every model this server runs: what each takes (input images and how a
+/// prompt names them), what sets its output size, its video limits, whether
+/// its jobs can pause, and whether its weights are already on the server.
+#[utoipa::path(
+    get, path = "/models",
+    responses((status = 200, body = ModelList))
+)]
+async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
+    // Each model's default job, built the way a real one is (pure: nothing
+    // is written), names the files a job needs.
+    let key = JobKey::generate();
+    let probe = state.config.artifact_dir.join("models-probe");
+    let models = thinfer_app::catalog::entries()
+        .into_iter()
+        .map(|e| {
+            let files = match e.spec {
+                Some(spec) => crate::jobspec::spec_into_request(
+                    spec,
+                    "models-probe",
+                    &probe,
+                    &key,
+                    &state.config,
+                    &state.uploads,
+                    &state.sessions,
+                )
+                .ok()
+                .and_then(|b| b.request.required_files().ok()),
+                None => Some(e.files),
+            };
+            let downloaded = files
+                .is_some_and(|f| thinfer_app::download::missing(&f).is_ok_and(|m| m.is_empty()));
+            ModelInfo {
+                downloaded,
+                ..e.info
+            }
+        })
+        .collect();
+    Json(ModelList { models })
 }
 
 /// `GET /capabilities` body: static server/GPU capabilities the UI adapts to.
@@ -85,6 +126,8 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}/events", get(events))
         .route("/jobs/{id}/result", get(get_result))
         .route("/jobs/{id}/cancel", post(cancel))
+        .route("/jobs/{id}/pause", post(pause_job))
+        .route("/jobs/{id}/resume", post(resume_job))
         .route("/sessions", post(create_session))
         .route(
             "/sessions/import",
@@ -103,6 +146,7 @@ pub fn router(state: AppState) -> Router {
         .route("/vault/adapters/add", post(crate::vault::add_adapter))
         .route("/vault/adapters/remove", post(crate::vault::remove_adapter))
         .route("/capabilities", get(capabilities))
+        .route("/models", get(list_models))
         .route("/openapi.json", get(openapi))
         // Router-wide cap for the JSON job spec (small base64 image only; big
         // video takes the /uploads path). `/uploads` overrides this per-route.
@@ -170,9 +214,13 @@ async fn create_job(
         })?),
         None => None,
     };
-    let handle = state
-        .store
-        .create(&state.config.artifact_dir, sealed, job.priority, owner);
+    let handle = state.store.create(
+        &state.config.artifact_dir,
+        sealed,
+        job.priority,
+        owner,
+        job.preempt,
+    );
     state
         .uploads
         .claim(&job.uploads, &handle)
@@ -654,7 +702,64 @@ async fn cancel(
     headers: HeaderMap,
 ) -> Result<Json<JobStatus>, ApiError> {
     let job = managed_job(&state, &id, &headers)?;
-    job.request_cancel();
+    state.store.cancel(&job);
+    Ok(Json(job.status(state.store.position(&id))))
+}
+
+/// Pause a job. A running one stops at its next step boundary (`stepEnd`)
+/// or as soon as it can (`now`, abandoning the step in flight), keeps its
+/// state sealed under its key, and gives up its worker: back in the queue,
+/// or held until `POST /jobs/{id}/resume` with `hold`. A queued one is held
+/// (`hold`) or just reprioritized. Resuming asks for the key again (a
+/// `keyRequired` event); the result matches an uninterrupted run.
+#[utoipa::path(
+    post, path = "/jobs/{id}/pause",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = JobPause,
+    responses(
+        (status = 200, body = JobStatus),
+        (status = 403, description = "Missing or wrong key proof"),
+        (status = 404, description = "Unknown job"),
+        (status = 409, description = "The job cannot pause (finished, or its model cannot)"),
+    )
+)]
+async fn pause_job(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<JobPause>,
+) -> Result<Json<JobStatus>, ApiError> {
+    let job = managed_job(&state, &id, &headers)?;
+    state
+        .store
+        .pause(&id, body)
+        .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
+    Ok(Json(job.status(state.store.position(&id))))
+}
+
+/// Queue a held job again (see `POST /jobs/{id}/pause`).
+#[utoipa::path(
+    post, path = "/jobs/{id}/resume",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = JobResume,
+    responses(
+        (status = 200, body = JobStatus),
+        (status = 403, description = "Missing or wrong key proof"),
+        (status = 404, description = "Unknown job"),
+        (status = 409, description = "The job is not held"),
+    )
+)]
+async fn resume_job(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<JobResume>,
+) -> Result<Json<JobStatus>, ApiError> {
+    let job = managed_job(&state, &id, &headers)?;
+    state
+        .store
+        .resume(&id, body.priority)
+        .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
     Ok(Json(job.status(state.store.position(&id))))
 }
 
@@ -669,7 +774,9 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         title = "thinfer",
         description = "Async job API for image, video, face-swap and text (LLM) generation.
 
-Every job is end-to-end sealed. The client generates a 32-byte AES-256-GCM key per job and submits `SealedJob.sealed` = base64(`[12-byte nonce][ciphertext + 16-byte tag]`) of the `JobSpec` JSON (tagged by `kind`). It then follows `GET /jobs/{id}/events` (SSE; events are `JobEvent` JSON tagged by `type`: queued, keyRequired, started, progress, log, text, done, error, cancelled). On `keyRequired` it posts the key to `/jobs/{id}/key`. `text` events carry reply pieces sealed under the same key. After `done`, `GET /jobs/{id}/result` with header `x-job-key-sha256: base64(SHA-256(key))` returns the artifact sealed under the key, then deletes it. Declaring `keyProof` at submit makes cancel / PATCH / DELETE require that header.
+Every job is end-to-end sealed. The client generates a 32-byte AES-256-GCM key per job and submits `SealedJob.sealed` = base64(`[12-byte nonce][ciphertext + 16-byte tag]`) of the `JobSpec` JSON (tagged by `kind`). It then follows `GET /jobs/{id}/events` (SSE; events are `JobEvent` JSON tagged by `type`: queued, keyRequired, started, progress, log, text, paused, done, error, cancelled). On `keyRequired` it posts the key to `/jobs/{id}/key`. `text` events carry reply pieces sealed under the same key. After `done`, `GET /jobs/{id}/result` with header `x-job-key-sha256: base64(SHA-256(key))` returns the artifact sealed under the key, then deletes it. Declaring `keyProof` at submit makes cancel / pause / resume / PATCH / DELETE require that header.
+
+Pausing: `POST /jobs/{id}/pause` stops a running job whose model can pause (`JobStatus.pausable`) at a step boundary and gives its worker up; its state stays sealed under the job key and the resumed run asks for the key again (`keyRequired`), then continues where it stopped, with the same result. `preempt` at submit runs a job next, pausing the lowest-priority pausable running job when no worker is free.
 
 Tool calling: a text job with `tools` may end with `TextResult.finishReason` = `toolCalls` and `TextResult.toolCalls` = a JSON array of `ToolCall` sealed under the job key. Every call names a defined tool and its arguments match that tool's schema. Run the calls, then submit the next text job with the assistant turn (`toolCalls` as returned) and one `tool` turn per call (`toolCallId`, `name`, `content`), the tools sent again; with a session, continue from the reply's `sessionNode` with just the `tool` turns."
     ),
@@ -679,6 +786,7 @@ Tool calling: a text job with `tools` may end with `TextResult.finishReason` = `
         patch_job,
         delete_job,
         capabilities,
+        list_models,
         create_session,
         get_session,
         patch_session,
@@ -692,6 +800,8 @@ Tool calling: a text job with `tools` may end with `TextResult.finishReason` = `
         events,
         get_result,
         cancel,
+        pause_job,
+        resume_job,
         crate::vault::list_adapters,
         crate::vault::add_adapter,
         crate::vault::remove_adapter,
@@ -700,6 +810,16 @@ Tool calling: a text job with `tools` may end with `TextResult.finishReason` = `
         SealedJob,
         JobKeyDelivery,
         JobPatch,
+        JobPause,
+        JobResume,
+        thinfer_app::wire::PauseMode,
+        ModelList,
+        ModelInfo,
+        thinfer_app::wire::ModelKind,
+        thinfer_app::wire::InputSlot,
+        thinfer_app::wire::InputUse,
+        thinfer_app::wire::SizeRules,
+        thinfer_app::wire::VideoInfo,
         JobList,
         thinfer_app::wire::JobListEntry,
         thinfer_app::wire::JobEvent,
@@ -787,6 +907,9 @@ mod tests {
             "/jobs/{id}/events",
             "/jobs/{id}/result",
             "/jobs/{id}/cancel",
+            "/jobs/{id}/pause",
+            "/jobs/{id}/resume",
+            "/models",
             "/uploads",
             "/capabilities",
             "/sessions",
@@ -813,6 +936,8 @@ mod tests {
             "JobEvent",
             "SessionInfo",
             "JobList",
+            "JobPause",
+            "PauseMode",
         ] {
             assert!(schemas.contains_key(s), "{s} schema missing");
         }

@@ -119,7 +119,7 @@ where
     );
     let mut model = load(backend.clone(), source, budget, max_ctx).await;
     let ws = Workspace::new(backend.clone(), model.residency().arbiter().clone());
-    let accel = model.enable_accel(&backend).expect("accel");
+    let accel = model.enable_accel(&backend, None).expect("accel");
     eprintln!(
         "accel: {accel}, experts {:.1} GB, {} VRAM slots",
         model.experts_total_bytes() as f64 / 1e9,

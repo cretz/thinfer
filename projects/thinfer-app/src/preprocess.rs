@@ -1,6 +1,7 @@
 //! Host-side input preparation for the Qwen-Image-Edit path. The engine's
 //! `generate_edit_rgb` consumes preprocessed tensors; this module derives them
-//! from a single source image + the edit prompt.
+//! from the source image(s) (up to [`MAX_EDIT_IMAGES`], each labelled
+//! `Picture N` in the template, in order) + the edit prompt.
 //!
 //! Qwen-Image-Edit-Rapid-AIO is an Edit-2509 ("Edit Plus") merge whose model
 //! card prescribes Phr00t's fixed ComfyUI `TextEncodeQwenImageEditPlus` node,
@@ -62,8 +63,13 @@ const T2I_TEMPLATE_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
 /// template-end scan), so the conditioning starts at `Picture 1: `. The single
 /// `<|image_pad|>` expands to `n_img` placeholders before tokenization.
 const EDIT_SYSTEM: &str = "<|im_start|>system\nDescribe key details of the input image (including any objects, characters, poses, facial features, clothing, setting, textures and style), then explain how the user's text instruction should alter, modify or recreate the image. Generate a new image that meets the user's requirements, which can vary from a small change to a completely new image using inputs as a guide.<|im_end|>\n<|im_start|>user\n";
-const EDIT_PICTURE: &str = "Picture 1: <|vision_start|>";
+/// Each input image's block: `Picture {n}: <|vision_start|>pads<|vision_end|>`
+/// (`n` from 1), all before the prompt (the node's `image_prompt`).
+const EDIT_PICTURE_OPEN: &str = "<|vision_start|>";
 const EDIT_TEMPLATE_MID: &str = "<|vision_end|>";
+
+/// Input images an edit takes (the Edit Plus node's three slots).
+pub const MAX_EDIT_IMAGES: usize = 3;
 const EDIT_TEMPLATE_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
 
 /// The VL image's target area (the node's `384 * 384`).
@@ -133,12 +139,30 @@ pub fn calc_vit_dims(in_w: u32, in_h: u32) -> (usize, usize) {
     (h_bar as usize, w_bar as usize)
 }
 
-/// Build all edit-path inputs from a decoded RGB source image + prompt.
-pub fn prepare_edit_inputs(
-    rgb: &RgbImage,
-    prompt: &str,
-    tokenizer: &impl Tokenizer,
-) -> Result<EditInputs, String> {
+/// One input image of an edit, both conditioning channels.
+pub struct EditImageInput {
+    /// Index of its first `<|image_pad|>` token.
+    pub pad_start: usize,
+    /// ViT patches `[N=gh*gw, 1176]`, merge-unit-major, CLIP-normalized.
+    pub vit_pixels: Vec<f32>,
+    /// ViT grid `(gh, gw)`.
+    pub vit_grid: (usize, usize),
+    /// VAE image CTHW `[3, 1, Hv, Wv]` in `[-1, 1]`.
+    pub vae_image: Vec<f32>,
+    /// VAE dims `(Hv, Wv)`, both multiples of 32.
+    pub vae_dims: (usize, usize),
+}
+
+/// A multi-image edit's inputs: the tokens (one `Picture N` block per image,
+/// in order), the dropped preamble, and each image's channels.
+pub struct MultiEditInputs {
+    pub token_ids: Vec<u32>,
+    pub drop: usize,
+    pub images: Vec<EditImageInput>,
+}
+
+/// One image's two channels (its `pad_start` is set once the tokens exist).
+fn edit_channels(rgb: &RgbImage) -> Result<EditImageInput, String> {
     let (in_w, in_h) = (rgb.width(), rgb.height());
 
     // --- ViT channel: area-resize to the VL area, then the processor's own
@@ -168,23 +192,71 @@ pub fn prepare_edit_inputs(
         .resize_exact(wv as u32, hv as u32, FilterType::Lanczos3)
         .to_rgb8();
     let vae_image = to_vae_cthw(&vae_img, hv, wv);
-
-    // --- tokens ---
-    let n_img = (gh / MERGE) * (gw / MERGE);
-    let (token_ids, image_pad_start) = tokenize_edit(prompt, n_img, tokenizer)?;
-    let drop = tokenizer
-        .encode(EDIT_SYSTEM, false)
-        .map_err(|e| format!("tokenize edit template: {e:?}"))?
-        .len();
-
-    Ok(EditInputs {
-        token_ids,
-        image_pad_start,
-        drop,
+    Ok(EditImageInput {
+        pad_start: 0,
         vit_pixels,
         vit_grid: (gh, gw),
         vae_image,
         vae_dims: (hv, wv),
+    })
+}
+
+/// Everything a (multi-image) edit needs from the host: each image's two
+/// channels, and the tokens naming them `Picture 1`, `Picture 2`, ... in order.
+pub fn prepare_multi_edit_inputs(
+    rgbs: &[RgbImage],
+    prompt: &str,
+    tokenizer: &impl Tokenizer,
+) -> Result<MultiEditInputs, String> {
+    if rgbs.is_empty() || rgbs.len() > MAX_EDIT_IMAGES {
+        return Err(format!(
+            "an edit takes 1 to {MAX_EDIT_IMAGES} input images (got {})",
+            rgbs.len()
+        ));
+    }
+    let mut images = rgbs
+        .iter()
+        .map(edit_channels)
+        .collect::<Result<Vec<_>, _>>()?;
+    let pads: Vec<usize> = images
+        .iter()
+        .map(|i| (i.vit_grid.0 / MERGE) * (i.vit_grid.1 / MERGE))
+        .collect();
+    let (token_ids, starts) = tokenize_edit(prompt, &pads, tokenizer)?;
+    for (img, start) in images.iter_mut().zip(starts) {
+        img.pad_start = start;
+    }
+    let drop = tokenizer
+        .encode(EDIT_SYSTEM, false)
+        .map_err(|e| format!("tokenize edit template: {e:?}"))?
+        .len();
+    Ok(MultiEditInputs {
+        token_ids,
+        drop,
+        images,
+    })
+}
+
+/// Build all edit-path inputs from a decoded RGB source image + prompt.
+pub fn prepare_edit_inputs(
+    rgb: &RgbImage,
+    prompt: &str,
+    tokenizer: &impl Tokenizer,
+) -> Result<EditInputs, String> {
+    let MultiEditInputs {
+        token_ids,
+        drop,
+        mut images,
+    } = prepare_multi_edit_inputs(std::slice::from_ref(rgb), prompt, tokenizer)?;
+    let img = images.pop().expect("one image");
+    Ok(EditInputs {
+        token_ids,
+        image_pad_start: img.pad_start,
+        drop,
+        vit_pixels: img.vit_pixels,
+        vit_grid: img.vit_grid,
+        vae_image: img.vae_image,
+        vae_dims: img.vae_dims,
     })
 }
 
@@ -307,18 +379,27 @@ pub fn tokenize_t2i(prompt: &str, tokenizer: &impl Tokenizer) -> Result<Vec<u32>
     Ok(ids)
 }
 
-/// Build + tokenize the edit template (image_pad expanded to `n_img`); return
-/// `(token_ids, image_pad_start)`. Mirrors `gen_edit_inputs.py`: encode with
-/// `add_special_tokens=false`, then find the contiguous `<|image_pad|>` run.
+/// Build + tokenize the edit template (each image's `<|image_pad|>` expanded
+/// to its count); return `(token_ids, each image's pad-run start)`. Mirrors
+/// `gen_edit_inputs.py`: encode with `add_special_tokens=false`, then find the
+/// contiguous `<|image_pad|>` runs, one per image in order.
 fn tokenize_edit(
     prompt: &str,
-    n_img: usize,
+    n_imgs: &[usize],
     tokenizer: &impl Tokenizer,
-) -> Result<(Vec<u32>, usize), String> {
-    let pads = IMAGE_PAD.repeat(n_img);
-    let text = format!(
-        "{EDIT_SYSTEM}{EDIT_PICTURE}{pads}{EDIT_TEMPLATE_MID}{prompt}{EDIT_TEMPLATE_SUFFIX}"
-    );
+) -> Result<(Vec<u32>, Vec<usize>), String> {
+    let blocks: String = n_imgs
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            format!(
+                "Picture {}: {EDIT_PICTURE_OPEN}{}{EDIT_TEMPLATE_MID}",
+                i + 1,
+                IMAGE_PAD.repeat(n)
+            )
+        })
+        .collect();
+    let text = format!("{EDIT_SYSTEM}{blocks}{prompt}{EDIT_TEMPLATE_SUFFIX}");
     let ids = tokenizer
         .encode(&text, false)
         .map_err(|e| format!("tokenize edit prompt: {e:?}"))?;
@@ -331,17 +412,26 @@ fn tokenize_edit(
         .filter(|&(_, &t)| t == IMAGE_PAD_TOKEN_ID)
         .map(|(i, _)| i)
         .collect();
-    if pad_positions.len() != n_img {
+    let total: usize = n_imgs.iter().sum();
+    if pad_positions.len() != total {
         return Err(format!(
-            "expected {n_img} <|image_pad|> tokens, got {} (special tokens not single-id?)",
+            "expected {total} <|image_pad|> tokens, got {} (special tokens not single-id?)",
             pad_positions.len()
         ));
     }
-    let start = pad_positions[0];
-    if pad_positions != (start..start + n_img).collect::<Vec<_>>() {
-        return Err("image-pad tokens are not contiguous".into());
+    // Split the pad positions into one contiguous run per image.
+    let mut starts = Vec::with_capacity(n_imgs.len());
+    let mut at = 0;
+    for &n in n_imgs {
+        let run = &pad_positions[at..at + n];
+        let start = run[0];
+        if run.iter().enumerate().any(|(k, &p)| p != start + k) {
+            return Err("image-pad tokens are not contiguous".into());
+        }
+        starts.push(start);
+        at += n;
     }
-    Ok((ids, start))
+    Ok((ids, starts))
 }
 
 #[cfg(test)]

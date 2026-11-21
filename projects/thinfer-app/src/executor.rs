@@ -79,15 +79,63 @@ fn image_budget(
 }
 
 /// Runs jobs on this machine's GPU. Construct once; the backend is reused.
+/// The last text model stays loaded between text jobs ([`crate::llm::WarmLlm`]):
+/// another text model releases it first, and so does any other job (all of
+/// it, or with [`Self::keep_text_host`] only its VRAM).
 pub struct LocalExecutor {
     backend: Arc<WgpuBackend>,
+    warm_llm: std::sync::Mutex<Option<crate::llm::WarmLlm>>,
+    keep_text_host: bool,
 }
 
 impl LocalExecutor {
     pub async fn new(cfg: BackendConfig) -> Result<Self, String> {
         Ok(Self {
             backend: init_backend(cfg).await?,
+            warm_llm: std::sync::Mutex::new(None),
+            keep_text_host: false,
         })
+    }
+
+    /// Keep the warm text model's host side (parsed assets, compiled
+    /// pipelines, page-locked expert cache) through other jobs, freeing only
+    /// its VRAM, so a text job after one skips that work. Costs the expert
+    /// cache's page-locked RAM while those jobs run.
+    pub fn keep_text_host(mut self, keep: bool) -> Self {
+        self.keep_text_host = keep;
+        self
+    }
+
+    /// A text model is kept between jobs (loaded, or its host side).
+    pub fn holds_warm_model(&self) -> bool {
+        self.warm_llm.lock().unwrap().is_some()
+    }
+
+    /// A kept text model has weights on the device (buffers of
+    /// [`thinfer_core::mem::VramCategory::Weights`] stay between jobs).
+    pub fn holds_warm_weights(&self) -> bool {
+        self.warm_llm
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|w| w.is_loaded())
+    }
+
+    /// Time since a text job last used the kept text model.
+    pub fn warm_model_idle(&self) -> Option<std::time::Duration> {
+        self.warm_llm.lock().unwrap().as_ref().map(|w| w.idle())
+    }
+
+    /// Release the kept text model (its VRAM and RAM).
+    pub fn release_warm_model(&self) {
+        let warm = self.warm_llm.lock().unwrap().take();
+        if let Some(w) = &warm {
+            tracing::info!(
+                idle_secs = w.idle().as_secs(),
+                host_bytes = w.host_bytes(),
+                "warm text model released"
+            );
+        }
     }
 
     /// The wgpu backend, for the caller's end-of-run memory rollup.
@@ -101,9 +149,24 @@ impl LocalExecutor {
         req: &JobRequest,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
+        if let JobRequest::Text(r) = req {
+            let mut warm = self.warm_llm.lock().unwrap().take();
+            let out = crate::llm::run(&self.backend, r, sink, &mut warm).await;
+            *self.warm_llm.lock().unwrap() = warm;
+            return out;
+        }
+        // Any other job needs the room: the loaded text model goes first
+        // (its VRAM at least).
+        if self.keep_text_host {
+            if let Some(w) = self.warm_llm.lock().unwrap().as_mut() {
+                w.release_device();
+            }
+        } else {
+            self.release_warm_model();
+        }
         match req {
             JobRequest::Image(r) => self.run_image(r, sink).await,
-            JobRequest::Text(r) => crate::llm::run(&self.backend, r, sink).await,
+            JobRequest::Text(_) => unreachable!("handled above"),
             JobRequest::Video(r) => self.run_video(r, sink).await,
             JobRequest::FaceSwap(r) => self.run_faceswap(r, sink).await,
         }
@@ -158,7 +221,16 @@ impl LocalExecutor {
 
         let tokenizer = load_tokenizer(&resolve_role(manifest, zrole::TOKENIZER_JSON)?).await?;
 
-        let seed = req.seed.unwrap_or_else(random_seed);
+        // A resumed run: the seed it drew and where it stood.
+        let resume = sink
+            .take_resume()
+            .map(|b| read_zimage_paused(&b))
+            .transpose()?;
+        let seed = resume
+            .as_ref()
+            .map(|(seed, _)| *seed)
+            .or(req.seed)
+            .unwrap_or_else(random_seed);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model, width = req.width, height = req.height,
@@ -192,10 +264,27 @@ impl LocalExecutor {
             .await
             .map_err(|e| format!("model load: {e:?}"))?
         };
-        let png = model
-            .generate(&params, Some(&progress))
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let ctl = zpipe::StepControl {
+            resume: resume.map(|(_, state)| state),
+            stop_here: Some(&stop_here),
+        };
+        let png = match model
+            .generate_ctl(&params, Some(&progress), ctl)
             .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+            .map_err(|e| format!("generate: {e:?}"))?
+        {
+            zpipe::Generated::Done(png) => png,
+            zpipe::Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop(sink, ZIMAGE_PAUSED_TAG, |w| {
+                    w.u64(seed);
+                    w.usize(st.step);
+                    w.usize(st.cap_len);
+                    w.f32s(&st.cap);
+                    w.f32s(&st.sample);
+                }));
+            }
+        };
         let bytes = png.len();
         crate::progress::write_artifact(sink, &req.output, png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
@@ -262,7 +351,14 @@ impl LocalExecutor {
             return Err("empty prompt produced no tokens".into());
         }
 
-        let seed = req.seed.unwrap_or_else(random_seed);
+        // A resumed run: the seed it drew and where it stood.
+        let resume = crate::checkpoint::take_steps(sink, IDEOGRAM_PAUSED_TAG)?;
+        let seed = resume
+            .as_ref()
+            .map(|r| r.seed)
+            .or(req.seed)
+            .unwrap_or_else(random_seed);
+        let resume = resume.map(|r| r.state);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model, width = req.width, height = req.height,
@@ -282,10 +378,29 @@ impl LocalExecutor {
                 .await
                 .map_err(|e| format!("model load: {e:?}"))?
         };
-        let png = pipeline
-            .generate(&params, None, Some(&progress))
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let rgb = match pipeline
+            .generate_rgb_ctl(
+                &params,
+                None,
+                Some(&progress),
+                crate::checkpoint::step_control(resume, &stop_here),
+            )
             .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+            .map_err(|e| format!("generate: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done((rgb, _, _)) => rgb,
+            thinfer_models::common::Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop_steps(
+                    sink,
+                    IDEOGRAM_PAUSED_TAG,
+                    seed,
+                    &st,
+                ));
+            }
+        };
+        let png = thinfer_models::z_image::pipeline::encode_png(&rgb, req.width, req.height)
+            .map_err(|e| format!("encode png: {e}"))?;
         let bytes = png.len();
         crate::progress::write_artifact(sink, &req.output, png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
@@ -314,9 +429,12 @@ impl LocalExecutor {
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         let manifest = req.model.manifest();
-        let [input_image] = req.input_images.as_slice() else {
-            return Err("qwen-image-edit-rapid edits exactly one --input-image".into());
-        };
+        let max = crate::preprocess::MAX_EDIT_IMAGES;
+        if req.input_images.is_empty() || req.input_images.len() > max {
+            return Err(format!(
+                "qwen-image-edit-rapid takes 1 to {max} --input-image"
+            ));
+        }
 
         // --- 4-source union: dit(1:1) + encoder(renamed) + mmproj(native) + vae ---
         let dit = open_mmap(&resolve_role(manifest, qrole::DIT_GGUF_Q8_0)?).await?;
@@ -342,25 +460,41 @@ impl LocalExecutor {
             .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
 
         // --- host-side input prep: decode source, preprocess, tokenize ---
-        let rgb = {
-            let dynimg = image::load_from_memory(&input_image.0)
-                .map_err(|e| format!("decode reference image: {e}"))?;
-            dynimg.to_rgb8()
-        };
-        sink.note(&format!(
-            "Loaded reference {}x{}",
-            rgb.width(),
-            rgb.height()
-        ));
-        let inputs = crate::preprocess::prepare_edit_inputs(&rgb, &req.prompt, &tokenizer)?;
+        let rgbs = req
+            .input_images
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let rgb = image::load_from_memory(&b.0)
+                    .map_err(|e| format!("decode input image {}: {e}", i + 1))?
+                    .to_rgb8();
+                sink.note(&format!(
+                    "Loaded Picture {} ({}x{})",
+                    i + 1,
+                    rgb.width(),
+                    rgb.height()
+                ));
+                Ok::<_, String>(rgb)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = crate::preprocess::prepare_multi_edit_inputs(&rgbs, &req.prompt, &tokenizer)?;
+        drop(rgbs);
 
-        let seed = req.seed.unwrap_or_else(random_seed);
+        // A resumed run: the seed it drew and where it stood.
+        let resume = crate::checkpoint::take_steps(sink, QWEN_EDIT_PAUSED_TAG)?;
+        let seed = resume
+            .as_ref()
+            .map(|r| r.seed)
+            .or(req.seed)
+            .unwrap_or_else(random_seed);
+        let resume = resume.map(|r| r.state);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model, width = req.width, height = req.height,
             steps = req.steps, seed, tokens = inputs.token_ids.len(),
-            image_pad_start = inputs.image_pad_start, drop = inputs.drop,
-            vit_grid = ?inputs.vit_grid, vae_dims = ?inputs.vae_dims,
+            images = inputs.images.len(), drop = inputs.drop,
+            vit_grids = ?inputs.images.iter().map(|i| i.vit_grid).collect::<Vec<_>>(),
+            vae_dims = ?inputs.images.iter().map(|i| i.vae_dims).collect::<Vec<_>>(),
             adapters = req.lora.len(), "qwen-image-edit generate start",
         );
         sink.note(&format!(
@@ -390,7 +524,7 @@ impl LocalExecutor {
                 vae_src,
             );
             return self
-                .qwen_image_edit_generate(source, req, &inputs, seed, sink)
+                .qwen_image_edit_generate(source, req, &inputs, seed, resume, sink)
                 .await;
         }
         #[cfg(not(feature = "vault"))]
@@ -401,7 +535,7 @@ impl LocalExecutor {
             UnionSource::new(UnionSource::new(dit_src, enc_src), mmproj_src),
             vae_src,
         );
-        self.qwen_image_edit_generate(source, req, &inputs, seed, sink)
+        self.qwen_image_edit_generate(source, req, &inputs, seed, resume, sink)
             .await
     }
 
@@ -412,8 +546,9 @@ impl LocalExecutor {
         &self,
         source: S,
         req: &ImageRequest,
-        inputs: &crate::preprocess::EditInputs,
+        inputs: &crate::preprocess::MultiEditInputs,
         seed: u64,
+        resume: Option<thinfer_models::common::StepState>,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         let residency = WeightResidency::new(source, image_budget(req.budget));
@@ -433,23 +568,42 @@ impl LocalExecutor {
             .map_err(|e| format!("model load: {e:?}"))?
         };
         let progress = |ev: qpipe::ProgressEvent| sink.stage(map_qwen(ev));
-        let rgb_out = pipeline
-            .generate_edit_rgb(
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let rgb_out = match pipeline
+            .generate_edit_rgb_ctl(
                 &inputs.token_ids,
-                inputs.image_pad_start,
                 inputs.drop,
-                &inputs.vit_pixels,
-                inputs.vit_grid,
-                &inputs.vae_image,
-                inputs.vae_dims,
+                &inputs
+                    .images
+                    .iter()
+                    .map(|i| qpipe::EditImage {
+                        pad_start: i.pad_start,
+                        vit_pixels: &i.vit_pixels,
+                        vit_grid: i.vit_grid,
+                        vae_image: &i.vae_image,
+                        vae_dims: i.vae_dims,
+                    })
+                    .collect::<Vec<_>>(),
                 req.height,
                 req.width,
                 req.steps,
                 seed,
                 Some(&progress),
+                crate::checkpoint::step_control(resume, &stop_here),
             )
             .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+            .map_err(|e| format!("generate: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done(rgb) => rgb,
+            thinfer_models::common::Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop_steps(
+                    sink,
+                    QWEN_EDIT_PAUSED_TAG,
+                    seed,
+                    &st,
+                ));
+            }
+        };
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
         let bytes = png.len();
@@ -500,7 +654,14 @@ impl LocalExecutor {
             .await
             .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
         let token_ids = crate::preprocess::tokenize_t2i(&req.prompt, &tokenizer)?;
-        let seed = req.seed.unwrap_or_else(random_seed);
+        // A resumed run: the seed it drew and where it stood.
+        let resume = crate::checkpoint::take_steps(sink, QWEN_PAUSED_TAG)?;
+        let seed = resume
+            .as_ref()
+            .map(|r| r.seed)
+            .or(req.seed)
+            .unwrap_or_else(random_seed);
+        let resume = resume.map(|r| r.state);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model, width = req.width, height = req.height,
@@ -531,7 +692,7 @@ impl LocalExecutor {
                 .await?;
             let source = UnionSource::new(UnionSource::new(folded, enc_src), vae_src);
             return self
-                .qwen_image_generate(source, req, &token_ids, seed, sink)
+                .qwen_image_generate(source, req, &token_ids, seed, resume, sink)
                 .await;
         }
         #[cfg(not(feature = "vault"))]
@@ -539,7 +700,7 @@ impl LocalExecutor {
             return Err("this build has no adapter (vault) support".into());
         }
         let source = UnionSource::new(UnionSource::new(dit_src, enc_src), vae_src);
-        self.qwen_image_generate(source, req, &token_ids, seed, sink)
+        self.qwen_image_generate(source, req, &token_ids, seed, resume, sink)
             .await
     }
 
@@ -552,6 +713,7 @@ impl LocalExecutor {
         req: &ImageRequest,
         token_ids: &[u32],
         seed: u64,
+        resume: Option<thinfer_models::common::StepState>,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         let residency = WeightResidency::new(source, image_budget(req.budget));
@@ -571,17 +733,30 @@ impl LocalExecutor {
             .map_err(|e| format!("model load: {e:?}"))?
         };
         let progress = |ev: qpipe::ProgressEvent| sink.stage(map_qwen(ev));
-        let rgb_out = pipeline
-            .generate_rgb(
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let rgb_out = match pipeline
+            .generate_rgb_ctl(
                 token_ids,
                 req.height,
                 req.width,
                 req.steps,
                 seed,
                 Some(&progress),
+                crate::checkpoint::step_control(resume, &stop_here),
             )
             .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+            .map_err(|e| format!("generate: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done(rgb) => rgb,
+            thinfer_models::common::Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop_steps(
+                    sink,
+                    QWEN_PAUSED_TAG,
+                    seed,
+                    &st,
+                ));
+            }
+        };
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
         let bytes = png.len();
@@ -632,7 +807,14 @@ impl LocalExecutor {
             .map_err(|e| format!("parse vae safetensors: {e:?}"))?;
 
         let token_ids = crate::preprocess::tokenize_t2i(&req.prompt, &tokenizer)?;
-        let seed = req.seed.unwrap_or_else(random_seed);
+        // A resumed run: the seed it drew and where it stood.
+        let resume = crate::checkpoint::take_steps(sink, KREA_PAUSED_TAG)?;
+        let seed = resume
+            .as_ref()
+            .map(|r| r.seed)
+            .or(req.seed)
+            .unwrap_or_else(random_seed);
+        let resume = resume.map(|r| r.state);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model, width = req.width, height = req.height,
@@ -664,7 +846,7 @@ impl LocalExecutor {
                 .await?;
             let source = UnionSource::new(UnionSource::new(folded, enc_src), vae_src);
             return self
-                .krea_generate(source, req, &token_ids, seed, sink)
+                .krea_generate(source, req, &token_ids, seed, resume, sink)
                 .await;
         }
         #[cfg(not(feature = "vault"))]
@@ -672,7 +854,7 @@ impl LocalExecutor {
             return Err("this build has no adapter (vault) support".into());
         }
         let source = UnionSource::new(UnionSource::new(dit_src, enc_src), vae_src);
-        self.krea_generate(source, req, &token_ids, seed, sink)
+        self.krea_generate(source, req, &token_ids, seed, resume, sink)
             .await
     }
 
@@ -685,6 +867,7 @@ impl LocalExecutor {
         req: &ImageRequest,
         token_ids: &[u32],
         seed: u64,
+        resume: Option<thinfer_models::common::StepState>,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
         let residency = WeightResidency::new(source, image_budget(req.budget));
@@ -701,17 +884,30 @@ impl LocalExecutor {
             .map_err(|e| format!("model load: {e:?}"))?
         };
         let progress = |ev: kreapipe::ProgressEvent| sink.stage(map_krea(ev));
-        let rgb_out = pipeline
-            .generate_rgb(
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let rgb_out = match pipeline
+            .generate_rgb_ctl(
                 token_ids,
                 req.height,
                 req.width,
                 req.steps,
                 seed,
                 Some(&progress),
+                crate::checkpoint::step_control(resume, &stop_here),
             )
             .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+            .map_err(|e| format!("generate: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done(rgb) => rgb,
+            thinfer_models::common::Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop_steps(
+                    sink,
+                    KREA_PAUSED_TAG,
+                    seed,
+                    &st,
+                ));
+            }
+        };
         let png = thinfer_models::z_image::pipeline::encode_png(&rgb_out, req.width, req.height)
             .map_err(|e| format!("encode png: {e}"))?;
         let bytes = png.len();
@@ -862,7 +1058,14 @@ impl LocalExecutor {
         let tokenizer =
             load_tokenizer(&resolve_role(manifest, wanmf::role::TOKENIZER_JSON)?).await?;
 
-        let seed = req.seed.unwrap_or_else(random_seed);
+        // A resumed run: the seed it drew and where it stood.
+        let resume = crate::checkpoint::take_steps(sink, WAN_PAUSED_TAG)?;
+        let seed = resume
+            .as_ref()
+            .map(|r| r.seed)
+            .or(req.seed)
+            .unwrap_or_else(random_seed);
+        let mut resume = resume.map(|r| r.state);
         tracing::info!(
             target: thinfer_core::trace::DIAG,
             model = %req.model,
@@ -883,6 +1086,7 @@ impl LocalExecutor {
 
         let progress = |ev: wanpipe::ProgressEvent| sink.stage(map_wan(ev));
         let cancel = || sink.cancelled();
+        let stop_here = || crate::checkpoint::stop_here(sink);
         let params = WanParams {
             prompt: req.prompts[0].clone(),
             height: req.height,
@@ -931,6 +1135,7 @@ impl LocalExecutor {
                 WanVariant::wan22_t2v_a14b(),
                 &progress,
                 &cancel,
+                crate::checkpoint::step_control(resume.take(), &stop_here),
             )
             .await?
         } else {
@@ -990,10 +1195,22 @@ impl LocalExecutor {
                 wan_variant,
                 &progress,
                 &cancel,
+                crate::checkpoint::step_control(resume.take(), &stop_here),
             )
             .await?
         };
 
+        let video = match video {
+            thinfer_models::common::Generated::Done(video) => video,
+            thinfer_models::common::Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop_steps(
+                    sink,
+                    WAN_PAUSED_TAG,
+                    seed,
+                    &st,
+                ));
+            }
+        };
         match req.format {
             VideoFormat::Mp4 => {
                 sink.note("Encoding MP4 (H.264)");
@@ -1037,7 +1254,8 @@ impl LocalExecutor {
         variant: WanVariant,
         progress: &dyn Fn(wanpipe::ProgressEvent),
         cancel: &dyn Fn() -> bool,
-    ) -> Result<WanVideo, String> {
+        ctl: thinfer_models::common::StepControl<'_>,
+    ) -> Result<thinfer_models::common::Generated<WanVideo>, String> {
         let residency = WeightResidency::new(source, req.budget);
         let model = {
             let _s = tracing::info_span!("model_load").entered();
@@ -1057,7 +1275,7 @@ impl LocalExecutor {
         // and aborts with GenerateError::Cancelled, which the worker maps to a
         // cancelled job state.
         model
-            .generate(params, vae, Some(progress), Some(&cancel))
+            .generate_ctl(params, vae, Some(progress), Some(&cancel), ctl)
             .await
             .map_err(|e| format!("generate: {e:?}"))
     }
@@ -1307,7 +1525,14 @@ impl LocalExecutor {
             .await
             .map_err(|e| format!("open dreamidv source: {e:?}"))?;
 
-        let seed = d.seed.unwrap_or_else(random_seed);
+        // A resumed run: the seed it drew and where it stood.
+        let resume = crate::checkpoint::take_steps(sink, DREAMIDV_PAUSED_TAG)?;
+        let seed = resume
+            .as_ref()
+            .map(|r| r.seed)
+            .or(d.seed)
+            .unwrap_or_else(random_seed);
+        let resume = resume.map(|r| r.state);
         let (guide_scale, steps) = (d.guide_scale, d.steps);
         // A crop runs at up to its native size (never upscaled).
         let target_area = match crop {
@@ -1363,14 +1588,32 @@ impl LocalExecutor {
             cfg_every: d.cfg_every,
         };
         sink.stage(Stage::VaeDecode);
-        let out = pipeline.generate(&inputs, None).await.map_err(|e| {
-            tracing::warn!(
-                target: thinfer_core::trace::DIAG,
-                mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
-                "dreamid-v generate failed",
-            );
-            format!("generate: {e:?}")
-        })?;
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let out = match pipeline
+            .generate_ctl(
+                &inputs,
+                None,
+                crate::checkpoint::step_control(resume, &stop_here),
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    target: thinfer_core::trace::DIAG,
+                    mem = ?thinfer_core::backend::Backend::mem_account(&*self.backend).snapshot(),
+                    "dreamid-v generate failed",
+                );
+                format!("generate: {e:?}")
+            })? {
+            thinfer_models::common::Generated::Done(out) => out,
+            thinfer_models::common::Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop_steps(
+                    sink,
+                    DREAMIDV_PAUSED_TAG,
+                    seed,
+                    &st,
+                ));
+            }
+        };
 
         // --- 7. encode the swapped clip -> MP4 ---
         let video = match crop {
@@ -1709,4 +1952,31 @@ fn map_wan(ev: wanpipe::ProgressEvent) -> Stage {
         wanpipe::ProgressEvent::Step { i, n } => Stage::Step { i, n },
         wanpipe::ProgressEvent::VaeDecode => Stage::VaeDecode,
     }
+}
+
+/// Paused-run layouts (see [`crate::checkpoint::take_steps`]).
+const KREA_PAUSED_TAG: &str = "krea/1";
+const IDEOGRAM_PAUSED_TAG: &str = "ideogram4/1";
+const QWEN_PAUSED_TAG: &str = "qwen-image/1";
+const QWEN_EDIT_PAUSED_TAG: &str = "qwen-image-edit/1";
+const WAN_PAUSED_TAG: &str = "wan/1";
+const DREAMIDV_PAUSED_TAG: &str = "dreamid-v/1";
+
+/// Z-Image's paused-run layout (see [`crate::checkpoint`]); bump on change.
+const ZIMAGE_PAUSED_TAG: &str = "zimage/1";
+
+/// A paused Z-Image run: its seed and where it stood.
+fn read_zimage_paused(buf: &[u8]) -> Result<(u64, zpipe::ZState), String> {
+    let mut r = crate::checkpoint::Reader::open(buf, ZIMAGE_PAUSED_TAG)?;
+    let seed = r.u64()?;
+    let step = r.usize()?;
+    let cap_len = r.usize()?;
+    let state = zpipe::ZState {
+        cap: r.f32s()?,
+        cap_len,
+        step,
+        sample: r.f32s()?,
+    };
+    r.finish()?;
+    Ok((seed, state))
 }

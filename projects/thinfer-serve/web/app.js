@@ -733,9 +733,16 @@ $("prompt").addEventListener("input", growPrompt);
 // selection on every pick, and phone pickers often allow only one), in pick
 // order. The prompt names them by position, so the list shows which is which:
 // FastH3-Omni as <Picture N> (up to 9), Qwen-Image-2.1 as image N (up to 10).
-const maxRefImages = () => (isMultiImageModel($("model").value) ? 10 : 9);
-const refImageName = (i) =>
-  isMultiImageModel($("model").value) ? `image ${i + 1}` : `<Picture ${i + 1}>`;
+// Qwen-Image-Edit Rapid takes up to 3, as Picture N (the one input image
+// alone when none are listed).
+const maxRefImages = () => {
+  const m = $("model").value;
+  return isEditModel(m) ? 3 : isMultiImageModel(m) ? 10 : 9;
+};
+const refImageName = (i) => {
+  const m = $("model").value;
+  return isEditModel(m) ? `Picture ${i + 1}` : isMultiImageModel(m) ? `image ${i + 1}` : `<Picture ${i + 1}>`;
+};
 const refImages = [];
 function renderRefImages() {
   renderChosen(
@@ -783,7 +790,7 @@ function applyModel() {
   // FastH3-Omni / Qwen-Image-2.1 reference images (optional; the prompt names
   // them). A list over the new model's cap keeps its first images.
   const omni = kind === "video" && takesRefs(model);
-  $("ref-images-row").hidden = !omni && !multiImage;
+  $("ref-images-row").hidden = !omni && !multiImage && !edit;
   $("ref-image-size-row").hidden = !omni;
   $("ref-crop-row").hidden = !omni;
   refImages.splice(maxRefImages());
@@ -804,6 +811,7 @@ function applyModel() {
   // Full-precision (bf16 vs default Q8) toggle: only the bf16-source Z-Image
   // variant. GGUF variants are already quantized.
   $("full-precision-row").hidden = !(kind === "image" && isBf16Model(model));
+  $("input-aspect-row").hidden = !multiImage;
   $("detect-stride-row").hidden = !hyperswap;
   $("bitrate-scale-row").hidden = !hyperswap;
   $("trim-start-row").hidden = !faceSwap;
@@ -1311,11 +1319,20 @@ async function buildSpec(jobKey) {
     // Edit models (qwen-image-edit) consume the one input image; multi-image
     // models the ordered reference list. Base64, camelCase per the wire schema.
     if (isEditModel(model)) {
-      const image = await inputImageBase64();
-      if (!image) throw new Error(`${model} requires a reference image; choose one first`);
-      spec.inputImages = [image];
+      // Several listed images edit together (Picture 1, 2, 3); else the one
+      // input image.
+      if (refImages.length) {
+        spec.inputImages = await Promise.all(refImages.map(fileToBase64));
+      } else {
+        const image = await inputImageBase64();
+        if (!image) throw new Error(`${model} requires a reference image; choose one first`);
+        spec.inputImages = [image];
+      }
     } else if (isMultiImageModel(model) && refImages.length) {
       spec.inputImages = await Promise.all(refImages.map(fileToBase64));
+      // The size fields are always set, so the server keeps that size unless
+      // asked to follow the input's aspect.
+      if ($("input-aspect").checked) spec.keepSize = false;
     }
     // bf16 Z-Image variants: opt into full bf16 precision (default off = Q8).
     if (isBf16Model(model) && $("full-precision").checked) spec.fullPrecision = true;
@@ -1522,6 +1539,8 @@ async function buildSpec(jobKey) {
 // --- progress rendering (mirrors the CLI wording) -----------------------------
 function progressText(stage) {
   switch (stage.stage) {
+    case "loading":
+      return "Loading model";
     case "textEncode":
       return "Encoding prompt";
     case "step":
@@ -1642,6 +1661,18 @@ function handleEvent(ev) {
       return undefined;
     case "started":
       setStatus("Started");
+      void refreshPausable();
+      return undefined;
+    case "paused":
+      showPause(false);
+      if (ev.held) {
+        setStatus("Paused. Resume when ready (it continues from its last finished step).");
+        log("Paused and held");
+        showResume(true);
+      } else {
+        setStatus("Paused; back in the queue.");
+        log("Paused; back in the queue");
+      }
       return undefined;
     case "progress":
       setStatus(progressText(ev.stage));
@@ -1766,6 +1797,68 @@ function showCancel(show) {
   btn.disabled = false;
   btn.hidden = !show;
 }
+function showPause(show) {
+  for (const id of ["pause", "pause-now"]) {
+    $(id).disabled = false;
+    $(id).hidden = !show;
+  }
+}
+function showResume(show) {
+  $("resume").disabled = false;
+  $("resume").hidden = !show;
+}
+
+// Offer Pause while the job runs a model that can pause.
+async function refreshPausable() {
+  const id = currentJobId;
+  if (!id) return;
+  try {
+    const resp = await fetch(`jobs/${id}`, { headers: authHeaders() });
+    if (resp.ok && currentJobId === id) showPause((await resp.json()).pausable === true);
+  } catch {
+    /* no Pause offered; Cancel still works */
+  }
+}
+
+// Pause / resume the current job (it declared its key proof at submit).
+async function jobAction(action, body) {
+  const proof = currentJobProof ? { "x-job-key-sha256": currentJobProof } : {};
+  const resp = await fetch(`jobs/${currentJobId}/${action}`, {
+    method: "POST",
+    headers: authHeaders({ ...proof, "content-type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(await errorText(resp));
+}
+for (const [id, mode] of [
+  ["pause", "stepEnd"],
+  ["pause-now", "now"],
+]) {
+  $(id).addEventListener("click", async () => {
+    if (!currentJobId) return;
+    showPause(false);
+    setStatus(mode === "now" ? "Pausing now…" : "Pausing after this step…");
+    try {
+      await jobAction("pause", { mode, hold: true });
+    } catch (e) {
+      log(`Pause request failed: ${e.message ?? e}`);
+      setStatus(`Pause failed: ${e.message ?? e}`);
+      showPause(true);
+    }
+  });
+}
+$("resume").addEventListener("click", async () => {
+  if (!currentJobId) return;
+  showResume(false);
+  setStatus("Resuming…");
+  try {
+    await jobAction("resume", { priority: intOrNull($("priority").value) ?? undefined });
+  } catch (e) {
+    log(`Resume request failed: ${e.message ?? e}`);
+    setStatus(`Resume failed: ${e.message ?? e}`);
+    showResume(true);
+  }
+});
 
 $("cancel").addEventListener("click", async () => {
   if (!currentJobId) return;
@@ -1808,7 +1901,7 @@ async function resumeOrphanJob() {
     } catch {
       state = "unreachable";
     }
-    if (!["queued", "starting", "running"].includes(state)) {
+    if (!["queued", "starting", "running", "paused"].includes(state)) {
       if (currentJobId === id) {
         currentJobId = null;
         showCancel(false);
@@ -1861,6 +1954,7 @@ async function generate() {
         uploads: spec.inputVideoUpload ? [spec.inputVideoUpload] : [],
         priority: intOrNull($("priority").value) ?? 0,
         keyProof: proof,
+        preempt: $("preempt").checked ? "stepEnd" : undefined,
       }),
     });
     if (!resp.ok) throw new Error(await errorText(resp));
@@ -1909,6 +2003,8 @@ async function generate() {
     currentJobId = null;
     currentJobProof = null;
     showCancel(false);
+    showPause(false);
+    showResume(false);
     if (streamGaveUp) resumeOrphanJob();
   }
 }

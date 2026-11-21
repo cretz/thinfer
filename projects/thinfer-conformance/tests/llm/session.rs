@@ -129,7 +129,7 @@ where
     };
     let mut model = load(backend.clone(), source, budget, max_ctx).await;
     let ws = Workspace::new(backend.clone(), model.residency().arbiter().clone());
-    let accel = model.enable_accel(&backend).expect("accel");
+    let accel = model.enable_accel(&backend, None).expect("accel");
     eprintln!(
         "[{name}] accel {accel}, prompt {} + {} tokens",
         first.len(),

@@ -13,7 +13,9 @@ publish.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Objects keep their key order: a reply format's (or tool's) properties
+# are generated in the order the schema lists them.
+serde_json = { version = "1", features = ["preserve_order"] }
 # Per-job encryption (`jobkey`): AES-256-GCM, SHA-256 key proofs.
 aes-gcm = "0.10"
 base64 = "0.22"

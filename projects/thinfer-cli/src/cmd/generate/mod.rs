@@ -82,6 +82,11 @@ pub struct RemoteArgs {
         allow_hyphen_values = true
     )]
     pub priority: i32,
+    /// Run next on the `--remote` server: when every worker is busy, a
+    /// running job that can pause pauses after its current step and resumes
+    /// after this one.
+    #[arg(long, requires = "remote")]
+    pub preempt: bool,
     /// Trust this PEM certificate for an HTTPS `--remote` (a server with
     /// its own `tls_cert`), on top of the system roots.
     #[arg(long, requires = "remote")]
@@ -109,7 +114,12 @@ impl RemoteArgs {
             b = b.root_certificate_pem(&pem);
         }
         let client = b.build().map_err(|e| format!("--remote: {e}"))?;
-        Ok(RemoteExecutor::new(client).with_priority(self.priority))
+        Ok(RemoteExecutor::new(client)
+            .with_priority(self.priority)
+            .with_preempt(
+                self.preempt
+                    .then_some(thinfer_app::checkpoint::PauseMode::StepEnd),
+            ))
     }
 }
 
@@ -279,6 +289,7 @@ impl CliSink {
 impl ProgressSink for CliSink {
     fn stage(&self, stage: Stage) {
         match stage {
+            Stage::Loading => eprintln!("{} Loading model", self.stamp()),
             Stage::TextEncode => eprintln!("{} Encoding prompt", self.stamp()),
             Stage::Step { i, n } => eprintln!("{} Denoising step {i}/{n}", self.stamp()),
             Stage::ChunkStep {

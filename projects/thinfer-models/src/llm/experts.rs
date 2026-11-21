@@ -436,6 +436,63 @@ pub struct Prefetch<'a> {
     _blocks: Vec<std::sync::Arc<HostBlock>>,
 }
 
+impl HostSlots {
+    /// No slots, the same layout, never growing: what a cache holds once
+    /// its tier is taken ([`ExpertCache::take_host`]).
+    fn empty_like(&self) -> Self {
+        // The kind sizes that lay out to these offsets (already aligned).
+        let o = self.kind_off;
+        let kinds = [o[1] - o[0], o[2] - o[1], self.slot_bytes - o[2]];
+        let mut s = Self::new(&self.backend, kinds, 0);
+        s.capped = true;
+        s
+    }
+
+    /// Settle for keeping between jobs: the speculative next block goes, a
+    /// slot whose read never finished is emptied, recency and telemetry
+    /// restart (the next cache's clock starts over).
+    fn park(&mut self) {
+        if let Some(next) = self.next.take() {
+            let _ = next.alloc.join();
+        }
+        for s in 0..self.owner.len() {
+            if self.last_use[s] == IN_FLIGHT
+                && let Some(key) = self.owner[s].take()
+            {
+                self.map.remove(&key);
+            }
+            self.last_use[s] = 0;
+        }
+        self.hits = 0;
+        self.reads = 0;
+        self.read_secs = 0.0;
+        self.read_bytes = 0;
+        self.grow_secs = 0.0;
+        self.prefetched = 0;
+        self.prefetch_secs = 0.0;
+    }
+
+    /// Page-locked bytes held.
+    fn bytes(&self) -> u64 {
+        // A block is allocated as exactly its slots.
+        self.owner.len() as u64 * self.slot_bytes
+    }
+}
+
+/// A model's page-locked host expert cache, taken out of its
+/// [`ExpertCache`] to outlive the model's VRAM ([`ExpertCache::take_host`])
+/// and handed to the next cache of the same weights
+/// ([`ExpertCache::enable_accel`]). Pristine weight bytes only, keyed by
+/// `(layer, expert)`: valid for those weights alone.
+pub struct HostTier(HostSlots);
+
+impl HostTier {
+    /// Page-locked bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.0.bytes()
+    }
+}
+
 impl Drop for HostSlots {
     fn drop(&mut self) {
         // The pending block lands (and is freed) before the backend goes.
@@ -446,6 +503,16 @@ impl Drop for HostSlots {
 }
 
 impl ExpertCache {
+    /// The backend the cache allocates on.
+    pub(crate) fn backend(&self) -> &std::sync::Arc<WgpuBackend> {
+        &self.backend
+    }
+
+    /// The accelerator tier is set up ([`Self::enable_accel`]).
+    pub fn accel_enabled(&self) -> bool {
+        self.accel.is_some()
+    }
+
     /// Slot bytes per kind: the largest expert matrix of that kind over all
     /// layers, rounded to 256 (storage-binding alignment).
     pub fn slot_bytes(layers: &[ExpertTensors]) -> [u64; 3] {
@@ -546,12 +613,15 @@ impl ExpertCache {
 
     /// Switch to accelerator fills: the device address table, its host
     /// mirror, and a host slot cache of up to `host_bytes` page-locked RAM
-    /// (grown on demand).
+    /// (grown on demand). `reuse`: a tier taken from a cache of the same
+    /// weights, adopted when its layout matches and it fits `host_bytes`
+    /// (else freed first).
     pub fn enable_accel(
         &mut self,
         backend: &WgpuBackend,
         experts: u32,
         host_bytes: u64,
+        reuse: Option<HostTier>,
     ) -> Result<(), ExpertError> {
         let acc = backend
             .accelerator()
@@ -579,8 +649,20 @@ impl ExpertCache {
                 *kb = (*kb).max(b);
             }
         }
-        let mut host = HostSlots::new(&self.backend, kind_bytes, 0);
-        host.max_slots = (host_bytes / host.slot_bytes) as usize;
+        let fresh = HostSlots::new(&self.backend, kind_bytes, 0);
+        let max_slots = (host_bytes / fresh.slot_bytes) as usize;
+        let mut host = match reuse {
+            Some(HostTier(h))
+                if h.kind_off == fresh.kind_off
+                    && h.slot_bytes == fresh.slot_bytes
+                    && h.owner.len() <= max_slots =>
+            {
+                h
+            }
+            // A mismatched tier is freed here, before the fresh one grows.
+            _ => fresh,
+        };
+        host.max_slots = max_slots;
         host.prefetch_block();
         self.map.clear();
         self.owner.iter_mut().for_each(|o| *o = None);
@@ -593,6 +675,25 @@ impl ExpertCache {
             host,
         });
         Ok(())
+    }
+
+    /// Take the page-locked host tier out (accelerator mode) to keep it past
+    /// this cache, after queued accelerator work that reads its blocks
+    /// finishes. `None`: no tier, or the sync failed (nothing is kept).
+    pub fn take_host(&mut self) -> Option<HostTier> {
+        let a = self.accel.as_mut()?;
+        let acc = self.backend.accelerator()?;
+        if let Err(e) = acc.join_ahead().and_then(|()| acc.sync()) {
+            tracing::warn!(
+                target: thinfer_core::trace::ADAPTER,
+                "expert host tier: accelerator sync failed: {e}"
+            );
+            return None;
+        }
+        let empty = a.host.empty_like();
+        let mut host = std::mem::replace(&mut a.host, empty);
+        host.park();
+        Some(HostTier(host))
     }
 
     /// The address-table buffer and the byte range of `(layer, kind)`'s
@@ -1012,6 +1113,21 @@ async fn read_tensor<S: WeightSource>(
 
 impl Drop for ExpertCache {
     fn drop(&mut self) {
+        // The accelerator's contract: sync before memory is recycled. Queued
+        // CUDA work still uses this cache's memory (expert kernels on the
+        // slots, side-stream copies into them, async pushes from the
+        // host-mapped table mirror, kernels reading host blocks in place),
+        // and an early exit (cancel, error) can leave some in flight. Wait
+        // for all of it before the slots, table, mirror and blocks go.
+        if self.accel.is_some()
+            && let Some(acc) = self.backend.accelerator()
+            && let Err(e) = acc.join_ahead().and_then(|()| acc.sync())
+        {
+            tracing::warn!(
+                target: thinfer_core::trace::ADAPTER,
+                "expert cache drop: accelerator sync failed: {e}"
+            );
+        }
         for b in self.bufs {
             self.backend.free(b);
         }

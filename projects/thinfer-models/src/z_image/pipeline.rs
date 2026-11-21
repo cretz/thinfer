@@ -204,8 +204,53 @@ pub enum GenerateError<SE: core::fmt::Debug> {
     Wgpu(WgpuError),
     Residency(ResidencyError<SE, WgpuError>),
     Png(String),
-    InvalidDims { height: u32, width: u32 },
-    PromptTooLong { tokens: usize, max: usize },
+    InvalidDims {
+        height: u32,
+        width: u32,
+    },
+    PromptTooLong {
+        tokens: usize,
+        max: usize,
+    },
+    /// A resume state that does not fit these parameters.
+    ResumeMismatch,
+}
+
+/// A run between steps: the caption features and the latents entering
+/// `step` (`step == steps`: denoised, before the decode).
+pub struct ZState {
+    pub cap: Vec<f32>,
+    pub cap_len: usize,
+    pub step: usize,
+    pub sample: Vec<f32>,
+}
+
+/// Stopping and resuming a run between steps (see
+/// [`ZImageModel::generate_ctl`]).
+#[derive(Default)]
+pub struct StepControl<'a> {
+    pub resume: Option<ZState>,
+    /// Polled at each step boundary: stop there.
+    pub stop_here: crate::common::Cancel<'a>,
+}
+
+/// How a [`ZImageModel::generate_ctl`] run ended.
+pub enum Generated {
+    /// The PNG.
+    Done(Vec<u8>),
+    Stopped(ZState),
+}
+
+/// How a denoise ended.
+enum Denoised {
+    Done {
+        sample: Vec<f32>,
+        h_lat: usize,
+        w_lat: usize,
+        cap: Vec<f32>,
+        cap_len: usize,
+    },
+    Stopped(ZState),
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for GenerateError<SE> {
@@ -631,6 +676,25 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         params: &GenerationParams,
         progress: ProgressFn<'_>,
     ) -> Result<Vec<u8>, GenerateError<S::Error>> {
+        match self
+            .generate_ctl(params, progress, StepControl::default())
+            .await?
+        {
+            Generated::Done(png) => Ok(png),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate`] that can stop between steps (`ctl.stop_here`,
+    /// polled after the encode, between steps, and before the decode) and
+    /// resume where a stopped run stood (`ctl.resume`). A resumed run gives
+    /// the same image: every step runs from exactly the state it would have.
+    pub async fn generate_ctl(
+        &self,
+        params: &GenerationParams,
+        progress: ProgressFn<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated, GenerateError<S::Error>> {
         // INFO-gated clocks: see `load` for the wasm rationale.
         let timing = tracing::enabled!(tracing::Level::INFO);
         let t_gen = timing.then(trace::Instant::now);
@@ -638,9 +702,31 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             Arc::clone(&self.backend),
             Arc::clone(self.residency.arbiter()),
         );
-        let (sample, h_lat, w_lat) = self
-            .denoise_with(params, None, &mut workspace, None, None, progress)
-            .await?;
+        let stop_here = ctl.stop_here;
+        let (sample, h_lat, w_lat) = match self
+            .denoise_impl(params, None, &mut workspace, None, None, progress, ctl)
+            .await?
+        {
+            Denoised::Done {
+                sample,
+                h_lat,
+                w_lat,
+                cap,
+                cap_len,
+            } => {
+                // Before the decode: a step boundary.
+                if stop_here.is_some_and(|c| c()) {
+                    return Ok(Generated::Stopped(ZState {
+                        cap,
+                        cap_len,
+                        step: params.steps as usize,
+                        sample,
+                    }));
+                }
+                (sample, h_lat, w_lat)
+            }
+            Denoised::Stopped(state) => return Ok(Generated::Stopped(state)),
+        };
 
         // VAE decode -> RGB CHW fp32 in [-1, 1]. Workspace carries over from
         // denoise so the DiT-phase buffer pool feeds VAE allocations (and
@@ -718,7 +804,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         };
         let gen_ms = t_gen.map_or(0, |t| t.elapsed().as_millis() as u64);
         tracing::info!(elapsed_ms = gen_ms, png_bytes = png.len(), "generate done");
-        Ok(png)
+        Ok(Generated::Done(png))
     }
 
     /// VAE decode a pre-VAE latent to CHW fp32 RGB in `[-1, 1]`. Mirrors
@@ -794,10 +880,43 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         params: &GenerationParams,
         initial_noise: Option<&[f32]>,
         workspace: &mut Workspace<WgpuBackend>,
+        step_dumps: Option<&mut Vec<Vec<f32>>>,
+        step0_taps: Option<&mut Step0LocalizationTaps>,
+        progress: ProgressFn<'_>,
+    ) -> Result<(Vec<f32>, usize, usize), GenerateError<S::Error>> {
+        match self
+            .denoise_impl(
+                params,
+                initial_noise,
+                workspace,
+                step_dumps,
+                step0_taps,
+                progress,
+                StepControl::default(),
+            )
+            .await?
+        {
+            Denoised::Done {
+                sample,
+                h_lat,
+                w_lat,
+                ..
+            } => Ok((sample, h_lat, w_lat)),
+            Denoised::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn denoise_impl(
+        &self,
+        params: &GenerationParams,
+        initial_noise: Option<&[f32]>,
+        workspace: &mut Workspace<WgpuBackend>,
         mut step_dumps: Option<&mut Vec<Vec<f32>>>,
         mut step0_taps: Option<&mut Step0LocalizationTaps>,
         progress: ProgressFn<'_>,
-    ) -> Result<(Vec<f32>, usize, usize), GenerateError<S::Error>> {
+        ctl: StepControl<'_>,
+    ) -> Result<Denoised, GenerateError<S::Error>> {
         if let Some(sink) = step_dumps.as_deref_mut() {
             sink.clear();
         }
@@ -830,72 +949,52 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
 
         let _denoise = trace::scope!("denoise").entered();
 
-        // 1. Tokenize. Chat-template wrap then encode.
-        let token_ids = {
-            let _s = trace::scope!("tokenize").entered();
-            let wrapped = format_qwen3_prompt(&params.prompt);
-            // Chat-template specials are already literal text in `wrapped`; do
-            // not let the tokenizer insert its own (would add a stray BOS/EOS).
-            let ids = self
-                .tokenizer
-                .encode(&wrapped, false)
-                .map_err(GenerateError::Tokenizer)?;
-            tracing::debug!(n_tokens = ids.len(), "tokenize done");
-            if ids.len() > MAX_PROMPT_TOKENS {
-                return Err(GenerateError::PromptTooLong {
-                    tokens: ids.len(),
-                    max: MAX_PROMPT_TOKENS,
-                });
+        // A resumed run has its encode output and latents already.
+        let (cap_hidden, cap_len, first, mut sample) = match ctl.resume {
+            Some(st) => {
+                if st.sample.len() != C_LATENT * h_lat * w_lat
+                    || st.step > params.steps as usize
+                    || st.cap_len == 0
+                    || st.cap.len() % st.cap_len != 0
+                {
+                    return Err(GenerateError::ResumeMismatch);
+                }
+                (st.cap, st.cap_len, st.step, st.sample)
             }
-            ids
-        };
-
-        // 2. Qwen3 encode -> cap features.
-        let qout = {
-            let _s = trace::scope!("text_encode", tokens = token_ids.len()).entered();
-            if let Some(p) = progress {
-                p(ProgressEvent::TextEncode);
+            None => {
+                let (cap_hidden, cap_len) = self
+                    .encode_prompt(params, workspace, progress, timing)
+                    .await?;
+                // 3. Initial noise: [16, 1, h_lat, w_lat] standard normal.
+                let n_lat = C_LATENT * h_lat * w_lat;
+                let sample: Vec<f32> = match initial_noise {
+                    Some(buf) => {
+                        assert_eq!(
+                            buf.len(),
+                            n_lat,
+                            "initial_noise length {} != expected {}",
+                            buf.len(),
+                            n_lat
+                        );
+                        buf.to_vec()
+                    }
+                    None => gaussian_noise(n_lat, params.seed),
+                };
+                (cap_hidden, cap_len, 0, sample)
             }
-            let t = timing.then(trace::Instant::now);
-            let out = self
-                .encoder
-                .forward(
-                    &self.backend,
-                    &self.encoder_block_pipelines,
-                    &self.residency,
-                    &*workspace,
-                    &self.encoder_handles,
-                    self.residency.source(),
-                    &token_ids,
-                )
-                .await?;
-            let text_ms = t.map_or(0, |t| t.elapsed().as_millis() as u64);
-            tracing::info!(elapsed_ms = text_ms, seq = out.seq, "text encode done");
-            out
         };
-        // Phase boundary: text encoder weights are dead for the rest of this
-        // call. Evict to the residency pool so DiT acquires reuse the slots,
-        // and drain the workspace pool so size classes from text_encode
-        // (cap-shaped) don't sit live in VRAM while DiT allocates its own
-        // (image-token-shaped) working set.
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // 3. Initial noise: [16, 1, h_lat, w_lat] standard normal.
-        let n_lat = C_LATENT * h_lat * w_lat;
-        let mut sample: Vec<f32> = match initial_noise {
-            Some(buf) => {
-                assert_eq!(
-                    buf.len(),
-                    n_lat,
-                    "initial_noise length {} != expected {}",
-                    buf.len(),
-                    n_lat
-                );
-                buf.to_vec()
-            }
-            None => gaussian_noise(n_lat, params.seed),
-        };
+        let stop_here = ctl.stop_here;
+        // After the encode: a step boundary.
+        if first == 0 && stop_here.is_some_and(|c| c()) {
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+            return Ok(Denoised::Stopped(ZState {
+                cap: cap_hidden,
+                cap_len,
+                step: 0,
+                sample,
+            }));
+        }
         if tracing::enabled!(target: trace::DIAG, tracing::Level::INFO) {
             let s = &sample;
             let smin = s.iter().copied().fold(f32::INFINITY, f32::min);
@@ -913,7 +1012,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         }
 
         // 4. Assemble DiT for this image shape + scheduler.
-        let shape = DitShape::for_image(C_LATENT, h_lat, w_lat, qout.seq, PATCH_SIZE, F_PATCH_SIZE);
+        let shape = DitShape::for_image(C_LATENT, h_lat, w_lat, cap_len, PATCH_SIZE, F_PATCH_SIZE);
         let dit = ZImageDit::assemble(self.dit_handles.clone(), shape);
         // Fill VRAM to budget: pin a deterministic prefix of the DiT weights
         // for the denoise phase so steps 2..N skip their re-upload (the ring
@@ -952,7 +1051,18 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // (positive prompt only, no CFG concat).
         let _steps_span =
             trace::scope!("diffusion_steps", steps = params.steps, seq_x = shape.seq_x).entered();
-        for i in 0..params.steps as usize {
+        for i in first..params.steps as usize {
+            // Between steps: a step boundary.
+            if i > first && stop_here.is_some_and(|c| c()) {
+                self.residency.evict_all_and_free(&*self.backend);
+                workspace.drain_pool();
+                return Ok(Denoised::Stopped(ZState {
+                    cap: cap_hidden,
+                    cap_len,
+                    step: i,
+                    sample,
+                }));
+            }
             let _step = trace::scope!("step", i = i, t = scheduler.t_norm(i)).entered();
             if let Some(p) = progress {
                 p(ProgressEvent::Step {
@@ -965,8 +1075,8 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
             let inputs = DitInputs {
                 image: &sample,
                 size: (C_LATENT, 1, h_lat, w_lat),
-                cap_feats: &qout.hidden,
-                cap_len: qout.seq,
+                cap_feats: &cap_hidden,
+                cap_len,
                 timestep: scheduler.t_norm(i),
                 patch_size: PATCH_SIZE,
                 f_patch_size: F_PATCH_SIZE,
@@ -1418,14 +1528,14 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                 // slope-per-event lets us check whether 30-block
                 // compounding explains the ~0.938 latent slope.
                 let roundtrip = |label: &str, v: &[f32]| {
-                    if v.is_empty() || (seq_u as usize) == 0 {
+                    if v.is_empty() || seq_u == 0 {
                         return;
                     }
-                    let inner = v.len() / (seq_u as usize);
+                    let inner = v.len() / seq_u;
                     if inner == 0 || !inner.is_multiple_of(32) {
                         return;
                     }
-                    crate::common::seq::diag_quant_roundtrip_loss(label, v, seq_u as usize, inner);
+                    crate::common::seq::diag_quant_roundtrip_loss(label, v, seq_u, inner);
                 };
                 if let Some(v) = &b0.attn_qkv_f16_pre_quant {
                     print("block0.attn_qkv_f16_pre_quant", v);
@@ -1589,7 +1699,7 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
                     .await?
             };
             let mut out = dit.decode_image(&layout, &bytes);
-            debug_assert_eq!(out.image.len(), n_lat);
+            debug_assert_eq!(out.image.len(), sample.len());
             // Upstream Z-Image pipelines negate the transformer output before
             // the Euler step (`pipeline_z_image.py:559`,
             // `Z-Image/src/zimage/pipeline.py:274`: `noise_pred = -noise_pred`).
@@ -1707,7 +1817,75 @@ impl<S: WeightSource, T: Tokenizer> ZImageModel<S, T> {
         // held idle while VAE allocates its own.
         self.residency.evict_all_and_free(&*self.backend);
         workspace.drain_pool();
-        Ok((sample, h_lat, w_lat))
+        Ok(Denoised::Done {
+            sample,
+            h_lat,
+            w_lat,
+            cap: cap_hidden,
+            cap_len,
+        })
+    }
+
+    /// Tokenize and run the text encoder: the caption features and their
+    /// length. Frees the encoder's weights after.
+    async fn encode_prompt(
+        &self,
+        params: &GenerationParams,
+        workspace: &mut Workspace<WgpuBackend>,
+        progress: ProgressFn<'_>,
+        timing: bool,
+    ) -> Result<(Vec<f32>, usize), GenerateError<S::Error>> {
+        // 1. Tokenize. Chat-template wrap then encode.
+        let token_ids = {
+            let _s = trace::scope!("tokenize").entered();
+            let wrapped = format_qwen3_prompt(&params.prompt);
+            // Chat-template specials are already literal text in `wrapped`; do
+            // not let the tokenizer insert its own (would add a stray BOS/EOS).
+            let ids = self
+                .tokenizer
+                .encode(&wrapped, false)
+                .map_err(GenerateError::Tokenizer)?;
+            tracing::debug!(n_tokens = ids.len(), "tokenize done");
+            if ids.len() > MAX_PROMPT_TOKENS {
+                return Err(GenerateError::PromptTooLong {
+                    tokens: ids.len(),
+                    max: MAX_PROMPT_TOKENS,
+                });
+            }
+            ids
+        };
+
+        // 2. Qwen3 encode -> cap features.
+        let qout = {
+            let _s = trace::scope!("text_encode", tokens = token_ids.len()).entered();
+            if let Some(p) = progress {
+                p(ProgressEvent::TextEncode);
+            }
+            let t = timing.then(trace::Instant::now);
+            let out = self
+                .encoder
+                .forward(
+                    &self.backend,
+                    &self.encoder_block_pipelines,
+                    &self.residency,
+                    &*workspace,
+                    &self.encoder_handles,
+                    self.residency.source(),
+                    &token_ids,
+                )
+                .await?;
+            let text_ms = t.map_or(0, |t| t.elapsed().as_millis() as u64);
+            tracing::info!(elapsed_ms = text_ms, seq = out.seq, "text encode done");
+            out
+        };
+        // Phase boundary: text encoder weights are dead for the rest of this
+        // call. Evict to the residency pool so DiT acquires reuse the slots,
+        // and drain the workspace pool so size classes from text_encode
+        // (cap-shaped) don't sit live in VRAM while DiT allocates its own
+        // (image-token-shaped) working set.
+        self.residency.evict_all_and_free(&*self.backend);
+        workspace.drain_pool();
+        Ok((qout.hidden, qout.seq))
     }
 }
 

@@ -100,7 +100,7 @@ where
     assert_eq!(dims.hidden as usize, hidden);
     let ws = Workspace::new(backend.clone(), model.residency().arbiter().clone());
     let t_host = std::time::Instant::now();
-    let accel = model.enable_accel(&backend).expect("accel");
+    let accel = model.enable_accel(&backend, None).expect("accel");
     eprintln!(
         "accel: {accel}, experts {:.1} GB ({:.2}s)",
         model.experts_total_bytes() as f64 / 1e9,

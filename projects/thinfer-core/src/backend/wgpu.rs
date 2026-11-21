@@ -777,6 +777,17 @@ impl WgpuBackend {
         self.accelerator.set(acc).is_ok()
     }
 
+    /// Live buffers outside `except`: `(count, bytes)`. A device kept across
+    /// jobs must be back to zero after each one (no job data outlives its
+    /// job); a model kept loaded leaves only its weights.
+    pub fn live_buffers(&self, except: &[crate::mem::VramCategory]) -> (usize, u64) {
+        let buffers = self.buffers.lock().unwrap();
+        buffers
+            .values()
+            .filter(|e| !except.contains(&e.cat))
+            .fold((0, 0), |(n, b), e| (n + 1, b + e.bytes))
+    }
+
     /// The wgpu device (for an [`ExternalAllocator`] or interop probe).
     pub fn wgpu_device(&self) -> &wgpu::Device {
         &self.device

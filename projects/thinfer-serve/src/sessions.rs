@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use thinfer_app::llm::chat::Tail;
 
 use thinfer_app::model::TextModelId;
 use thinfer_app::wire::{SessionInfo, SessionNodeInfo};
@@ -45,6 +46,8 @@ struct Node {
     parent: Option<String>,
     start: u32,
     end: u32,
+    /// How its state ends (after a reply, or open turns of a prefix).
+    tail: Tail,
     sealed: Arc<Vec<u8>>,
     created: Instant,
     touched: Instant,
@@ -77,6 +80,7 @@ impl Session {
                 end: n.end,
                 bytes: n.sealed.len() as u64,
                 age_secs: n.created.elapsed().as_secs(),
+                open: n.tail != Tail::Reply,
             })
             .collect();
         nodes.sort_by_key(|n| (n.start, std::cmp::Reverse(n.age_secs)));
@@ -146,6 +150,8 @@ impl Session {
 pub struct Chain {
     pub model: TextModelId,
     pub weights: Option<String>,
+    /// How the chain's last node ends (a new root: after nothing, `Reply`).
+    pub tail: Tail,
     /// `(start, end, sealed state)` from the root.
     pub links: Vec<(u32, u32, Arc<Vec<u8>>)>,
 }
@@ -196,6 +202,11 @@ struct ExportNode {
     start: u32,
     end: u32,
     len: u64,
+    /// A prefix node's open turn roles (absent: ends after a reply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    open_roles: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    after_reply: bool,
 }
 
 impl SessionStore {
@@ -310,14 +321,17 @@ impl SessionStore {
                 None => Vec::new(),
             };
             let mut links = Vec::with_capacity(path.len());
+            let mut tail = Tail::Reply;
             for k in &path {
                 let n = s.nodes.get_mut(k).expect("on path");
                 n.touched = now;
                 links.push((n.start, n.end, n.sealed.clone()));
+                tail = n.tail.clone();
             }
             Ok(Chain {
                 model: s.model,
                 weights: s.weights.clone(),
+                tail,
                 links,
             })
         })
@@ -333,6 +347,7 @@ impl SessionStore {
         end: u32,
         sealed: Vec<u8>,
         weights: String,
+        tail: Tail,
     ) -> Result<String, SessionError> {
         let len = sealed.len() as u64;
         if len > self.budget {
@@ -376,6 +391,7 @@ impl SessionStore {
                 parent: parent.map(str::to_string),
                 start,
                 end,
+                tail,
                 sealed: Arc::new(sealed),
                 created: now,
                 touched: now,
@@ -432,6 +448,17 @@ impl SessionStore {
                         start: n.start,
                         end: n.end,
                         len: n.sealed.len() as u64,
+                        open_roles: match &n.tail {
+                            Tail::Reply => None,
+                            Tail::Open { roles, .. } => Some(roles.clone()),
+                        },
+                        after_reply: matches!(
+                            n.tail,
+                            Tail::Open {
+                                after_reply: true,
+                                ..
+                            }
+                        ),
                     })
                     .collect(),
             };
@@ -479,6 +506,14 @@ impl SessionStore {
                 .get(at..at + len)
                 .ok_or_else(|| bad("truncated node"))?;
             at += len;
+            let tail = match &n.open_roles {
+                None => Tail::Reply,
+                Some(roles) if roles.iter().all(|r| r == "system" || r == "user") => Tail::Open {
+                    roles: roles.clone(),
+                    after_reply: n.after_reply,
+                },
+                Some(_) => return Err(bad("prefix node roles")),
+            };
             let now = Instant::now();
             if nodes
                 .insert(
@@ -487,6 +522,7 @@ impl SessionStore {
                         parent: n.parent.clone(),
                         start: n.start,
                         end: n.end,
+                        tail,
                         sealed: Arc::new(sealed.to_vec()),
                         created: now,
                         touched: now,
@@ -572,13 +608,29 @@ mod tests {
         let st = store(1 << 20);
         let id = st.create(TextModelId::DEFAULT, None, OWNER).id;
         let root = st
-            .insert(&id, None, 0, 10, vec![1; 10], "w".into())
+            .insert(&id, None, 0, 10, vec![1; 10], "w".into(), Tail::Reply)
             .unwrap();
         let a = st
-            .insert(&id, Some(&root), 10, 15, vec![2; 5], "w".into())
+            .insert(
+                &id,
+                Some(&root),
+                10,
+                15,
+                vec![2; 5],
+                "w".into(),
+                Tail::Reply,
+            )
             .unwrap();
         let b = st
-            .insert(&id, Some(&root), 10, 12, vec![3; 2], "w".into())
+            .insert(
+                &id,
+                Some(&root),
+                10,
+                12,
+                vec![3; 2],
+                "w".into(),
+                Tail::Reply,
+            )
             .unwrap();
         let ch = st.chain(&id, &OWNER, Some(&b)).unwrap();
         assert_eq!(
@@ -587,11 +639,11 @@ mod tests {
         );
         assert_eq!(ch.weights.as_deref(), Some("w"));
         assert!(
-            st.insert(&id, Some(&a), 14, 20, vec![0], "w".into())
+            st.insert(&id, Some(&a), 14, 20, vec![0], "w".into(), Tail::Reply)
                 .is_err()
         );
         assert!(
-            st.insert(&id, Some(&a), 15, 20, vec![0], "other".into())
+            st.insert(&id, Some(&a), 15, 20, vec![0], "other".into(), Tail::Reply)
                 .is_err()
         );
         let info = st.delete_node(&id, &OWNER, &root).unwrap();
@@ -617,27 +669,52 @@ mod tests {
         let st = store(25);
         let id = st.create(TextModelId::DEFAULT, None, OWNER).id;
         let root = st
-            .insert(&id, None, 0, 10, vec![0; 10], "w".into())
+            .insert(&id, None, 0, 10, vec![0; 10], "w".into(), Tail::Reply)
             .unwrap();
         let old = st
-            .insert(&id, Some(&root), 10, 11, vec![0; 10], "w".into())
+            .insert(
+                &id,
+                Some(&root),
+                10,
+                11,
+                vec![0; 10],
+                "w".into(),
+                Tail::Reply,
+            )
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
         // Over budget: the least recently used leaf (`old`) goes.
         let new = st
-            .insert(&id, Some(&root), 10, 12, vec![0; 10], "w".into())
+            .insert(
+                &id,
+                Some(&root),
+                10,
+                12,
+                vec![0; 10],
+                "w".into(),
+                Tail::Reply,
+            )
             .unwrap();
         assert!(st.chain(&id, &OWNER, Some(&old)).is_err());
         assert!(st.chain(&id, &OWNER, Some(&new)).is_ok());
-        assert!(st.insert(&id, None, 0, 1, vec![0; 26], "w".into()).is_err());
+        assert!(
+            st.insert(&id, None, 0, 1, vec![0; 26], "w".into(), Tail::Reply)
+                .is_err()
+        );
     }
 
     #[test]
     fn export_import_round_trips() {
         let st = store(1 << 20);
         let id = st.create(TextModelId::DEFAULT, Some(99), OWNER).id;
-        let root = st.insert(&id, None, 0, 3, vec![5; 3], "w".into()).unwrap();
-        st.insert(&id, Some(&root), 3, 4, vec![6; 1], "w".into())
+        let open = Tail::Open {
+            roles: vec!["system".into()],
+            after_reply: false,
+        };
+        let root = st
+            .insert(&id, None, 0, 3, vec![5; 3], "w".into(), open.clone())
+            .unwrap();
+        st.insert(&id, Some(&root), 3, 4, vec![6; 1], "w".into(), Tail::Reply)
             .unwrap();
         let blob = st.export(&id, &OWNER).unwrap();
         let back = st.import(&blob).unwrap();
@@ -646,6 +723,9 @@ mod tests {
         assert_eq!(back.nodes.len(), 2);
         let ch = st.chain(&back.id, &OWNER, Some(&root)).unwrap();
         assert_eq!(*ch.links[0].2, vec![5; 3]);
+        // The prefix root stays a prefix; its reply child ends after a reply.
+        assert_eq!(ch.tail, open);
+        assert_eq!(back.nodes.iter().filter(|n| n.open).count(), 1);
         let mut cut = blob.clone();
         cut.pop();
         assert!(st.import(&cut).is_err());
@@ -655,7 +735,8 @@ mod tests {
     fn reap_forgets_idle_sessions() {
         let st = SessionStore::new(1 << 20, Duration::from_secs(600));
         let id = st.create(TextModelId::DEFAULT, Some(1), OWNER).id;
-        st.insert(&id, None, 0, 1, vec![0; 4], "w".into()).unwrap();
+        st.insert(&id, None, 0, 1, vec![0; 4], "w".into(), Tail::Reply)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(st.reap(), 1);
         assert_eq!(st.inner.lock().unwrap().used, 0);

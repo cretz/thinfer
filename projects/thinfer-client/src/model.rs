@@ -209,6 +209,20 @@ impl ImageModelId {
     }
 }
 
+impl ImageModelId {
+    /// Every image model, in listing order.
+    pub const ALL: [ImageModelId; 8] = [
+        ImageModelId::ZImageTurboQ8,
+        ImageModelId::ZImageTurboQ4,
+        ImageModelId::ZImageTurboBf16,
+        ImageModelId::Ideogram4Q8,
+        ImageModelId::QwenImageEditRapid,
+        ImageModelId::QwenImageRapid,
+        ImageModelId::Krea2Turbo,
+        ImageModelId::QwenImage21Turbo,
+    ];
+}
+
 impl std::fmt::Display for ImageModelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -392,6 +406,31 @@ pub enum VideoModelId {
 
 impl VideoModelId {
     pub const DEFAULT: VideoModelId = VideoModelId::FastwanTi2v5b;
+
+    /// Every video model, in listing order.
+    pub const ALL: [VideoModelId; 21] = [
+        VideoModelId::FastwanTi2v5b,
+        VideoModelId::AnyflowT2v14b,
+        VideoModelId::Mobilewan,
+        VideoModelId::Fastwan21T2v13b,
+        VideoModelId::Wan21T2v13b,
+        VideoModelId::Ltx23Distilled,
+        VideoModelId::Ltx23DistilledQ4,
+        VideoModelId::Ltx23Dev,
+        VideoModelId::Ltx23DevQ4,
+        VideoModelId::Ltx2Rapid,
+        VideoModelId::Wan22T2vA14b,
+        VideoModelId::Hunyuan15T2v,
+        VideoModelId::Hunyuan15I2v,
+        VideoModelId::MinimaxH3,
+        VideoModelId::MinimaxH3Turbo,
+        VideoModelId::MinimaxH3TurboRef,
+        VideoModelId::Fasth3Trim,
+        VideoModelId::Fasth3V2,
+        VideoModelId::Fasth3Omni,
+        VideoModelId::HyperflowFlash,
+        VideoModelId::HyperflowFlashRef,
+    ];
 
     /// The attention precision a request gets without `--attn`: INT8 QK^T +
     /// FP8 P.V on the MiniMax-H3 family (no visible quality change, faster;
@@ -1310,6 +1349,15 @@ pub enum SwapModel {
 
 impl SwapModel {
     pub const DEFAULT: SwapModel = SwapModel::Hyperswap1a;
+
+    /// Every face-swap model, in listing order.
+    pub const ALL: [SwapModel; 5] = [
+        SwapModel::Hyperswap1a,
+        SwapModel::Hyperswap1b,
+        SwapModel::Hyperswap1c,
+        SwapModel::AlphaFace,
+        SwapModel::DreamIdV,
+    ];
 
     /// One-line name for listings (`thinfer models`).
     pub fn title(self) -> &'static str {

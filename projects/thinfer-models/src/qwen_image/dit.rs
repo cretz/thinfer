@@ -12,8 +12,10 @@
 //!
 //! Runs bf16 acts (see [`block_cfgs`]): the residual stream has large-outlier
 //! channels beyond f16's +-65504, so block-wide f16 is not viable here. Block
-//! matmuls are Q8_0 dequant-once routed per-site ([`Site`]);
-//! img_in/txt_in/time_embed/norm_out/proj_out are F16->bf16 (adaln site).
+//! matmuls are dequant-once, each weight decoded by ITS on-disk quant kind (a
+//! `_K_M` file mixes Q4_K/Q5_K/Q6_K/Q8_0 per tensor; see
+//! [`QwenImageDitPipelines::dense_dequant`]); img_in/txt_in/time_embed/
+//! norm_out/proj_out are dense bf16 (adaln site).
 
 use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError, WgpuPipeline};
 use thinfer_core::ops::{
@@ -28,7 +30,7 @@ use thinfer_core::workspace::{BatchBuf, BatchScope, Workspace};
 use tracing::Instrument;
 
 use crate::common::block::{
-    ActBuf, Block, BlockPipelines, BlockWgslConfigs, DenseActSites, alloc_act,
+    ActBuf, Block, BlockPipelines, BlockWgslConfigs, DenseActSites, DequantStep, alloc_act,
     alloc_matmul_out_buf, op_rmsnorm, op_rope, op_sdpa,
 };
 use crate::common::embedders::{LinearBiasBufs, LinearBiasViews};
@@ -60,6 +62,11 @@ pub struct QwenImageDitPipelines {
     pub block: BlockPipelines,
     pub gelu: WgpuPipeline,
     pub fast_sdpa: Option<FastSdpa>,
+    /// Dense (dequant-once) step per quant kind. `BlockPipelines` bakes ONE
+    /// scheme per site, which a mixed `_K_M` DiT (Q4_K + Q6_K within a block,
+    /// Q5_K in some layers) would decode as garbage, so every block matmul
+    /// picks the step of its own weight's kind.
+    pub dense_dequant: std::collections::HashMap<QuantKind, DequantStep>,
 }
 
 impl QwenImageDitPipelines {
@@ -130,10 +137,39 @@ impl QwenImageDitPipelines {
         } else {
             None
         };
+        let target = if cfgs.ops.act_dtype == ActDtype::F16 {
+            thinfer_core::ops::dequant::DequantTarget::F16
+        } else {
+            thinfer_core::ops::dequant::DequantTarget::Bf16
+        };
+        let mut dense_dequant = std::collections::HashMap::new();
+        for scheme in [
+            QuantKind::Q8_0,
+            QuantKind::Q4_K,
+            QuantKind::Q5_K,
+            QuantKind::Q6_K,
+        ] {
+            let pipeline = backend
+                .create_pipeline(
+                    &format!("qwen_image_dequant_{}", scheme.hint()),
+                    &thinfer_core::ops::dequant::build_wgsl(scheme, target),
+                    "main",
+                    thinfer_core::ops::dequant::layout(),
+                )
+                .await?;
+            dense_dequant.insert(
+                scheme,
+                DequantStep {
+                    pipeline,
+                    scheme: thinfer_core::ops::DequantScheme::Block(scheme),
+                },
+            );
+        }
         Ok(Self {
             block,
             gelu,
             fast_sdpa,
+            dense_dequant,
         })
     }
 }
@@ -233,6 +269,148 @@ fn op_gate_residual<'wsp>(
     scope.bcast_fma::<BcastFmaF32>(&bp.bcast_fma, x.data, gate, y.data, u, dst.data, rows * dim)
 }
 
+/// One stream's `[shift, scale, gate]` for a sublayer (each `[dim]`).
+#[derive(Clone, Copy)]
+struct ModSig<'wsp> {
+    shift: BatchBuf<'wsp>,
+    scale: BatchBuf<'wsp>,
+    gate: BatchBuf<'wsp>,
+}
+
+/// The image stream's modulation: `main` for every row, except that with
+/// `zero_cond_t` (Edit-2511) the reference rows `[split, rows)` take `refs`,
+/// the signals of the timestep-0 embedding (diffusers `modulate_index`).
+#[derive(Clone, Copy)]
+struct ImgSig<'wsp> {
+    main: ModSig<'wsp>,
+    refs: Option<ModSig<'wsp>>,
+    split: u32,
+}
+
+impl<'wsp> ImgSig<'wsp> {
+    /// `(row_start, rows, signals)` spans covering `[0, rows)`.
+    fn spans(&self, rows: u32) -> Vec<(u32, u32, ModSig<'wsp>)> {
+        match self.refs {
+            Some(r) if self.split < rows => vec![
+                (0, self.split, self.main),
+                (self.split, rows - self.split, r),
+            ],
+            _ => vec![(0, rows, self.main)],
+        }
+    }
+}
+
+/// Row-range view of a `[rows, dim]` act buffer (row offsets of a bf16/f32
+/// `dim=3072` row are 256B-aligned, as storage binding requires).
+fn act_rows<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    buf: ActBuf<'wsp>,
+    row0: u32,
+    rows: u32,
+    dim: u32,
+) -> ActBuf<'wsp> {
+    let row_b = bp.act_bytes(dim);
+    ActBuf::dense(scope.subview(&buf.data, row0 as u64 * row_b, rows as u64 * row_b))
+}
+
+/// [`op_modulate`] over the image stream, per [`ImgSig`] span.
+fn op_modulate_img<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    x: ActBuf<'wsp>,
+    sig: ImgSig<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    dim: u32,
+) -> Result<(), WgpuError> {
+    for (r0, n, s) in sig.spans(rows) {
+        let xs = act_rows(scope, bp, x, r0, n, dim);
+        let ds = act_rows(scope, bp, dst, r0, n, dim);
+        op_modulate(scope, bp, xs, s.scale, s.shift, ds, n, dim)?;
+    }
+    Ok(())
+}
+
+/// [`op_gate_residual`] over the image stream, per [`ImgSig`] span.
+#[allow(clippy::too_many_arguments)]
+fn op_gate_residual_img<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    x: ActBuf<'wsp>,
+    sig: ImgSig<'wsp>,
+    y: ActBuf<'wsp>,
+    dst: ActBuf<'wsp>,
+    rows: u32,
+    dim: u32,
+) -> Result<(), WgpuError> {
+    for (r0, n, s) in sig.spans(rows) {
+        let xs = act_rows(scope, bp, x, r0, n, dim);
+        let ys = act_rows(scope, bp, y, r0, n, dim);
+        let ds = act_rows(scope, bp, dst, r0, n, dim);
+        op_gate_residual(scope, bp, xs, s.gate, ys, ds, n, dim)?;
+    }
+    Ok(())
+}
+
+/// The `[shift, scale, gate]` of sublayer `half` (0 = attention, 1 = MLP) of
+/// a `[1, 6*dim]` modulation-params buffer.
+fn mod_sig<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    params: BatchBuf<'wsp>,
+    half: u32,
+    dim: u32,
+) -> Result<ModSig<'wsp>, WgpuError> {
+    let k = 3 * half;
+    Ok(ModSig {
+        shift: mod_signal(scope, bp, params, k, dim)?,
+        scale: mod_signal(scope, bp, params, k + 1, dim)?,
+        gate: mod_signal(scope, bp, params, k + 2, dim)?,
+    })
+}
+
+/// Both streams' signals for sublayer `half`: `Linear(SiLU(temb))` per
+/// stream; with `silu_ref` (zero_cond_t), the image stream's reference rows
+/// get `img_mod(SiLU(temb(t=0)))` instead.
+#[allow(clippy::too_many_arguments)]
+fn block_sigs<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    bufs: &'wsp BlockBufs<'_>,
+    silu_temb: BatchBuf<'wsp>,
+    silu_ref: Option<BatchBuf<'wsp>>,
+    split: u32,
+    half: u32,
+) -> Result<(ImgSig<'wsp>, ModSig<'wsp>), WgpuError> {
+    let dim = config::DIM as u32;
+    let silu = ActBuf::dense(silu_temb);
+    let img_modp = qbiased(scope, bp, silu, &bufs.img_mod, 1, 6 * dim, dim, Site::Proj)?;
+    let txt_modp = qbiased(scope, bp, silu, &bufs.txt_mod, 1, 6 * dim, dim, Site::Proj)?;
+    let refs = match silu_ref {
+        Some(s) => {
+            let p = qbiased(
+                scope,
+                bp,
+                ActBuf::dense(s),
+                &bufs.img_mod,
+                1,
+                6 * dim,
+                dim,
+                Site::Proj,
+            )?;
+            Some(mod_sig(scope, bp, p.data, half, dim)?)
+        }
+        None => None,
+    };
+    let img = ImgSig {
+        main: mod_sig(scope, bp, img_modp.data, half, dim)?,
+        refs,
+        split,
+    };
+    Ok((img, mod_sig(scope, bp, txt_modp.data, half, dim)?))
+}
+
 /// `out = x + bias[i % dim]`, bias `[dim]` resident weight broadcast over rows.
 fn op_bias_add<'wsp>(
     scope: &BatchScope<'wsp, WgpuBackend>,
@@ -277,6 +455,7 @@ fn matmul_site<'wsp>(
     n: u32,
     k: u32,
     site: Site,
+    dq_kind: Option<&DequantStep>,
 ) -> Result<BatchBuf<'wsp>, WgpuError> {
     let out = alloc_matmul_out_buf(scope, bp, rows * n)?;
     let dims = scope.u32x4_uniform(rows, n, k, 0)?;
@@ -312,6 +491,8 @@ fn matmul_site<'wsp>(
         ),
         Site::Adaln => (None, None, None, &bp.matmul_adaln, &bp.matmuls.adaln),
     };
+    // The weight's own kind overrides the site's baked scheme (mixed `_K_M`).
+    let dq = dq_kind.or(dq);
     Block::dispatch_matmul_site(
         scope, bp, x, w, out, dims, i8, dq_i8, dq, pipe, op, rows, n, k,
     )?;
@@ -331,12 +512,52 @@ fn biased<'wsp>(
     k: u32,
     site: Site,
 ) -> Result<ActBuf<'wsp>, WgpuError> {
+    biased_dq(scope, bp, x, w, rows, n, k, site, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn biased_dq<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    x: ActBuf<'wsp>,
+    w: &LinearBiasBufs,
+    rows: u32,
+    n: u32,
+    k: u32,
+    site: Site,
+    dq_kind: Option<&DequantStep>,
+) -> Result<ActBuf<'wsp>, WgpuError> {
     let wv = scope.import_copy(w.weight);
-    let pre = matmul_site(scope, bp, x, wv, rows, n, k, site)?;
+    let pre = matmul_site(scope, bp, x, wv, rows, n, k, site, dq_kind)?;
     let bv = scope.import_copy(w.bias);
     let out = alloc_act(scope, bp, rows, n)?;
     op_bias_add(scope, bp, ActBuf::dense(pre), bv, out, rows, n)?;
     Ok(out)
+}
+
+/// A block linear's buffers + the dense dequant step of its weight's on-disk
+/// kind (`None` = a float weight: it runs the bf16 dense site instead).
+struct QLinBufs<'p> {
+    lin: LinearBiasBufs,
+    dq: Option<&'p DequantStep>,
+}
+
+/// [`biased`] for a block linear, decoded by its own quant kind.
+#[allow(clippy::too_many_arguments)]
+fn qbiased<'wsp>(
+    scope: &BatchScope<'wsp, WgpuBackend>,
+    bp: &BlockPipelines,
+    x: ActBuf<'wsp>,
+    w: &QLinBufs<'_>,
+    rows: u32,
+    n: u32,
+    k: u32,
+    site: Site,
+) -> Result<ActBuf<'wsp>, WgpuError> {
+    match w.dq {
+        Some(dq) => biased_dq(scope, bp, x, &w.lin, rows, n, k, site, Some(dq)),
+        None => biased(scope, bp, x, &w.lin, rows, n, k, Site::Adaln),
+    }
 }
 
 // --- timestep sinusoid (CPU, diffusers `Timesteps`) ---------------------------
@@ -360,7 +581,48 @@ fn timestep_sinusoid(t: f32) -> Vec<f32> {
 
 // --- per-block weight views ---------------------------------------------------
 
+/// Each block linear's on-disk quant kind (see `loader::QLinearHandles`).
+#[derive(Clone, Copy)]
+struct BlockKinds {
+    img_mod: Option<QuantKind>,
+    txt_mod: Option<QuantKind>,
+    to_q: Option<QuantKind>,
+    to_k: Option<QuantKind>,
+    to_v: Option<QuantKind>,
+    to_out: Option<QuantKind>,
+    add_q: Option<QuantKind>,
+    add_k: Option<QuantKind>,
+    add_v: Option<QuantKind>,
+    to_add_out: Option<QuantKind>,
+    img_mlp_0: Option<QuantKind>,
+    img_mlp_2: Option<QuantKind>,
+    txt_mlp_0: Option<QuantKind>,
+    txt_mlp_2: Option<QuantKind>,
+}
+
+impl BlockKinds {
+    fn of(h: &DitBlockHandles) -> Self {
+        Self {
+            img_mod: h.img_mod.kind,
+            txt_mod: h.txt_mod.kind,
+            to_q: h.to_q.kind,
+            to_k: h.to_k.kind,
+            to_v: h.to_v.kind,
+            to_out: h.to_out.kind,
+            add_q: h.add_q.kind,
+            add_k: h.add_k.kind,
+            add_v: h.add_v.kind,
+            to_add_out: h.to_add_out.kind,
+            img_mlp_0: h.img_mlp_0.kind,
+            img_mlp_2: h.img_mlp_2.kind,
+            txt_mlp_0: h.txt_mlp_0.kind,
+            txt_mlp_2: h.txt_mlp_2.kind,
+        }
+    }
+}
+
 struct BlockViews<'a> {
+    kinds: BlockKinds,
     img_mod: LinearBiasViews<'a>,
     txt_mod: LinearBiasViews<'a>,
     to_q: LinearBiasViews<'a>,
@@ -381,25 +643,25 @@ struct BlockViews<'a> {
     txt_mlp_2: LinearBiasViews<'a>,
 }
 
-struct BlockBufs {
-    img_mod: LinearBiasBufs,
-    txt_mod: LinearBiasBufs,
-    to_q: LinearBiasBufs,
-    to_k: LinearBiasBufs,
-    to_v: LinearBiasBufs,
-    to_out: LinearBiasBufs,
-    add_q: LinearBiasBufs,
-    add_k: LinearBiasBufs,
-    add_v: LinearBiasBufs,
-    to_add_out: LinearBiasBufs,
+struct BlockBufs<'p> {
+    img_mod: QLinBufs<'p>,
+    txt_mod: QLinBufs<'p>,
+    to_q: QLinBufs<'p>,
+    to_k: QLinBufs<'p>,
+    to_v: QLinBufs<'p>,
+    to_out: QLinBufs<'p>,
+    add_q: QLinBufs<'p>,
+    add_k: QLinBufs<'p>,
+    add_v: QLinBufs<'p>,
+    to_add_out: QLinBufs<'p>,
     norm_q: BufRef,
     norm_k: BufRef,
     norm_added_q: BufRef,
     norm_added_k: BufRef,
-    img_mlp_0: LinearBiasBufs,
-    img_mlp_2: LinearBiasBufs,
-    txt_mlp_0: LinearBiasBufs,
-    txt_mlp_2: LinearBiasBufs,
+    img_mlp_0: QLinBufs<'p>,
+    img_mlp_2: QLinBufs<'p>,
+    txt_mlp_0: QLinBufs<'p>,
+    txt_mlp_2: QLinBufs<'p>,
 }
 
 impl<'a> BlockViews<'a> {
@@ -409,47 +671,52 @@ impl<'a> BlockViews<'a> {
         backend: &WgpuBackend,
     ) -> Result<BlockViews<'a>, ResidencyError<S::Error, WgpuError>> {
         Ok(BlockViews {
-            img_mod: h.img_mod.acquire(residency, backend).await?,
-            txt_mod: h.txt_mod.acquire(residency, backend).await?,
-            to_q: h.to_q.acquire(residency, backend).await?,
-            to_k: h.to_k.acquire(residency, backend).await?,
-            to_v: h.to_v.acquire(residency, backend).await?,
-            to_out: h.to_out.acquire(residency, backend).await?,
-            add_q: h.add_q.acquire(residency, backend).await?,
-            add_k: h.add_k.acquire(residency, backend).await?,
-            add_v: h.add_v.acquire(residency, backend).await?,
-            to_add_out: h.to_add_out.acquire(residency, backend).await?,
+            kinds: BlockKinds::of(h),
+            img_mod: h.img_mod.lin.acquire(residency, backend).await?,
+            txt_mod: h.txt_mod.lin.acquire(residency, backend).await?,
+            to_q: h.to_q.lin.acquire(residency, backend).await?,
+            to_k: h.to_k.lin.acquire(residency, backend).await?,
+            to_v: h.to_v.lin.acquire(residency, backend).await?,
+            to_out: h.to_out.lin.acquire(residency, backend).await?,
+            add_q: h.add_q.lin.acquire(residency, backend).await?,
+            add_k: h.add_k.lin.acquire(residency, backend).await?,
+            add_v: h.add_v.lin.acquire(residency, backend).await?,
+            to_add_out: h.to_add_out.lin.acquire(residency, backend).await?,
             norm_q: residency.acquire(h.norm_q, backend).await?,
             norm_k: residency.acquire(h.norm_k, backend).await?,
             norm_added_q: residency.acquire(h.norm_added_q, backend).await?,
             norm_added_k: residency.acquire(h.norm_added_k, backend).await?,
-            img_mlp_0: h.img_mlp_0.acquire(residency, backend).await?,
-            img_mlp_2: h.img_mlp_2.acquire(residency, backend).await?,
-            txt_mlp_0: h.txt_mlp_0.acquire(residency, backend).await?,
-            txt_mlp_2: h.txt_mlp_2.acquire(residency, backend).await?,
+            img_mlp_0: h.img_mlp_0.lin.acquire(residency, backend).await?,
+            img_mlp_2: h.img_mlp_2.lin.acquire(residency, backend).await?,
+            txt_mlp_0: h.txt_mlp_0.lin.acquire(residency, backend).await?,
+            txt_mlp_2: h.txt_mlp_2.lin.acquire(residency, backend).await?,
         })
     }
 
-    fn bufs(&self) -> BlockBufs {
+    fn bufs<'p>(&self, pipelines: &'p QwenImageDitPipelines) -> BlockBufs<'p> {
+        let q = |lin: &LinearBiasViews<'_>, kind: Option<QuantKind>| QLinBufs {
+            lin: lin.bufs(),
+            dq: kind.and_then(|k| pipelines.dense_dequant.get(&k)),
+        };
         BlockBufs {
-            img_mod: self.img_mod.bufs(),
-            txt_mod: self.txt_mod.bufs(),
-            to_q: self.to_q.bufs(),
-            to_k: self.to_k.bufs(),
-            to_v: self.to_v.bufs(),
-            to_out: self.to_out.bufs(),
-            add_q: self.add_q.bufs(),
-            add_k: self.add_k.bufs(),
-            add_v: self.add_v.bufs(),
-            to_add_out: self.to_add_out.bufs(),
+            img_mod: q(&self.img_mod, self.kinds.img_mod),
+            txt_mod: q(&self.txt_mod, self.kinds.txt_mod),
+            to_q: q(&self.to_q, self.kinds.to_q),
+            to_k: q(&self.to_k, self.kinds.to_k),
+            to_v: q(&self.to_v, self.kinds.to_v),
+            to_out: q(&self.to_out, self.kinds.to_out),
+            add_q: q(&self.add_q, self.kinds.add_q),
+            add_k: q(&self.add_k, self.kinds.add_k),
+            add_v: q(&self.add_v, self.kinds.add_v),
+            to_add_out: q(&self.to_add_out, self.kinds.to_add_out),
             norm_q: self.norm_q.buf(),
             norm_k: self.norm_k.buf(),
             norm_added_q: self.norm_added_q.buf(),
             norm_added_k: self.norm_added_k.buf(),
-            img_mlp_0: self.img_mlp_0.bufs(),
-            img_mlp_2: self.img_mlp_2.bufs(),
-            txt_mlp_0: self.txt_mlp_0.bufs(),
-            txt_mlp_2: self.txt_mlp_2.bufs(),
+            img_mlp_0: q(&self.img_mlp_0, self.kinds.img_mlp_0),
+            img_mlp_2: q(&self.img_mlp_2, self.kinds.img_mlp_2),
+            txt_mlp_0: q(&self.txt_mlp_0, self.kinds.txt_mlp_0),
+            txt_mlp_2: q(&self.txt_mlp_2, self.kinds.txt_mlp_2),
         }
     }
 }
@@ -487,6 +754,8 @@ fn block_attn<'wsp>(
     hs_in: BatchBuf<'wsp>,
     eh_in: BatchBuf<'wsp>,
     silu_temb: BatchBuf<'wsp>,
+    silu_ref: Option<BatchBuf<'wsp>>,
+    split: u32,
     vid_freqs: BatchBuf<'wsp>,
     txt_freqs: BatchBuf<'wsp>,
     mask: BatchBuf<'wsp>,
@@ -494,7 +763,7 @@ fn block_attn<'wsp>(
     txt_seq: u32,
     hs1_out: BatchBuf<'wsp>,
     eh1_out: BatchBuf<'wsp>,
-    bufs: &'wsp BlockBufs,
+    bufs: &'wsp BlockBufs<'_>,
 ) -> Result<(), WgpuError> {
     let bp = &pipelines.block;
     let dim = config::DIM as u32;
@@ -503,33 +772,17 @@ fn block_attn<'wsp>(
     let eps = config::NORM_EPS;
     let joint = txt_seq + img_seq;
     let scale = 1.0 / (hd as f32).sqrt();
-    let silu = ActBuf::dense(silu_temb);
     let hs_in = ActBuf::dense(hs_in);
     let eh_in = ActBuf::dense(eh_in);
 
     // --- modulation params: Linear(SiLU(temb)) -> [1, 6*dim] per stream ---
-    let img_modp = biased(scope, bp, silu, &bufs.img_mod, 1, 6 * dim, dim, Site::Proj)?;
-    let txt_modp = biased(scope, bp, silu, &bufs.txt_mod, 1, 6 * dim, dim, Site::Proj)?;
-    // signals: 0 shift_msa, 1 scale_msa, 2 gate_msa, 3 shift_mlp, 4 scale_mlp, 5 gate_mlp
-    let i_sig = |k| mod_signal(scope, bp, img_modp.data, k, dim);
-    let t_sig = |k| mod_signal(scope, bp, txt_modp.data, k, dim);
-    let (i_shift_msa, i_scale_msa, i_gate_msa) = (i_sig(0)?, i_sig(1)?, i_sig(2)?);
-    let (t_shift_msa, t_scale_msa, t_gate_msa) = (t_sig(0)?, t_sig(1)?, t_sig(2)?);
+    let (i_msa, t_msa) = block_sigs(scope, bp, bufs, silu_temb, silu_ref, split, 0)?;
 
     // --- norm1 + modulate both streams ---
     let img_n1 = alloc_act(scope, bp, img_seq, dim)?;
     op_layernorm(scope, bp, hs_in, img_n1, img_seq, dim, eps)?;
     let img_mod1 = alloc_act(scope, bp, img_seq, dim)?;
-    op_modulate(
-        scope,
-        bp,
-        img_n1,
-        i_scale_msa,
-        i_shift_msa,
-        img_mod1,
-        img_seq,
-        dim,
-    )?;
+    op_modulate_img(scope, bp, img_n1, i_msa, img_mod1, img_seq, dim)?;
     let txt_n1 = alloc_act(scope, bp, txt_seq, dim)?;
     op_layernorm(scope, bp, eh_in, txt_n1, txt_seq, dim, eps)?;
     let txt_mod1 = alloc_act(scope, bp, txt_seq, dim)?;
@@ -537,8 +790,8 @@ fn block_attn<'wsp>(
         scope,
         bp,
         txt_n1,
-        t_scale_msa,
-        t_shift_msa,
+        t_msa.scale,
+        t_msa.shift,
         txt_mod1,
         txt_seq,
         dim,
@@ -547,13 +800,13 @@ fn block_attn<'wsp>(
     // --- joint attention ---
     // per-head QK-RMSNorm then interleaved RoPE; concat [txt ++ img] -> SDPA.
     let proj_qkn = |x: ActBuf<'wsp>,
-                    w: &LinearBiasBufs,
+                    w: &QLinBufs<'_>,
                     rows: u32,
                     norm_w: BufRef,
                     freqs: BatchBuf<'wsp>,
                     is_q: bool|
      -> Result<ActBuf<'wsp>, WgpuError> {
-        let p = biased(scope, bp, x, w, rows, dim, dim, Site::Qkv)?;
+        let p = qbiased(scope, bp, x, w, rows, dim, dim, Site::Qkv)?;
         let normed = alloc_act(scope, bp, rows * heads, hd)?;
         let nw = scope.import_copy(norm_w);
         op_rmsnorm(scope, bp, p, nw, normed, rows * heads, hd, eps)?;
@@ -565,7 +818,7 @@ fn block_attn<'wsp>(
     // image q/k (qk-norm + rope), v (raw)
     let img_q = proj_qkn(img_mod1, &bufs.to_q, img_seq, bufs.norm_q, vid_freqs, true)?;
     let img_k = proj_qkn(img_mod1, &bufs.to_k, img_seq, bufs.norm_k, vid_freqs, false)?;
-    let img_v = biased(
+    let img_v = qbiased(
         scope,
         bp,
         img_mod1,
@@ -591,7 +844,7 @@ fn block_attn<'wsp>(
         txt_freqs,
         false,
     )?;
-    let txt_v = biased(
+    let txt_v = qbiased(
         scope,
         bp,
         txt_mod1,
@@ -662,7 +915,7 @@ fn block_attn<'wsp>(
     let img_sa = alloc_act(scope, bp, img_seq, dim)?;
     scope.copy_buffer_to_buffer(sa.data, abytes, img_sa.data, 0, bbytes)?;
 
-    let img_attn = biased(
+    let img_attn = qbiased(
         scope,
         bp,
         img_sa,
@@ -672,7 +925,7 @@ fn block_attn<'wsp>(
         dim,
         Site::Proj,
     )?;
-    let txt_attn = biased(
+    let txt_attn = qbiased(
         scope,
         bp,
         txt_sa,
@@ -684,11 +937,11 @@ fn block_attn<'wsp>(
     )?;
 
     // --- gate1 residual (written to the carry buffers; FFN half resumes here) ---
-    op_gate_residual(
+    op_gate_residual_img(
         scope,
         bp,
         hs_in,
-        i_gate_msa,
+        i_msa,
         img_attn,
         ActBuf::dense(hs1_out),
         img_seq,
@@ -698,7 +951,7 @@ fn block_attn<'wsp>(
         scope,
         bp,
         eh_in,
-        t_gate_msa,
+        t_msa.gate,
         txt_attn,
         ActBuf::dense(eh1_out),
         txt_seq,
@@ -720,59 +973,46 @@ fn block_mlp<'wsp>(
     hs1: BatchBuf<'wsp>,
     eh1: BatchBuf<'wsp>,
     silu_temb: BatchBuf<'wsp>,
+    silu_ref: Option<BatchBuf<'wsp>>,
+    split: u32,
     img_seq: u32,
     txt_seq: u32,
     hs_out: BatchBuf<'wsp>,
     eh_out: BatchBuf<'wsp>,
-    bufs: &'wsp BlockBufs,
+    bufs: &'wsp BlockBufs<'_>,
 ) -> Result<(), WgpuError> {
     let bp = &pipelines.block;
     let dim = config::DIM as u32;
     let ffn = config::FFN_HIDDEN as u32;
     let eps = config::NORM_EPS;
-    let silu = ActBuf::dense(silu_temb);
     let hs1 = ActBuf::dense(hs1);
     let eh1 = ActBuf::dense(eh1);
 
     // Recompute the MLP modulation signals (cheap; keeps the split stateless).
-    let img_modp = biased(scope, bp, silu, &bufs.img_mod, 1, 6 * dim, dim, Site::Proj)?;
-    let txt_modp = biased(scope, bp, silu, &bufs.txt_mod, 1, 6 * dim, dim, Site::Proj)?;
-    let i_sig = |k| mod_signal(scope, bp, img_modp.data, k, dim);
-    let t_sig = |k| mod_signal(scope, bp, txt_modp.data, k, dim);
-    let (i_shift_mlp, i_scale_mlp, i_gate_mlp) = (i_sig(3)?, i_sig(4)?, i_sig(5)?);
-    let (t_shift_mlp, t_scale_mlp, t_gate_mlp) = (t_sig(3)?, t_sig(4)?, t_sig(5)?);
+    let (i_mlp, t_mlp) = block_sigs(scope, bp, bufs, silu_temb, silu_ref, split, 1)?;
 
     // --- norm2 + modulate + GELU MLP + gate2 residual, per stream ---
     let mlp = |x: ActBuf<'wsp>,
-               w0: &LinearBiasBufs,
-               w2: &LinearBiasBufs,
+               w0: &QLinBufs<'_>,
+               w2: &QLinBufs<'_>,
                rows: u32|
      -> Result<ActBuf<'wsp>, WgpuError> {
-        let up = biased(scope, bp, x, w0, rows, ffn, dim, Site::FfnUp)?;
+        let up = qbiased(scope, bp, x, w0, rows, ffn, dim, Site::FfnUp)?;
         let g = alloc_act(scope, bp, rows, ffn)?;
         scope.dispatch_op::<GeluF32>(&pipelines.gelu, &[up.data], g.data)?;
-        biased(scope, bp, g, w2, rows, dim, ffn, Site::FfnDown)
+        qbiased(scope, bp, g, w2, rows, dim, ffn, Site::FfnDown)
     };
 
     let img_n2 = alloc_act(scope, bp, img_seq, dim)?;
     op_layernorm(scope, bp, hs1, img_n2, img_seq, dim, eps)?;
     let img_mod2 = alloc_act(scope, bp, img_seq, dim)?;
-    op_modulate(
-        scope,
-        bp,
-        img_n2,
-        i_scale_mlp,
-        i_shift_mlp,
-        img_mod2,
-        img_seq,
-        dim,
-    )?;
+    op_modulate_img(scope, bp, img_n2, i_mlp, img_mod2, img_seq, dim)?;
     let img_mlp = mlp(img_mod2, &bufs.img_mlp_0, &bufs.img_mlp_2, img_seq)?;
-    op_gate_residual(
+    op_gate_residual_img(
         scope,
         bp,
         hs1,
-        i_gate_mlp,
+        i_mlp,
         img_mlp,
         ActBuf::dense(hs_out),
         img_seq,
@@ -786,8 +1026,8 @@ fn block_mlp<'wsp>(
         scope,
         bp,
         txt_n2,
-        t_scale_mlp,
-        t_shift_mlp,
+        t_mlp.scale,
+        t_mlp.shift,
         txt_mod2,
         txt_seq,
         dim,
@@ -797,7 +1037,7 @@ fn block_mlp<'wsp>(
         scope,
         bp,
         eh1,
-        t_gate_mlp,
+        t_mlp.gate,
         txt_mlp,
         ActBuf::dense(eh_out),
         txt_seq,
@@ -842,7 +1082,15 @@ impl<SE: core::fmt::Debug> From<ResidencyError<SE, WgpuError>> for DitError<SE> 
 
 pub struct QwenImageDit {
     rope: QwenImageRope,
+    /// Edit-2511 (`zero_cond_t`): reference tokens are modulated as if clean
+    /// (timestep 0). Checkpoints mark it with an `__index_timestep_zero__`
+    /// tensor (see [`ZERO_COND_T_MARKER`]).
+    zero_cond_t: bool,
 }
+
+/// The empty tensor a 2511-family checkpoint carries (ComfyUI's
+/// `model_detection` keys `index_timestep_zero` off it).
+pub const ZERO_COND_T_MARKER: &str = "__index_timestep_zero__";
 
 /// Upload a host f32 `[.., n]` row-major buffer as an act buffer.
 fn upload_act(
@@ -871,10 +1119,57 @@ fn upload_freqs(
 }
 
 impl QwenImageDit {
-    pub fn new() -> Self {
+    pub fn new(zero_cond_t: bool) -> Self {
         Self {
             rope: QwenImageRope::new(),
+            zero_cond_t,
         }
+    }
+
+    /// `(temb, SiLU(temb))` for timestep `t`, `temb =
+    /// linear_2(SiLU(linear_1(sinusoid(t))))`, each `[1, dim]`.
+    async fn silu_temb<S: WeightSource>(
+        backend: &WgpuBackend,
+        bp: &BlockPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        handles: &DitHandles,
+        t: f32,
+    ) -> Result<
+        (
+            thinfer_core::workspace::WsBuf<WgpuBackend>,
+            thinfer_core::workspace::WsBuf<WgpuBackend>,
+        ),
+        DitError<S::Error>,
+    > {
+        let dim = config::DIM as u32;
+        let sin = timestep_sinusoid(t);
+        let sin_buf = upload_act(scratch, backend, bp, &sin, 256)?;
+        let temb = scratch.alloc(bp.act_bytes(dim))?;
+        let silu_temb = scratch.alloc(bp.act_bytes(dim))?;
+        let v1 = handles
+            .top
+            .time_linear_1
+            .acquire(residency, backend)
+            .await?;
+        let v2 = handles
+            .top
+            .time_linear_2
+            .acquire(residency, backend)
+            .await?;
+        let (w1, w2) = (v1.bufs(), v2.bufs());
+        let scope = scratch.batch();
+        let x = ActBuf::dense(scope.import_copy(sin_buf.as_buf_ref()));
+        let h1 = biased(&scope, bp, x, &w1, 1, dim, 256, Site::Adaln)?;
+        let s1 = alloc_act(&scope, bp, 1, dim)?;
+        scope.dispatch_op::<SiluF32>(&bp.silu, &[h1.data], s1.data)?;
+        let tb = biased(&scope, bp, s1, &w2, 1, dim, dim, Site::Adaln)?;
+        let dst = scope.import_copy(temb.as_buf_ref());
+        scope.copy_buffer_to_buffer(tb.data, 0, dst, 0, bp.act_bytes(dim))?;
+        let sdst = scope.import_copy(silu_temb.as_buf_ref());
+        scope.dispatch_op::<SiluF32>(&bp.silu, &[tb.data], sdst)?;
+        scope.submit_void().await?;
+        Ok((temb, silu_temb))
     }
 
     /// t2i forward: one image grid `(frame, gh, gw)`, velocity over all tokens.
@@ -984,46 +1279,27 @@ impl QwenImageDit {
             scope.submit_void().await?;
         }
 
-        // --- temb = linear_2(SiLU(linear_1(sinusoid))) -> [1, dim] ---
-        let sin = timestep_sinusoid(timestep);
-        let sin_buf = upload_act(scratch, backend, bp, &sin, 256)?;
-        let temb = scratch.alloc(bp.act_bytes(dim))?;
-        {
-            let v1 = handles
-                .top
-                .time_linear_1
-                .acquire(residency, backend)
-                .await?;
-            let v2 = handles
-                .top
-                .time_linear_2
-                .acquire(residency, backend)
-                .await?;
-            let (w1, w2) = (v1.bufs(), v2.bufs());
-            let scope = scratch.batch();
-            let x = ActBuf::dense(scope.import_copy(sin_buf.as_buf_ref()));
-            let h1 = biased(&scope, bp, x, &w1, 1, dim, 256, Site::Adaln)?;
-            let s1 = alloc_act(&scope, bp, 1, dim)?;
-            scope.dispatch_op::<SiluF32>(&bp.silu, &[h1.data], s1.data)?;
-            let t = biased(&scope, bp, s1, &w2, 1, dim, dim, Site::Adaln)?;
-            let dst = scope.import_copy(temb.as_buf_ref());
-            scope.copy_buffer_to_buffer(t.data, 0, dst, 0, bp.act_bytes(dim))?;
-            scope.submit_void().await?;
-        }
+        // --- silu_temb = SiLU(temb(t)), shared by every block + the final layer ---
+        let (temb, silu_temb) =
+            Self::silu_temb(backend, bp, residency, scratch, handles, timestep).await?;
         if let Some(t) = taps.as_deref_mut() {
             let bytes = backend.read_buffer(temb.id(), 0, bp.act_bytes(dim)).await?;
             t.temb = Some(seq::act_readback_to_f32(bp.act_dtype, &bytes, dim as usize));
         }
-
-        // --- silu_temb = SiLU(temb), shared by every block + the final layer ---
-        let silu_temb = scratch.alloc(bp.act_bytes(dim))?;
-        {
-            let scope = scratch.batch();
-            let src = scope.import_copy(temb.as_buf_ref());
-            let dst = scope.import_copy(silu_temb.as_buf_ref());
-            scope.dispatch_op::<SiluF32>(&bp.silu, &[src], dst)?;
-            scope.submit_void().await?;
-        }
+        // zero_cond_t (Edit-2511): the reference rows `[velocity_tokens, ..)`
+        // of the image stream are modulated by temb(t=0) (diffusers
+        // `modulate_index` / ComfyUI `index_timestep_zero`); the text stream
+        // and the final layer keep temb(t).
+        let split = velocity_tokens as u32;
+        let silu_ref = if self.zero_cond_t && split < img_seq {
+            Some(
+                Self::silu_temb(backend, bp, residency, scratch, handles, 0.0)
+                    .await?
+                    .1,
+            )
+        } else {
+            None
+        };
 
         // --- rope freqs + (unused) joint mask ---
         let vid = self.rope.vid_freqs_multi(grids);
@@ -1067,7 +1343,7 @@ impl QwenImageDit {
         for idx in 0..handles.blocks.len() {
             let _g = trace::scope!(format!("qwen_image.dit.block.{idx}")).entered();
             let views = pending.take().expect("pending acquire missing");
-            let bufs = views.bufs();
+            let bufs = views.bufs(pipelines);
             let t_blk = std::time::Instant::now();
             let hs_nxt = scratch.alloc(bp.act_bytes(img_seq * dim))?;
             let eh_nxt = scratch.alloc(bp.act_bytes(txt_seq * dim))?;
@@ -1099,6 +1375,8 @@ impl QwenImageDit {
                     scope.import_copy(hs_cur.as_buf_ref()),
                     scope.import_copy(eh_cur.as_buf_ref()),
                     scope.import_copy(silu_temb.as_buf_ref()),
+                    silu_ref.as_ref().map(|b| scope.import_copy(b.as_buf_ref())),
+                    split,
                     scope.import_copy(vid_buf.as_buf_ref()),
                     scope.import_copy(txt_buf.as_buf_ref()),
                     scope.import_copy(mask_buf.as_buf_ref()),
@@ -1120,6 +1398,8 @@ impl QwenImageDit {
                     scope.import_copy(hs1_carry.as_buf_ref()),
                     scope.import_copy(eh1_carry.as_buf_ref()),
                     scope.import_copy(silu_temb.as_buf_ref()),
+                    silu_ref.as_ref().map(|b| scope.import_copy(b.as_buf_ref())),
+                    split,
                     img_seq,
                     txt_seq,
                     scope.import_copy(hs_nxt.as_buf_ref()),
@@ -1220,6 +1500,6 @@ impl QwenImageDit {
 
 impl Default for QwenImageDit {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }

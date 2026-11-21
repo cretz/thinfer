@@ -5,6 +5,7 @@
 //! the budget). Weights come from one residency over the DiT GGUF (krea2 keys) +
 //! the renamed Qwen3-VL encoder GGUF + the Wan2.1 VAE.
 
+use crate::common::{Generated, StepControl, StepState};
 use std::sync::Arc;
 
 use thinfer_core::backend::WgpuBackend;
@@ -122,11 +123,16 @@ impl From<thinfer_core::backend::WgpuError> for LoadError {
 #[derive(Debug)]
 pub enum GenerateError<SE: core::fmt::Debug> {
     EmptyPrompt,
-    InvalidDims { height: u32, width: u32 },
+    InvalidDims {
+        height: u32,
+        width: u32,
+    },
     Encode(crate::z_image::text_encoder::Qwen3ForwardError<SE>),
     Dit(DitError<SE>),
     Vae(crate::wan::vae::WanVaeDecodeError<SE>),
     Png(String),
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
 }
 
 pub struct KreaPipeline<S: WeightSource> {
@@ -231,6 +237,7 @@ impl<S: WeightSource> KreaPipeline<S> {
 
     /// Encode -> denoise -> VAE decode. Returns RGB CHW f32 in `[-1, 1]`,
     /// `[3, height, width]`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_rgb(
         &self,
         token_ids: &[u32],
@@ -240,6 +247,39 @@ impl<S: WeightSource> KreaPipeline<S> {
         seed: u64,
         progress: ProgressFn<'_>,
     ) -> Result<Vec<f32>, GenerateError<S::Error>> {
+        match self
+            .generate_rgb_ctl(
+                token_ids,
+                height,
+                width,
+                steps,
+                seed,
+                progress,
+                StepControl::default(),
+            )
+            .await?
+        {
+            Generated::Done(rgb) => Ok(rgb),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate_rgb`] that can stop between steps (`ctl.stop_here`,
+    /// polled between steps and before the decode) and resume where a
+    /// stopped run stood (`ctl.resume`). The encode is recomputed on resume
+    /// (deterministic), so the state is just the latent; the result matches
+    /// an uninterrupted run.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_rgb_ctl(
+        &self,
+        token_ids: &[u32],
+        height: u32,
+        width: u32,
+        steps: u32,
+        seed: u64,
+        progress: ProgressFn<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated<Vec<f32>>, GenerateError<S::Error>> {
         if token_ids.is_empty() {
             return Err(GenerateError::EmptyPrompt);
         }
@@ -257,123 +297,142 @@ impl<S: WeightSource> KreaPipeline<S> {
             Arc::clone(self.residency.arbiter()),
         );
 
-        // --- 1. encode (12 taps) + txtfusion (once) -> txt_features [txt_tok, DIM]
-        if let Some(p) = progress {
-            p(ProgressEvent::TextEncode);
-        }
-        let txt_features = {
-            let _s = trace::scope!("krea.encode", tokens = token_ids.len()).entered();
-            let taps = self
-                .encoder
-                .forward(
-                    &self.backend,
-                    &self.encoder_pipelines,
-                    &self.residency,
-                    &workspace,
-                    &self.encoder_handles,
-                    self.residency.source(),
-                    token_ids,
-                )
-                .await
-                .map_err(GenerateError::Encode)?;
-            // Drop the template preamble taps (system prefix) before txtfusion;
-            // each token carries TEXT_LAYERS*TEXT_DIM tap values.
-            let per_tok = config::TEXT_LAYERS * config::TEXT_DIM;
-            let txt_tok = taps.len() / per_tok;
-            let drop = DROP_IDX.min(txt_tok.saturating_sub(1));
-            if tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG) {
-                let bad = taps.iter().filter(|v| !v.is_finite()).count();
-                let (s, _) = latent_stats(&taps, txt_tok);
-                tracing::event!(
-                    target: "thinfer::diag", tracing::Level::DEBUG,
-                    tokens = txt_tok, nonfinite = bad, std = s,
-                    "krea encoder taps stats"
-                );
-            }
-            let feats = self
-                .dit
-                .prepare_txt(
-                    &self.backend,
-                    &self.dit_pipelines,
-                    &self.residency,
-                    &workspace,
-                    &self.dit_handles,
-                    &taps[drop * per_tok..],
-                )
-                .await
-                .map_err(GenerateError::Dit)?;
-            if tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG) {
-                let bad = feats.iter().filter(|v| !v.is_finite()).count();
-                let toks = feats.len() / config::DIM;
-                let (s, _) = latent_stats(&feats, toks);
-                tracing::event!(
-                    target: "thinfer::diag", tracing::Level::DEBUG,
-                    tokens = toks, nonfinite = bad, std = s,
-                    "krea txt_features (post prepare_txt) stats"
-                );
-            }
-            feats
-        };
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 2. FlowMatchEuler denoise (CFG-free, turbo mu) ---
         let steps_plan = build_steps(steps as usize, TURBO_MU);
-        let z = gaussian_noise(config::LATENT_CH * lat_h * lat_w, seed);
-        let mut tokens = pack_latents(&z, lat_h, lat_w);
-        {
-            let _s = trace::scope!("krea.denoise", steps = steps).entered();
-            for (i, step) in steps_plan.iter().enumerate() {
-                if let Some(p) = progress {
-                    p(ProgressEvent::Step {
-                        i: i as u32 + 1,
-                        n: steps,
-                    });
+        let n_lat = config::LATENT_CH * lat_h * lat_w;
+        let (first, mut tokens) = match ctl.resume {
+            Some(st) => {
+                if st.step > steps_plan.len() || st.latent.len() != n_lat {
+                    return Err(GenerateError::ResumeMismatch);
                 }
-                let out = self
-                    .dit
+                (st.step, st.latent)
+            }
+            None => (0, pack_latents(&gaussian_noise(n_lat, seed), lat_h, lat_w)),
+        };
+        if first < steps_plan.len() {
+            // --- 1. encode (12 taps) + txtfusion (once) -> txt_features [txt_tok, DIM]
+            if let Some(p) = progress {
+                p(ProgressEvent::TextEncode);
+            }
+            let txt_features = {
+                let _s = trace::scope!("krea.encode", tokens = token_ids.len()).entered();
+                let taps = self
+                    .encoder
                     .forward(
+                        &self.backend,
+                        &self.encoder_pipelines,
+                        &self.residency,
+                        &workspace,
+                        &self.encoder_handles,
+                        self.residency.source(),
+                        token_ids,
+                    )
+                    .await
+                    .map_err(GenerateError::Encode)?;
+                // Drop the template preamble taps (system prefix) before txtfusion;
+                // each token carries TEXT_LAYERS*TEXT_DIM tap values.
+                let per_tok = config::TEXT_LAYERS * config::TEXT_DIM;
+                let txt_tok = taps.len() / per_tok;
+                let drop = DROP_IDX.min(txt_tok.saturating_sub(1));
+                if tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG) {
+                    let bad = taps.iter().filter(|v| !v.is_finite()).count();
+                    let (s, _) = latent_stats(&taps, txt_tok);
+                    tracing::event!(
+                        target: "thinfer::diag", tracing::Level::DEBUG,
+                        tokens = txt_tok, nonfinite = bad, std = s,
+                        "krea encoder taps stats"
+                    );
+                }
+                let feats = self
+                    .dit
+                    .prepare_txt(
                         &self.backend,
                         &self.dit_pipelines,
                         &self.residency,
                         &workspace,
                         &self.dit_handles,
-                        &tokens,
-                        &txt_features,
-                        step.t,
-                        gh,
-                        gw,
+                        &taps[drop * per_tok..],
                     )
                     .await
                     .map_err(GenerateError::Dit)?;
-                debug_assert_eq!(out.velocity.len(), tokens.len());
                 if tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG) {
-                    let (vstd, vspat) = latent_stats(&out.velocity, out.img_seq);
-                    for (zi, &v) in tokens.iter_mut().zip(out.velocity.iter()) {
-                        *zi += v * step.delta;
-                    }
-                    let (zstd, zspat) = latent_stats(&tokens, out.img_seq);
+                    let bad = feats.iter().filter(|v| !v.is_finite()).count();
+                    let toks = feats.len() / config::DIM;
+                    let (s, _) = latent_stats(&feats, toks);
                     tracing::event!(
-                        target: "thinfer::diag",
-                        tracing::Level::DEBUG,
-                        step = i as u32 + 1,
-                        t = step.t,
-                        delta = step.delta,
-                        vel_std = vstd,
-                        vel_spatial_std = vspat,
-                        lat_std = zstd,
-                        lat_spatial_std = zspat,
-                        "krea denoise step latent stats"
+                        target: "thinfer::diag", tracing::Level::DEBUG,
+                        tokens = toks, nonfinite = bad, std = s,
+                        "krea txt_features (post prepare_txt) stats"
                     );
-                } else {
-                    for (zi, &v) in tokens.iter_mut().zip(out.velocity.iter()) {
-                        *zi += v * step.delta;
+                }
+                feats
+            };
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+
+            // --- 2. FlowMatchEuler denoise (CFG-free, turbo mu) ---
+            {
+                let _s = trace::scope!("krea.denoise", steps = steps).entered();
+                for (i, step) in steps_plan.iter().enumerate().skip(first) {
+                    // Between steps: a step boundary.
+                    if i > first && ctl.stop_here.is_some_and(|c| c()) {
+                        self.residency.evict_all_and_free(&*self.backend);
+                        return Ok(Generated::Stopped(StepState::at(i, tokens)));
+                    }
+                    if let Some(p) = progress {
+                        p(ProgressEvent::Step {
+                            i: i as u32 + 1,
+                            n: steps,
+                        });
+                    }
+                    let out = self
+                        .dit
+                        .forward(
+                            &self.backend,
+                            &self.dit_pipelines,
+                            &self.residency,
+                            &workspace,
+                            &self.dit_handles,
+                            &tokens,
+                            &txt_features,
+                            step.t,
+                            gh,
+                            gw,
+                        )
+                        .await
+                        .map_err(GenerateError::Dit)?;
+                    debug_assert_eq!(out.velocity.len(), tokens.len());
+                    if tracing::enabled!(target: "thinfer::diag", tracing::Level::DEBUG) {
+                        let (vstd, vspat) = latent_stats(&out.velocity, out.img_seq);
+                        for (zi, &v) in tokens.iter_mut().zip(out.velocity.iter()) {
+                            *zi += v * step.delta;
+                        }
+                        let (zstd, zspat) = latent_stats(&tokens, out.img_seq);
+                        tracing::event!(
+                            target: "thinfer::diag",
+                            tracing::Level::DEBUG,
+                            step = i as u32 + 1,
+                            t = step.t,
+                            delta = step.delta,
+                            vel_std = vstd,
+                            vel_spatial_std = vspat,
+                            lat_std = zstd,
+                            lat_spatial_std = zspat,
+                            "krea denoise step latent stats"
+                        );
+                    } else {
+                        for (zi, &v) in tokens.iter_mut().zip(out.velocity.iter()) {
+                            *zi += v * step.delta;
+                        }
                     }
                 }
             }
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+            // Before the decode: a step boundary.
+            if ctl.stop_here.is_some_and(|c| c()) {
+                return Ok(Generated::Stopped(StepState::at(steps_plan.len(), tokens)));
+            }
         }
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
 
         // --- 3. unpack -> VAE decode ---
         if let Some(p) = progress {
@@ -410,7 +469,7 @@ impl<S: WeightSource> KreaPipeline<S> {
             .await
             .map_err(GenerateError::Vae)?;
         self.residency.evict_all_and_free(&*self.backend);
-        Ok(rgb)
+        Ok(Generated::Done(rgb))
     }
 
     /// `generate_rgb` + PNG encode.

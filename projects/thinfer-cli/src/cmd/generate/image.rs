@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::ImageModelId;
-use thinfer_app::request::{ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret};
+use thinfer_app::request::{
+    ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, resolve_keep_size,
+};
 use thinfer_app::vault::{self, Vault};
 use thinfer_app::wire::{ImageSpec, JobSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
@@ -20,12 +22,23 @@ pub struct GenerateImage {
     pub model: ImageModelId,
     #[arg(long)]
     pub prompt: String,
-    /// Input image (PNG/JPEG); repeat for several, in prompt order. Exactly one
-    /// for `qwen-image-edit-rapid` (the image to edit); up to 10 condition
-    /// images for `qwen-image-2.1-turbo` (edit / composition: the prompt
-    /// names them "image 1", "image 2", ...); rejected for the t2i models.
+    /// Input image (PNG/JPEG); repeat for several, in prompt order. 1 to 3
+    /// for `qwen-image-edit-rapid` (the prompt names them "Picture 1",
+    /// "Picture 2", ...); up to 10 condition images for
+    /// `qwen-image-2.1-turbo` (edit / composition: "image 1", "image 2",
+    /// ...); rejected for the t2i models.
     #[arg(long = "input-image")]
     pub input_images: Vec<PathBuf>,
+    /// With `--input-image` (`qwen-image-2.1-turbo`): render at exactly
+    /// `--width` x `--height`. The default whenever either is set; with
+    /// neither set, the output takes the last input's aspect ratio.
+    #[arg(long, conflicts_with = "input_aspect")]
+    pub keep_size: bool,
+    /// With `--input-image` (`qwen-image-2.1-turbo`): take the last input's
+    /// aspect ratio at the `--width` x `--height` pixel area, even when a
+    /// size is set.
+    #[arg(long)]
+    pub input_aspect: bool,
     #[arg(long)]
     pub output: PathBuf,
     /// Output format. Defaults to inferring from the `--output` extension;
@@ -81,7 +94,21 @@ pub struct GenerateImage {
     pub remote: super::RemoteArgs,
 }
 
+impl GenerateImage {
+    /// The explicit size choice, if any (`--keep-size` / `--input-aspect`).
+    fn keep_choice(&self) -> Option<bool> {
+        if self.keep_size {
+            Some(true)
+        } else if self.input_aspect {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 pub async fn run_image(args: GenerateImage) -> Result<(), String> {
+    let keep_choice = args.keep_choice();
     // Resolve up front so a bad extension fails before any download / GPU work.
     let format = resolve_output_format(
         args.output_format,
@@ -111,6 +138,8 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
                 .iter()
                 .map(|p| super::video::base64_file(p))
                 .collect::<Result<_, _>>()?,
+            // The server resolves None against the dims (resolve_keep_size).
+            keep_size: keep_choice,
             i8_matmul: Some(!args.no_i8_matmul),
             full_precision: Some(args.full_precision),
             // Remote path defers coopmat to the server default; local runs read
@@ -154,6 +183,7 @@ pub async fn run_image(args: GenerateImage) -> Result<(), String> {
                     .map_err(|e| format!("read {}: {e}", p.display()))
             })
             .collect::<Result<_, _>>()?,
+        keep_size: resolve_keep_size(keep_choice, args.width, args.height),
         lora,
         vault_password,
         vault_dir: vault::resolve_dir(args.vault_dir.as_deref()),

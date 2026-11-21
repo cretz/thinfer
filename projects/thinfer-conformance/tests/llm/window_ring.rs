@@ -121,7 +121,7 @@ async fn gemma4_window_ring() {
         .await
         .expect("load");
     let ws = Workspace::new(backend.clone(), model.residency().arbiter().clone());
-    let accel = model.enable_accel(&backend).expect("accel");
+    let accel = model.enable_accel(&backend, None).expect("accel");
     eprintln!(
         "[ring] accel {accel}, prompt {} tokens, window {window}, ring {}",
         prompt.len(),

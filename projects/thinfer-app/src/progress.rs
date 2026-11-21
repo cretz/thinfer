@@ -26,6 +26,22 @@ pub trait ProgressSink {
     fn cancelled(&self) -> bool {
         false
     }
+    /// A pause the job's owner asked for (the server; see
+    /// [`crate::checkpoint`]). Default none: the run goes to the end.
+    fn pause(&self) -> Option<crate::checkpoint::PauseMode> {
+        None
+    }
+    /// Keep a pausing run's state (the server seals it under the job key
+    /// before it reaches disk); the run returns
+    /// [`crate::checkpoint::SUSPENDED`] right after. Default: refused.
+    fn suspend(&self, _state: &[u8]) -> Result<(), String> {
+        Err("this run cannot pause".into())
+    }
+    /// The state a paused run left, page-locked: taken by the run that
+    /// resumes it. Default none (a fresh run).
+    fn take_resume(&self) -> Option<thinfer_core::secmem::Locked<u8>> {
+        None
+    }
     /// Take ownership of the finished artifact's bytes (encoded PNG / MP4)
     /// before anything is written to `path`. `Ok(true)` = the sink stored it
     /// (a server seals it under the job key in RAM and writes only

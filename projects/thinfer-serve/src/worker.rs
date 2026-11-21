@@ -4,19 +4,34 @@
 //! worker pulls jobs from the shared [`JobStore`] and reports progress into the
 //! job's event log.
 //!
-//! ## A fresh GPU device per job (crash isolation, no VRAM leak)
+//! ## A warm text model between jobs (no job data, no poison)
 //!
-//! The worker builds a NEW [`LocalExecutor`] -- and therefore a new wgpu device
-//! -- for EACH job, and drops it when the job finishes. Nothing is kept resident
-//! across jobs: the executor holds only the device handle, and every model's
-//! weights are streamed in per request anyway (scoped residency), so a warm
-//! cache would buy nothing. What a long-lived device DID buy was a failure mode:
-//! a device-OOM / device-lost poisons the wgpu device, which then holds its VRAM
-//! allocations for the life of the process -- every later job fails until the
-//! server is killed. Recreating per job means that poison is reclaimed the
-//! instant the job ends; the next job gets a clean device. Device + pipeline
-//! creation is ~sub-second (the driver shader cache survives device recreation),
-//! negligible against a multi-minute generate.
+//! A text job's fixed costs (tokenizer, kernels: the CUDA LLM set takes ~3 s
+//! to build per device, weights, the expert cache) dwarf a short reply, so a
+//! worker keeps its [`LocalExecutor`], with the last text model on it, until
+//! `warm_text_secs` after a text job last used it. Opt-in (default 0: every
+//! job's device goes when it ends, so an idle server holds no GPU memory).
+//! Only text gains enough to
+//! pay for it: a device holding no warm text model goes after its job. What
+//! a long-lived device used to risk is excluded by rule:
+//! - Poison: a device-OOM / device-lost poisons a wgpu device, which then
+//!   holds its VRAM for good. Any job that does not finish cleanly discards
+//!   the device; the next job gets a fresh one.
+//! - Job data: only pristine model data stays. A job must leave no buffer
+//!   behind ([`WgpuBackend::live_buffers`] back to zero, the warm model's
+//!   weights aside), or the device is discarded.
+//! - Other jobs: an image/video job frees the text model first (all of it,
+//!   or with `keep_text_host` its VRAM only), so it gets the whole device.
+//!
+//! ## Paused jobs
+//!
+//! A run asked to pause hands its state to the sink at a step boundary
+//! ([`thinfer_app::checkpoint`]); the worker seals it under the job key into
+//! the job dir, gives the sealed spec back to the job, and requeues (or holds)
+//! it. The resumed run asks for the key again, opens the state into
+//! page-locked memory, deletes the file, and continues from it.
+//!
+//! [`WgpuBackend::live_buffers`]: thinfer_core::backend::WgpuBackend::live_buffers
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +43,7 @@ use thinfer_app::jobkey::{JobKey, OpenLocked};
 use thinfer_app::progress::{ProgressSink, Stage};
 use thinfer_app::wire::{JobEvent, JobResult, JobSpec};
 use thinfer_app::{JobSummary, LocalExecutor};
+use thinfer_core::mem::VramCategory;
 
 use crate::config::ServeConfig;
 use crate::job::{JobHandle, JobStore};
@@ -74,24 +90,90 @@ pub fn spawn_worker(index: usize, ctx: WorkerCtx) {
         .expect("spawn worker thread");
 }
 
+/// A worker's device kept between jobs (holding a warm text model), and the
+/// per-job setting it was built with.
+struct Warm {
+    executor: LocalExecutor,
+    disable_coopmat: bool,
+}
+
 async fn worker_loop(ctx: WorkerCtx) {
+    let ttl = Duration::from_secs(ctx.config.warm_text_secs);
+    let mut warm: Option<Warm> = None;
     loop {
         match ctx.store.take_next() {
             Some(job) => {
-                run_job(&ctx, &job).await;
+                // A panicking job fails alone: the worker lives on, and the
+                // device (whatever state the panic left it in) goes.
+                if CatchPanic(Box::pin(run_job(&ctx, &job, &mut warm)))
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(id = %job.id, "job panicked; device discarded");
+                    warm = None;
+                    job.push(JobEvent::Error {
+                        message: "internal error: the job panicked".into(),
+                    });
+                }
                 ctx.store.finish();
                 // A freed worker may unblock another queued job.
                 ctx.store.notify.notify_one();
             }
-            None => ctx.store.notify.notified().await,
+            None => {
+                // Idle with a warm text model: it (and the device) goes when
+                // its time since last use reaches the TTL.
+                let left = warm
+                    .as_ref()
+                    .and_then(|w| w.executor.warm_model_idle())
+                    .map(|idle| ttl.saturating_sub(idle));
+                match left {
+                    Some(left) => {
+                        if tokio::time::timeout(left, ctx.store.notify.notified())
+                            .await
+                            .is_err()
+                        {
+                            warm = None;
+                            tracing::info!("warm text model and device released (idle)");
+                        }
+                    }
+                    None => ctx.store.notify.notified().await,
+                }
+            }
         }
+    }
+}
+
+/// Polls a job future, turning a panic inside it into `Err`.
+struct CatchPanic<F>(std::pin::Pin<Box<F>>);
+
+impl<F: std::future::Future> std::future::Future for CatchPanic<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(_) => std::task::Poll::Ready(Err(())),
+        }
+    }
+}
+
+/// Release the warm text model once `ttl` has passed since a text job last
+/// used it (checked at every job boundary, whatever the job).
+fn expire_warm_model(executor: &LocalExecutor, ttl: Duration) {
+    if executor.warm_model_idle().is_some_and(|idle| idle >= ttl) {
+        executor.release_warm_model();
     }
 }
 
 /// One job, end to end. The spec is ciphertext until the key arrives; the
 /// decrypted request, the key, and every plaintext buffer this owns are dropped
 /// (keys/specs zeroed) when this returns.
-async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>) {
+async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>, warm: &mut Option<Warm>) {
     let Some(sealed) = job.take_sealed() else {
         return job.push(JobEvent::Error {
             message: "job already taken".into(),
@@ -118,31 +200,125 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>) {
         Ok(r) => r,
         Err(message) => return job.push(JobEvent::Error { message }),
     };
-    drop(sealed);
-    // Fresh device per job (see module docs); dropped at the end of this
-    // function, releasing all VRAM even if the job poisoned it. The
-    // per-request coopmat opt-out layers over the server default.
+    // Its outputs (and a pause's state) live in the job dir.
+    if let Err(e) = std::fs::create_dir_all(&job.dir) {
+        return job.push(JobEvent::Error {
+            message: format!("create {}: {e}", job.dir.display()),
+        });
+    }
+    // Paused before it ran (taken while waiting for its key): given back.
+    if let Some(pause) = job.take_pause() {
+        job.restore_sealed(sealed);
+        ctx.store.requeue(job, pause);
+        return;
+    }
+    job.set_pausable(request.pausable());
+    // A resumed job: its state, opened into page-locked memory (the sealed
+    // file goes; a later pause writes a new one).
+    let resume = match read_checkpoint(job, &key) {
+        Ok(r) => r,
+        Err(message) => {
+            job.set_pausable(false);
+            return job.push(JobEvent::Error { message });
+        }
+    };
+    // The warm device when it matches this job's setup, else a fresh one (see
+    // module docs). The per-request coopmat opt-out layers over the server
+    // default.
     let mut cfg: BackendConfig = ctx.config.backend_config();
     if let Some(disable) = disable_coopmat {
         cfg.disable_coopmat = disable;
     }
-    match LocalExecutor::new(cfg).await {
-        Ok(executor) => {
-            process(
-                &executor,
-                job,
-                &request,
-                &key,
-                ctx.config.download_as_needed,
-                lock_mark,
-                session.map(|c| (c, ctx.sessions.as_ref())),
-            )
-            .await
+    let executor = match warm.take() {
+        Some(w) if w.disable_coopmat == cfg.disable_coopmat => w.executor,
+        stale => {
+            // Released before the new device is built.
+            drop(stale);
+            let disable = cfg.disable_coopmat;
+            match LocalExecutor::new(cfg).await {
+                Ok(executor) => {
+                    tracing::info!(disable_coopmat = disable, "device created");
+                    executor.keep_text_host(ctx.config.keep_text_host)
+                }
+                Err(e) => {
+                    job.set_pausable(false);
+                    return job.push(JobEvent::Error {
+                        message: format!("backend init: {e}"),
+                    });
+                }
+            }
         }
-        Err(e) => job.push(JobEvent::Error {
-            message: format!("backend init: {e}"),
-        }),
+    };
+    let ttl = Duration::from_secs(ctx.config.warm_text_secs);
+    expire_warm_model(&executor, ttl);
+    let ran = process(
+        &executor,
+        job,
+        &request,
+        &key,
+        ctx.config.download_as_needed,
+        lock_mark,
+        resume,
+        session.map(|c| (c, ctx.sessions.as_ref())),
+    )
+    .await;
+    job.set_pausable(false);
+    let clean = ran != Ran::Failed;
+    if ran == Ran::Paused {
+        job.restore_sealed(sealed);
+        ctx.store.requeue(job, job.take_pause().unwrap_or_default());
     }
+    // Keep the device only after a clean job that left no buffer behind
+    // (a loaded text model's weights aside).
+    let except: &[VramCategory] = if executor.holds_warm_weights() {
+        &[VramCategory::Weights]
+    } else {
+        &[]
+    };
+    let (left, bytes) = executor.backend().live_buffers(except);
+    expire_warm_model(&executor, ttl);
+    // Kept for a warm text model only (nothing else gains enough).
+    if ttl > Duration::ZERO && clean && left == 0 && executor.holds_warm_model() {
+        *warm = Some(Warm {
+            executor,
+            disable_coopmat: cfg.disable_coopmat,
+        });
+    } else if clean && left > 0 {
+        tracing::warn!(
+            buffers = left,
+            bytes,
+            "job left buffers behind; device discarded"
+        );
+    }
+}
+
+/// A paused job's state, if it has one: opened with the job key into
+/// page-locked memory, the sealed file deleted.
+fn read_checkpoint(
+    job: &JobHandle,
+    key: &JobKey,
+) -> Result<Option<thinfer_core::secmem::Locked<u8>>, String> {
+    let path = job.checkpoint_path();
+    let sealed = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read the paused job's state: {e}")),
+    };
+    let _ = std::fs::remove_file(&path);
+    key.open_locked(&sealed)
+        .map(Some)
+        .map_err(|e| format!("open the paused job's state: {e}"))
+}
+
+/// How a job's run went.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ran {
+    Done,
+    Failed,
+    /// It stopped at a checkpoint and gives up its worker.
+    Paused,
+    /// The owner cancelled it (a clean stop).
+    Cancelled,
 }
 
 /// Open the sealed spec with the job key (plaintext zeroed on drop) and build
@@ -174,35 +350,41 @@ async fn process(
     key: &JobKey,
     download_as_needed: bool,
     lock_mark: u64,
+    resume: Option<thinfer_core::secmem::Locked<u8>>,
     session: Option<(SessionCommit, &SessionStore)>,
-) {
+) -> Ran {
     job.push(JobEvent::Started);
+    // Until the model's first stage: loading it (weights, kernels).
+    job.push(JobEvent::Progress {
+        stage: thinfer_app::wire::ProgressStage::Loading,
+    });
     // Durable job record (structural fields ONLY -- prompts are never logged).
     tracing::info!(id = %job.id, "job started");
     let t0 = std::time::Instant::now();
 
     let files = match request.required_files() {
         Ok(f) => f,
-        Err(e) => return job.push(JobEvent::Error { message: e }),
+        Err(e) => return fail(job, e),
     };
     let missing = match download::missing(&files) {
         Ok(m) => m,
-        Err(e) => return job.push(JobEvent::Error { message: e }),
+        Err(e) => return fail(job, e),
     };
     if !missing.is_empty() {
         if !download_as_needed {
-            return job.push(JobEvent::Error {
-                message: format!(
+            return fail(
+                job,
+                format!(
                     "{} weight file(s) missing and download_as_needed=false",
                     missing.len()
                 ),
-            });
+            );
         }
         job.push(JobEvent::Log {
             message: format!("Downloading {} missing file(s)", missing.len()),
         });
         if let Err(e) = download::ensure(&files, &NullReporter as &dyn DownloadReporter).await {
-            return job.push(JobEvent::Error { message: e });
+            return fail(job, e);
         }
     }
 
@@ -210,6 +392,8 @@ async fn process(
         job: job.clone(),
         key,
         lock_mark,
+        resume: std::sync::Mutex::new(resume),
+        suspended: std::sync::atomic::AtomicBool::new(false),
     };
     let summary = match executor.run(request, &sink).await {
         Ok(summary) => summary,
@@ -217,27 +401,35 @@ async fn process(
         // cancel (the denoise loop bails with GenerateError::Cancelled); report
         // it as Cancelled, not a failure. Any other error is a real failure.
         Err(message) => {
-            return if thinfer_core::secmem::failed_since(lock_mark) {
+            if thinfer_core::secmem::failed_since(lock_mark) {
                 tracing::warn!(id = %job.id, "job stopped: job data could not be locked in RAM");
                 job.push(JobEvent::Error {
                     message: LOCK_FAILED.into(),
                 })
+            } else if sink.suspended.load(std::sync::atomic::Ordering::SeqCst) {
+                tracing::info!(id = %job.id, "job paused");
+                return Ran::Paused;
             } else if job.is_cancel_requested() {
                 tracing::info!(id = %job.id, "job cancelled");
-                job.push(JobEvent::Cancelled)
+                job.push(JobEvent::Cancelled);
+                // A cancel is no device fault: the device may stay (the
+                // no-leftover-buffers check still decides).
+                return Ran::Cancelled;
             } else {
                 tracing::warn!(id = %job.id, %message, "job failed");
                 job.push(JobEvent::Error { message })
-            };
+            }
+            return Ran::Failed;
         }
     };
     // A lock that failed after the last cancel poll: the result was sealed,
     // but some plaintext was swappable, so the job does not count as done.
     if thinfer_core::secmem::failed_since(lock_mark) {
         tracing::warn!(id = %job.id, "job stopped: job data could not be locked in RAM");
-        return job.push(JobEvent::Error {
+        job.push(JobEvent::Error {
             message: LOCK_FAILED.into(),
         });
+        return Ran::Failed;
     }
     tracing::info!(
         id = %job.id,
@@ -257,6 +449,13 @@ async fn process(
     job.push(JobEvent::Done {
         result: to_result(&job.id, &summary, node, key),
     });
+    Ran::Done
+}
+
+/// End a job with `message` (before it ran): not a clean finish.
+fn fail(job: &JobHandle, message: String) -> Ran {
+    job.push(JobEvent::Error { message });
+    Ran::Failed
 }
 
 /// Seal a session reply's state under the session key and add it as a node.
@@ -276,6 +475,7 @@ fn save_node(
         save.chunk.end,
         sealed,
         save.weights.clone(),
+        save.tail.clone(),
     ) {
         Ok(node) => Some(node),
         Err(e) => {
@@ -330,6 +530,10 @@ struct ServeSink<'k> {
     key: &'k JobKey,
     /// [`thinfer_core::secmem::failure_mark`] at the job's start.
     lock_mark: u64,
+    /// A resumed run's state, until the run takes it.
+    resume: std::sync::Mutex<Option<thinfer_core::secmem::Locked<u8>>>,
+    /// The run handed over its state to pause.
+    suspended: std::sync::atomic::AtomicBool,
 }
 
 impl ProgressSink for ServeSink<'_> {
@@ -365,5 +569,69 @@ impl ProgressSink for ServeSink<'_> {
     fn cancelled(&self) -> bool {
         // A failed page lock stops the job at its next poll.
         self.job.is_cancel_requested() || thinfer_core::secmem::failed_since(self.lock_mark)
+    }
+    fn pause(&self) -> Option<thinfer_app::checkpoint::PauseMode> {
+        self.job.pause_mode()
+    }
+    fn suspend(&self, state: &[u8]) -> Result<(), String> {
+        if thinfer_core::secmem::failed_since(self.lock_mark) {
+            return Err(LOCK_FAILED.into());
+        }
+        // Sealed in RAM; written whole, then moved into place.
+        let path = self.job.checkpoint_path();
+        let tmp = path.with_extension("tmp");
+        std::fs::create_dir_all(&self.job.dir)
+            .and_then(|()| std::fs::write(&tmp, self.key.seal(state)))
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("keep the paused job's state: {e}")
+            })?;
+        self.suspended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn take_resume(&self) -> Option<thinfer_core::secmem::Locked<u8>> {
+        self.resume.lock().unwrap().take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a pausing run hands over is ciphertext on disk, and the resumed
+    /// run (the same key) gets it back exactly, once.
+    #[test]
+    fn a_suspended_state_is_sealed_at_rest_and_comes_back() {
+        let tmp = std::env::temp_dir().join(format!("thinfer-ckpt-{}", std::process::id()));
+        let store = crate::job::JobStore::default();
+        let job = store.create(&tmp, vec![1], 0, None, None);
+        let key = JobKey::generate();
+        let sink = ServeSink {
+            job: job.clone(),
+            key: &key,
+            lock_mark: thinfer_core::secmem::failure_mark(),
+            resume: std::sync::Mutex::new(None),
+            suspended: std::sync::atomic::AtomicBool::new(false),
+        };
+        let state = b"latents entering step 3".repeat(100);
+        sink.suspend(&state).unwrap();
+        assert!(sink.suspended.load(std::sync::atomic::Ordering::SeqCst));
+        let at_rest = std::fs::read(job.checkpoint_path()).unwrap();
+        assert!(
+            !at_rest.windows(7).any(|w| w == b"latents"),
+            "the state reached disk in the clear"
+        );
+        assert!(
+            read_checkpoint(&job, &JobKey::generate()).is_err(),
+            "another key opens it"
+        );
+        sink.suspend(&state).unwrap();
+        let back = read_checkpoint(&job, &key).unwrap().unwrap();
+        assert_eq!(&*back, &state[..]);
+        assert!(!job.checkpoint_path().exists(), "the file goes once read");
+        assert!(read_checkpoint(&job, &key).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

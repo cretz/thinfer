@@ -619,39 +619,52 @@ fn build_mrope_freqs(position_ids: &[i32], invf: &[f64]) -> Vec<f32> {
 /// image tokens (row-major h-then-w over the merged grid) get `t = cur`,
 /// `h = cur + row`, `w = cur + col`; then `cur += max(mgh, mgw)` and trailing
 /// text resumes sequential on all axes.
-fn build_edit_position_ids(
-    seq: usize,
-    image_pad_start: usize,
-    merged_grid: (usize, usize),
-) -> Vec<i32> {
-    let (mgh, mgw) = merged_grid;
-    let n_img = mgh * mgw;
+fn build_edit_position_ids(seq: usize, blocks: &[(usize, (usize, usize))]) -> Vec<i32> {
     let mut pos = vec![0_i32; seq * 3];
     let set = |pos: &mut [i32], i: usize, t: i32, h: i32, w: i32| {
         pos[i * 3] = t;
         pos[i * 3 + 1] = h;
         pos[i * 3 + 2] = w;
     };
-    // Leading text: 0..image_pad_start on all axes.
-    for i in 0..image_pad_start {
-        let p = i as i32;
-        set(&mut pos, i, p, p, p);
-    }
-    let cur = image_pad_start as i32;
-    // Image block: t const, h/w over the merged grid.
-    for r in 0..mgh {
-        for c in 0..mgw {
-            let i = image_pad_start + r * mgw + c;
-            set(&mut pos, i, cur, cur + r as i32, cur + c as i32);
+    // Text runs sequential on all axes; each image block (in prompt order)
+    // sits at the running position `cur`: t const, h/w over its merged grid,
+    // then `cur += max(mgh, mgw)` (HF `get_rope_index`).
+    let (mut i, mut cur) = (0usize, 0i32);
+    for &(start, (mgh, mgw)) in blocks {
+        while i < start {
+            set(&mut pos, i, cur, cur, cur);
+            i += 1;
+            cur += 1;
         }
+        for r in 0..mgh {
+            for c in 0..mgw {
+                set(
+                    &mut pos,
+                    start + r * mgw + c,
+                    cur,
+                    cur + r as i32,
+                    cur + c as i32,
+                );
+            }
+        }
+        i = start + mgh * mgw;
+        cur += mgh.max(mgw) as i32;
     }
-    // Trailing text: sequential from `cur + max(mgh, mgw)` on all axes.
-    let base = cur + mgh.max(mgw) as i32;
-    for (step, i) in ((image_pad_start + n_img)..seq).enumerate() {
-        let p = base + step as i32;
-        set(&mut pos, i, p, p, p);
+    while i < seq {
+        set(&mut pos, i, cur, cur, cur);
+        i += 1;
+        cur += 1;
     }
     pos
+}
+
+/// One image block of an edit prompt: its `<|image_pad|>` run start, and the
+/// vision tower's rows for it over its merged grid.
+pub struct EditVision<'a> {
+    pub pad_start: usize,
+    /// `[mgh * mgw, HIDDEN]`, raster merged order.
+    pub embeds: &'a [f32],
+    pub merged_grid: (usize, usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -858,20 +871,58 @@ impl TextEncoder {
         merged_grid: (usize, usize),
         want_layer_outputs: bool,
     ) -> Result<EncoderOutput, ForwardError<S::Error>> {
+        self.forward_edit_multi(
+            backend,
+            pipelines,
+            residency,
+            scratch,
+            handles,
+            source,
+            token_ids,
+            &[EditVision {
+                pad_start: image_pad_start,
+                embeds: vision_embeds,
+                merged_grid,
+            }],
+            want_layer_outputs,
+        )
+        .await
+    }
+
+    /// [`Self::forward_edit`] over several image blocks (multi-image edits),
+    /// in prompt order and non-overlapping.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_edit_multi<S: WeightSource>(
+        &self,
+        backend: &WgpuBackend,
+        pipelines: &EditEncoderPipelines,
+        residency: &WeightResidency<S>,
+        scratch: &Workspace<WgpuBackend>,
+        handles: &EncoderHandles,
+        source: &S,
+        token_ids: &[u32],
+        images: &[EditVision<'_>],
+        want_layer_outputs: bool,
+    ) -> Result<EncoderOutput, ForwardError<S::Error>> {
         let block_pipelines = &pipelines.block;
         let seq = token_ids.len();
         assert!(seq > 0, "TextEncoder::forward_edit: empty token list");
-        let n_img = merged_grid.0 * merged_grid.1;
-        assert_eq!(
-            vision_embeds.len(),
-            n_img * config::HIDDEN,
-            "vision_embeds must be [n_img={n_img}, HIDDEN]"
-        );
-        assert!(
-            image_pad_start + n_img <= seq,
-            "image-pad block [{image_pad_start}, {}) exceeds seq {seq}",
-            image_pad_start + n_img
-        );
+        let mut end = 0;
+        for img in images {
+            let n_img = img.merged_grid.0 * img.merged_grid.1;
+            assert_eq!(
+                img.embeds.len(),
+                n_img * config::HIDDEN,
+                "vision embeds must be [n_img={n_img}, HIDDEN]"
+            );
+            assert!(
+                img.pad_start >= end && img.pad_start + n_img <= seq,
+                "image-pad block [{}, {}) out of order or past seq {seq}",
+                img.pad_start,
+                img.pad_start + n_img
+            );
+            end = img.pad_start + n_img;
+        }
 
         // Even-pad (mask layout wants even s_k); pad row repeats the last token,
         // is causally invisible, sliced off after readback.
@@ -892,8 +943,10 @@ impl TextEncoder {
             .instrument(tracing::debug_span!(target: PHASE, "qwen25.embed_lookup", seq))
             .await
             .map_err(ForwardError::Embed)?;
-        let dst = image_pad_start * config::HIDDEN;
-        embeds[dst..dst + n_img * config::HIDDEN].copy_from_slice(vision_embeds);
+        for img in images {
+            let dst = img.pad_start * config::HIDDEN;
+            embeds[dst..dst + img.embeds.len()].copy_from_slice(img.embeds);
+        }
 
         let block = DecoderBlock {
             shape: BlockShape {
@@ -914,7 +967,11 @@ impl TextEncoder {
 
         // --- 3-axis MRoPE freqs (the [cos_lo, sin_lo, cos_hi, sin_hi] layout) ---
         // The pad row reuses the last real position (causally invisible).
-        let mut pos_ids = build_edit_position_ids(seq, image_pad_start, merged_grid);
+        let blocks: Vec<(usize, (usize, usize))> = images
+            .iter()
+            .map(|i| (i.pad_start, i.merged_grid))
+            .collect();
+        let mut pos_ids = build_edit_position_ids(seq, &blocks);
         if seq_pad > seq {
             let last = pos_ids[(seq - 1) * 3..seq * 3].to_vec();
             pos_ids.extend_from_slice(&last);
@@ -1115,6 +1172,30 @@ mod tests {
         }
     }
 
+    /// Two image blocks (multi-image edit): each sits at the running position,
+    /// and the text between and after them resumes from each block's bump
+    /// (HF `get_rope_index` over several images).
+    #[test]
+    fn edit_position_ids_for_two_images() {
+        // 2 text, image A 2x3 (6), 3 text, image B 1x2 (2), 1 text.
+        let seq = 2 + 6 + 3 + 2 + 1;
+        let pos = build_edit_position_ids(seq, &[(2, (2, 3)), (11, (1, 2))]);
+        let at = |i: usize| (pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+        assert_eq!(at(0), (0, 0, 0));
+        assert_eq!(at(1), (1, 1, 1));
+        // Image A at cur 2: t 2, h 2 + row, w 2 + col.
+        assert_eq!(at(2), (2, 2, 2));
+        assert_eq!(at(7), (2, 3, 4));
+        // cur = 2 + max(2, 3) = 5: the text between resumes there.
+        assert_eq!(at(8), (5, 5, 5));
+        assert_eq!(at(10), (7, 7, 7));
+        // Image B at cur 8.
+        assert_eq!(at(11), (8, 8, 8));
+        assert_eq!(at(12), (8, 8, 9));
+        // cur = 8 + max(1, 2) = 10.
+        assert_eq!(at(13), (10, 10, 10));
+    }
+
     /// Image tokens get distinct per-axis positions; pad-handling and the merged
     /// grid layout must match the SPEC (row-major h-then-w, t const, cur bump).
     #[test]
@@ -1123,7 +1204,7 @@ mod tests {
         let (mgh, mgw) = (2, 3);
         let pad_start = 4;
         let seq = pad_start + mgh * mgw + 2;
-        let pos = build_edit_position_ids(seq, pad_start, (mgh, mgw));
+        let pos = build_edit_position_ids(seq, &[(pad_start, (mgh, mgw))]);
         // Leading text: i on all axes.
         for i in 0..pad_start {
             assert_eq!(&pos[i * 3..i * 3 + 3], &[i as i32; 3]);

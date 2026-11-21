@@ -1049,6 +1049,8 @@ pub enum DitError<SE: core::fmt::Debug> {
     Wgpu(WgpuError),
     Residency(ResidencyError<SE, WgpuError>),
     Load(LoadError),
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
 }
 impl<SE: core::fmt::Debug> From<WgpuError> for DitError<SE> {
     fn from(e: WgpuError) -> Self {

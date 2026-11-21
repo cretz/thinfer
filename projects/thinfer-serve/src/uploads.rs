@@ -53,6 +53,9 @@ struct Entry {
     /// The queued job holding this upload (see [`UploadStore::claim`]): while
     /// it may still consume it, the TTL does not apply.
     owner: Option<Weak<JobHandle>>,
+    /// Where its ciphertext went when its job consumed it: a paused job's
+    /// resumed run consumes it again from there.
+    consumed: Option<PathBuf>,
 }
 
 impl Entry {
@@ -96,6 +99,7 @@ impl UploadStore {
                 dir,
                 created: Instant::now(),
                 owner: None,
+                consumed: None,
             },
         );
         Ok((id, sealed.len()))
@@ -133,27 +137,33 @@ impl UploadStore {
         job_dir: &Path,
         key: &JobKey,
     ) -> Result<VideoInput, String> {
-        let entry = {
-            let mut entries = self.entries.lock().unwrap();
-            let e = entries
-                .get(id)
-                .ok_or("upload not found (expired, already used, or never uploaded)")?;
-            if let Some(owner) = &e.owner
-                && owner.upgrade().is_none_or(|j| j.id != job_id)
-            {
-                return Err(format!("upload {id} is claimed by another job"));
-            }
-            entries.remove(id).expect("present under the lock")
-        };
-        std::fs::create_dir_all(job_dir)
-            .map_err(|e| format!("create {}: {e}", job_dir.display()))?;
+        let mut entries = self.entries.lock().unwrap();
+        let e = entries
+            .get_mut(id)
+            .ok_or("upload not found (expired, already used, or never uploaded)")?;
+        if let Some(owner) = &e.owner
+            && owner.upgrade().is_none_or(|j| j.id != job_id)
+        {
+            return Err(format!("upload {id} is claimed by another job"));
+        }
         let dest = job_dir.join("input_video.enc");
-        move_file(&entry.path, &dest)?;
-        let _ = std::fs::remove_dir_all(&entry.dir);
+        if e.consumed.is_none() {
+            std::fs::create_dir_all(job_dir)
+                .map_err(|e| format!("create {}: {e}", job_dir.display()))?;
+            move_file(&e.path, &dest)?;
+            let _ = std::fs::remove_dir_all(&e.dir);
+            e.consumed = Some(dest.clone());
+        }
+        // An unclaimed upload has no later run to serve: done with it.
+        let nonce = if e.owner.is_none() {
+            entries.remove(id).expect("present under the lock").nonce
+        } else {
+            e.nonce.clone()
+        };
         Ok(VideoInput::Encrypted {
             path: dest,
             key: *key.bytes(),
-            nonce: entry.nonce,
+            nonce,
         })
     }
 
@@ -270,11 +280,11 @@ mod tests {
         let jobs = crate::job::JobStore::default();
         let key = JobKey::generate();
         let (id, _) = store.put(&key.seal(b"queued clip")).unwrap();
-        let job = jobs.create(&tmp, Vec::new(), 0, None);
+        let job = jobs.create(&tmp, Vec::new(), 0, None, None);
         let ids = vec![id.clone()];
         assert!(store.claim(&["missing".into()], &job).is_err());
         store.claim(&ids, &job).unwrap();
-        let other = jobs.create(&tmp, Vec::new(), 0, None);
+        let other = jobs.create(&tmp, Vec::new(), 0, None, None);
         assert!(store.claim(&ids, &other).is_err(), "one owner per upload");
         assert!(
             store
@@ -297,13 +307,45 @@ mod tests {
         assert!(!tmp.join(&id).exists());
 
         let (id, _) = store.put(&key.seal(b"dropped job")).unwrap();
-        let job = jobs.create(&tmp, Vec::new(), 0, None);
+        let job = jobs.create(&tmp, Vec::new(), 0, None, None);
         store.claim(std::slice::from_ref(&id), &job).unwrap();
         drop(job);
         assert_eq!(
             store.reap(Duration::from_secs(3600)),
             1,
             "a dropped job ends the claim"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A paused job's resumed run consumes its upload again: the same
+    /// ciphertext, from the job dir, under the same key.
+    #[test]
+    fn a_claimed_upload_opens_again_for_its_jobs_resumed_run() {
+        let tmp = std::env::temp_dir().join(format!("thinfer_up_resume_{}", random_id()));
+        let store = UploadStore::new(tmp.clone());
+        let jobs = crate::job::JobStore::default();
+        let key = JobKey::generate();
+        let (id, _) = store.put(&key.seal(b"clip to swap")).unwrap();
+        let job = jobs.create(&tmp, Vec::new(), 0, None, None);
+        store.claim(std::slice::from_ref(&id), &job).unwrap();
+        let open = |input: VideoInput| match &input {
+            VideoInput::Encrypted { path, key, nonce } => {
+                let ct = std::fs::read(path).unwrap();
+                thinfer_app::vault::ephemeral_unseal(key, nonce, &ct).unwrap()
+            }
+            VideoInput::Ram(_) => panic!("expected a decrypt-on-read input"),
+        };
+        let first = store.consume(&id, &job.id, &job.dir, &key).unwrap();
+        assert_eq!(open(first), b"clip to swap");
+        assert!(!tmp.join(&id).exists(), "the upload moved into the job dir");
+        let again = store.consume(&id, &job.id, &job.dir, &key).unwrap();
+        assert_eq!(open(again), b"clip to swap");
+        job.request_cancel();
+        assert_eq!(
+            store.reap(Duration::from_secs(3600)),
+            1,
+            "the job's end ends it"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

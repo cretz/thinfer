@@ -22,7 +22,9 @@ use thinfer_core::weight::{WeightId, WeightReader, WeightSource};
 use thinfer_core::workspace::{BatchScope, Workspace, WsBuf};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::llm::experts::{DOWN, ExpertCache, ExpertError, ExpertTensors, GATE, Prefetch, UP};
+use crate::llm::experts::{
+    DOWN, ExpertCache, ExpertError, ExpertTensors, GATE, HostTier, Prefetch, UP,
+};
 use crate::llm::kernels::{Act, LlmPipelines, Mat, act_bytes};
 
 pub type Buf<'s> = thinfer_core::workspace::BatchBuf<'s>;
@@ -641,6 +643,22 @@ pub struct Decoder<S: WeightSource, B: Blocks> {
     pub times: PhaseTimes,
 }
 
+/// Frees every weight the decoder made resident (dense pins included): the
+/// device may outlive the model (a warm device), and nothing a job loaded
+/// may stay on it. Queued accelerator work that may still read them (an
+/// early exit) finishes first.
+impl<S: WeightSource, B: Blocks> Drop for Decoder<S, B> {
+    fn drop(&mut self) {
+        let backend = self.experts.backend().clone();
+        if let Some(acc) = backend.accelerator()
+            && let Err(e) = acc.join_ahead().and_then(|()| acc.sync())
+        {
+            tracing::warn!(target: thinfer_core::trace::ADAPTER, "decoder drop: accelerator sync failed: {e}");
+        }
+        self.residency.evict_all_and_free(&*backend);
+    }
+}
+
 impl<S: WeightSource, B: Blocks> Decoder<S, B> {
     /// Pin every dense weight (they are touched every token) and size the
     /// routed-expert pool from what the VRAM budget leaves after them, the
@@ -829,10 +847,19 @@ impl<S: WeightSource, B: Blocks> Decoder<S, B> {
     /// one stream per token with a short per-layer sync to fill the routed
     /// experts by DMA from a page-locked host cache sized by the RAM budget
     /// (less [`HOST_RESERVE`] for the rest of the request). `Ok(false)` = no
-    /// accelerator LLM kernels (the wgpu path stays).
-    pub fn enable_accel(&mut self, backend: &WgpuBackend) -> Result<bool, LlmError> {
+    /// accelerator LLM kernels (the wgpu path stays). `reuse`: the host tier
+    /// of an earlier decoder of these same weights ([`Self::take_host_tier`]).
+    pub fn enable_accel(
+        &mut self,
+        backend: &WgpuBackend,
+        reuse: Option<HostTier>,
+    ) -> Result<bool, LlmError> {
         if !backend.accelerator().is_some_and(|a| a.accepts_llm()) {
             return Ok(false);
+        }
+        // A model kept between jobs enables it once.
+        if self.experts.accel_enabled() {
+            return Ok(true);
         }
         let host = self
             .residency
@@ -841,8 +868,14 @@ impl<S: WeightSource, B: Blocks> Decoder<S, B> {
             .saturating_sub(HOST_RESERVE)
             .min(self.experts_total_bytes());
         let experts = self.blocks.dims().experts;
-        self.experts.enable_accel(backend, experts, host)?;
+        self.experts.enable_accel(backend, experts, host, reuse)?;
         Ok(true)
+    }
+
+    /// Take the page-locked host expert cache out, to outlive this decoder's
+    /// VRAM (see [`HostTier`]). `None` off the accelerator path.
+    pub fn take_host_tier(&mut self) -> Option<HostTier> {
+        self.experts.take_host()
     }
 
     /// Bytes of every routed expert.

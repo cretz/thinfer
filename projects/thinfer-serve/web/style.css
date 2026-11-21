@@ -394,6 +394,12 @@ details.panel[open] > summary {
 
 /* Cancel stays reachable on a phone: full width, thumb-sized, pinned to the
    bottom of the viewport while the page scrolls. */
+.job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
 #cancel {
   position: sticky;
   bottom: 0.75rem;

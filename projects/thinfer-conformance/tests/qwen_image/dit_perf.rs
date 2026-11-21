@@ -145,7 +145,7 @@ async fn dit_perf() {
         .expect("compile dit pipelines");
 
     let scratch = Workspace::new(Arc::clone(&backend), Arc::clone(residency.arbiter()));
-    let dit = QwenImageDit::new();
+    let dit = QwenImageDit::new(false);
 
     let mut step_ms = Vec::with_capacity(steps);
     for s in 0..steps {

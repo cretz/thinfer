@@ -12,6 +12,7 @@
 //! DiT forward per step over the whole `[48, f_lat, h, w]` latent with a single
 //! scalar timestep, renoised between steps.
 
+use crate::common::{Generated, StepControl, StepState};
 use std::sync::Arc;
 
 use thinfer_core::arbiter::RECLAIM_EVICTABLE_WEIGHTS;
@@ -279,6 +280,8 @@ pub enum GenerateError<SE: core::fmt::Debug> {
     /// denoise loop bailed at a step boundary. Not an error condition -- the
     /// front end maps it to a "cancelled" job state, not a failure.
     Cancelled,
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for GenerateError<SE> {
@@ -794,13 +797,39 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         progress: ProgressFn<'_>,
         cancel: Cancel<'_>,
     ) -> Result<WanVideo, GenerateError<S::Error>> {
+        match self
+            .generate_ctl(params, vae, progress, cancel, StepControl::default())
+            .await?
+        {
+            Generated::Done(video) => Ok(video),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate`] that can stop at a step boundary (`ctl.stop_here`,
+    /// polled between steps and before the decode) and resume there. The
+    /// text encode is recomputed on resume (deterministic); a multistep
+    /// sampler's history rides in the state, so the result matches an
+    /// uninterrupted run.
+    pub async fn generate_ctl(
+        &self,
+        params: &GenerationParams,
+        vae: VaeChoice,
+        progress: ProgressFn<'_>,
+        cancel: Cancel<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated<WanVideo>, GenerateError<S::Error>> {
         let mut workspace = Workspace::new(
             Arc::clone(&self.backend),
             Arc::clone(self.residency.arbiter()),
         );
-        let (latent, f_lat, h_lat, w_lat) = self
-            .denoise_with(params, None, &mut workspace, None, progress, cancel)
-            .await?;
+        let (latent, f_lat, h_lat, w_lat) = match self
+            .denoise_ctl(params, None, &mut workspace, None, progress, cancel, ctl)
+            .await?
+        {
+            Generated::Done(out) => out,
+            Generated::Stopped(state) => return Ok(Generated::Stopped(state)),
+        };
 
         if let Some(p) = progress {
             p(ProgressEvent::VaeDecode);
@@ -816,12 +845,12 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         } else {
             TEMPORAL_SCALE * f_lat - 3
         };
-        Ok(WanVideo {
+        Ok(Generated::Done(WanVideo {
             frames: frames.into(),
             num_frames,
             height: h_lat * self.vae_scale,
             width: w_lat * self.vae_scale,
-        })
+        }))
     }
 
     /// VAE-decode a pre-VAE latent (CTHW `[16, f_lat, h_lat, w_lat]`) to video
@@ -873,10 +902,38 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         params: &GenerationParams,
         initial_noise: Option<&[f32]>,
         workspace: &mut Workspace<WgpuBackend>,
-        mut step_diag: Option<&mut Vec<WanStepDiag>>,
+        step_diag: Option<&mut Vec<WanStepDiag>>,
         progress: ProgressFn<'_>,
         cancel: Cancel<'_>,
     ) -> Result<(Vec<f32>, usize, usize, usize), GenerateError<S::Error>> {
+        match self
+            .denoise_ctl(
+                params,
+                initial_noise,
+                workspace,
+                step_diag,
+                progress,
+                cancel,
+                StepControl::default(),
+            )
+            .await?
+        {
+            Generated::Done(out) => Ok(out),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn denoise_ctl(
+        &self,
+        params: &GenerationParams,
+        initial_noise: Option<&[f32]>,
+        workspace: &mut Workspace<WgpuBackend>,
+        mut step_diag: Option<&mut Vec<WanStepDiag>>,
+        progress: ProgressFn<'_>,
+        cancel: Cancel<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated<(Vec<f32>, usize, usize, usize)>, GenerateError<S::Error>> {
         if let Some(sink) = step_diag.as_deref_mut() {
             sink.clear();
         }
@@ -968,6 +1025,19 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             }
             None => gaussian_noise(n_lat, params.seed),
         };
+        // A resumed run starts at its step, from its latent (and its
+        // solver's history).
+        let (first, mut solver) = match ctl.resume {
+            Some(st) => {
+                if st.latent.len() != n_lat {
+                    return Err(GenerateError::ResumeMismatch);
+                }
+                sample = st.latent;
+                (st.step, Some(st.solver))
+            }
+            None => (0, None),
+        };
+        let stop_here = ctl.stop_here;
 
         // --- 4. DiT denoise (CFG-free). The DiT forward is byte-identical for
         // both samplers; only the schedule around it differs. UniPC (the served
@@ -1041,10 +1111,15 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             // block to_k/to_v weights, which differ between the experts.
             let mut ckv_high = WanCrossKvCache::new(self.cfg.num_layers);
             let mut ckv_low = WanCrossKvCache::new(self.cfg.num_layers);
-            for i in 0..n_steps {
+            for i in first.min(n_steps)..n_steps {
                 let _step = trace::scope!("step", i = i).entered();
                 if cancel.is_some_and(|c| c()) {
                     return Err(GenerateError::Cancelled);
+                }
+                // Between steps: a step boundary.
+                if i > first && stop_here.is_some_and(|c| c()) {
+                    self.residency.evict_all_and_free(&*self.backend);
+                    return Ok(Generated::Stopped(StepState::at(i, sample)));
                 }
                 if let Some(p) = progress {
                     p(ProgressEvent::Step {
@@ -1109,7 +1184,11 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             }
             self.residency.evict_all_and_free(&*self.backend);
             workspace.drain_pool();
-            return Ok((sample, f_lat, h_lat, w_lat));
+            // Before the decode: a step boundary.
+            if stop_here.is_some_and(|c| c()) {
+                return Ok(Generated::Stopped(StepState::at(n_steps, sample)));
+            }
+            return Ok(Generated::Done((sample, f_lat, h_lat, w_lat)));
         }
 
         // --- AnyFlow any-step flow-map path (`delta_embedder` configs): the
@@ -1120,10 +1199,15 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             let steps = params.steps.unwrap_or(ANYFLOW_DEFAULT_STEPS).max(1) as usize;
             let sampler = AnyFlowSampler::new(steps);
             let mut ckv = WanCrossKvCache::new(self.cfg.num_layers);
-            for i in 0..steps {
+            for i in first.min(steps)..steps {
                 let _step = trace::scope!("step", i = i).entered();
                 if cancel.is_some_and(|c| c()) {
                     return Err(GenerateError::Cancelled);
+                }
+                // Between steps: a step boundary.
+                if i > first && stop_here.is_some_and(|c| c()) {
+                    self.residency.evict_all_and_free(&*self.backend);
+                    return Ok(Generated::Stopped(StepState::at(i, sample)));
                 }
                 if let Some(p) = progress {
                     p(ProgressEvent::Step {
@@ -1192,21 +1276,30 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             }
             self.residency.evict_all_and_free(&*self.backend);
             workspace.drain_pool();
-            return Ok((sample, f_lat, h_lat, w_lat));
+            // Before the decode: a step boundary.
+            if stop_here.is_some_and(|c| c()) {
+                return Ok(Generated::Stopped(StepState::at(steps, sample)));
+            }
+            return Ok(Generated::Done((sample, f_lat, h_lat, w_lat)));
         }
 
         let dit = WanDit::assemble(self.dit_handles.clone(), shape(), self.cfg);
         let mut ckv = WanCrossKvCache::new(self.cfg.num_layers);
-        match params.sampler {
+        let n_steps = match params.sampler {
             // --- DMD: one DiT forward per fixed timestep, renoise between. The
             // step-diag taps live here (the parity/bisection path is DMD-only). ---
             VideoSampler::Dmd => {
                 let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
                 let n_steps = sampler.num_steps();
-                for i in 0..n_steps {
+                for i in first.min(n_steps)..n_steps {
                     let _step = trace::scope!("step", i = i).entered();
                     if cancel.is_some_and(|c| c()) {
                         return Err(GenerateError::Cancelled);
+                    }
+                    // Between steps: a step boundary.
+                    if i > first && stop_here.is_some_and(|c| c()) {
+                        self.residency.evict_all_and_free(&*self.backend);
+                        return Ok(Generated::Stopped(StepState::at(i, sample)));
                     }
                     if let Some(p) = progress {
                         p(ProgressEvent::Step {
@@ -1310,6 +1403,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         workspace.drain_pool();
                     }
                 }
+                n_steps
             }
             // --- UniPC multistep (flow_shift=8.0, CFG-free): feed each step's DiT
             // velocity into the FlowUniPc solver; no renoise, no guidance. Same DiT
@@ -1317,10 +1411,22 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
             VideoSampler::UniPc { steps } => {
                 let mut unipc = FlowUniPc::new(&UniPcConfig::fastwan(steps));
                 let n_steps = unipc.num_steps();
-                for i in 0..n_steps {
+                if first > 0 && !solver.take().is_some_and(|state| unipc.restore(state)) {
+                    return Err(GenerateError::ResumeMismatch);
+                }
+                for i in first.min(n_steps)..n_steps {
                     let _step = trace::scope!("step", i = i).entered();
                     if cancel.is_some_and(|c| c()) {
                         return Err(GenerateError::Cancelled);
+                    }
+                    // Between steps: a step boundary.
+                    if i > first && stop_here.is_some_and(|c| c()) {
+                        self.residency.evict_all_and_free(&*self.backend);
+                        return Ok(Generated::Stopped(StepState {
+                            step: i,
+                            latent: sample,
+                            solver: unipc.state(),
+                        }));
                     }
                     if let Some(p) = progress {
                         p(ProgressEvent::Step {
@@ -1355,13 +1461,18 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
                         workspace.drain_pool();
                     }
                 }
+                n_steps
             }
-        }
+        };
 
         // Phase boundary: DiT weights dead until VAE.
         self.residency.evict_all_and_free(&*self.backend);
         workspace.drain_pool();
-        Ok((sample, f_lat, h_lat, w_lat))
+        // Before the decode: a step boundary.
+        if stop_here.is_some_and(|c| c()) {
+            return Ok(Generated::Stopped(StepState::at(n_steps, sample)));
+        }
+        Ok(Generated::Done((sample, f_lat, h_lat, w_lat)))
     }
 
     /// Bringup diagnostic: tokenize -> umT5 -> ONE DiT forward (step 0) with all

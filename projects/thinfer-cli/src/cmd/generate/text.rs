@@ -52,6 +52,8 @@ pub struct GenerateText {
     #[arg(long)]
     pub seed: Option<u64>,
     /// Constrain the reply (after any thinking) to this JSON Schema file.
+    /// Output is single-line JSON, and objects with `properties` are closed
+    /// to other keys unless the schema says otherwise.
     #[arg(long, conflicts_with = "grammar")]
     pub schema: Option<PathBuf>,
     /// Constrain the reply (after any thinking) to this Lark grammar file.
@@ -148,9 +150,9 @@ fn tool_choice(arg: Option<&str>) -> ToolChoice {
     }
 }
 
-/// Where replies come from: this machine (keeping the conversation's model
-/// state between tool rounds) or a `--remote` server (stateless: the whole
-/// conversation each round).
+/// Where replies come from: this machine or a `--remote` server, either way
+/// keeping the conversation's model state between tool rounds so a round
+/// prefills only the tool results.
 enum Runner {
     /// A fresh device per reply (as the server does per job): a round
     /// leaves no VRAM behind for the next model load.
@@ -160,7 +162,13 @@ enum Runner {
         /// in RAM only), and how many messages it covers.
         state: Option<(Vec<StateChunk>, String, usize)>,
     },
-    Remote(RemoteExecutor),
+    Remote {
+        executor: RemoteExecutor,
+        /// The server session holding the conversation (tool rounds only;
+        /// `None` when the server would not open one), the node to continue
+        /// from and how many messages it covers.
+        session: Option<(thinfer_client::Session, Option<String>, usize)>,
+    },
 }
 
 pub async fn run_text(args: GenerateText) -> Result<(), String> {
@@ -175,7 +183,26 @@ pub async fn run_text(args: GenerateText) -> Result<(), String> {
     convo.push(TextMessage::new("user", args.prompt.as_str()));
 
     let mut runner = match &args.remote.remote {
-        Some(_) => Runner::Remote(args.remote.executor()?),
+        Some(_) => {
+            let executor = args.remote.executor()?;
+            let session = if defs.is_empty() {
+                None
+            } else {
+                match executor
+                    .client()
+                    .create_session(Some(args.model), None)
+                    .await
+                {
+                    Ok(s) => Some((s, None, 0)),
+                    // Still works, resending the conversation each round.
+                    Err(e) => {
+                        eprintln!("no server session ({e}); resending the conversation each round");
+                        None
+                    }
+                }
+            };
+            Runner::Remote { executor, session }
+        }
         None => {
             let ram = parse_budget(
                 "--ram-budget",
@@ -206,20 +233,54 @@ pub async fn run_text(args: GenerateText) -> Result<(), String> {
     };
 
     let sink = CliSink::new();
+    let out = rounds(
+        &args,
+        &tools,
+        &defs,
+        &choice,
+        &format,
+        &mut convo,
+        &mut runner,
+        &sink,
+    )
+    .await;
+    // The server session goes with the conversation.
+    if let Runner::Remote {
+        executor,
+        session: Some((s, ..)),
+    } = &runner
+        && let Err(e) = executor.client().delete_session(s).await
+    {
+        eprintln!("could not delete the server session: {e}");
+    }
+    out
+}
+
+/// The tool rounds: reply, run its calls, continue with the results.
+#[allow(clippy::too_many_arguments)]
+async fn rounds(
+    args: &GenerateText,
+    tools: &[ToolEntry],
+    defs: &[ToolDef],
+    choice: &ToolChoice,
+    format: &Option<TextFormat>,
+    convo: &mut Vec<TextMessage>,
+    runner: &mut Runner,
+    sink: &CliSink,
+) -> Result<(), String> {
     for round in 0..=args.max_tool_rounds {
-        let summary =
-            match run_once(&args, &defs, &choice, &format, &convo, &mut runner, &sink).await {
-                Ok(s) => s,
-                // The request path keeps the compiler's message out (it quotes
-                // job data); this is the user's own terminal, so show it.
-                Err(e) if tools::is_rejection(&e) => {
-                    return Err(tools::explain(args.model, &defs, &choice, format.as_ref()));
-                }
-                Err(e) if text_format::is_rejection(&e) && format.is_some() => {
-                    return Err(text_format::explain(args.model, format.as_ref().unwrap()));
-                }
-                Err(e) => return Err(e),
-            };
+        let summary = match run_once(args, defs, choice, format, convo, runner, sink).await {
+            Ok(s) => s,
+            // The request path keeps the compiler's message out (it quotes
+            // job data); this is the user's own terminal, so show it.
+            Err(e) if tools::is_rejection(&e) => {
+                return Err(tools::explain(args.model, defs, choice, format.as_ref()));
+            }
+            Err(e) if text_format::is_rejection(&e) && format.is_some() => {
+                return Err(text_format::explain(args.model, format.as_ref().unwrap()));
+            }
+            Err(e) => return Err(e),
+        };
         sink.footer(&summary);
         if summary.tool_calls.is_empty() {
             return Ok(());
@@ -307,10 +368,18 @@ async fn run_once(
     sink: &CliSink,
 ) -> Result<JobSummary, String> {
     match runner {
-        Runner::Remote(executor) => {
+        Runner::Remote { executor, session } => {
+            // With a session, only what follows the last reply's node.
+            let (messages, from) = match session {
+                Some((s, Some(node), covered)) => {
+                    (convo[*covered..].to_vec(), Some(s.at(Some(node))))
+                }
+                Some((s, None, _)) => (convo.to_vec(), Some(s.at(None))),
+                None => (convo.to_vec(), None),
+            };
             let spec = JobSpec::Text(TextSpec {
                 model: Some(args.model),
-                messages: convo.to_vec(),
+                messages,
                 max_tokens: Some(args.max_tokens),
                 think: Some(args.think),
                 temperature: args.temperature,
@@ -321,12 +390,19 @@ async fn run_once(
                 repetition_penalty: args.repetition_penalty,
                 seed: args.seed,
                 format: format.clone(),
-                session: None,
+                session: from,
                 tools: defs.to_vec(),
                 tool_choice: (!defs.is_empty()).then(|| choice.clone()),
             });
             let output = args.output.clone().unwrap_or_default();
-            executor.run(&spec, &output, sink).await
+            let (summary, node) = executor.run_in_session(&spec, &output, sink).await?;
+            if let Some((_, last, covered)) = session {
+                // The reply's assistant turn (pushed next) is in the node. No
+                // node (not kept): the next round resends from a new root.
+                *covered = if node.is_some() { convo.len() + 1 } else { 0 };
+                *last = node;
+            }
+            Ok(summary)
         }
         Runner::Local { budget, state } => {
             // With tools the reply's model state is kept (in RAM) so the next
@@ -338,6 +414,7 @@ async fn run_once(
                     Some(TextSession {
                         path: Vec::new(),
                         weights: None,
+                        tail: Default::default(),
                     }),
                 ),
                 (false, Some((path, weights, covered))) => (
@@ -345,6 +422,7 @@ async fn run_once(
                     Some(TextSession {
                         path,
                         weights: Some(weights),
+                        tail: Default::default(),
                     }),
                 ),
             };

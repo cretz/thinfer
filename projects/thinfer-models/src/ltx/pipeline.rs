@@ -21,6 +21,7 @@ use super::dit::{
 };
 use super::patchify;
 use super::sampler::{self, AudioLatentDims, VideoLatentDims};
+use crate::common::{Generated, SolverState, StepControl, StepState};
 
 use thinfer_core::backend::WgpuBackend;
 use thinfer_core::residency::WeightResidency;
@@ -209,6 +210,53 @@ pub async fn denoise_loop<S: WeightSource>(
     model: &DitModel,
     s: Streams,
     sigmas: &[f32],
+    latent_v: Vec<f32>,
+    latent_a: Vec<f32>,
+    vtext: &[f32],
+    atext: &[f32],
+    freqs: &HostFreqs,
+    cond: Option<I2vCond<'_>>,
+    progress: Option<&dyn Fn(usize)>,
+) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
+    match denoise_loop_ctl(
+        backend,
+        pipes,
+        residency,
+        workspace,
+        model,
+        s,
+        sigmas,
+        latent_v,
+        latent_a,
+        vtext,
+        atext,
+        freqs,
+        cond,
+        progress,
+        StepControl::default(),
+    )
+    .await?
+    {
+        Generated::Done(out) => Ok(out),
+        Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+    }
+}
+
+/// [`denoise_loop`] that can stop at a step boundary (`ctl.stop_here`,
+/// polled between steps and after the last) and resume there. The state's
+/// latent is the video's; its solver carries the audio latent and the step
+/// cache (`[audio, prev video, cached video velocity, cached audio
+/// velocity]`, `[staleness bits, skipped]`), so a resumed run matches an
+/// uninterrupted one.
+#[allow(clippy::too_many_arguments)]
+pub async fn denoise_loop_ctl<S: WeightSource>(
+    backend: &WgpuBackend,
+    pipes: &DitPipelines,
+    residency: &WeightResidency<S>,
+    workspace: &Workspace<WgpuBackend>,
+    model: &DitModel,
+    s: Streams,
+    sigmas: &[f32],
     mut latent_v: Vec<f32>,
     mut latent_a: Vec<f32>,
     vtext: &[f32],
@@ -216,7 +264,8 @@ pub async fn denoise_loop<S: WeightSource>(
     freqs: &HostFreqs,
     cond: Option<I2vCond<'_>>,
     progress: Option<&dyn Fn(usize)>,
-) -> Result<(Vec<f32>, Vec<f32>), DitError<S::Error>> {
+    ctl: StepControl<'_>,
+) -> Result<Generated<(Vec<f32>, Vec<f32>)>, DitError<S::Error>> {
     // Step-invariant inputs (caption KV, rope freqs, ones gains) upload ONCE;
     // every step's forward binds the same buffers.
     let inputs = DitLoopInputs::upload(backend, pipes, workspace, vtext, atext, freqs)
@@ -229,8 +278,61 @@ pub async fn denoise_loop<S: WeightSource>(
     let mut cached: Option<(Vec<f32>, Vec<f32>)> = None;
     let mut staleness = 0.0f32;
     let mut skipped = 0usize;
+    let n_steps = sigmas.len().saturating_sub(1);
+    let first = match ctl.resume {
+        Some(st) => {
+            let mut v = st.solver.vecs.into_iter();
+            let (Some(Some(a)), Some(prev), Some(cv), Some(ca), &[stale, skip]) = (
+                v.next(),
+                v.next(),
+                v.next(),
+                v.next(),
+                st.solver.ints.as_slice(),
+            ) else {
+                return Err(DitError::ResumeMismatch);
+            };
+            if st.step > n_steps || st.latent.len() != latent_v.len() || a.len() != latent_a.len() {
+                return Err(DitError::ResumeMismatch);
+            }
+            (latent_v, latent_a, prev_latent_v) = (st.latent, a, prev);
+            cached = cv.zip(ca);
+            staleness = f32::from_bits(stale as u32);
+            skipped = skip as usize;
+            st.step
+        }
+        None => 0,
+    };
+    let state = |step: usize,
+                 latent_v: Vec<f32>,
+                 latent_a: Vec<f32>,
+                 prev: Option<Vec<f32>>,
+                 cached: Option<(Vec<f32>, Vec<f32>)>,
+                 staleness: f32,
+                 skipped: usize| {
+        let (cv, ca) = cached.unzip();
+        StepState {
+            step,
+            latent: latent_v,
+            solver: SolverState {
+                vecs: vec![Some(latent_a), prev, cv, ca],
+                ints: vec![u64::from(staleness.to_bits()), skipped as u64],
+            },
+        }
+    };
     let last_step = sigmas.len().saturating_sub(2);
-    for (step, w) in sigmas.windows(2).enumerate() {
+    for (step, w) in sigmas.windows(2).enumerate().skip(first) {
+        // Between steps: a step boundary.
+        if step > first && ctl.stop_here.is_some_and(|c| c()) {
+            return Ok(Generated::Stopped(state(
+                step,
+                latent_v,
+                latent_a,
+                prev_latent_v,
+                cached,
+                staleness,
+                skipped,
+            )));
+        }
         let (sigma, sigma_next) = (w[0], w[1]);
         // Never skip the final step: it sets the latent the VAE actually decodes.
         if let Some(pv) = &prev_latent_v {
@@ -274,7 +376,19 @@ pub async fn denoise_loop<S: WeightSource>(
             sigmas.len() - 1
         );
     }
-    Ok((latent_v, latent_a))
+    // After the last step: a step boundary (the next stage, or the decode).
+    if ctl.stop_here.is_some_and(|c| c()) {
+        return Ok(Generated::Stopped(state(
+            n_steps,
+            latent_v,
+            latent_a,
+            prev_latent_v,
+            cached,
+            staleness,
+            skipped,
+        )));
+    }
+    Ok(Generated::Done((latent_v, latent_a)))
 }
 
 #[cfg(test)]

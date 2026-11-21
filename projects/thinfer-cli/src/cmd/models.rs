@@ -54,3 +54,23 @@ fn notes(manifest: Option<&ModelManifest>, cuda: bool) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The catalog lists models from the `ALL` arrays (no clap on the
+    /// server); they must hold every variant.
+    #[test]
+    fn all_lists_cover_every_variant() {
+        assert_eq!(ImageModelId::ALL.as_slice(), ImageModelId::value_variants());
+        assert_eq!(VideoModelId::ALL.as_slice(), VideoModelId::value_variants());
+        assert_eq!(SwapModel::ALL.as_slice(), SwapModel::value_variants());
+        // The text list predates this check and keeps its own order.
+        let mut text = TextModelId::ALL.to_vec();
+        text.sort_by_key(|m| m.to_string());
+        let mut parsed = TextModelId::value_variants().to_vec();
+        parsed.sort_by_key(|m| m.to_string());
+        assert_eq!(text, parsed);
+    }
+}

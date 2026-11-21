@@ -16,6 +16,7 @@
 //! token ids; the CLI wiring will supply a Qwen3-VL chat-template tokenizer):
 //! `generate` takes `token_ids` directly.
 
+use crate::common::{Generated, StepControl, StepState};
 use std::sync::Arc;
 
 use thinfer_core::arbiter::RECLAIM_EVICTABLE_WEIGHTS;
@@ -138,8 +139,13 @@ pub enum GenerateError<SE: core::fmt::Debug> {
     Wgpu(WgpuError),
     Residency(ResidencyError<SE, WgpuError>),
     Png(String),
-    InvalidDims { height: u32, width: u32 },
+    InvalidDims {
+        height: u32,
+        width: u32,
+    },
     EmptyPrompt,
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for GenerateError<SE> {
@@ -353,6 +359,24 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
         initial_noise: Option<&[f32]>,
         progress: ProgressFn<'_>,
     ) -> Result<(Vec<f32>, Vec<f32>, ImageGrid), GenerateError<S::Error>> {
+        match self
+            .generate_rgb_ctl(params, initial_noise, progress, StepControl::default())
+            .await?
+        {
+            Generated::Done(out) => Ok(out),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate_rgb`] that can stop at a step boundary (`ctl`) and
+    /// resume there; the encode is recomputed on resume (deterministic).
+    pub async fn generate_rgb_ctl(
+        &self,
+        params: &GenerationParams,
+        initial_noise: Option<&[f32]>,
+        progress: ProgressFn<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated<(Vec<f32>, Vec<f32>, ImageGrid)>, GenerateError<S::Error>> {
         if params.token_ids.is_empty() {
             return Err(GenerateError::EmptyPrompt);
         }
@@ -380,59 +404,6 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
         );
 
         // --- 1. encode ---
-        if let Some(p) = progress {
-            p(ProgressEvent::TextEncode);
-        }
-        let qout = {
-            let _s = trace::scope!("ideogram.encode", tokens = params.token_ids.len()).entered();
-            self.encoder
-                .encode(
-                    &self.backend,
-                    &self.encoder_pipelines,
-                    &self.residency,
-                    &workspace,
-                    &self.encoder_handles,
-                    self.residency.source(),
-                    &params.token_ids,
-                    false,
-                )
-                .await?
-        };
-        let num_text = qout.seq;
-        // Phase boundary: encoder weights dead; free for the DiT phase.
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        // --- 2. DiT no-CFG Euler denoise loop ---
-        let seq = num_text + num_image;
-        let dit = Ideogram4Dit::assemble(self.dit_handles.clone(), seq);
-        // Fill VRAM to budget: pin a deterministic prefix of the DiT weights for
-        // the denoise phase so steps 2..N skip their re-upload (the ring streams
-        // only the remainder). Pin-on-first-touch -- step 1 uploads as usual,
-        // pinned entries just aren't evicted afterwards. The headroom reserve
-        // keeps the rings, the packer's workspace, and one staging buffer out of
-        // the pinned span. This is per-request (mirrors `ZImageDit`): the
-        // `evict_all_and_free` after the loop drops the plan so the VAE phase
-        // (and any following request) reclaims the VRAM -- no cross-request
-        // residue.
-        {
-            let vram = self.residency.budget().vram_bytes;
-            let reserve = self
-                .residency
-                .ring_reserved_bytes()
-                .saturating_add(dit.workspace_reserve_estimate(&self.dit_main_pipelines))
-                .saturating_add(self.residency.staging_reserve_bytes());
-            let pin_budget = vram.saturating_sub(reserve);
-            let (pin_bytes, pin_count) =
-                self.residency.set_pin_plan(&dit.pin_priority(), pin_budget);
-            tracing::info!(
-                pinned_mib = pin_bytes / (1024 * 1024),
-                pinned_count = pin_count,
-                pin_budget_mib = pin_budget / (1024 * 1024),
-                reserve_mib = reserve / (1024 * 1024),
-                "ideogram4 dit pin plan"
-            );
-        }
         let steps = build_steps(
             params.steps as usize,
             params.height as usize,
@@ -440,55 +411,137 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
             params.mu,
             params.std,
         );
-        let mut z: Vec<f32> = match initial_noise {
-            Some(buf) => {
-                assert_eq!(
-                    buf.len(),
-                    num_image * super::config::IN_CHANNELS,
-                    "noise len"
-                );
-                buf.to_vec()
-            }
-            None => gaussian_noise(num_image * super::config::IN_CHANNELS, params.seed),
-        };
-        {
-            let _s = trace::scope!("ideogram.denoise", steps = params.steps, seq).entered();
-            for (i, step) in steps.iter().enumerate() {
-                if let Some(p) = progress {
-                    p(ProgressEvent::Step {
-                        i: i as u32 + 1,
-                        n: params.steps,
-                    });
+
+        // A resumed run starts at its step, from its latent.
+        let (first, mut z) = match ctl.resume {
+            Some(st) => {
+                if st.step > steps.len()
+                    || st.latent.len() != num_image * super::config::IN_CHANNELS
+                {
+                    return Err(GenerateError::ResumeMismatch);
                 }
-                let inputs = DitInputs {
-                    llm_features: &qout.features,
-                    num_text,
-                    noise: &z,
-                    grid,
-                    timestep: step.t_val as f32,
-                };
-                let velocity = dit
-                    .forward(
+                (st.step, st.latent)
+            }
+            None => (
+                0,
+                match initial_noise {
+                    Some(buf) => {
+                        assert_eq!(
+                            buf.len(),
+                            num_image * super::config::IN_CHANNELS,
+                            "noise len"
+                        );
+                        buf.to_vec()
+                    }
+                    None => gaussian_noise(num_image * super::config::IN_CHANNELS, params.seed),
+                },
+            ),
+        };
+        // Denoised already: straight to the decode.
+        if first < steps.len() {
+            if let Some(p) = progress {
+                p(ProgressEvent::TextEncode);
+            }
+            let qout = {
+                let _s =
+                    trace::scope!("ideogram.encode", tokens = params.token_ids.len()).entered();
+                self.encoder
+                    .encode(
                         &self.backend,
-                        &self.dit_main_pipelines,
-                        &self.dit_dense_pipelines,
+                        &self.encoder_pipelines,
                         &self.residency,
                         &workspace,
-                        &inputs,
+                        &self.encoder_handles,
+                        self.residency.source(),
+                        &params.token_ids,
+                        false,
                     )
-                    .await?;
-                debug_assert_eq!(velocity.len(), z.len());
-                let delta = step.delta as f32;
-                for (zi, &v) in z.iter_mut().zip(velocity.iter()) {
-                    *zi += v * delta;
+                    .await?
+            };
+            let num_text = qout.seq;
+            // Phase boundary: encoder weights dead; free for the DiT phase.
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+
+            // --- 2. DiT no-CFG Euler denoise loop ---
+            let seq = num_text + num_image;
+            let dit = Ideogram4Dit::assemble(self.dit_handles.clone(), seq);
+            // Fill VRAM to budget: pin a deterministic prefix of the DiT weights for
+            // the denoise phase so steps 2..N skip their re-upload (the ring streams
+            // only the remainder). Pin-on-first-touch -- step 1 uploads as usual,
+            // pinned entries just aren't evicted afterwards. The headroom reserve
+            // keeps the rings, the packer's workspace, and one staging buffer out of
+            // the pinned span. This is per-request (mirrors `ZImageDit`): the
+            // `evict_all_and_free` after the loop drops the plan so the VAE phase
+            // (and any following request) reclaims the VRAM -- no cross-request
+            // residue.
+            {
+                let vram = self.residency.budget().vram_bytes;
+                let reserve = self
+                    .residency
+                    .ring_reserved_bytes()
+                    .saturating_add(dit.workspace_reserve_estimate(&self.dit_main_pipelines))
+                    .saturating_add(self.residency.staging_reserve_bytes());
+                let pin_budget = vram.saturating_sub(reserve);
+                let (pin_bytes, pin_count) =
+                    self.residency.set_pin_plan(&dit.pin_priority(), pin_budget);
+                tracing::info!(
+                    pinned_mib = pin_bytes / (1024 * 1024),
+                    pinned_count = pin_count,
+                    pin_budget_mib = pin_budget / (1024 * 1024),
+                    reserve_mib = reserve / (1024 * 1024),
+                    "ideogram4 dit pin plan"
+                );
+            }
+            {
+                let _s = trace::scope!("ideogram.denoise", steps = params.steps, seq).entered();
+                for (i, step) in steps.iter().enumerate().skip(first) {
+                    // Between steps: a step boundary.
+                    if i > first && ctl.stop_here.is_some_and(|c| c()) {
+                        self.residency.evict_all_and_free(&*self.backend);
+                        return Ok(Generated::Stopped(StepState::at(i, z)));
+                    }
+                    if let Some(p) = progress {
+                        p(ProgressEvent::Step {
+                            i: i as u32 + 1,
+                            n: params.steps,
+                        });
+                    }
+                    let inputs = DitInputs {
+                        llm_features: &qout.features,
+                        num_text,
+                        noise: &z,
+                        grid,
+                        timestep: step.t_val as f32,
+                    };
+                    let velocity = dit
+                        .forward(
+                            &self.backend,
+                            &self.dit_main_pipelines,
+                            &self.dit_dense_pipelines,
+                            &self.residency,
+                            &workspace,
+                            &inputs,
+                        )
+                        .await?;
+                    debug_assert_eq!(velocity.len(), z.len());
+                    let delta = step.delta as f32;
+                    for (zi, &v) in z.iter_mut().zip(velocity.iter()) {
+                        *zi += v * delta;
+                    }
                 }
             }
-        }
-        // Phase boundary: DiT weights dead; free for VAE.
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
+            // Phase boundary: DiT weights dead; free for VAE.
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
 
-        // --- 3. VAE decode -> RGB CHW [-1,1] ---
+            // --- 3. VAE decode -> RGB CHW [-1,1] ---
+            // Before the decode: a step boundary.
+            if ctl.stop_here.is_some_and(|c| c()) {
+                return Ok(Generated::Stopped(StepState::at(steps.len(), z)));
+            }
+        }
+
         if let Some(p) = progress {
             p(ProgressEvent::VaeDecode);
         }
@@ -505,7 +558,7 @@ impl<S: WeightSource> Ideogram4Pipeline<S> {
             )
             .await?;
         self.residency.evict_all_and_free(&*self.backend);
-        Ok((rgb, z, grid))
+        Ok(Generated::Done((rgb, z, grid)))
     }
 }
 

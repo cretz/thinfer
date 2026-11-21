@@ -52,6 +52,11 @@ const VAE_SPATIAL: usize = 16;
 const VAE_TEMPORAL: usize = 4;
 const LATENT_CHANNELS: usize = 32;
 
+/// The t2v paused-run layout (see [`crate::checkpoint::take_steps`]).
+const PAUSED_TAG: &str = "hunyuan-t2v/1";
+/// The i2v paused-run layout.
+const I2V_PAUSED_TAG: &str = "hunyuan-i2v/1";
+
 /// Run a HunyuanVideo 1.5 T2V generate to completion. `req.model` must be the
 /// Hunyuan id (the caller dispatches on [`crate::model::VideoModelId::is_hunyuan`]).
 pub async fn run(
@@ -94,17 +99,25 @@ pub async fn run(
     // incoherent video. Expand it via the rewrite endpoint; fall back to the
     // original on any failure (rewriting never blocks a run). Prompt text is
     // never logged.
-    let rewritten = crate::rewrite::maybe_rewrite_prompt(
-        req.rewrite,
-        req.rewrite_quality,
-        crate::rewrite::T2V_REWRITE_SYSTEM_PROMPT,
-        raw_prompt,
-        backend,
-        manifest,
-        req.budget.vram_bytes,
-        sink,
-    )
-    .await;
+    // A resumed run: the seed it drew, where it stood, and the prompt it
+    // conditioned on (no second rewrite).
+    let resume = crate::checkpoint::take_steps(sink, PAUSED_TAG)?;
+    let rewritten = match resume.as_ref().and_then(|r| r.prompt.clone()) {
+        Some(p) => Some(p.to_string()),
+        None => {
+            crate::rewrite::maybe_rewrite_prompt(
+                req.rewrite,
+                req.rewrite_quality,
+                crate::rewrite::T2V_REWRITE_SYSTEM_PROMPT,
+                raw_prompt,
+                backend,
+                manifest,
+                req.budget.vram_bytes,
+                sink,
+            )
+            .await
+        }
+    };
     let prompt = rewritten.as_deref().unwrap_or(raw_prompt);
     let full = build_chat_prompt(prompt);
     let ids_full = tokenizer
@@ -122,7 +135,12 @@ pub async fn run(
     }
     let seq = token_ids.len();
 
-    let seed = req.seed.unwrap_or_else(random_seed);
+    let seed = resume
+        .as_ref()
+        .map(|r| r.seed)
+        .or(req.seed)
+        .unwrap_or_else(random_seed);
+    let resume = resume.map(|r| r.state);
     tracing::info!(
         target: thinfer_core::trace::DIAG,
         model = %req.model, width = req.width, height = req.height,
@@ -234,8 +252,9 @@ pub async fn run(
             requested = ?req.attn_window,
             "hunyuan denoise attention window",
         );
-        let latent = dit
-            .denoise(
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let latent = match dit
+            .denoise_ctl(
                 backend,
                 &dit_res,
                 &dit_ws,
@@ -247,9 +266,24 @@ pub async fn run(
                 window,
                 Some(&step_progress),
                 Some(&cancel),
+                crate::checkpoint::step_control(resume, &stop_here),
             )
             .await
-            .map_err(|e| format!("denoise: {e:?}"))?;
+            .map_err(|e| format!("denoise: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done(latent) => latent,
+            thinfer_models::common::Generated::Stopped(st) => {
+                drop(dit_ws);
+                dit_res.evict_all_and_free(&**backend);
+                return Err(crate::checkpoint::stop_steps_with(
+                    sink,
+                    PAUSED_TAG,
+                    seed,
+                    Some(prompt),
+                    &st,
+                ));
+            }
+        };
         drop(dit_ws);
         dit_res.evict_all_and_free(&**backend); // return all DiT VRAM before VAE
         latent
@@ -485,7 +519,13 @@ pub async fn run_i2v(
     // model). Image runs skip it: the text-only rewriter can't see the image
     // and would describe a scene that contradicts it (image-aware rewrite is a
     // follow-up).
-    let rewritten = if pixels.is_none() {
+    // A resumed run: the seed it drew, where it stood, and the prompt it
+    // conditioned on (no second rewrite).
+    let resume = crate::checkpoint::take_steps(sink, I2V_PAUSED_TAG)?;
+    let resumed_prompt = resume.as_ref().and_then(|r| r.prompt.clone());
+    let rewritten = if let Some(p) = resumed_prompt {
+        Some(p.to_string())
+    } else if pixels.is_none() {
         crate::rewrite::maybe_rewrite_prompt(
             req.rewrite,
             req.rewrite_quality,
@@ -546,7 +586,12 @@ pub async fn run_i2v(
         ));
     }
 
-    let seed = req.seed.unwrap_or_else(random_seed);
+    let seed = resume
+        .as_ref()
+        .map(|r| r.seed)
+        .or(req.seed)
+        .unwrap_or_else(random_seed);
+    let resume = resume.map(|r| r.state);
     tracing::info!(
         target: thinfer_core::trace::DIAG,
         model = %req.model, width = req.width, height = req.height,
@@ -686,8 +731,9 @@ pub async fn run_i2v(
             })
         };
         let cancel = || sink.cancelled();
-        let latent = dit
-            .generate(
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let latent = match dit
+            .generate_ctl(
                 backend,
                 &dit_res,
                 &dit_ws,
@@ -700,9 +746,24 @@ pub async fn run_i2v(
                 &schedule,
                 Some(&step_progress),
                 Some(&cancel),
+                crate::checkpoint::step_control(resume, &stop_here),
             )
             .await
-            .map_err(|e| format!("ar denoise: {e:?}"))?;
+            .map_err(|e| format!("ar denoise: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done(latent) => latent,
+            thinfer_models::common::Generated::Stopped(st) => {
+                drop(dit_ws);
+                dit_res.evict_all_and_free(&**backend);
+                return Err(crate::checkpoint::stop_steps_with(
+                    sink,
+                    I2V_PAUSED_TAG,
+                    seed,
+                    Some(prompt),
+                    &st,
+                ));
+            }
+        };
         drop(dit_ws);
         dit_res.evict_all_and_free(&**backend);
         latent

@@ -10,8 +10,10 @@ use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::secmem::Locked;
 use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::workspace::Workspace;
-use thinfer_models::llm::chat;
+/// The engine's chat rendering (its session `Tail` is shared with the server).
+pub use thinfer_models::llm::chat;
 use thinfer_models::llm::decoder::{Blocks, Decoder, MAX_STEP, Want};
+use thinfer_models::llm::experts::HostTier;
 use thinfer_models::llm::gemma4::{Gemma4Config, Gemma4Model};
 use thinfer_models::llm::kernels::LlmPipelines;
 use thinfer_models::llm::manifest::role;
@@ -26,7 +28,7 @@ use crate::download::resolve_role;
 use crate::model::TextModelEngine;
 use crate::model::TextModelId;
 use crate::progress::ProgressSink;
-use crate::request::{JobSummary, SessionSave, TextRequest, TextStats};
+use crate::request::{JobSummary, SessionSave, TextRequest, TextSession, TextStats};
 use crate::text_format::{self, Constraint};
 use crate::tools::{self, FinishReason, Syntax};
 
@@ -51,23 +53,185 @@ pub fn chat_message(m: thinfer_client::wire::TextMessage) -> chat::ChatMessage {
 /// activation workspace: a step's routed-expert pairs are `step * top_k` rows).
 const PREFILL_CHUNK: usize = MAX_STEP as usize;
 
+/// A text model kept loaded between jobs on a warm device (see
+/// [`crate::LocalExecutor`]): its parsed tokenizer, template and configs, the
+/// constraint's tokenizer view, and (once a job loaded it) the compiled
+/// pipelines and the decoder with its resident weights and expert pool.
+/// Pristine model data only: every request's tokens, state and reply live in
+/// the job and go with it.
+///
+/// [`Self::release_device`] frees the model's VRAM but keeps its host side
+/// (see [`Parked`]), so the next text job skips the host work.
+pub struct WarmLlm {
+    model: TextModelId,
+    assets: Assets,
+    loaded: Option<Loaded>,
+    parked: Option<Parked>,
+    /// When a text job last finished on it.
+    last_used: Instant,
+}
+
+impl WarmLlm {
+    /// Free the loaded model's VRAM, keeping what the host holds for it:
+    /// the parsed assets, the compiled pipelines and the page-locked expert
+    /// cache.
+    pub fn release_device(&mut self) {
+        if let Some(l) = self.loaded.take() {
+            self.parked = Some(l.park());
+        }
+    }
+
+    /// Its model is on the device (not released to its host side).
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.is_some()
+    }
+
+    /// Time since a text job last used it.
+    pub fn idle(&self) -> std::time::Duration {
+        self.last_used.elapsed()
+    }
+
+    /// Page-locked host bytes held for it (the expert cache).
+    pub fn host_bytes(&self) -> u64 {
+        self.parked
+            .as_ref()
+            .and_then(|p| p.host.as_ref())
+            .map_or(0, HostTier::bytes)
+    }
+}
+
+/// A released model's host side, for the next load of the same weights:
+/// its compiled pipelines (no buffers) and page-locked expert cache.
+struct Parked {
+    weights: String,
+    pipes: LlmPipelines,
+    host: Option<HostTier>,
+}
+
+/// A model's host-side files, parsed.
+struct Assets {
+    tokenizer_json: std::path::PathBuf,
+    tokenizer: HfTokenizer,
+    template: String,
+    config: serde_json::Value,
+    gen_cfg: serde_json::Value,
+    /// The constraint's tokenizer view (built on the first grammar job).
+    env: Option<Arc<llguidance::toktrie::TokEnv>>,
+}
+
+impl Assets {
+    async fn load(model: TextModelId) -> Result<Self, String> {
+        let manifest = model.manifest();
+        let tokenizer_json = resolve_role(manifest, role::TOKENIZER)?;
+        let tokenizer = HfTokenizer::from_path(&tokenizer_json)
+            .await
+            .map_err(|e| format!("load tokenizer: {e:?}"))?;
+        let template = std::fs::read_to_string(resolve_role(manifest, role::CHAT_TEMPLATE)?)
+            .map_err(|e| format!("read chat template: {e}"))?;
+        Ok(Self {
+            tokenizer_json,
+            tokenizer,
+            template,
+            config: read_json(&resolve_role(manifest, role::CONFIG)?)?,
+            gen_cfg: read_json(&resolve_role(manifest, role::GENERATION_CONFIG)?)?,
+            env: None,
+        })
+    }
+}
+
+/// A loaded decoder and what it was sized for.
+struct Loaded {
+    weights: String,
+    /// The requested budget it was sized from.
+    budget: thinfer_core::policy::ResidencyBudget,
+    max_ctx: u32,
+    pipes: LlmPipelines,
+    model: AnyModel,
+}
+
+impl Loaded {
+    /// Free the model's VRAM; keep its host side.
+    fn park(self) -> Parked {
+        let Loaded {
+            weights,
+            pipes,
+            mut model,
+            ..
+        } = self;
+        let host = match &mut model {
+            AnyModel::Gemma4(m) => m.take_host_tier(),
+            AnyModel::Qwen35(m) => m.take_host_tier(),
+        };
+        Parked {
+            weights,
+            pipes,
+            host,
+        }
+    }
+}
+
+enum AnyModel {
+    Gemma4(Gemma4Model<GgufSource<MmapFileOpener>>),
+    Qwen35(Qwen35Model<GgufSource<MmapFileOpener>>),
+}
+
+/// A loaded model's context, rounded up so a conversation that grows a
+/// little (a session's next turn) still fits it.
+const CTX_STEP: u32 = 1024;
+
 pub async fn run(
     backend: &Arc<WgpuBackend>,
     req: &TextRequest,
     sink: &dyn ProgressSink,
+    warm: &mut Option<WarmLlm>,
 ) -> Result<JobSummary, String> {
     req.validate()?;
+    // Another model's warm state goes first (its VRAM and RAM).
+    if warm.as_ref().is_some_and(|w| w.model != req.model) {
+        *warm = None;
+    }
+    let mut w = match warm.take() {
+        Some(w) => w,
+        None => WarmLlm {
+            model: req.model,
+            assets: Assets::load(req.model).await?,
+            loaded: None,
+            parked: None,
+            last_used: Instant::now(),
+        },
+    };
+    let out = run_with(backend, req, sink, &mut w).await;
+    // Kept only after a clean job: a failure may leave the model mid-update.
+    if out.is_ok() {
+        w.last_used = Instant::now();
+        *warm = Some(w);
+    }
+    out
+}
+
+async fn run_with(
+    backend: &Arc<WgpuBackend>,
+    req: &TextRequest,
+    sink: &dyn ProgressSink,
+    w: &mut WarmLlm,
+) -> Result<JobSummary, String> {
     let manifest = req.model.manifest();
-    let tokenizer_json = resolve_role(manifest, role::TOKENIZER)?;
-    let tokenizer = HfTokenizer::from_path(&tokenizer_json)
-        .await
-        .map_err(|e| format!("load tokenizer: {e:?}"))?;
-    let template = std::fs::read_to_string(resolve_role(manifest, role::CHAT_TEMPLATE)?)
-        .map_err(|e| format!("read chat template: {e}"))?;
-    let config: serde_json::Value = read_json(&resolve_role(manifest, role::CONFIG)?)?;
-    let gen_cfg: serde_json::Value = read_json(&resolve_role(manifest, role::GENERATION_CONFIG)?)?;
-    let stop = eos_ids(&gen_cfg);
-    let syntax = Syntax::of(req.model, |t| single_token(&tokenizer, t))?;
+    let WarmLlm {
+        assets,
+        loaded,
+        parked,
+        ..
+    } = w;
+    let Assets {
+        tokenizer_json,
+        tokenizer,
+        template,
+        config,
+        gen_cfg,
+        env: env_cache,
+    } = assets;
+    let stop = eos_ids(gen_cfg);
+    let syntax = Syntax::of(req.model, |t| single_token(tokenizer, t))?;
     // The reply's grammar: the tools' call syntax (prose shaped by the format,
     // if any), else the format alone.
     let grammar = match (req.tools.is_empty(), &req.format) {
@@ -88,9 +252,14 @@ pub async fn run(
     // compiled) before any weights load: a bad schema fails fast.
     let grammar_env = match grammar {
         Some((g, rejected)) => {
-            let env = Arc::new(text_format::tok_env(&tokenizer_json, None, &stop)?);
+            let env = match env_cache {
+                Some(e) => e.clone(),
+                None => env_cache
+                    .insert(Arc::new(text_format::tok_env(tokenizer_json, None, &stop)?))
+                    .clone(),
+            };
             let gate = if req.think {
-                Some(single_token(&tokenizer, req.model.think_close())?)
+                Some(single_token(tokenizer, req.model.think_close())?)
             } else {
                 None
             };
@@ -120,19 +289,26 @@ pub async fn run(
         .as_ref()
         .and_then(|s| s.path.last())
         .map_or(0, |c| c.end);
-    let mut prompt = if resume_at > 0 {
-        chat::continuation(
-            &template,
+    // A prefix-only request (`max_tokens` 0) renders no generation prompt:
+    // later requests continue its turns.
+    let prefix_only = req.max_tokens == 0;
+    let mut prompt = match &req.session {
+        Some(s) if resume_at > 0 => chat::resume(
+            template,
+            &s.tail,
             &req.messages,
             &tool_defs,
             syntax.call_close(),
+            !prefix_only,
             req.think,
             &bos,
-        )?
-    } else {
-        chat::render(&template, &req.messages, &tool_defs, req.think, &bos)?
+        )?,
+        _ if prefix_only => {
+            chat::render_prefix(template, &req.messages, &tool_defs, req.think, &bos)?
+        }
+        _ => chat::render(template, &req.messages, &tool_defs, req.think, &bos)?,
     };
-    if req.messages.last().is_some_and(|m| m.role == "tool") {
+    if !prefix_only && req.messages.last().is_some_and(|m| m.role == "tool") {
         // Grown into a fresh buffer: the old one (prompt text) is wiped.
         let tail = syntax.after_results(req.think);
         let mut grown = String::with_capacity(prompt.len() + tail.len());
@@ -166,34 +342,108 @@ pub async fn run(
     {
         return Err("session was built with different model weights".into());
     }
-    let source = GgufSource::open(
-        MmapFileOpener::new(&gguf)
-            .await
-            .map_err(|e| format!("open gguf: {e:?}"))?,
-    )
-    .await
-    .map_err(|e| format!("parse gguf: {e:?}"))?;
-    sink.note(&format!(
-        "Loading {} ({} prompt tokens)",
-        req.model,
-        ids.len()
-    ));
-    let pipes = LlmPipelines::compile(backend)
-        .await
-        .map_err(|e| format!("compile llm pipelines: {e:?}"))?;
-    let load_err = |e| format!("model load: {e:?}");
-    // Inside what the OS keeps resident: past it allocations are demoted to
-    // system memory and every read crosses PCIe.
-    let mut budget = req.budget;
-    budget.vram_bytes =
-        thinfer_native::gpu_budget::resident_vram_budget(backend.wgpu_device(), budget.vram_bytes);
-    if budget.vram_bytes < req.budget.vram_bytes {
-        tracing::info!(
-            target: thinfer_core::trace::DIAG,
-            requested = req.budget.vram_bytes, resident = budget.vram_bytes,
-            "vram budget lowered to the OS-resident headroom",
+    // The loaded model when it is the same weights, requested budget and big
+    // enough; else it goes (its memory first) and the model loads fresh.
+    let fits = loaded
+        .as_ref()
+        .is_some_and(|l| l.weights == weights && l.budget == req.budget && l.max_ctx >= max_ctx);
+    if fits {
+        sink.note(&format!(
+            "Using loaded {} ({} prompt tokens)",
+            req.model,
+            ids.len()
+        ));
+    } else {
+        // The old model's VRAM goes; its host side (or the parked one) is
+        // reused when it is for these weights.
+        let carried = loaded
+            .take()
+            .map(Loaded::park)
+            .or_else(|| parked.take())
+            .filter(|p| p.weights == weights);
+        *parked = None;
+        // Inside what the OS keeps resident (measured with the old model
+        // gone): past it allocations are demoted to system memory and every
+        // read crosses PCIe.
+        let mut budget = req.budget;
+        budget.vram_bytes = thinfer_native::gpu_budget::resident_vram_budget(
+            backend.wgpu_device(),
+            budget.vram_bytes,
         );
+        if budget.vram_bytes < req.budget.vram_bytes {
+            tracing::info!(
+                target: thinfer_core::trace::DIAG,
+                requested = req.budget.vram_bytes, resident = budget.vram_bytes,
+                "vram budget lowered to the OS-resident headroom",
+            );
+        }
+        let source = GgufSource::open(
+            MmapFileOpener::new(&gguf)
+                .await
+                .map_err(|e| format!("open gguf: {e:?}"))?,
+        )
+        .await
+        .map_err(|e| format!("parse gguf: {e:?}"))?;
+        sink.note(&format!(
+            "Loading {} ({} prompt tokens)",
+            req.model,
+            ids.len()
+        ));
+        let (pipes, host) = match carried {
+            Some(p) => {
+                tracing::info!(
+                    target: thinfer_core::trace::DIAG,
+                    host_bytes = p.host.as_ref().map_or(0, HostTier::bytes),
+                    "llm host side reused",
+                );
+                (p.pipes, p.host)
+            }
+            None => (
+                LlmPipelines::compile(backend)
+                    .await
+                    .map_err(|e| format!("compile llm pipelines: {e:?}"))?,
+                None,
+            ),
+        };
+        let load_err = |e| format!("model load: {e:?}");
+        let ctx = max_ctx.div_ceil(CTX_STEP) * CTX_STEP;
+        let mut model = match req.model {
+            TextModelId::Qwen36_35bA3b => AnyModel::Qwen35(
+                Qwen35Model::load(
+                    backend,
+                    source,
+                    Qwen35Config::from_json(config)?,
+                    budget,
+                    ctx,
+                )
+                .map_err(load_err)?,
+            ),
+            TextModelId::Gemma4_26bA4b => AnyModel::Gemma4(
+                Gemma4Model::load(
+                    backend,
+                    source,
+                    Gemma4Config::from_json(config)?,
+                    budget,
+                    ctx,
+                )
+                .await
+                .map_err(load_err)?,
+            ),
+        };
+        let accel = match &mut model {
+            AnyModel::Gemma4(m) => m.enable_accel(backend, host),
+            AnyModel::Qwen35(m) => m.enable_accel(backend, host),
+        };
+        accel.map_err(|e| format!("enable accelerator: {e:?}"))?;
+        *loaded = Some(Loaded {
+            weights: weights.clone(),
+            budget: req.budget,
+            max_ctx: ctx,
+            pipes,
+            model,
+        });
     }
+    let Loaded { pipes, model, .. } = loaded.as_mut().expect("loaded above");
     let job = Job {
         backend,
         req,
@@ -208,20 +458,9 @@ pub async fn run(
         syntax,
         weights,
     };
-    match req.model {
-        TextModelId::Qwen36_35bA3b => {
-            let cfg = Qwen35Config::from_json(&config)?;
-            let model =
-                Qwen35Model::load(backend, source, cfg, budget, max_ctx).map_err(load_err)?;
-            job.generate(model).await
-        }
-        TextModelId::Gemma4_26bA4b => {
-            let cfg = Gemma4Config::from_json(&config)?;
-            let model = Gemma4Model::load(backend, source, cfg, budget, max_ctx)
-                .await
-                .map_err(load_err)?;
-            job.generate(model).await
-        }
+    match model {
+        AnyModel::Qwen35(m) => job.generate(m).await,
+        AnyModel::Gemma4(m) => job.generate(m).await,
     }
 }
 
@@ -239,11 +478,11 @@ struct Job<'a> {
     backend: &'a Arc<WgpuBackend>,
     req: &'a TextRequest,
     sink: &'a dyn ProgressSink,
-    pipes: LlmPipelines,
+    pipes: &'a LlmPipelines,
     /// Prompt token ids (job data).
     ids: Locked<u32>,
     stop: Vec<u32>,
-    tokenizer: HfTokenizer,
+    tokenizer: &'a HfTokenizer,
     seed: u64,
     max_ctx: u32,
     /// The reply grammar (tools / format), when set.
@@ -259,7 +498,7 @@ impl Job<'_> {
     /// token budget, streaming the reply.
     async fn generate<B: Blocks>(
         self,
-        mut model: Decoder<GgufSource<MmapFileOpener>, B>,
+        model: &mut Decoder<GgufSource<MmapFileOpener>, B>,
     ) -> Result<JobSummary, String> {
         let Job {
             backend,
@@ -276,13 +515,16 @@ impl Job<'_> {
             weights,
         } = self;
         let accel = model
-            .enable_accel(backend)
+            .enable_accel(backend, None)
             .map_err(|e| format!("enable accelerator: {e:?}"))?;
         tracing::info!(target: thinfer_core::trace::DIAG, accel, "llm path");
         let ws = Workspace::new(backend.clone(), model.residency().arbiter().clone());
         let mut state = model
             .new_state(backend, &ws, max_ctx)
             .map_err(|e| format!("state: {e:?}"))?;
+        // Dropped before the state and workspace (declared after them): on
+        // an early exit it waits for queued CUDA work on their memory.
+        let _drain = AccelDrain(backend.clone());
         if let Some(session) = &req.session {
             let chain: Vec<_> = session.path.iter().collect();
             state
@@ -297,11 +539,13 @@ impl Job<'_> {
             if sink.cancelled() {
                 return Err("cancelled".into());
             }
-            let last = (i + 1) * PREFILL_CHUNK >= ids.len();
+            // Logits for the last chunk only, and none for a prefix (nothing
+            // is sampled from it).
+            let last = (i + 1) * PREFILL_CHUNK >= ids.len() && req.max_tokens > 0;
             let out = model
                 .forward(
                     backend,
-                    &pipes,
+                    pipes,
                     &ws,
                     &mut state,
                     chunk,
@@ -333,6 +577,10 @@ impl Job<'_> {
         let mut out_of_tokens = false;
         let t1 = Instant::now();
         loop {
+            // A prefix-only request (`max_tokens` 0) generates nothing.
+            if req.max_tokens == 0 {
+                break;
+            }
             if sink.cancelled() {
                 return Err("cancelled".into());
             }
@@ -364,7 +612,7 @@ impl Job<'_> {
                 produced[n] = t;
                 n += 1;
             }
-            sink.text(&text.push(&tokenizer, &produced[..calls_at.unwrap_or(n)])?);
+            sink.text(&text.push(tokenizer, &produced[..calls_at.unwrap_or(n)])?);
             if n >= req.max_tokens as usize {
                 out_of_tokens = true;
                 break;
@@ -378,7 +626,7 @@ impl Job<'_> {
                 logits = model
                     .forward(
                         backend,
-                        &pipes,
+                        pipes,
                         &ws,
                         &mut state,
                         chunk,
@@ -392,7 +640,7 @@ impl Job<'_> {
                     .logits;
             }
         }
-        sink.text(&text.flush(&tokenizer, &produced[..calls_at.unwrap_or(n)])?);
+        sink.text(&text.flush(tokenizer, &produced[..calls_at.unwrap_or(n)])?);
         let decode_secs = t1.elapsed().as_secs_f64();
         let (finish_reason, tool_calls) = match (out_of_tokens, calls_at) {
             (true, _) => (FinishReason::Length, Vec::new()),
@@ -418,12 +666,13 @@ impl Job<'_> {
 
         // The positions this request added, for the session's new node.
         let session = match &req.session {
-            Some(_) => Some(Arc::new(SessionSave {
+            Some(s) => Some(Arc::new(SessionSave {
                 chunk: state
                     .export(resume_at)
                     .await
                     .map_err(|e| format!("save session: {e:?}"))?,
                 weights,
+                tail: new_tail(req, s, resume_at > 0),
             })),
             None => None,
         };
@@ -448,6 +697,46 @@ impl Job<'_> {
             ..Default::default()
         })
     }
+}
+
+/// Waits for the accelerator's queued work when dropped. CUDA kernels are
+/// enqueued without a wait, so an early exit (cancel, error) can leave some
+/// reading or writing buffers that are about to be freed.
+struct AccelDrain(Arc<WgpuBackend>);
+
+impl Drop for AccelDrain {
+    fn drop(&mut self) {
+        use thinfer_core::backend::Backend;
+        if let Some(acc) = self.0.accelerator()
+            && let Err(e) = acc.join_ahead().and_then(|()| acc.sync())
+        {
+            tracing::warn!(target: thinfer_core::trace::ADAPTER, "accelerator drain failed: {e}");
+        }
+    }
+}
+
+/// How a session request's new node ends: after its reply, or (a prefix-only
+/// request) after its turns, extending an open parent's turns.
+fn new_tail(req: &TextRequest, session: &TextSession, resumed: bool) -> chat::Tail {
+    if req.max_tokens > 0 {
+        return chat::Tail::Reply;
+    }
+    let mut roles: Vec<String> = Vec::new();
+    let mut after_reply = false;
+    if resumed {
+        match &session.tail {
+            chat::Tail::Reply => after_reply = true,
+            chat::Tail::Open {
+                roles: r,
+                after_reply: a,
+            } => {
+                roles.extend(r.iter().cloned());
+                after_reply = *a;
+            }
+        }
+    }
+    roles.extend(req.messages.iter().map(|m| m.role.clone()));
+    chat::Tail::Open { roles, after_reply }
 }
 
 /// The weights file's identity: name and byte length (cheap; a different

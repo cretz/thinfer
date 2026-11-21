@@ -88,6 +88,8 @@ pub enum DreamIdvError<SE: core::fmt::Debug> {
     /// A preprocessed input collapsed to zero size (all frames cropped away, or a
     /// resolution below one 16x16 grid cell).
     DegenerateInput(String),
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
 }
 
 impl<SE: core::fmt::Debug> From<crate::wan::loader::LoadError> for DreamIdvError<SE> {
@@ -300,8 +302,29 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
     pub async fn generate(
         &self,
         inputs: &DreamIdvInputs<'_>,
-        mut diag: Option<&mut DreamIdvDiag>,
+        diag: Option<&mut DreamIdvDiag>,
     ) -> Result<DreamIdvVideo, DreamIdvError<S::Error>> {
+        match self
+            .generate_ctl(inputs, diag, crate::common::StepControl::default())
+            .await?
+        {
+            crate::common::Generated::Done(video) => Ok(video),
+            crate::common::Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate`] that can stop at a step boundary (`ctl.stop_here`,
+    /// polled between steps and before the decode) and resume there. The VAE
+    /// encodes are recomputed on resume (deterministic); the UniPC history and
+    /// the guidance delta reused between guided steps ride in the state
+    /// (`solver.vecs`: UniPC's, then the delta), so a resumed run matches an
+    /// uninterrupted one.
+    pub async fn generate_ctl(
+        &self,
+        inputs: &DreamIdvInputs<'_>,
+        mut diag: Option<&mut DreamIdvDiag>,
+        ctl: crate::common::StepControl<'_>,
+    ) -> Result<crate::common::Generated<DreamIdvVideo>, DreamIdvError<S::Error>> {
         let mut workspace = Workspace::new(
             Arc::clone(&self.backend),
             Arc::clone(self.residency.arbiter()),
@@ -426,9 +449,42 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
         let cfg_every = inputs.cfg_every.max(1) as usize;
         // `cond - uncond` of the last guided step (reused between them).
         let mut delta: Vec<f32> = Vec::new();
+        // A resumed run: its latent, solver history and guidance delta.
+        let first = match ctl.resume {
+            Some(st) => {
+                let mut solver = st.solver;
+                let saved_delta = solver.vecs.pop().flatten().unwrap_or_default();
+                if st.latent.len() != latents.len()
+                    || st.step > unipc.num_steps()
+                    || (st.step > 0 && !unipc.restore(solver))
+                {
+                    return Err(DreamIdvError::ResumeMismatch);
+                }
+                latents = st.latent;
+                delta = saved_delta;
+                st.step
+            }
+            None => 0,
+        };
+        let state = |step: usize, latents: Vec<f32>, unipc: &FlowUniPc, delta: Vec<f32>| {
+            let mut solver = unipc.state();
+            solver.vecs.push(Some(delta));
+            crate::common::StepState {
+                step,
+                latent: latents,
+                solver,
+            }
+        };
         {
             let _denoise = trace::scope!("denoise").entered();
-            for i in 0..unipc.num_steps() {
+            for i in first.min(unipc.num_steps())..unipc.num_steps() {
+                // Between steps: a step boundary.
+                if i > first && ctl.stop_here.is_some_and(|c| c()) {
+                    self.residency.evict_all_and_free(&*self.backend);
+                    return Ok(crate::common::Generated::Stopped(state(
+                        i, latents, &unipc, delta,
+                    )));
+                }
                 let _step = trace::scope!("step", i = i).entered();
                 let t = unipc.timestep(i);
                 // 48-ch input = cat(noise[16], y[32]).
@@ -489,6 +545,13 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
         }
         self.residency.evict_all_and_free(&*self.backend);
         workspace.drain_pool();
+        // Before the decode: a step boundary.
+        if ctl.stop_here.is_some_and(|c| c()) {
+            let n = unipc.num_steps();
+            return Ok(crate::common::Generated::Stopped(state(
+                n, latents, &unipc, delta,
+            )));
+        }
 
         // --- 4. VAE-decode -> RGB [-1, 1] ---
         let rgb = self
@@ -505,12 +568,12 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
             .await?;
         let out_frames = self.vae_decoder.cfg.temporal_compression * f_lat
             - (self.vae_decoder.cfg.temporal_compression - 1);
-        Ok(DreamIdvVideo {
+        Ok(crate::common::Generated::Done(DreamIdvVideo {
             frames: rgb,
             num_frames: out_frames,
             height: ph,
             width: pw,
-        })
+        }))
     }
 
     /// Parity/diag accessor (no forward-logic change): run ONE DiT forward on

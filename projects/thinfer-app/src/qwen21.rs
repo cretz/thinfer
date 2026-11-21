@@ -8,8 +8,10 @@
 //! - A condition image is resized ONCE to the 1 MP area at its own aspect
 //!   (sides multiples of 32, Lanczos), RGBA. The vision tower sees it
 //!   composited over white; the VAE reads all four channels.
-//! - With input images, the output keeps the last image's aspect at the
-//!   requested pixel area (the reference derives its size from the input).
+//! - With input images and no `keep_size`, the output keeps the last image's
+//!   aspect at the requested pixel area (the reference derives its size from
+//!   the input). Callers keep the size whenever one was set explicitly
+//!   ([`crate::request::resolve_keep_size`]).
 
 use std::sync::Arc;
 
@@ -25,6 +27,7 @@ use thinfer_core::workspace::Workspace;
 use thinfer_models::common::block::BlockPipelines;
 #[cfg(feature = "vault")]
 use thinfer_models::common::lora::{LoraFoldSource, discover_specs};
+use thinfer_models::common::{Generated, StepState};
 use thinfer_models::minimax::vision::{self, VisionOutput};
 use thinfer_models::qwen_image21::config;
 #[cfg(feature = "vault")]
@@ -260,8 +263,9 @@ pub async fn run(
         .iter()
         .map(|b| prepare(&b.0))
         .collect::<Result<_, _>>()?;
-    // An edit keeps the input's aspect at the requested pixel area.
-    let (width, height) = match images.last() {
+    // An edit keeps the input's aspect at the requested pixel area, unless
+    // the request keeps its own size.
+    let (width, height) = match images.last().filter(|_| !req.keep_size) {
         Some(p) => dims_for(
             req.width as f64 * req.height as f64,
             p.width as f64 / p.height as f64,
@@ -276,7 +280,14 @@ pub async fn run(
         .map(|p| (p.height / 32) * (p.width / 32))
         .collect();
     let prompt = tokenize(&tokenizer, &req.prompt, &pads)?;
-    let seed = req.seed.unwrap_or_else(random_seed);
+    // A resumed run: the seed it drew and where it stood.
+    let resume = crate::checkpoint::take_steps(sink, PAUSED_TAG)?;
+    let seed = resume
+        .as_ref()
+        .map(|r| r.seed)
+        .or(req.seed)
+        .unwrap_or_else(random_seed);
+    let resume = resume.map(|r| r.state);
     tracing::info!(
         target: thinfer_core::trace::DIAG,
         model = %req.model, width, height, seed, tokens = prompt.ids.len(),
@@ -333,6 +344,7 @@ pub async fn run(
         conditions: &conditions,
         size: (width, height),
         seed,
+        resume,
     };
     // Vault adapters fold into the DiT (a distinct source type, hence the two
     // calls into the shared generic finish).
@@ -361,7 +373,12 @@ struct Job<'a> {
     conditions: &'a [ConditionImage],
     size: (u32, u32),
     seed: u64,
+    /// Where a paused run stood.
+    resume: Option<StepState>,
 }
+
+/// The paused-run layout (see [`crate::checkpoint`]); bump on change.
+const PAUSED_TAG: &str = "qwen-image-2.1/1";
 
 impl Job<'_> {
     async fn finish<S: thinfer_core::weight::WeightSource>(
@@ -377,6 +394,7 @@ impl Job<'_> {
             conditions,
             size: (width, height),
             seed,
+            resume,
         } = self;
         let residency = WeightResidency::new(source, budget);
         let pipeline = Qwen21Pipeline::load(Arc::clone(backend), residency)
@@ -389,8 +407,10 @@ impl Job<'_> {
                 sink.note("Encoding input image(s)");
             }
         };
-        let rgba = pipeline
-            .generate(
+        let stop_here = || crate::checkpoint::stop_here(sink);
+        let ctl = crate::checkpoint::step_control(resume, &stop_here);
+        let rgba = match pipeline
+            .generate_ctl(
                 &Request {
                     token_ids: &prompt.ids,
                     drop: prompt.drop,
@@ -400,9 +420,16 @@ impl Job<'_> {
                     seed,
                 },
                 Some(&progress),
+                ctl,
             )
             .await
-            .map_err(|e| format!("generate: {e:?}"))?;
+            .map_err(|e| format!("generate: {e:?}"))?
+        {
+            Generated::Done(rgba) => rgba,
+            Generated::Stopped(st) => {
+                return Err(crate::checkpoint::stop_steps(sink, PAUSED_TAG, seed, &st));
+            }
+        };
         let png = encode_png(&rgba, width, height)?;
         let bytes = png.len();
         crate::progress::write_artifact(sink, &req.output, png)?;

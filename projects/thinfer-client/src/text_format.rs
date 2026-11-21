@@ -7,7 +7,12 @@
 pub enum TextFormat {
     /// A JSON Schema (the llguidance subset: types, properties, required,
     /// enum/const, items, anyOf/oneOf, $ref/$defs, string patterns/lengths,
-    /// numeric bounds).
+    /// numeric bounds). Replies are single-line JSON (`", "` and `": "`
+    /// separators, no other whitespace), and objects that declare
+    /// `properties` are closed to other keys unless the schema sets
+    /// `additionalProperties` itself; a bare `{"type": "object"}` stays a
+    /// free-form map. llguidance's `x-guidance` options override (e.g.
+    /// `{"whitespace_flexible": true}` for pretty-printed output).
     JsonSchema {
         #[cfg_attr(feature = "utoipa", schema(value_type = Object))]
         schema: serde_json::Value,

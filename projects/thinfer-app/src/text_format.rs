@@ -23,8 +23,95 @@ pub use thinfer_client::text_format::TextFormat;
 /// The llguidance grammar for `format`.
 pub fn top_level(format: &TextFormat) -> TopLevelGrammar {
     match format {
-        TextFormat::JsonSchema { schema } => TopLevelGrammar::from_json_schema(schema.clone()),
+        TextFormat::JsonSchema { schema } => TopLevelGrammar::from_json_schema(strict(schema)),
         TextFormat::Lark { grammar } => TopLevelGrammar::from_lark(grammar.clone()),
+    }
+}
+
+/// A JSON Schema with thinfer's defaults: single-line JSON spaced the usual
+/// way (`", "` between items, `": "` after keys, no other whitespace) and
+/// closed objects. llguidance's own defaults leave objects open to extra keys
+/// and allow whitespace anywhere, and a model can wander into either (an
+/// invented key, then whitespace until the token budget runs out). Fully
+/// compact separators are worse: models mostly saw `": "`, and forced into
+/// `":"` one wrote an empty string where it wrote prose with the space. The
+/// caller's own choices win: an explicit `additionalProperties` (or
+/// `unevaluatedProperties`) is kept, and `x-guidance` keys override ours.
+/// Only objects that declare `properties` are closed: a bare
+/// `{"type": "object"}` stays a free-form map.
+pub fn strict(schema: &serde_json::Value) -> serde_json::Value {
+    let mut s = schema.clone();
+    close_objects(&mut s);
+    if let Some(root) = s.as_object_mut() {
+        let mut guidance = serde_json::json!({
+            "whitespace_flexible": false,
+            "key_separator": ": ",
+            "item_separator": ", ",
+        });
+        if let Some(theirs) = root.get("x-guidance").and_then(|g| g.as_object()) {
+            let ours = guidance.as_object_mut().expect("object");
+            for (k, v) in theirs {
+                ours.insert(k.clone(), v.clone());
+            }
+        }
+        root.insert("x-guidance".into(), guidance);
+    }
+    s
+}
+
+/// Add `additionalProperties: false` to every object schema with
+/// `properties` that sets neither it nor `unevaluatedProperties`, walking
+/// only schema positions (never `enum` / `const` / `default` data, never a
+/// `properties` map's names).
+fn close_objects(v: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Value::Object(o) = v else {
+        return;
+    };
+    if o.contains_key("properties")
+        && !o.contains_key("additionalProperties")
+        && !o.contains_key("unevaluatedProperties")
+    {
+        o.insert("additionalProperties".into(), Value::Bool(false));
+    }
+    const ONE: &[&str] = &[
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ];
+    const MAP: &[&str] = &[
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ];
+    const LIST: &[&str] = &["anyOf", "oneOf", "allOf", "prefixItems"];
+    for (k, child) in o.iter_mut() {
+        let k = k.as_str();
+        if ONE.contains(&k) {
+            match child {
+                // `items` may still be a list (draft 4-7 tuples).
+                Value::Array(a) => a.iter_mut().for_each(close_objects),
+                c => close_objects(c),
+            }
+        } else if MAP.contains(&k) {
+            if let Value::Object(m) = child {
+                m.values_mut().for_each(close_objects);
+            }
+        } else if LIST.contains(&k)
+            && let Value::Array(a) = child
+        {
+            a.iter_mut().for_each(close_objects);
+        }
     }
 }
 
@@ -167,6 +254,11 @@ mod tests {
     /// past space (byte-level maps those to themselves; id = byte - 0x21),
     /// a multi-byte token for `"name"` (94) and `</s>` (EOS, 95).
     fn tokenizer_file(dir: &Path) -> std::path::PathBuf {
+        tokenizer_file_with(dir, false)
+    }
+
+    /// [`tokenizer_file`], optionally with a space token (`Ġ`, id 96).
+    fn tokenizer_file_with(dir: &Path, space: bool) -> std::path::PathBuf {
         let mut vocab = serde_json::Map::new();
         let mut id = 0u32;
         for b in 0x21u8..0x7f {
@@ -176,6 +268,9 @@ mod tests {
         vocab.insert("\"name\"".into(), id.into());
         let eos = id + 1;
         vocab.insert("</s>".into(), eos.into());
+        if space {
+            vocab.insert("\u{120}".into(), (eos + 1).into());
+        }
         let json = serde_json::json!({
             "version": "1.0",
             "added_tokens": [{"id": eos, "content": "</s>", "single_word": false,
@@ -206,6 +301,8 @@ mod tests {
                 "properties": {"name": {"enum": ["ab", "ac"]}},
                 "required": ["name"],
                 "additionalProperties": false,
+                // The toy vocab has no space-led tokens: compact separators.
+                "x-guidance": {"key_separator": ":", "item_separator": ","},
             }),
         };
         let mut c = Constraint::new(top_level(&format), &env, None, REJECTED).unwrap();
@@ -280,5 +377,213 @@ mod tests {
         // Opening the gate: the one-token grammar is forced outright.
         assert_eq!(c.accept(gate).unwrap(), vec![b'x' as u32 - 0x21]);
         assert!(c.finished());
+    }
+
+    #[test]
+    fn strict_closes_declared_objects_only_and_keeps_caller_choices() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                // A property literally named `properties`: a name, not a schema.
+                "properties": {"type": "string"},
+                "inner": {"type": "object", "properties": {"x": {"type": "integer"}}},
+                "free": {"type": "object"},
+                "open": {"type": "object", "properties": {}, "additionalProperties": true},
+                "list": {"type": "array", "items": {"properties": {"y": {}}}},
+                "choice": {"anyOf": [{"properties": {"z": {}}}, {"type": "null"}]},
+                "fixed": {"enum": [{"properties": {"data": 1}}]},
+            },
+            "$defs": {"d": {"properties": {"w": {}}}},
+            "x-guidance": {"key_separator": ":"},
+        });
+        let s = strict(&schema);
+        assert_eq!(s["additionalProperties"], false);
+        let p = &s["properties"];
+        assert!(p.get("additionalProperties").is_none(), "names untouched");
+        assert_eq!(p["inner"]["additionalProperties"], false);
+        assert!(
+            p["free"].get("additionalProperties").is_none(),
+            "free-form map stays open"
+        );
+        assert_eq!(
+            p["open"]["additionalProperties"], true,
+            "explicit choice kept"
+        );
+        assert_eq!(p["list"]["items"]["additionalProperties"], false);
+        assert_eq!(p["choice"]["anyOf"][0]["additionalProperties"], false);
+        assert!(
+            p["fixed"]["enum"][0].get("additionalProperties").is_none(),
+            "enum data untouched"
+        );
+        assert_eq!(s["$defs"]["d"]["additionalProperties"], false);
+        assert_eq!(
+            s["x-guidance"],
+            serde_json::json!({
+                "whitespace_flexible": false,
+                "key_separator": ":",
+                "item_separator": ", ",
+            }),
+            "theirs override ours, ours fill the rest"
+        );
+    }
+
+    /// The allowed ids after feeding `text` (one token per character) under
+    /// `grammar`, following forced runs.
+    fn allowed_after(
+        grammar: TopLevelGrammar,
+        env: &Arc<TokEnv>,
+        vocab: usize,
+        text: &str,
+    ) -> Vec<usize> {
+        let tok = |c: char| if c == ' ' { 96 } else { c as u32 - 0x21 };
+        let want: Vec<u32> = text.chars().map(tok).collect();
+        let mut c = Constraint::new(grammar, env, None, REJECTED).unwrap();
+        let mut logits = vec![0.0f32; vocab];
+        let mut i = 0;
+        while i < want.len() {
+            logits.iter_mut().for_each(|l| *l = 0.0);
+            c.mask(&mut logits).unwrap();
+            assert!(
+                logits[want[i] as usize].is_finite(),
+                "{text}: step {i} refused; allowed {:?}",
+                (0..vocab)
+                    .filter(|&k| logits[k].is_finite())
+                    .collect::<Vec<_>>()
+            );
+            let forced = c.accept(want[i]).unwrap();
+            i += 1;
+            for f in forced {
+                assert_eq!(Some(&f), want.get(i), "{text}: forced run diverged");
+                i += 1;
+            }
+        }
+        logits.iter_mut().for_each(|l| *l = 0.0);
+        c.mask(&mut logits).unwrap();
+        (0..vocab).filter(|&i| logits[i].is_finite()).collect()
+    }
+
+    #[test]
+    fn strict_schema_refuses_extra_keys_and_free_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let tj = tokenizer_file_with(dir.path(), true);
+        let env = Arc::new(tok_env(&tj, Some(97), &[95]).unwrap());
+        // The toy vocab has no space-led tokens: compact separators (the
+        // default spacing is checked on a real tokenizer below).
+        let schema = serde_json::json!({"type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "x-guidance": {"key_separator": ":", "item_separator": ","}});
+        let (comma, space) = (',' as usize - 0x21, 96);
+        let strict_g = || {
+            top_level(&TextFormat::JsonSchema {
+                schema: schema.clone(),
+            })
+        };
+        let loose_g = || TopLevelGrammar::from_json_schema(schema.clone());
+        // Closed: after the only key's value, no `,` (llguidance's default
+        // would let the model start an invented key there).
+        assert!(!allowed_after(strict_g(), &env, 97, "{\"a\":1").contains(&comma));
+        assert!(allowed_after(loose_g(), &env, 97, "{\"a\":1").contains(&comma));
+        // No free whitespace.
+        assert!(!allowed_after(strict_g(), &env, 97, "{").contains(&space));
+        assert!(allowed_after(loose_g(), &env, 97, "{").contains(&space));
+    }
+
+    /// Whether `grammar` accepts all of `text` (Gemma's tokenization, token by
+    /// token, no jump-forward) and may end there. `None`: tokenizer not cached.
+    fn gemma_accepts(grammar: TopLevelGrammar, text: &str) -> Option<bool> {
+        use crate::model::TextModelEngine;
+        use thinfer_core::tokenizer::Tokenizer;
+        use thinfer_models::llm::manifest::role;
+        let m = crate::model::TextModelId::Gemma4_26bA4b.manifest();
+        let (Ok(tj), Ok(gc)) = (
+            crate::download::resolve_role(m, role::TOKENIZER),
+            crate::download::resolve_role(m, role::GENERATION_CONFIG),
+        ) else {
+            eprintln!("skipped: gemma tokenizer not cached");
+            return None;
+        };
+        let tok = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(thinfer_native::tokenizer::HfTokenizer::from_path(&tj))
+            .unwrap();
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(gc).unwrap()).unwrap();
+        let stop: Vec<u32> = match &cfg["eos_token_id"] {
+            serde_json::Value::Array(a) => a.iter().map(|v| v.as_u64().unwrap() as u32).collect(),
+            v => vec![v.as_u64().unwrap() as u32],
+        };
+        let env = tok_env(&tj, None, &stop).unwrap();
+        let mut m = Matcher::new(Ok(factory(&env).unwrap().create_parser(grammar).unwrap()));
+        for t in tok.encode(text, false).unwrap() {
+            if !m.compute_mask_or_eos().unwrap().is_allowed(t) {
+                return Some(false);
+            }
+            m.consume_token(t).unwrap();
+        }
+        let end = m.compute_mask_or_eos().unwrap();
+        Some(m.is_stopped() || stop.iter().any(|&s| end.is_allowed(s)))
+    }
+
+    #[test]
+    fn strict_schema_takes_spaced_single_line_json_only() {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "a": {"type": "integer"}, "b": {"type": "string"}}});
+        let strict_g = || {
+            top_level(&TextFormat::JsonSchema {
+                schema: schema.clone(),
+            })
+        };
+        let loose_g = || TopLevelGrammar::from_json_schema(schema.clone());
+        for (text, strict, loose) in [
+            (r#"{"a": 1, "b": "x"}"#, true, true),
+            (r#"{"a":1,"b":"x"}"#, false, true),
+            (r#"{ "a": 1}"#, false, true),
+            (r#"{"a": 1,  "b": "x"}"#, false, true),
+            ("{\"a\": 1,\n\"b\": \"x\"}", false, true),
+            (r#"{"a": 1, "c": 2}"#, false, true),
+        ] {
+            let Some(got) = gemma_accepts(strict_g(), text) else {
+                return;
+            };
+            assert_eq!(got, strict, "strict {text:?}");
+            assert_eq!(
+                gemma_accepts(loose_g(), text),
+                Some(loose),
+                "loose {text:?}"
+            );
+        }
+    }
+
+    /// A schema parsed from the wire keeps its property order, and the reply
+    /// is generated in it (not sorted: `caption` first would leave a reply
+    /// that opened with `type` no way to add the other fields).
+    #[test]
+    fn properties_keep_the_schema_order() {
+        let schema: serde_json::Value = serde_json::from_str(
+            r#"{"type": "object", "properties": {"type": {"type": "string"},
+                "prompt": {"type": "string"}, "caption": {"type": "string"}},
+                "required": ["type", "prompt", "caption"]}"#,
+        )
+        .unwrap();
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["type", "prompt", "caption"]);
+        let g = || {
+            top_level(&TextFormat::JsonSchema {
+                schema: schema.clone(),
+            })
+        };
+        let Some(declared) =
+            gemma_accepts(g(), r#"{"type": "image", "prompt": "p", "caption": "c"}"#)
+        else {
+            return;
+        };
+        assert!(declared, "the schema's order");
+        assert_eq!(
+            gemma_accepts(g(), r#"{"caption": "c", "prompt": "p", "type": "image"}"#),
+            Some(false),
+            "sorted order"
+        );
     }
 }

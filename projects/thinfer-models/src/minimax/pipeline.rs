@@ -106,6 +106,8 @@ pub enum PipelineError<SE: core::fmt::Debug> {
     NonContiguousLayout,
     /// The caller's `cancel` predicate returned true at a block boundary.
     Cancelled,
+    /// A resume state whose latents do not fit this plan.
+    ResumeMismatch,
 }
 
 impl<SE: core::fmt::Debug> From<WgpuError> for PipelineError<SE> {
@@ -1091,11 +1093,30 @@ pub struct Latents {
     pub audio: Vec<f32>,
 }
 
+/// A denoise between steps: the latents entering `step` (the target rows
+/// only; the conditioning rows are rebuilt from the seed).
+pub struct DenoiseState {
+    pub step: usize,
+    pub latents: Latents,
+}
+
+/// How a denoise ended.
+pub enum Denoised {
+    Done(Latents),
+    /// Stopped before `step` ran (`cancel` mid-step, or `stop_here` after
+    /// the step before it): what resuming it needs.
+    Stopped(DenoiseState),
+}
+
 /// Run the whole t2va denoise loop.
 ///
 /// Video and audio ride INDEPENDENT sigma schedules over one shared forward, so
 /// each modality steps with its own coefficients against the same predicted
 /// velocity. `progress` is called with `(step, num_steps)` after each step.
+///
+/// `start` resumes a stopped denoise. It stops early, with what resuming
+/// needs, when `cancel` fires (polled per block: the step in flight is
+/// abandoned) or `stop_here` does (polled after each step but the last).
 #[allow(clippy::too_many_arguments)]
 pub async fn denoise<S: WeightSource>(
     cfg: &DitConfig,
@@ -1109,9 +1130,11 @@ pub async fn denoise<S: WeightSource>(
     cond_video: &[f32],
     text: &[f32],
     seed: u64,
+    start: Option<DenoiseState>,
     mut progress: impl FnMut(usize, usize),
+    stop_here: Cancel<'_>,
     cancel: Cancel<'_>,
-) -> Result<Latents, PipelineError<S::Error>> {
+) -> Result<Denoised, PipelineError<S::Error>> {
     // Conditioning rows (clean, patchified) are noise-augmented ONCE to the
     // 0.999 level and then held fixed; their noise comes first off the seed,
     // as the reference draws it before the target's.
@@ -1139,8 +1162,23 @@ pub async fn denoise<S: WeightSource>(
     video.iter_mut().for_each(|x| *x *= sv);
     audio.iter_mut().for_each(|x| *x *= sa);
     let steps = plan.schedule.num_steps();
+    // A resumed run takes the latents entering its first step; the
+    // conditioning noise above is the seed's either way.
+    let first = match start {
+        Some(s) => {
+            if s.step >= steps
+                || s.latents.video.len() != video.len()
+                || s.latents.audio.len() != audio.len()
+            {
+                return Err(PipelineError::ResumeMismatch);
+            }
+            (video, audio) = (s.latents.video, s.latents.audio);
+            s.step
+        }
+        None => 0,
+    };
     let mut carry = StepCarry::default();
-    for step in 0..steps {
+    for step in first..steps {
         carry.more_steps = step + 1 < steps;
         let _guard = trace::scope!(format!("minimax.denoise.step.{step}")).entered();
         // The step-end memory line below then reports this step's own peaks.
@@ -1150,7 +1188,7 @@ pub async fn denoise<S: WeightSource>(
         } else {
             Cow::Owned([cond.as_slice(), &video].concat())
         };
-        let v = forward_impl(
+        let v = match forward_impl(
             cfg,
             backend,
             pipelines,
@@ -1167,7 +1205,17 @@ pub async fn denoise<S: WeightSource>(
             Some(&mut carry),
             cancel,
         )
-        .await?;
+        .await
+        {
+            // The step is abandoned: the latents still enter it.
+            Err(PipelineError::Cancelled) => {
+                return Ok(Denoised::Stopped(DenoiseState {
+                    step,
+                    latents: Latents { video, audio },
+                }));
+            }
+            v => v?,
+        };
         // The reference evaluates `ratio * x + (1 - ratio) * (x + sigma * v)`
         // rather than the algebraically equal `x + (1 - ratio) * sigma * v`;
         // the two are not bit-identical in f32, so keep this form.
@@ -1201,6 +1249,12 @@ pub async fn denoise<S: WeightSource>(
             "minimax denoise memory",
         );
         progress(step + 1, steps);
+        if step + 1 < steps && stop_here.is_some_and(|c| c()) {
+            return Ok(Denoised::Stopped(DenoiseState {
+                step: step + 1,
+                latents: Latents { video, audio },
+            }));
+        }
     }
     // Spatial coherence of the result: correlation between horizontally
     // adjacent patch rows (natural latents are strongly positive; a denoiser
@@ -1221,7 +1275,7 @@ pub async fn denoise<S: WeightSource>(
         sxy / (sxx * syy).sqrt().max(1e-30)
     };
     tracing::debug!(target: thinfer_core::trace::DIAG, neighbor_corr = corr, "minimax denoise result");
-    Ok(Latents { video, audio })
+    Ok(Denoised::Done(Latents { video, audio }))
 }
 
 /// Re-lay the packed video rows as the video VAE's `[frames, h, w, channels]`,

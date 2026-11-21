@@ -26,6 +26,34 @@ use api::AppState;
 use config::ServeConfig;
 use job::JobStore;
 
+/// Delete what an earlier process left in `artifact_dir`: its jobs and
+/// uploads lived in RAM, so their dirs (sealed results, paused jobs' sealed
+/// state, sealed uploads) can no longer be fetched or resumed. Only the
+/// server's own entries go: dirs named by its 32-hex-char ids.
+fn sweep_orphans(artifact_dir: &std::path::Path) {
+    let ours = |name: &std::ffi::OsStr| {
+        name.to_str()
+            .is_some_and(|n| n.len() == 32 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    let mut swept = 0;
+    for dir in [artifact_dir.to_path_buf(), artifact_dir.join("uploads")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if ours(&entry.file_name())
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+                && std::fs::remove_dir_all(entry.path()).is_ok()
+            {
+                swept += 1;
+            }
+        }
+    }
+    if swept > 0 {
+        tracing::info!(swept, "removed job and upload dirs left by an earlier run");
+    }
+}
+
 fn main() -> ExitCode {
     // rustls 0.23 with the no-provider feature needs a process-wide crypto
     // provider installed before any TLS config is built. Ignore the error if a
@@ -155,9 +183,11 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
     std::fs::create_dir_all(&config.artifact_dir)
         .map_err(|e| format!("create {}: {e}", config.artifact_dir.display()))?;
 
-    let store = Arc::new(JobStore::new(std::time::Duration::from_secs(
-        config.queue_aging_secs.max(1),
-    )));
+    sweep_orphans(&config.artifact_dir);
+    let store = Arc::new(JobStore::new(
+        std::time::Duration::from_secs(config.queue_aging_secs.max(1)),
+        config.workers.max(1),
+    ));
     let backend_cfg = config.backend_config();
     // Probe coopmat (tensor-core) support once at startup: build a throwaway
     // device, check, drop it (no VRAM held across jobs). Surfaced to the web UI

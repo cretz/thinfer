@@ -8,7 +8,7 @@ use thinfer_app::jobkey::{JobKey, OpenLocked};
 use thinfer_app::model::{ImageModelId, SwapModel, TextModelId, VideoModelId};
 use thinfer_app::request::{
     FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, TextRequest,
-    VideoFormat, VideoInput, VideoRequest,
+    VideoFormat, VideoInput, VideoRequest, resolve_keep_size,
 };
 use thinfer_app::wire::{JobSpec, TextSessionRef};
 
@@ -71,6 +71,7 @@ fn open_session(
     let session = thinfer_app::request::TextSession {
         path,
         weights: chain.weights,
+        tail: chain.tail,
     };
     let commit = SessionCommit {
         id: r.id,
@@ -112,8 +113,6 @@ pub fn spec_into_request(
 ) -> Result<Built, String> {
     let budget = config.budget()?;
     let mp4 = || dir.join("output.mp4");
-    let make_dir =
-        || std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()));
     let disable_coopmat = spec.disable_coopmat();
     match spec {
         JobSpec::Text(s) => {
@@ -149,7 +148,6 @@ pub fn spec_into_request(
                 tool_choice: s.tool_choice.unwrap_or_default(),
             };
             req.validate()?;
-            make_dir()?;
             Ok(Built {
                 session: commit,
                 ..Built::new(JobRequest::Text(req), disable_coopmat)
@@ -176,6 +174,7 @@ pub fn spec_into_request(
                 i8_matmul: s.i8_matmul.unwrap_or(true),
                 full_precision: s.full_precision.unwrap_or(false),
                 input_images,
+                keep_size: resolve_keep_size(s.keep_size, s.width, s.height),
                 lora: s
                     .lora
                     .into_iter()
@@ -191,7 +190,6 @@ pub fn spec_into_request(
                 format: ImageFormat::Png,
             };
             req.validate()?;
-            make_dir()?;
             Ok(Built::new(JobRequest::Image(req), disable_coopmat))
         }
         JobSpec::Video(s) => {
@@ -257,7 +255,6 @@ pub fn spec_into_request(
                 format: VideoFormat::Mp4,
             };
             req.resolve()?;
-            make_dir()?;
             Ok(Built::new(
                 JobRequest::Video(Box::new(req)),
                 disable_coopmat,
@@ -310,7 +307,6 @@ pub fn spec_into_request(
                 },
             };
             req.validate()?;
-            make_dir()?;
             Ok(Built::new(JobRequest::FaceSwap(req), disable_coopmat))
         }
     }

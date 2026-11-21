@@ -5,6 +5,7 @@
 //! renamed encoder GGUF and the VAE; `evict_all_and_free` between phases keeps
 //! each phase's peak inside the budget.
 
+use crate::common::{Generated, StepControl, StepState};
 use std::sync::Arc;
 
 use thinfer_core::backend::WgpuBackend;
@@ -85,13 +86,18 @@ impl From<thinfer_core::backend::WgpuError> for LoadError {
 
 #[derive(Debug)]
 pub enum GenerateError<SE: core::fmt::Debug> {
-    InvalidDims { height: u32, width: u32 },
+    InvalidDims {
+        height: u32,
+        width: u32,
+    },
     Layout(String),
     Encode(crate::minimax::text_encoder::ForwardError<SE>),
     VaeEncode(crate::wan::vae::WanVaeEncodeError<SE>),
     Dit(DitError<SE>),
     VaeDecode(crate::wan::vae::WanVaeDecodeError<SE>),
     Wgpu(thinfer_core::backend::WgpuError),
+    /// A resume state that does not fit this request.
+    ResumeMismatch,
 }
 
 pub struct Qwen21Pipeline<S: WeightSource> {
@@ -324,6 +330,26 @@ impl<S: WeightSource> Qwen21Pipeline<S> {
         req: &Request<'_>,
         progress: ProgressFn<'_>,
     ) -> Result<Vec<f32>, GenerateError<S::Error>> {
+        match self
+            .generate_ctl(req, progress, StepControl::default())
+            .await?
+        {
+            Generated::Done(rgba) => Ok(rgba),
+            Generated::Stopped(_) => unreachable!("no stop predicate was given"),
+        }
+    }
+
+    /// [`Self::generate`] that can stop between steps (`ctl.stop_here`,
+    /// polled between steps and before the decode) and resume where a
+    /// stopped run stood (`ctl.resume`). The encode and the prompt prefix
+    /// are recomputed on resume (deterministic, a few seconds), so the state
+    /// is just the latent tokens; the result matches an uninterrupted run.
+    pub async fn generate_ctl(
+        &self,
+        req: &Request<'_>,
+        progress: ProgressFn<'_>,
+        ctl: StepControl<'_>,
+    ) -> Result<Generated<Vec<f32>>, GenerateError<S::Error>> {
         let (height, width) = (req.height, req.width);
         let m = config::SIDE_MULTIPLE;
         if height == 0 || width == 0 || !height.is_multiple_of(m) || !width.is_multiple_of(m) {
@@ -344,85 +370,104 @@ impl<S: WeightSource> Qwen21Pipeline<S> {
             }
         };
 
-        notify(ProgressEvent::TextEncode);
-        let encoder = {
-            let _s = trace::scope!("qwen21.encode", tokens = req.token_ids.len()).entered();
-            self.encode(req, &workspace).await?
+        let lc = config::LATENT_CH;
+        let steps = turbo_steps();
+        let n = steps.len() as u32;
+        let (first, mut tokens) = match ctl.resume {
+            Some(st) => {
+                if st.step > steps.len() || st.latent.len() != lc * hw {
+                    return Err(GenerateError::ResumeMismatch);
+                }
+                (st.step, st.latent)
+            }
+            None => (0, pack(&gaussian_noise(lc * hw, req.seed), lc, hw)),
         };
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
-
-        let cond = if req.images.is_empty() {
-            Vec::new()
-        } else {
-            notify(ProgressEvent::ImageEncode);
-            let _s = trace::scope!("qwen21.image_encode", images = req.images.len()).entered();
-            let c = self.encode_images(req.images, &mut workspace).await?;
+        if first < steps.len() {
+            notify(ProgressEvent::TextEncode);
+            let encoder = {
+                let _s = trace::scope!("qwen21.encode", tokens = req.token_ids.len()).entered();
+                self.encode(req, &workspace).await?
+            };
             self.residency.evict_all_and_free(&*self.backend);
             workspace.drain_pool();
-            c
-        };
 
-        let lc = config::LATENT_CH;
-        let mut tokens = pack(&gaussian_noise(lc * hw, req.seed), lc, hw);
-        {
-            let kv = KvPlacement::for_budget(
-                &self.dit_pipelines,
-                parts.iter().map(|p| p.rows()).sum(),
-                self.dit_handles.blocks.len(),
-                self.residency.budget().vram_bytes,
-            );
-            let prefix = {
-                let _s = trace::scope!("qwen21.prefill").entered();
-                self.dit
-                    .prefill(
-                        &self.backend,
-                        &self.dit_pipelines,
-                        &self.residency,
-                        &workspace,
-                        &self.dit_handles,
-                        &encoder,
-                        &cond,
-                        &parts,
-                        (lat_h, lat_w),
-                        kv,
-                    )
-                    .await
-                    .map_err(GenerateError::Dit)?
+            let cond = if req.images.is_empty() {
+                Vec::new()
+            } else {
+                notify(ProgressEvent::ImageEncode);
+                let _s = trace::scope!("qwen21.image_encode", images = req.images.len()).entered();
+                let c = self.encode_images(req.images, &mut workspace).await?;
+                self.residency.evict_all_and_free(&*self.backend);
+                workspace.drain_pool();
+                c
             };
-            tracing::info!(
-                target: trace::DIAG,
-                prefix_rows = prefix.rows(),
-                target_rows = hw,
-                spilled = prefix.spilled(),
-                "qwen-image-2.1 prefix cached",
-            );
-            let steps = turbo_steps();
-            let n = steps.len() as u32;
-            let _s = trace::scope!("qwen21.denoise", steps = n).entered();
-            for (i, step) in steps.iter().enumerate() {
-                notify(ProgressEvent::Step { i: i as u32 + 1, n });
-                let v = self
-                    .dit
-                    .step(
-                        &self.backend,
-                        &self.dit_pipelines,
-                        &self.residency,
-                        &workspace,
-                        &self.dit_handles,
-                        &prefix,
-                        &tokens,
-                        step.t,
-                    )
-                    .await
-                    .map_err(GenerateError::Dit)?;
-                for (z, dv) in tokens.iter_mut().zip(&v) {
-                    *z += dv * step.delta;
+
+            {
+                let kv = KvPlacement::for_budget(
+                    &self.dit_pipelines,
+                    parts.iter().map(|p| p.rows()).sum(),
+                    self.dit_handles.blocks.len(),
+                    self.residency.budget().vram_bytes,
+                );
+                let prefix = {
+                    let _s = trace::scope!("qwen21.prefill").entered();
+                    self.dit
+                        .prefill(
+                            &self.backend,
+                            &self.dit_pipelines,
+                            &self.residency,
+                            &workspace,
+                            &self.dit_handles,
+                            &encoder,
+                            &cond,
+                            &parts,
+                            (lat_h, lat_w),
+                            kv,
+                        )
+                        .await
+                        .map_err(GenerateError::Dit)?
+                };
+                tracing::info!(
+                    target: trace::DIAG,
+                    prefix_rows = prefix.rows(),
+                    target_rows = hw,
+                    spilled = prefix.spilled(),
+                    "qwen-image-2.1 prefix cached",
+                );
+                let _s = trace::scope!("qwen21.denoise", steps = n).entered();
+                for (i, step) in steps.iter().enumerate().skip(first) {
+                    // Between steps: a step boundary.
+                    if i > first && ctl.stop_here.is_some_and(|c| c()) {
+                        self.residency.evict_all_and_free(&*self.backend);
+                        return Ok(Generated::Stopped(StepState::at(i, tokens)));
+                    }
+                    notify(ProgressEvent::Step { i: i as u32 + 1, n });
+                    let v = self
+                        .dit
+                        .step(
+                            &self.backend,
+                            &self.dit_pipelines,
+                            &self.residency,
+                            &workspace,
+                            &self.dit_handles,
+                            &prefix,
+                            &tokens,
+                            step.t,
+                        )
+                        .await
+                        .map_err(GenerateError::Dit)?;
+                    for (z, dv) in tokens.iter_mut().zip(&v) {
+                        *z += dv * step.delta;
+                    }
                 }
             }
+            self.residency.evict_all_and_free(&*self.backend);
+            workspace.drain_pool();
+            // Before the decode: a step boundary.
+            if ctl.stop_here.is_some_and(|c| c()) {
+                return Ok(Generated::Stopped(StepState::at(steps.len(), tokens)));
+            }
         }
-        self.residency.evict_all_and_free(&*self.backend);
-        workspace.drain_pool();
 
         notify(ProgressEvent::VaeDecode);
         let latent = unpack(&tokens, lc, hw);
@@ -444,7 +489,7 @@ impl<S: WeightSource> Qwen21Pipeline<S> {
             rgba.len(),
             PIXEL_CHANNELS * height as usize * width as usize
         );
-        Ok(rgba)
+        Ok(Generated::Done(rgba))
     }
 }
 

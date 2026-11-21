@@ -93,6 +93,19 @@ pub struct ServeConfig {
     /// Idle seconds before a session is forgotten, unless it sets its own.
     /// Default 1800.
     pub session_ttl_secs: u64,
+    /// Keep the last text model loaded (and the GPU device it is on) until
+    /// this many seconds after a text job last used it, whatever ran in
+    /// between; `0` = load per job. Pristine model data only: no job data
+    /// stays (a job must leave no buffers behind, or the device is
+    /// discarded), and any failed job discards it. Default 0: opt-in, an
+    /// idle server holds no GPU memory unless the operator asks it to.
+    pub warm_text_secs: u64,
+    /// Keep the warm text model's host side (parsed tokenizer, compiled
+    /// pipelines, page-locked expert cache) through image/video jobs, which
+    /// still get all of its VRAM, so the next text job skips that work.
+    /// Costs that page-locked RAM (not swappable) while they run.
+    /// Default false.
+    pub keep_text_host: bool,
 }
 
 impl Default for ServeConfig {
@@ -123,6 +136,8 @@ impl Default for ServeConfig {
             queue_aging_secs: 300,
             session_ram_budget: "4G".into(),
             session_ttl_secs: 1800,
+            warm_text_secs: 0,
+            keep_text_host: false,
         }
     }
 }

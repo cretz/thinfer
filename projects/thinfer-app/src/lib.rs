@@ -7,6 +7,8 @@
 //! JSON) into a [`JobRequest`], provide a [`ProgressSink`], ensure the request's
 //! files are cached, and call [`LocalExecutor::run`].
 
+pub mod catalog;
+pub mod checkpoint;
 pub mod codec;
 pub mod config;
 pub mod download;

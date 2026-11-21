@@ -16,7 +16,7 @@ use crate::model::{
 };
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
-const VAE_SCALE: u32 = 16;
+pub const VAE_SCALE: u32 = 16;
 
 /// Prompt rows a MiniMax-H3 default clip length budgets for (tokens are not
 /// known at resolve time). Generous for a typical prompt.
@@ -33,6 +33,16 @@ pub fn validate_dim(name: &str, v: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Whether an image request with input images renders at exactly its
+/// `width` x `height` ([`ImageRequest::keep_size`]). An explicit choice wins
+/// (`Some(false)` = take the last input's aspect at that pixel area);
+/// otherwise a caller who set either dimension gets that size, and one who
+/// set none gets the input's aspect at the model's default area. Shared by
+/// the CLI and serve so both resolve the same way.
+pub fn resolve_keep_size(keep: Option<bool>, width: Option<u32>, height: Option<u32>) -> bool {
+    keep.unwrap_or(width.is_some() || height.is_some())
 }
 
 /// Resolve an output format: an explicit choice wins, otherwise infer from the
@@ -224,6 +234,10 @@ pub struct ImageRequest {
     /// for the t2i kinds. Held in RAM ([`ImageBytes`]); a decrypted image
     /// never touches disk.
     pub input_images: Vec<ImageBytes>,
+    /// With input images, render at exactly `width` x `height` (Qwen-Image
+    /// 2.1); false = the last input's aspect at that pixel area. Callers
+    /// resolve it with [`resolve_keep_size`].
+    pub keep_size: bool,
     /// User adapters to fold into the DiT for this generation, in fold order
     /// (each id is a vault entry for THIS model). Empty = the plain base model.
     /// Only models where [`ImageModelId::supports_adapters`] is true accept a
@@ -274,9 +288,10 @@ impl ImageRequest {
         let n = self.input_images.len();
         match self.model.kind() {
             crate::model::ImageKind::QwenImageEdit => {
-                if n != 1 {
+                let max = crate::preprocess::MAX_EDIT_IMAGES;
+                if n == 0 || n > max {
                     return Err(format!(
-                        "{} edits exactly one --input-image (got {n})",
+                        "{} takes 1 to {max} --input-image (got {n})",
                         self.model
                     ));
                 }
@@ -1267,6 +1282,19 @@ pub enum JobRequest {
 }
 
 impl JobRequest {
+    /// Whether the run can pause and resume (see [`crate::checkpoint`]).
+    pub fn pausable(&self) -> bool {
+        match self {
+            // Every video model.
+            JobRequest::Video(_) => true,
+            // The diffusion swap; the frame swappers run straight through.
+            JobRequest::FaceSwap(r) => r.model.is_dreamidv(),
+            // Every image model.
+            JobRequest::Image(_) => true,
+            _ => false,
+        }
+    }
+
     /// Files this request needs in the HF cache.
     pub fn required_files(&self) -> Result<Vec<FileRef>, String> {
         match self {
@@ -1322,6 +1350,8 @@ pub struct TextSession {
     pub path: Vec<StateChunk>,
     /// Weights identity of the chain (`None` for a new root).
     pub weights: Option<String>,
+    /// How the chain's state ends (the `from` node's tail).
+    pub tail: thinfer_models::llm::chat::Tail,
 }
 
 /// What a session request leaves behind: its state chunk (positions it
@@ -1329,6 +1359,8 @@ pub struct TextSession {
 pub struct SessionSave {
     pub chunk: StateChunk,
     pub weights: String,
+    /// How the new node's state ends.
+    pub tail: thinfer_models::llm::chat::Tail,
 }
 
 impl std::fmt::Debug for SessionSave {
@@ -1356,7 +1388,18 @@ impl TextRequest {
             return Err("a prompt is required".into());
         }
         if self.max_tokens == 0 {
-            return Err("--max-tokens must be > 0".into());
+            // A prefix-only request: prefills its turns into a session node
+            // that later requests branch from.
+            if self.session.is_none() {
+                return Err("--max-tokens must be > 0 (0 = prefix only, with a session)".into());
+            }
+            if !self
+                .messages
+                .iter()
+                .all(|m| m.role == "system" || m.role == "user")
+            {
+                return Err("a prefix-only request holds system and user turns only".into());
+            }
         }
         // Negated ranges so NaN fails too.
         if self
@@ -1565,11 +1608,24 @@ impl Drop for VideoRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{VideoFormat, VideoRequest, resolve_frames};
+    use super::{VideoFormat, VideoRequest, resolve_frames, resolve_keep_size};
     use crate::model::VideoModelEngine;
     use crate::model::VideoModelId::FastwanTi2v5b as Fw;
 
     const FPS: u32 = 24;
+
+    #[test]
+    fn keep_size_follows_explicit_dims_unless_told() {
+        // No size given: follow the input's aspect.
+        assert!(!resolve_keep_size(None, None, None));
+        // Either dimension given: honor the requested size.
+        assert!(resolve_keep_size(None, Some(1024), Some(1536)));
+        assert!(resolve_keep_size(None, Some(1024), None));
+        assert!(resolve_keep_size(None, None, Some(1536)));
+        // An explicit choice wins both ways.
+        assert!(!resolve_keep_size(Some(false), Some(1024), Some(1536)));
+        assert!(resolve_keep_size(Some(true), None, None));
+    }
 
     fn prompts(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("prompt {i}")).collect()

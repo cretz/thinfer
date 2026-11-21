@@ -146,13 +146,17 @@ pub fn grammar(
     let mut g = Grammar::new(syntax, stop);
     // Prose may lead into calls: a model writes its own markup (Gemma's
     // thought channel) or a line of reasoning (Qwen's template invites it)
-    // before calling.
+    // before calling. Not under a format: there the first token picks the
+    // format or a call, as prose that may only end in a call never ends when
+    // the model does not mean to call (it writes its answer as prose and
+    // runs on to the token limit).
     let prose = g.text();
     let reply = match format {
         None => prose.clone(),
-        Some(TextFormat::JsonSchema { schema }) => {
-            g.add(format!("%json {}", serde_json::to_string(schema).unwrap()))
-        }
+        Some(TextFormat::JsonSchema { schema }) => g.add(format!(
+            "%json {}",
+            serde_json::to_string(&crate::text_format::strict(schema)).unwrap()
+        )),
         Some(TextFormat::Lark { .. }) => {
             return Err("a Lark reply format cannot be combined with tools".into());
         }
@@ -168,7 +172,7 @@ pub fn grammar(
     let start = match (choice, format.is_some()) {
         (ToolChoice::None, _) => reply,
         (ToolChoice::Auto, false) => format!("{prose} {calls}?"),
-        (ToolChoice::Auto, true) => format!("{reply} | {prose} {calls}"),
+        (ToolChoice::Auto, true) => format!("{reply} | {calls}"),
         (ToolChoice::Required | ToolChoice::Tool(_), _) => format!("{prose} {calls}"),
     };
     Ok(g.finish(&start))
@@ -618,7 +622,7 @@ impl Grammar {
         if !is_string {
             return Ok(self.add(format!(
                 "%json {} {}",
-                serde_json::to_string(schema).unwrap(),
+                serde_json::to_string(&crate::text_format::strict(schema)).unwrap(),
                 lit(END)
             )));
         }
@@ -1018,6 +1022,7 @@ mod tests {
     fn run_grammar(
         model: TextModelId,
         choice: &ToolChoice,
+        format: Option<&TextFormat>,
         text: &str,
     ) -> Option<Result<(), String>> {
         use thinfer_core::tokenizer::Tokenizer;
@@ -1047,7 +1052,7 @@ mod tests {
             _ => Err(format!("{t} not one token")),
         };
         let syntax = Syntax::of(model, id).unwrap();
-        let src = grammar(syntax, &tools(), choice, None, &stop).unwrap();
+        let src = grammar(syntax, &tools(), choice, format, &stop).unwrap();
         let env = std::sync::Arc::new(crate::text_format::tok_env(&tj, None, &stop).unwrap());
         let mut f = llguidance::ParserFactory::new_simple(&env).unwrap();
         f.set_stderr_log_level(0).set_buffer_log_level(0);
@@ -1081,8 +1086,55 @@ mod tests {
     }
 
     fn expect(model: TextModelId, choice: &ToolChoice, text: &str, ok: bool) {
-        if let Some(r) = run_grammar(model, choice, text) {
+        if let Some(r) = run_grammar(model, choice, None, text) {
             assert_eq!(r.is_ok(), ok, "{model} {choice:?} {text:?}: {r:?}");
+        }
+    }
+
+    /// Tools plus a reply format, choice auto: the reply is the format
+    /// (which can end) or calls, picked at the first token; prose (fenced
+    /// JSON, a lead-in to a call) is refused, so a reply that is not a call
+    /// cannot run on to the token limit.
+    #[test]
+    fn format_or_calls_from_the_first_token() {
+        let format = TextFormat::JsonSchema {
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"narration": {"type": "string"}},
+                "required": ["narration"],
+            }),
+        };
+        let gemma_call = "<|tool_call>call:wait{}<tool_call|>";
+        let qwen_call = "<tool_call>
+<function=wait>
+</function>
+</tool_call>";
+        // Each syntax's separator between calls.
+        for (model, call, sep) in [
+            (TextModelId::Gemma4_26bA4b, gemma_call, ""),
+            (
+                TextModelId::Qwen36_35bA3b,
+                qwen_call,
+                "
+",
+            ),
+        ] {
+            let run = |text: &str, ok: bool| {
+                if let Some(r) = run_grammar(model, &ToolChoice::Auto, Some(&format), text) {
+                    assert_eq!(r.is_ok(), ok, "{model} {text:?}: {r:?}");
+                }
+            };
+            run("{\"narration\": \"You wake.\"}", true);
+            run(call, true);
+            run(&format!("{call}{sep}{call}"), true);
+            run(
+                "```json
+{\"narration\": \"You wake.\"}
+```",
+                false,
+            );
+            run("Sure", false);
+            run(&format!("Let me look that up.{call}"), false);
         }
     }
 
@@ -1290,6 +1342,66 @@ in the snow",
             let t = std::fs::read_to_string(t).unwrap();
             let got = continuation(&t, &result, &[], close, false, "").unwrap();
             assert_eq!(got, want, "{model}");
+        }
+    }
+
+    /// A prefix node (turns rendered without a generation prompt) plus the
+    /// next request's turns is exactly the full render, under both official
+    /// templates, with and without tools and thinking. Qwen's template needs
+    /// a user turn in every render, so a system-only prefix is Gemma only
+    /// (Qwen refuses it with its own error).
+    #[test]
+    fn prefix_node_resume_matches_the_official_templates() {
+        use thinfer_models::llm::chat::{ChatMessage, Tail, render, render_prefix, resume};
+        use thinfer_models::llm::manifest::role;
+        let tool_defs = template_tools(&tools());
+        let system = ChatMessage::new("system", "You narrate a story.");
+        let first = ChatMessage::new("user", "The setting: a foggy harbor.");
+        let beat = ChatMessage::new("user", "Begin.");
+        for model in [TextModelId::Gemma4_26bA4b, TextModelId::Qwen36_35bA3b] {
+            let Ok(t) = crate::download::resolve_role(model.manifest(), role::CHAT_TEMPLATE) else {
+                eprintln!("skipped: {model} template not cached");
+                continue;
+            };
+            let t = std::fs::read_to_string(t).unwrap();
+            let mut prefixes = vec![vec![system.clone(), first.clone()]];
+            if model == TextModelId::Gemma4_26bA4b {
+                prefixes.push(vec![system.clone()]);
+            } else {
+                assert!(render_prefix(&t, std::slice::from_ref(&system), &[], false, "").is_err());
+            }
+            for prefix in &prefixes {
+                let open = Tail::Open {
+                    roles: prefix.iter().map(|m| m.role.clone()).collect(),
+                    after_reply: false,
+                };
+                let mut all = prefix.clone();
+                all.push(beat.clone());
+                for tools in [&[][..], &tool_defs[..]] {
+                    for think in [false, true] {
+                        let head = render_prefix(&t, prefix, tools, think, "<bos>").unwrap();
+                        let next = resume(
+                            &t,
+                            &open,
+                            std::slice::from_ref(&beat),
+                            tools,
+                            "",
+                            true,
+                            think,
+                            "<bos>",
+                        )
+                        .unwrap();
+                        let full = render(&t, &all, tools, think, "<bos>").unwrap();
+                        assert_eq!(
+                            format!("{head}{next}"),
+                            full,
+                            "{model} prefix={} tools={} think={think}",
+                            prefix.len(),
+                            !tools.is_empty()
+                        );
+                    }
+                }
+            }
         }
     }
 

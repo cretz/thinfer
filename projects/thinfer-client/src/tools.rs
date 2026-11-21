@@ -35,7 +35,9 @@ fn no_arguments() -> Value {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum ToolChoice {
-    /// Reply in prose or call tools: the model decides.
+    /// Reply in prose or call tools: the model decides. With a reply
+    /// format, the reply is either that format or calls (no prose before a
+    /// call).
     #[default]
     Auto,
     /// Call at least one tool.

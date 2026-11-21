@@ -143,6 +143,40 @@ impl FlowUniPc {
             .collect()
     }
 
+    /// The multistep state between steps (see [`Self::restore`]).
+    pub fn state(&self) -> crate::common::SolverState {
+        let mut vecs = self.model_outputs.clone();
+        vecs.push(self.last_sample.clone());
+        crate::common::SolverState {
+            vecs,
+            ints: vec![
+                self.step_index as u64,
+                self.lower_order_nums as u64,
+                self.this_order as u64,
+            ],
+        }
+    }
+
+    /// Continue from a [`Self::state`] of the same schedule. `false` (and
+    /// nothing changed) when it does not fit.
+    pub fn restore(&mut self, state: crate::common::SolverState) -> bool {
+        let crate::common::SolverState { mut vecs, ints } = state;
+        if vecs.len() != self.model_outputs.len() + 1 || ints.len() != 3 {
+            return false;
+        }
+        let [step_index, lower_order_nums, this_order] =
+            [ints[0], ints[1], ints[2]].map(|v| v as usize);
+        if step_index > self.timesteps.len() {
+            return false;
+        }
+        self.last_sample = vecs.pop().expect("checked length");
+        self.model_outputs = vecs;
+        self.step_index = step_index;
+        self.lower_order_nums = lower_order_nums;
+        self.this_order = this_order;
+        true
+    }
+
     /// One scheduler step: `flow` is the DiT velocity at the current latent
     /// `sample`; returns the latent for the next step. Mutates the multistep
     /// state. Mirrors `FlowUniPCMultistepScheduler.step`.

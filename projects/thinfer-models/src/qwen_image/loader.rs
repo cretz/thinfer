@@ -1,15 +1,22 @@
 //! Qwen-Image DiT weight registration. Tensor keys are 1:1 with the diffusers
-//! `QwenImageTransformer2DModel` module paths (no rename map). Big matmul
-//! weights ship Q8_0; biases, norms, and the sensitive embedders
-//! (img_in/txt_in/txt_norm/time_embed/norm_out/proj_out) ship F16 (narrowed to
-//! bf16 on upload). The number of registered blocks is a parameter so the
-//! single-block dit_parity registers just block 0.
+//! `QwenImageTransformer2DModel` module paths (no rename map). Block matmul
+//! weights are GGUF quant, and a `_K_M` file mixes kinds PER TENSOR (Q4_K /
+//! Q5_K / Q6_K / Q8_0), so each block linear records its own on-disk kind and
+//! the DiT routes its dequant by it. The top-level embedders
+//! (img_in/txt_in/time_embed/norm_out/proj_out) ride a bf16 dense site whatever
+//! the file stores (F16/BF16 narrow, quant dequants at upload). The number of
+//! registered blocks is a parameter so the single-block dit_parity registers
+//! just block 0.
 
+use thinfer_core::quant::QuantKind;
 use thinfer_core::residency::{TransposePolicy, WeightHandle, WeightResidency};
+use thinfer_core::tensor::StorageEncoding;
 use thinfer_core::weight::{WeightId, WeightSource};
 
 use crate::common::embedders::LinearBiasHandles;
-use crate::common::loader::{LoadError, register_linear, register_passthrough};
+use crate::common::loader::{
+    LoadError, register_linear, register_linear_dense_opt_ring, register_passthrough,
+};
 
 fn id(s: &str) -> WeightId {
     WeightId(s.to_string())
@@ -27,6 +34,47 @@ fn lin_bias<S: WeightSource>(
     })
 }
 
+/// Dense-site linear (the top-level embedders): bf16 `[K, N]` on the GPU
+/// whatever the file encoding.
+fn lin_bias_dense<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    weight: &str,
+    bias: &str,
+) -> Result<LinearBiasHandles, LoadError> {
+    Ok(LinearBiasHandles {
+        weight: register_linear_dense_opt_ring(residency, &id(weight), None)?,
+        bias: register_passthrough(residency, &id(bias))?,
+    })
+}
+
+/// A block linear + its weight's on-disk quant kind (`None` = a float weight,
+/// which runs the dense bf16 site).
+#[derive(Clone, Debug)]
+pub struct QLinearHandles {
+    pub lin: LinearBiasHandles,
+    pub kind: Option<QuantKind>,
+}
+
+fn qlin_bias<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    weight: &str,
+    bias: &str,
+) -> Result<QLinearHandles, LoadError> {
+    let kind = match residency
+        .source()
+        .catalog()
+        .get(&id(weight))
+        .and_then(|e| e.encoding)
+    {
+        Some(StorageEncoding::Quant(k)) => Some(k),
+        _ => None,
+    };
+    Ok(QLinearHandles {
+        lin: lin_bias(residency, weight, bias)?,
+        kind,
+    })
+}
+
 fn norm<S: WeightSource>(
     residency: &WeightResidency<S>,
     name: &str,
@@ -36,24 +84,24 @@ fn norm<S: WeightSource>(
 
 #[derive(Clone, Debug)]
 pub struct DitBlockHandles {
-    pub img_mod: LinearBiasHandles,
-    pub txt_mod: LinearBiasHandles,
-    pub to_q: LinearBiasHandles,
-    pub to_k: LinearBiasHandles,
-    pub to_v: LinearBiasHandles,
-    pub to_out: LinearBiasHandles,
-    pub add_q: LinearBiasHandles,
-    pub add_k: LinearBiasHandles,
-    pub add_v: LinearBiasHandles,
-    pub to_add_out: LinearBiasHandles,
+    pub img_mod: QLinearHandles,
+    pub txt_mod: QLinearHandles,
+    pub to_q: QLinearHandles,
+    pub to_k: QLinearHandles,
+    pub to_v: QLinearHandles,
+    pub to_out: QLinearHandles,
+    pub add_q: QLinearHandles,
+    pub add_k: QLinearHandles,
+    pub add_v: QLinearHandles,
+    pub to_add_out: QLinearHandles,
     pub norm_q: WeightHandle,
     pub norm_k: WeightHandle,
     pub norm_added_q: WeightHandle,
     pub norm_added_k: WeightHandle,
-    pub img_mlp_0: LinearBiasHandles,
-    pub img_mlp_2: LinearBiasHandles,
-    pub txt_mlp_0: LinearBiasHandles,
-    pub txt_mlp_2: LinearBiasHandles,
+    pub img_mlp_0: QLinearHandles,
+    pub img_mlp_2: QLinearHandles,
+    pub txt_mlp_0: QLinearHandles,
+    pub txt_mlp_2: QLinearHandles,
 }
 
 #[derive(Clone, Debug)]
@@ -78,7 +126,7 @@ fn register_block<S: WeightSource>(
     i: usize,
 ) -> Result<DitBlockHandles, LoadError> {
     let p = format!("transformer_blocks.{i}");
-    let lb = |w: &str, b: &str| lin_bias(residency, &format!("{p}.{w}"), &format!("{p}.{b}"));
+    let lb = |w: &str, b: &str| qlin_bias(residency, &format!("{p}.{w}"), &format!("{p}.{b}"));
     Ok(DitBlockHandles {
         img_mod: lb("img_mod.1.weight", "img_mod.1.bias")?,
         txt_mod: lb("txt_mod.1.weight", "txt_mod.1.bias")?,
@@ -108,21 +156,21 @@ pub fn register_handles<S: WeightSource>(
     n_layers: usize,
 ) -> Result<DitHandles, LoadError> {
     let top = DitTopHandles {
-        img_in: lin_bias(residency, "img_in.weight", "img_in.bias")?,
-        txt_in: lin_bias(residency, "txt_in.weight", "txt_in.bias")?,
+        img_in: lin_bias_dense(residency, "img_in.weight", "img_in.bias")?,
+        txt_in: lin_bias_dense(residency, "txt_in.weight", "txt_in.bias")?,
         txt_norm: norm(residency, "txt_norm.weight")?,
-        time_linear_1: lin_bias(
+        time_linear_1: lin_bias_dense(
             residency,
             "time_text_embed.timestep_embedder.linear_1.weight",
             "time_text_embed.timestep_embedder.linear_1.bias",
         )?,
-        time_linear_2: lin_bias(
+        time_linear_2: lin_bias_dense(
             residency,
             "time_text_embed.timestep_embedder.linear_2.weight",
             "time_text_embed.timestep_embedder.linear_2.bias",
         )?,
-        norm_out: lin_bias(residency, "norm_out.linear.weight", "norm_out.linear.bias")?,
-        proj_out: lin_bias(residency, "proj_out.weight", "proj_out.bias")?,
+        norm_out: lin_bias_dense(residency, "norm_out.linear.weight", "norm_out.linear.bias")?,
+        proj_out: lin_bias_dense(residency, "proj_out.weight", "proj_out.bias")?,
     };
     let mut blocks = Vec::with_capacity(n_layers);
     for i in 0..n_layers {

@@ -12,6 +12,7 @@ use std::path::Path;
 use thinfer_client::wire::JobSpec;
 use thinfer_client::{Client, JobKey, SubmitOptions, Update};
 
+use crate::checkpoint::PauseMode;
 use crate::progress::ProgressSink;
 use crate::request::JobSummary;
 
@@ -21,6 +22,9 @@ pub struct RemoteExecutor {
     client: Client,
     /// Queue priority of submitted jobs (higher first; default 0).
     priority: i32,
+    /// Submit jobs to run next, pausing a running job this way when no
+    /// worker is free.
+    preempt: Option<PauseMode>,
 }
 
 impl RemoteExecutor {
@@ -28,13 +32,37 @@ impl RemoteExecutor {
         Self {
             client,
             priority: 0,
+            preempt: None,
         }
+    }
+
+    /// Submit jobs to run next (see [`thinfer_client::wire::SealedJob::preempt`]).
+    pub fn with_preempt(mut self, preempt: Option<PauseMode>) -> Self {
+        self.preempt = preempt;
+        self
     }
 
     /// Submit jobs at this queue priority (higher runs first).
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
+    }
+
+    /// The underlying client (sessions and other calls beyond `run`).
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// [`Self::run`], plus the session node a session reply created.
+    pub async fn run_in_session(
+        &self,
+        spec: &JobSpec,
+        output: &Path,
+        sink: &dyn ProgressSink,
+    ) -> Result<(JobSummary, Option<String>), String> {
+        let mut node = None;
+        let summary = self.run_inner(spec, output, sink, &mut node).await?;
+        Ok((summary, node))
     }
 
     /// Submit `spec`, stream progress into `sink`, and write the result to
@@ -47,8 +75,19 @@ impl RemoteExecutor {
         output: &Path,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
+        self.run_inner(spec, output, sink, &mut None).await
+    }
+
+    async fn run_inner(
+        &self,
+        spec: &JobSpec,
+        output: &Path,
+        sink: &dyn ProgressSink,
+        session_node: &mut Option<String>,
+    ) -> Result<JobSummary, String> {
         let opts = SubmitOptions {
             priority: self.priority,
+            preempt: self.preempt,
         };
         let job = self.client.submit(spec, JobKey::generate(), &opts).await?;
         sink.note(&format!("Submitted job {}", job.id));
@@ -60,11 +99,14 @@ impl RemoteExecutor {
                 Update::Progress(stage) => sink.stage(stage),
                 Update::Log(message) => sink.note(message),
                 Update::Text(delta) => sink.text(delta),
+                Update::Paused { held: false } => sink.note("Paused; queued to resume"),
+                Update::Paused { held: true } => sink.note("Paused and held"),
             })
             .await?;
         // Fetched either way: the fetch is what deletes the job server-side.
         let artifact = self.client.fetch_result(&job).await?;
         let result = finished.result;
+        *session_node = result.text.as_ref().and_then(|t| t.session_node.clone());
         if result.text.is_none() || !output.as_os_str().is_empty() {
             if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
                 tokio::fs::create_dir_all(parent)

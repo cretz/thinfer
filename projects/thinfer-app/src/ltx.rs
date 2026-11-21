@@ -43,7 +43,7 @@ use thinfer_models::ltx::lora;
 use thinfer_models::ltx::manifest::role;
 use thinfer_models::ltx::pipeline::I2vCond;
 use thinfer_models::ltx::pipeline::{
-    build_dit_freqs, denoise_loop, normalize_cthw, streams_for, un_normalize_cthw,
+    build_dit_freqs, denoise_loop_ctl, normalize_cthw, streams_for, un_normalize_cthw,
 };
 use thinfer_models::ltx::rapid_vocoder::{self, RapidVocoder, RapidVocoderPipelines};
 use thinfer_models::ltx::sampler::{
@@ -132,6 +132,9 @@ fn ltx_vram_cap(rapid: bool) -> u64 {
     }
 }
 
+/// The paused-run layout (see [`crate::checkpoint::take_steps`]).
+const PAUSED_TAG: &str = "ltx/1";
+
 /// Run an LTX-2.3 joint audio-video generate to completion. `req.model` must be
 /// the LTX id (the caller dispatches on [`crate::model::VideoModelId::is_ltx`]).
 pub async fn run(
@@ -182,7 +185,13 @@ pub async fn run(
     if raw_prompt.is_empty() {
         return Err("empty prompt produced no tokens".into());
     }
-    let rewritten = if rapid {
+    // A resumed run: the seed it drew, where it stood (and in which stage),
+    // and the prompt it conditioned on (no second rewrite).
+    let resume = crate::checkpoint::take_steps(sink, PAUSED_TAG)?;
+    let resumed_prompt = resume.as_ref().and_then(|r| r.prompt.clone());
+    let rewritten = if let Some(p) = resumed_prompt {
+        Some(p.to_string())
+    } else if rapid {
         crate::rewrite::maybe_rewrite_prompt(
             req.rewrite,
             req.rewrite_quality,
@@ -211,7 +220,30 @@ pub async fn run(
     }
     let seq = ids.len();
 
-    let seed = req.seed.unwrap_or_else(random_seed);
+    let seed = resume
+        .as_ref()
+        .map(|r| r.seed)
+        .or(req.seed)
+        .unwrap_or_else(random_seed);
+    // The stage rides last in the solver's counters.
+    let (resume_stage, mut resume) = match resume {
+        Some(r) => {
+            let mut state = r.state;
+            let stage = state
+                .solver
+                .ints
+                .pop()
+                .ok_or("the paused job's checkpoint is corrupt")?;
+            (stage, Some(state))
+        }
+        None => (0, None),
+    };
+    let stop_here = || crate::checkpoint::stop_here(sink);
+    // Pause: keep the state, its stage, and the prompt this run used.
+    let pause = |mut st: thinfer_models::common::StepState, stage: u64| {
+        st.solver.ints.push(stage);
+        crate::checkpoint::stop_steps_with(sink, PAUSED_TAG, seed, Some(prompt), &st)
+    };
     tracing::info!(
         target: thinfer_core::trace::DIAG,
         model = %req.model, width = req.width, height = req.height,
@@ -600,84 +632,97 @@ pub async fn run(
             ));
         }
 
-        // --- Stage 1: pure-noise init, denoise at half res ---
-        let s1 = streams_for(vd_s1, ad);
-        let freqs_s1 = build_dit_freqs(vd_s1, ad, fps);
-        let lat_v = sampler::gaussian_noise(vd_s1.elems(), sampler::substream_seed(seed, 0));
-        let lat_a = sampler::gaussian_noise(ad.elems(), sampler::substream_seed(seed, 1));
-        let prog_s1 = |step: usize| {
-            sink.stage(Stage::Step {
-                i: step as u32 + 1,
-                n: total_steps,
-            })
-        };
-        let (lat_v, lat_a) = denoise_loop(
-            backend,
-            &dit_pipes,
-            &dit_res,
-            &dit_ws,
-            &dit_model,
-            s1,
-            &s1_sigmas,
-            lat_v,
-            lat_a,
-            &vtext,
-            &atext,
-            &freqs_s1,
-            None, // upscale path is t2v only (rapid, the i2v model, is single-stage)
-            Some(&prog_s1),
-        )
-        .await
-        .map_err(|e| format!("stage1 denoise: {e:?}"))?;
+        // Resuming in stage 2 skips stage 1 and the upscale: its state holds
+        // stage 2's own latents.
+        let (lat_v2, lat_a2) = if resume_stage == 1 {
+            (vec![0.0; vd_full.elems()], vec![0.0; ad.elems()])
+        } else {
+            // --- Stage 1: pure-noise init, denoise at half res ---
+            let s1 = streams_for(vd_s1, ad);
+            let freqs_s1 = build_dit_freqs(vd_s1, ad, fps);
+            let lat_v = sampler::gaussian_noise(vd_s1.elems(), sampler::substream_seed(seed, 0));
+            let lat_a = sampler::gaussian_noise(ad.elems(), sampler::substream_seed(seed, 1));
+            let prog_s1 = |step: usize| {
+                sink.stage(Stage::Step {
+                    i: step as u32 + 1,
+                    n: total_steps,
+                })
+            };
+            let (lat_v, lat_a) = match denoise_loop_ctl(
+                backend,
+                &dit_pipes,
+                &dit_res,
+                &dit_ws,
+                &dit_model,
+                s1,
+                &s1_sigmas,
+                lat_v,
+                lat_a,
+                &vtext,
+                &atext,
+                &freqs_s1,
+                None, // upscale path is t2v only (rapid, the i2v model, is single-stage)
+                Some(&prog_s1),
+                crate::checkpoint::step_control(resume.take(), &stop_here),
+            )
+            .await
+            .map_err(|e| format!("stage1 denoise: {e:?}"))?
+            {
+                thinfer_models::common::Generated::Done(out) => out,
+                thinfer_models::common::Generated::Stopped(st) => return Err(pause(st, 0)),
+            };
 
-        // --- Upscale x2 (un-normalize -> upsample -> re-normalize) ---
-        let mut cthw = sampler::video_tokens_to_cthw(&lat_v, vd_s1);
-        let thw_s1 = vd_s1.tokens();
-        un_normalize_cthw(&mut cthw, &mean, &std, thw_s1);
-        // Free the DiT's GPU-cached block weights so the upsampler has the full
-        // card; stage 2 re-streams the DiT from disk anyway (budget << 22.8GB).
-        dit_res.evict_all_and_free(&**backend);
-        let mut upscaled = {
-            let src = open_st(&upscaler_path).await?;
-            let residency = WeightResidency::new(src, budget);
-            let pipes = LtxUpsamplerPipelines::compile(backend)
-                .await
-                .map_err(|e| format!("compile upsampler: {e:?}"))?;
-            let ups =
-                LtxUpsampler::new(pipes, &residency).map_err(|e| format!("build ups: {e:?}"))?;
-            let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
-            let up = ups
-                .forward(
-                    backend,
-                    &residency,
-                    &ws,
-                    &cthw,
-                    vd_s1.frames,
-                    vd_s1.height,
-                    vd_s1.width,
-                )
-                .await
-                .map_err(|e| format!("upsample: {e:?}"))?;
-            residency.evict_all_and_free(&**backend);
-            up
-        };
-        let thw_full = vd_full.tokens();
-        if upscaled.len() != LATENT_CHANNELS * thw_full {
-            return Err(format!(
-                "upscaled size {} != expected {}",
-                upscaled.len(),
-                LATENT_CHANNELS * thw_full
-            ));
-        }
-        normalize_cthw(&mut upscaled, &mean, &std, thw_full);
-        let lat_v_full = sampler::video_cthw_to_tokens(&upscaled, vd_full);
+            // --- Upscale x2 (un-normalize -> upsample -> re-normalize) ---
+            let mut cthw = sampler::video_tokens_to_cthw(&lat_v, vd_s1);
+            let thw_s1 = vd_s1.tokens();
+            un_normalize_cthw(&mut cthw, &mean, &std, thw_s1);
+            // Free the DiT's GPU-cached block weights so the upsampler has the full
+            // card; stage 2 re-streams the DiT from disk anyway (budget << 22.8GB).
+            dit_res.evict_all_and_free(&**backend);
+            let mut upscaled = {
+                let src = open_st(&upscaler_path).await?;
+                let residency = WeightResidency::new(src, budget);
+                let pipes = LtxUpsamplerPipelines::compile(backend)
+                    .await
+                    .map_err(|e| format!("compile upsampler: {e:?}"))?;
+                let ups = LtxUpsampler::new(pipes, &residency)
+                    .map_err(|e| format!("build ups: {e:?}"))?;
+                let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+                let up = ups
+                    .forward(
+                        backend,
+                        &residency,
+                        &ws,
+                        &cthw,
+                        vd_s1.frames,
+                        vd_s1.height,
+                        vd_s1.width,
+                    )
+                    .await
+                    .map_err(|e| format!("upsample: {e:?}"))?;
+                residency.evict_all_and_free(&**backend);
+                up
+            };
+            let thw_full = vd_full.tokens();
+            if upscaled.len() != LATENT_CHANNELS * thw_full {
+                return Err(format!(
+                    "upscaled size {} != expected {}",
+                    upscaled.len(),
+                    LATENT_CHANNELS * thw_full
+                ));
+            }
+            normalize_cthw(&mut upscaled, &mean, &std, thw_full);
+            let lat_v_full = sampler::video_cthw_to_tokens(&upscaled, vd_full);
 
-        // --- Stage 2: renoise to STAGE2_SIGMAS[0], refine at full res ---
-        let renoise = s2_sigmas[0];
-        let noise_v = sampler::gaussian_noise(lat_v_full.len(), sampler::substream_seed(seed, 2));
-        let lat_v2 = sampler::renoise(&lat_v_full, &noise_v, renoise);
-        let noise_a = sampler::gaussian_noise(lat_a.len(), sampler::substream_seed(seed, 3));
-        let lat_a2 = sampler::renoise(&lat_a, &noise_a, renoise);
+            // --- Stage 2: renoise to STAGE2_SIGMAS[0], refine at full res ---
+            let renoise = s2_sigmas[0];
+            let noise_v =
+                sampler::gaussian_noise(lat_v_full.len(), sampler::substream_seed(seed, 2));
+            let lat_v2 = sampler::renoise(&lat_v_full, &noise_v, renoise);
+            let noise_a = sampler::gaussian_noise(lat_a.len(), sampler::substream_seed(seed, 3));
+            let lat_a2 = sampler::renoise(&lat_a, &noise_a, renoise);
+            (lat_v2, lat_a2)
+        };
         let s2 = streams_for(vd_full, ad);
         let freqs_s2 = build_dit_freqs(vd_full, ad, fps);
         let prog_s2 = |step: usize| {
@@ -686,7 +731,7 @@ pub async fn run(
                 n: total_steps,
             })
         };
-        denoise_loop(
+        match denoise_loop_ctl(
             backend,
             &dit_pipes,
             &dit_res,
@@ -701,9 +746,14 @@ pub async fn run(
             &freqs_s2,
             None, // upscale path is t2v only
             Some(&prog_s2),
+            crate::checkpoint::step_control(resume.take(), &stop_here),
         )
         .await
         .map_err(|e| format!("stage2 denoise: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done(out) => out,
+            thinfer_models::common::Generated::Stopped(st) => return Err(pause(st, 1)),
+        }
     } else {
         // --- Single-stage distilled: 8-step denoise directly at the target res ---
         // Opt-in HQ audio: subdivide the coarse distilled sigma jumps into finer
@@ -740,7 +790,7 @@ pub async fn run(
                 n: total_steps,
             })
         };
-        denoise_loop(
+        match denoise_loop_ctl(
             backend,
             &dit_pipes,
             &dit_res,
@@ -755,9 +805,14 @@ pub async fn run(
             &freqs,
             cond,
             Some(&prog),
+            crate::checkpoint::step_control(resume.take(), &stop_here),
         )
         .await
         .map_err(|e| format!("denoise: {e:?}"))?
+        {
+            thinfer_models::common::Generated::Done(out) => out,
+            thinfer_models::common::Generated::Stopped(st) => return Err(pause(st, 0)),
+        }
     };
 
     // Free the DiT before the VAE phases (release its streamed GPU residents).

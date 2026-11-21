@@ -13,7 +13,16 @@
 //! The queue is a priority queue: higher `priority` runs first, ties in
 //! arrival order, and waiting raises a job's effective priority by one level
 //! per `aging` so low-priority work never starves. Jobs are picked between
-//! runs; a running job is never preempted.
+//! runs. A job submitted with `preempt` runs next, ahead of the queue, and
+//! when no worker is free it pauses a running job that can (one it may
+//! manage), which goes back in the queue.
+//!
+//! Pausing (see `thinfer_app::checkpoint`): a running job asked to pause
+//! stops at a step boundary, hands its state to the worker, which seals it
+//! under the job key into `<dir>/checkpoint.sealed`, and the job gives up its
+//! worker: back in the queue, or held (out of it) until resumed. Its sealed
+//! spec stays with it, and the resumed run asks for the key again, so the
+//! state is ciphertext at rest and opened only to run.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use thinfer_app::jobkey::JobKey;
 use thinfer_app::wire::{
-    JobEvent, JobListEntry, JobResult, JobStateKind, JobStatus, ProgressStage,
+    JobEvent, JobListEntry, JobPause, JobResult, JobStateKind, JobStatus, PauseMode, ProgressStage,
 };
 use tokio::sync::{Notify, broadcast};
 
@@ -76,7 +85,16 @@ pub struct JobHandle {
     /// (cancel / reprioritize / delete) requires it, and the delivered key
     /// must match it.
     owner: Option<[u8; 32]>,
+    /// Run next; pause a running job this way when no worker is free.
+    preempt: Option<PauseMode>,
+    /// A pause asked for and not yet acted on.
+    pause: Mutex<Option<JobPause>>,
+    /// While it runs a model that can pause.
+    pausable: AtomicBool,
 }
+
+/// A paused job's state, sealed under its key, in its dir.
+const CHECKPOINT_FILE: &str = "checkpoint.sealed";
 
 impl JobHandle {
     fn new(
@@ -85,6 +103,7 @@ impl JobHandle {
         sealed: Vec<u8>,
         priority: i32,
         owner: Option<[u8; 32]>,
+        preempt: Option<PauseMode>,
     ) -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
@@ -93,6 +112,9 @@ impl JobHandle {
             priority: AtomicI32::new(priority),
             created: Instant::now(),
             owner,
+            preempt,
+            pause: Mutex::new(None),
+            pausable: AtomicBool::new(false),
             sealed: Mutex::new(Some(sealed)),
             keys: Mutex::new(KeySlot {
                 awaiting: false,
@@ -134,6 +156,8 @@ impl JobHandle {
                 inner.error = Some(message.clone());
             }
             JobEvent::Cancelled => inner.kind = JobStateKind::Cancelled,
+            JobEvent::Paused { held: true } => inner.kind = JobStateKind::Paused,
+            JobEvent::Paused { held: false } => inner.kind = JobStateKind::Queued,
         }
         if event.is_terminal() {
             inner.finished = Some(Instant::now());
@@ -170,7 +194,41 @@ impl JobHandle {
             progress: inner.last_progress.clone(),
             result: inner.result.clone(),
             error: inner.error.clone(),
+            pausable: self.can_pause(inner.kind),
         }
+    }
+
+    /// Running a model that can pause, and not already pausing.
+    fn can_pause(&self, kind: JobStateKind) -> bool {
+        kind == JobStateKind::Running
+            && self.pausable.load(Ordering::SeqCst)
+            && self.pause.lock().unwrap().is_none()
+    }
+
+    /// Whether the run may pause (set once its request is open, cleared when
+    /// it ends).
+    pub fn set_pausable(&self, pausable: bool) {
+        self.pausable.store(pausable, Ordering::SeqCst);
+    }
+
+    /// How the owner asked the run to pause, if they did.
+    pub fn pause_mode(&self) -> Option<PauseMode> {
+        self.pause.lock().unwrap().as_ref().map(|p| p.mode)
+    }
+
+    /// The pause the worker acts on (taken once).
+    pub fn take_pause(&self) -> Option<JobPause> {
+        self.pause.lock().unwrap().take()
+    }
+
+    /// Where a paused run's sealed state lives.
+    pub fn checkpoint_path(&self) -> PathBuf {
+        self.dir.join(CHECKPOINT_FILE)
+    }
+
+    /// Give the sealed spec back (a paused job runs again).
+    pub fn restore_sealed(&self, sealed: Vec<u8>) {
+        *self.sealed.lock().unwrap() = Some(sealed);
     }
 
     /// The structural listing row (no result, no error text).
@@ -183,6 +241,7 @@ impl JobHandle {
             queue_position,
             progress: inner.last_progress.clone(),
             age_secs: self.created.elapsed().as_secs(),
+            pausable: self.can_pause(inner.kind),
         }
     }
 
@@ -293,6 +352,9 @@ pub struct JobStore {
     /// Pending jobs in arrival order; picked by effective priority.
     queue: Mutex<Vec<Arc<JobHandle>>>,
     active: AtomicUsize,
+    /// Workers taking jobs (a preempting job pauses another only when all
+    /// are busy).
+    workers: usize,
     /// One priority level gained per this long waited.
     aging: Duration,
     /// Wakes idle workers when a job is enqueued.
@@ -301,7 +363,7 @@ pub struct JobStore {
 
 impl Default for JobStore {
     fn default() -> Self {
-        Self::new(Duration::from_secs(300))
+        Self::new(Duration::from_secs(300), 1)
     }
 }
 
@@ -313,11 +375,12 @@ fn random_id() -> String {
 }
 
 impl JobStore {
-    pub fn new(aging: Duration) -> Self {
+    pub fn new(aging: Duration, workers: usize) -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
             queue: Mutex::new(Vec::new()),
             active: AtomicUsize::new(0),
+            workers: workers.max(1),
             aging,
             notify: Notify::new(),
         }
@@ -331,6 +394,7 @@ impl JobStore {
         sealed: Vec<u8>,
         priority: i32,
         owner: Option<[u8; 32]>,
+        preempt: Option<PauseMode>,
     ) -> Arc<JobHandle> {
         let id = random_id();
         Arc::new(JobHandle::new(
@@ -339,14 +403,21 @@ impl JobStore {
             sealed,
             priority,
             owner,
+            preempt,
         ))
     }
 
-    /// The pending queue in run order: effective priority descending, then
-    /// arrival (the stable sort keeps arrival order among ties).
+    /// The pending queue in run order: preempting jobs first, then effective
+    /// priority descending, then arrival (the stable sort keeps arrival
+    /// order among ties).
     fn ordered(&self, q: &[Arc<JobHandle>]) -> Vec<Arc<JobHandle>> {
         let mut v = q.to_vec();
-        v.sort_by_key(|h| std::cmp::Reverse(h.effective_priority(self.aging)));
+        v.sort_by_key(|h| {
+            (
+                h.preempt.is_none(),
+                std::cmp::Reverse(h.effective_priority(self.aging)),
+            )
+        });
         v
     }
 
@@ -363,8 +434,96 @@ impl JobStore {
             order.iter().position(|h| h.id == handle.id).unwrap_or(0)
         };
         handle.push(JobEvent::Queued { position });
+        if let Some(mode) = handle.preempt {
+            self.preempt_for(handle, mode);
+        }
         self.notify.notify_one();
         position
+    }
+
+    /// With every worker busy, pause the lowest-priority running job that can
+    /// pause (and is not already pausing), so `job` gets its worker. Any job
+    /// may: a pause loses no work, it only reorders, as priority does.
+    fn preempt_for(&self, job: &JobHandle, mode: PauseMode) {
+        if self.active.load(Ordering::SeqCst) < self.workers {
+            return;
+        }
+        let victim = self
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|h| h.id != job.id && h.can_pause(h.state_kind()))
+            .min_by_key(|h| h.priority())
+            .cloned();
+        if let Some(victim) = victim {
+            tracing::info!(id = %victim.id, by = %job.id, "pausing a running job for a preempting one");
+            *victim.pause.lock().unwrap() = Some(JobPause {
+                mode,
+                hold: false,
+                priority: None,
+            });
+        }
+    }
+
+    /// Ask a job to pause. Queued: held (`hold`) or just reprioritized.
+    /// Taken but not yet running: given back before it runs. Running: it
+    /// pauses at its next step boundary (or poll, for [`PauseMode::Now`]),
+    /// when its model can.
+    pub fn pause(&self, id: &str, pause: JobPause) -> Result<(), &'static str> {
+        let job = self.get(id).ok_or("no such job")?;
+        {
+            let mut q = self.queue.lock().unwrap();
+            if q.iter().any(|h| h.id == id) {
+                if let Some(p) = pause.priority {
+                    job.priority.store(p, Ordering::SeqCst);
+                }
+                if pause.hold {
+                    q.retain(|h| h.id != id);
+                    drop(q);
+                    job.push(JobEvent::Paused { held: true });
+                }
+                return Ok(());
+            }
+        }
+        match job.state_kind() {
+            JobStateKind::Starting => {}
+            JobStateKind::Running if job.pausable.load(Ordering::SeqCst) => {}
+            JobStateKind::Running => return Err("this job's model cannot pause"),
+            JobStateKind::Paused => return Err("the job is already paused"),
+            _ => return Err("the job is not queued or running"),
+        }
+        *job.pause.lock().unwrap() = Some(pause);
+        Ok(())
+    }
+
+    /// Queue a held job again.
+    pub fn resume(&self, id: &str, priority: Option<i32>) -> Result<(), &'static str> {
+        let job = self.get(id).ok_or("no such job")?;
+        if job.state_kind() != JobStateKind::Paused {
+            return Err("the job is not held");
+        }
+        if let Some(p) = priority {
+            job.priority.store(p, Ordering::SeqCst);
+        }
+        self.enqueue(&job);
+        Ok(())
+    }
+
+    /// A worker gave up a paused job: back in the queue, or held (or ended,
+    /// when it was cancelled meanwhile).
+    pub fn requeue(&self, job: &Arc<JobHandle>, pause: JobPause) {
+        if job.is_cancel_requested() {
+            let _ = std::fs::remove_file(job.checkpoint_path());
+            return job.push(JobEvent::Cancelled);
+        }
+        if let Some(p) = pause.priority {
+            job.priority.store(p, Ordering::SeqCst);
+        }
+        job.push(JobEvent::Paused { held: pause.hold });
+        if !pause.hold {
+            self.enqueue(job);
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<JobHandle>> {
@@ -432,7 +591,7 @@ impl JobStore {
             q.retain(|h| h.id != id);
             q.len() < before
         };
-        if queued {
+        if queued || job.state_kind() == JobStateKind::Paused {
             job.request_cancel();
             job.push(JobEvent::Cancelled);
             self.remove(id);
@@ -458,6 +617,16 @@ impl JobStore {
             next.inner.lock().unwrap().kind = JobStateKind::Starting;
             self.active.fetch_add(1, Ordering::SeqCst);
             return Some(next);
+        }
+    }
+
+    /// Cancel a job: a running or queued one stops (see
+    /// [`JobHandle::request_cancel`]); a held one ends now, its state deleted.
+    pub fn cancel(&self, job: &JobHandle) {
+        job.request_cancel();
+        if job.state_kind() == JobStateKind::Paused {
+            job.push(JobEvent::Cancelled);
+            let _ = std::fs::remove_file(job.checkpoint_path());
         }
     }
 
@@ -510,14 +679,186 @@ mod tests {
     use super::*;
 
     fn submit(store: &JobStore, priority: i32, owner: Option<[u8; 32]>) -> Arc<JobHandle> {
-        let h = store.create(std::path::Path::new("unused"), vec![1], priority, owner);
+        let h = store.create(
+            std::path::Path::new("unused"),
+            vec![1],
+            priority,
+            owner,
+            None,
+        );
         store.enqueue(&h);
         h
     }
 
+    /// Take the next job and mark it running a model that can pause.
+    fn run_pausable(store: &JobStore) -> Arc<JobHandle> {
+        let h = store.take_next().unwrap();
+        h.set_pausable(true);
+        h.push(JobEvent::Started);
+        h
+    }
+
+    fn hold(mode: PauseMode) -> JobPause {
+        JobPause {
+            mode,
+            hold: true,
+            priority: None,
+        }
+    }
+
+    #[test]
+    fn a_queued_job_is_held_and_resumed() {
+        let store = JobStore::new(Duration::from_secs(3600), 1);
+        let a = submit(&store, 0, None);
+        let b = submit(&store, 0, None);
+        store.pause(&a.id, hold(PauseMode::StepEnd)).unwrap();
+        assert_eq!(a.state_kind(), JobStateKind::Paused);
+        assert_eq!(store.position(&a.id), None);
+        assert!(
+            store.pause(&a.id, hold(PauseMode::Now)).is_err(),
+            "already held"
+        );
+        // Held: the queue runs past it.
+        assert_eq!(store.take_next().unwrap().id, b.id);
+        assert!(store.take_next().is_none());
+        assert!(
+            store.resume(&b.id, None).is_err(),
+            "only a held job resumes"
+        );
+        store.resume(&a.id, Some(4)).unwrap();
+        assert_eq!(a.priority(), 4);
+        assert_eq!(a.state_kind(), JobStateKind::Queued);
+        assert_eq!(store.take_next().unwrap().id, a.id);
+    }
+
+    #[test]
+    fn a_running_job_pauses_only_when_its_model_can() {
+        let store = JobStore::new(Duration::from_secs(3600), 1);
+        submit(&store, 0, None);
+        let a = store.take_next().unwrap();
+        // Taken, still waiting for its key: the worker gives it back.
+        store.pause(&a.id, hold(PauseMode::Now)).unwrap();
+        assert_eq!(a.pause_mode(), Some(PauseMode::Now));
+        a.take_pause();
+        a.push(JobEvent::Started);
+        assert!(store.pause(&a.id, hold(PauseMode::StepEnd)).is_err());
+        assert!(!a.status(None).pausable);
+        a.set_pausable(true);
+        assert!(a.status(None).pausable);
+        store.pause(&a.id, hold(PauseMode::StepEnd)).unwrap();
+        assert_eq!(a.pause_mode(), Some(PauseMode::StepEnd));
+        assert!(!a.status(None).pausable, "already pausing");
+        // The worker hands it back: held until resumed.
+        store.requeue(&a, a.take_pause().unwrap());
+        assert_eq!(a.state_kind(), JobStateKind::Paused);
+        assert_eq!(store.position(&a.id), None);
+        // Requeued without hold: back in line.
+        let store = JobStore::new(Duration::from_secs(3600), 1);
+        submit(&store, 0, None);
+        let b = run_pausable(&store);
+        store.requeue(
+            &b,
+            JobPause {
+                mode: PauseMode::StepEnd,
+                hold: false,
+                priority: Some(-3),
+            },
+        );
+        assert_eq!(b.state_kind(), JobStateKind::Queued);
+        assert_eq!(b.priority(), -3);
+        assert_eq!(store.position(&b.id), Some(0));
+    }
+
+    #[test]
+    fn a_preempting_job_pauses_a_running_one_and_runs_next() {
+        let store = JobStore::new(Duration::from_secs(3600), 1);
+        submit(&store, 0, Some(JobKey::generate().proof()));
+        let running = run_pausable(&store);
+        let high = submit(&store, 9, None);
+        assert_eq!(running.pause_mode(), None, "priority alone never pauses");
+        // Another client's job (its own key) pauses it and runs next, ahead
+        // of a higher-priority one.
+        let pre = store.create(
+            std::path::Path::new("unused"),
+            vec![1],
+            0,
+            Some(JobKey::generate().proof()),
+            Some(PauseMode::Now),
+        );
+        store.enqueue(&pre);
+        assert_eq!(running.pause_mode(), Some(PauseMode::Now));
+        // A second preempting job finds nothing more to pause.
+        let pre2 = store.create(
+            std::path::Path::new("unused"),
+            vec![1],
+            0,
+            None,
+            Some(PauseMode::StepEnd),
+        );
+        store.enqueue(&pre2);
+        assert_eq!(running.pause_mode(), Some(PauseMode::Now));
+        store.requeue(&running, running.take_pause().unwrap());
+        store.finish();
+        let order: Vec<String> = (0..4)
+            .map(|_| store.take_next().unwrap().id.clone())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                pre.id.clone(),
+                pre2.id.clone(),
+                high.id.clone(),
+                running.id.clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_free_worker_means_no_preemption() {
+        let store = JobStore::new(Duration::from_secs(3600), 2);
+        submit(&store, 0, None);
+        let running = run_pausable(&store);
+        let pre = store.create(
+            std::path::Path::new("unused"),
+            vec![1],
+            0,
+            None,
+            Some(PauseMode::StepEnd),
+        );
+        store.enqueue(&pre);
+        assert_eq!(running.pause_mode(), None);
+    }
+
+    #[test]
+    fn a_held_job_cancels_and_deletes() {
+        let tmp = std::env::temp_dir().join(format!("thinfer-held-{}", random_id()));
+        let store = JobStore::new(Duration::from_secs(3600), 1);
+        let a = store.create(&tmp, vec![1], 0, None, None);
+        store.enqueue(&a);
+        store.pause(&a.id, hold(PauseMode::StepEnd)).unwrap();
+        std::fs::create_dir_all(&a.dir).unwrap();
+        std::fs::write(a.checkpoint_path(), b"sealed").unwrap();
+        store.cancel(&a);
+        assert_eq!(a.state_kind(), JobStateKind::Cancelled);
+        assert!(!a.checkpoint_path().exists());
+        let b = store.create(&tmp, vec![1], 0, None, None);
+        store.enqueue(&b);
+        store.pause(&b.id, hold(PauseMode::StepEnd)).unwrap();
+        store.delete(&b.id);
+        assert!(store.get(&b.id).is_none());
+        // A job cancelled while it paused ends instead of requeueing.
+        let c = submit(&store, 0, None);
+        let c2 = run_pausable(&store);
+        assert_eq!(c.id, c2.id);
+        c.request_cancel();
+        store.requeue(&c, hold(PauseMode::StepEnd));
+        assert_eq!(c.state_kind(), JobStateKind::Cancelled);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn higher_priority_first_ties_in_arrival_order() {
-        let store = JobStore::new(Duration::from_secs(3600));
+        let store = JobStore::new(Duration::from_secs(3600), 1);
         let a = submit(&store, 0, None);
         let b = submit(&store, 5, None);
         let c = submit(&store, 0, None);
@@ -532,7 +873,7 @@ mod tests {
 
     #[test]
     fn reprioritize_and_delete_queued() {
-        let store = JobStore::new(Duration::from_secs(3600));
+        let store = JobStore::new(Duration::from_secs(3600), 1);
         let a = submit(&store, 0, None);
         let b = submit(&store, 0, None);
         assert!(store.set_priority(&b.id, 1));
@@ -550,7 +891,7 @@ mod tests {
 
     #[test]
     fn aging_lifts_waiting_jobs() {
-        let store = JobStore::new(Duration::from_secs(1));
+        let store = JobStore::new(Duration::from_secs(1), 1);
         let old = submit(&store, -2, None);
         std::thread::sleep(Duration::from_millis(3100));
         let new = submit(&store, 0, None);

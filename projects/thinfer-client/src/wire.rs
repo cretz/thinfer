@@ -39,6 +39,54 @@ pub struct SealedJob {
     /// `x-job-key-sha256` header, and the key delivered later must match it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_proof: Option<String>,
+    /// Run next, ahead of the queue: when no worker is free, the
+    /// lowest-priority running job that can pause pauses this way and goes
+    /// back in the queue, resuming after this job. Any job may preempt: a
+    /// pause loses no work (like a higher `priority`, it only reorders).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt: Option<PauseMode>,
+}
+
+/// How a running job pauses. Encode, each denoise step, and the VAE decode
+/// are steps; a paused job keeps its state from its last finished step
+/// (sealed under its key, on disk), gives up the GPU and its memory, and
+/// resumes from there: the result is the same as an uninterrupted run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum PauseMode {
+    /// When the step in flight finishes.
+    #[default]
+    StepEnd,
+    /// As soon as the job can stop: the step in flight is abandoned and runs
+    /// again on resume.
+    Now,
+}
+
+/// `POST /jobs/{id}/pause` body.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct JobPause {
+    #[serde(default)]
+    pub mode: PauseMode,
+    /// Hold the job until `POST /jobs/{id}/resume` (default: back in the
+    /// queue as soon as it has paused).
+    #[serde(default)]
+    pub hold: bool,
+    /// Its queue priority from here on (default: unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+}
+
+/// `POST /jobs/{id}/resume` body.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct JobResume {
+    /// Its queue priority from here on (default: unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
 }
 
 /// `PATCH /jobs/{id}` body.
@@ -168,6 +216,10 @@ pub struct TextSpec {
     pub model: Option<TextModelId>,
     /// The conversation, oldest first.
     pub messages: Vec<TextMessage>,
+    /// Reply token budget. `0` with a `session`: a prefix-only request that
+    /// processes `messages` (system / user turns) into a node and generates
+    /// nothing; requests continuing from that node send the turns that
+    /// follow (same `tools` and `think`).
     pub max_tokens: Option<u32>,
     /// Let the model reason before it answers (thinking mode).
     pub think: Option<bool>,
@@ -278,6 +330,10 @@ pub struct SessionNodeInfo {
     pub end: u32,
     pub bytes: u64,
     pub age_secs: u64,
+    /// Ends without a reply: a prefix node (`maxTokens: 0`), continued with
+    /// new turns.
+    #[serde(default)]
+    pub open: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -297,11 +353,18 @@ pub struct ImageSpec {
     /// precision). Default false. No effect on GGUF variants / other models.
     #[serde(default)]
     pub full_precision: Option<bool>,
-    /// Base64-encoded input images (PNG/JPEG), in prompt order: exactly one
-    /// for qwen-image-edit-rapid, up to 10 condition images for
-    /// qwen-image-2.1-turbo, rejected otherwise. Held in RAM server-side.
+    /// Base64-encoded input images (PNG/JPEG), in prompt order: 1 to 3 for
+    /// qwen-image-edit-rapid (the prompt names them "Picture 1", ...), up to
+    /// 10 condition images for qwen-image-2.1-turbo, rejected otherwise. Held
+    /// in RAM server-side.
     #[serde(default)]
     pub input_images: Vec<String>,
+    /// With input images (qwen-image-2.1-turbo; other models always render
+    /// the requested size): true = exactly the requested width x height,
+    /// false = the last input's aspect ratio at that pixel area. Unset =
+    /// true when `width` or `height` is set, else false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_size: Option<bool>,
     /// Opt out of the cooperative-matrix (tensor-core) path; see
     /// [`JobSpec::disable_coopmat`].
     #[serde(default)]
@@ -593,6 +656,8 @@ pub enum JobStateKind {
     /// Taken by a worker: waiting for the key, then opening the spec.
     Starting,
     Running,
+    /// Paused and held: out of the queue until resumed.
+    Paused,
     Done,
     Failed,
     Cancelled,
@@ -603,6 +668,8 @@ pub enum JobStateKind {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(tag = "stage", rename_all = "camelCase")]
 pub enum ProgressStage {
+    /// The job has a worker and is loading its model (see [`Stage::Loading`]).
+    Loading,
     TextEncode,
     Step {
         i: u32,
@@ -628,6 +695,7 @@ pub enum ProgressStage {
 impl From<Stage> for ProgressStage {
     fn from(s: Stage) -> Self {
         match s {
+            Stage::Loading => ProgressStage::Loading,
             Stage::TextEncode => ProgressStage::TextEncode,
             Stage::Step { i, n } => ProgressStage::Step { i, n },
             Stage::ChunkStep {
@@ -650,6 +718,7 @@ impl From<Stage> for ProgressStage {
 impl From<ProgressStage> for Stage {
     fn from(s: ProgressStage) -> Self {
         match s {
+            ProgressStage::Loading => Stage::Loading,
             ProgressStage::TextEncode => Stage::TextEncode,
             ProgressStage::Step { i, n } => Stage::Step { i, n },
             ProgressStage::ChunkStep {
@@ -718,6 +787,10 @@ pub struct JobStatus {
     pub progress: Option<ProgressStage>,
     pub result: Option<JobResult>,
     pub error: Option<String>,
+    /// Whether the job can pause now: it runs a model that can, and is not
+    /// already pausing.
+    #[serde(default)]
+    pub pausable: bool,
 }
 
 /// One `GET /jobs` row: structural fields only (the spec is sealed; no result
@@ -734,6 +807,9 @@ pub struct JobListEntry {
     pub progress: Option<ProgressStage>,
     /// Seconds since submit.
     pub age_secs: u64,
+    /// See [`JobStatus::pausable`].
+    #[serde(default)]
+    pub pausable: bool,
 }
 
 /// `GET /jobs` body: pending jobs in run order, then the rest newest first.
@@ -777,6 +853,14 @@ pub enum JobEvent {
         message: String,
     },
     Cancelled,
+    /// The job paused (see [`PauseMode`]) and gave up its worker. It resumes
+    /// from its last finished step, asking for its key again
+    /// ([`JobEvent::KeyRequired`]). `held`: it waits for `POST
+    /// /jobs/{id}/resume`; else it is back in the queue (a `queued` event
+    /// follows).
+    Paused {
+        held: bool,
+    },
 }
 
 impl JobEvent {
@@ -791,6 +875,7 @@ impl JobEvent {
             JobEvent::Done { .. } => "done",
             JobEvent::Error { .. } => "error",
             JobEvent::Cancelled => "cancelled",
+            JobEvent::Paused { .. } => "paused",
         }
     }
 
@@ -801,4 +886,120 @@ impl JobEvent {
             JobEvent::Done { .. } | JobEvent::Error { .. } | JobEvent::Cancelled
         )
     }
+}
+
+/// `GET /models` body: every model this server runs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ModelList {
+    pub models: Vec<ModelInfo>,
+}
+
+/// What a model runs, takes and makes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    /// The job spec's `model` value.
+    pub id: String,
+    pub kind: ModelKind,
+    /// One-line description.
+    pub title: String,
+    /// The model a spec without `model` runs.
+    pub default: bool,
+    /// Every weight file its default job needs is on the server already (else
+    /// the first job downloads them, when the server allows it).
+    pub downloaded: bool,
+    /// Its jobs can pause (`POST /jobs/{id}/pause`).
+    pub pausable: bool,
+    /// The images it takes; empty: none.
+    pub inputs: Vec<InputSlot>,
+    /// Image / video models: what sets the output size, and its rules.
+    pub size: Option<SizeRules>,
+    /// Video models.
+    pub video: Option<VideoInfo>,
+}
+
+/// A model family, as a job spec's `kind` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum ModelKind {
+    Text,
+    Image,
+    Video,
+    FaceSwap,
+}
+
+/// One kind of image input a model takes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct InputSlot {
+    /// The spec field that carries it (`inputImages`, `inputImage`,
+    /// `refImages`, `sourceImage`).
+    pub field: String,
+    pub used_as: InputUse,
+    pub min: u32,
+    pub max: u32,
+    /// How a prompt names the n-th image (`{n}` from 1), when it can.
+    pub prompt_tag: Option<String>,
+}
+
+/// What a model does with an input image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum InputUse {
+    /// Conditioning for an edit or a composition (several, in prompt order).
+    Condition,
+    /// The one image an edit changes.
+    Edit,
+    /// The video's first frame.
+    FirstFrame,
+    /// Named references (people, objects, styles) the video draws on.
+    Reference,
+    /// The face to swap in.
+    Face,
+}
+
+/// What decides the output size, and the sizes allowed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SizeRules {
+    /// Width and height must be multiples of this.
+    pub multiple: u32,
+    pub default_width: u32,
+    pub default_height: u32,
+    /// With input images, the output can take the last input's aspect ratio
+    /// at the requested pixel area: when the spec sets no size, or sets
+    /// `keepSize: false`.
+    pub follows_last_input: bool,
+}
+
+/// Video limits that matter to callers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct VideoInfo {
+    /// Playback frame rate (fixed when `fixedFps`).
+    pub fps: u32,
+    pub fixed_fps: bool,
+    /// At the default size, the most frames one clip can have on this
+    /// server's GPU budget (larger sizes allow fewer); `None`: set by the
+    /// prompt's length (a longer one leaves fewer).
+    pub max_frames: Option<u32>,
+    /// Legal clip lengths: `frameStep * n + frameOffset` frames (`n >= 0`).
+    /// Other requests are moved onto this grid (see `framesRoundUp`).
+    pub frame_step: u32,
+    pub frame_offset: u32,
+    /// Off-grid lengths round UP to the next legal one (else to the nearest).
+    pub frames_round_up: bool,
+    /// Several prompts render as chained clips (each starts on the previous
+    /// one's last frame).
+    pub chained_clips: bool,
+    /// It renders an audio track.
+    pub audio: bool,
 }
