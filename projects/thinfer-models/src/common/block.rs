@@ -3762,6 +3762,7 @@ fn op_sdpa_impl<'wsp>(
                 b,
                 rows,
                 h_q,
+                head_dim,
             )?;
             scope.dispatch_op::<F16ToBf16>(to_bf16, &[o_f16], scope.subview(&dst, off, len))?;
             r0 += rows;
@@ -3823,7 +3824,7 @@ fn op_sdpa_impl<'wsp>(
         && has_mask == 0
         && scope
             .accelerator()
-            .is_some_and(|a| a.accepts_sdpa_f16(SDPA_UNIFORM_BYTES))
+            .is_some_and(|a| a.accepts_sdpa_f16(SDPA_UNIFORM_BYTES, head_dim))
     {
         const MAX_ACCEL_WORK: u64 = 2_000_000_000_000;
         let per_row = s_k.max(1) as u64 * row_elems as u64;
@@ -3874,6 +3875,7 @@ fn op_sdpa_impl<'wsp>(
                 b,
                 rows,
                 h_q,
+                head_dim,
             )?;
         } else {
             let u = sdpa_uniform(scope, b, h_q, h_kv, rows, s_k, head_dim, scale, has_mask)?;
@@ -3958,6 +3960,7 @@ fn dispatch_sdpa_dense<'wsp>(
             b,
             s_q,
             h_q,
+            head_dim,
         )
     } else {
         scope.sdpa::<SdpaF32>(&pipelines.sdpa, q, k, v, mask, u, out, b, s_q, h_q)

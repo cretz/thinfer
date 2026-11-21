@@ -205,9 +205,10 @@ impl CudaAccel {
 }
 
 impl Accelerator for CudaAccel {
-    fn accepts_sdpa_f16(&self, uniform_len: u64) -> bool {
-        // The plain `sdpa_sg` uniform only (the windowed one is longer).
-        uniform_len == UNIFORM_LEN && self.sdpa().is_some()
+    fn accepts_sdpa_f16(&self, uniform_len: u64, head_dim: u32) -> bool {
+        // The plain `sdpa_sg` uniform only (the windowed one is longer), at the
+        // head dims the kernel is built for.
+        uniform_len == UNIFORM_LEN && matches!(head_dim, 64 | 128) && self.sdpa().is_some()
     }
 
     fn sdpa_f16(&self, a: &SdpaAddrs) -> Result<bool, String> {

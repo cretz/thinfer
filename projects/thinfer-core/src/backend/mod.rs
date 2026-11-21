@@ -267,8 +267,8 @@ impl StagedWrite for Vec<u8> {
 pub trait Accelerator: Send + Sync {
     /// Cheap host-side precheck for [`Self::sdpa_f16`], before the caller pays
     /// to flush and drain the GPU. `uniform_len` distinguishes the plain `sdpa_sg`
-    /// uniform from the windowed one.
-    fn accepts_sdpa_f16(&self, uniform_len: u64) -> bool;
+    /// uniform from the windowed one; `head_dim` is the call's head dimension.
+    fn accepts_sdpa_f16(&self, uniform_len: u64, head_dim: u32) -> bool;
 
     /// Fused f16 attention with exactly the `sdpa_sg` contract (BSHD f16 Q/K/V/
     /// out, GQA, mask modes 0/1/2, f32 softmax; shapes read from the uniform).

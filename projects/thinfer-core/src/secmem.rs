@@ -12,11 +12,13 @@
 //! with an error instead of carrying on with swappable plaintext. Model
 //! weights are never locked (they are not job data and would not fit).
 //!
-//! Locks are page-granular and not reference counted: two buffers sharing an
-//! edge page unlock it when the first is dropped. Large buffers come from
-//! their own mappings, so this only ever concerns a buffer's edge pages.
+//! Locks are page-granular, and two small buffers can share a page. A
+//! buffer's interior pages are its own; its two edge pages are counted
+//! ([`EDGES`]), and a page is unlocked only once no live buffer holds it.
 
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use zeroize::{DefaultIsZeroes, Zeroize};
@@ -49,6 +51,67 @@ fn record_failure() {
     FAILURES.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Live holders of each locked buffer's edge pages (page index -> count).
+/// Held across the OS lock / unlock calls, so a page another buffer is just
+/// locking is never unlocked under it.
+static EDGES: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
+
+/// The first and last page of a non-empty range (equal for a one-page range).
+fn edge_pages(ptr: usize, len: usize) -> (usize, usize) {
+    let page = platform::page_size();
+    (ptr / page, (ptr + len - 1) / page)
+}
+
+/// Lock `len > 0` bytes at `ptr`; `false` (nothing held) when the OS refused.
+fn acquire(ptr: *const u8, len: usize) -> bool {
+    let mut edges = EDGES.lock().unwrap_or_else(|p| p.into_inner());
+    if !platform::lock(ptr.cast(), len) {
+        return false;
+    }
+    let (first, last) = edge_pages(ptr as usize, len);
+    *edges.entry(first).or_insert(0) += 1;
+    if last != first {
+        *edges.entry(last).or_insert(0) += 1;
+    }
+    true
+}
+
+/// Drop an [`acquire`] of the same range: unlock its pages except edge pages
+/// another live buffer still holds.
+fn give_back(ptr: *const u8, len: usize) {
+    let mut edges = EDGES.lock().unwrap_or_else(|p| p.into_inner());
+    let page = platform::page_size();
+    let (first, last) = edge_pages(ptr as usize, len);
+    // Drop one hold on page `p`; whether another buffer still holds it.
+    let mut still_held = |p: usize| {
+        let n = edges.get_mut(&p).expect("edge page of a held lock");
+        *n -= 1;
+        if *n == 0 {
+            edges.remove(&p);
+            false
+        } else {
+            true
+        }
+    };
+    let (mut lo, mut hi) = (ptr as usize, ptr as usize + len);
+    if first == last {
+        if still_held(first) {
+            hi = lo;
+        }
+    } else {
+        if still_held(first) {
+            lo = (first + 1) * page;
+        }
+        if still_held(last) {
+            hi = last * page;
+        }
+    }
+    if lo < hi {
+        platform::unlock(lo as *const _, hi - lo);
+    }
+    platform::forget(len);
+}
+
 /// A page-locked (under [`enforce`]), zeroize-on-drop buffer. Its length is
 /// fixed: it derefs to a slice, so it can never reallocate out of the locked
 /// pages.
@@ -61,7 +124,7 @@ impl<T: DefaultIsZeroes> Locked<T> {
     /// Take ownership of `buf` and lock its pages.
     pub fn new(buf: Vec<T>) -> Self {
         let locked = ENFORCED.load(Ordering::SeqCst) && !buf.is_empty() && {
-            let ok = platform::lock(buf.as_ptr().cast(), std::mem::size_of_val(&buf[..]));
+            let ok = acquire(buf.as_ptr().cast(), std::mem::size_of_val(&buf[..]));
             if !ok {
                 record_failure();
                 tracing::error!(
@@ -116,35 +179,11 @@ impl<T: DefaultIsZeroes> Drop for Locked<T> {
     fn drop(&mut self) {
         self.buf.as_mut_slice().zeroize();
         if self.locked {
-            platform::unlock(
+            give_back(
                 self.buf.as_ptr().cast(),
                 std::mem::size_of_val(&self.buf[..]),
             );
         }
-    }
-}
-
-/// Lock `bytes` for as long as the caller keeps them (no ownership): for a
-/// buffer whose owner zeroizes it already. Pair with [`release`].
-pub fn lock_slice(bytes: &[u8]) {
-    if ENFORCED.load(Ordering::SeqCst)
-        && !bytes.is_empty()
-        && !platform::lock(bytes.as_ptr().cast(), bytes.len())
-    {
-        record_failure();
-        tracing::error!(
-            target: crate::trace::ADAPTER,
-            bytes = bytes.len(),
-            "could not lock job data in RAM (not enough lockable memory); stopping the job",
-        );
-    }
-}
-
-/// Zeroize `bytes` and drop a [`lock_slice`] lock.
-pub fn release(bytes: &mut [u8]) {
-    bytes.zeroize();
-    if ENFORCED.load(Ordering::SeqCst) && !bytes.is_empty() {
-        platform::unlock(bytes.as_ptr().cast(), bytes.len());
     }
 }
 
@@ -194,10 +233,29 @@ mod platform {
         ok
     }
 
+    /// Unlock pages of a held lock (a sub-range of it: shared edges stay).
     pub fn unlock(ptr: *const c_void, len: usize) {
-        // SAFETY: as in `lock`; unlocking pages already unlocked is harmless.
+        // SAFETY: `ptr..ptr + len` lies within a live, locked allocation.
         unsafe { VirtualUnlock(ptr, len) };
+    }
+
+    /// Return a `len`-byte lock's working-set growth.
+    pub fn forget(len: usize) {
         grow(-((len + SLACK) as isize));
+    }
+
+    pub fn page_size() -> usize {
+        use std::sync::OnceLock;
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        static PAGE: OnceLock<usize> = OnceLock::new();
+        *PAGE.get_or_init(|| {
+            // SAFETY: fills a plain out-struct.
+            unsafe {
+                let mut info: SYSTEM_INFO = std::mem::zeroed();
+                GetSystemInfo(&mut info);
+                info.dwPageSize as usize
+            }
+        })
     }
 }
 
@@ -227,7 +285,7 @@ mod platform {
         #[cfg(target_os = "linux")]
         if ok {
             // Out of core dumps too (page-aligned range covering the buffer).
-            let page = 4096usize;
+            let page = page_size();
             let start = (ptr as usize) & !(page - 1);
             let end = (ptr as usize + len).next_multiple_of(page);
             // SAFETY: advice only, over pages of the caller's allocation.
@@ -236,9 +294,17 @@ mod platform {
         ok
     }
 
+    /// Unlock pages of a held lock (a sub-range of it: shared edges stay).
     pub fn unlock(ptr: *const c_void, len: usize) {
-        // SAFETY: as in `lock`.
+        // SAFETY: `ptr..ptr + len` lies within a live, locked allocation.
         unsafe { libc::munlock(ptr, len) };
+    }
+
+    pub fn forget(_len: usize) {}
+
+    pub fn page_size() -> usize {
+        // SAFETY: a plain sysconf query.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
     }
 }
 
@@ -254,6 +320,12 @@ mod platform {
     }
 
     pub fn unlock(_ptr: *const c_void, _len: usize) {}
+
+    pub fn forget(_len: usize) {}
+
+    pub fn page_size() -> usize {
+        65536
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +345,30 @@ mod tests {
         assert_eq!(b.len(), 1 << 20);
         drop(b);
         assert!(!failed_since(mark));
+    }
+
+    /// Two buffers sharing a page: dropping one leaves the shared page held
+    /// for the other, and the table forgets it once both are gone.
+    #[test]
+    fn shared_edge_page_stays_locked_until_its_last_holder_drops() {
+        enforce();
+        let page = platform::page_size();
+        let backing = vec![0u8; 4 * page];
+        let base = backing.as_ptr() as usize;
+        // A page boundary inside `backing`, and two ranges sharing the page
+        // after it: `a` straddles the boundary, `b` sits within that page.
+        let mid = (base / page + 2) * page;
+        let a = ((mid - 100) as *const u8, 200);
+        let b = ((mid + 50) as *const u8, 100);
+        let holders = |addr: usize| EDGES.lock().unwrap().get(&(addr / page)).copied();
+        assert!(acquire(a.0, a.1));
+        assert!(acquire(b.0, b.1));
+        assert_eq!(holders(mid), Some(2));
+        give_back(a.0, a.1);
+        assert_eq!(holders(mid), Some(1));
+        assert_eq!(holders(mid - 100), None);
+        give_back(b.0, b.1);
+        assert_eq!(holders(mid), None);
+        drop(backing);
     }
 }

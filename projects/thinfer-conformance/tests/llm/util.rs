@@ -21,6 +21,10 @@ pub fn read_i32(p: &Path) -> Vec<i32> {
 pub fn compare(label: &str, exp: &[f32], got: &[f32]) -> (f64, f64) {
     assert_eq!(exp.len(), got.len(), "[{label}] length mismatch");
     assert!(
+        exp.iter().all(|x| x.is_finite()),
+        "[{label}] reference has non-finite values"
+    );
+    assert!(
         got.iter().all(|x| x.is_finite()),
         "[{label}] engine output has non-finite values"
     );

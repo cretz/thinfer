@@ -646,6 +646,7 @@ fn block_attn<'wsp>(
                 1,
                 joint,
                 heads,
+                hd,
             )?;
             scope.dispatch_op::<F16ToBf16>(&fast.to_bf16, &[sa_f16.data], sa.data)?;
         }
