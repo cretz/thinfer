@@ -104,6 +104,7 @@ pub fn register_video_patch_proj<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose: TransposePolicy::Linear2D,
         transcode: None,
+        keep_f32: false,
     }))
 }
 

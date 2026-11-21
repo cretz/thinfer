@@ -1274,7 +1274,7 @@ impl ElementwiseKernels {
                     QuantKind::Q5_K => (self.dequant_q5_k, blocks, "dequant_q5_k"),
                     QuantKind::Q6_K => (self.dequant_q6_k, blocks, "dequant_q6_k"),
                     QuantKind::Q8_0 => (self.dequant_q8_0, blocks.div_ceil(8), "dequant_q8_0"),
-                    QuantKind::Q4_0 => return Ok(false),
+                    QuantKind::Q4_0 | QuantKind::Q5_0 | QuantKind::Q5_1 => return Ok(false),
                 };
                 if grid > i32::MAX as u64 || blocks > u32::MAX as u64 {
                     return Ok(false);

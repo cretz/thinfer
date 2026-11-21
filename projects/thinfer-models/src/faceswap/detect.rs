@@ -23,6 +23,15 @@ const NUM_ANCHORS: usize = 2;
 const SCORE_THRESHOLD: f32 = 0.5;
 const NMS_IOU: f32 = 0.4;
 
+/// Load the SCRFD detector on its fixed letterbox input.
+pub async fn load(
+    backend: std::sync::Arc<thinfer_core::backend::WgpuBackend>,
+    onnx: &[u8],
+) -> Result<OnnxModel, OnnxError> {
+    let shapes = super::input_shape_map(onnx, &[1, 3, DETECTOR_SIZE as i64, DETECTOR_SIZE as i64])?;
+    OnnxModel::load(backend, onnx, &shapes).await
+}
+
 /// Detect faces in `img`. Returns NMS-filtered faces sorted by descending score.
 pub async fn detect(model: &OnnxModel, img: &Image) -> Result<Vec<Face>, OnnxError> {
     // Letterbox: scale preserving aspect ratio, origin top-left, zero pad.
@@ -111,6 +120,57 @@ pub async fn detect(model: &OnnxModel, img: &Image) -> Result<Vec<Face>, OnnxErr
     Ok(nms(faces, NMS_IOU))
 }
 
+/// [`detect`] that also finds faces too small for one whole-image pass (which
+/// shrinks `img` to 640): the whole image, plus overlapping 640 tiles at
+/// `img`'s own resolution, merged by NMS. Cost grows with `img`'s area, so
+/// callers bound its size first.
+pub async fn detect_tiled(model: &OnnxModel, img: &Image) -> Result<Vec<Face>, OnnxError> {
+    let mut faces = detect(model, img).await?;
+    let (w, h) = (DETECTOR_SIZE.min(img.w), DETECTOR_SIZE.min(img.h));
+    if (w, h) == (img.w, img.h) {
+        return Ok(faces); // One tile would be the whole image.
+    }
+    // A face cut by an inner tile edge is seen whole by its neighbour (the
+    // overlap is wider than the faces this pass is for): drop the partial box.
+    let margin = 2.0;
+    for (x, y) in tile_origins(img.w, DETECTOR_SIZE)
+        .flat_map(|x| tile_origins(img.h, DETECTOR_SIZE).map(move |y| (x, y)))
+    {
+        for mut f in detect(model, &img.crop(x, y, w, h)).await? {
+            let [x1, y1, x2, y2] = f.bbox;
+            let cut = (x > 0 && x1 < margin)
+                || (y > 0 && y1 < margin)
+                || (x + w < img.w && x2 > w as f32 - margin)
+                || (y + h < img.h && y2 > h as f32 - margin);
+            if cut {
+                continue;
+            }
+            let (dx, dy) = (x as f32, y as f32);
+            f.bbox = [
+                f.bbox[0] + dx,
+                f.bbox[1] + dy,
+                f.bbox[2] + dx,
+                f.bbox[3] + dy,
+            ];
+            for lm in &mut f.landmark5 {
+                lm[0] += dx;
+                lm[1] += dy;
+            }
+            faces.push(f);
+        }
+    }
+    Ok(nms(faces, NMS_IOU))
+}
+
+/// Tile starts along an edge of `len` for `tile`-wide tiles overlapping by a
+/// quarter, the last flush with the far edge (a single 0 when it fits).
+fn tile_origins(len: usize, tile: usize) -> impl Iterator<Item = usize> {
+    let step = tile - tile / 4;
+    let last = len.saturating_sub(tile);
+    let n = last.div_ceil(step) + 1;
+    (0..n).map(move |i| (i * step).min(last))
+}
+
 fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let x1 = a[0].max(b[0]);
     let y1 = a[1].max(b[1]);
@@ -134,4 +194,25 @@ fn nms(mut faces: Vec<Face>, thr: f32) -> Vec<Face> {
         keep.push(f);
     }
     keep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tile_origins;
+
+    #[test]
+    fn tiles_cover_the_edge_with_overlap() {
+        assert_eq!(tile_origins(640, 640).collect::<Vec<_>>(), [0]);
+        assert_eq!(tile_origins(300, 640).collect::<Vec<_>>(), [0]);
+        for len in [641, 1000, 1440, 1920, 2561] {
+            let t: Vec<usize> = tile_origins(len, 640).collect();
+            assert_eq!(t[0], 0);
+            assert_eq!(*t.last().unwrap(), len - 640, "flush with the far edge");
+            // Consecutive tiles overlap by at least a quarter tile.
+            assert!(
+                t.windows(2)
+                    .all(|p| p[1] > p[0] && p[0] + 640 - p[1] >= 160)
+            );
+        }
+    }
 }

@@ -472,6 +472,7 @@ fn register_squeezed<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose: TransposePolicy::Linear2D,
         transcode: None,
+        keep_f32: false,
     }))
 }
 

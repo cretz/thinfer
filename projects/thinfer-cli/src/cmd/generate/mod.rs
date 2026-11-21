@@ -23,10 +23,12 @@ use thinfer_native::cache::DownloadProgress;
 
 mod faceswap;
 mod image;
+mod text;
 mod video;
 
 use faceswap::GenerateFaceSwap;
 use image::GenerateImage;
+use text::GenerateText;
 use video::GenerateVideo;
 
 #[derive(Subcommand)]
@@ -35,6 +37,8 @@ pub enum GenerateCmd {
     Image(GenerateImage),
     /// Generate a video from a prompt (t2v).
     Video(GenerateVideo),
+    /// Generate a chat reply with an LLM (streamed to stdout).
+    Text(GenerateText),
     /// Swap a face from a source image into every frame of an input video.
     #[command(name = "face-swap")]
     FaceSwap(GenerateFaceSwap),
@@ -44,6 +48,7 @@ pub async fn run(cmd: GenerateCmd) -> ExitCode {
     let result = match cmd {
         GenerateCmd::Image(args) => image::run_image(args).await,
         GenerateCmd::Video(args) => video::run_video(args).await,
+        GenerateCmd::Text(args) => text::run_text(args).await,
         GenerateCmd::FaceSwap(args) => faceswap::run_faceswap(args).await,
     };
     match result {
@@ -68,6 +73,15 @@ pub struct RemoteArgs {
     /// Bearer token for an `auth_token`-protected `--remote` server.
     #[arg(long, requires = "remote")]
     pub remote_token: Option<String>,
+    /// Queue priority on the `--remote` server: higher runs first (default 0;
+    /// e.g. 10 interactive, -10 background).
+    #[arg(
+        long,
+        requires = "remote",
+        default_value_t = 0,
+        allow_hyphen_values = true
+    )]
+    pub priority: i32,
 }
 
 /// Shared remote run path: submit `spec` to the `--remote` server, tail its SSE
@@ -82,7 +96,8 @@ pub(super) async fn run_remote(
         .remote
         .as_deref()
         .expect("run_remote without --remote");
-    let executor = RemoteExecutor::new(url, remote.remote_token.clone())?;
+    let executor =
+        RemoteExecutor::new(url, remote.remote_token.clone())?.with_priority(remote.priority);
     let sink = CliSink::new();
     let summary = executor.run(&spec, &output, &sink).await?;
     sink.footer(&summary);
@@ -100,16 +115,7 @@ pub(super) async fn run_job(
     ram: u64,
     vram: u64,
 ) -> Result<(), String> {
-    let missing = download::missing(files)?;
-    if !missing.is_empty()
-        && !confirm_download(&missing, download_as_needed).map_err(|e| e.to_string())?
-    {
-        return Err("declined download; rerun with --download-as-needed or `hf download …`".into());
-    }
-    download::ensure(files, &CliReporter).await?;
-
-    let backend_cfg = backend_config_from_env();
-    let executor = LocalExecutor::new(backend_cfg).await?;
+    let executor = local_executor(files, download_as_needed).await?;
 
     // Timer starts post-download + post-GPU-init, so it reflects generation work
     // (matches the historical CLI placement).
@@ -121,6 +127,34 @@ pub(super) async fn run_job(
         report_mem(executor.backend(), ram, vram);
     }
     Ok(())
+}
+
+/// Consent + download missing `files`, then build the local backend.
+async fn local_executor(
+    files: &[FileRef],
+    download_as_needed: bool,
+) -> Result<LocalExecutor, String> {
+    ensure_files(files, download_as_needed).await?;
+    new_local().await
+}
+
+/// Consent + download the missing `files`.
+pub(super) async fn ensure_files(
+    files: &[FileRef],
+    download_as_needed: bool,
+) -> Result<(), String> {
+    let missing = download::missing(files)?;
+    if !missing.is_empty()
+        && !confirm_download(&missing, download_as_needed).map_err(|e| e.to_string())?
+    {
+        return Err("declined download; rerun with --download-as-needed or `hf download …`".into());
+    }
+    download::ensure(files, &CliReporter).await
+}
+
+/// A local backend on a fresh device (dropping it releases all its VRAM).
+pub(super) async fn new_local() -> Result<LocalExecutor, String> {
+    LocalExecutor::new(backend_config_from_env()).await
 }
 
 /// Build the wgpu backend config from `THINFER_*` env (the binary layer reads
@@ -151,14 +185,24 @@ fn backend_config_from_env() -> BackendConfig {
 /// Stamped stderr progress sink: every line is prefixed with elapsed-from-start
 /// so per-stage durations read off directly. Structured [`Stage`]s render to the
 /// historical wording; free-form `note`s pass through.
-struct CliSink {
+pub(super) struct CliSink {
     start: Instant,
+    /// Streamed text left stdout mid-line (break it before stderr lines).
+    mid_line: std::cell::Cell<bool>,
 }
 
 impl CliSink {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             start: Instant::now(),
+            mid_line: std::cell::Cell::new(false),
+        }
+    }
+
+    /// End a streamed reply's line before writing to stderr.
+    fn break_line(&self) {
+        if self.mid_line.replace(false) {
+            println!();
         }
     }
 
@@ -167,8 +211,20 @@ impl CliSink {
     }
 
     /// The end-of-run summary line (modality-shaped from the summary fields).
-    fn footer(&self, s: &JobSummary) {
+    pub(super) fn footer(&self, s: &JobSummary) {
         let elapsed = self.start.elapsed().as_secs_f64();
+        self.break_line();
+        if let Some(t) = &s.text {
+            eprintln!(
+                "{} {} prompt tokens, {} generated ({:.1} tok/s){} in {elapsed:.1}s",
+                self.stamp(),
+                t.prompt_tokens,
+                t.generated_tokens,
+                t.generated_tokens.saturating_sub(1) as f64 / t.decode_secs.max(1e-9),
+                s.seed.map(|v| format!(", seed {v}")).unwrap_or_default(),
+            );
+            return;
+        }
         let out = s.output.display();
         match (s.fps, s.seed) {
             (None, seed) => eprintln!(
@@ -221,7 +277,17 @@ impl ProgressSink for CliSink {
     }
 
     fn note(&self, msg: &str) {
+        self.break_line();
         eprintln!("{} {msg}", self.stamp());
+    }
+
+    fn text(&self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        print!("{delta}");
+        let _ = io::stdout().flush();
+        self.mid_line.set(!delta.ends_with('\n'));
     }
 }
 

@@ -76,6 +76,7 @@ pub(crate) fn register_linear_dense_opt_ring<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose: TransposePolicy::Linear2D,
         transcode: None,
+        keep_f32: false,
     };
     Ok(match ring {
         Some(r) => residency.register_in_ring(meta, r)?,
@@ -159,6 +160,7 @@ pub(crate) fn register_linear_transcode<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose,
         transcode,
+        keep_f32: false,
     };
     Ok(match ring {
         Some(r) => residency.register_in_ring(meta, r)?,
@@ -203,6 +205,7 @@ pub(crate) fn register_raw_param<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose: TransposePolicy::None,
         transcode: None,
+        keep_f32: false,
     };
     Ok(residency.register(meta))
 }
@@ -236,6 +239,7 @@ pub(crate) fn register_linear_flatten<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose: TransposePolicy::Linear2D,
         transcode: None,
+        keep_f32: false,
     };
     Ok(residency.register(meta))
 }
@@ -286,6 +290,7 @@ pub(crate) fn register_one<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose,
         transcode: None,
+        keep_f32: false,
     };
     Ok(match ring {
         Some(r) => residency.register_in_ring(meta, r)?,

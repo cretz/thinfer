@@ -10,6 +10,8 @@ publish.workspace = true
 thinfer-core = { path = "../thinfer-core" }
 tracing = { workspace = true }
 wgpu = "29"
+# Same ash as wgpu-hal 29: the device-memory budget query (`gpu_budget`).
+ash = "0.38"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 safetensors = "0.4"

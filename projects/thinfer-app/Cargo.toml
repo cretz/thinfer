@@ -41,7 +41,11 @@ serde = { version = "1", features = ["derive"], optional = true }
 utoipa = { version = "5", optional = true }
 # HTTP client for the `RemoteExecutor` (talks to a thinfer-serve box). rustls so
 # no OpenSSL/SChannel build dep; `stream` for tailing the SSE event body.
-serde_json = { version = "1", optional = true }
+# Model configs (LLM `config.json` / `generation_config.json`), vault + remote wire.
+serde_json = "1"
+# Constrained decoding (JSON Schema / Lark): token masks + forced runs.
+llguidance = { version = "1.9", default-features = false, features = ["lark", "referencing", "ahash"] }
+toktrie_hf_tokenizers = "1.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
 futures-util = { version = "0.3", optional = true }
 # The minimax DiT pipeline compile runs on its own thread (`oneshot` + `block_on`).
@@ -76,7 +80,7 @@ serve = ["serde", "dep:utoipa", "rewrite", "vault"]
 # The encrypted adapter vault (`vault` module + LoRA request plumbing). Native
 # crypto + reqwest download; shared by CLI and serve so the capability is at
 # parity across every interface.
-vault = ["serde", "dep:serde_json", "dep:reqwest", "dep:argon2", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
+vault = ["serde", "dep:reqwest", "dep:argon2", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
 # Optional HunyuanVideo 1.5 prompt rewriting: runs the cached Qwen3-VL-8B GGUF
 # on-device (native wgpu, `thinfer_models::qwen3_lm`), no HTTP/Python sidecar.
 # Just gates the `rewrite` module + the Phase-0 call; no extra deps. Enabled by
@@ -84,7 +88,7 @@ vault = ["serde", "dep:serde_json", "dep:reqwest", "dep:argon2", "dep:aes-gcm", 
 rewrite = []
 # The HTTP `RemoteExecutor` client (thinfer-cli --remote). Pulls reqwest; other
 # app consumers (serve) stay free of it.
-remote = ["serde", "dep:serde_json", "dep:reqwest", "dep:futures-util", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
+remote = ["serde", "dep:reqwest", "dep:futures-util", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
 # Opt-in Qwen-Image-Edit host PREPROCESS parity test (real PNG -> ViT/VAE/tokens
 # vs the HF/diffusers reference via `uv run`). Touches the HF cache for the
 # tokenizer/preprocessor; skips cleanly when uncached.

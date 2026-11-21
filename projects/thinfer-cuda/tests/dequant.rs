@@ -47,6 +47,10 @@ fn blocks(kind: QuantKind, count: usize, seed: &mut u64) -> Vec<u8> {
         QuantKind::Q4_K | QuantKind::Q5_K => &[0, 2],
         QuantKind::Q6_K => &[208],
         QuantKind::Q4_0 => &[0],
+        // d and m (Q5_1) / d (Q5_0); the image dequant declines both, so
+        // they never reach the comparison below.
+        QuantKind::Q5_1 => &[0, 2],
+        QuantKind::Q5_0 => &[0],
     };
     for blk in b.chunks_mut(bpb) {
         for &at in scale_at {

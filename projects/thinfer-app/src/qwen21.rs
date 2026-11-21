@@ -407,6 +407,9 @@ impl Job<'_> {
         crate::progress::write_artifact(sink, &req.output, png)?;
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width,
             height,

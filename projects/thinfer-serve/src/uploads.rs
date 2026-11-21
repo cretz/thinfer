@@ -270,11 +270,11 @@ mod tests {
         let jobs = crate::job::JobStore::default();
         let key = JobKey::generate();
         let (id, _) = store.put(&key.seal(b"queued clip")).unwrap();
-        let job = jobs.create(&tmp, Vec::new());
+        let job = jobs.create(&tmp, Vec::new(), 0, None);
         let ids = vec![id.clone()];
         assert!(store.claim(&["missing".into()], &job).is_err());
         store.claim(&ids, &job).unwrap();
-        let other = jobs.create(&tmp, Vec::new());
+        let other = jobs.create(&tmp, Vec::new(), 0, None);
         assert!(store.claim(&ids, &other).is_err(), "one owner per upload");
         assert!(
             store
@@ -297,7 +297,7 @@ mod tests {
         assert!(!tmp.join(&id).exists());
 
         let (id, _) = store.put(&key.seal(b"dropped job")).unwrap();
-        let job = jobs.create(&tmp, Vec::new());
+        let job = jobs.create(&tmp, Vec::new(), 0, None);
         store.claim(std::slice::from_ref(&id), &job).unwrap();
         drop(job);
         assert_eq!(

@@ -1,6 +1,6 @@
 # thinfer
 
-Image, video and face-swap generation on consumer GPUs. Weights stream in, so
+Image, video, face-swap and text (LLM) generation on consumer GPUs. Weights stream in, so
 models far bigger than your VRAM still run.
 
 ## Setup
@@ -20,7 +20,7 @@ the confirmation.
     thinfer models
 
 lists every model. Pass one with `--model <id>`. Defaults: image `zimage-turbo-q4`,
-video `fastwan-ti2v-5b`.
+video `fastwan-ti2v-5b`, text `gemma-4-26b-a4b`.
 
 `qwen-image-rapid`, `qwen-image-edit-rapid` and `ltx2-rapid` ship no default
 weights: name yours in `thinfer-sources.toml` in your Hugging Face cache dir (or
@@ -63,6 +63,13 @@ shows them.
 ## Swap a face into a video
 
     thinfer generate face-swap --input-video clip.mp4 --source-image face.png --output swapped.mp4
+
+## Chat with an LLM
+
+    thinfer generate text --prompt "write a two-line poem about rain"
+
+`--schema` (JSON Schema) or `--grammar` (Lark) constrains the reply's shape;
+`--tools tools.json` lets it call your commands.
 
 ## Web UI
 

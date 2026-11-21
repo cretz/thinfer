@@ -8,6 +8,7 @@ use thinfer_core::manifest::ModelManifest;
 use thinfer_models::hunyuan::manifest as hunmf;
 use thinfer_models::ideogram4::manifest as idmf;
 use thinfer_models::krea::manifest as kreamf;
+use thinfer_models::llm::manifest as llmmf;
 use thinfer_models::ltx::manifest as ltxmf;
 use thinfer_models::minimax::manifest as mmmf;
 use thinfer_models::qwen_image::manifest as qimf;
@@ -1300,6 +1301,34 @@ impl std::fmt::Display for RefImageSize {
     }
 }
 
+/// How FastH3-Omni frames each reference image before sizing it. A person
+/// photographed from afar keeps only a few dozen face pixels once the image
+/// is sized to the canvas, too few for the model to hold the identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum RefCrop {
+    /// Detect faces (SCRFD) and, when the largest would come out small, crop
+    /// in on it and everyone of a similar size (head down to the chest or
+    /// further, as the canvas area allows). Images with large faces, or none
+    /// found, pass whole. Opt-in: it changes what the model is shown.
+    Auto,
+    /// Always the whole image, as the reference does it.
+    #[default]
+    Off,
+}
+
+impl std::fmt::Display for RefCrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RefCrop::Auto => "auto",
+            RefCrop::Off => "off",
+        })
+    }
+}
+
 /// VAE decoder choice. App-local mirror of `wan::pipeline::VaeChoice` so the
 /// clap derive (and a future `ToSchema`) lives on a type we own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1585,3 +1614,109 @@ pub const XSEG: thinfer_core::manifest::FileRef =
 /// GFPGAN 1.4 face enhancer, pulled in only when `--enhance` is set.
 pub const GFPGAN: thinfer_core::manifest::FileRef =
     thinfer_core::manifest::FileRef::new("facefusion/models-3.0.0", "gfpgan_1.4.onnx");
+
+/// Default VRAM budget of a text job when none is given: dense weights stay
+/// resident and the rest feeds the routed-expert slot cache (fits an 8 GB card
+/// next to a desktop).
+pub const TEXT_DEFAULT_VRAM: &str = "6G";
+/// Default RAM budget of a text job: the ceiling of the page-locked host expert
+/// cache (it grows only as far as the driver grants page-locked memory).
+pub const TEXT_DEFAULT_RAM: &str = "16G";
+
+/// Text-generation (chat) models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub enum TextModelId {
+    /// Qwen3.6-35B-A3B (unsloth UD-Q4_K_XL GGUF): hybrid Gated-DeltaNet +
+    /// gated attention, 256-expert MoE with 3B active per token.
+    #[cfg_attr(feature = "cli", value(name = "qwen3.6-35b-a3b"))]
+    #[cfg_attr(feature = "serde", serde(rename = "qwen3.6-35b-a3b"))]
+    Qwen36_35bA3b,
+    /// Gemma 4 26B-A4B-it (unsloth UD-Q4_K_XL GGUF): sliding-window + global
+    /// attention, dense GELU MLP plus a 128-expert MoE, 4B active per token.
+    #[cfg_attr(feature = "cli", value(name = "gemma-4-26b-a4b"))]
+    #[cfg_attr(feature = "serde", serde(rename = "gemma-4-26b-a4b"))]
+    Gemma4_26bA4b,
+}
+
+/// Default sampling of a text model, per thinking mode (the model card's
+/// recommendations).
+#[derive(Clone, Copy, Debug)]
+pub struct TextDefaults {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+    pub min_p: f32,
+    pub presence_penalty: f32,
+}
+
+impl TextModelId {
+    pub const DEFAULT: TextModelId = TextModelId::Gemma4_26bA4b;
+    pub const ALL: [TextModelId; 2] = [TextModelId::Gemma4_26bA4b, TextModelId::Qwen36_35bA3b];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Qwen36_35bA3b => "Qwen3.6 35B-A3B, MoE chat (Q4)",
+            Self::Gemma4_26bA4b => "Gemma 4 26B-A4B, MoE chat (Q4)",
+        }
+    }
+
+    pub fn manifest(self) -> &'static ModelManifest {
+        match self {
+            Self::Qwen36_35bA3b => &llmmf::QWEN36_MANIFEST,
+            Self::Gemma4_26bA4b => &llmmf::GEMMA4_MANIFEST,
+        }
+    }
+
+    pub fn required_roles(self) -> &'static [&'static str] {
+        llmmf::RUNTIME_ROLES
+    }
+
+    /// The special token that ends the model's thinking block: a constrained
+    /// reply starts after it.
+    pub fn think_close(self) -> &'static str {
+        match self {
+            Self::Qwen36_35bA3b => "</think>",
+            Self::Gemma4_26bA4b => "<channel|>",
+        }
+    }
+
+    /// Model-card sampling for thinking (`think`) or instruct mode.
+    pub fn defaults(self, think: bool) -> TextDefaults {
+        match (self, think) {
+            (Self::Qwen36_35bA3b, true) => TextDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+                min_p: 0.0,
+                presence_penalty: 0.0,
+            },
+            (Self::Qwen36_35bA3b, false) => TextDefaults {
+                temperature: 0.7,
+                top_p: 0.8,
+                top_k: 20,
+                min_p: 0.0,
+                presence_penalty: 1.5,
+            },
+            // Model card (generation_config.json): one setting for both modes.
+            (Self::Gemma4_26bA4b, _) => TextDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 64,
+                min_p: 0.0,
+                presence_penalty: 0.0,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for TextModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TextModelId::Qwen36_35bA3b => "qwen3.6-35b-a3b",
+            TextModelId::Gemma4_26bA4b => "gemma-4-26b-a4b",
+        })
+    }
+}

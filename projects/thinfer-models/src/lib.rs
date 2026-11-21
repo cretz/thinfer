@@ -5,6 +5,7 @@ pub mod faceswap;
 pub mod hunyuan;
 pub mod ideogram4;
 pub mod krea;
+pub mod llm;
 pub mod ltx;
 pub mod minimax;
 pub mod qwen3_lm;

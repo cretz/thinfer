@@ -18,6 +18,7 @@ use crate::device::CudaDevice;
 use crate::elementwise::ElementwiseKernels;
 use crate::gemm::{self, GemmKernels};
 use crate::gemm_fp4::GemmFp4Kernels;
+use crate::llm::LlmKernels;
 use crate::sdpa::{SdpaKernels, SdpaUniform, UNIFORM_LEN};
 use crate::vsa::VsaKernels;
 use crate::window::WindowKernels;
@@ -30,6 +31,9 @@ pub struct CudaAccel {
     vsa: OnceLock<Option<VsaKernels>>,
     window: OnceLock<Option<WindowKernels>>,
     elementwise: OnceLock<Option<ElementwiseKernels>>,
+    llm: OnceLock<Option<LlmKernels>>,
+    /// Side copy stream of [`Accelerator::copy_ahead`] (created on first use).
+    ahead: OnceLock<Result<AheadStream, String>>,
     /// Logged once per op kind, on the first call that actually runs on CUDA.
     engaged: AtomicBool,
     gemm_engaged: AtomicBool,
@@ -37,7 +41,52 @@ pub struct CudaAccel {
     vsa_engaged: AtomicBool,
 }
 
+/// A non-blocking stream (it does not serialize with the legacy default
+/// stream the engine enqueues on) and the event that joins it back.
+struct AheadStream {
+    stream: sys::CUstream,
+    event: sys::CUevent,
+}
+
+// SAFETY: plain driver handles, valid for the context's lifetime; every use
+// binds the context first.
+unsafe impl Send for AheadStream {}
+unsafe impl Sync for AheadStream {}
+
 impl CudaAccel {
+    /// The side copy stream, created on first use (context bound).
+    fn ahead(&self) -> Result<&AheadStream, String> {
+        self.dev
+            .ctx
+            .bind_to_thread()
+            .map_err(|e| format!("bind: {e:?}"))?;
+        self.ahead
+            .get_or_init(|| {
+                let mut stream = std::ptr::null_mut();
+                let mut event = std::ptr::null_mut();
+                // SAFETY: plain creation calls on the bound context.
+                unsafe {
+                    crate::nvrtc::drv(
+                        sys::cuStreamCreate(
+                            &mut stream,
+                            sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                        ),
+                        "cuStreamCreate",
+                    )?;
+                    crate::nvrtc::drv(
+                        sys::cuEventCreate(
+                            &mut event,
+                            sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+                        ),
+                        "cuEventCreate",
+                    )?;
+                }
+                Ok(AheadStream { stream, event })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     pub fn new(dev: Arc<CudaDevice>) -> Self {
         Self {
             dev,
@@ -47,6 +96,8 @@ impl CudaAccel {
             vsa: OnceLock::new(),
             window: OnceLock::new(),
             elementwise: OnceLock::new(),
+            llm: OnceLock::new(),
+            ahead: OnceLock::new(),
             engaged: AtomicBool::new(false),
             gemm_engaged: AtomicBool::new(false),
             fp4_engaged: AtomicBool::new(false),
@@ -107,6 +158,21 @@ impl CudaAccel {
                 Ok(k) => Some(k),
                 Err(e) => {
                     tracing::warn!(target: thinfer_core::trace::ADAPTER, error = %e, "cuda elementwise unavailable; wgpu path");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    fn llm_kernels(&self) -> Option<&LlmKernels> {
+        self.llm
+            .get_or_init(|| match LlmKernels::new(self.dev.ctx.clone(), self.dev.sm) {
+                Ok(k) => {
+                    tracing::info!(target: thinfer_core::trace::ADAPTER, "cuda llm kernels ready");
+                    Some(k)
+                }
+                Err(e) => {
+                    tracing::warn!(target: thinfer_core::trace::ADAPTER, error = %e, "cuda llm unavailable; wgpu path");
                     None
                 }
             })
@@ -317,6 +383,101 @@ impl Accelerator for CudaAccel {
             Some(k) => k.launch(op),
             None => Ok(false),
         }
+    }
+
+    fn accepts_llm(&self) -> bool {
+        self.llm_kernels().is_some()
+    }
+
+    fn llm(&self, op: &thinfer_core::ops::llm::LlmOp) -> Result<bool, String> {
+        match self.llm_kernels() {
+            Some(k) => k.run(op),
+            None => Ok(false),
+        }
+    }
+
+    fn host_alloc(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<Box<dyn thinfer_core::backend::MappedHost>>, String> {
+        crate::host::MappedHostMem::alloc(&self.dev, bytes)
+            .map(|m| Some(Box::new(m) as Box<dyn thinfer_core::backend::MappedHost>))
+    }
+
+    fn copy(&self, dst: u64, src: u64, len: u64) -> Result<bool, String> {
+        self.dev
+            .ctx
+            .bind_to_thread()
+            .map_err(|e| format!("bind: {e:?}"))?;
+        // SAFETY: both addresses are live device / mapped-host allocations of
+        // at least `len` bytes (caller contract); default-stream ordered.
+        crate::nvrtc::drv(
+            unsafe { sys::cuMemcpyAsync(dst, src, len as usize, std::ptr::null_mut()) },
+            "cuMemcpyAsync",
+        )?;
+        Ok(true)
+    }
+
+    fn copy_ahead(&self, dst: u64, src: u64, len: u64) -> Result<bool, String> {
+        let a = self.ahead()?;
+        // SAFETY: both addresses are live device / mapped-host allocations of
+        // at least `len` bytes (caller contract); ordered on the side stream.
+        crate::nvrtc::drv(
+            unsafe { sys::cuMemcpyAsync(dst, src, len as usize, a.stream) },
+            "cuMemcpyAsync (ahead)",
+        )?;
+        Ok(true)
+    }
+
+    fn join_ahead(&self) -> Result<(), String> {
+        let Some(Ok(a)) = self.ahead.get() else {
+            return Ok(());
+        };
+        self.dev
+            .ctx
+            .bind_to_thread()
+            .map_err(|e| format!("bind: {e:?}"))?;
+        // SAFETY: the event and stream live as long as `self`; the legacy
+        // default stream waits for the side stream's work so far.
+        unsafe {
+            crate::nvrtc::drv(sys::cuEventRecord(a.event, a.stream), "cuEventRecord")?;
+            crate::nvrtc::drv(
+                sys::cuStreamWaitEvent(std::ptr::null_mut(), a.event, 0),
+                "cuStreamWaitEvent",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write(&self, dst: u64, bytes: &[u8]) -> Result<bool, String> {
+        self.dev
+            .ctx
+            .bind_to_thread()
+            .map_err(|e| format!("bind: {e:?}"))?;
+        // SAFETY: `dst` holds at least `bytes.len()` bytes; a pageable source is
+        // staged before the call returns, so `bytes` may be freed after.
+        crate::nvrtc::drv(
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    dst,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuMemcpyHtoDAsync",
+        )?;
+        Ok(true)
+    }
+
+    fn read(&self, src: u64, dst: &mut [u8]) -> Result<bool, String> {
+        self.sync()?;
+        // SAFETY: `src` holds at least `dst.len()` bytes; the stream is idle.
+        crate::nvrtc::drv(
+            unsafe { sys::cuMemcpyDtoH_v2(dst.as_mut_ptr().cast(), src, dst.len()) },
+            "cuMemcpyDtoH",
+        )?;
+        Ok(true)
     }
 
     fn sync(&self) -> Result<(), String> {

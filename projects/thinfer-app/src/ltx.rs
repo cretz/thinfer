@@ -962,6 +962,9 @@ pub async fn run(
     tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
     Ok(JobSummary {
+        text: None,
+        session: None,
+        tool_calls: Vec::new(),
         output: req.output.clone(),
         width: w_px as u32,
         height: h_px as u32,

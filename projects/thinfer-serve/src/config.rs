@@ -75,9 +75,24 @@ pub struct ServeConfig {
     /// Residency budgets (e.g. `5G`, `512M`, raw bytes).
     pub ram_budget: String,
     pub vram_budget: String,
+    /// Text (LLM chat) job budgets: an MoE LLM streams its experts through a
+    /// host cache, so it wants more RAM than the image/video default. Same
+    /// defaults as the CLI's `generate text`.
+    pub text_ram_budget: String,
+    pub text_vram_budget: String,
     /// Native CUDA hot-op interop on NVIDIA (see `BackendConfig::cuda`).
     /// Falls back to the wgpu path when unavailable. Default true.
     pub cuda: bool,
+    /// A queued job gains one priority level per this many seconds waited
+    /// (no starvation). Default 300.
+    pub queue_aging_secs: u64,
+    /// Opt-in text sessions (`/sessions`): max sealed state held in RAM
+    /// across all sessions (least recently used nodes are evicted past it).
+    /// Never written to disk. Default `4G`.
+    pub session_ram_budget: String,
+    /// Idle seconds before a session is forgotten, unless it sets its own.
+    /// Default 1800.
+    pub session_ttl_secs: u64,
 }
 
 impl Default for ServeConfig {
@@ -102,7 +117,12 @@ impl Default for ServeConfig {
             power_preference: "high".into(),
             ram_budget: "5G".into(),
             vram_budget: "5G".into(),
+            text_ram_budget: thinfer_app::model::TEXT_DEFAULT_RAM.into(),
+            text_vram_budget: thinfer_app::model::TEXT_DEFAULT_VRAM.into(),
             cuda: true,
+            queue_aging_secs: 300,
+            session_ram_budget: "4G".into(),
+            session_ttl_secs: 1800,
         }
     }
 }
@@ -143,6 +163,17 @@ impl ServeConfig {
         Ok(ResidencyBudget {
             ram_bytes: thinfer_app::parse_budget("ram_budget", Some(&self.ram_budget))?,
             vram_bytes: thinfer_app::parse_budget("vram_budget", Some(&self.vram_budget))?,
+        })
+    }
+
+    /// Budget of a text (LLM chat) job.
+    pub fn text_budget(&self) -> Result<ResidencyBudget, String> {
+        Ok(ResidencyBudget {
+            ram_bytes: thinfer_app::parse_budget("text_ram_budget", Some(&self.text_ram_budget))?,
+            vram_bytes: thinfer_app::parse_budget(
+                "text_vram_budget",
+                Some(&self.text_vram_budget),
+            )?,
         })
     }
 }

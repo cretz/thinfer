@@ -44,7 +44,78 @@ const MODELS = {
   // Face swap (its own JobSpec, FaceSwapSpec): HyperSwap / AlphaFace ONNX paste
   // the source face into every frame (no size / steps); DreamID-V is a diffusion swap.
   "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c", "alphaface", "dreamid-v"],
+  // Text (TextSpec): chat with an LLM; the reply streams in sealed pieces.
+  text: ["gemma-4-26b-a4b", "qwen3.6-35b-a3b"],
 };
+
+// The text kind's reply constraint (wire `TextFormat`), or undefined for free text.
+function textFormat() {
+  const type = $("text-format").value;
+  const body = $("text-format-body").value;
+  if (!type) return undefined;
+  if (type === "lark") return { type, grammar: body };
+  try {
+    return { type, schema: JSON.parse(body) };
+  } catch (e) {
+    throw new Error(`Reply format: the JSON Schema does not parse (${e.message})`);
+  }
+}
+$("text-format").addEventListener("change", () => {
+  $("text-format-field").hidden = !$("text-format").value;
+});
+
+// The chat transcript of the text kind: `{ role, content }` turns, oldest first.
+// The server keeps no conversation, so every turn sends the whole history.
+const chat = [];
+function renderChat() {
+  $("chat-out").replaceChildren(
+    ...chat.map((m) => {
+      const d = document.createElement("div");
+      d.className = `msg ${m.role}`;
+      d.textContent = m.content;
+      return d;
+    }),
+  );
+}
+$("new-chat").addEventListener("click", () => {
+  chat.length = 0;
+  renderChat();
+  dropSession();
+});
+
+// Opt-in server-held chat state (`/sessions`): `{ id, model, key, proof, node }`.
+// The key lives only in this page; the server's copy of the state is sealed
+// under it. `node` is the reply to continue from (null = send the whole
+// history as a new root, e.g. after the server could not keep a node).
+let session = null;
+function dropSession() {
+  const s = session;
+  session = null;
+  if (!s) return;
+  fetch(`sessions/${s.id}`, {
+    method: "DELETE",
+    headers: authHeaders({ "x-session-key-sha256": s.proof }),
+  }).catch(() => {});
+  s.key.raw.fill(0);
+}
+$("session-keep").addEventListener("change", () => {
+  if (!$("session-keep").checked) dropSession();
+});
+// The session for this turn (created on first use; one model per session).
+async function ensureSession(model) {
+  if (session && session.model !== model) dropSession();
+  if (session) return session;
+  const key = await newJobKey();
+  const proof = await keyProof(key);
+  const resp = await fetch("sessions", {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ model, keyProof: proof }),
+  });
+  if (!resp.ok) throw new Error(`session: ${await errorText(resp)}`);
+  session = { id: (await resp.json()).id, model, key, proof, node: null };
+  return session;
+}
 // LTX-2.3 is a joint audio-video model with its own grid (/64 dims, 8k+1 frames).
 // Its video VAE decode tiles to the VRAM budget, so larger dims are allowed (more
 // tiles = slower; the temporal dim is whole, so keep clips short). Dims default
@@ -627,9 +698,13 @@ function populateSize(kind, model) {
   $("height").value = presets[0].height;
 }
 
+const DEFAULT_PROMPT = $("prompt").value;
 function applyKind() {
   const kind = $("kind").value;
   document.body.className = `kind-${kind}`;
+  // Text chats send a message (the image placeholder prompt would be odd).
+  $("prompt-label").textContent = kind === "text" ? "Message" : "Prompt";
+  if (kind === "text" && $("prompt").value === DEFAULT_PROMPT) $("prompt").value = "";
   const model = $("model");
   model.replaceChildren(
     ...MODELS[kind].map((m, i) => {
@@ -710,6 +785,7 @@ function applyModel() {
   const omni = kind === "video" && takesRefs(model);
   $("ref-images-row").hidden = !omni && !multiImage;
   $("ref-image-size-row").hidden = !omni;
+  $("ref-crop-row").hidden = !omni;
   refImages.splice(maxRefImages());
   renderRefImages();
   // Face swap consumes a source FACE image + a target VIDEO instead of a text
@@ -1191,6 +1267,37 @@ async function buildSpec(jobKey) {
       bitrateScale: floatOrNull($("bitrate-scale").value) ?? 1.15,
     };
   }
+  if (kind === "text") {
+    const messages = [];
+    const turns = chat.slice(0, -1).map(({ role, content }) => ({ role, content }));
+    const keep = $("session-keep").checked ? await ensureSession(model) : null;
+    if (keep?.node) {
+      // The server holds everything up to the last reply: send the new turn only.
+      messages.push(turns.at(-1));
+    } else {
+      const system = $("system").value.trim();
+      if (system) messages.push({ role: "system", content: system });
+      // The last turn is the pending assistant bubble: send everything before it.
+      messages.push(...turns);
+    }
+    const sessionRef = keep ? { id: keep.id, from: keep.node, key: bytesToBase64(keep.key.raw) } : undefined;
+    return {
+      session: sessionRef,
+      kind: "text",
+      model,
+      messages,
+      maxTokens: intOrNull($("max-tokens").value),
+      think: $("think").checked,
+      temperature: floatOrNull($("temperature").value),
+      topP: floatOrNull($("top-p").value),
+      topK: intOrNull($("top-k").value),
+      minP: floatOrNull($("min-p").value),
+      presencePenalty: floatOrNull($("presence-penalty").value),
+      repetitionPenalty: floatOrNull($("repetition-penalty").value),
+      seed: intOrNull($("text-seed").value),
+      format: textFormat(),
+    };
+  }
   if (kind === "image") {
     const spec = {
       kind: "image",
@@ -1248,6 +1355,7 @@ async function buildSpec(jobKey) {
     if (takesRefs(model)) {
       if (refImages.length) spec.refImages = await Promise.all(refImages.map(fileToBase64));
       spec.refImageSize = $("ref-image-size").value;
+      spec.refCrop = $("ref-crop").value;
     }
     if (isMinimaxFl2va(model)) {
       const image = await inputImageBase64();
@@ -1488,6 +1596,16 @@ async function streamOnce(id, jobKey, cursor) {
         await deliverKey(id, jobKey);
         continue;
       }
+      if (ev.type === "text") {
+        // A sealed piece of the reply: open it and grow the assistant bubble.
+        const piece = await openSealed(jobKey, base64ToBytes(ev.sealed));
+        const last = chat.at(-1);
+        if (last?.role === "assistant") {
+          last.content += new TextDecoder().decode(piece);
+          renderChat();
+        }
+        continue;
+      }
       const result = handleEvent(ev);
       if (result !== undefined) return result;
     }
@@ -1562,6 +1680,14 @@ async function showResult(kind, result, jobKey) {
   });
   if (!resp.ok) throw new Error(await errorText(resp));
   const bytes = await openSealed(jobKey, new Uint8Array(await resp.arrayBuffer()));
+  if (kind === "text") {
+    // The sealed reply artifact is authoritative (the stream is best effort).
+    const last = chat.at(-1);
+    if (last?.role === "assistant") last.content = new TextDecoder().decode(bytes);
+    renderChat();
+    bytes.fill(0);
+    return;
+  }
   const mime = kind === "image" ? "image/png" : "video/mp4";
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   const img = $("image-out");
@@ -1616,6 +1742,9 @@ $("form").addEventListener("submit", (ev) => {
 // remembered in localStorage so a reloaded page (phones discard backgrounded
 // tabs) can still cancel it; the result itself is lost with the old page's key.
 let currentJobId = null;
+// Its key proof (base64 SHA-256 of the key; reveals nothing of it): cancel
+// needs it because the job declared it at submit.
+let currentJobProof = null;
 // True while `generate()` owns a job: leaving the page then loses the result
 // (its key lives only here), so ask first. Browsers show their own wording,
 // and phones often skip the prompt; the orphan watcher below covers those.
@@ -1624,9 +1753,9 @@ window.addEventListener("beforeunload", (ev) => {
   if (ownJobRunning) ev.preventDefault();
 });
 const ACTIVE_JOB_KEY = "thinfer.activeJob";
-function rememberJob(id) {
+function rememberJob(id, proof) {
   try {
-    if (id) localStorage.setItem(ACTIVE_JOB_KEY, id);
+    if (id) localStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify({ id, proof }));
     else localStorage.removeItem(ACTIVE_JOB_KEY);
   } catch {
     /* storage unavailable: cancel still works for this page's own job */
@@ -1646,9 +1775,10 @@ $("cancel").addEventListener("click", async () => {
     // A queued job is dropped immediately; a running one is flagged and stops
     // at the next block or phase boundary. The events stream then ends in
     // `cancelled` and `generate()`'s catch reports it.
+    const proof = currentJobProof ? { "x-job-key-sha256": currentJobProof } : {};
     const resp = await fetch(`jobs/${currentJobId}/cancel`, {
       method: "POST",
-      headers: authHeaders(),
+      headers: authHeaders(proof),
     });
     if (!resp.ok) throw new Error(await errorText(resp));
   } catch (e) {
@@ -1662,8 +1792,9 @@ $("cancel").addEventListener("click", async () => {
 // watch it until it ends. Skipped while this page has its own job.
 async function resumeOrphanJob() {
   let id = null;
+  let proof = null;
   try {
-    id = localStorage.getItem(ACTIVE_JOB_KEY);
+    ({ id, proof } = JSON.parse(localStorage.getItem(ACTIVE_JOB_KEY) ?? "{}"));
   } catch {
     return;
   }
@@ -1677,7 +1808,7 @@ async function resumeOrphanJob() {
     } catch {
       state = "unreachable";
     }
-    if (state !== "queued" && state !== "running") {
+    if (!["queued", "starting", "running"].includes(state)) {
       if (currentJobId === id) {
         currentJobId = null;
         showCancel(false);
@@ -1688,6 +1819,7 @@ async function resumeOrphanJob() {
     }
     if (currentJobId !== id) {
       currentJobId = id;
+      currentJobProof = proof ?? null;
       showCancel(true);
       setStatus("A job from before this page loaded is still running (its result can't be shown here).");
     }
@@ -1707,11 +1839,19 @@ async function generate() {
   try {
     if (!SECURE) throw new Error("insecure context: open this page over https (or localhost) so jobs can be encrypted");
     jobKey = await newJobKey();
+    if (kind === "text") {
+      const msg = $("prompt").value.trim();
+      if (!msg) throw new Error("type a message");
+      chat.push({ role: "user", content: msg }, { role: "assistant", content: "" });
+      renderChat();
+      $("prompt").value = "";
+    }
     const spec = await buildSpec(jobKey);
     // Coopmat is opt-OUT: only send the flag when the user unticked it (the
     // server treats absent as "use default"). A no-op on GPUs without support.
     if (!$("coopmat").checked) spec.disableCoopmat = true;
     const sealed = await seal(jobKey, new TextEncoder().encode(JSON.stringify(spec)));
+    const proof = await keyProof(jobKey);
     const resp = await fetch("jobs", {
       method: "POST",
       headers: authHeaders({ "content-type": "application/json" }),
@@ -1719,22 +1859,43 @@ async function generate() {
       body: JSON.stringify({
         sealed: bytesToBase64(sealed),
         uploads: spec.inputVideoUpload ? [spec.inputVideoUpload] : [],
+        priority: intOrNull($("priority").value) ?? 0,
+        keyProof: proof,
       }),
     });
     if (!resp.ok) throw new Error(await errorText(resp));
     const { id } = await resp.json();
     currentJobId = id;
+    currentJobProof = proof;
     ownJobRunning = true;
-    rememberJob(id);
+    rememberJob(id, proof);
     showCancel(true);
     log(`Submitted job ${id} (sealed)`);
     const result = await streamEvents(id, jobKey);
+    // The reply's node is where the next turn continues (none kept: the next
+    // turn re-sends the history as a new root).
+    if (kind === "text" && session) session.node = result.text?.sessionNode ?? null;
     await showResult(kind, result, jobKey);
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     const seed = result.seed != null ? `seed ${result.seed}, ` : "";
-    setStatus(`Done: ${seed}${secs}s.`);
+    const t = result.text;
+    const speed = t
+      ? `${t.promptTokens} prompt tokens (${t.prefillSecs.toFixed(1)}s), ${t.generatedTokens} generated at ${(Math.max(t.generatedTokens - 1, 0) / Math.max(t.decodeSecs, 1e-9)).toFixed(1)} tok/s, `
+      : "";
+    setStatus(`Done: ${speed}${seed}${secs}s.`);
   } catch (e) {
     streamGaveUp = e instanceof StreamDropped;
+    // A failed session turn (node evicted, session expired): start over from
+    // the full history next turn, in a fresh session if this one is gone.
+    if (kind === "text" && session) {
+      if (/unknown session/.test(String(e.message ?? e))) session = null;
+      else session.node = null;
+    }
+    // A failed text turn leaves no half reply in the transcript.
+    if (kind === "text" && chat.at(-1)?.role === "assistant") {
+      chat.splice(-2, 2);
+      renderChat();
+    }
     setStatus(`Failed: ${e.message ?? e}`);
     log(`Failed: ${e.message ?? e}`);
   } finally {
@@ -1746,6 +1907,7 @@ async function generate() {
     // id); a stream that gave up leaves it remembered so a reload can cancel.
     if (currentJobId && !streamGaveUp) rememberJob(null);
     currentJobId = null;
+    currentJobProof = null;
     showCancel(false);
     if (streamGaveUp) resumeOrphanJob();
   }

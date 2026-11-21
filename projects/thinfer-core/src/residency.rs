@@ -141,6 +141,10 @@ pub struct WeightMeta {
     /// transpose) so the weight rides the quant matmul path. `None`:
     /// upload at `encoding` as-is.
     pub transcode: Option<QuantKind>,
+    /// Keep an F32 file tensor F32 on GPU instead of narrowing it to bf16.
+    /// For tensors that are not bf16-exact (GGUF zero-centered norms stored
+    /// `w + 1`, `ssm_a = -exp(A_log)`) and that f32-weight kernels consume.
+    pub keep_f32: bool,
 }
 
 impl WeightMeta {
@@ -162,6 +166,9 @@ impl WeightMeta {
         match (self.transcode, self.encoding, self.transpose) {
             (Some(k), _, _) => StorageEncoding::Quant(k),
             (None, StorageEncoding::Quant(_), TransposePolicy::Linear2D) => StorageEncoding::Bf16,
+            (None, StorageEncoding::F32, TransposePolicy::None) if self.keep_f32 => {
+                StorageEncoding::F32
+            }
             (None, StorageEncoding::F32, _) => StorageEncoding::Bf16,
             // F16 file (GGUF VAE convs): expand to the engine-wide bf16 weight
             // storage, same as F32. Decode happens host-side at upload.
@@ -986,14 +993,12 @@ impl<S: WeightSource> WeightResidency<S> {
         // read the tight on-disk bytes and build the storage buffer in the
         // transform below.
         let same_encoding = meta.gpu_encoding() == meta.encoding;
-        let mut bytes = vec![
-            0u8;
-            if same_encoding {
-                storage_len
-            } else {
-                on_disk_len
-            }
-        ];
+        let buf_len = if same_encoding {
+            storage_len.max(on_disk_len)
+        } else {
+            on_disk_len
+        };
+        let mut bytes = vec![0u8; buf_len];
 
         let mut reader = self
             .source
@@ -1020,7 +1025,14 @@ impl<S: WeightSource> WeightResidency<S> {
         let t_xpose = diag.then(crate::trace::Instant::now);
 
         let out = match (meta.encoding, meta.transpose) {
-            (StorageEncoding::Bf16 | StorageEncoding::Quant(_), TransposePolicy::None) => Ok(bytes),
+            (StorageEncoding::Bf16 | StorageEncoding::Quant(_), TransposePolicy::None) => {
+                bytes.truncate(storage_len);
+                Ok(bytes)
+            }
+            (StorageEncoding::F32, TransposePolicy::None) if meta.keep_f32 => {
+                bytes.truncate(storage_len);
+                Ok(bytes)
+            }
             (StorageEncoding::Bf16, TransposePolicy::Linear2D) => {
                 let (n, k) = rank2(meta)?;
                 Ok(transpose_bf16_cpu(&bytes, on_disk_len, storage_len, n, k))

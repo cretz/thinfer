@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use clap::Args;
 use thinfer_app::config::ResidencyBudget;
 use thinfer_app::model::{
-    AttnPrecision, EncoderQuant, RefImageSize, RewriteQuality, SuperRes, VaeChoice, VideoModelId,
-    VideoSampler,
+    AttnPrecision, EncoderQuant, RefCrop, RefImageSize, RewriteQuality, SuperRes, VaeChoice,
+    VideoModelId, VideoSampler,
 };
 use thinfer_app::request::{ImageBytes, VideoFormat, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
@@ -40,6 +40,11 @@ pub struct GenerateVideo {
     /// reference; ~2.4x slower with one reference, no better identity).
     #[arg(long, value_enum, default_value_t)]
     pub ref_image_size: RefImageSize,
+    /// fasth3-omni only: `off` (default) keeps the whole image; `auto` crops
+    /// each reference image in on its faces when they would come out small
+    /// (a person photographed from afar keeps more face pixels).
+    #[arg(long, value_enum, default_value_t)]
+    pub ref_crop: RefCrop,
     /// Output video file (e.g. `out.mp4`).
     #[arg(long)]
     pub output: PathBuf,
@@ -250,6 +255,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             )
             .filter(|v| !v.is_empty()),
             ref_image_size: Some(args.ref_image_size),
+            ref_crop: Some(args.ref_crop),
             encoder: Some(args.encoder),
             i8_matmul: Some(!args.no_i8_matmul),
             audio: Some(!args.no_audio),
@@ -308,6 +314,7 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             })
             .collect::<Result<_, _>>()?,
         ref_image_size: args.ref_image_size,
+        ref_crop: args.ref_crop,
         sampler: args.sampler.unwrap_or(args.model.default_sampler()),
         steps: args.steps.unwrap_or(args.model.default_steps()),
         attn_window: args.attn_window,

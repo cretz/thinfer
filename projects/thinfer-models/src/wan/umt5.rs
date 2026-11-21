@@ -211,6 +211,7 @@ fn register_one<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose,
         transcode,
+        keep_f32: false,
     }))
 }
 

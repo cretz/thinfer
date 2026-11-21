@@ -29,6 +29,8 @@ pub struct RemoteExecutor {
     base: String,
     client: reqwest::Client,
     token: Option<String>,
+    /// Queue priority of submitted jobs (higher first; default 0).
+    priority: i32,
 }
 
 impl RemoteExecutor {
@@ -43,7 +45,14 @@ impl RemoteExecutor {
             base,
             client: reqwest::Client::new(),
             token,
+            priority: 0,
         })
+    }
+
+    /// Submit jobs at this queue priority (higher runs first).
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
     }
 
     fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -68,6 +77,9 @@ impl RemoteExecutor {
         let sealed = SealedJob {
             sealed: base64::engine::general_purpose::STANDARD.encode(key.seal(&spec_json)),
             uploads: spec.upload_ids(),
+            priority: self.priority,
+            // Proves ownership for cancel / reprioritize / delete.
+            key_proof: Some(base64::engine::general_purpose::STANDARD.encode(key.proof())),
         };
         drop(spec_json);
         let created: CreateResponse = self
@@ -76,15 +88,39 @@ impl RemoteExecutor {
         sink.note(&format!("Submitted job {}", created.id));
 
         let result = self.stream_events(&created.id, &key, sink).await?;
-        self.download(&result.result_url, &key, output).await?;
+        // A text reply already streamed through the sink; its artifact is only
+        // saved when an output path was given.
+        if result.text.is_none() || !output.as_os_str().is_empty() {
+            self.download(&result.result_url, &key, output).await?;
+        }
 
+        // A reply of tool calls: open them with the job key.
+        let tool_calls = match result.text.as_ref().and_then(|t| t.tool_calls.as_ref()) {
+            Some(sealed) => {
+                let blob = base64::engine::general_purpose::STANDARD
+                    .decode(sealed)
+                    .map_err(|e| format!("tool calls: {e}"))?;
+                let plain = key.open(&blob)?;
+                serde_json::from_slice(&plain).map_err(|e| format!("tool calls: {e}"))?
+            }
+            None => Vec::new(),
+        };
         Ok(JobSummary {
+            text: result.text.map(|t| crate::request::TextStats {
+                prompt_tokens: t.prompt_tokens,
+                generated_tokens: t.generated_tokens,
+                prefill_secs: t.prefill_secs,
+                decode_secs: t.decode_secs,
+                finish_reason: t.finish_reason,
+            }),
+            tool_calls,
             output: output.to_path_buf(),
             width: result.width,
             height: result.height,
             frames: result.frames,
             fps: result.fps,
             seed: result.seed,
+            session: None,
         })
     }
 
@@ -134,7 +170,7 @@ impl RemoteExecutor {
                 let frame = buf[..end].to_string();
                 buf.drain(..end + frame_sep_len(&buf, end));
                 if let Some(event) = parse_frame(&frame)? {
-                    match apply(event, sink) {
+                    match apply(event, key, sink) {
                         Flow::Continue => {}
                         Flow::KeyRequired => self.deliver_key(id, key).await?,
                         Flow::Done(result) => return Ok(result),
@@ -196,7 +232,7 @@ enum Flow {
 }
 
 /// Route one decoded event onto the sink, returning whether to keep streaming.
-fn apply(event: JobEvent, sink: &dyn ProgressSink) -> Flow {
+fn apply(event: JobEvent, key: &JobKey, sink: &dyn ProgressSink) -> Flow {
     match event {
         JobEvent::Queued { position } => {
             sink.note(&format!("Queued at position {position}"));
@@ -213,6 +249,18 @@ fn apply(event: JobEvent, sink: &dyn ProgressSink) -> Flow {
         }
         JobEvent::Log { message } => {
             sink.note(&message);
+            Flow::Continue
+        }
+        JobEvent::Text { sealed } => {
+            use base64::Engine;
+            let opened = base64::engine::general_purpose::STANDARD
+                .decode(sealed.as_bytes())
+                .map_err(|e| e.to_string())
+                .and_then(|b| key.open(&b));
+            match opened {
+                Ok(plain) => sink.text(&String::from_utf8_lossy(&plain)),
+                Err(e) => return Flow::Err(format!("open streamed text: {e}")),
+            }
             Flow::Continue
         }
         JobEvent::Done { result } => Flow::Done(result),

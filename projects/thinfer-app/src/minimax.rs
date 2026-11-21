@@ -74,6 +74,7 @@ use crate::config::{ResidencyBudget, random_seed};
 use crate::download::resolve_role;
 use crate::executor::BytesOpener;
 use crate::minimax_ref;
+use crate::model::RefCrop;
 use crate::progress::{ProgressSink, Stage};
 use crate::request::{JobSummary, VideoFormat, VideoRequest};
 
@@ -203,6 +204,9 @@ pub async fn run(
     tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
     Ok(JobSummary {
+        text: None,
+        session: None,
+        tool_calls: Vec::new(),
         output: req.output.clone(),
         width: w_px as u32,
         height: h_px as u32,
@@ -312,20 +316,7 @@ async fn run_clip(
     // the clip start (the request rejects both together).
     let (refs, anchor) = match keyframe {
         Some(k) => (vec![k], Some(KeyframeAnchor::First)),
-        None => (
-            req.ref_images
-                .iter()
-                .map(|b| {
-                    minimax_ref::prepare(
-                        &b.0,
-                        req.ref_image_size,
-                        req.width as usize,
-                        req.height as usize,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            None,
-        ),
+        None => (prepare_refs(backend, req).await?, None),
     };
     let ref_tokens: Vec<usize> = refs
         .iter()
@@ -1227,6 +1218,32 @@ pub(crate) async fn open_st(
     SafetensorsSource::open(opener)
         .await
         .map_err(|e| format!("parse {}: {e:?}", path.display()))
+}
+
+/// Decode, frame ([`RefCrop`]) and size every reference image of `req`.
+async fn prepare_refs(
+    backend: &Arc<WgpuBackend>,
+    req: &VideoRequest,
+) -> Result<Vec<minimax_ref::Prepared>, String> {
+    let (w, h) = (req.width as usize, req.height as usize);
+    // The detector runs no accelerator op: plain buffers, released at return.
+    let _plain = backend.plain_allocations();
+    let finder = match req.ref_crop {
+        RefCrop::Auto if !req.ref_images.is_empty() => {
+            Some(minimax_ref::FaceFinder::load(backend).await?)
+        }
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(req.ref_images.len());
+    for b in &req.ref_images {
+        let img = minimax_ref::decode(&b.0)?;
+        let crop = match &finder {
+            Some(f) => f.crop(&img, req.ref_image_size, w, h).await?,
+            None => None,
+        };
+        out.push(minimax_ref::prepare(img, crop, req.ref_image_size, w, h)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

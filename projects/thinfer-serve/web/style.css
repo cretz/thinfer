@@ -408,8 +408,33 @@ details.panel[open] > summary {
 
 /* Per-type fields (body class set by app.js). */
 body:not(.kind-image) .image-only,
-body:not(.kind-video) .video-only {
+body:not(.kind-video) .video-only,
+body:not(.kind-text) .text-only,
+body.kind-text .media-only {
   display: none;
+}
+
+/* --- chat ------------------------------------------------------------------- */
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 0.8rem;
+}
+.chat .msg {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 0.6rem 0.8rem;
+  border-radius: 0.6rem;
+  max-width: 100%;
+}
+.chat .msg.user {
+  align-self: flex-end;
+  background: var(--accent-soft, rgba(80, 140, 255, 0.15));
+}
+.chat .msg.assistant {
+  align-self: flex-start;
+  background: var(--card-2, rgba(127, 127, 127, 0.12));
 }
 /* The `hidden` attribute always wins over any display rule above. */
 [hidden] {

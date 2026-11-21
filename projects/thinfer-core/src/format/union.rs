@@ -82,6 +82,54 @@ impl<S: WeightSource> WeightSource for RenamedSource<S> {
 
 /// Wraps two sources. `primary` wins on `WeightId` collisions. The
 /// catalog is rebuilt at construction from both sources' catalogs.
+/// The shards of one split model (GGUF `-0000k-of-0000n`): one catalog over
+/// all of them, each tensor read from the shard that holds it.
+pub struct MultiSource<S: WeightSource> {
+    shards: Vec<S>,
+    catalog: WeightCatalog,
+    owner: HashMap<WeightId, usize>,
+}
+
+impl<S: WeightSource> MultiSource<S> {
+    /// Panics if two shards hold the same tensor name (a malformed split).
+    pub fn new(shards: Vec<S>) -> Self {
+        let mut catalog = WeightCatalog::new();
+        let mut owner = HashMap::new();
+        for (i, s) in shards.iter().enumerate() {
+            for (id, entry) in &s.catalog().entries {
+                assert!(
+                    owner.insert(id.clone(), i).is_none(),
+                    "tensor {} in two shards",
+                    id.0
+                );
+                catalog.entries.insert(id.clone(), entry.clone());
+            }
+        }
+        Self {
+            shards,
+            catalog,
+            owner,
+        }
+    }
+
+    pub fn shards(&self) -> &[S] {
+        &self.shards
+    }
+}
+
+impl<S: WeightSource> WeightSource for MultiSource<S> {
+    type Reader = S::Reader;
+    type Error = S::Error;
+    fn catalog(&self) -> &WeightCatalog {
+        &self.catalog
+    }
+    async fn open(&self, id: &WeightId) -> Result<Self::Reader, Self::Error> {
+        // Unknown ids go to shard 0, which reports them as missing itself.
+        let i = self.owner.get(id).copied().unwrap_or(0);
+        self.shards[i].open(id).await
+    }
+}
+
 pub struct UnionSource<P: WeightSource, F: WeightSource> {
     primary: P,
     fallback: F,

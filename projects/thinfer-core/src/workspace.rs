@@ -1859,6 +1859,26 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         }
     }
 
+    /// Enqueue an LLM kernel (deferred mode only). `false` = declined; work
+    /// already enqueued stays valid.
+    pub fn accel_llm(&self, op: &crate::ops::llm::LlmOp) -> bool {
+        debug_assert!(self.deferred.on.get(), "accel_llm outside deferred mode");
+        let Some(acc) = self.backend.accelerator() else {
+            return false;
+        };
+        if let Err(e) = self.accel_drain() {
+            tracing::warn!(target: crate::trace::ADAPTER, error = ?e, "flush before an accelerator op failed");
+            return false;
+        }
+        match acc.llm(op) {
+            Ok(ran) => ran,
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator llm op failed");
+                false
+            }
+        }
+    }
+
     /// Enqueue [`crate::backend::DenseAttention`] (deferred mode only).
     /// `false` = declined; work already enqueued stays valid.
     pub fn accel_dense_attention(&self, a: &crate::backend::DenseAttention) -> bool {
