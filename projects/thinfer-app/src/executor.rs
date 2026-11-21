@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::model::{
+    ImageModelEngine, SwapModelEngine, VaeChoiceEngine, VideoModelEngine, VideoSamplerEngine,
+};
 use thinfer_core::backend::WgpuBackend;
 use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::format::safetensors::SafetensorsSource;
@@ -100,6 +103,7 @@ impl LocalExecutor {
     ) -> Result<JobSummary, String> {
         match req {
             JobRequest::Image(r) => self.run_image(r, sink).await,
+            JobRequest::Text(r) => crate::llm::run(&self.backend, r, sink).await,
             JobRequest::Video(r) => self.run_video(r, sink).await,
             JobRequest::FaceSwap(r) => self.run_faceswap(r, sink).await,
         }
@@ -197,6 +201,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: req.width,
             height: req.height,
@@ -284,6 +291,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: req.width,
             height: req.height,
@@ -447,6 +457,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: req.width,
             height: req.height,
@@ -576,6 +589,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: req.width,
             height: req.height,
@@ -703,6 +719,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: req.width,
             height: req.height,
@@ -822,7 +841,7 @@ impl LocalExecutor {
         let vae: VaeChoice = if matches!(req.model, VideoModelId::Wan22T2vA14b) {
             VaeChoice::Full
         } else {
-            req.vae.into()
+            req.vae.engine()
         };
 
         let mut weight_openers: Vec<MmapFileOpener> =
@@ -833,7 +852,7 @@ impl LocalExecutor {
         // The tiny decoder is an extra safetensors shard (disjoint keys), unioned
         // into the same catalog. Only when selected, so the parity path is
         // byte-for-byte the source it always was.
-        // `vae` here is the Wan-mapped choice (`req.vae.into()`), so a Hunyuan-only
+        // `vae` here is the Wan-mapped choice (`req.vae.engine()`), so a Hunyuan-only
         // `TinyFt` request has already collapsed to `Tiny` -- this load covers it.
         if vae == VaeChoice::Tiny {
             weight_openers
@@ -992,6 +1011,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: video.width as u32,
             height: video.height as u32,
@@ -1132,6 +1154,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: w as u32,
             height: h as u32,
@@ -1160,10 +1185,12 @@ impl LocalExecutor {
         let d = &opts.diffusion;
 
         // --- 1. decode the target video into RAM frames ---
-        let video_bytes = resolve_video_bytes(&req.input_video)?;
-        sink.note("Decoding target video");
-        let (mut frames, fps) = codec::decode_mp4_frames(video_bytes.as_ref())?;
-        drop(video_bytes);
+        // The (possibly decrypted) container bytes end with this block.
+        let (mut frames, fps) = {
+            let video_bytes = resolve_video_bytes(&req.input_video)?;
+            sink.note("Decoding target video");
+            codec::decode_mp4_frames(video_bytes.as_ref())?
+        };
         // The optional [start, end) window, in source seconds.
         let at = |secs: f32| (secs * fps as f32).round() as usize;
         let first = opts.start_secs.map_or(0, at).min(frames.len());
@@ -1365,6 +1392,9 @@ impl LocalExecutor {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
         Ok(JobSummary {
+            text: None,
+            session: None,
+            tool_calls: Vec::new(),
             output: req.output.clone(),
             width: video.width as u32,
             height: video.height as u32,
@@ -1491,6 +1521,7 @@ fn largest_4k_plus_1(n: usize) -> usize {
 /// (page-locked on a server, zeroized on drop).
 enum VideoBytes<'a> {
     Ram(&'a [u8]),
+    #[cfg(feature = "vault")]
     Decrypted(thinfer_core::secmem::Locked<u8>),
 }
 
@@ -1498,6 +1529,7 @@ impl AsRef<[u8]> for VideoBytes<'_> {
     fn as_ref(&self) -> &[u8] {
         match self {
             VideoBytes::Ram(b) => b,
+            #[cfg(feature = "vault")]
             VideoBytes::Decrypted(b) => b,
         }
     }

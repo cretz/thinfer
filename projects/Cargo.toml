@@ -5,6 +5,7 @@ members = [
     "thinfer-native",
     "thinfer-cuda",
     "thinfer-web",
+    "thinfer-client",
     "thinfer-app",
     "thinfer-serve",
     "thinfer-cli",

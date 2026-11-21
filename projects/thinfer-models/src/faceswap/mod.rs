@@ -183,12 +183,7 @@ impl FaceSwapper {
             }
             _ => None,
         };
-        let scrfd = OnnxModel::load(
-            Arc::clone(&backend),
-            scrfd_onnx,
-            &input_shape_map(scrfd_onnx, &[1, 3, 640, 640])?,
-        )
-        .await?;
+        let scrfd = detect::load(Arc::clone(&backend), scrfd_onnx).await?;
         let arcface = OnnxModel::load(
             Arc::clone(&backend),
             arcface_onnx,
@@ -527,7 +522,10 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
 }
 
 /// Build the `{first_input_name: shape}` map for a single-input model.
-fn input_shape_map(onnx: &[u8], shape: &[i64]) -> Result<HashMap<String, Vec<i64>>, OnnxError> {
+pub(crate) fn input_shape_map(
+    onnx: &[u8],
+    shape: &[i64],
+) -> Result<HashMap<String, Vec<i64>>, OnnxError> {
     let graph =
         thinfer_core::onnx::proto::parse_model(onnx).map_err(|e| OnnxError::Io(e.to_string()))?;
     let name = graph

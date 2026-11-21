@@ -1,20 +1,17 @@
 //! The client/server wire types: the JSON job specs a client sends, the
-//! responses it gets back, and the SSE event payloads. They live here (not in
-//! `thinfer-serve`) so both ends share one definition: `thinfer-serve`
-//! deserializes specs + serializes events, and the `RemoteExecutor` (the HTTP
-//! client, behind the `remote` feature) does the mirror. The server keeps the
+//! responses it gets back, and the SSE event payloads. Both ends share this
+//! one definition: `thinfer-serve` deserializes specs + serializes events,
+//! and [`crate::Client`] does the mirror. The server keeps the
 //! parts a client never sees -- artifact paths, budgets, the in-memory job
 //! store -- next to its handlers.
 //!
-//! Gated behind `serde` (no consumer wants these without it). The OpenAPI
-//! `ToSchema` derives ride the `serve` feature so a plain `serde` client (the
-//! CLI's `RemoteExecutor`) does not pull `utoipa`.
+//! The OpenAPI `ToSchema` derives ride the `utoipa` feature (the server's).
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SuperRes, SwapModel,
-    VaeChoice, VideoModelId, VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelId, RefCrop, RefImageSize, RewriteQuality, SuperRes,
+    SwapModel, TextModelId, VaeChoice, VideoModelId, VideoSampler,
 };
 use crate::progress::Stage;
 
@@ -23,7 +20,7 @@ use crate::progress::Stage;
 /// The server queues only this ciphertext; when a worker is ready it emits
 /// [`JobEvent::KeyRequired`] and the client answers with [`JobKeyDelivery`].
 #[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SealedJob {
     pub sealed: String,
@@ -33,12 +30,30 @@ pub struct SealedJob {
     /// about the content. See [`JobSpec::upload_ids`].
     #[serde(default)]
     pub uploads: Vec<String>,
+    /// Queue priority: higher runs first (default 0). Waiting raises it by
+    /// one level per `queue_aging_secs`, so low-priority work never starves.
+    #[serde(default)]
+    pub priority: i32,
+    /// Base64 SHA-256 of the job key (reveals nothing about it). When set,
+    /// managing the job (cancel, `PATCH`, `DELETE`) requires it in the
+    /// `x-job-key-sha256` header, and the key delivered later must match it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_proof: Option<String>,
+}
+
+/// `PATCH /jobs/{id}` body.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct JobPatch {
+    /// New queue priority (queued jobs only).
+    pub priority: i32,
 }
 
 /// `POST /jobs/{id}/key` body: the base64 job key, sent only in answer to
 /// [`JobEvent::KeyRequired`]. Never logged (no `Debug`).
 #[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct JobKeyDelivery {
     pub key: String,
@@ -48,10 +63,11 @@ pub struct JobKeyDelivery {
 /// caller chooses; the server assigns the artifact path and pulls budgets from
 /// its config.
 #[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum JobSpec {
     Image(ImageSpec),
+    Text(TextSpec),
     Video(VideoSpec),
     FaceSwap(FaceSwapSpec),
 }
@@ -61,7 +77,7 @@ impl JobSpec {
     /// the sealed spec; see [`SealedJob::uploads`]).
     pub fn upload_ids(&self) -> Vec<String> {
         let id = match self {
-            JobSpec::Image(_) | JobSpec::Video(_) => None,
+            JobSpec::Image(_) | JobSpec::Text(_) | JobSpec::Video(_) => None,
             JobSpec::FaceSwap(s) => s.input_video_upload.as_ref(),
         };
         id.into_iter().cloned().collect()
@@ -74,14 +90,198 @@ impl JobSpec {
     pub fn disable_coopmat(&self) -> Option<bool> {
         match self {
             JobSpec::Image(s) => s.disable_coopmat,
+            JobSpec::Text(_) => None,
             JobSpec::Video(s) => s.disable_coopmat,
             JobSpec::FaceSwap(s) => s.disable_coopmat,
         }
     }
 }
 
+/// One chat turn of a [`TextSpec`]. No `Debug`: content is never logged.
 #[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TextMessage {
+    /// `system`, `user`, `assistant` or `tool` (a tool call's result).
+    pub role: String,
+    /// The text (a `tool` turn: the call's result, as the model should read
+    /// it).
+    #[serde(default)]
+    pub content: String,
+    /// An `assistant` turn's tool calls (as a reply returned them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<crate::tools::ToolCall>,
+    /// A `tool` turn: the id of the call it answers...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// ...and that call's tool name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl TextMessage {
+    pub fn new(role: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new("system", content)
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+
+    /// The assistant turn of a reply that made `calls` (as the reply
+    /// returned them), for resending the conversation statelessly.
+    pub fn assistant_calls(calls: Vec<crate::tools::ToolCall>) -> Self {
+        let mut m = Self::new("assistant", "");
+        m.tool_calls = calls;
+        m
+    }
+
+    /// The result of running `call`, as the model should read it.
+    pub fn tool_result(call: &crate::tools::ToolCall, content: impl Into<String>) -> Self {
+        let mut m = Self::new("tool", content);
+        m.tool_call_id = Some(call.id.clone());
+        m.name = Some(call.name.clone());
+        m
+    }
+}
+
+/// A chat reply request (LLM text generation). Unset sampling fields take the
+/// model card's defaults for the chosen mode.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TextSpec {
+    pub model: Option<TextModelId>,
+    /// The conversation, oldest first.
+    pub messages: Vec<TextMessage>,
+    pub max_tokens: Option<u32>,
+    /// Let the model reason before it answers (thinking mode).
+    pub think: Option<bool>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub seed: Option<u64>,
+    /// Constrain the reply (after any thinking) to a JSON Schema or a Lark
+    /// grammar. Forced runs (fixed keys, punctuation) are inserted in one pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<crate::text_format::TextFormat>,
+    /// Continue a server-held session (`POST /sessions`) instead of
+    /// re-sending the conversation: `messages` then holds only the new turns.
+    /// The reply's state becomes a new node (`TextResult.sessionNode`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<TextSessionRef>,
+    /// Tools the model may call. Every call names one of them and its
+    /// arguments match the tool's schema (constrained decoding in the
+    /// model's own call syntax). A reply of calls ends the job with
+    /// `finishReason: toolCalls` and the calls in `TextResult.toolCalls`;
+    /// run them, then continue with one `tool` turn per call (send the tools
+    /// again). With a session, continue from the reply's node with just the
+    /// `tool` turns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<crate::tools::ToolDef>,
+    /// Default `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<crate::tools::ToolChoice>,
+}
+
+impl TextSpec {
+    /// A reply to `messages` (oldest first) with the model's defaults.
+    pub fn new(messages: Vec<TextMessage>) -> Self {
+        Self {
+            messages,
+            ..Self::default()
+        }
+    }
+}
+
+/// A text job's session reference. Rides inside the sealed spec, so the
+/// session key reaches the server only when the job runs.
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TextSessionRef {
+    pub id: String,
+    /// Node to continue from; `None` = a new root (send the whole
+    /// conversation, system prompt included).
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Base64 32-byte AES-256-GCM session key (client-held; the server's
+    /// copy of the session is sealed under it).
+    pub key: String,
+}
+
+/// `POST /sessions` body.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSession {
+    /// The text model every node is built with (default: the text default).
+    #[serde(default)]
+    pub model: Option<TextModelId>,
+    /// Idle time before the server forgets the session (default
+    /// `session_ttl_secs`).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// Base64 SHA-256 of the session key: managing the session requires it
+    /// (`x-session-key-sha256`), and jobs must use the matching key.
+    pub key_proof: String,
+}
+
+/// `PATCH /sessions/{id}` body.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPatch {
+    pub ttl_secs: u64,
+}
+
+/// A session's structure (no content: every node's state is sealed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub id: String,
+    pub model: TextModelId,
+    pub ttl_secs: u64,
+    /// Seconds until the server forgets it if unused.
+    pub expires_in_secs: u64,
+    /// Sealed bytes held across all nodes.
+    pub bytes: u64,
+    pub nodes: Vec<SessionNodeInfo>,
+}
+
+/// One node: the state one text request added (positions `start..end`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNodeInfo {
+    pub id: String,
+    pub parent: Option<String>,
+    pub start: u32,
+    pub end: u32,
+    pub bytes: u64,
+    pub age_secs: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ImageSpec {
     pub model: Option<ImageModelId>,
@@ -121,7 +321,7 @@ pub struct ImageSpec {
 /// One adapter reference in a generate request: a vault entry id + optional blend
 /// weight (defaults to 1.0).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct LoraSpec {
     pub id: String,
@@ -129,8 +329,18 @@ pub struct LoraSpec {
     pub weight: Option<f32>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+impl ImageSpec {
+    /// A `prompt` image with the model's defaults.
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct VideoSpec {
     pub model: Option<VideoModelId>,
@@ -182,6 +392,11 @@ pub struct VideoSpec {
     /// ~2.4x slower with one reference).
     #[serde(default)]
     pub ref_image_size: Option<RefImageSize>,
+    /// FastH3-Omni: `auto` (default) crops each reference in on its faces
+    /// when they would come out small (a person photographed from afar);
+    /// `off` always keeps the whole image, as the reference does.
+    #[serde(default)]
+    pub ref_crop: Option<RefCrop>,
     /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
     /// baseline) or `q4` (Q4_K_M, ~2.8x faster encode, lower precision). Applies
     /// to all LTX models; ignored by Wan.
@@ -245,8 +460,18 @@ pub struct VideoSpec {
     pub password: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+impl VideoSpec {
+    /// A one-prompt video with the model's defaults.
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompts: vec![prompt.into()],
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct FaceSwapSpec {
     pub model: Option<SwapModel>,
@@ -331,9 +556,18 @@ pub struct FaceSwapSpec {
     pub face_crop: Option<bool>,
 }
 
+/// `GET /capabilities`: what the server's GPU supports.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    /// GPU supports the coopmat (tensor-core) matmul path.
+    pub coopmat: bool,
+}
+
 /// The `POST /jobs` response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CreateResponse {
     pub id: String,
@@ -343,7 +577,7 @@ pub struct CreateResponse {
 /// The `POST /uploads` response: an opaque id a job spec references via
 /// `input_video_upload`, plus the received byte count.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UploadResponse {
     pub id: String,
@@ -352,10 +586,12 @@ pub struct UploadResponse {
 
 /// Coarse job lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum JobStateKind {
     Queued,
+    /// Taken by a worker: waiting for the key, then opening the spec.
+    Starting,
     Running,
     Done,
     Failed,
@@ -364,7 +600,7 @@ pub enum JobStateKind {
 
 /// Serializable mirror of [`Stage`] (the wire shape of a progress event).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(tag = "stage", rename_all = "camelCase")]
 pub enum ProgressStage {
     TextEncode,
@@ -435,7 +671,7 @@ impl From<ProgressStage> for Stage {
 
 /// What a finished job produced (the SSE `done` payload + status `result`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct JobResult {
     pub width: u32,
@@ -445,25 +681,74 @@ pub struct JobResult {
     pub seed: Option<u64>,
     /// Relative URL to fetch the artifact bytes.
     pub result_url: String,
+    /// Text jobs: token counts and speed (the reply itself is the artifact).
+    #[serde(default)]
+    pub text: Option<TextResult>,
+}
+
+/// Token counts and timings of a finished text job.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TextResult {
+    pub prompt_tokens: u32,
+    pub generated_tokens: u32,
+    pub prefill_secs: f64,
+    pub decode_secs: f64,
+    /// The session node this reply created (session jobs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_node: Option<String>,
+    #[serde(default)]
+    pub finish_reason: crate::tools::FinishReason,
+    /// With `finishReason: toolCalls`: the calls, a JSON array of
+    /// `ToolCall`, sealed under the job key (`crate::jobkey` blob, base64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<String>,
 }
 
 /// Snapshot of a job for `GET /jobs/{id}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
     pub id: String,
     pub state: JobStateKind,
+    pub priority: i32,
     pub queue_position: Option<usize>,
     pub progress: Option<ProgressStage>,
     pub result: Option<JobResult>,
     pub error: Option<String>,
 }
 
+/// One `GET /jobs` row: structural fields only (the spec is sealed; no result
+/// or error text).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct JobListEntry {
+    pub id: String,
+    pub state: JobStateKind,
+    pub priority: i32,
+    /// Run-order index while queued.
+    pub queue_position: Option<usize>,
+    pub progress: Option<ProgressStage>,
+    /// Seconds since submit.
+    pub age_secs: u64,
+}
+
+/// `GET /jobs` body: pending jobs in run order, then the rest newest first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct JobList {
+    pub jobs: Vec<JobListEntry>,
+}
+
 /// One SSE event payload. `type` tags the variant; the SSE `event:` name is
 /// [`JobEvent::kind`]. The server serializes these; a `RemoteExecutor` parses
 /// them back.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum JobEvent {
     Queued {
@@ -478,6 +763,12 @@ pub enum JobEvent {
     },
     Log {
         message: String,
+    },
+    /// A streamed piece of a text job's reply, sealed under the job key
+    /// (`crate::jobkey` blob, base64): reply text never crosses the server in
+    /// the clear.
+    Text {
+        sealed: String,
     },
     Done {
         result: JobResult,
@@ -496,6 +787,7 @@ impl JobEvent {
             JobEvent::Started => "started",
             JobEvent::Progress { .. } => "progress",
             JobEvent::Log { .. } => "log",
+            JobEvent::Text { .. } => "text",
             JobEvent::Done { .. } => "done",
             JobEvent::Error { .. } => "error",
             JobEvent::Cancelled => "cancelled",

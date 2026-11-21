@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use axum::Router;
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tower_http::services::ServeDir;
@@ -18,7 +18,9 @@ const APP_JS: &str = include_str!("../web/app.js");
 /// The UI router. With `web_dir`, files are served live from disk; otherwise the
 /// compiled-in assets are served.
 pub fn router(web_dir: Option<&Path>) -> Router {
-    match web_dir {
+    // No icon: answer the browser's automatic request instead of a 404.
+    let icon = get(|| async { StatusCode::NO_CONTENT });
+    let ui = match web_dir {
         Some(dir) => Router::new().fallback_service(ServeDir::new(dir)),
         None => Router::new()
             .route("/", get(|| asset("text/html; charset=utf-8", INDEX_HTML)))
@@ -28,7 +30,8 @@ pub fn router(web_dir: Option<&Path>) -> Router {
             )
             .route("/style.css", get(|| asset("text/css", STYLE_CSS)))
             .route("/app.js", get(|| asset("text/javascript", APP_JS))),
-    }
+    };
+    ui.route("/favicon.ico", icon)
 }
 
 /// Content-Security-Policy for every response. The UI is one same-origin

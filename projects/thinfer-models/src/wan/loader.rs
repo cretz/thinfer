@@ -457,6 +457,7 @@ pub(crate) fn register_conv_as_linear_bias<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose,
         transcode,
+        keep_f32: false,
     };
     Ok(LinearBiasHandles {
         weight: residency.register(meta),
@@ -483,6 +484,7 @@ pub(crate) fn register_linear<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose,
         transcode,
+        keep_f32: false,
     }))
 }
 
@@ -551,6 +553,7 @@ pub(crate) fn register_passthrough<S: WeightSource>(
         on_disk_bytes: entry.size,
         transpose: TransposePolicy::None,
         transcode: None,
+        keep_f32: false,
     }))
 }
 

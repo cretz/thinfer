@@ -48,6 +48,16 @@ async fn vae_parity() {
         );
         return;
     };
+    // The reference builds the VAE with `from_pretrained`, which also needs
+    // its `config.json` (the runtime manifest never downloads it).
+    let vae_dir = vae_path.parent().expect("vae dir");
+    if !vae_dir.join("config.json").is_file() {
+        eprintln!(
+            "skipped[vae_parity]: {}/config.json not in HF cache (the reference needs it)",
+            vae_dir.display()
+        );
+        return;
+    }
 
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qwen21_vae_parity");
     std::fs::create_dir_all(&tmp).expect("tmpdir");
@@ -56,7 +66,7 @@ async fn vae_parity() {
     if std::fs::read_to_string(&marker).is_ok_and(|c| c == cfg_tag) {
         eprintln!("vae-parity: reusing cached pyref dumps ({})", tmp.display());
     } else {
-        run_python_ref(vae_path.parent().expect("vae dir"), &tmp);
+        run_python_ref(vae_dir, &tmp);
         std::fs::write(&marker, &cfg_tag).expect("write marker");
     }
 

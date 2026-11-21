@@ -42,6 +42,7 @@ use thinfer_native::tokenizer::HfTokenizer;
 use crate::config::random_seed;
 use crate::download::resolve_role;
 use crate::model::VaeChoice;
+use crate::model::VideoModelEngine;
 use crate::progress::{ProgressSink, Stage};
 use crate::request::{JobSummary, VideoFormat, VideoRequest};
 
@@ -369,6 +370,9 @@ pub async fn run(
     tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
     Ok(JobSummary {
+        text: None,
+        session: None,
+        tool_calls: Vec::new(),
         output: req.output.clone(),
         width: w_px as u32,
         height: h_px as u32,
@@ -803,6 +807,9 @@ pub async fn run_i2v(
     tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), "wrote output");
 
     Ok(JobSummary {
+        text: None,
+        session: None,
+        tool_calls: Vec::new(),
         output: req.output.clone(),
         width: w_px as u32,
         height: h_px as u32,

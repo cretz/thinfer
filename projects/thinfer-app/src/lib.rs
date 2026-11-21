@@ -12,8 +12,8 @@ pub mod config;
 pub mod download;
 pub mod executor;
 pub mod hunyuan;
-#[cfg(any(feature = "vault", feature = "remote"))]
 pub mod jobkey;
+pub mod llm;
 pub mod ltx;
 pub mod minimax;
 mod minimax_ref;
@@ -24,17 +24,20 @@ mod qwen21;
 #[cfg(feature = "remote")]
 pub mod remote;
 pub mod request;
+pub mod text_format;
+pub mod tools;
 // Always compiled: `maybe_rewrite_prompt` gates its body on the feature itself.
 pub mod rewrite;
 #[cfg(feature = "vault")]
 pub mod vault;
 pub mod vsr;
-#[cfg(feature = "serde")]
-pub mod wire;
+pub use thinfer_client::wire;
 
 pub use config::{BackendConfig, DEFAULT_BUDGET_BYTES, ResidencyBudget, parse_budget, report_mem};
 pub use executor::LocalExecutor;
 pub use progress::{NullSink, ProgressSink, Stage};
 pub use request::{
-    FaceSwapRequest, ImageRequest, JobRequest, JobSummary, VideoRequest, resolve_output_format,
+    FaceSwapRequest, ImageRequest, JobRequest, JobSummary, TextRequest, TextStats, VideoRequest,
+    resolve_output_format,
 };
+pub use thinfer_models::llm::chat::ChatMessage;

@@ -24,13 +24,15 @@ use std::time::Duration;
 use thinfer_app::JobRequest;
 use thinfer_app::config::BackendConfig;
 use thinfer_app::download::{self, DownloadReporter, NullReporter};
-use thinfer_app::jobkey::JobKey;
+use thinfer_app::jobkey::{JobKey, OpenLocked};
 use thinfer_app::progress::{ProgressSink, Stage};
 use thinfer_app::wire::{JobEvent, JobResult, JobSpec};
 use thinfer_app::{JobSummary, LocalExecutor};
 
 use crate::config::ServeConfig;
 use crate::job::{JobHandle, JobStore};
+use crate::jobspec::{Built, SessionCommit};
+use crate::sessions::SessionStore;
 use crate::uploads::UploadStore;
 
 /// Worker thread stack. The default spawned-thread stack (2 MiB) is NOT enough:
@@ -50,6 +52,7 @@ pub struct WorkerCtx {
     pub store: Arc<JobStore>,
     pub config: Arc<ServeConfig>,
     pub uploads: Arc<UploadStore>,
+    pub sessions: Arc<SessionStore>,
 }
 
 /// Spawn a worker on a dedicated OS thread. It builds its own backend +
@@ -107,7 +110,11 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>) {
     // Job plaintext is page-locked from here on; a lock that fails (no
     // lockable memory left) stops the job rather than let it reach swap.
     let lock_mark = thinfer_core::secmem::failure_mark();
-    let (request, disable_coopmat) = match decrypt_request(ctx, job, &key, &sealed) {
+    let Built {
+        request,
+        disable_coopmat,
+        session,
+    } = match decrypt_request(ctx, job, &key, &sealed) {
         Ok(r) => r,
         Err(message) => return job.push(JobEvent::Error { message }),
     };
@@ -128,6 +135,7 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>) {
                 &key,
                 ctx.config.download_as_needed,
                 lock_mark,
+                session.map(|c| (c, ctx.sessions.as_ref())),
             )
             .await
         }
@@ -144,11 +152,19 @@ fn decrypt_request(
     job: &JobHandle,
     key: &JobKey,
     sealed: &[u8],
-) -> Result<(JobRequest, Option<bool>), String> {
-    let spec_json = key.open(sealed)?;
+) -> Result<Built, String> {
+    let spec_json = key.open_locked(sealed)?;
     let spec: JobSpec =
         serde_json::from_slice(&spec_json).map_err(|e| format!("invalid job spec: {e}"))?;
-    crate::jobspec::spec_into_request(spec, &job.id, &job.dir, key, &ctx.config, &ctx.uploads)
+    crate::jobspec::spec_into_request(
+        spec,
+        &job.id,
+        &job.dir,
+        key,
+        &ctx.config,
+        &ctx.uploads,
+        &ctx.sessions,
+    )
 }
 
 async fn process(
@@ -158,6 +174,7 @@ async fn process(
     key: &JobKey,
     download_as_needed: bool,
     lock_mark: u64,
+    session: Option<(SessionCommit, &SessionStore)>,
 ) {
     job.push(JobEvent::Started);
     // Durable job record (structural fields ONLY -- prompts are never logged).
@@ -233,12 +250,53 @@ async fn process(
         "job done"
     );
 
+    let node = match (session, &summary.session) {
+        (Some((commit, store)), Some(save)) => save_node(job, store, commit, save),
+        _ => None,
+    };
     job.push(JobEvent::Done {
-        result: to_result(&job.id, &summary),
+        result: to_result(&job.id, &summary, node, key),
     });
 }
 
-fn to_result(id: &str, s: &JobSummary) -> JobResult {
+/// Seal a session reply's state under the session key and add it as a node.
+/// A node that cannot be kept (budget, evicted parent) leaves the reply
+/// intact; the client sees no `sessionNode` and a log line.
+fn save_node(
+    job: &JobHandle,
+    store: &SessionStore,
+    commit: SessionCommit,
+    save: &thinfer_app::request::SessionSave,
+) -> Option<String> {
+    let sealed = commit.key.seal(&save.chunk.bytes);
+    match store.insert(
+        &commit.id,
+        commit.parent.as_deref(),
+        save.chunk.start,
+        save.chunk.end,
+        sealed,
+        save.weights.clone(),
+    ) {
+        Ok(node) => Some(node),
+        Err(e) => {
+            job.push(JobEvent::Log {
+                message: format!("session node not kept: {e}"),
+            });
+            None
+        }
+    }
+}
+
+/// The job's result as the wire reports it; a reply's tool calls are sealed
+/// under the job key (job data, like the reply text).
+fn to_result(id: &str, s: &JobSummary, session_node: Option<String>, key: &JobKey) -> JobResult {
+    use base64::Engine;
+    let tool_calls = (!s.tool_calls.is_empty()).then(|| {
+        let json = zeroize::Zeroizing::new(
+            serde_json::to_vec(&s.tool_calls).expect("tool calls serialize"),
+        );
+        base64::engine::general_purpose::STANDARD.encode(key.seal(&json))
+    });
     JobResult {
         width: s.width,
         height: s.height,
@@ -246,6 +304,15 @@ fn to_result(id: &str, s: &JobSummary) -> JobResult {
         fps: s.fps,
         seed: s.seed,
         result_url: format!("/jobs/{id}/result"),
+        text: s.text.map(|t| thinfer_app::wire::TextResult {
+            prompt_tokens: t.prompt_tokens,
+            generated_tokens: t.generated_tokens,
+            prefill_secs: t.prefill_secs,
+            decode_secs: t.decode_secs,
+            session_node,
+            finish_reason: t.finish_reason,
+            tool_calls,
+        }),
     }
 }
 
@@ -283,6 +350,16 @@ impl ProgressSink for ServeSink<'_> {
     fn note(&self, msg: &str) {
         self.job.push(JobEvent::Log {
             message: msg.to_string(),
+        });
+    }
+    fn text(&self, delta: &str) {
+        use base64::Engine;
+        if delta.is_empty() {
+            return;
+        }
+        self.job.push(JobEvent::Text {
+            sealed: base64::engine::general_purpose::STANDARD
+                .encode(self.key.seal(delta.as_bytes())),
         });
     }
     fn cancelled(&self) -> bool {

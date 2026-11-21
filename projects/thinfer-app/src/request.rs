@@ -10,8 +10,9 @@ use thinfer_core::manifest::FileRef;
 use thinfer_core::policy::ResidencyBudget;
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelId, RefImageSize, RewriteQuality, SuperRes, SwapModel,
-    VaeChoice, VideoModelId, VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelEngine, ImageModelId, RefCrop, RefImageSize,
+    RewriteQuality, RewriteQualityEngine, SuperRes, SwapModel, SwapModelEngine, TextModelEngine,
+    VaeChoice, VaeChoiceEngine, VideoModelEngine, VideoModelId, VideoSampler,
 };
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
@@ -338,6 +339,9 @@ pub struct VideoRequest {
     /// FastH3-Omni only: how each reference image is sized (rejected for every
     /// other model when not the default).
     pub ref_image_size: RefImageSize,
+    /// FastH3-Omni only: whether each reference image is cropped in on a
+    /// small face first (rejected for every other model when not the default).
+    pub ref_crop: RefCrop,
     /// FastWan denoise sampler (ignored on the AR path).
     pub sampler: VideoSampler,
     /// UniPC denoise step count (1..=`VIDEO_MAX_STEPS`); DMD ignores it.
@@ -472,6 +476,10 @@ impl VideoRequest {
                         .ok_or_else(|| format!("MiniMax-H3 manifest missing role {r}"))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            // The face detector frames the references.
+            if !self.ref_images.is_empty() && self.ref_crop == RefCrop::Auto {
+                files.push(crate::model::SCRFD);
+            }
             if let Some(sr) = self.super_res {
                 use thinfer_models::wan::relayvsr::manifest as vsr;
                 let (dit, flash) = vsr::roles(sr.factor());
@@ -767,6 +775,12 @@ impl VideoRequest {
         if self.ref_image_size != RefImageSize::default() && !self.model.takes_refs() {
             return Err(format!(
                 "--ref-image-size applies to reference images; {} does not take them",
+                self.model
+            ));
+        }
+        if self.ref_crop != RefCrop::default() && !self.model.takes_refs() {
+            return Err(format!(
+                "--ref-crop applies to reference images; {} does not take them",
                 self.model
             ));
         }
@@ -1246,6 +1260,7 @@ impl FaceSwapRequest {
 #[derive(Clone, Debug)]
 pub enum JobRequest {
     Image(ImageRequest),
+    Text(TextRequest),
     /// Boxed: the video request is several times the others' size.
     Video(Box<VideoRequest>),
     FaceSwap(FaceSwapRequest),
@@ -1256,14 +1271,160 @@ impl JobRequest {
     pub fn required_files(&self) -> Result<Vec<FileRef>, String> {
         match self {
             JobRequest::Image(r) => Ok(r.required_files()),
+            JobRequest::Text(r) => Ok(r.required_files()),
             JobRequest::Video(r) => r.required_files(),
             JobRequest::FaceSwap(r) => Ok(r.required_files()),
         }
     }
 }
 
+/// Generate a chat reply (LLM text generation).
+#[derive(Clone)]
+pub struct TextRequest {
+    pub model: crate::model::TextModelId,
+    /// The conversation, oldest first; the reply continues it. Never logged.
+    pub messages: Vec<thinfer_models::llm::chat::ChatMessage>,
+    /// Upper bound on generated tokens.
+    pub max_tokens: u32,
+    /// Let the model reason before answering (the template's thinking mode).
+    pub think: bool,
+    /// Sampling overrides; `None` = the model's default for the mode.
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    /// `None` -> randomized at run time; the resolved value is reported back.
+    pub seed: Option<u64>,
+    pub budget: ResidencyBudget,
+    /// Also write the reply here (streamed through the sink either way).
+    pub output: Option<PathBuf>,
+    /// Constrain the reply (after any thinking) to a schema or grammar.
+    pub format: Option<crate::text_format::TextFormat>,
+    /// Continue from / extend a server-held session (`None` = stateless).
+    /// Shared: the decrypted chain is never copied.
+    pub session: Option<std::sync::Arc<TextSession>>,
+    /// Tools the model may call (none = plain chat). A reply of calls ends
+    /// the request ([`crate::tools::FinishReason::ToolCalls`]); the caller
+    /// runs them and continues with `tool` turns holding the results.
+    pub tools: Vec<crate::tools::ToolDef>,
+    pub tool_choice: crate::tools::ToolChoice,
+}
+
+pub use thinfer_models::llm::decoder::StateChunk;
+
+/// A text request's session context: the decrypted state chain to resume
+/// from (empty = a new root) and the weights it was built with. The finished
+/// request returns its own chunk ([`SessionSave`]) to append as a child node.
+pub struct TextSession {
+    /// Root-to-`from` chunks (contiguous from position 0).
+    pub path: Vec<StateChunk>,
+    /// Weights identity of the chain (`None` for a new root).
+    pub weights: Option<String>,
+}
+
+/// What a session request leaves behind: its state chunk (positions it
+/// added) and the weights identity that made it.
+pub struct SessionSave {
+    pub chunk: StateChunk,
+    pub weights: String,
+}
+
+impl std::fmt::Debug for SessionSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSave")
+            .field("start", &self.chunk.start)
+            .field("end", &self.chunk.end)
+            .field("bytes", &self.chunk.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TextRequest {
+    pub fn required_files(&self) -> Vec<FileRef> {
+        let m = self.model.manifest();
+        self.model
+            .required_roles()
+            .iter()
+            .map(|r| *m.get(r).expect("text role in manifest"))
+            .collect()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.messages.is_empty() {
+            return Err("a prompt is required".into());
+        }
+        if self.max_tokens == 0 {
+            return Err("--max-tokens must be > 0".into());
+        }
+        // Negated ranges so NaN fails too.
+        if self
+            .temperature
+            .is_some_and(|t| !(t >= 0.0 && t.is_finite()))
+        {
+            return Err("--temperature must be >= 0".into());
+        }
+        if self.top_p.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
+            return Err("--top-p must be in (0, 1]".into());
+        }
+        if self.min_p.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
+            return Err("--min-p must be in [0, 1]".into());
+        }
+        if self.presence_penalty.is_some_and(|p| !p.is_finite()) {
+            return Err("--presence-penalty must be finite".into());
+        }
+        // The penalty divides positive logits and multiplies negative ones:
+        // zero or below would flip or blow up a seen token's logit.
+        if self
+            .repetition_penalty
+            .is_some_and(|p| !(p > 0.0 && p.is_finite()))
+        {
+            return Err("--repetition-penalty must be > 0".into());
+        }
+        if self.tools.is_empty() && self.tool_choice != crate::tools::ToolChoice::Auto {
+            return Err("a tool choice needs tools".into());
+        }
+        for m in &self.messages {
+            match m.role.as_str() {
+                "system" | "user" | "assistant" => {}
+                "tool" if m.tool_call_id.is_some() && m.name.is_some() => {}
+                "tool" => return Err("a tool result needs its call's id and tool name".into()),
+                _ => return Err("message roles are system, user, assistant or tool".into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective sampling for this request (model defaults + overrides).
+    pub fn sampling(&self, seed: u64) -> thinfer_models::llm::sampler::SamplingParams {
+        let d = self.model.defaults(self.think);
+        thinfer_models::llm::sampler::SamplingParams {
+            temperature: self.temperature.unwrap_or(d.temperature),
+            top_k: self.top_k.unwrap_or(d.top_k),
+            top_p: self.top_p.unwrap_or(d.top_p),
+            min_p: self.min_p.unwrap_or(d.min_p),
+            presence_penalty: self.presence_penalty.unwrap_or(d.presence_penalty),
+            repetition_penalty: self.repetition_penalty.unwrap_or(1.0),
+            seed,
+        }
+    }
+}
+
+/// Token counts and timings of a text generation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextStats {
+    pub prompt_tokens: u32,
+    pub generated_tokens: u32,
+    /// Seconds to the first generated token (prefill).
+    pub prefill_secs: f64,
+    /// Seconds spent generating after the first token.
+    pub decode_secs: f64,
+    pub finish_reason: crate::tools::FinishReason,
+}
+
 /// What a finished job produced.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct JobSummary {
     pub output: PathBuf,
     pub width: u32,
@@ -1272,8 +1433,15 @@ pub struct JobSummary {
     pub frames: u32,
     /// Playback fps (video / face-swap only).
     pub fps: Option<u32>,
-    /// The seed actually used (image/video; `None` for face-swap).
+    /// The seed actually used (image/video/text; `None` for face-swap).
     pub seed: Option<u64>,
+    /// Text generation stats (`None` for media jobs).
+    pub text: Option<TextStats>,
+    /// A session text request's new state chunk (shared, never copied).
+    pub session: Option<std::sync::Arc<SessionSave>>,
+    /// The tool calls a text reply ended with (job data; see
+    /// [`crate::tools::FinishReason::ToolCalls`]).
+    pub tool_calls: Vec<crate::tools::ToolCall>,
 }
 
 /// Resolve frames/durations into the clip's frame count. These models take one
@@ -1311,6 +1479,24 @@ pub fn resolve_frames(
 
 // Prompts are user content: never rendered by `Debug` (structural fields only)
 // and wiped when the request drops (the job ended).
+impl std::fmt::Debug for TextRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+        f.debug_struct("TextRequest")
+            .field("model", &self.model)
+            .field(
+                "messages",
+                &format_args!("<{} messages, {chars} chars redacted>", self.messages.len()),
+            )
+            .field("max_tokens", &self.max_tokens)
+            .field("think", &self.think)
+            .field("seed", &self.seed)
+            .field("format", &self.format.is_some())
+            .field("tools", &self.tools.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for ImageRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageRequest")
@@ -1324,6 +1510,26 @@ impl std::fmt::Debug for ImageRequest {
             .field("steps", &self.steps)
             .field("seed", &self.seed)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TextRequest {
+    fn drop(&mut self) {
+        // The messages wipe themselves (`ChatMessage`'s drop).
+        for t in &mut self.tools {
+            zeroize::Zeroize::zeroize(&mut t.name);
+            zeroize::Zeroize::zeroize(&mut t.description);
+            crate::tools::wipe(&mut t.parameters);
+        }
+        match &mut self.format {
+            Some(crate::text_format::TextFormat::Lark { grammar }) => {
+                zeroize::Zeroize::zeroize(grammar)
+            }
+            Some(crate::text_format::TextFormat::JsonSchema { schema }) => {
+                crate::tools::wipe(schema)
+            }
+            None => {}
+        }
     }
 }
 
@@ -1360,6 +1566,7 @@ impl Drop for VideoRequest {
 #[cfg(test)]
 mod tests {
     use super::{VideoFormat, VideoRequest, resolve_frames};
+    use crate::model::VideoModelEngine;
     use crate::model::VideoModelId::FastwanTi2v5b as Fw;
 
     const FPS: u32 = 24;
@@ -1411,6 +1618,7 @@ mod tests {
             strength: 1.0,
             ref_images: Vec::new(),
             ref_image_size: Default::default(),
+            ref_crop: Default::default(),
             sampler: VideoSampler::UniPc,
             steps: 8,
             attn_window: None,
@@ -1539,6 +1747,7 @@ mod tests {
             strength: 1.0,
             ref_images: Vec::new(),
             ref_image_size: Default::default(),
+            ref_crop: Default::default(),
             sampler: VideoSampler::UniPc,
             steps: 4,
             attn_window: None,
@@ -1672,5 +1881,57 @@ mod tests {
         let mut omni = trim_req(2, vec![5.0, 5.0]);
         omni.model = crate::model::VideoModelId::Fasth3Omni;
         assert!(omni.resolve_minimax(row_limit).is_err());
+    }
+
+    fn text(f: impl FnOnce(&mut super::TextRequest)) -> super::TextRequest {
+        let mut r = super::TextRequest {
+            model: crate::model::TextModelId::DEFAULT,
+            messages: vec![thinfer_models::llm::chat::ChatMessage::new("user", "hi")],
+            max_tokens: 8,
+            think: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            seed: None,
+            budget: thinfer_core::policy::ResidencyBudget {
+                ram_bytes: 0,
+                vram_bytes: 0,
+            },
+            output: None,
+            format: None,
+            session: None,
+            tools: Vec::new(),
+            tool_choice: crate::tools::ToolChoice::Auto,
+        };
+        f(&mut r);
+        r
+    }
+
+    #[test]
+    fn text_sampling_rejects_out_of_range_and_nan() {
+        assert!(text(|_| {}).validate().is_ok());
+        assert!(
+            text(|r| r.repetition_penalty = Some(1.1))
+                .validate()
+                .is_ok()
+        );
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                text(|r| r.repetition_penalty = Some(bad))
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(text(|r| r.temperature = Some(f32::NAN)).validate().is_err());
+        assert!(text(|r| r.top_p = Some(f32::NAN)).validate().is_err());
+        assert!(text(|r| r.min_p = Some(1.5)).validate().is_err());
+        assert!(
+            text(|r| r.presence_penalty = Some(f32::NAN))
+                .validate()
+                .is_err()
+        );
     }
 }

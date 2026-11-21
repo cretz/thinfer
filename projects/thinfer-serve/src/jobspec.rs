@@ -4,16 +4,81 @@
 use std::path::Path;
 
 use thinfer_app::JobRequest;
-use thinfer_app::jobkey::JobKey;
-use thinfer_app::model::{ImageModelId, SwapModel, VideoModelId};
+use thinfer_app::jobkey::{JobKey, OpenLocked};
+use thinfer_app::model::{ImageModelId, SwapModel, TextModelId, VideoModelId};
 use thinfer_app::request::{
-    FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, VideoFormat,
-    VideoInput, VideoRequest,
+    FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, TextRequest,
+    VideoFormat, VideoInput, VideoRequest,
 };
-use thinfer_app::wire::JobSpec;
+use thinfer_app::wire::{JobSpec, TextSessionRef};
 
 use crate::config::ServeConfig;
+use crate::sessions::SessionStore;
 use crate::uploads::UploadStore;
+
+/// Where a session job's new node goes once the reply is done: the session,
+/// the node it continued (`None` = a new root), and the session key that
+/// seals the node (dropped, zeroed, with the job).
+pub struct SessionCommit {
+    pub id: String,
+    pub parent: Option<String>,
+    pub key: JobKey,
+}
+
+/// A decrypted job, ready to run.
+pub struct Built {
+    pub request: JobRequest,
+    /// Per-request coopmat opt-out.
+    pub disable_coopmat: Option<bool>,
+    pub session: Option<SessionCommit>,
+}
+
+impl Built {
+    fn new(request: JobRequest, disable_coopmat: Option<bool>) -> Self {
+        Self {
+            request,
+            disable_coopmat,
+            session: None,
+        }
+    }
+}
+
+/// Open a text job's session: check the key against the session, decrypt the
+/// root-to-`from` chain into page-locked state chunks.
+fn open_session(
+    mut r: TextSessionRef,
+    model: TextModelId,
+    sessions: &SessionStore,
+) -> Result<(thinfer_app::request::TextSession, SessionCommit), String> {
+    let key = JobKey::from_b64(&r.key).map_err(|e| format!("session key: {e}"))?;
+    zeroize::Zeroize::zeroize(&mut r.key);
+    let chain = sessions
+        .chain(&r.id, &key.proof(), r.from.as_deref())
+        .map_err(|e| format!("session: {e}"))?;
+    if chain.model != model {
+        return Err(format!("session is for {}, not {model}", chain.model));
+    }
+    let mut path = Vec::with_capacity(chain.links.len());
+    for (start, end, sealed) in &chain.links {
+        path.push(thinfer_app::request::StateChunk {
+            start: *start,
+            end: *end,
+            bytes: key
+                .open_locked(sealed)
+                .map_err(|e| format!("session node: {e}"))?,
+        });
+    }
+    let session = thinfer_app::request::TextSession {
+        path,
+        weights: chain.weights,
+    };
+    let commit = SessionCommit {
+        id: r.id,
+        parent: r.from,
+        key,
+    };
+    Ok((session, commit))
+}
 
 /// Base64-decode a required upload field, tagging errors with the field name.
 fn b64_decode(field: &str, b64: &str) -> Result<Vec<u8>, String> {
@@ -43,13 +108,53 @@ pub fn spec_into_request(
     key: &JobKey,
     config: &ServeConfig,
     uploads: &UploadStore,
-) -> Result<(JobRequest, Option<bool>), String> {
+    sessions: &SessionStore,
+) -> Result<Built, String> {
     let budget = config.budget()?;
     let mp4 = || dir.join("output.mp4");
     let make_dir =
         || std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()));
     let disable_coopmat = spec.disable_coopmat();
     match spec {
+        JobSpec::Text(s) => {
+            let model = s.model.unwrap_or(TextModelId::DEFAULT);
+            let (session, commit) = match s.session {
+                Some(r) => {
+                    let (session, commit) = open_session(r, model, sessions)?;
+                    (Some(std::sync::Arc::new(session)), Some(commit))
+                }
+                None => (None, None),
+            };
+            let req = TextRequest {
+                model,
+                messages: s
+                    .messages
+                    .into_iter()
+                    .map(thinfer_app::llm::chat_message)
+                    .collect(),
+                max_tokens: s.max_tokens.unwrap_or(2048),
+                think: s.think.unwrap_or(false),
+                temperature: s.temperature,
+                top_p: s.top_p,
+                top_k: s.top_k,
+                min_p: s.min_p,
+                presence_penalty: s.presence_penalty,
+                repetition_penalty: s.repetition_penalty,
+                seed: s.seed,
+                budget: config.text_budget()?,
+                output: Some(dir.join("reply.txt")),
+                format: s.format,
+                session,
+                tools: s.tools,
+                tool_choice: s.tool_choice.unwrap_or_default(),
+            };
+            req.validate()?;
+            make_dir()?;
+            Ok(Built {
+                session: commit,
+                ..Built::new(JobRequest::Text(req), disable_coopmat)
+            })
+        }
         JobSpec::Image(s) => {
             let model = s.model.unwrap_or(ImageModelId::DEFAULT);
             let d = model.defaults();
@@ -87,7 +192,7 @@ pub fn spec_into_request(
             };
             req.validate()?;
             make_dir()?;
-            Ok((JobRequest::Image(req), disable_coopmat))
+            Ok(Built::new(JobRequest::Image(req), disable_coopmat))
         }
         JobSpec::Video(s) => {
             let model = s.model.unwrap_or(VideoModelId::DEFAULT);
@@ -120,6 +225,7 @@ pub fn spec_into_request(
                 strength: s.strength.unwrap_or(1.0),
                 ref_images,
                 ref_image_size: s.ref_image_size.unwrap_or_default(),
+                ref_crop: s.ref_crop.unwrap_or_default(),
                 sampler: s.sampler.unwrap_or(model.default_sampler()),
                 steps: s.steps.unwrap_or(model.default_steps()),
                 attn_window: s.attn_window,
@@ -152,7 +258,10 @@ pub fn spec_into_request(
             };
             req.resolve()?;
             make_dir()?;
-            Ok((JobRequest::Video(Box::new(req)), disable_coopmat))
+            Ok(Built::new(
+                JobRequest::Video(Box::new(req)),
+                disable_coopmat,
+            ))
         }
         JobSpec::FaceSwap(s) => {
             // Target video: a streamed upload id (sealed under the job key,
@@ -202,7 +311,7 @@ pub fn spec_into_request(
             };
             req.validate()?;
             make_dir()?;
-            Ok((JobRequest::FaceSwap(req), disable_coopmat))
+            Ok(Built::new(JobRequest::FaceSwap(req), disable_coopmat))
         }
     }
 }

@@ -1327,6 +1327,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         b: u32,
         s_q: u32,
         h_q: u32,
+        head_dim: u32,
     ) -> Result<(), B::Error> {
         let q = self.resolve(q);
         let k = self.resolve(k);
@@ -1334,7 +1335,7 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         let mask = self.resolve(mask);
         let uniform = self.resolve(uniform);
         let out = self.resolve(out);
-        if self.try_accel_sdpa(&q, &k, &v, &mask, &uniform, &out)? {
+        if self.try_accel_sdpa(&q, &k, &v, &mask, &uniform, &out, head_dim)? {
             return Ok(());
         }
         let bufs = crate::ops::SdpaBufs {
@@ -1372,11 +1373,12 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         mask: &crate::backend::BufRef,
         uniform: &crate::backend::BufRef,
         out: &crate::backend::BufRef,
+        head_dim: u32,
     ) -> Result<bool, B::Error> {
         let Some(acc) = self.backend.accelerator() else {
             return Ok(false);
         };
-        if !acc.accepts_sdpa_f16(uniform.len) {
+        if !acc.accepts_sdpa_f16(uniform.len, head_dim) {
             return Ok(false);
         }
         let addr = |b: &crate::backend::BufRef| self.backend.device_address(b);
@@ -1854,6 +1856,26 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
             Ok(ran) => ran,
             Err(e) => {
                 tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator elementwise failed");
+                false
+            }
+        }
+    }
+
+    /// Enqueue an LLM kernel (deferred mode only). `false` = declined; work
+    /// already enqueued stays valid.
+    pub fn accel_llm(&self, op: &crate::ops::llm::LlmOp) -> bool {
+        debug_assert!(self.deferred.on.get(), "accel_llm outside deferred mode");
+        let Some(acc) = self.backend.accelerator() else {
+            return false;
+        };
+        if let Err(e) = self.accel_drain() {
+            tracing::warn!(target: crate::trace::ADAPTER, error = ?e, "flush before an accelerator op failed");
+            return false;
+        }
+        match acc.llm(op) {
+            Ok(ran) => ran,
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator llm op failed");
                 false
             }
         }

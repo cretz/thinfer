@@ -2,7 +2,10 @@
 //! `--model` parses (so the list cannot drift from what the CLI accepts).
 
 use clap::ValueEnum;
-use thinfer_app::model::{ImageModelId, SwapModel, VideoModelId};
+use thinfer_app::model::{
+    ImageModelEngine, ImageModelId, SwapModel, TextModelEngine, TextModelId, VideoModelEngine,
+    VideoModelId,
+};
 use thinfer_core::manifest::ModelManifest;
 use thinfer_native::sources;
 
@@ -15,6 +18,9 @@ pub fn run() {
     });
     section("face-swap", SwapModel::DEFAULT, |m| {
         (m.title(), notes(None, false))
+    });
+    section("text", TextModelId::DEFAULT, |m| {
+        (m.title(), notes(Some(m.manifest()), false))
     });
     println!("\nUse one with `thinfer generate <kind> --model <id>`; `--help` there has details.");
 }

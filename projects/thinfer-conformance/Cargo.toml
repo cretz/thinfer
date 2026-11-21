@@ -16,6 +16,7 @@ thinfer-core = { path = "../thinfer-core", features = ["conformance", "trace-sub
 serde_json = "1"
 
 [dev-dependencies]
+bytemuck = "1"
 half = "2"
 png = "0.17"
 pollster = "0.4"
@@ -33,6 +34,9 @@ tracing = { workspace = true }
 # default `cargo test --workspace` shouldn't trigger them. CI invokes
 # `cargo test -p thinfer-conformance --features conformance`.
 conformance = []
+# Opt-in LLM parity (Qwen3.6 / Gemma 4 / Flash-Next). Touches the local HF
+# cache (unsloth GGUFs + official config/tokenizer); skips when uncached.
+llm-e2e = []
 # Opt-in Z-Image end-to-end tests that touch the local HF cache. Skip
 # cleanly if the relevant files aren't cached; never trigger a download.
 zimage-e2e = []

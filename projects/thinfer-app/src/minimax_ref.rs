@@ -103,15 +103,172 @@ pub fn prepare_keyframe(bytes: &[u8], height: usize, width: usize) -> Result<Pre
     })
 }
 
-/// Decode, orient and resize one reference image for a `width x height`
-/// canvas.
+/// Decode and orient one reference image.
+pub fn decode(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    decode_oriented(bytes, "reference image")
+}
+
+/// [`RefCrop::Auto`]: crop in when the largest face would come out shorter
+/// than this many pixels once the image is sized...
+const CROP_BELOW_FACE: f64 = 96.0;
+/// ...aiming for this prepared face height...
+const CROP_TARGET_FACE: f64 = 144.0;
+/// ...while always keeping this many face heights of the person (head to
+/// chest), plus a face height of margin around everyone kept.
+const CROP_MIN_FACES: f64 = 3.0;
+/// Faces at least this fraction of the largest one's height stay in the crop
+/// (a couple photographed together); smaller ones are background.
+const CROP_KEEP_FACE: f32 = 0.6;
+/// Not worth a crop that keeps more than this fraction of the image height.
+const CROP_MAX_KEEP: f64 = 0.9;
+/// Detection runs on a copy with at most this long edge, whole and in 640
+/// tiles (one whole-image pass shrinks a 2400 px photo 4x, below where SCRFD
+/// sees the small faces this exists for); bounds the tile count to 12.
+const DETECT_EDGE: u32 = 1920;
+
+/// A source-pixel rectangle: x, y, width, height.
+pub type Rect = [u32; 4];
+
+/// The SCRFD face detector, loaded once per request.
+pub struct FaceFinder(thinfer_core::onnx::OnnxModel);
+
+impl FaceFinder {
+    pub async fn load(backend: &Arc<WgpuBackend>) -> Result<Self, String> {
+        let path = crate::download::resolve_file(&crate::model::SCRFD)?;
+        let onnx = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        thinfer_models::faceswap::detect::load(Arc::clone(backend), &onnx)
+            .await
+            .map(Self)
+            .map_err(|e| format!("load face detector: {e:?}"))
+    }
+
+    /// Where to crop `img` for a `width x height` canvas sized per `size`,
+    /// or `None` to keep it whole.
+    pub async fn crop(
+        &self,
+        img: &image::DynamicImage,
+        size: RefImageSize,
+        width: usize,
+        height: usize,
+    ) -> Result<Option<Rect>, String> {
+        let (w, h) = (img.width(), img.height());
+        let small = if w.max(h) > DETECT_EDGE {
+            img.resize(
+                DETECT_EDGE,
+                DETECT_EDGE,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            img.clone()
+        };
+        let ratio = w as f32 / small.width() as f32;
+        let rgb = thinfer_core::secmem::Locked::from(small.to_rgb8().into_raw());
+        let det = thinfer_models::faceswap::image::Image::from_rgb8(
+            small.width() as usize,
+            small.height() as usize,
+            &rgb,
+        );
+        let faces = thinfer_models::faceswap::detect::detect_tiled(&self.0, &det)
+            .await
+            .map_err(|e| format!("face detection: {e:?}"))?;
+        let boxes: Vec<[f32; 4]> = faces.iter().map(|f| f.bbox.map(|v| v * ratio)).collect();
+        let rect = face_crop(&boxes, w as usize, h as usize, size, width, height);
+        tracing::debug!(
+            target: "thinfer::diag",
+            faces = boxes.len(),
+            largest = boxes.iter().map(|b| b[3] - b[1]).fold(0.0, f32::max),
+            source = ?(w, h),
+            crop = ?rect,
+            "omni reference framing"
+        );
+        Ok(rect)
+    }
+}
+
+/// [`RefCrop::Auto`]'s rectangle for face `boxes` (`[x1, y1, x2, y2]`,
+/// source pixels) in a `w x h` image sized per `size` for the canvas: `None`
+/// when no face is found, the largest is already big enough, or the crop
+/// would keep nearly everything. Keeps the source aspect ratio; the face sits
+/// near the top so the crop runs down the body.
+fn face_crop(
+    boxes: &[[f32; 4]],
+    w: usize,
+    h: usize,
+    size: RefImageSize,
+    canvas_w: usize,
+    canvas_h: usize,
+) -> Option<Rect> {
+    let height = |b: &[f32; 4]| b[3] - b[1];
+    let largest = boxes.iter().map(height).fold(0.0, f32::max);
+    if largest <= 0.0 {
+        return None;
+    }
+    let face = largest as f64;
+    if face * size.scale(w, h, canvas_w, canvas_h) >= CROP_BELOW_FACE {
+        return None;
+    }
+    let kept = boxes
+        .iter()
+        .filter(|b| height(b) >= CROP_KEEP_FACE * largest);
+    let u = kept.fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |u, b| {
+        [
+            u[0].min(b[0]),
+            u[1].min(b[1]),
+            u[2].max(b[2]),
+            u[3].max(b[3]),
+        ]
+    });
+    let (wf, hf) = (w as f64, h as f64);
+    let aspect = wf / hf;
+    let min_h = (CROP_MIN_FACES * face)
+        .max((u[3] - u[1]) as f64 + 2.0 * face)
+        .max(((u[2] - u[0]) as f64 + 2.0 * face) / aspect);
+    // Shrink until the face reaches its target size or the crop is no
+    // longer downscaled (sizing never upscales, so a tighter crop would only
+    // lose context); never below the person. The sizing modes differ, so
+    // search rather than solve.
+    let mut ch = hf;
+    while ch > min_h {
+        let s = size.scale(
+            (aspect * ch).round() as usize,
+            ch.round() as usize,
+            canvas_w,
+            canvas_h,
+        );
+        if face * s >= CROP_TARGET_FACE || s >= 1.0 {
+            break;
+        }
+        ch *= 0.95;
+    }
+    let ch = ch.max(min_h);
+    if ch >= CROP_MAX_KEEP * hf {
+        return None;
+    }
+    let cw = (aspect * ch).min(wf);
+    let cx = (u[0] + u[2]) as f64 / 2.0;
+    let x = (cx - cw / 2.0).clamp(0.0, wf - cw);
+    // Hair above the box, then the body.
+    let y = (u[1] as f64 - 0.6 * face).clamp(0.0, hf - ch);
+    Some([
+        x.round() as u32,
+        y.round() as u32,
+        (cw.round() as u32).min(w as u32 - x.round() as u32),
+        (ch.round() as u32).min(h as u32 - y.round() as u32),
+    ])
+}
+
+/// Crop (optionally), then resize one decoded reference image for a
+/// `width x height` canvas.
 pub fn prepare(
-    bytes: &[u8],
+    mut img: image::DynamicImage,
+    crop: Option<Rect>,
     size: RefImageSize,
     width: usize,
     height: usize,
 ) -> Result<Prepared, String> {
-    let mut img = decode_oriented(bytes, "reference image")?;
+    if let Some([x, y, cw, ch]) = crop {
+        img = img.crop_imm(x, y, cw, ch);
+    }
     let (w, h) = (img.width() as usize, img.height() as usize);
     if w > MAX_ASPECT * h || h > MAX_ASPECT * w {
         return Err(format!(
@@ -325,7 +482,14 @@ mod tests {
     /// The spec's worked size: 1024x1536 -> 2048x3072 (6144 vision tokens).
     #[test]
     fn diffusers_scales_the_short_edge_to_2048() {
-        let p = prepare(&png(1024, 1536), RefImageSize::Diffusers, 832, 480).unwrap();
+        let p = prepare(
+            decode(&png(1024, 1536)).unwrap(),
+            None,
+            RefImageSize::Diffusers,
+            832,
+            480,
+        )
+        .unwrap();
         assert_eq!((p.width, p.height), (2048, 3072));
         assert_eq!(p.rgb.len(), 2048 * 3072 * 3);
     }
@@ -334,11 +498,71 @@ mod tests {
     /// 516x774 -> 512x768); `max` never upscales.
     #[test]
     fn match_and_max_never_upscale() {
-        let p = prepare(&png(1024, 1536), RefImageSize::Match, 832, 480).unwrap();
+        let p = prepare(
+            decode(&png(1024, 1536)).unwrap(),
+            None,
+            RefImageSize::Match,
+            832,
+            480,
+        )
+        .unwrap();
         assert_eq!((p.width, p.height), (512, 768));
-        let p = prepare(&png(320, 480), RefImageSize::Match, 832, 480).unwrap();
+        let p = prepare(
+            decode(&png(320, 480)).unwrap(),
+            None,
+            RefImageSize::Match,
+            832,
+            480,
+        )
+        .unwrap();
         assert_eq!((p.width, p.height), (320, 480));
-        let p = prepare(&png(1024, 1536), RefImageSize::Max, 832, 480).unwrap();
+        let p = prepare(
+            decode(&png(1024, 1536)).unwrap(),
+            None,
+            RefImageSize::Max,
+            832,
+            480,
+        )
+        .unwrap();
         assert_eq!((p.width, p.height), (1024, 1536));
+    }
+
+    /// A far-away person (face 60 px of a 3000x2000 photo, ~15 px once sized
+    /// to an 832x480 canvas) is cropped in on: the face keeps its source
+    /// pixels (sizing never upscales), inside the crop, near its top, with
+    /// the source aspect kept and as much body as that allows.
+    #[test]
+    fn auto_crop_zooms_in_on_a_small_face() {
+        let face = [1400.0, 600.0, 1450.0, 660.0];
+        let r = face_crop(&[face], 3000, 2000, RefImageSize::Match, 832, 480).unwrap();
+        let [x, y, w, h] = r.map(|v| v as f32);
+        assert!(x <= face[0] && x + w >= face[2] && y <= face[1] && y + h >= face[3]);
+        assert!((w / h - 1.5).abs() < 0.01, "{r:?}");
+        assert!(face[1] - y < 0.25 * h, "{r:?}");
+        let s = RefImageSize::Match.scale(w as usize, h as usize, 832, 480);
+        assert!(60.0 * s >= 57.0, "{s} {r:?}");
+        assert!(h >= 6.0 * 60.0, "{r:?}");
+    }
+
+    /// Big faces, no faces and crops that would keep nearly everything pass
+    /// the image whole; a second similar face stays in the crop.
+    #[test]
+    fn auto_crop_keeps_large_faces_and_couples() {
+        let big = [400.0, 300.0, 700.0, 700.0];
+        assert_eq!(
+            face_crop(&[big], 1024, 1536, RefImageSize::Match, 832, 480),
+            None
+        );
+        assert_eq!(
+            face_crop(&[], 1024, 1536, RefImageSize::Match, 832, 480),
+            None
+        );
+        let a = [1000.0, 600.0, 1050.0, 660.0];
+        let b = [1800.0, 620.0, 1848.0, 676.0];
+        let tiny = [100.0, 100.0, 110.0, 110.0];
+        let [x, _, w, _] = face_crop(&[a, b, tiny], 3000, 2000, RefImageSize::Match, 832, 480)
+            .unwrap()
+            .map(|v| v as f32);
+        assert!(x <= a[0] && x + w >= b[2] && x > tiny[2]);
     }
 }

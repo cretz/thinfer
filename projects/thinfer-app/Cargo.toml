@@ -20,6 +20,9 @@ thinfer-native = { path = "../thinfer-native" }
 thinfer-models = { path = "../thinfer-models" }
 # Optional native CUDA hot-op interop (runtime-loaded driver; no toolkit needed).
 thinfer-cuda = { path = "../thinfer-cuda" }
+# The wire types, model ids and per-job encryption (and, `remote`, its HTTP
+# client), shared with any Rust project that talks to a thinfer-serve.
+thinfer-client = { path = "../thinfer-client", default-features = false }
 tracing = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # Video output: H.264 encode (Cisco BSD, compiled from source) + MP4 mux. Kept
@@ -39,11 +42,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 utoipa = { version = "5", optional = true }
-# HTTP client for the `RemoteExecutor` (talks to a thinfer-serve box). rustls so
-# no OpenSSL/SChannel build dep; `stream` for tailing the SSE event body.
-serde_json = { version = "1", optional = true }
+# Model configs (LLM `config.json` / `generation_config.json`), vault + remote wire.
+serde_json = "1"
+# Constrained decoding (JSON Schema / Lark): token masks + forced runs.
+llguidance = { version = "1.9", default-features = false, features = ["lark", "referencing", "ahash"] }
+toktrie_hf_tokenizers = "1.9"
+# Vault adapter downloads. rustls so no OpenSSL/SChannel build dep.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
-futures-util = { version = "0.3", optional = true }
 # The minimax DiT pipeline compile runs on its own thread (`oneshot` + `block_on`).
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 pollster = "0.4"
@@ -67,24 +72,24 @@ tempfile = "3"
 default = []
 # clap `ValueEnum` derives on the canonical id enums, so thinfer-cli reuses the
 # app enums as its `--model` etc. value types (one name per concept).
-cli = ["dep:clap", "rewrite", "vault"]
+cli = ["dep:clap", "thinfer-client/clap", "rewrite", "vault"]
 # serde derives on the canonical id enums (kebab-case ids matching the CLI).
 serde = ["dep:serde"]
 # serde + utoipa `ToSchema`, so thinfer-serve reuses the id enums as its OpenAPI
 # schema (single source for the variant lists).
-serve = ["serde", "dep:utoipa", "rewrite", "vault"]
+serve = ["serde", "dep:utoipa", "thinfer-client/utoipa", "rewrite", "vault"]
 # The encrypted adapter vault (`vault` module + LoRA request plumbing). Native
 # crypto + reqwest download; shared by CLI and serve so the capability is at
 # parity across every interface.
-vault = ["serde", "dep:serde_json", "dep:reqwest", "dep:argon2", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
+vault = ["serde", "dep:reqwest", "dep:argon2", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
 # Optional HunyuanVideo 1.5 prompt rewriting: runs the cached Qwen3-VL-8B GGUF
 # on-device (native wgpu, `thinfer_models::qwen3_lm`), no HTTP/Python sidecar.
 # Just gates the `rewrite` module + the Phase-0 call; no extra deps. Enabled by
 # both `cli` and `serve` so the capability is at parity.
 rewrite = []
-# The HTTP `RemoteExecutor` client (thinfer-cli --remote). Pulls reqwest; other
-# app consumers (serve) stay free of it.
-remote = ["serde", "dep:serde_json", "dep:reqwest", "dep:futures-util", "dep:aes-gcm", "dep:base64", "dep:rand", "dep:sha2"]
+# The `RemoteExecutor` (thinfer-cli --remote) over `thinfer_client::Client`.
+# Pulls reqwest; other app consumers (serve) stay free of it.
+remote = ["serde", "thinfer-client/http"]
 # Opt-in Qwen-Image-Edit host PREPROCESS parity test (real PNG -> ViT/VAE/tokens
 # vs the HF/diffusers reference via `uv run`). Touches the HF cache for the
 # tokenizer/preprocessor; skips cleanly when uncached.

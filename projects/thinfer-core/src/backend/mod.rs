@@ -267,8 +267,8 @@ impl StagedWrite for Vec<u8> {
 pub trait Accelerator: Send + Sync {
     /// Cheap host-side precheck for [`Self::sdpa_f16`], before the caller pays
     /// to flush and drain the GPU. `uniform_len` distinguishes the plain `sdpa_sg`
-    /// uniform from the windowed one.
-    fn accepts_sdpa_f16(&self, uniform_len: u64) -> bool;
+    /// uniform from the windowed one; `head_dim` is the call's head dimension.
+    fn accepts_sdpa_f16(&self, uniform_len: u64, head_dim: u32) -> bool;
 
     /// Fused f16 attention with exactly the `sdpa_sg` contract (BSHD f16 Q/K/V/
     /// out, GQA, mask modes 0/1/2, f32 softmax; shapes read from the uniform).
@@ -410,6 +410,56 @@ pub trait Accelerator: Send + Sync {
         Ok(None)
     }
 
+    /// Whether [`Self::llm`] runs every [`crate::ops::llm::LlmOp`] (kernels
+    /// compiled), so a caller may enqueue a whole LLM forward deferred.
+    fn accepts_llm(&self) -> bool {
+        false
+    }
+
+    /// Enqueue one LLM kernel. `Ok(false)` = declined (nothing enqueued).
+    fn llm(&self, _op: &crate::ops::llm::LlmOp) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Page-locked host memory the accelerator's kernels can read in place
+    /// (zero-copy over the bus). `Ok(None)` = unsupported.
+    fn host_alloc(&self, _bytes: u64) -> Result<Option<Box<dyn MappedHost>>, String> {
+        Ok(None)
+    }
+
+    /// Enqueue a copy of `len` bytes between device addresses (either side may
+    /// be mapped host memory), in stream order.
+    fn copy(&self, _dst: u64, _src: u64, _len: u64) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// [`Self::copy`] on a side stream that runs concurrently with the main
+    /// one (unordered with main-stream work either way), e.g. weights for the
+    /// next layer while this one computes. [`Self::join_ahead`] orders later
+    /// main-stream work after it; [`Self::sync`] waits for it too. `Ok(false)`
+    /// = unsupported (nothing enqueued).
+    fn copy_ahead(&self, _dst: u64, _src: u64, _len: u64) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Main-stream work enqueued from now on runs after every
+    /// [`Self::copy_ahead`] so far.
+    fn join_ahead(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Enqueue a write of `bytes` (copied before returning) to device `dst`,
+    /// in stream order.
+    fn write(&self, _dst: u64, _bytes: &[u8]) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Wait for everything enqueued, then copy `dst.len()` bytes from device
+    /// `src` into `dst`.
+    fn read(&self, _src: u64, _dst: &mut [u8]) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Wait for every op this accelerator has enqueued. [`Self::gemm_nvfp4`],
     /// [`Self::vsa`] and [`Self::elementwise`] only ENQUEUE (in order, on one
     /// stream); the caller syncs before anything else reads their outputs or
@@ -417,6 +467,14 @@ pub trait Accelerator: Send + Sync {
     fn sync(&self) -> Result<(), String> {
         Ok(())
     }
+}
+
+/// Page-locked host memory from [`Accelerator::host_alloc`]: writable from
+/// the host, readable by accelerator kernels at [`Self::device_addr`]. Freed
+/// on drop.
+pub trait MappedHost: Send + Sync {
+    fn bytes(&mut self) -> &mut [u8];
+    fn device_addr(&self) -> u64;
 }
 
 /// See [`Accelerator::fence`].

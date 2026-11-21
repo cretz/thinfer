@@ -1,0 +1,1436 @@
+//! Canonical model identifiers and their per-model defaults / grids. Single
+//! source of truth shared by every front end: the CLI derives clap `ValueEnum`
+//! off these (the `clap` feature), and `thinfer-app` maps each onto the
+//! engine (manifests, file roles; its `*Engine` traits). `Display` is the canonical id string (matches the clap
+//! value names and the registry keys); the registry lookups key off it.
+
+// Image defaults follow upstream Z-Image (8 Turbo steps, CFG-free) except dims:
+// upstream assumes datacenter GPUs at 1024x1024; we default to 768x768, the
+// thin-hardware sweet spot every parity/perf baseline uses. Defined as consts so
+// clap `default_value_t` and [`ImageModelId::defaults`] read the same numbers.
+pub const IMAGE_DEFAULT_WIDTH: u32 = 768;
+pub const IMAGE_DEFAULT_HEIGHT: u32 = 768;
+pub const IMAGE_DEFAULT_STEPS: u32 = 8;
+
+// Video defaults: 960x544 (the FastWan e2e baseline). Frame count + fps are
+// model-derived (see [`VideoModelId`]).
+pub const VIDEO_DEFAULT_WIDTH: u32 = 960;
+pub const VIDEO_DEFAULT_HEIGHT: u32 = 544;
+
+// Default UniPC denoise steps for FastWan (the served sampler). 4 matches the
+// public HF Spaces (slider 1..=8). DMD ignores this (its schedule is fixed at 3).
+pub const VIDEO_DEFAULT_STEPS: u32 = 4;
+/// Upper bound on the UniPC step slider (the Spaces cap at 8).
+pub const VIDEO_MAX_STEPS: u32 = 8;
+/// HyperFlow's default step count (the engine's schedule length; thinfer-app
+/// checks the two agree).
+pub const HYPERFLOW_DEFAULT_STEPS: u32 = 6;
+
+/// The kebab wire ids of every model (image or video) that accepts vault
+/// adapters. The vault add/list/remove surfaces are model-agnostic (keyed by the
+/// string), so they take a plain model string and validate it against this set
+/// instead of a typed enum. Keep in sync with the typed
+/// `ImageModelId::supports_adapters` / `VideoModelId::supports_adapters` predicates.
+pub const ADAPTER_MODEL_IDS: [&str; 11] = [
+    "krea-2-turbo",
+    "qwen-image-2.1-turbo",
+    "qwen-image-rapid",
+    "qwen-image-edit-rapid",
+    "anyflow-t2v-14b",
+    "fastwan2.1-t2v-1.3b",
+    "wan2.1-t2v-1.3b",
+    "minimax-h3",
+    "fasth3-trim",
+    "fasth3-v2",
+    "fasth3-omni",
+];
+
+/// Whether `id` names an adapter-supporting model (see [`ADAPTER_MODEL_IDS`]).
+pub fn is_adapter_model(id: &str) -> bool {
+    ADAPTER_MODEL_IDS.contains(&id)
+}
+
+/// Resolved per-model image defaults (the registry accessor `thinfer-serve` and
+/// the CLI both read).
+#[derive(Clone, Copy, Debug)]
+pub struct ImageDefaults {
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum ImageModelId {
+    /// Z-Image-Turbo, Q8_0 DiT matmul weights (unsloth GGUF); rest bf16.
+    #[cfg_attr(feature = "clap", value(name = "zimage-turbo-q8"))]
+    #[serde(rename = "zimage-turbo-q8")]
+    ZImageTurboQ8,
+    /// Z-Image-Turbo, Q4_K_M DiT matmul weights; halves DiT VRAM/bandwidth vs
+    /// Q8_0 at production quality.
+    #[cfg_attr(feature = "clap", value(name = "zimage-turbo-q4"))]
+    #[serde(rename = "zimage-turbo-q4")]
+    ZImageTurboQ4,
+    /// Z-Image-Turbo, bf16 DiT weights (dimitribarbot safetensors).
+    #[cfg_attr(feature = "clap", value(name = "zimage-turbo-bf16"))]
+    #[serde(rename = "zimage-turbo-bf16")]
+    ZImageTurboBf16,
+    /// Ideogram-4 + the ostris turbotime LoRA (CFG-free): Q8_0 encoder + DiT,
+    /// LoRA folded to Q8_0 at load (near-lossless); FLUX.2 KL VAE. (A Q4_K DiT
+    /// default was tried and dropped: per-request re-fold to Q4_K was ~2x slower
+    /// than Q8_0 with worse quality -- not worth it for this fold-per-request
+    /// pipeline.)
+    #[cfg_attr(feature = "clap", value(name = "ideogram4-q8"))]
+    #[serde(rename = "ideogram4-q8")]
+    Ideogram4Q8,
+    /// Qwen-Image-Edit-Rapid-AIO: a 4-step distilled, CFG-free image-EDIT MMDiT.
+    /// Requires `--input-image` (the reference image to edit). Q8_0 DiT for now
+    /// (Q4_K_M streaming is a later perf task).
+    #[cfg_attr(feature = "clap", value(name = "qwen-image-edit-rapid"))]
+    #[serde(rename = "qwen-image-edit-rapid")]
+    QwenImageEditRapid,
+    /// Qwen-Image-Rapid: the same 4-step distilled, CFG-free MMDiT as the edit
+    /// model, driven text-to-image (no reference image, no vision tower).
+    #[cfg_attr(feature = "clap", value(name = "qwen-image-rapid"))]
+    #[serde(rename = "qwen-image-rapid")]
+    QwenImageRapid,
+    /// Krea 2 Turbo: a 12.9B aesthetic-first, 8-step distilled CFG-free
+    /// single-stream MMDiT (Qwen3-VL-4B encoder + txtfusion; Wan2.1 VAE).
+    /// Text-to-image, no reference image.
+    #[cfg_attr(feature = "clap", value(name = "krea-2-turbo"))]
+    #[serde(rename = "krea-2-turbo")]
+    Krea2Turbo,
+    /// Qwen-Image-2.1-Turbo: a 7B single-stream DiT, 8 CFG-free steps, text to
+    /// image or editing / composing from `--input-image` (optional). Qwen3-VL-8B
+    /// encoder; 2K native. Qwen Research License (non-commercial).
+    #[cfg_attr(feature = "clap", value(name = "qwen-image-2.1-turbo"))]
+    #[serde(rename = "qwen-image-2.1-turbo")]
+    QwenImage21Turbo,
+}
+
+/// Which engine pipeline an image id drives. The executor branches on this:
+/// Z-Image and Ideogram-4 have different sources, tokenizers, and pipelines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageKind {
+    ZImage,
+    Ideogram4,
+    /// Qwen-Image-Edit (image->image; requires a reference image).
+    QwenImageEdit,
+    /// Qwen-Image (text->image; same MMDiT, no reference image).
+    QwenImage,
+    /// Krea 2 Turbo (text->image; Qwen3-VL encoder + single-stream DiT).
+    Krea2,
+    /// Qwen-Image-2.1 (text->image, or image->image with optional inputs).
+    QwenImage21,
+}
+
+impl ImageModelId {
+    /// Z-Image-Turbo Q4_K_M: upstream weights, the fastest image model, and the
+    /// web UI's first entry (keep the two in step).
+    pub const DEFAULT: ImageModelId = ImageModelId::ZImageTurboQ4;
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ZImageTurboQ8 => "Z-Image Turbo, 8-step (Q8)",
+            Self::ZImageTurboQ4 => "Z-Image Turbo, 8-step (Q4, smaller)",
+            Self::ZImageTurboBf16 => "Z-Image Turbo, 8-step (bf16, largest)",
+            Self::Ideogram4Q8 => "Ideogram 4 + turbotime LoRA",
+            Self::QwenImageEditRapid => "Qwen-Image Edit Rapid, 4-step (edits --input-image)",
+            Self::QwenImageRapid => "Qwen-Image Rapid, 4-step",
+            Self::Krea2Turbo => "Krea 2 Turbo, 8-step, aesthetic",
+            Self::QwenImage21Turbo => "Qwen-Image 2.1 Turbo, 8-step (optional --input-image)",
+        }
+    }
+
+    /// Which engine pipeline this id drives.
+    pub fn kind(self) -> ImageKind {
+        match self {
+            ImageModelId::Ideogram4Q8 => ImageKind::Ideogram4,
+            ImageModelId::QwenImageEditRapid => ImageKind::QwenImageEdit,
+            ImageModelId::QwenImageRapid => ImageKind::QwenImage,
+            ImageModelId::Krea2Turbo => ImageKind::Krea2,
+            ImageModelId::QwenImage21Turbo => ImageKind::QwenImage21,
+            _ => ImageKind::ZImage,
+        }
+    }
+
+    /// Whether request-time user adapters (the vault LoRA fold) apply to this
+    /// model. The fold itself is model-agnostic, so a new image DiT opts in here +
+    /// wires the fold into its executor path (with its diffusers->base rename map).
+    pub fn supports_adapters(self) -> bool {
+        matches!(
+            self.kind(),
+            ImageKind::Krea2
+                | ImageKind::QwenImage
+                | ImageKind::QwenImageEdit
+                | ImageKind::QwenImage21
+        )
+    }
+
+    pub fn defaults(self) -> ImageDefaults {
+        match self.kind() {
+            // Ideogram-4 trains at 1024 (resolution-aware schedule). The
+            // turbotime LoRA is a few-step distill (2/4/8); 4 is the balance
+            // default (8 = quality ceiling, 2 = fastest).
+            ImageKind::Ideogram4 => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 4,
+            },
+            // Qwen-Image(-Edit)-Rapid: 4-step distill, authored at 1024.
+            ImageKind::QwenImageEdit | ImageKind::QwenImage => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 4,
+            },
+            ImageKind::ZImage => ImageDefaults {
+                width: IMAGE_DEFAULT_WIDTH,
+                height: IMAGE_DEFAULT_HEIGHT,
+                steps: IMAGE_DEFAULT_STEPS,
+            },
+            // Krea 2 Turbo: aesthetic-first, authored at 1024; fixed 8-step turbo
+            // schedule (mu=1.15). 512x512 is the sub-2-min fast tier.
+            ImageKind::Krea2 => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 8,
+            },
+            // Qwen-Image-2.1-Turbo: the checkpoint's own 8-sigma schedule (the
+            // step count is fixed); 1024 is the reference's default size.
+            ImageKind::QwenImage21 => ImageDefaults {
+                width: 1024,
+                height: 1024,
+                steps: 8,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ImageModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ImageModelId::ZImageTurboQ8 => "zimage-turbo-q8",
+            ImageModelId::ZImageTurboQ4 => "zimage-turbo-q4",
+            ImageModelId::ZImageTurboBf16 => "zimage-turbo-bf16",
+            ImageModelId::Ideogram4Q8 => "ideogram4-q8",
+            ImageModelId::QwenImageEditRapid => "qwen-image-edit-rapid",
+            ImageModelId::QwenImageRapid => "qwen-image-rapid",
+            ImageModelId::Krea2Turbo => "krea-2-turbo",
+            ImageModelId::QwenImage21Turbo => "qwen-image-2.1-turbo",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum VideoModelId {
+    /// FastWan2.2-TI2V-5B-FullAttn, DMD-distilled (3-step, CFG-free). The
+    /// e2e-validated path.
+    #[cfg_attr(feature = "clap", value(name = "fastwan-ti2v-5b"))]
+    #[serde(rename = "fastwan-ti2v-5b")]
+    FastwanTi2v5b,
+    /// nvidia AnyFlow-Wan2.1-T2V-14B: any-step flow-map distill (the step
+    /// count is a user option, `--steps`; 2-step is the fast play). T2V only.
+    /// NVIDIA NSCLv1 license (noncommercial).
+    #[cfg_attr(feature = "clap", value(name = "anyflow-t2v-14b"))]
+    #[serde(rename = "anyflow-t2v-14b")]
+    AnyflowT2v14b,
+    /// Qualcomm-AI-Research/mobilewan: efficient T2V on the FastWan2.2-TI2V-5B
+    /// backbone with per-block PRUNED self-attention heads. Full softmax over the
+    /// pruned heads (the ReHyAt linear-attention maps are skipped: no public
+    /// reference). Shares the FastWan umT5 + Wan2.2 TI2V VAE + tokenizer. 480p,
+    /// 16fps. No parity reference (eyeball-only).
+    #[cfg_attr(feature = "clap", value(name = "mobilewan"))]
+    #[serde(rename = "mobilewan")]
+    Mobilewan,
+    /// FastVideo FastWan2.1-T2V-1.3B: DMD 3-step distill (CFG-free) of the stock
+    /// Wan2.1-T2V-1.3B; umT5 + Wan2.1 VAE. Trained at 448x832, 16fps. The DiT is
+    /// a user weight slot, and request-time vault adapters fold onto it. T2V only.
+    #[cfg_attr(feature = "clap", value(name = "fastwan2.1-t2v-1.3b"))]
+    #[serde(rename = "fastwan2.1-t2v-1.3b")]
+    Fastwan21T2v13b,
+    /// Wan2.1-T2V-1.3B (stock, or a full finetune in its DiT slot) with a
+    /// step-distill LoRA folded in (default CausVid, the same DMD 3-step schedule
+    /// as FastWan2.1). For finetunes of the stock model, which FastWan's own
+    /// distill does not carry. Vault adapters stack on top. T2V only.
+    #[cfg_attr(feature = "clap", value(name = "wan2.1-t2v-1.3b"))]
+    #[serde(rename = "wan2.1-t2v-1.3b")]
+    Wan21T2v13b,
+    /// LTX-2.3 distilled-1.1: a 22B joint audio-video DiT (two-stage distilled).
+    /// Its own pipeline (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder);
+    /// ignores the FastWan sampler/vae/shot knobs. Output MP4 carries an AAC
+    /// audio track unless audio is disabled (`--no-audio`), which skips the audio
+    /// tail for a faster video-only MP4. The video VAE decode tiles spatially to
+    /// the residency budget, so larger dims fit (slower); keep clips short (the
+    /// temporal dim is decoded whole).
+    #[cfg_attr(feature = "clap", value(name = "ltx-2.3-distilled"))]
+    #[serde(rename = "ltx-2.3-distilled")]
+    Ltx23Distilled,
+    /// LTX-2.3 distilled-1.1 with the Q4_K_M DiT (footprint variant): same
+    /// pipeline as [`Self::Ltx23Distilled`] but the 14.2GB Q4_K_M DiT GGUF in
+    /// place of the 22.8GB Q8_0 (encoder/connector/VAEs/upscaler unchanged). The
+    /// DiT runs the per-quant-kind dense dequant path. Q8_0 stays the quality
+    /// baseline; this halves DiT VRAM/disk for tighter budgets. No per-step speed
+    /// change at product scale (the DiT is compute-bound, weight streaming hidden
+    /// by prefetch), so it is a footprint option, not a perf one.
+    #[cfg_attr(feature = "clap", value(name = "ltx-2.3-distilled-q4"))]
+    #[serde(rename = "ltx-2.3-distilled-q4")]
+    Ltx23DistilledQ4,
+    /// LTX-2.3 `dev` (base) DiT with the distill LoRA folded in at load.
+    /// Byte-identical DiT layout to [`Self::Ltx23Distilled`], so it runs the exact
+    /// same pipeline (Gemma-3 encoder, dual-stream DiT, two VAEs + vocoder,
+    /// two-stage distilled sampler); only the DiT weights differ (Q8_0 baseline).
+    /// The DiT and distill LoRA are user weight slots (upstream dev + the official
+    /// distill LoRA by default), so any layout-identical dev finetune fills them.
+    #[cfg_attr(feature = "clap", value(name = "ltx-2.3-dev"))]
+    #[serde(rename = "ltx-2.3-dev")]
+    Ltx23Dev,
+    /// [`Self::Ltx23Dev`] with the Q4_K_M DiT (footprint variant), mirroring the
+    /// distilled Q8/Q4 pair. Q8_0 stays the quality baseline.
+    #[cfg_attr(feature = "clap", value(name = "ltx-2.3-dev-q4"))]
+    #[serde(rename = "ltx-2.3-dev-q4")]
+    Ltx23DevQ4,
+    /// ltx2-rapid: an LTX-2 19B community merge (distilled + native I2V). Same
+    /// dual-stream AV DiT backbone as LTX-2.3, but the 19B conditioning line
+    /// (FeatureExtractor V1 + in-transformer caption projection, 2-layer ungated
+    /// 3840 connector, 6-way block modulation, no gated attention / prompt-AdaLN)
+    /// and its own LTX-2 (non-.3) VAEs. Q5_K_M DiT (no Q8 exists). SINGLE-STAGE
+    /// only (no spatial upscaler ships), so it renders directly at the target res.
+    #[cfg_attr(feature = "clap", value(name = "ltx2-rapid"))]
+    #[serde(rename = "ltx2-rapid")]
+    Ltx2Rapid,
+    /// Wan2.2-T2V-A14B (MoE): two 14B experts (high/low noise) + the LightX2V
+    /// 4-step distill LoRA, GGUF Q5_K_M, on the Wan backbone. CFG-free distill
+    /// denoise (high expert steps 0-1, low expert 2-3); Wan2.1 VAE. The state-of-
+    /// the-art Wan-family quality tier; heavier than the 5B, so it defaults to
+    /// 832x480 on the 8GB card.
+    #[cfg_attr(feature = "clap", value(name = "wan2.2-t2v-a14b"))]
+    #[serde(rename = "wan2.2-t2v-a14b")]
+    Wan22T2vA14b,
+    /// HunyuanVideo 1.5 T2V, lightx2v 4-step flow-match distill (CFG-free). Its
+    /// own pipeline (Qwen2.5-VL encoder + SingleTokenRefiner, 54-block dual-stream
+    /// MMDiT, 16x-spatial/4x-temporal causal-conv VAE); shares none of the
+    /// Wan/LTX machinery. Industry-norm 480p default (832x480, 81f @ 16fps, 4
+    /// step). FastWan-class quality target with stronger faces.
+    #[cfg_attr(feature = "clap", value(name = "hunyuan-video-1.5-t2v"))]
+    #[serde(rename = "hunyuan-video-1.5-t2v")]
+    Hunyuan15T2v,
+    /// HunyuanVideo 1.5 causal TI2V (minWM WorldPlay `HY15/TI2V/dmd`, 4-step
+    /// DMD). Same 8B MMDiT family as the T2V, run chunk-autoregressively over a
+    /// KV cache: 4 flow-match Euler steps + a recache pass per 4-latent-frame
+    /// chunk. `--input-image` is OPTIONAL: with it the run is image-conditioned
+    /// (SigLIP + VAE-encoded first frame); without it the model generates from
+    /// the prompt alone (probe-validated coherent despite the i2v training).
+    /// 832x480, 77f @ 16fps default (latent frames must chunk by 4 -> frames in
+    /// {13, 29, 45, 61, 77, ...}).
+    #[cfg_attr(feature = "clap", value(name = "hunyuan-video-1.5-ti2v"))]
+    #[serde(rename = "hunyuan-video-1.5-ti2v")]
+    Hunyuan15I2v,
+    /// MiniMax-H3 (FL2VA): a 33B dense SINGLE-STREAM joint audio-video DiT. One
+    /// packed 1-D sequence carries text, audio and video rows under full
+    /// self-attention, so there is no cross-attention and no conditioning tail.
+    /// Its own pipeline: a Qwen3-VL-32B conditioner truncated to layers 0..49, a
+    /// 36-layer ViT video VAE (16x spatial / 4x temporal, NOT a conv tower) and a
+    /// BigVGAN audio VAE at 32 kHz. Two things make it fit an 8GB card: the
+    /// per-block AdaLN projections (~13B of the 33B) are precomputed into a
+    /// ~78 MB modulation table at load, and the required lightx2v 4-step turbo
+    /// distillation is applied as a RUNTIME adapter rather than folded (folding
+    /// would re-encode every Q4_K site to Q8_0 and nearly double the streaming).
+    /// 24 fps fixed. Defaults to 832x480; the packed sequence is row-capped, so
+    /// larger canvases (up to the native 1344x768) fit shorter clips.
+    #[cfg_attr(feature = "clap", value(name = "minimax-h3"))]
+    #[serde(rename = "minimax-h3")]
+    MinimaxH3,
+    /// MiniMax-H3 33B (the same Q4 base) under larryvrh's v4 turbo LoRA (AdaLN
+    /// pairs folded into the modulation table): 6 steps (4-8 via `--steps`),
+    /// video + audio, first frame and chained clips.
+    #[cfg_attr(feature = "clap", value(name = "minimax-h3-turbo"))]
+    #[serde(rename = "minimax-h3-turbo")]
+    MinimaxH3Turbo,
+    /// The same v4 turbo LoRA on the Q4 Ref2VA base: text to video + audio
+    /// conditioned on reference images the prompt can name. The LoRA was
+    /// trained on FL2VA only, so references hold a bit less well.
+    #[cfg_attr(feature = "clap", value(name = "minimax-h3-turbo-ref"))]
+    #[serde(rename = "minimax-h3-turbo-ref")]
+    MinimaxH3TurboRef,
+    /// FastVideo FastH3-Trim: the 8-step DMD distillation of MiniMax-H3 (42
+    /// blocks, rank-16 AdaLN, NVFP4 block linears). Same conditioner, VAEs and
+    /// packed pipeline as `minimax-h3`; a fixed 8-step schedule, no turbo LoRA.
+    /// Defaults to 832x480 x 124 frames (~5.2s), FastVideo's 480p regime.
+    #[cfg_attr(feature = "clap", value(name = "fasth3-trim"))]
+    #[serde(rename = "fasth3-trim")]
+    Fasth3Trim,
+    /// FastVideo FastH3 V2: the full-depth (50-block) 8-step DMD distillation
+    /// of MiniMax-H3, Comfy NVFP4. Trim's higher-quality sibling: same
+    /// schedule and surface (first frame, chained clips), ~1.2x Trim's blocks.
+    #[cfg_attr(feature = "clap", value(name = "fasth3-v2"))]
+    #[serde(rename = "fasth3-v2")]
+    Fasth3V2,
+    /// FastVideo FastH3-Omni: the 8-step distillation of the Ref2VA
+    /// checkpoint (all 50 blocks, PDD heads, Comfy NVFP4). Text to video+audio,
+    /// optionally conditioned on reference images the prompt can name.
+    #[cfg_attr(feature = "clap", value(name = "fasth3-omni"))]
+    #[serde(rename = "fasth3-omni")]
+    Fasth3Omni,
+    /// Video Rebirth HyperFlow H3 Flash (FL2VA): MiniMax-H3 compressed to 47
+    /// blocks (low-rank linears, two-time conditioning), 6 CFG-free steps (4 or
+    /// 8 via `--steps`). Text, first frame and chained clips, video + audio.
+    #[cfg_attr(feature = "clap", value(name = "hyperflow-flash"))]
+    #[serde(rename = "hyperflow-flash")]
+    HyperflowFlash,
+    /// HyperFlow H3 Flash Ref2VA (49 blocks): text to video + audio
+    /// conditioned on reference images the prompt can name.
+    #[cfg_attr(feature = "clap", value(name = "hyperflow-flash-ref"))]
+    #[serde(rename = "hyperflow-flash-ref")]
+    HyperflowFlashRef,
+}
+
+impl VideoModelId {
+    pub const DEFAULT: VideoModelId = VideoModelId::FastwanTi2v5b;
+
+    /// The attention precision a request gets without `--attn`: INT8 QK^T +
+    /// FP8 P.V on the MiniMax-H3 family (no visible quality change, faster;
+    /// GPUs below sm_89 run `int8`), bf16 elsewhere (no INT8 path).
+    pub fn default_attn(self) -> AttnPrecision {
+        if self.is_minimax() {
+            AttnPrecision::Int8Fp8
+        } else {
+            AttnPrecision::Bf16
+        }
+    }
+
+    /// The decoder a request gets without `--vae`. MiniMax-H3 family: the
+    /// NVFP4 decoder (indistinguishable frames, ~2x faster decode), which the
+    /// driver swaps for the fp16 one on hardware without NVFP4. Others: tiny.
+    pub fn default_vae(self) -> VaeChoice {
+        if self.is_minimax() {
+            VaeChoice::Nvfp4
+        } else {
+            VaeChoice::Tiny
+        }
+    }
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::FastwanTi2v5b => "FastWan2.2 TI2V 5B, 3-step",
+            Self::AnyflowT2v14b => "AnyFlow Wan2.1 14B, any step count",
+            Self::Mobilewan => "MobileWan, pruned 5B",
+            Self::Fastwan21T2v13b => "FastWan2.1 1.3B, 3-step",
+            Self::Wan21T2v13b => "Wan2.1 1.3B + step-distill LoRA",
+            Self::Ltx23Distilled => "LTX-2.3 22B distilled, video + audio (Q8)",
+            Self::Ltx23DistilledQ4 => "LTX-2.3 22B distilled, video + audio (Q4)",
+            Self::Ltx23Dev => "LTX-2.3 22B dev + distill LoRA, video + audio (Q8)",
+            Self::Ltx23DevQ4 => "LTX-2.3 22B dev + distill LoRA, video + audio (Q4)",
+            Self::Ltx2Rapid => "LTX-2 19B rapid merge, video + audio",
+            Self::Wan22T2vA14b => "Wan2.2 A14B MoE, 4-step",
+            Self::Hunyuan15T2v => "HunyuanVideo 1.5, 4-step",
+            Self::Hunyuan15I2v => "HunyuanVideo 1.5 image-to-video (--input-image)",
+            Self::MinimaxH3 => "MiniMax-H3 33B + turbo LoRA, video + audio",
+            Self::MinimaxH3Turbo => "MiniMax-H3 33B + larryvrh turbo v4, 6-step, video + audio",
+            Self::MinimaxH3TurboRef => {
+                "MiniMax-H3 33B Ref2VA + larryvrh turbo v4, 6-step, video + audio, --ref-image"
+            }
+            Self::Fasth3Trim => "FastH3-Trim, 8-step, video + audio",
+            Self::Fasth3V2 => "FastH3 V2 (50 blocks), 8-step, video + audio",
+            Self::HyperflowFlash => "HyperFlow H3 Flash, 6-step, video + audio",
+            Self::HyperflowFlashRef => "HyperFlow H3 Flash Ref2VA, references, video + audio",
+            Self::Fasth3Omni => "FastH3-Omni, 8-step, video + audio, --ref-image",
+        }
+    }
+
+    /// HunyuanVideo 1.5 path: its own Qwen2.5-VL-encoder + dual-stream-MMDiT +
+    /// causal-conv-VAE pipeline (`crate::hunyuan`); none of the Wan/LTX variant,
+    /// sampler, or VAE-choice machinery applies. Covers the T2V and causal I2V
+    /// variants; dispatch checks [`Self::is_hunyuan_i2v`] first.
+    pub fn is_hunyuan(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::Hunyuan15T2v | VideoModelId::Hunyuan15I2v
+        )
+    }
+
+    /// Causal I2V variant: chunked AR denoise over a KV cache, first-frame
+    /// image conditioning (`--input-image` required), SigLIP + VAE-encoder
+    /// components on top of the shared Hunyuan stack.
+    pub fn is_hunyuan_i2v(self) -> bool {
+        matches!(self, VideoModelId::Hunyuan15I2v)
+    }
+
+    /// MiniMax-H3 and its distillations: their own single-stream packed-sequence
+    /// pipeline + audio tail. None of the Wan/LTX machinery applies.
+    pub fn is_minimax(self) -> bool {
+        matches!(self, VideoModelId::MinimaxH3)
+            || self.is_turbo()
+            || self.is_fasth3()
+            || self.is_hyperflow()
+    }
+
+    /// HyperFlow H3 Flash: its fixed 4/6/8-step two-time grid on the backend
+    /// block (GGUF, dense attention).
+    pub fn is_hyperflow(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::HyperflowFlash | VideoModelId::HyperflowFlashRef
+        )
+    }
+
+    /// larryvrh's v4 turbo LoRA on the Q4 base (FL2VA or Ref2VA).
+    pub fn is_turbo(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::MinimaxH3Turbo | VideoModelId::MinimaxH3TurboRef
+        )
+    }
+
+    /// The MiniMax-family ids on the Ref2VA checkpoint line (reference images).
+    pub fn takes_refs(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::Fasth3Omni
+                | VideoModelId::HyperflowFlashRef
+                | VideoModelId::MinimaxH3TurboRef
+        )
+    }
+
+    /// The MiniMax-family ids on the FL2VA checkpoint line (first-frame
+    /// keyframes, and with them chained clips); FastH3-Omni is the Ref2VA one.
+    pub fn minimax_fl2va(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::MinimaxH3
+                | VideoModelId::MinimaxH3Turbo
+                | VideoModelId::Fasth3Trim
+                | VideoModelId::Fasth3V2
+                | VideoModelId::HyperflowFlash
+        )
+    }
+
+    /// FastVideo's 8-step H3 distills: fixed schedules, NVFP4 block linears on
+    /// the accelerated row-chunked block.
+    pub fn is_fasth3(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::Fasth3Trim | VideoModelId::Fasth3V2 | VideoModelId::Fasth3Omni
+        )
+    }
+
+    /// The MiniMax-family ids on the GGUF block (everything but FastH3's NVFP4
+    /// checkpoints): the opt-in INT8 GEMMs apply to these.
+    pub fn is_minimax_gguf(self) -> bool {
+        self.is_minimax() && !self.is_fasth3()
+    }
+
+    /// LTX-2.3 joint audio-video path: its own two-stage pipeline + audio tail,
+    /// none of the FastWan (Wan-base) machinery applies.
+    pub fn is_ltx(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::Ltx23Distilled
+                | VideoModelId::Ltx23DistilledQ4
+                | VideoModelId::Ltx23Dev
+                | VideoModelId::Ltx23DevQ4
+                | VideoModelId::Ltx2Rapid
+        )
+    }
+
+    /// ltx2-rapid (LTX-2 19B merge): the 19B conditioning line (FE V1 + caption
+    /// projection + 2-layer ungated 3840 connector, no gated attn / prompt-AdaLN)
+    /// and the LTX-2 VAEs. Selects the 19B branch in the LTX executor + the
+    /// single-stage-only denoise (no spatial upscaler ships for this merge).
+    pub fn is_ltx_rapid(self) -> bool {
+        matches!(self, VideoModelId::Ltx2Rapid)
+    }
+
+    /// LTX native I2V (first-frame anchor): only ltx2-rapid. The merge is a
+    /// "distilled + native I2V" checkpoint, so encoding an input image to a clean
+    /// frame-0 latent and holding it through the denoise rescues its weak
+    /// compositional T2V. `input_image` is OPTIONAL (present -> I2V, absent ->
+    /// T2V); the other LTX models reject it (no encoder path, two-stage grid).
+    pub fn is_ltx_i2v(self) -> bool {
+        self.is_ltx_rapid()
+    }
+
+    /// Whether this variant needs the distill LoRA folded into its DiT at load
+    /// (see `ltx::lora`): true only for the `dev` ids, whose DiT is the BASE
+    /// checkpoint. The distilled ids ship pre-distilled DiTs, so folding again
+    /// would apply it twice.
+    pub fn folds_distill_lora(self) -> bool {
+        matches!(self, VideoModelId::Ltx23Dev | VideoModelId::Ltx23DevQ4)
+    }
+
+    /// Default frame dims for this model. FastWan ships the 960x544
+    /// e2e baseline; LTX ships 768x512 (see the arm for the measurement behind
+    /// that number and the quality cliff just below it).
+    ///
+    /// LTX renders via the two-stage path (`upscale`, default-on): stage 1
+    /// denoises at HALF the target, then a 2x latent upscale + 3-step refine at
+    /// full res, which keeps the per-step DiT activation peak inside the 8GB card
+    /// when paired with the LTX vram-budget cap (see `ltx::LTX_VRAM_BUDGET_CAP`).
+    /// That halving is why the useful floor is a 512 short side: it sets stage 1
+    /// at the 256 `LTX_MIN_DIM`. The video VAE decode tiles (spatial + temporal)
+    /// to the residency budget. All callers resolve unset `--width/--height`
+    /// through this.
+    pub fn video_defaults(self) -> (u32, u32) {
+        if self.is_ltx_rapid() {
+            // The res the v62 merge's ComfyUI workflow runs (EmptyLTXVLatentVideo
+            // 768x512), i.e. in-distribution. Single-stage (no upscaler), so it
+            // renders directly here; cost scales with token count, so keep clips
+            // short on the 8GB card (~90s/step at 81f). /64-divisible.
+            (768, 512)
+        } else if self.is_ltx() {
+            // 1280x704, the model's native widescreen regime. DO NOT lower this
+            // for speed: it does not buy speed. Measured 2026-09-06, same prompt
+            // and seed, a distilled LTX-2.3 Q4_K_M DiT:
+            //
+            //   1280x704  caps at 49f (2.0s)  399.0s  PHOTOREAL, best adherence
+            //   1024x576  caps at 73f (3.0s)  392.1s  stylized 3D render
+            //   768x512   full   121f (5.0s)  418.5s  cartoon, weaker adherence
+            //
+            // Every rung costs ~400s because `ltx_max_frames` shrinks the clip as
+            // dims grow, so the token budget is roughly constant on an 8GB card.
+            // Resolution therefore trades QUALITY against CLIP LENGTH, not against
+            // time. Dropping to 768x512 gives up photorealism and prompt adherence
+            // for nothing except a longer clip.
+            //
+            // Adherence and photorealism BOTH track this regime, and they track it
+            // far more strongly than the quant tier does (Q8_0 and Q4_K_M are
+            // indistinguishable at matched dims). A user who needs the full 5s must
+            // opt into 768x512 and accept the stylized look.
+            (1280, 704)
+        } else if self.is_minimax() {
+            // 832x480: the 480p tier FastVideo runs FastH3 at (its other tier is
+            // H3's native 1344x768). 768p does not fit: the packed sequence puts
+            // every modality in ONE self-attention stream, ~37.8k rows at 5s, past
+            // `MAX_PACKED_ROWS` until the row-independent sites are chunked over
+            // rows. Smaller canvases are off-distribution (faces and fine detail
+            // fall apart), so the ladder does not go below this by default.
+            (832, 480)
+        } else if self.is_hunyuan() {
+            // 832x480: HunyuanVideo 1.5's native 480p T2V regime (the res the
+            // lightx2v 4-step distill was trained for). 16:9, /16-divisible.
+            (832, 480)
+        } else if matches!(
+            self,
+            VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b
+        ) {
+            // 832x448: the FastWan2.1-1.3B distill's training res (61x448x832).
+            (832, 448)
+        } else if matches!(self, VideoModelId::Mobilewan) {
+            // 832x480: mobilewan's 480p regime (Wan2.2-TI2V-5B backbone, /16
+            // grid). Landscape to match the rest of the Wan 480p family and stay
+            // inside the activation envelope; override with --width/--height.
+            (832, 480)
+        } else if matches!(
+            self,
+            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
+        ) {
+            // 832x480: the lightx2v 480p distill regime (and AnyFlow's demo/
+            // trained res), the industry-norm res for
+            // this model. The old <=512x288 default existed only to dodge a
+            // device-loss that was MISDIAGNOSED as a >4096-cell shader fault; the
+            // real cause is the 2s Windows GPU watchdog (TDR) tripping on a single
+            // long self-attention dispatch, now fixed by per-dispatch query
+            // chunking in `op_sdpa` (bit-exact, scales to any sequence length). So
+            // 832x480 is the default again; clip length is bounded by wall time /
+            // VRAM, not a fault (see WAN22_MAX_LATENT_CELLS).
+            (832, 480)
+        } else {
+            (VIDEO_DEFAULT_WIDTH, VIDEO_DEFAULT_HEIGHT)
+        }
+    }
+
+    /// Default temporal self-attention window (latent-frame radius) when the
+    /// caller leaves `--attn-window` unset. `Some(3)` for Wan2.2-14B (~1.55x e2e,
+    /// user-eyeballed). `None` (full attention) for HunyuanVideo 1.5: W=3 looked
+    /// clean on a single-subject clip (~2x DiT) but breaks multi-subject
+    /// coherence -- a second cat spawned at latent frame ~14 once the +-3 window
+    /// could no longer see the opening frames (browser eyeball 2026-07-01) -- so
+    /// windowing there is opt-in via `--attn-window`. An explicit `0` disables it.
+    pub fn default_attn_window(self) -> Option<u32> {
+        match self {
+            VideoModelId::Wan22T2vA14b => Some(3),
+            _ => None,
+        }
+    }
+
+    /// Whether this model's default denoise path is the two-stage upscale-refine
+    /// (stage 1 half-res -> 2x latent upscale -> 3-step refine). True for LTX: on
+    /// the 8GB target card, single-stage at the in-distribution widescreen res
+    /// OOMs, and low-res single-stage is out of distribution, so two-stage is the
+    /// only good regime. Surfaces that leave `upscale` unset default to this.
+    pub fn two_stage_default(self) -> bool {
+        // ltx2-rapid ships no spatial upscaler -> single-stage only.
+        self.is_ltx() && !self.is_ltx_rapid()
+    }
+
+    /// Minimum LTX pixel dim. 256 (the "fastest" tier, stage 1 at 128) is the
+    /// floor: below it the model is so far out of distribution that output is
+    /// incoherent, so dims under this are rejected rather than silently bad.
+    pub const LTX_MIN_DIM: u32 = 256;
+
+    /// Adherence floor for the LTX family: BOTH a total pixel count and a short
+    /// side. Below it the denoise stays perfectly coherent but stops rendering
+    /// what was asked for -- and it is the SCENE that goes, not the subject. That
+    /// is the worst kind of failure, because the clip looks fine on its own and
+    /// is simply not the requested shot. Dims under the floor are allowed (a fast
+    /// preview is a legitimate thing to want) but always warn.
+    ///
+    /// MEASURED 2026-09-06, a distilled LTX-2.3 Q4_K_M DiT, one prompt with 4 subject and 3
+    /// scene attributes, every rung at a FIXED 49 frames so resolution is the
+    /// only variable (the earlier ladder let the frame cap grow as dims shrank,
+    /// which confounded resolution with clip length):
+    ///
+    /// | dims     |   px | short | result                                  |
+    /// |----------|------|-------|-----------------------------------------|
+    /// | 1280x704 | 901k |   704 | subject + pier, 3D-render look          |
+    /// | 1024x576 | 590k |   576 | subject + pier, 3D-render look          |
+    /// |  896x512 | 459k |   512 | photoreal, but lost the pier            |
+    /// |  768x512 | 393k |   512 | subject + pier + correct overcast sky   |
+    /// |  896x448 | 401k |   448 | CARTOON, scene gone                     |
+    /// |  640x512 | 328k |   512 | claymation, subject cropped             |
+    /// |  640x384 | 245k |   384 | scene dissolves to a blank void         |
+    /// |  512x320 | 164k |   320 | scene REPLACED (indoor shop, not a pier)|
+    ///
+    /// BOTH conditions bind, which is why this is not one number. 896x448 has
+    /// MORE pixels than 768x512 and still goes cartoon (short side 448), while
+    /// 640x512 has the 512 short side and still collapses (only 328k px). So
+    /// neither the pure-area rule nor the pure-short-side rule fits; the earlier
+    /// "512 short side" falsification was itself measured on 512x512, which fails
+    /// the AREA condition, so it never tested the short side in isolation.
+    /// 768x512 is the smallest point on the /64 grid meeting both, and it is also
+    /// the largest rung where a full 5s clip fits the frame cap.
+    ///
+    /// Caveat on granularity: adherence is NOT monotonic rung-to-rung at a single
+    /// seed (896x512 scored worse than the smaller 768x512 here, on composition
+    /// luck). These conditions separate the two GROUPS reliably; they are not
+    /// fine enough to rank neighbours.
+    pub const LTX_ADHERENCE_FLOOR_PX: u32 = 768 * 512;
+    pub const LTX_ADHERENCE_MIN_SIDE: u32 = 512;
+
+    /// Whether these dims clear the adherence floor (see
+    /// [`Self::LTX_ADHERENCE_FLOOR_PX`]).
+    pub fn ltx_dims_hold_adherence(self, width: u32, height: u32) -> bool {
+        !self.is_ltx()
+            || (width * height >= Self::LTX_ADHERENCE_FLOOR_PX
+                && width.min(height) >= Self::LTX_ADHERENCE_MIN_SIDE)
+    }
+
+    /// Pixel-dim divisor this model requires (`--width`/`--height` must be a
+    /// multiple). Wan narrows by 16; LTX's two-stage halving + /32 latent grid
+    /// needs a multiple of 64 (stage 1 runs at half res, /32-divisible).
+    pub fn dim_multiple(self) -> u32 {
+        if self.is_ltx() {
+            64
+        } else if self.is_minimax() {
+            // 16x VAE spatial compression x the (1, 2, 2) DiT patch.
+            32
+        } else {
+            16
+        }
+    }
+
+    /// MiniMax-H3 default clip length. Frames snap to `17n + 5`; `n = 3` is
+    /// 56 frames (~2.3 s at 24 fps): the base model runs the slow 4-step turbo
+    /// over the Q4_K DiT, so its default stays short.
+    pub const MINIMAX_DEFAULT_FRAMES: u32 = 56;
+
+    /// FastH3-Trim default clip length: 124 frames (`n = 7`, ~5.2 s), the
+    /// length FastVideo trains and runs it at. ~14.9k packed rows at 832x480.
+    pub const FASTH3_DEFAULT_FRAMES: u32 = 124;
+
+    /// Model-preferred playback fps: default for fps and the `--duration`
+    /// divisor. The Wan TI2V line is authored at 24; Wan2.2-A14B at 16 (upstream).
+    pub fn fps(self) -> u32 {
+        if matches!(
+            self,
+            VideoModelId::Wan22T2vA14b
+                | VideoModelId::AnyflowT2v14b
+                | VideoModelId::Mobilewan
+                | VideoModelId::Fastwan21T2v13b
+                | VideoModelId::Wan21T2v13b
+        ) || self.is_hunyuan()
+        {
+            16
+        } else {
+            24
+        }
+    }
+
+    /// Default denoise step count when the caller leaves `--steps` unset. Most
+    /// video models share [`VIDEO_DEFAULT_STEPS`].
+    pub fn default_steps(self) -> u32 {
+        match self {
+            // AnyFlow is an any-step flow map: an eyeball sweep at 832x480 showed 2
+            // steps holds 4-step quality (the flow map jumps in one displacement per
+            // step). Each step re-streams the whole 15GB DiT (it does not fit the 8GB
+            // card), so halving steps ~halves wall time -- 2 is the quality-neutral
+            // fast default. More steps stay available via `--steps`.
+            VideoModelId::AnyflowT2v14b => 2,
+            VideoModelId::HyperflowFlash | VideoModelId::HyperflowFlashRef => {
+                HYPERFLOW_DEFAULT_STEPS
+            }
+            // larryvrh: 4 is the floor, 6-8 noticeably better (less ghosting).
+            VideoModelId::MinimaxH3Turbo | VideoModelId::MinimaxH3TurboRef => 6,
+            _ => VIDEO_DEFAULT_STEPS,
+        }
+    }
+
+    /// Default denoise sampler when the caller leaves it unset. UniPC (the public
+    /// FastWan Spaces' solver) for the Wan line, except FastWan2.1-1.3B, whose
+    /// card documents only its DMD 3-step schedule (`1000,757,522`), the regime
+    /// the e2e parity gate pins, and Wan2.1-1.3B, whose distill LoRA is CausVid's
+    /// same DMD schedule.
+    pub fn default_sampler(self) -> VideoSampler {
+        match self {
+            VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b => VideoSampler::Dmd,
+            _ => VideoSampler::UniPc,
+        }
+    }
+
+    /// Whether request-time user adapters (the vault LoRA fold) apply to this
+    /// video model. The single-file Wan2.1 DiTs (AnyFlow 14B, FastWan2.1 1.3B,
+    /// Wan2.1 1.3B, the last stacked over its distill LoRA): the `wan::lora`
+    /// rename map targets those ids, and the ecosystem base-Wan2.1 LoRAs fold onto
+    /// them. MiniMax-H3 and FastH3 apply them at RUNTIME (stacked low-rank
+    /// pairs, `minimax::lora`), so neither the Q4_K nor the NVFP4 DiT is
+    /// refolded. The other GGUF/MoE/LTX/causal paths are not wired.
+    pub fn supports_adapters(self) -> bool {
+        matches!(
+            self,
+            VideoModelId::AnyflowT2v14b | VideoModelId::Fastwan21T2v13b | VideoModelId::Wan21T2v13b
+        ) || self.is_minimax()
+    }
+
+    /// Default clip length in seconds when neither frames nor duration is
+    /// given. 5s is the Wan2.2-TI2V-5B design point.
+    pub const DEFAULT_DURATION_SECS: u32 = 5;
+
+    /// Default clip length (frames) when neither frames nor duration is given:
+    /// [`Self::DEFAULT_DURATION_SECS`] at the model fps, snapped to its legal
+    /// grid (FastWan lands at 121). LTX overrides
+    /// this with a short default ([`Self::LTX_DEFAULT_FRAMES`]): the full chain
+    /// (single-submit VAE decode) fits only modest lengths on thin hardware.
+    pub fn default_frames(self) -> u32 {
+        if self.is_ltx() {
+            Self::LTX_DEFAULT_FRAMES
+        } else if self.is_fasth3() {
+            Self::FASTH3_DEFAULT_FRAMES
+        } else if self.is_minimax() {
+            Self::MINIMAX_DEFAULT_FRAMES
+        } else if matches!(self, VideoModelId::Wan22T2vA14b) {
+            Self::WAN22_DEFAULT_FRAMES
+        } else {
+            self.snap_frames(Self::DEFAULT_DURATION_SECS * self.fps())
+        }
+    }
+
+    /// Wan2.2-A14B default clip length (frames) at the 832x480 default res. Length
+    /// is a wall-time choice now, not a fault envelope: the TDR crash is fixed (see
+    /// `op_sdpa` query chunking, which removes the watchdog trip at ANY row count).
+    /// 33f = f_lat 9 = 14040 DiT rows (~2.1s @16fps), ~2.25x the 13f/6240-row point
+    /// that is validated e2e (`fixed_full.mp4`); 33f itself is browser-confirmed,
+    /// not yet eyeballed in a parity gate. Longer is allowed up to
+    /// [`Self::max_frames`] (the model's 81f design envelope) via explicit
+    /// `--frames`/`--duration`; at 832x480 those run progressively slower (the
+    /// self-attention is O(rows^2), ~70min for 33f / hours for 81f on the 8GB card).
+    pub const WAN22_DEFAULT_FRAMES: u32 = 33;
+
+    /// LTX ideal clip length: 121 frames (latent frame count `(f-1)/8+1 = 16`,
+    /// ~5s @ 24fps) -- the length the model is distilled for (upstream
+    /// `num_frames=121`). This is the UPPER target only: the actual default is
+    /// `min(this, ltx_max_frames(w, h))`, because at the widescreen default the
+    /// 8GB card cannot hold 121 frames (see [`Self::ltx_max_frames`]). At low res
+    /// the cap is above 121, so the full 5s is used; at 1280x704 it lands at 49.
+    pub const LTX_DEFAULT_FRAMES: u32 = 121;
+
+    /// Max full-res latent cells (`f_lat * h/32 * w/32`) the 8GB card sustains
+    /// through the LTX two-stage stage-2 denoise (which runs the DiT at full res).
+    /// Above this the stage-2 activation peak, plus the per-block streaming
+    /// alloc/free churn's fragmentation, loses the device. Derived empirically on
+    /// the RTX 5070 Laptop (8GB): 49 frames @ 1280x704 = 6160 cells holds with
+    /// ~2.7GB margin (peak 5.4GB); 73 frames @ 1024x576 = 5760 holds (peak 5.2GB);
+    /// 73 frames @ 1280x704 = 8800 device-loses. 6300 sits just above both proven
+    /// points and well below the failure. Revisit for >8GB cards.
+    pub const LTX_MAX_LATENT_CELLS: u32 = 6300;
+
+    /// Max DiT latent cells (`f_lat * h/16 * w/16`, == the per-forward token/row
+    /// count) allowed for a Wan2.2-A14B clip. This is the model's 81-frame design
+    /// envelope (81f @ 832x480 = f_lat 21 * 30 * 52 = 32760 rows), NOT a fault
+    /// guard: the old "device LOST above ~6240 rows" was a 2s Windows GPU watchdog
+    /// (TDR) tripping on a single long self-attention dispatch (nvlddmkm Event 153
+    /// = an engine reset on watchdog timeout, NOT the shader OOB it was first read
+    /// as). That is fixed by per-dispatch query chunking in `op_sdpa` (each SDPA
+    /// dispatch is bounded to ~10M q*k pairs, <1s, in its own submit), which is
+    /// bit-exact and scales to any row count. So this cap now just bounds wall
+    /// time / VRAM to the model's intended envelope; explicit over-cap `--frames`
+    /// still errors (fail fast) and a default/`--duration` caps down with a
+    /// warning. Wan2.1 VAE is 8x spatial + patch 2 -> /16 grid (4x denser than
+    /// LTX's /32). NB the longest length actually validated e2e is tracked by
+    /// [`Self::WAN22_DEFAULT_FRAMES`]; lengths between that and this cap run but
+    /// are progressively slower (O(rows^2) attention) and not yet eyeballed.
+    pub const WAN22_MAX_LATENT_CELLS: u32 = 32760;
+
+    /// Per-spatial-axis latent downscale (VAE spatial factor * patch): the DiT
+    /// token grid is `h/div * w/div` per latent frame. LTX /32; Wan2.1 VAE /16.
+    fn latent_spatial_divisor(self) -> u32 {
+        if self.is_ltx() { 32 } else { 16 }
+    }
+
+    /// VAE temporal downscale (latent frames = `(frames-1)/factor + 1`). LTX 8,
+    /// Wan 4. Inverse: `frames = factor*(f_lat-1) + 1`.
+    fn temporal_factor(self) -> u32 {
+        if self.is_ltx() { 8 } else { 4 }
+    }
+
+    /// The per-resolution VRAM activation-envelope cap, in latent cells, or `None`
+    /// for models that fit at every legal dim on the 8GB card (FastWan
+    /// ships low-res defaults well inside the envelope). LTX and Wan2.2-A14B run
+    /// the DiT at full res over a large token grid and need an explicit cap.
+    fn max_latent_cells(self) -> Option<u32> {
+        if self.is_ltx() {
+            Some(Self::LTX_MAX_LATENT_CELLS)
+        } else if matches!(
+            self,
+            VideoModelId::Wan22T2vA14b | VideoModelId::AnyflowT2v14b
+        ) {
+            // AnyFlow shares the 14B geometry + Wan2.1 VAE grid, so the same
+            // activation envelope applies.
+            Some(Self::WAN22_MAX_LATENT_CELLS)
+        } else {
+            None
+        }
+    }
+
+    /// Largest legal frame count whose full-res latent-cell count stays within
+    /// this model's activation envelope ([`Self::max_latent_cells`]) at the given
+    /// pixel dims, or `None` for an uncapped model. Lower res -> more frames fit;
+    /// higher res -> fewer. Used to size the default clip and to reject explicit
+    /// over-budget requests before any GPU work (so a long duration at high res
+    /// fails fast at submit instead of device-losing mid-denoise). The returned
+    /// count is on the model's temporal grid (`factor*k + 1`).
+    pub fn max_frames(self, width: u32, height: u32) -> Option<u32> {
+        let max_cells = self.max_latent_cells()?;
+        // Experiment-only override of the activation envelope
+        // (`THINFER_MAX_LATENT_CELLS`). The shipped constant was derived
+        // empirically; this exists to RE-MEASURE the device-loss boundary after
+        // changes that move the peak. Raising it can device-lose mid-denoise.
+        let max_cells = std::env::var("THINFER_MAX_LATENT_CELLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(max_cells);
+        let div = self.latent_spatial_divisor();
+        let cells_per_lat_frame = (height / div).max(1) * (width / div).max(1);
+        let max_f_lat = (max_cells / cells_per_lat_frame).max(1);
+        Some(self.temporal_factor() * (max_f_lat - 1) + 1)
+    }
+
+    /// LTX alias of [`Self::max_frames`] (always `Some` for LTX). Kept for the
+    /// LTX resolve path + its regression tests. Panics for non-LTX.
+    pub fn ltx_max_frames(self, width: u32, height: u32) -> u32 {
+        debug_assert!(self.is_ltx());
+        self.max_frames(width, height)
+            .expect("LTX always has an envelope cap")
+    }
+
+    /// Snap a raw frame count to this model's legal temporal grid. FastWan needs
+    /// `4k+1` (causal-VAE grid).
+    /// LTX needs `8k+1` (its VAE has temporal factor 8).
+    pub fn snap_frames(self, raw: u32) -> u32 {
+        let raw = raw.max(1);
+        if self.is_ltx() {
+            let k = ((raw - 1) as f32 / 8.0).round() as u32;
+            8 * k + 1
+        } else if self.is_hunyuan_i2v() {
+            // Causal I2V chunks 4 latent frames at a time: latent frame count
+            // (frames-1)/4+1 must be a positive multiple of 4 -> frames in
+            // {13, 29, 45, 61, 77, ...}.
+            let f_lat = (raw as f32 + 3.0) / 4.0;
+            let f_lat4 = ((f_lat / 4.0).round().max(1.0) as u32) * 4;
+            4 * f_lat4 - 3
+        } else {
+            let k = ((raw - 1) as f32 / 4.0).round() as u32;
+            4 * k + 1
+        }
+    }
+
+    /// Validate an explicit frame count against the model grid (see
+    /// [`Self::snap_frames`]).
+    pub fn validate_frames(self, frames: u32) -> Result<(), String> {
+        if self.is_ltx() {
+            if frames == 0 || !(frames - 1).is_multiple_of(8) {
+                return Err(format!(
+                    "--frames for {self} must be 8*k + 1 (got {frames}); e.g. 1, 9, 17, 25, 33"
+                ));
+            }
+            return Ok(());
+        }
+        if frames == 0 || frames % 4 != 1 {
+            return Err(format!(
+                "--frames must be 4*k + 1 (got {frames}); e.g. 1, 5, 9, ..., 97"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for VideoModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VideoModelId::FastwanTi2v5b => "fastwan-ti2v-5b",
+            VideoModelId::AnyflowT2v14b => "anyflow-t2v-14b",
+            VideoModelId::Mobilewan => "mobilewan",
+            VideoModelId::Fastwan21T2v13b => "fastwan2.1-t2v-1.3b",
+            VideoModelId::Wan21T2v13b => "wan2.1-t2v-1.3b",
+            VideoModelId::Ltx23Distilled => "ltx-2.3-distilled",
+            VideoModelId::Ltx23DistilledQ4 => "ltx-2.3-distilled-q4",
+            VideoModelId::Ltx23Dev => "ltx-2.3-dev",
+            VideoModelId::Ltx23DevQ4 => "ltx-2.3-dev-q4",
+            VideoModelId::Ltx2Rapid => "ltx2-rapid",
+            VideoModelId::Wan22T2vA14b => "wan2.2-t2v-a14b",
+            VideoModelId::Hunyuan15T2v => "hunyuan-video-1.5-t2v",
+            VideoModelId::Hunyuan15I2v => "hunyuan-video-1.5-ti2v",
+            VideoModelId::MinimaxH3 => "minimax-h3",
+            VideoModelId::MinimaxH3Turbo => "minimax-h3-turbo",
+            VideoModelId::MinimaxH3TurboRef => "minimax-h3-turbo-ref",
+            VideoModelId::Fasth3Trim => "fasth3-trim",
+            VideoModelId::Fasth3V2 => "fasth3-v2",
+            VideoModelId::Fasth3Omni => "fasth3-omni",
+            VideoModelId::HyperflowFlash => "hyperflow-flash",
+            VideoModelId::HyperflowFlashRef => "hyperflow-flash-ref",
+        })
+    }
+}
+
+/// RelayVSR super-resolution of a generated video (`Comfy-Org/RelayVSR`):
+/// every frame upscaled by the factor after generation, before encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum SuperRes {
+    /// 2x (LightX2V's retrain for H3 output; 480p -> 960p).
+    #[cfg_attr(feature = "clap", value(name = "2x"))]
+    #[serde(rename = "2x")]
+    X2,
+    /// 4x (480p -> 1920p).
+    #[cfg_attr(feature = "clap", value(name = "4x"))]
+    #[serde(rename = "4x")]
+    X4,
+}
+
+impl SuperRes {
+    pub fn factor(self) -> usize {
+        match self {
+            SuperRes::X2 => 2,
+            SuperRes::X4 => 4,
+        }
+    }
+}
+
+/// Attention precision for the FastH3 models' sparse attention (VSA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum AttnPrecision {
+    /// bf16 Q/K/V (the reference path).
+    Bf16,
+    /// INT8 QK^T (SageAttention-style: K smoothed by its mean, per-tile
+    /// scales; P.V stays bf16). Same quality, but a different sample per seed
+    /// than bf16; ~1.2x faster attention (~1.35x with reference images).
+    Int8,
+    /// INT8 QK^T plus FP8 (e4m3) P.V (SageAttention2-style: P scaled by
+    /// 448, V per-tile scales, f32 accumulate across key stages). Faster
+    /// attention again; lower attention precision than `int8` with no
+    /// visible change in the output. The FastH3 default; needs an sm_89+
+    /// NVIDIA GPU (older ones run `int8`).
+    Int8Fp8,
+}
+
+impl AttnPrecision {
+    /// INT8 QK^T (`int8` and `int8-fp8`).
+    pub fn int8_qk(self) -> bool {
+        matches!(self, AttnPrecision::Int8 | AttnPrecision::Int8Fp8)
+    }
+}
+
+impl std::fmt::Display for AttnPrecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AttnPrecision::Bf16 => "bf16",
+            AttnPrecision::Int8 => "int8",
+            AttnPrecision::Int8Fp8 => "int8-fp8",
+        })
+    }
+}
+
+/// How FastH3-Omni sizes each reference image before the vision tower and the
+/// VAE encoder, ComfyUI's `ref_image_size` modes. Every mode keeps the aspect
+/// ratio and rounds both sides to multiples of 32. The reference's rows are
+/// attended densely by every block, so their count drives Omni's step time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum RefImageSize {
+    /// The pixel area of the output canvas, never upscaled. The default, as in
+    /// ComfyUI (lightx2v trained its Ref2VA distill this way): identity held
+    /// as well as `diffusers` in A/B, at ~2.4x the speed with one reference.
+    #[default]
+    Match,
+    /// Short edge capped at 2048, never upscaled.
+    Max,
+    /// Short edge exactly 2048, the Diffusers reference (~5.4k dense rows and
+    /// as many vision tokens per portrait reference at 832x480).
+    Diffusers,
+}
+
+impl RefImageSize {
+    /// The resize factor for a `width x height` reference on a
+    /// `canvas_width x canvas_height` output, before rounding to 32.
+    pub fn scale(
+        self,
+        width: usize,
+        height: usize,
+        canvas_width: usize,
+        canvas_height: usize,
+    ) -> f64 {
+        const SHORT_EDGE: f64 = 2048.0;
+        let short = width.min(height) as f64;
+        match self {
+            RefImageSize::Match => {
+                let area = (canvas_width * canvas_height) as f64 / (width * height) as f64;
+                area.sqrt().min(1.0)
+            }
+            RefImageSize::Max => (SHORT_EDGE / short).min(1.0),
+            RefImageSize::Diffusers => SHORT_EDGE / short,
+        }
+    }
+}
+
+impl std::fmt::Display for RefImageSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RefImageSize::Match => "match",
+            RefImageSize::Max => "max",
+            RefImageSize::Diffusers => "diffusers",
+        })
+    }
+}
+
+/// How FastH3-Omni frames each reference image before sizing it. A person
+/// photographed from afar keeps only a few dozen face pixels once the image
+/// is sized to the canvas, too few for the model to hold the identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum RefCrop {
+    /// Detect faces (SCRFD) and, when the largest would come out small, crop
+    /// in on it and everyone of a similar size (head down to the chest or
+    /// further, as the canvas area allows). Images with large faces, or none
+    /// found, pass whole. Opt-in: it changes what the model is shown.
+    Auto,
+    /// Always the whole image, as the reference does it.
+    #[default]
+    Off,
+}
+
+impl std::fmt::Display for RefCrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RefCrop::Auto => "auto",
+            RefCrop::Off => "off",
+        })
+    }
+}
+
+/// VAE decoder choice. App-local mirror of `wan::pipeline::VaeChoice` so the
+/// clap derive (and a future `ToSchema`) lives on a type we own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum VaeChoice {
+    Full,
+    Tiny,
+    /// Hunyuan-1.5 fine-tuned TAEHV: tiny-VAE speed (~seconds), better fidelity
+    /// than the base tiny. Hunyuan-only; other models fall back to `Tiny`.
+    #[cfg_attr(feature = "clap", value(name = "tiny-ft"))]
+    TinyFt,
+    /// MiniMax-H3 family: FastVideo's NVFP4 video decoder, all 36 layers
+    /// (QAD; ~46 dB PSNR vs the original decoder). Opt-in: lossy, faster, needs
+    /// an NVIDIA Blackwell GPU (NVFP4).
+    Nvfp4,
+    /// MiniMax-H3 family: the 8-layer NVFP4 decoder (~36 dB). Opt-in, fastest.
+    #[cfg_attr(feature = "clap", value(name = "nvfp4-fast"))]
+    Nvfp4Fast,
+}
+
+impl VaeChoice {}
+
+impl std::fmt::Display for VaeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VaeChoice::Full => "full",
+            VaeChoice::Tiny => "tiny",
+            VaeChoice::TinyFt => "tiny-ft",
+            VaeChoice::Nvfp4 => "nvfp4",
+            VaeChoice::Nvfp4Fast => "nvfp4-fast",
+        })
+    }
+}
+
+/// LTX-2.3 text-encoder (Gemma-3-12B) quantization. Applies to ALL LTX models
+/// (the encoder is shared across `ltx-2.3-distilled{,-q4}` and `ltx-2.3-dev{,-q4}`).
+/// `Q8` is the conditioning-quality baseline (uniform Q8_0, 12.5G); `Q4` is the
+/// Q4_K_M variant (7.3G; mixed Q4_K/Q6_K) -- ~2.8x faster encode (~16s -> ~6s)
+/// for lower-precision conditioning. Ignored by the Wan models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderQuant {
+    #[default]
+    Q8,
+    Q4,
+}
+
+impl std::fmt::Display for EncoderQuant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EncoderQuant::Q8 => "q8",
+            EncoderQuant::Q4 => "q4",
+        })
+    }
+}
+
+/// HunyuanVideo 1.5 prompt-rewriter model choice. The rewriter expands a terse
+/// prompt into the long, structured caption the DiT was trained on. `Fast` (the
+/// default) runs the Qwen3-VL-4B GGUF (~2.5GB): small enough to decode quickly
+/// even under a tight VRAM budget, so it is the budget-honest default. `Full`
+/// runs the Qwen3-VL-8B (~5.85GB) for slightly richer captions at a much higher
+/// time cost (it streams weights under a normal budget). Both share the same
+/// runtime-parameterized `qwen3_lm` stack; only the weights + dims differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum RewriteQuality {
+    #[default]
+    Fast,
+    Full,
+}
+
+impl RewriteQuality {}
+
+impl std::fmt::Display for RewriteQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RewriteQuality::Fast => "fast",
+            RewriteQuality::Full => "full",
+        })
+    }
+}
+
+/// FastWan denoise sampler. App-local mirror of `wan::pipeline::VideoSampler` (so
+/// the clap/`ToSchema` derives live on a type we own). The step count travels
+/// alongside on the request, not in the enum, so it stays a plain UI number.
+/// `UniPc` is the serve/UI default (matches the public FastWan Spaces); `Dmd` is
+/// the byte-parity reference path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum VideoSampler {
+    #[default]
+    UniPc,
+    Dmd,
+}
+
+impl VideoSampler {}
+
+impl std::fmt::Display for VideoSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VideoSampler::UniPc => "unipc",
+            VideoSampler::Dmd => "dmd",
+        })
+    }
+}
+
+/// Face-swap model. HyperSwap 1a/1b/1c (FaceFusion `models-3.3.0`) paste a
+/// swapped face per frame: same architecture and speed, different visual
+/// character. AlphaFace 256 (FaceFusion `models-3.9.0`) is the same per-frame
+/// form, pose-robust and ~20x the compute. DreamID-V is a diffusion video face
+/// swap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum SwapModel {
+    #[cfg_attr(feature = "clap", value(name = "hyperswap-1a"))]
+    #[serde(rename = "hyperswap-1a")]
+    Hyperswap1a,
+    #[cfg_attr(feature = "clap", value(name = "hyperswap-1b"))]
+    #[serde(rename = "hyperswap-1b")]
+    Hyperswap1b,
+    #[cfg_attr(feature = "clap", value(name = "hyperswap-1c"))]
+    #[serde(rename = "hyperswap-1c")]
+    Hyperswap1c,
+    /// AlphaFace 256 (arXiv 2601.16429): a per-frame swapper trained for
+    /// extreme head poses. Same crop, masks and enhancer as HyperSwap;
+    /// non-commercial license.
+    #[cfg_attr(feature = "clap", value(name = "alphaface"))]
+    #[serde(rename = "alphaface")]
+    AlphaFace,
+    /// DreamID-V-Wan-1.3B-Faster: a diffusion VIDEO face swap on the Wan2.1
+    /// backbone (16-step image-CFG; the umT5 context is baked in). Its own
+    /// pipeline (`wan::dreamidv`): the target clip, a live DWPose face mask and
+    /// the source face are VAE-encoded, the mask conditions a 48-channel DiT
+    /// input and a ref-conv prefix injects the source face. Holds identity
+    /// through hard poses; far slower than HyperSwap. Apache-2.0.
+    #[cfg_attr(feature = "clap", value(name = "dreamid-v"))]
+    #[serde(rename = "dreamid-v")]
+    DreamIdV,
+}
+
+impl SwapModel {
+    pub const DEFAULT: SwapModel = SwapModel::Hyperswap1a;
+
+    /// One-line name for listings (`thinfer models`).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Hyperswap1a => "HyperSwap 1a",
+            Self::Hyperswap1b => "HyperSwap 1b",
+            Self::Hyperswap1c => "HyperSwap 1c",
+            Self::AlphaFace => "AlphaFace 256 (pose-robust, slower)",
+            Self::DreamIdV => "DreamID-V diffusion face swap (slow, holds hard poses)",
+        }
+    }
+
+    /// The diffusion face swap (its own pipeline), not a HyperSwap checkpoint.
+    pub fn is_dreamidv(self) -> bool {
+        matches!(self, SwapModel::DreamIdV)
+    }
+}
+
+impl std::fmt::Display for SwapModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SwapModel::Hyperswap1a => "hyperswap-1a",
+            SwapModel::Hyperswap1b => "hyperswap-1b",
+            SwapModel::Hyperswap1c => "hyperswap-1c",
+            SwapModel::AlphaFace => "alphaface",
+            SwapModel::DreamIdV => "dreamid-v",
+        })
+    }
+}
+
+/// Default VRAM budget of a text job when none is given: dense weights stay
+/// resident and the rest feeds the routed-expert slot cache (fits an 8 GB card
+/// next to a desktop).
+pub const TEXT_DEFAULT_VRAM: &str = "6G";
+/// Default RAM budget of a text job: the ceiling of the page-locked host expert
+/// cache (it grows only as far as the driver grants page-locked memory).
+pub const TEXT_DEFAULT_RAM: &str = "16G";
+
+/// Text-generation (chat) models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum TextModelId {
+    /// Qwen3.6-35B-A3B (unsloth UD-Q4_K_XL GGUF): hybrid Gated-DeltaNet +
+    /// gated attention, 256-expert MoE with 3B active per token.
+    #[cfg_attr(feature = "clap", value(name = "qwen3.6-35b-a3b"))]
+    #[serde(rename = "qwen3.6-35b-a3b")]
+    Qwen36_35bA3b,
+    /// Gemma 4 26B-A4B-it (unsloth UD-Q4_K_XL GGUF): sliding-window + global
+    /// attention, dense GELU MLP plus a 128-expert MoE, 4B active per token.
+    #[cfg_attr(feature = "clap", value(name = "gemma-4-26b-a4b"))]
+    #[serde(rename = "gemma-4-26b-a4b")]
+    Gemma4_26bA4b,
+}
+
+/// Default sampling of a text model, per thinking mode (the model card's
+/// recommendations).
+#[derive(Clone, Copy, Debug)]
+pub struct TextDefaults {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+    pub min_p: f32,
+    pub presence_penalty: f32,
+}
+
+impl TextModelId {
+    pub const DEFAULT: TextModelId = TextModelId::Gemma4_26bA4b;
+    pub const ALL: [TextModelId; 2] = [TextModelId::Gemma4_26bA4b, TextModelId::Qwen36_35bA3b];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Qwen36_35bA3b => "Qwen3.6 35B-A3B, MoE chat (Q4)",
+            Self::Gemma4_26bA4b => "Gemma 4 26B-A4B, MoE chat (Q4)",
+        }
+    }
+
+    /// The special token that ends the model's thinking block: a constrained
+    /// reply starts after it.
+    pub fn think_close(self) -> &'static str {
+        match self {
+            Self::Qwen36_35bA3b => "</think>",
+            Self::Gemma4_26bA4b => "<channel|>",
+        }
+    }
+
+    /// Model-card sampling for thinking (`think`) or instruct mode.
+    pub fn defaults(self, think: bool) -> TextDefaults {
+        match (self, think) {
+            (Self::Qwen36_35bA3b, true) => TextDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+                min_p: 0.0,
+                presence_penalty: 0.0,
+            },
+            (Self::Qwen36_35bA3b, false) => TextDefaults {
+                temperature: 0.7,
+                top_p: 0.8,
+                top_k: 20,
+                min_p: 0.0,
+                presence_penalty: 1.5,
+            },
+            // Model card (generation_config.json): one setting for both modes.
+            (Self::Gemma4_26bA4b, _) => TextDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 64,
+                min_p: 0.0,
+                presence_penalty: 0.0,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for TextModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TextModelId::Qwen36_35bA3b => "qwen3.6-35b-a3b",
+            TextModelId::Gemma4_26bA4b => "gemma-4-26b-a4b",
+        })
+    }
+}

@@ -74,6 +74,22 @@ pub trait WeightReader {
     /// a perf bug, never a correctness one: `read_at` must validate any
     /// prefetched bytes against its actual arguments.
     fn will_read(&mut self, _offset: u64, _len: u64) {}
+
+    /// Fill every `(offset, dst)` (disjoint destinations, any order). A
+    /// reader over a block device overrides this to coalesce nearby ranges
+    /// into few large reads (an NVMe serves 8 MiB requests ~2.3x faster than
+    /// 640 KiB ones, e.g. MoE expert slices); the default reads one by one.
+    fn read_batch(
+        &mut self,
+        reqs: &mut [(u64, &mut [u8])],
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        async move {
+            for (offset, dst) in reqs.iter_mut() {
+                self.read_at(*offset, dst).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 pub trait WeightSource {
@@ -109,6 +125,20 @@ impl<R: WeightReader> OffsetView<R> {
     pub fn new(inner: R, base: u64, len: u64) -> Self {
         Self { inner, base, len }
     }
+
+    /// The inner offset of `[offset, offset + n)`, which must lie inside the
+    /// view. Enforced in release too: a read past a tensor would otherwise
+    /// return its neighbour's bytes. A caller bug, so it panics (the reader's
+    /// error type is the inner one's and has no such variant).
+    fn inner_offset(&self, offset: u64, n: usize) -> u64 {
+        let end = offset.checked_add(n as u64);
+        assert!(
+            end.is_some_and(|e| e <= self.len),
+            "OffsetView: read {offset}+{n} past view length {}",
+            self.len
+        );
+        self.base + offset
+    }
 }
 
 impl<R: WeightReader> WeightReader for OffsetView<R> {
@@ -117,11 +147,19 @@ impl<R: WeightReader> WeightReader for OffsetView<R> {
         self.len
     }
     async fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
-        debug_assert!(offset + dst.len() as u64 <= self.len);
-        self.inner.read_at(self.base + offset, dst).await
+        let at = self.inner_offset(offset, dst.len());
+        self.inner.read_at(at, dst).await
     }
     fn will_read(&mut self, offset: u64, len: u64) {
-        self.inner.will_read(self.base + offset, len);
+        // A hint only: out-of-range ones are dropped by the reader.
+        self.inner.will_read(self.base.saturating_add(offset), len);
+    }
+    async fn read_batch(&mut self, reqs: &mut [(u64, &mut [u8])]) -> Result<(), Self::Error> {
+        let mut file: Vec<(u64, &mut [u8])> = reqs
+            .iter_mut()
+            .map(|(offset, dst)| (self.inner_offset(*offset, dst.len()), &mut **dst))
+            .collect();
+        self.inner.read_batch(&mut file).await
     }
 }
 

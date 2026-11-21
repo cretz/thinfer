@@ -1,6 +1,8 @@
 // thinfer-native: desktop/native impls of thinfer-core IO traits.
 
 pub mod cache;
+mod direct;
+pub mod gpu_budget;
 pub mod harden;
 pub mod prefetch;
 pub mod sources;
@@ -19,25 +21,29 @@ use thinfer_core::weight::{FileOpener, WeightReader};
 pub struct MmapFileOpener {
     mmap: Arc<memmap2::Mmap>,
     file: Arc<std::fs::File>,
+    /// Page-cache-bypassing handle for [`WeightReader::read_batch`].
+    direct: Option<Arc<std::fs::File>>,
 }
 
 impl MmapFileOpener {
     pub async fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let (mmap, file) = tokio::task::spawn_blocking(move || {
+        let (mmap, file, direct) = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&path)?;
+            let direct = direct::open(&path);
             // SAFETY: We hold no claim that the underlying file is immutable
             // for the lifetime of the mmap; concurrent external truncate or
             // rewrite is UB. Same assumption as safetensors's own mmap loaders
             // and pytorch's safetensors mmap path. Out of scope to defend.
             let mmap = unsafe { memmap2::Mmap::map(&file) }?;
-            io::Result::Ok((mmap, file))
+            io::Result::Ok((mmap, file, direct))
         })
         .await
         .expect("mmap blocking task panicked")?;
         Ok(Self {
             mmap: Arc::new(mmap),
             file: Arc::new(file),
+            direct: direct.map(Arc::new),
         })
     }
 }
@@ -49,19 +55,23 @@ impl FileOpener for MmapFileOpener {
         Ok(MmapFile {
             mmap: Arc::clone(&self.mmap),
             file: Arc::clone(&self.file),
+            direct: self.direct.clone(),
         })
     }
 }
 
 /// Reads at least this large bypass the mapping. A cold mmap copy pages in
 /// fault by fault (measured ~1 GB/s on an NVMe that serves 3+ GB/s to plain
-/// 16 MiB reads); a positioned read hands the OS the whole range as one
-/// request. Warm (page-cached) bytes cost the same either way.
-const DIRECT_READ_MIN: usize = 1 << 20;
+/// 16 MiB reads), and even page-cached bytes soft-fault once per 4 KiB page
+/// into this process (MoE expert slices of ~0.6 MiB measured ~2.5 GB/s
+/// through the mapping); a positioned read hands the OS the whole range as
+/// one request.
+const DIRECT_READ_MIN: usize = 256 << 10;
 
 pub struct MmapFile {
     mmap: Arc<memmap2::Mmap>,
     file: Arc<std::fs::File>,
+    direct: Option<Arc<std::fs::File>>,
 }
 
 /// Reads at least this large are split into [`READ_PARTS`] concurrent
@@ -91,9 +101,9 @@ async fn read_exact_at_split(
         let (tx, rx) = futures_channel::oneshot::channel();
         let (file, at) = (Arc::clone(file), offset + (i * part) as u64);
         let chunk = RawChunk(chunk.as_mut_ptr(), chunk.len());
-        workers.0.push(std::thread::spawn(move || {
-            // SAFETY: `dst` outlives this thread: `Workers` joins it before the
-            // borrow ends, even when the future is dropped mid-read.
+        workers.0.push(read_pool().run(move || {
+            // SAFETY: `dst` outlives this job: `Workers` waits for it before
+            // the borrow ends, even when the future is dropped mid-read.
             let _ = tx.send(read_exact_at(&file, at, unsafe { chunk.slice() }));
         }));
         done.push(rx);
@@ -118,14 +128,87 @@ impl RawChunk {
     }
 }
 
-/// Joins the read workers on drop, so none outlives the buffer it writes.
-struct Workers(Vec<std::thread::JoinHandle<()>>);
+/// Waits for its read jobs on drop, so none outlives the buffer it writes.
+struct Workers(Vec<Pending>);
 
 impl Drop for Workers {
     fn drop(&mut self) {
         for w in self.0.drain(..) {
-            let _ = w.join();
+            w.wait();
         }
+    }
+}
+
+/// Persistent reader threads for positioned reads: spawning a thread per read
+/// costs ~100 us on Windows, which dominated MoE expert streaming (hundreds of
+/// sub-MiB reads per token).
+struct ReadPool {
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Readers in [`ReadPool`]: enough to keep an NVMe at queue depth.
+const READ_THREADS: usize = 8;
+
+fn read_pool() -> &'static ReadPool {
+    static POOL: std::sync::OnceLock<ReadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        for i in 0..READ_THREADS {
+            let rx = Arc::clone(&rx);
+            let _ = std::thread::Builder::new()
+                .name(format!("thinfer-read-{i}"))
+                .spawn(move || {
+                    loop {
+                        let job = rx.lock().unwrap().recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => return,
+                        }
+                    }
+                });
+        }
+        ReadPool {
+            tx: std::sync::Mutex::new(tx),
+        }
+    })
+}
+
+/// Completion of one pooled job.
+struct Pending(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Pending {
+    fn wait(self) {
+        let (lock, cv) = &*self.0;
+        let mut done = lock.lock().unwrap();
+        while !*done {
+            done = cv.wait(done).unwrap();
+        }
+    }
+}
+
+impl ReadPool {
+    fn run(&self, job: impl FnOnce() + Send + 'static) -> Pending {
+        let flag = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let signal = Arc::clone(&flag);
+        let wrapped = Box::new(move || {
+            // Mark done even if the job panics, so a waiter never hangs.
+            struct Done(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    let (lock, cv) = &*self.0;
+                    *lock.lock().unwrap() = true;
+                    cv.notify_all();
+                }
+            }
+            let _done = Done(signal);
+            job();
+        });
+        if self.tx.lock().unwrap().send(wrapped).is_err() {
+            // Pool gone (process teardown): nothing will run; report done.
+            *flag.0.lock().unwrap() = true;
+        }
+        Pending(flag)
     }
 }
 
@@ -169,6 +252,13 @@ impl WeightReader for MmapFile {
         }
         dst.copy_from_slice(&self.mmap[off..end]);
         Ok(())
+    }
+
+    /// Coalesced unbuffered reads (see [`direct`]); the buffered handle when
+    /// the platform refused an unbuffered one.
+    async fn read_batch(&mut self, reqs: &mut [(u64, &mut [u8])]) -> Result<(), Self::Error> {
+        let file = self.direct.as_ref().unwrap_or(&self.file);
+        direct::read_batch(file, self.mmap.len() as u64, reqs).await
     }
 
     /// Real OS readahead. The streaming chunk loop hints `READ_PREFETCH_CHUNKS`

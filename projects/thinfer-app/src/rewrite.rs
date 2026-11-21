@@ -30,6 +30,7 @@ use thinfer_native::tokenizer::HfTokenizer;
 
 use crate::download::resolve_role;
 use crate::model::RewriteQuality;
+use crate::model::RewriteQualityEngine;
 
 /// The official HunyuanVideo 1.5 t2v rewrite system prompt (verbatim from
 /// `hyvideo/utils/rewrite/t2v_prompt.py`). ~5.8k tokens; prefilled once per

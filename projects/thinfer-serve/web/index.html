@@ -40,6 +40,7 @@
                   <option value="image" selected>Image</option>
                   <option value="video">Video</option>
                   <option value="face-swap">Face swap</option>
+                  <option value="text">Text (chat)</option>
                 </select>
               </div>
               <div class="field">
@@ -56,7 +57,7 @@
             </div>
           </section>
 
-          <section class="group">
+          <section class="group media-only">
             <h2>Inputs</h2>
             <div class="grid">
               <!-- First-frame / edit image (edit models require it; I2V models
@@ -95,6 +96,13 @@
                   <option value="diffusers">2048 short edge (reference, ~2.4x slower)</option>
                 </select>
               </div>
+              <div class="field span-all" id="ref-crop-row" hidden>
+                <label for="ref-crop">Reference framing</label>
+                <select id="ref-crop">
+                  <option value="off" selected>Always the whole image (default)</option>
+                  <option value="auto">Zoom in on small faces</option>
+                </select>
+              </div>
 
               <!-- ltx2-rapid native I2V: frame-0 conditioning strength. -->
               <div class="field" id="strength-row" hidden>
@@ -122,7 +130,7 @@
             </div>
           </section>
 
-          <section class="group">
+          <section class="group media-only">
             <h2>Size</h2>
             <div class="grid">
               <div class="field span-all" id="preset-row">
@@ -146,7 +154,7 @@
             </div>
           </section>
 
-          <section class="group">
+          <section class="group media-only">
             <h2>Quality and speed</h2>
             <div class="grid">
               <div class="field" id="steps-row">
@@ -308,9 +316,80 @@
             </div>
           </details>
 
+          <section class="group text-only">
+            <h2>Chat</h2>
+            <div class="grid">
+              <div class="field span-all">
+                <label for="system">System prompt</label>
+                <textarea id="system" rows="2" placeholder="(optional)"></textarea>
+              </div>
+              <div class="field">
+                <label for="max-tokens">Max tokens</label>
+                <input id="max-tokens" type="number" min="1" value="2048" />
+              </div>
+              <div class="field">
+                <label for="temperature">Temperature</label>
+                <input id="temperature" type="text" inputmode="decimal" placeholder="(model default)" />
+              </div>
+              <div class="field">
+                <label for="top-p">Top-p</label>
+                <input id="top-p" type="text" inputmode="decimal" placeholder="(model default)" />
+              </div>
+              <div class="field">
+                <label for="top-k">Top-k</label>
+                <input id="top-k" type="text" inputmode="numeric" placeholder="(model default)" />
+              </div>
+              <div class="field">
+                <label for="min-p">Min-p</label>
+                <input id="min-p" type="text" inputmode="decimal" placeholder="(model default)" />
+              </div>
+              <div class="field">
+                <label for="presence-penalty">Presence penalty</label>
+                <input id="presence-penalty" type="text" inputmode="decimal" placeholder="(model default)" />
+              </div>
+              <div class="field">
+                <label for="repetition-penalty">Repetition penalty</label>
+                <input id="repetition-penalty" type="text" inputmode="decimal" placeholder="(off)" />
+              </div>
+              <div class="field">
+                <label for="text-seed">Seed</label>
+                <input id="text-seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />
+              </div>
+              <div class="field">
+                <label for="text-format">Reply format</label>
+                <select id="text-format">
+                  <option value="">Free text</option>
+                  <option value="jsonSchema">JSON Schema</option>
+                  <option value="lark">Lark grammar</option>
+                </select>
+              </div>
+              <div class="field span-all" id="text-format-field" hidden>
+                <label for="text-format-body">Schema / grammar (applies after any thinking)</label>
+                <textarea id="text-format-body" rows="5" spellcheck="false"></textarea>
+              </div>
+            </div>
+            <div class="checks">
+              <div class="check">
+                <input id="think" type="checkbox" />
+                <label for="think">Think before answering</label>
+              </div>
+              <div class="check">
+                <input id="session-keep" type="checkbox" />
+                <label for="session-keep" title="The server keeps this chat's model state (encrypted under a key only this page holds, RAM only, forgotten after 30 min idle or on New chat), so each turn sends only the new message instead of re-reading the whole history.">Keep context on the server (faster turns)</label>
+              </div>
+            </div>
+            <div class="actions">
+              <button id="new-chat" type="button" class="secondary">New chat</button>
+            </div>
+          </section>
+
           <details class="group panel" id="advanced">
             <summary>Advanced</summary>
             <div class="grid">
+              <div class="field">
+                <label for="priority">Queue priority</label>
+                <input id="priority" type="number" step="1" value="0" title="Higher runs first. Waiting raises a job's priority over time, so background work still runs." />
+              </div>
               <div class="field" id="attn-window-row" hidden>
                 <label for="attn-window">Attention window (frames)</label>
                 <input id="attn-window" type="number" min="0" title="Latent-frame radius. Blank = model default (Wan2.2 3, AnyFlow/Hunyuan full). 0 = full attention. On AnyFlow the first denoise step always runs full attention (anchors the scene); the window speeds up the later steps." />
@@ -333,6 +412,7 @@
       <section class="card output" aria-live="polite">
         <p id="status">Idle.</p>
         <button id="cancel" type="button" class="danger" hidden>Cancel</button>
+        <div id="chat-out" class="chat text-only"></div>
         <div class="media">
           <img id="image-out" alt="Generated image" hidden />
           <video id="video-out" controls playsinline hidden></video>

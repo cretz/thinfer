@@ -36,6 +36,7 @@ pub mod hadamard;
 pub mod hunyuan_upsample3d;
 pub mod layernorm;
 pub mod leaky_relu;
+pub mod llm;
 pub mod matmul;
 pub mod matmul_coopmat;
 pub mod matmul_i8;
@@ -227,6 +228,8 @@ impl WeightDtype {
             Self::F16 => "wf16",
             Self::Quant(crate::quant::QuantKind::Q8_0) => "wq80",
             Self::Quant(crate::quant::QuantKind::Q4_0) => "wq40",
+            Self::Quant(crate::quant::QuantKind::Q5_0) => "wq50",
+            Self::Quant(crate::quant::QuantKind::Q5_1) => "wq51",
             Self::Quant(crate::quant::QuantKind::Q4_K) => "wq4k",
             Self::Quant(crate::quant::QuantKind::Q5_K) => "wq5k",
             Self::Quant(crate::quant::QuantKind::Q6_K) => "wq6k",

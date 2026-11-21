@@ -782,6 +782,22 @@ impl WgpuBackend {
         &self.device
     }
 
+    /// Zero `ids` on the GPU in one fire-and-forget submit (ordered after all
+    /// prior work): wipes job data (KV caches, recurrent state) out of buffers
+    /// before they go back to a pool or the allocator.
+    pub fn clear_buffers(&self, ids: &[GpuBufferId]) -> Result<(), WgpuError> {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("thinfer-wipe"),
+            });
+        for &id in ids {
+            enc.clear_buffer(&*self.get_buffer(id)?, 0, None);
+        }
+        self.queue.submit([enc.finish()]);
+        Ok(())
+    }
+
     fn create_plain_buffer(
         &self,
         bytes: u64,

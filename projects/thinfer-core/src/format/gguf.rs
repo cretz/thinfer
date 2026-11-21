@@ -98,7 +98,15 @@ pub struct GgufHeader {
     /// Number of header bytes consumed (== `tensor_data_offset`).
     pub header_bytes: u64,
     pub tensors: Vec<GgufTensorInfo>,
+    /// Unsigned-integer metadata (scalars as one element, arrays of at most
+    /// [`MAX_KEPT_ARRAY`] elements), by key: architecture constants a loader
+    /// needs beyond `config.json` (e.g. hash parameters).
+    pub uints: HashMap<String, Vec<u64>>,
 }
+
+/// Longest unsigned array kept in [`GgufHeader::uints`] (token-sized arrays
+/// are walked, not kept).
+const MAX_KEPT_ARRAY: u64 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct GgufTensorInfo {
@@ -159,6 +167,7 @@ pub fn parse_header(buf: &[u8]) -> Result<GgufHeader, ParseError> {
     // without retaining the value, but we still have to walk the bytes.
     let mut alignment: u64 = DEFAULT_ALIGNMENT;
     let mut orig_shapes: HashMap<String, Shape> = HashMap::new();
+    let mut uints: HashMap<String, Vec<u64>> = HashMap::new();
     for _ in 0..n_kv {
         let key = c.read_string()?;
         let vtype = c.read_u32()?;
@@ -170,7 +179,16 @@ pub fn parse_header(buf: &[u8]) -> Result<GgufHeader, ParseError> {
             }
             continue;
         }
+        if vtype == VT_ARRAY {
+            if let Some(v) = read_uint_array(&mut c)? {
+                uints.insert(key, v);
+            }
+            continue;
+        }
         let v = parse_value(&mut c, vtype)?;
+        if let Some(x) = v {
+            uints.insert(key.clone(), vec![x]);
+        }
         if let Some(parsed) = v
             && key == "general.alignment"
         {
@@ -221,6 +239,7 @@ pub fn parse_header(buf: &[u8]) -> Result<GgufHeader, ParseError> {
         tensor_data_offset,
         header_bytes: tensor_data_offset,
         tensors,
+        uints,
     })
 }
 
@@ -305,6 +324,8 @@ pub fn encoding_from_ggml_type(t: u32) -> Option<StorageEncoding> {
         0 => Some(StorageEncoding::F32),
         1 => Some(StorageEncoding::F16),
         2 => Some(StorageEncoding::Quant(QuantKind::Q4_0)),
+        6 => Some(StorageEncoding::Quant(QuantKind::Q5_0)),
+        7 => Some(StorageEncoding::Quant(QuantKind::Q5_1)),
         8 => Some(StorageEncoding::Quant(QuantKind::Q8_0)),
         12 => Some(StorageEncoding::Quant(QuantKind::Q4_K)),
         13 => Some(StorageEncoding::Quant(QuantKind::Q5_K)),
@@ -432,6 +453,29 @@ fn parse_value(c: &mut Cursor<'_>, vt: u32) -> Result<Option<u64>, ParseError> {
     })
 }
 
+/// An array value (cursor after its value type) of unsigned integers with at
+/// most [`MAX_KEPT_ARRAY`] elements, or `None` (still fully consumed).
+fn read_uint_array(c: &mut Cursor<'_>) -> Result<Option<Vec<u64>>, ParseError> {
+    let inner = c.read_u32()?;
+    let len = c.read_u64()?;
+    if len > MAX_ARRAY_LEN {
+        return Err(ParseError::Oversized {
+            field: "array_len",
+            got: len,
+            max: MAX_ARRAY_LEN,
+        });
+    }
+    let keep = len <= MAX_KEPT_ARRAY && matches!(inner, VT_U8 | VT_U16 | VT_U32 | VT_U64);
+    let mut out = Vec::with_capacity(if keep { len as usize } else { 0 });
+    for _ in 0..len {
+        match parse_value(c, inner)? {
+            Some(v) if keep => out.push(v),
+            _ => {}
+        }
+    }
+    Ok(keep.then_some(out))
+}
+
 /// The comfy converter's per-tensor logical-shape metadata key prefix.
 const ORIG_SHAPE_PREFIX: &str = "comfy.gguf.orig_shape.";
 
@@ -556,6 +600,7 @@ const HEADER_READ_GROW: u64 = 1 << 22; // 4 MiB per retry
 pub struct GgufSource<F: FileOpener> {
     catalog: WeightCatalog,
     opener: F,
+    uints: HashMap<String, Vec<u64>>,
 }
 
 impl<F: FileOpener> GgufSource<F> {
@@ -593,7 +638,16 @@ impl<F: FileOpener> GgufSource<F> {
             }
         };
         let catalog = catalog_from(&header, Some(total));
-        Ok(Self { catalog, opener })
+        Ok(Self {
+            catalog,
+            opener,
+            uints: header.uints,
+        })
+    }
+
+    /// Unsigned-integer metadata `key` (see [`GgufHeader::uints`]).
+    pub fn uints(&self, key: &str) -> Option<&[u64]> {
+        self.uints.get(key).map(Vec::as_slice)
     }
 
     pub fn catalog(&self) -> &WeightCatalog {

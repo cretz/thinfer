@@ -16,6 +16,7 @@ mod api;
 mod config;
 mod job;
 mod jobspec;
+mod sessions;
 mod uploads;
 mod vault;
 mod web;
@@ -154,7 +155,9 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
     std::fs::create_dir_all(&config.artifact_dir)
         .map_err(|e| format!("create {}: {e}", config.artifact_dir.display()))?;
 
-    let store = Arc::new(JobStore::default());
+    let store = Arc::new(JobStore::new(std::time::Duration::from_secs(
+        config.queue_aging_secs.max(1),
+    )));
     let backend_cfg = config.backend_config();
     // Probe coopmat (tensor-core) support once at startup: build a throwaway
     // device, check, drop it (no VRAM held across jobs). Surfaced to the web UI
@@ -189,6 +192,13 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
         store.clone(),
         std::time::Duration::from_secs(config.retention_secs),
     );
+    let session_budget =
+        thinfer_app::parse_budget("session_ram_budget", Some(&config.session_ram_budget))?;
+    let sessions = Arc::new(sessions::SessionStore::new(
+        session_budget,
+        std::time::Duration::from_secs(config.session_ttl_secs.max(1)),
+    ));
+    sessions::spawn_reaper(sessions.clone());
     let config_arc = Arc::new(config.clone());
     let workers = config.workers.max(1);
     for i in 0..workers {
@@ -198,6 +208,7 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
                 store: store.clone(),
                 config: config_arc.clone(),
                 uploads: uploads.clone(),
+                sessions: sessions.clone(),
             },
         );
     }
@@ -209,6 +220,7 @@ async fn serve(config_path: Option<String>) -> Result<(), String> {
         coopmat_supported,
         vault: Arc::new(thinfer_app::vault::Vault::new(vault_dir)),
         uploads,
+        sessions,
     };
     let app = api::router(state)
         .merge(web)

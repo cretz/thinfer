@@ -17,6 +17,14 @@ pub enum QuantKind {
     /// 32 elements/block. `f16 d` + `u4 qs[32]` (packed, low-nibble first)
     /// = 18 bytes. Dequant: `f = (i8(nib) - 8) * f32(d)`.
     Q4_0,
+    /// 32 elements/block. `f16 d` + `u32 qh` (5th bits) + `u4 qs[32]` (same
+    /// nibble order as Q5_1) = 22 bytes. Dequant: `f = ((nib | qh_bit << 4) -
+    /// 16) * d`.
+    Q5_0,
+    /// 32 elements/block. `f16 d` + `f16 m` + `u32 qh` (5th bits) + `u4
+    /// qs[32]` (element j low nibble of byte j, element j + 16 high nibble)
+    /// = 24 bytes. Dequant: `f = (nib | qh_bit << 4) * d + m`.
+    Q5_1,
     /// 256-elem super-block, 8 sub-blocks of 32. `f16 d` + `f16 dmin` +
     /// `u8 scales[12]` (6-bit packed sc/m, 8 each) + `u4 qs[256]` = 144 B.
     /// Per sub-block: `f = d*sc[s]*nib - dmin*m[s]`.
@@ -38,6 +46,8 @@ impl QuantKind {
         match self {
             Self::Q8_0 => 32,
             Self::Q4_0 => 32,
+            Self::Q5_0 => 32,
+            Self::Q5_1 => 32,
             Self::Q4_K => 256,
             Self::Q5_K => 256,
             Self::Q6_K => 256,
@@ -51,6 +61,8 @@ impl QuantKind {
         match self {
             Self::Q8_0 => 34,
             Self::Q4_0 => 18,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
             Self::Q4_K => 144,
             Self::Q5_K => 176,
             Self::Q6_K => 210,
@@ -73,6 +85,8 @@ impl QuantKind {
         match self {
             Self::Q8_0 => "q80",
             Self::Q4_0 => "q40",
+            Self::Q5_0 => "q50",
+            Self::Q5_1 => "q51",
             Self::Q4_K => "q4k",
             Self::Q5_K => "q5k",
             Self::Q6_K => "q6k",
@@ -93,6 +107,8 @@ impl QuantKind {
         match self {
             Self::Q8_0 => "load_b_block_q8_0",
             Self::Q4_0 => "load_b_block_q4_0",
+            Self::Q5_0 => "load_b_block_q5_0",
+            Self::Q5_1 => "load_b_block_q5_1",
             Self::Q4_K => "load_b_block_q4_k",
             Self::Q5_K => "load_b_block_q5_k",
             Self::Q6_K => "load_b_block_q6_k",
@@ -110,6 +126,8 @@ impl QuantKind {
         match self {
             Self::Q8_0 => "block_init_q8_0",
             Self::Q4_0 => "block_init_q4_0",
+            Self::Q5_0 => "block_init_q5_0",
+            Self::Q5_1 => "block_init_q5_1",
             Self::Q4_K => "block_init_q4_k",
             Self::Q5_K => "block_init_q5_k",
             Self::Q6_K => "block_init_q6_k",
@@ -125,6 +143,8 @@ impl QuantKind {
         match self {
             Self::Q8_0 => "block_elem_q8_0",
             Self::Q4_0 => "block_elem_q4_0",
+            Self::Q5_0 => "block_elem_q5_0",
+            Self::Q5_1 => "block_elem_q5_1",
             Self::Q4_K => "block_elem_q4_k",
             Self::Q5_K => "block_elem_q5_k",
             Self::Q6_K => "block_elem_q6_k",
@@ -140,6 +160,8 @@ impl QuantKind {
         match self {
             Self::Q8_0 => "block_elem4_q8_0",
             Self::Q4_0 => "block_elem4_q4_0",
+            Self::Q5_0 => "block_elem4_q5_0",
+            Self::Q5_1 => "block_elem4_q5_1",
             Self::Q4_K => "block_elem4_q4_k",
             Self::Q5_K => "block_elem4_q5_k",
             Self::Q6_K => "block_elem4_q6_k",
@@ -353,6 +375,89 @@ fn load_b_block_q4_0(byte0: u32, dst: ptr<function, array<f32, 32u>>) {
     let st = block_init_q4_0(byte0);
     for (var i: u32 = 0u; i < 32u; i = i + 1u) {
         (*dst)[i] = block_elem_q4_0(byte0, st, i);
+    }
+}
+"#;
+
+/// Q5_0: 22 bytes. `f16 d` + `u32 qh` + 16 packed-nibble bytes. State carries
+/// `d` and `qh` (byte0 is 2-byte aligned: 22 B stride, so `b_word_at`).
+const Q5_0_BODY: &str = r#"
+struct BlockState_Q5_0 {
+    d: f32,
+    qh: u32,
+}
+
+fn block_init_q5_0(byte0: u32) -> BlockState_Q5_0 {
+    return BlockState_Q5_0(f16_at(byte0), b_word_at(byte0 + 2u));
+}
+
+fn block_elem_q5_0(byte0: u32, st: BlockState_Q5_0, elem: u32) -> f32 {
+    let pair: u32 = elem & 15u;
+    let hi: u32 = (elem >> 4u) & 1u;
+    let nib: u32 = (b_byte(byte0 + 6u + pair) >> (hi * 4u)) & 0xFu;
+    let q: u32 = nib | (((st.qh >> elem) & 1u) << 4u);
+    return (f32(q) - 16.0) * st.d;
+}
+
+// vec4 dequant: `elem_start % 4 == 0`, so the 4 elements share a nibble half.
+fn block_elem4_q5_0(byte0: u32, st: BlockState_Q5_0, elem_start: u32) -> vec4<f32> {
+    let hi_half: u32 = elem_start >> 4u;
+    let word: u32 = b_word_at(byte0 + 6u + (elem_start & 15u));
+    let ns: u32 = hi_half * 4u;
+    let h: u32 = st.qh >> elem_start;
+    let q0: u32 = ((word >> ns) & 0xFu) | ((h & 1u) << 4u);
+    let q1: u32 = ((word >> (8u + ns)) & 0xFu) | (((h >> 1u) & 1u) << 4u);
+    let q2: u32 = ((word >> (16u + ns)) & 0xFu) | (((h >> 2u) & 1u) << 4u);
+    let q3: u32 = ((word >> (24u + ns)) & 0xFu) | (((h >> 3u) & 1u) << 4u);
+    return (vec4<f32>(f32(q0), f32(q1), f32(q2), f32(q3)) - vec4<f32>(16.0)) * st.d;
+}
+
+fn load_b_block_q5_0(byte0: u32, dst: ptr<function, array<f32, 32u>>) {
+    let st = block_init_q5_0(byte0);
+    for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        (*dst)[i] = block_elem_q5_0(byte0, st, i);
+    }
+}
+"#;
+
+/// Q5_1: 24 bytes. `f16 d` + `f16 m` + `u32 qh` + 16 packed-nibble bytes.
+/// State carries `d`, `m` and `qh` (byte0 is 4-byte aligned: 24 B stride).
+const Q5_1_BODY: &str = r#"
+struct BlockState_Q5_1 {
+    d: f32,
+    m: f32,
+    qh: u32,
+}
+
+fn block_init_q5_1(byte0: u32) -> BlockState_Q5_1 {
+    return BlockState_Q5_1(f16_at(byte0), f16_at(byte0 + 2u), b_word_at(byte0 + 4u));
+}
+
+fn block_elem_q5_1(byte0: u32, st: BlockState_Q5_1, elem: u32) -> f32 {
+    let pair: u32 = elem & 15u;
+    let hi: u32 = (elem >> 4u) & 1u;
+    let nib: u32 = (b_byte(byte0 + 8u + pair) >> (hi * 4u)) & 0xFu;
+    let q: u32 = nib | (((st.qh >> elem) & 1u) << 4u);
+    return f32(q) * st.d + st.m;
+}
+
+// vec4 dequant: `elem_start % 4 == 0`, so the 4 elements share a nibble half.
+fn block_elem4_q5_1(byte0: u32, st: BlockState_Q5_1, elem_start: u32) -> vec4<f32> {
+    let hi_half: u32 = elem_start >> 4u;
+    let word: u32 = b_word_at(byte0 + 8u + (elem_start & 15u));
+    let ns: u32 = hi_half * 4u;
+    let h: u32 = st.qh >> elem_start;
+    let q0: u32 = ((word >> ns) & 0xFu) | ((h & 1u) << 4u);
+    let q1: u32 = ((word >> (8u + ns)) & 0xFu) | (((h >> 1u) & 1u) << 4u);
+    let q2: u32 = ((word >> (16u + ns)) & 0xFu) | (((h >> 2u) & 1u) << 4u);
+    let q3: u32 = ((word >> (24u + ns)) & 0xFu) | (((h >> 3u) & 1u) << 4u);
+    return vec4<f32>(f32(q0), f32(q1), f32(q2), f32(q3)) * st.d + vec4<f32>(st.m);
+}
+
+fn load_b_block_q5_1(byte0: u32, dst: ptr<function, array<f32, 32u>>) {
+    let st = block_init_q5_1(byte0);
+    for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        (*dst)[i] = block_elem_q5_1(byte0, st, i);
     }
 }
 "#;
@@ -684,12 +789,16 @@ impl QuantKind {
     pub fn wgsl(self) -> &'static str {
         static Q8_0_S: OnceLock<String> = OnceLock::new();
         static Q4_0_S: OnceLock<String> = OnceLock::new();
+        static Q5_0_S: OnceLock<String> = OnceLock::new();
+        static Q5_1_S: OnceLock<String> = OnceLock::new();
         static Q4_K_S: OnceLock<String> = OnceLock::new();
         static Q5_K_S: OnceLock<String> = OnceLock::new();
         static Q6_K_S: OnceLock<String> = OnceLock::new();
         match self {
             Self::Q8_0 => cached(&Q8_0_S, Q8_0_BODY),
             Self::Q4_0 => cached(&Q4_0_S, Q4_0_BODY),
+            Self::Q5_0 => cached(&Q5_0_S, Q5_0_BODY),
+            Self::Q5_1 => cached(&Q5_1_S, Q5_1_BODY),
             Self::Q4_K => cached(&Q4_K_S, Q4_K_BODY),
             Self::Q5_K => cached(&Q5_K_S, Q5_K_BODY),
             Self::Q6_K => cached(&Q6_K_S, Q6_K_BODY),
@@ -778,6 +887,63 @@ pub fn dequantize_row_q4_0(src: &[u8], dst: &mut [f32]) {
         let mut blk = [0f32; 32];
         dequantize_block_q4_0(&src[s..s + 18], &mut blk);
         dst[i * 32..(i + 1) * 32].copy_from_slice(&blk);
+    }
+}
+
+/// Dequantize one Q5_0 block (32 elements, 22 bytes), as llama.cpp's
+/// `dequantize_row_q5_0`.
+pub fn dequantize_block_q5_0(src: &[u8], dst: &mut [f32; 32]) {
+    assert!(src.len() >= 22, "Q5_0 block needs 22 bytes");
+    let d = half::f16::from_le_bytes([src[0], src[1]]).to_f32();
+    let qh = u32::from_le_bytes([src[2], src[3], src[4], src[5]]);
+    for j in 0..16 {
+        let byte = src[6 + j] as u32;
+        let lo = (byte & 0x0F) | (((qh >> j) & 1) << 4);
+        let hi = (byte >> 4) | (((qh >> (j + 16)) & 1) << 4);
+        dst[j] = (lo as i32 - 16) as f32 * d;
+        dst[j + 16] = (hi as i32 - 16) as f32 * d;
+    }
+}
+
+pub fn dequantize_row_q5_0(src: &[u8], dst: &mut [f32]) {
+    assert!(
+        src.len().is_multiple_of(22),
+        "Q5_0 buffer must be a whole number of 22-byte blocks"
+    );
+    assert_eq!(dst.len(), src.len() / 22 * 32);
+    for (blk, out) in src.chunks_exact(22).zip(dst.chunks_exact_mut(32)) {
+        let mut b = [0f32; 32];
+        dequantize_block_q5_0(blk, &mut b);
+        out.copy_from_slice(&b);
+    }
+}
+
+/// Dequantize one Q5_1 block (32 elements, 24 bytes), as llama.cpp's
+/// `dequantize_row_q5_1`.
+pub fn dequantize_block_q5_1(src: &[u8], dst: &mut [f32; 32]) {
+    assert!(src.len() >= 24, "Q5_1 block needs 24 bytes");
+    let d = half::f16::from_le_bytes([src[0], src[1]]).to_f32();
+    let m = half::f16::from_le_bytes([src[2], src[3]]).to_f32();
+    let qh = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+    for j in 0..16 {
+        let byte = src[8 + j] as u32;
+        let lo = (byte & 0x0F) | (((qh >> j) & 1) << 4);
+        let hi = (byte >> 4) | (((qh >> (j + 16)) & 1) << 4);
+        dst[j] = lo as f32 * d + m;
+        dst[j + 16] = hi as f32 * d + m;
+    }
+}
+
+pub fn dequantize_row_q5_1(src: &[u8], dst: &mut [f32]) {
+    assert!(
+        src.len().is_multiple_of(24),
+        "Q5_1 buffer must be a whole number of 24-byte blocks"
+    );
+    assert_eq!(dst.len(), src.len() / 24 * 32);
+    for (blk, out) in src.chunks_exact(24).zip(dst.chunks_exact_mut(32)) {
+        let mut b = [0f32; 32];
+        dequantize_block_q5_1(blk, &mut b);
+        out.copy_from_slice(&b);
     }
 }
 
@@ -1114,6 +1280,8 @@ pub fn dequantize_row(kind: QuantKind, src: &[u8], dst: &mut [f32]) {
     match kind {
         QuantKind::Q8_0 => dequantize_row_q8_0(src, dst),
         QuantKind::Q4_0 => dequantize_row_q4_0(src, dst),
+        QuantKind::Q5_0 => dequantize_row_q5_0(src, dst),
+        QuantKind::Q5_1 => dequantize_row_q5_1(src, dst),
         QuantKind::Q4_K => dequantize_row_q4_k(src, dst),
         QuantKind::Q5_K => dequantize_row_q5_k(src, dst),
         QuantKind::Q6_K => dequantize_row_q6_k(src, dst),
@@ -1128,7 +1296,7 @@ pub fn quantize_row(kind: QuantKind, src: &[f32], dst: &mut Vec<u8>) {
         QuantKind::Q8_0 => quantize_row_q8_0(src, dst),
         QuantKind::Q4_0 => quantize_row_q4_0(src, dst),
         QuantKind::Q4_K => quantize_row_q4_k(src, dst),
-        QuantKind::Q5_K | QuantKind::Q6_K => {
+        QuantKind::Q5_0 | QuantKind::Q5_1 | QuantKind::Q5_K | QuantKind::Q6_K => {
             panic!("quantize_row: no quantizer for {kind:?} (dequant-only scheme)")
         }
     }
@@ -1148,6 +1316,51 @@ mod tests {
     fn q4_0_layout() {
         assert_eq!(QuantKind::Q4_0.block_size(), 32);
         assert_eq!(QuantKind::Q4_0.bytes_per_block(), 18);
+    }
+
+    #[test]
+    fn q5_0_layout_and_dequant() {
+        assert_eq!(QuantKind::Q5_0.block_size(), 32);
+        assert_eq!(QuantKind::Q5_0.bytes_per_block(), 22);
+        // d = 0.25, element j stores q = j (5 bits): f = (j - 16) * 0.25.
+        let mut blk = vec![0u8; 22];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+        let mut qh = 0u32;
+        for j in 0..32u32 {
+            qh |= ((j >> 4) & 1) << j;
+            let (byte, shift) = ((j % 16) as usize, if j < 16 { 0 } else { 4 });
+            blk[6 + byte] |= ((j & 15) as u8) << shift;
+        }
+        blk[2..6].copy_from_slice(&qh.to_le_bytes());
+        let mut out = vec![0f32; 32];
+        dequantize_row(QuantKind::Q5_0, &blk, &mut out);
+        for (j, v) in out.iter().enumerate() {
+            assert_eq!(*v, (j as f32 - 16.0) * 0.25, "element {j}");
+        }
+    }
+
+    #[test]
+    fn q5_1_layout_and_dequant() {
+        assert_eq!(QuantKind::Q5_1.block_size(), 32);
+        assert_eq!(QuantKind::Q5_1.bytes_per_block(), 24);
+        // d = 0.5, m = -2, element j has value j (low 4 bits in its nibble,
+        // bit 4 in qh): f = j * 0.5 - 2.
+        let mut blk = vec![0u8; 24];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        blk[2..4].copy_from_slice(&half::f16::from_f32(-2.0).to_le_bytes());
+        let mut qh = 0u32;
+        for j in 0..32u32 {
+            qh |= ((j >> 4) & 1) << j;
+            let nib = (j & 15) as u8;
+            let (byte, shift) = ((j % 16) as usize, if j < 16 { 0 } else { 4 });
+            blk[8 + byte] |= nib << shift;
+        }
+        blk[4..8].copy_from_slice(&qh.to_le_bytes());
+        let mut out = vec![0f32; 32];
+        dequantize_row(QuantKind::Q5_1, &blk, &mut out);
+        for (j, v) in out.iter().enumerate() {
+            assert_eq!(*v, j as f32 * 0.5 - 2.0, "element {j}");
+        }
     }
 
     #[test]
@@ -1187,6 +1400,8 @@ mod tests {
         for k in [
             QuantKind::Q8_0,
             QuantKind::Q4_0,
+            QuantKind::Q5_0,
+            QuantKind::Q5_1,
             QuantKind::Q4_K,
             QuantKind::Q5_K,
             QuantKind::Q6_K,

@@ -17,9 +17,13 @@ pub mod gemm;
 #[cfg(not(target_os = "macos"))]
 pub mod gemm_fp4;
 #[cfg(not(target_os = "macos"))]
+mod host;
+#[cfg(not(target_os = "macos"))]
 pub mod interop;
 #[cfg(not(target_os = "macos"))]
 pub mod libs;
+#[cfg(not(target_os = "macos"))]
+pub mod llm;
 #[cfg(not(target_os = "macos"))]
 mod nvrtc;
 #[cfg(not(target_os = "macos"))]
