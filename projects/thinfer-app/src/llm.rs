@@ -32,20 +32,19 @@ use crate::tools::{self, FinishReason, Syntax};
 
 /// The engine's chat turn for a wire message.
 pub fn chat_message(m: thinfer_client::wire::TextMessage) -> chat::ChatMessage {
-    chat::ChatMessage {
-        tool_calls: m
-            .tool_calls
-            .into_iter()
-            .map(|mut c| chat::ChatToolCall {
-                id: std::mem::take(&mut c.id),
-                name: std::mem::take(&mut c.name),
-                arguments: c.arguments.take(),
-            })
-            .collect(),
-        tool_call_id: m.tool_call_id,
-        name: m.name,
-        ..chat::ChatMessage::new(&m.role, m.content)
-    }
+    let mut out = chat::ChatMessage::new(&m.role, m.content);
+    out.tool_calls = m
+        .tool_calls
+        .into_iter()
+        .map(|mut c| chat::ChatToolCall {
+            id: std::mem::take(&mut c.id),
+            name: std::mem::take(&mut c.name),
+            arguments: c.arguments.take(),
+        })
+        .collect();
+    out.tool_call_id = m.tool_call_id;
+    out.name = m.name;
+    out
 }
 
 /// Prompt tokens per prefill forward: one decoder step (bounds the

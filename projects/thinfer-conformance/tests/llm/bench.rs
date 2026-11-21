@@ -197,8 +197,10 @@ where
         tokenizer.decode(&produced, true).unwrap_or_default()
     );
     // The same prefill again on a fresh state, experts now cached in RAM /
-    // VRAM: the compute floor without disk reads.
+    // VRAM: the compute floor without disk reads. The decoded state is
+    // dropped first: the expert pool leaves room for one state only.
     model.times = Default::default();
+    drop(st);
     let mut st = model.new_state(&backend, &ws, max_ctx).expect("state");
     let t2 = Instant::now();
     model

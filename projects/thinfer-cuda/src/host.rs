@@ -37,6 +37,11 @@ impl MappedHostMem {
             },
             "cuMemHostAlloc",
         )?;
+        // The driver does not initialize the allocation, and `bytes()` hands
+        // it out as a slice: zero it first. Pinning already faulted every
+        // page in, and blocks are allocated off the critical path.
+        // SAFETY: `ptr` is a live allocation of `len` bytes.
+        unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0, len) };
         let mut dev_ptr = 0;
         // SAFETY: `ptr` is a live DEVICEMAP allocation.
         let r = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev_ptr, ptr, 0) };

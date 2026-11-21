@@ -37,3 +37,7 @@ default = ["http"]
 http = ["dep:reqwest", "dep:futures-util", "dep:tokio"]
 clap = ["dep:clap"]
 utoipa = ["dep:utoipa"]
+
+[[example]]
+name = "tool_loop"
+required-features = ["http"]

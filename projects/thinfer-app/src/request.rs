@@ -1358,14 +1358,29 @@ impl TextRequest {
         if self.max_tokens == 0 {
             return Err("--max-tokens must be > 0".into());
         }
-        if self.temperature.is_some_and(|t| t < 0.0) {
+        // Negated ranges so NaN fails too.
+        if self
+            .temperature
+            .is_some_and(|t| !(t >= 0.0 && t.is_finite()))
+        {
             return Err("--temperature must be >= 0".into());
         }
-        if self
-            .top_p
-            .is_some_and(|p| !(0.0..=1.0).contains(&p) || p == 0.0)
-        {
+        if self.top_p.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
             return Err("--top-p must be in (0, 1]".into());
+        }
+        if self.min_p.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
+            return Err("--min-p must be in [0, 1]".into());
+        }
+        if self.presence_penalty.is_some_and(|p| !p.is_finite()) {
+            return Err("--presence-penalty must be finite".into());
+        }
+        // The penalty divides positive logits and multiplies negative ones:
+        // zero or below would flip or blow up a seen token's logit.
+        if self
+            .repetition_penalty
+            .is_some_and(|p| !(p > 0.0 && p.is_finite()))
+        {
+            return Err("--repetition-penalty must be > 0".into());
         }
         if self.tools.is_empty() && self.tool_choice != crate::tools::ToolChoice::Auto {
             return Err("a tool choice needs tools".into());
@@ -1500,20 +1515,20 @@ impl std::fmt::Debug for ImageRequest {
 
 impl Drop for TextRequest {
     fn drop(&mut self) {
-        for m in &mut self.messages {
-            zeroize::Zeroize::zeroize(&mut m.content);
-            for c in &mut m.tool_calls {
-                zeroize::Zeroize::zeroize(&mut c.name);
-                crate::tools::wipe(&mut c.arguments);
-            }
-        }
+        // The messages wipe themselves (`ChatMessage`'s drop).
         for t in &mut self.tools {
             zeroize::Zeroize::zeroize(&mut t.name);
             zeroize::Zeroize::zeroize(&mut t.description);
             crate::tools::wipe(&mut t.parameters);
         }
-        if let Some(crate::text_format::TextFormat::Lark { grammar }) = &mut self.format {
-            zeroize::Zeroize::zeroize(grammar);
+        match &mut self.format {
+            Some(crate::text_format::TextFormat::Lark { grammar }) => {
+                zeroize::Zeroize::zeroize(grammar)
+            }
+            Some(crate::text_format::TextFormat::JsonSchema { schema }) => {
+                crate::tools::wipe(schema)
+            }
+            None => {}
         }
     }
 }
@@ -1866,5 +1881,57 @@ mod tests {
         let mut omni = trim_req(2, vec![5.0, 5.0]);
         omni.model = crate::model::VideoModelId::Fasth3Omni;
         assert!(omni.resolve_minimax(row_limit).is_err());
+    }
+
+    fn text(f: impl FnOnce(&mut super::TextRequest)) -> super::TextRequest {
+        let mut r = super::TextRequest {
+            model: crate::model::TextModelId::DEFAULT,
+            messages: vec![thinfer_models::llm::chat::ChatMessage::new("user", "hi")],
+            max_tokens: 8,
+            think: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            seed: None,
+            budget: thinfer_core::policy::ResidencyBudget {
+                ram_bytes: 0,
+                vram_bytes: 0,
+            },
+            output: None,
+            format: None,
+            session: None,
+            tools: Vec::new(),
+            tool_choice: crate::tools::ToolChoice::Auto,
+        };
+        f(&mut r);
+        r
+    }
+
+    #[test]
+    fn text_sampling_rejects_out_of_range_and_nan() {
+        assert!(text(|_| {}).validate().is_ok());
+        assert!(
+            text(|r| r.repetition_penalty = Some(1.1))
+                .validate()
+                .is_ok()
+        );
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                text(|r| r.repetition_penalty = Some(bad))
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(text(|r| r.temperature = Some(f32::NAN)).validate().is_err());
+        assert!(text(|r| r.top_p = Some(f32::NAN)).validate().is_err());
+        assert!(text(|r| r.min_p = Some(1.5)).validate().is_err());
+        assert!(
+            text(|r| r.presence_penalty = Some(f32::NAN))
+                .validate()
+                .is_err()
+        );
     }
 }

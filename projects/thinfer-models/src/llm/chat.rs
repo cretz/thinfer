@@ -1,9 +1,18 @@
 //! Chat prompt rendering with the model's own Jinja chat template (from the
 //! official repo), the same template transformers and llama.cpp render.
+//!
+//! Messages are job data. Every copy this module makes is wiped: messages
+//! and calls on drop, the strings handed to the template ([`Strings`]) once
+//! the render is done, and the rendered text as its buffer grows
+//! ([`WipingBuf`]). Strings the template engine derives internally (filter
+//! results such as `trim`, captured blocks) are outside our reach.
+
+use std::sync::Arc;
 
 use minijinja::{Environment, Error, ErrorKind, Value, context};
+use zeroize::Zeroize;
 
-/// One chat turn.
+/// One chat turn. Wiped on drop (move fields out with `std::mem::take`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     /// `system`, `user`, `assistant` or `tool` (a tool call's result).
@@ -16,13 +25,161 @@ pub struct ChatMessage {
     pub name: Option<String>,
 }
 
-/// One tool call of an assistant turn.
+/// One tool call of an assistant turn. Wiped on drop.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatToolCall {
     pub id: String,
     pub name: String,
     /// The arguments object.
     pub arguments: serde_json::Value,
+}
+
+impl Drop for ChatMessage {
+    fn drop(&mut self) {
+        self.content.zeroize();
+        if let Some(n) = &mut self.name {
+            n.zeroize();
+        }
+    }
+}
+
+impl Drop for ChatToolCall {
+    fn drop(&mut self) {
+        self.name.zeroize();
+        wipe_json(&mut self.arguments);
+    }
+}
+
+/// Wipe every string in `v`, object keys included (the object is left
+/// empty: its keys cannot be wiped in place).
+pub fn wipe_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => s.zeroize(),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(wipe_json),
+        serde_json::Value::Object(m) => {
+            for (mut k, mut v) in std::mem::take(m) {
+                k.zeroize();
+                wipe_json(&mut v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The template's values, built so every string in them is an `Arc<str>`
+/// this keeps: on drop, once the render has released its references, each
+/// is zeroed in place.
+#[derive(Default)]
+struct Strings(Vec<Arc<str>>);
+
+impl Strings {
+    fn str(&mut self, s: &str) -> Value {
+        let a: Arc<str> = Arc::from(s);
+        self.0.push(a.clone());
+        Value::from(a)
+    }
+
+    fn json(&mut self, v: &serde_json::Value) -> Value {
+        use serde_json::Value as J;
+        match v {
+            J::Null => Value::from(()),
+            J::Bool(b) => Value::from(*b),
+            J::Number(n) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => Value::from(i),
+                (None, Some(u)) => Value::from(u),
+                _ => Value::from(n.as_f64().unwrap_or(0.0)),
+            },
+            J::String(s) => self.str(s),
+            J::Array(a) => Value::from(a.iter().map(|x| self.json(x)).collect::<Vec<_>>()),
+            J::Object(m) => Value::from_iter(
+                m.iter()
+                    .map(|(k, v)| (self.str(k), self.json(v)))
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    /// The template's view of `m`: the OpenAI chat shape the official
+    /// templates read (`tool_calls[].function.{name, arguments}` with the
+    /// arguments as a mapping).
+    fn message(&mut self, m: &ChatMessage) -> Value {
+        let mut fields = vec![
+            (self.str("role"), self.str(&m.role)),
+            (self.str("content"), self.str(&m.content)),
+        ];
+        if !m.tool_calls.is_empty() {
+            let calls: Vec<Value> = m
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    let function = Value::from_iter([
+                        (self.str("name"), self.str(&c.name)),
+                        (self.str("arguments"), self.json(&c.arguments)),
+                    ]);
+                    Value::from_iter([
+                        (self.str("id"), self.str(&c.id)),
+                        (self.str("type"), self.str("function")),
+                        (self.str("function"), function),
+                    ])
+                })
+                .collect();
+            fields.push((self.str("tool_calls"), Value::from(calls)));
+        }
+        if let Some(id) = &m.tool_call_id {
+            fields.push((self.str("tool_call_id"), self.str(id)));
+        }
+        if let Some(n) = &m.name {
+            fields.push((self.str("name"), self.str(n)));
+        }
+        Value::from_iter(fields)
+    }
+}
+
+/// Strings a render left shared (so unwiped); tests assert it stays 0.
+#[cfg(test)]
+static UNWIPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for Strings {
+    fn drop(&mut self) {
+        for a in &mut self.0 {
+            let Some(s) = Arc::get_mut(a) else {
+                #[cfg(test)]
+                UNWIPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            };
+            // SAFETY: zero bytes are valid UTF-8, so the str stays valid.
+            unsafe { s.as_bytes_mut() }.zeroize();
+        }
+    }
+}
+
+/// The render's output buffer: growing moves the text into a larger
+/// allocation and wipes the old one; dropped unclaimed, it wipes itself.
+#[derive(Default)]
+struct WipingBuf(Vec<u8>);
+
+impl std::io::Write for WipingBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let need = self.0.len() + b.len();
+        if need > self.0.capacity() {
+            let mut grown = Vec::with_capacity(need.max(self.0.capacity() * 2).max(4096));
+            grown.extend_from_slice(&self.0);
+            self.0.zeroize();
+            self.0 = grown;
+        }
+        self.0.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for WipingBuf {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 impl ChatMessage {
@@ -38,41 +195,10 @@ impl ChatMessage {
 
     /// The result of tool call `id` (to tool `name`).
     pub fn tool_result(id: &str, name: &str, content: impl Into<String>) -> Self {
-        Self {
-            tool_call_id: Some(id.into()),
-            name: Some(name.into()),
-            ..Self::new("tool", content)
-        }
-    }
-
-    /// The template's view: the OpenAI chat shape the official templates
-    /// read (`tool_calls[].function.{name, arguments}` with the arguments
-    /// as a mapping).
-    fn to_value(&self) -> Value {
-        let mut m = serde_json::Map::new();
-        m.insert("role".into(), self.role.clone().into());
-        m.insert("content".into(), self.content.clone().into());
-        if !self.tool_calls.is_empty() {
-            let calls: Vec<serde_json::Value> = self
-                .tool_calls
-                .iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": {"name": c.name, "arguments": c.arguments},
-                    })
-                })
-                .collect();
-            m.insert("tool_calls".into(), calls.into());
-        }
-        if let Some(id) = &self.tool_call_id {
-            m.insert("tool_call_id".into(), id.clone().into());
-        }
-        if let Some(n) = &self.name {
-            m.insert("name".into(), n.clone().into());
-        }
-        Value::from_serialize(serde_json::Value::Object(m))
+        let mut m = Self::new("tool", content);
+        m.tool_call_id = Some(id.into());
+        m.name = Some(name.into());
+        m
     }
 }
 
@@ -98,22 +224,35 @@ pub fn render(
     });
     env.add_template("chat", &src)
         .map_err(|e| format!("chat template: {e}"))?;
-    let msgs: Vec<Value> = messages.iter().map(ChatMessage::to_value).collect();
+    // Declared before the values so it drops after them (and after the
+    // render released them): only then are its strings unshared.
+    let mut strings = Strings::default();
+    let msgs: Vec<Value> = messages.iter().map(|m| strings.message(m)).collect();
     let tools = match tools.is_empty() {
         true => Value::from(()),
-        false => Value::from_serialize(tools),
+        false => Value::from(tools.iter().map(|t| strings.json(t)).collect::<Vec<_>>()),
     };
+    let mut out = WipingBuf::default();
     env.get_template("chat")
         .and_then(|t| {
-            t.render(context! {
-                messages => msgs,
-                tools => tools,
-                add_generation_prompt => true,
-                enable_thinking => thinking,
-                bos_token => bos,
-            })
+            t.render_captured_to(
+                context! {
+                    messages => msgs,
+                    tools => tools,
+                    add_generation_prompt => true,
+                    enable_thinking => thinking,
+                    bos_token => bos,
+                },
+                &mut out,
+            )
+            .map(drop)
         })
-        .map_err(|e| format!("render chat template: {e}"))
+        .map_err(|e| format!("render chat template: {e}"))?;
+    String::from_utf8(std::mem::take(&mut out.0)).map_err(|e| {
+        let mut bytes = e.into_bytes();
+        bytes.zeroize();
+        "render chat template: output is not UTF-8".to_string()
+    })
 }
 
 /// Stand-ins for an earlier exchange (private-use code points: never in a
@@ -154,9 +293,10 @@ pub fn continuation(
             .collect();
     }
     let calls = prior.tool_calls.len();
+    // Clones are wiped on drop (`ChatMessage`), and so is the full render.
     let mut all = vec![ChatMessage::new("user", PRIOR_USER), prior];
     all.extend(messages.iter().cloned());
-    let full = render(template, &all, tools, thinking, bos)?;
+    let mut full = zeroize::Zeroizing::new(render(template, &all, tools, thinking, bos)?);
     let user = full
         .find(PRIOR_USER)
         .ok_or("chat template dropped the prior turn")?;
@@ -181,7 +321,7 @@ pub fn continuation(
             at
         }
     };
-    Ok(full[cut..].to_string())
+    Ok(full.split_off(cut))
 }
 
 /// Remove every `{%- name %}` / `{% name %}` / `{%- name -%}` tag.
@@ -254,6 +394,27 @@ mod tests {
             out,
             "[tools:roll]<|user|>roll<|end|><|assistant|><call>roll{\"sides\":6}</call><|end|><result>4</result><|assistant|>"
         );
+    }
+
+    #[test]
+    fn render_releases_every_string_for_wiping() {
+        let tpl = "{% for m in messages %}{{ m.role }}:{{ m.content }}\
+            {% for c in m.tool_calls or [] %}[{{ c.function.name }} {{ c.function.arguments | tojson }}]{% endfor %}\
+            {% endfor %}{% for t in tools or [] %}<{{ t.name }}>{% endfor %}";
+        let mut call = ChatMessage::new("assistant", "");
+        call.tool_calls.push(ChatToolCall {
+            id: "c1".into(),
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"city": "Lisbon"}),
+        });
+        let msgs = [ChatMessage::new("user", "secret prompt"), call];
+        let tools = [serde_json::json!({"name": "get_weather"})];
+        let before = UNWIPED.load(std::sync::atomic::Ordering::SeqCst);
+        let out = render(tpl, &msgs, &tools, false, "").unwrap();
+        assert!(out.contains("user:secret prompt"), "{out}");
+        assert!(out.contains("[get_weather {\"city\":\"Lisbon\"}]"), "{out}");
+        assert!(out.contains("<get_weather>"), "{out}");
+        assert_eq!(UNWIPED.load(std::sync::atomic::Ordering::SeqCst), before);
     }
 
     #[test]

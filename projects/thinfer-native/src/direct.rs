@@ -78,13 +78,13 @@ pub(crate) async fn read_batch(
     let mut runs: Vec<Run> = Vec::new();
     for i in order {
         let (off, dst) = (reqs[i].0, &mut *reqs[i].1);
-        let end = off + dst.len() as u64;
-        if end > len {
+        // Checked: a wrapped sum would slip under `len`.
+        let Some(end) = off.checked_add(dst.len() as u64).filter(|&e| e <= len) else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "read past file end",
             ));
-        }
+        };
         let part = (off, RawChunk(dst.as_mut_ptr(), dst.len()));
         match runs.last_mut() {
             Some(r) if off <= r.end + MERGE_GAP && end.max(r.end) - r.start <= MAX_RUN => {

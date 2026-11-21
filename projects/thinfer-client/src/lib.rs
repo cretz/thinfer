@@ -8,7 +8,8 @@
 //! plaintext. Text sessions ([`Session`]) keep the model's state on the
 //! server, sealed under a key only the client holds.
 //!
-//! ```no_run
+#![cfg_attr(feature = "http", doc = "```no_run")]
+#![cfg_attr(not(feature = "http"), doc = "```ignore")]
 //! use thinfer_client::wire::{ImageSpec, JobSpec};
 //! use thinfer_client::{Client, Update};
 //!
