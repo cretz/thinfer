@@ -87,9 +87,9 @@ pub struct RemoteArgs {
     #[arg(long, requires = "remote")]
     pub remote_cert: Option<PathBuf>,
     /// Accept any certificate from the `--remote` server (a `tls_self_signed`
-    /// one: it is minted fresh at each start). The job stays sealed, but the
-    /// bearer token and the job's metadata are then open to anyone on the
-    /// network path.
+    /// one: it is minted fresh at each start). Trusted networks only: anyone on
+    /// the network path can then pose as the server and receive the job key,
+    /// which decrypts the job's inputs and outputs, and the bearer token.
     #[arg(long, requires = "remote")]
     pub remote_insecure: bool,
 }

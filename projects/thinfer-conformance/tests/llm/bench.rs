@@ -7,6 +7,8 @@
 //! `THINFER_LLM_RAM_GB` set the decode length and budgets;
 //! `THINFER_LLM_BENCH_REPEAT` repeats the prompt (a long chat's prefill).
 
+#![cfg(feature = "llm-e2e")]
+
 use std::future::Future;
 use std::time::Instant;
 

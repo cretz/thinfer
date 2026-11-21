@@ -1503,10 +1503,12 @@ impl Drop for TextRequest {
         for m in &mut self.messages {
             zeroize::Zeroize::zeroize(&mut m.content);
             for c in &mut m.tool_calls {
+                zeroize::Zeroize::zeroize(&mut c.name);
                 crate::tools::wipe(&mut c.arguments);
             }
         }
         for t in &mut self.tools {
+            zeroize::Zeroize::zeroize(&mut t.name);
             zeroize::Zeroize::zeroize(&mut t.description);
             crate::tools::wipe(&mut t.parameters);
         }

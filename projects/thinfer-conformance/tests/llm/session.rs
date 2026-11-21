@@ -200,7 +200,12 @@ where
         .logits
         .to_vec();
 
+    // Panics on non-finite input: `f32::max` would skip a NaN.
     let max_diff = |x: &[f32], y: &[f32]| {
+        assert!(
+            x.iter().chain(y).all(|v| v.is_finite()),
+            "[{name}] non-finite logits"
+        );
         x.iter()
             .zip(y)
             .map(|(p, q)| (p - q).abs())

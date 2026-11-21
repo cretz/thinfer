@@ -5,6 +5,8 @@
 //! the last token + one decode step (the last row compared), which exercises
 //! the KV cache and any recurrent state carry.
 
+#![cfg(feature = "llm-e2e")]
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;

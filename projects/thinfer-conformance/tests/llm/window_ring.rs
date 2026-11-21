@@ -32,7 +32,13 @@ fn argmax(v: &[f32]) -> u32 {
         .0 as u32
 }
 
+/// Largest absolute difference. Panics on non-finite input: `f32::max`
+/// would skip a NaN and report no drift.
 fn max_diff(x: &[f32], y: &[f32]) -> f32 {
+    assert!(
+        x.iter().chain(y).all(|v| v.is_finite()),
+        "non-finite logits"
+    );
     x.iter()
         .zip(y)
         .map(|(p, q)| (p - q).abs())

@@ -36,10 +36,10 @@ pub fn chat_message(m: thinfer_client::wire::TextMessage) -> chat::ChatMessage {
         tool_calls: m
             .tool_calls
             .into_iter()
-            .map(|c| chat::ChatToolCall {
-                id: c.id,
-                name: c.name,
-                arguments: c.arguments,
+            .map(|mut c| chat::ChatToolCall {
+                id: std::mem::take(&mut c.id),
+                name: std::mem::take(&mut c.name),
+                arguments: c.arguments.take(),
             })
             .collect(),
         tool_call_id: m.tool_call_id,

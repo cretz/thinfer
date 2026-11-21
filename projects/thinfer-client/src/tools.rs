@@ -66,13 +66,43 @@ impl std::fmt::Debug for ToolCall {
     }
 }
 
-/// Wipe every string in `v` (tool schemas, arguments: job data).
+/// Job data: the name and arguments are wiped on drop. Move fields out with
+/// `std::mem::take`.
+impl Drop for ToolCall {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.name);
+        wipe(&mut self.arguments);
+    }
+}
+
+/// Wipe every string in `v`, object keys included (tool schemas, arguments:
+/// job data). Objects are left empty: their keys cannot be wiped in place.
 pub fn wipe(v: &mut Value) {
     match v {
         Value::String(s) => zeroize::Zeroize::zeroize(s),
         Value::Array(a) => a.iter_mut().for_each(wipe),
-        Value::Object(m) => m.values_mut().for_each(wipe),
+        Value::Object(m) => {
+            for (mut k, mut v) in std::mem::take(m) {
+                zeroize::Zeroize::zeroize(&mut k);
+                wipe(&mut v);
+            }
+        }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wipe_clears_keys_and_values() {
+        let mut v = serde_json::json!({"secret_key": ["a", {"inner": "b"}], "n": 1});
+        wipe(&mut v);
+        assert_eq!(v, serde_json::json!({}));
+        let mut s = serde_json::json!(["plain", 2]);
+        wipe(&mut s);
+        assert_eq!(s, serde_json::json!(["", 2]));
     }
 }
 

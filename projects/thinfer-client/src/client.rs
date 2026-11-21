@@ -68,9 +68,11 @@ impl ClientBuilder {
         self
     }
 
-    /// Skip TLS certificate checks. Anyone on the path can then read and
-    /// change the traffic outside the sealed parts (and the bearer token):
-    /// prefer [`Self::root_certificate_pem`].
+    /// Skip TLS certificate checks. Anyone on the network path can then pose
+    /// as the server, and the job key is delivered to whoever answers: an
+    /// impersonator gets the key and with it every sealed input and output,
+    /// plus the bearer token. For a trusted network only; prefer
+    /// [`Self::root_certificate_pem`].
     pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
         self.accept_invalid_certs = accept;
         self
