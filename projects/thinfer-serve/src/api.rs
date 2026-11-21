@@ -17,8 +17,8 @@ use axum::routing::{get, post};
 use base64::Engine;
 use thinfer_app::jobkey::JobKey;
 use thinfer_app::wire::{
-    CreateResponse, CreateSession, JobKeyDelivery, JobList, JobPatch, JobStateKind, JobStatus,
-    SealedJob, SessionInfo, SessionPatch, UploadResponse,
+    Capabilities, CreateResponse, CreateSession, JobKeyDelivery, JobList, JobPatch, JobStateKind,
+    JobStatus, SealedJob, SessionInfo, SessionPatch, UploadResponse,
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -52,18 +52,12 @@ pub struct AppState {
 }
 
 /// `GET /capabilities` body: static server/GPU capabilities the UI adapts to.
-#[derive(serde::Serialize, utoipa::ToSchema)]
-struct CapabilitiesResponse {
-    /// GPU supports the coopmat (tensor-core) matmul path.
-    coopmat: bool,
-}
-
 #[utoipa::path(
     get, path = "/capabilities",
-    responses((status = 200, body = CapabilitiesResponse))
+    responses((status = 200, body = Capabilities))
 )]
-async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
-    Json(CapabilitiesResponse {
+async fn capabilities(State(state): State<AppState>) -> Json<Capabilities> {
+    Json(Capabilities {
         coopmat: state.coopmat_supported,
     })
 }
@@ -709,7 +703,7 @@ Tool calling: a text job with `tools` may end with `TextResult.finishReason` = `
         JobList,
         thinfer_app::wire::JobListEntry,
         thinfer_app::wire::JobEvent,
-        CapabilitiesResponse,
+        Capabilities,
         thinfer_app::wire::JobSpec,
         thinfer_app::wire::TextSpec,
         thinfer_app::wire::TextMessage,

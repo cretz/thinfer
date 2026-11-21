@@ -12,7 +12,6 @@ pub mod config;
 pub mod download;
 pub mod executor;
 pub mod hunyuan;
-#[cfg(any(feature = "vault", feature = "remote"))]
 pub mod jobkey;
 pub mod llm;
 pub mod ltx;
@@ -32,8 +31,7 @@ pub mod rewrite;
 #[cfg(feature = "vault")]
 pub mod vault;
 pub mod vsr;
-#[cfg(feature = "serde")]
-pub mod wire;
+pub use thinfer_client::wire;
 
 pub use config::{BackendConfig, DEFAULT_BUDGET_BYTES, ResidencyBudget, parse_budget, report_mem};
 pub use executor::LocalExecutor;

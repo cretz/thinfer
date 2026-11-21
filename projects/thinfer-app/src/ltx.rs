@@ -64,6 +64,7 @@ use thinfer_native::tokenizer::HfTokenizer;
 
 use crate::config::{ResidencyBudget, random_seed};
 use crate::download::resolve_role;
+use crate::model::VideoModelEngine;
 use crate::progress::{ProgressSink, Stage};
 use crate::request::{JobSummary, VideoFormat, VideoRequest};
 

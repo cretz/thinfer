@@ -2,6 +2,7 @@
 //! `--model` parses (so the list cannot drift from what the CLI accepts).
 
 use clap::ValueEnum;
+use thinfer_app::model::{ImageModelEngine, VideoModelEngine};
 use thinfer_app::model::{ImageModelId, SwapModel, VideoModelId};
 use thinfer_core::manifest::ModelManifest;
 use thinfer_native::sources;

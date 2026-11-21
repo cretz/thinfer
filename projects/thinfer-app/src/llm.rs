@@ -23,11 +23,30 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::random_seed;
 use crate::download::resolve_role;
+use crate::model::TextModelEngine;
 use crate::model::TextModelId;
 use crate::progress::ProgressSink;
 use crate::request::{JobSummary, SessionSave, TextRequest, TextStats};
 use crate::text_format::{self, Constraint};
 use crate::tools::{self, FinishReason, Syntax};
+
+/// The engine's chat turn for a wire message.
+pub fn chat_message(m: thinfer_client::wire::TextMessage) -> chat::ChatMessage {
+    chat::ChatMessage {
+        tool_calls: m
+            .tool_calls
+            .into_iter()
+            .map(|c| chat::ChatToolCall {
+                id: c.id,
+                name: c.name,
+                arguments: c.arguments,
+            })
+            .collect(),
+        tool_call_id: m.tool_call_id,
+        name: m.name,
+        ..chat::ChatMessage::new(&m.role, m.content)
+    }
+}
 
 /// Prompt tokens per prefill forward: one decoder step (bounds the
 /// activation workspace: a step's routed-expert pairs are `step * top_k` rows).
@@ -63,7 +82,7 @@ pub async fn run(
             )?),
             tools::REJECTED,
         )),
-        (true, Some(f)) => Some((f.grammar(), text_format::REJECTED)),
+        (true, Some(f)) => Some((text_format::top_level(f), text_format::REJECTED)),
         (true, None) => None,
     };
     // The constraint's view of the tokenizer, built (and the grammar

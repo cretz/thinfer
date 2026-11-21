@@ -3152,7 +3152,6 @@ dependencies = [
  "clap",
  "fdk-aac",
  "futures-channel",
- "futures-util",
  "image",
  "llguidance",
  "mp4",
@@ -3165,6 +3164,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thinfer-client",
  "thinfer-core",
  "thinfer-cuda",
  "thinfer-models",
@@ -3185,11 +3185,30 @@ dependencies = [
  "rpassword",
  "serde_json",
  "thinfer-app",
+ "thinfer-client",
  "thinfer-core",
  "thinfer-native",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "thinfer-client"
+version = "0.0.0"
+dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
+ "clap",
+ "futures-util",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "utoipa",
+ "zeroize",
 ]
 
 [[package]]

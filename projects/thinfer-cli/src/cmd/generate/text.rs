@@ -175,10 +175,7 @@ pub async fn run_text(args: GenerateText) -> Result<(), String> {
     convo.push(TextMessage::new("user", args.prompt.as_str()));
 
     let mut runner = match &args.remote.remote {
-        Some(url) => Runner::Remote(
-            RemoteExecutor::new(url, args.remote.remote_token.clone())?
-                .with_priority(args.remote.priority),
-        ),
+        Some(_) => Runner::Remote(args.remote.executor()?),
         None => {
             let ram = parse_budget(
                 "--ram-budget",
@@ -192,7 +189,11 @@ pub async fn run_text(args: GenerateText) -> Result<(), String> {
                 ram_bytes: ram,
                 vram_bytes: vram,
             };
-            let messages = convo.iter().cloned().map(TextMessage::into_chat).collect();
+            let messages = convo
+                .iter()
+                .cloned()
+                .map(thinfer_app::llm::chat_message)
+                .collect();
             let probe = request(&args, &defs, &choice, &format, messages, None, budget);
             probe.validate()?;
             let files = probe.required_files();
@@ -347,7 +348,10 @@ async fn run_once(
                     }),
                 ),
             };
-            let messages = messages.into_iter().map(TextMessage::into_chat).collect();
+            let messages = messages
+                .into_iter()
+                .map(thinfer_app::llm::chat_message)
+                .collect();
             let req = request(
                 args,
                 defs,

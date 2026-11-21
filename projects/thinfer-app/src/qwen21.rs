@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use crate::model::ImageModelEngine;
 use image::imageops::FilterType;
 use thinfer_core::backend::WgpuBackend;
 use thinfer_core::format::gguf::GgufSource;

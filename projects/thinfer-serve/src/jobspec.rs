@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use thinfer_app::JobRequest;
-use thinfer_app::jobkey::JobKey;
+use thinfer_app::jobkey::{JobKey, OpenLocked};
 use thinfer_app::model::{ImageModelId, SwapModel, TextModelId, VideoModelId};
 use thinfer_app::request::{
     FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, TextRequest,
@@ -63,7 +63,9 @@ fn open_session(
         path.push(thinfer_app::request::StateChunk {
             start: *start,
             end: *end,
-            bytes: key.open(sealed).map_err(|e| format!("session node: {e}"))?,
+            bytes: key
+                .open_locked(sealed)
+                .map_err(|e| format!("session node: {e}"))?,
         });
     }
     let session = thinfer_app::request::TextSession {
@@ -128,7 +130,7 @@ pub fn spec_into_request(
                 messages: s
                     .messages
                     .into_iter()
-                    .map(thinfer_app::wire::TextMessage::into_chat)
+                    .map(thinfer_app::llm::chat_message)
                     .collect(),
                 max_tokens: s.max_tokens.unwrap_or(2048),
                 think: s.think.unwrap_or(false),

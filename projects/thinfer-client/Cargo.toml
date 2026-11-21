@@ -1,0 +1,39 @@
+[package]
+name = "thinfer-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The client side of the thinfer-serve job API, usable by any Rust project:
+# the wire types, the model ids, per-job encryption, and (feature `http`, on by
+# default) an async HTTP client. No engine, GPU or codec dependencies.
+# thinfer-app builds on it (the CLI's `--remote`, the server's wire types).
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Per-job encryption (`jobkey`): AES-256-GCM, SHA-256 key proofs.
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+zeroize = "1"
+# Optional derives for the CLI (`ValueEnum`) and the server's OpenAPI schema.
+clap = { version = "4", features = ["derive"], optional = true }
+utoipa = { version = "5", optional = true }
+# The HTTP client. rustls so no OpenSSL/SChannel build dep; `stream` for the
+# SSE event body.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["time"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[features]
+default = ["http"]
+http = ["dep:reqwest", "dep:futures-util", "dep:tokio"]
+clap = ["dep:clap"]
+utoipa = ["dep:utoipa"]

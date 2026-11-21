@@ -24,7 +24,7 @@ use std::time::Duration;
 use thinfer_app::JobRequest;
 use thinfer_app::config::BackendConfig;
 use thinfer_app::download::{self, DownloadReporter, NullReporter};
-use thinfer_app::jobkey::JobKey;
+use thinfer_app::jobkey::{JobKey, OpenLocked};
 use thinfer_app::progress::{ProgressSink, Stage};
 use thinfer_app::wire::{JobEvent, JobResult, JobSpec};
 use thinfer_app::{JobSummary, LocalExecutor};
@@ -153,7 +153,7 @@ fn decrypt_request(
     key: &JobKey,
     sealed: &[u8],
 ) -> Result<Built, String> {
-    let spec_json = key.open(sealed)?;
+    let spec_json = key.open_locked(sealed)?;
     let spec: JobSpec =
         serde_json::from_slice(&spec_json).map_err(|e| format!("invalid job spec: {e}"))?;
     crate::jobspec::spec_into_request(

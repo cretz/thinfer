@@ -10,8 +10,9 @@ use thinfer_core::manifest::FileRef;
 use thinfer_core::policy::ResidencyBudget;
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelId, RefCrop, RefImageSize, RewriteQuality, SuperRes,
-    SwapModel, VaeChoice, VideoModelId, VideoSampler,
+    AttnPrecision, EncoderQuant, ImageModelEngine, ImageModelId, RefCrop, RefImageSize,
+    RewriteQuality, RewriteQualityEngine, SuperRes, SwapModel, SwapModelEngine, TextModelEngine,
+    VaeChoice, VaeChoiceEngine, VideoModelEngine, VideoModelId, VideoSampler,
 };
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
@@ -1548,6 +1549,7 @@ impl Drop for VideoRequest {
 #[cfg(test)]
 mod tests {
     use super::{VideoFormat, VideoRequest, resolve_frames};
+    use crate::model::VideoModelEngine;
     use crate::model::VideoModelId::FastwanTi2v5b as Fw;
 
     const FPS: u32 = 24;

@@ -79,6 +79,9 @@ shows them.
 `serve.toml` containing `tls_self_signed = true` gives HTTPS, required when opening
 it from another device. Open https://localhost:8080.
 
+Other Rust projects can drive the server through the `thinfer-client` crate (a git
+dependency; see `projects/thinfer-client/examples`).
+
 ## Options
 
 `--help` on any command lists everything. Common ones: `--model`, `--width`,

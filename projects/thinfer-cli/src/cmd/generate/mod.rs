@@ -82,6 +82,35 @@ pub struct RemoteArgs {
         allow_hyphen_values = true
     )]
     pub priority: i32,
+    /// Trust this PEM certificate for an HTTPS `--remote` (a server with
+    /// its own `tls_cert`), on top of the system roots.
+    #[arg(long, requires = "remote")]
+    pub remote_cert: Option<PathBuf>,
+    /// Accept any certificate from the `--remote` server (a `tls_self_signed`
+    /// one: it is minted fresh at each start). The job stays sealed, but the
+    /// bearer token and the job's metadata are then open to anyone on the
+    /// network path.
+    #[arg(long, requires = "remote")]
+    pub remote_insecure: bool,
+}
+
+impl RemoteArgs {
+    /// The executor for `--remote` (which must be set).
+    pub(super) fn executor(&self) -> Result<RemoteExecutor, String> {
+        let url = self.remote.as_deref().expect("executor without --remote");
+        let mut b =
+            thinfer_client::Client::builder(url).danger_accept_invalid_certs(self.remote_insecure);
+        if let Some(t) = &self.remote_token {
+            b = b.token(t.as_str());
+        }
+        if let Some(p) = &self.remote_cert {
+            let pem =
+                std::fs::read(p).map_err(|e| format!("--remote-cert {}: {e}", p.display()))?;
+            b = b.root_certificate_pem(&pem);
+        }
+        let client = b.build().map_err(|e| format!("--remote: {e}"))?;
+        Ok(RemoteExecutor::new(client).with_priority(self.priority))
+    }
 }
 
 /// Shared remote run path: submit `spec` to the `--remote` server, tail its SSE
@@ -92,12 +121,7 @@ pub(super) async fn run_remote(
     spec: JobSpec,
     output: PathBuf,
 ) -> Result<(), String> {
-    let url = remote
-        .remote
-        .as_deref()
-        .expect("run_remote without --remote");
-    let executor =
-        RemoteExecutor::new(url, remote.remote_token.clone())?.with_priority(remote.priority);
+    let executor = remote.executor()?;
     let sink = CliSink::new();
     let summary = executor.run(&spec, &output, &sink).await?;
     sink.footer(&summary);

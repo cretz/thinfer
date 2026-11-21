@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::model::{
+    ImageModelEngine, SwapModelEngine, VaeChoiceEngine, VideoModelEngine, VideoSamplerEngine,
+};
 use thinfer_core::backend::WgpuBackend;
 use thinfer_core::format::gguf::GgufSource;
 use thinfer_core::format::safetensors::SafetensorsSource;
@@ -838,7 +841,7 @@ impl LocalExecutor {
         let vae: VaeChoice = if matches!(req.model, VideoModelId::Wan22T2vA14b) {
             VaeChoice::Full
         } else {
-            req.vae.into()
+            req.vae.engine()
         };
 
         let mut weight_openers: Vec<MmapFileOpener> =
@@ -849,7 +852,7 @@ impl LocalExecutor {
         // The tiny decoder is an extra safetensors shard (disjoint keys), unioned
         // into the same catalog. Only when selected, so the parity path is
         // byte-for-byte the source it always was.
-        // `vae` here is the Wan-mapped choice (`req.vae.into()`), so a Hunyuan-only
+        // `vae` here is the Wan-mapped choice (`req.vae.engine()`), so a Hunyuan-only
         // `TinyFt` request has already collapsed to `Tiny` -- this load covers it.
         if vae == VaeChoice::Tiny {
             weight_openers

@@ -12,34 +12,19 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::model::TextModelEngine;
 use llguidance::api::TopLevelGrammar;
 use llguidance::toktrie::TokEnv;
 use llguidance::{Matcher, ParserFactory};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
-/// The shape the reply must take.
-#[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "serde", serde(tag = "type", rename_all = "camelCase"))]
-pub enum TextFormat {
-    /// A JSON Schema (the llguidance subset: types, properties, required,
-    /// enum/const, items, anyOf/oneOf, $ref/$defs, string patterns/lengths,
-    /// numeric bounds).
-    JsonSchema {
-        #[cfg_attr(feature = "serve", schema(value_type = Object))]
-        schema: serde_json::Value,
-    },
-    /// A Lark grammar (llguidance dialect; `start` is the entry rule).
-    Lark { grammar: String },
-}
+pub use thinfer_client::text_format::TextFormat;
 
-impl TextFormat {
-    pub fn grammar(&self) -> TopLevelGrammar {
-        match self {
-            Self::JsonSchema { schema } => TopLevelGrammar::from_json_schema(schema.clone()),
-            Self::Lark { grammar } => TopLevelGrammar::from_lark(grammar.clone()),
-        }
+/// The llguidance grammar for `format`.
+pub fn top_level(format: &TextFormat) -> TopLevelGrammar {
+    match format {
+        TextFormat::JsonSchema { schema } => TopLevelGrammar::from_json_schema(schema.clone()),
+        TextFormat::Lark { grammar } => TopLevelGrammar::from_lark(grammar.clone()),
     }
 }
 
@@ -77,7 +62,7 @@ fn factory(env: &TokEnv) -> Result<ParserFactory, String> {
 pub fn check(format: &TextFormat, tokenizer_json: &Path, stop: &[u32]) -> Result<(), String> {
     let env = tok_env(tokenizer_json, None, stop)?;
     factory(&env)?
-        .create_parser(format.grammar())
+        .create_parser(top_level(format))
         .map(|_| ())
         .map_err(|e| format!("invalid output format: {e}"))
 }
@@ -223,7 +208,7 @@ mod tests {
                 "additionalProperties": false,
             }),
         };
-        let mut c = Constraint::new(format.grammar(), &env, None, REJECTED).unwrap();
+        let mut c = Constraint::new(top_level(&format), &env, None, REJECTED).unwrap();
         // The opening `{` is forced at once, and the whole key soon after.
         let mut out = Vec::new();
         let mut logits = vec![0.0f32; 96];
@@ -271,7 +256,7 @@ mod tests {
         let bad = TextFormat::Lark {
             grammar: "start: secret_rule_name_xyz".into(),
         };
-        let err = Constraint::new(bad.grammar(), &env, None, REJECTED)
+        let err = Constraint::new(top_level(&bad), &env, None, REJECTED)
             .err()
             .unwrap();
         assert!(!err.contains("secret_rule_name_xyz"));
@@ -287,7 +272,7 @@ mod tests {
             grammar: "start: \"x\"".into(),
         };
         let gate = 2; // '#'
-        let mut c = Constraint::new(format.grammar(), &env, Some(gate), REJECTED).unwrap();
+        let mut c = Constraint::new(top_level(&format), &env, Some(gate), REJECTED).unwrap();
         let mut logits = vec![0.0f32; 96];
         c.mask(&mut logits).unwrap();
         assert!(logits.iter().all(|l| l.is_finite()));

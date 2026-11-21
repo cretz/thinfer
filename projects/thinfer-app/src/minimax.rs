@@ -75,6 +75,7 @@ use crate::download::resolve_role;
 use crate::executor::BytesOpener;
 use crate::minimax_ref;
 use crate::model::RefCrop;
+use crate::model::{VaeChoiceEngine, VideoModelEngine};
 use crate::progress::{ProgressSink, Stage};
 use crate::request::{JobSummary, VideoFormat, VideoRequest};
 
