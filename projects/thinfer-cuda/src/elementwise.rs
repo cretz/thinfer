@@ -201,6 +201,20 @@ extern "C" __global__ void __launch_bounds__(256) add_f32(
     if (i < n) out[i] = x[i] + y[i];
 }
 
+extern "C" __global__ void __launch_bounds__(256) snake_f32(
+    const float* __restrict__ x, const float* __restrict__ alpha,
+    const float* __restrict__ beta, float* __restrict__ out,
+    unsigned channels, unsigned inner, float eps, unsigned log_scale)
+{
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= channels * inner) return;
+    const unsigned c = i / inner;
+    const float a = log_scale ? expf(alpha[c]) : alpha[c];
+    const float inv = 1.f / ((log_scale ? expf(beta[c]) : beta[c]) + eps);
+    const float s = sinf(a * x[i]);
+    out[i] = x[i] + inv * s * s;
+}
+
 // The Wan DiT's f16 forms. h2f/f2h: f16 bits <-> f32 (round to nearest even,
 // clamped to the f16 range like the WGSL stores).
 __device__ __forceinline__ float h2f(unsigned short v) { return __half2float(__ushort_as_half(v)); }
@@ -581,6 +595,7 @@ pub struct ElementwiseKernels {
     gn_stats: sys::CUfunction,
     gn_apply: sys::CUfunction,
     add_f32: sys::CUfunction,
+    snake_f32: sys::CUfunction,
     dequant_q4_k: sys::CUfunction,
     dequant_q5_k: sys::CUfunction,
     dequant_q6_k: sys::CUfunction,
@@ -627,6 +642,7 @@ impl ElementwiseKernels {
             gn_stats: module.function(c"gn_stats", 0)?,
             gn_apply: module.function(c"gn_apply", 0)?,
             add_f32: module.function(c"add_f32", 0)?,
+            snake_f32: module.function(c"snake_f32", 0)?,
             dequant_q4_k: module.function(c"dequant_q4_k", 0)?,
             dequant_q5_k: module.function(c"dequant_q5_k", 0)?,
             dequant_q6_k: module.function(c"dequant_q6_k", 0)?,
@@ -873,6 +889,37 @@ impl ElementwiseKernels {
                     0,
                     &mut a,
                     "add_f32",
+                )?;
+            }
+            ElementwiseOp::SnakeF32 {
+                x,
+                alpha,
+                beta,
+                out,
+                channels,
+                inner,
+                eps,
+                log_scale,
+            } => {
+                let (mut x, mut al, mut be, mut out, mut c, mut l, mut e, mut lg) =
+                    (x, alpha, beta, out, channels, inner, eps, log_scale as u32);
+                let mut a: [*mut c_void; 8] = [
+                    (&raw mut x).cast(),
+                    (&raw mut al).cast(),
+                    (&raw mut be).cast(),
+                    (&raw mut out).cast(),
+                    (&raw mut c).cast(),
+                    (&raw mut l).cast(),
+                    (&raw mut e).cast(),
+                    (&raw mut lg).cast(),
+                ];
+                self.module.launch(
+                    self.snake_f32,
+                    (blocks(channels as u64 * inner as u64), 1, 1),
+                    256,
+                    0,
+                    &mut a,
+                    "snake_f32",
                 )?;
             }
             ElementwiseOp::LayerNormModulateF16 {

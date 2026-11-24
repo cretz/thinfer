@@ -90,7 +90,9 @@ impl Sampler {
         }
     }
 
-    fn uniform(&mut self) -> f32 {
+    /// The next draw of the stream [`Self::sample`] consumes (one per
+    /// non-greedy sample), for a sampler that runs elsewhere (the GPU).
+    pub fn uniform(&mut self) -> f32 {
         // splitmix64
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.state;

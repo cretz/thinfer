@@ -9,8 +9,10 @@ use thinfer_models::krea::manifest as kreamf;
 use thinfer_models::llm::manifest as llmmf;
 use thinfer_models::ltx::manifest as ltxmf;
 use thinfer_models::minimax::manifest as mmmf;
+use thinfer_models::moss_sfx::manifest as sfxmf;
 use thinfer_models::qwen_image::manifest as qimf;
 use thinfer_models::qwen_image21::manifest as qi21mf;
+use thinfer_models::qwen3_tts::manifest as ttsmf;
 use thinfer_models::wan::manifest as wanmf;
 use thinfer_models::z_image::manifest as zmf;
 
@@ -341,6 +343,29 @@ impl TextModelEngine for TextModelId {
 
     fn required_roles(self) -> &'static [&'static str] {
         llmmf::RUNTIME_ROLES
+    }
+}
+
+/// An audio id's engine side: its manifest and files.
+pub trait AudioModelEngine {
+    fn manifest(self) -> &'static ModelManifest;
+    fn required_roles(self) -> &'static [&'static str];
+}
+
+impl AudioModelEngine for AudioModelId {
+    fn manifest(self) -> &'static ModelManifest {
+        match self {
+            Self::Qwen3Tts => &ttsmf::BASE_MANIFEST,
+            Self::Qwen3TtsDesign => &ttsmf::DESIGN_MANIFEST,
+            Self::MossSfx => &sfxmf::MANIFEST,
+        }
+    }
+
+    fn required_roles(self) -> &'static [&'static str] {
+        match self {
+            Self::Qwen3Tts | Self::Qwen3TtsDesign => ttsmf::RUNTIME_ROLES,
+            Self::MossSfx => sfxmf::RUNTIME_ROLES,
+        }
     }
 }
 

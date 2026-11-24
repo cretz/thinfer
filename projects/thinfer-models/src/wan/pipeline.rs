@@ -63,7 +63,7 @@ const TEMPORAL_SCALE: usize = 4;
 /// The DiT step loop prefetches two blocks ahead (next-acquire + prefetch via
 /// the `join!` in `WanDit::forward`), so up to this many whole-tensor upload
 /// stagings overlap in VRAM at once.
-const PREFETCH_STAGING_DEPTH: u64 = 2;
+pub(crate) const PREFETCH_STAGING_DEPTH: u64 = 2;
 
 /// FastWan denoise sampler. Both run the SAME DiT forward CFG-free; only
 /// the schedule around it differs. `Dmd` is the few-step renoise schedule the DMD
@@ -85,10 +85,10 @@ pub enum VideoSampler {
 /// [`VideoSampler::UniPc`].
 pub struct GenerationParams {
     pub prompt: String,
-    /// Frame height in pixels. Divisible by `vae_scale * PATCH_H` (32 for the
+    /// Frame height in pixels. Divisible by `vae_scale * p_h` (32 for the
     /// TI2V 5B VAE, 16 for the Wan2.1 14B VAE).
     pub height: u32,
-    /// Frame width in pixels. Divisible by `vae_scale * PATCH_W`.
+    /// Frame width in pixels. Divisible by `vae_scale * p_w`.
     pub width: u32,
     /// Output frame count. Must be `4 * k + 1` (the causal-VAE temporal grid).
     pub num_frames: u32,
@@ -937,7 +937,7 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         if let Some(sink) = step_diag.as_deref_mut() {
             sink.clear();
         }
-        let div = (self.vae_scale * dit_config::PATCH_H) as u32;
+        let div = (self.vae_scale * self.cfg.geometry.patch()[1]) as u32;
         if params.height == 0
             || params.width == 0
             || !params.height.is_multiple_of(div)
@@ -1042,7 +1042,16 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         // --- 4. DiT denoise (CFG-free). The DiT forward is byte-identical for
         // both samplers; only the schedule around it differs. UniPC (the served
         // default) mirrors the public FastWan Spaces; DMD is the parity path. ---
-        let shape = || WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let shape = || {
+            WanDitShape::new(
+                self.cfg.geometry,
+                self.cfg.in_channels,
+                f_lat,
+                h_lat,
+                w_lat,
+                TEXT_SEQ,
+            )
+        };
 
         // Hold the DiT forward's full non-weight working set free on every weight
         // admission, so weight residency only ever fills `budget - working_set`
@@ -1547,7 +1556,14 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         assert_eq!(latent.len(), n_lat, "diag_step_at latent len");
         let sample = latent.to_vec();
 
-        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let shape = WanDitShape::new(
+            self.cfg.geometry,
+            self.cfg.in_channels,
+            f_lat,
+            h_lat,
+            w_lat,
+            TEXT_SEQ,
+        );
         let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
         let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
         let t = sampler.timestep(step_index);
@@ -1722,7 +1738,14 @@ impl<S: WeightSource, T: Tokenizer> WanModel<S, T> {
         self.residency.evict_all_and_free(&*self.backend);
         workspace.drain_pool();
 
-        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let shape = WanDitShape::new(
+            self.cfg.geometry,
+            self.cfg.in_channels,
+            f_lat,
+            h_lat,
+            w_lat,
+            TEXT_SEQ,
+        );
         let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
         let sampler = DmdSampler::new(&DmdConfig::fastwan_ti2v_5b());
         let inputs = WanDitInputs {

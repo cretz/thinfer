@@ -15,7 +15,10 @@
 //! conv output): `(f, h, w)` row-major over `(ppf, pph, ppw)`.
 
 use crate::common::rope_embedder::RopeEmbedder;
-use crate::wan::dit_block::config;
+use crate::wan::dit_block::{WanGeometry, config};
+
+/// Longest audio latent the 1D table covers (frames; MOSS runs 1500 = 30 s).
+pub const AUDIO_ROPE_LEN: usize = 4096;
 
 /// RoPE3D builder for one latent grid shape. Holds the per-axis cis tables;
 /// `lookup` produces the `[n_tok, head_dim]` interleaved freqs the DiT block's
@@ -27,11 +30,19 @@ pub struct WanRope3d {
 }
 
 impl WanRope3d {
-    /// Tables sized to `ROPE_MAX_SEQ_LEN` per axis (diffusers precomputes to
-    /// `rope_max_seq_len` then slices per grid). Axis order is `(t, h, w)`.
-    pub fn new() -> Self {
-        let axes_dims = [config::ROPE_T_DIM, config::ROPE_H_DIM, config::ROPE_W_DIM];
-        let axes_lens = [config::ROPE_MAX_SEQ_LEN; 3];
+    /// Video: tables sized to `ROPE_MAX_SEQ_LEN` per axis (diffusers
+    /// precomputes to `rope_max_seq_len` then slices per grid), axis order
+    /// `(t, h, w)`. Audio: one temporal axis over the whole head dim (the
+    /// `h`/`w` axes are empty, so a `[F, 1, 1]` grid's ids `(f, 0, 0)` rotate
+    /// every pair by `f`).
+    pub fn new(geometry: WanGeometry) -> Self {
+        let (axes_dims, axes_lens) = match geometry {
+            WanGeometry::Video => (
+                [config::ROPE_T_DIM, config::ROPE_H_DIM, config::ROPE_W_DIM],
+                [config::ROPE_MAX_SEQ_LEN; 3],
+            ),
+            WanGeometry::Audio => ([config::HEAD_DIM, 0, 0], [AUDIO_ROPE_LEN, 1, 1]),
+        };
         Self {
             inner: RopeEmbedder::new(config::ROPE_THETA, axes_dims, axes_lens),
         }
@@ -67,12 +78,6 @@ impl WanRope3d {
     }
 }
 
-impl Default for WanRope3d {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,7 +110,7 @@ mod tests {
 
     #[test]
     fn lookup_shape_and_origin() {
-        let r = WanRope3d::new();
+        let r = WanRope3d::new(WanGeometry::Video);
         let f = r.lookup(2, 3, 4);
         let n_tok = 2 * 3 * 4;
         assert_eq!(f.len(), n_tok * config::HEAD_DIM);
@@ -113,6 +118,21 @@ mod tests {
         for j in 0..config::HEAD_DIM / 2 {
             assert!((f[2 * j] - 1.0).abs() < 1e-6);
             assert!(f[2 * j + 1].abs() < 1e-6);
+        }
+    }
+
+    /// MOSS `precompute_freqs_cis_1d(128)`: pair j of frame f rotates by
+    /// `f / 10000^(2j / 128)` across the whole head dim.
+    #[test]
+    fn audio_rotates_every_pair_by_frame() {
+        let r = WanRope3d::new(WanGeometry::Audio);
+        let f = r.lookup(1500, 1, 1);
+        assert_eq!(f.len(), 1500 * config::HEAD_DIM);
+        let row = &f[1499 * config::HEAD_DIM..][..config::HEAD_DIM];
+        for j in 0..config::HEAD_DIM / 2 {
+            let a = 1499.0 / 10_000f64.powf(2.0 * j as f64 / config::HEAD_DIM as f64);
+            assert!((row[2 * j] as f64 - a.cos()).abs() < 1e-5, "pair {j}");
+            assert!((row[2 * j + 1] as f64 - a.sin()).abs() < 1e-5, "pair {j}");
         }
     }
 }

@@ -4,6 +4,7 @@
 
 pub mod chat;
 pub mod decoder;
+pub mod dense;
 pub mod experts;
 pub mod gemma4;
 pub mod kernels;

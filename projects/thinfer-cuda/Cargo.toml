@@ -30,5 +30,7 @@ futures-channel = { version = "0.3", default-features = false, features = ["std"
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
+bytemuck = "1"
+thinfer-models = { path = "../thinfer-models" }
 pollster = "0.4"
 half = "2"

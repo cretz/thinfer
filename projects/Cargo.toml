@@ -27,6 +27,13 @@ publish = false
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "tracing-log"] }
 
+# Local iteration builds (`--profile fast`): release codegen, incremental so a
+# one-crate change recompiles only what it touched. CI and releases use plain
+# `--release`.
+[profile.fast]
+inherits = "release"
+incremental = true
+
 # Browser wasm blob (`pnpm build:wasm`). Runtime perf first (opt-level 3
 # inherited from release, NOT z/s), size second; keeps the normal `release`
 # profile fast to build for the native dev loop.

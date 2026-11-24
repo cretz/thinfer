@@ -71,7 +71,7 @@ impl ConditionEmbedder {
         Self {
             freq_dim: config::FREQ_DIM,
             inner: cfg.inner(),
-            text_dim: config::TEXT_DIM,
+            text_dim: cfg.text_dim,
         }
     }
 

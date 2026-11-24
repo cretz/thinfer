@@ -405,6 +405,7 @@ pub async fn run(
 
     Ok(JobSummary {
         text: None,
+        audio: None,
         session: None,
         tool_calls: Vec::new(),
         output: req.output.clone(),
@@ -869,6 +870,7 @@ pub async fn run_i2v(
 
     Ok(JobSummary {
         text: None,
+        audio: None,
         session: None,
         tool_calls: Vec::new(),
         output: req.output.clone(),

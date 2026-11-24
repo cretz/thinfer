@@ -66,7 +66,9 @@ pub(crate) fn dispatch_snake_beta<O: SnakeBetaOp, B: Backend>(
     backend.dispatch(encoder, pipeline, &bindings, O::workgroups(n))
 }
 
-fn build_wgsl(cfg: &WgslConfig) -> String {
+/// `log_scale`: SnakeBeta's `exp(alpha)` / `exp(beta)`; else the raw
+/// parameters (DAC's `Snake1d`, whose alphas may be negative).
+fn build_wgsl(cfg: &WgslConfig, log_scale: bool) -> String {
     assert!(
         !cfg.bf16_quant_writes,
         "snake_beta has no bf16-quant-write mode"
@@ -82,6 +84,7 @@ fn build_wgsl(cfg: &WgslConfig) -> String {
         other => panic!("snake_beta does not support act dtype {other:?}"),
     };
 
+    let param = if log_scale { "exp" } else { "" };
     format!(
         r#"{f16_prelude}
 struct U {{ n: u32, channels: u32, inner: u32, eps_bits: u32 }};
@@ -100,8 +103,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (i >= u.n) {{ return; }}
     let c: u32 = (i / u.inner) % u.channels;
     let eps: f32 = bitcast<f32>(u.eps_bits);
-    let a: f32 = exp(alpha[c]);
-    let b: f32 = exp(beta[c]);
+    let a: f32 = {param}(alpha[c]);
+    let b: f32 = {param}(beta[c]);
     let xv: f32 = load_x(i);
     let s: f32 = sin(a * xv);
     let v: f32 = xv + (1.0 / (b + eps)) * s * s;
@@ -145,7 +148,28 @@ impl SnakeBetaOp for SnakeBetaF32 {
     const DIMS: &'static str = "snake_beta/dims";
     const OUTPUT: &'static str = "snake_beta/out";
     fn wgsl(cfg: &WgslConfig) -> String {
-        build_wgsl(cfg)
+        build_wgsl(cfg, true)
+    }
+    fn layout() -> &'static [BindingLayout] {
+        LAYOUT
+    }
+}
+
+/// Snake with RAW per-channel parameters: `out = x + (1/(beta+eps)) *
+/// sin(alpha*x)^2` (DAC's `Snake1d` binds `alpha` as both). Same layout and
+/// uniform as [`SnakeBetaF32`].
+pub struct SnakeF32;
+
+impl SnakeBetaOp for SnakeF32 {
+    const KERNEL_ID: &'static str = "snake.f32";
+    type Dtype = F32;
+    const X: &'static str = "snake/x";
+    const ALPHA: &'static str = "snake/alpha";
+    const BETA: &'static str = "snake/beta";
+    const DIMS: &'static str = "snake/dims";
+    const OUTPUT: &'static str = "snake/out";
+    fn wgsl(cfg: &WgslConfig) -> String {
+        build_wgsl(cfg, false)
     }
     fn layout() -> &'static [BindingLayout] {
         LAYOUT

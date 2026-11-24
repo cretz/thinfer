@@ -245,6 +245,35 @@ pub(crate) fn register_linear_flatten<S: WeightSource>(
     Ok(residency.register(meta))
 }
 
+/// Register an f32 tensor to stay f32 on the GPU (kernels compiled for f32
+/// weights: the f32 audio towers).
+pub(crate) fn register_keep_f32<S: WeightSource>(
+    residency: &WeightResidency<S>,
+    id: &WeightId,
+) -> Result<WeightHandle, LoadError> {
+    let entry = residency
+        .source()
+        .catalog()
+        .get(id)
+        .ok_or_else(|| LoadError::UnknownWeight(id.clone()))?;
+    if entry.encoding != Some(StorageEncoding::F32) {
+        return Err(LoadError::Undecodable {
+            id: id.clone(),
+            encoding: entry.encoding,
+            label: entry.encoding_label.clone(),
+        });
+    }
+    Ok(residency.register(WeightMeta {
+        id: id.clone(),
+        shape: entry.shape.clone(),
+        encoding: StorageEncoding::F32,
+        on_disk_bytes: entry.size,
+        transpose: TransposePolicy::None,
+        transcode: None,
+        keep_f32: true,
+    }))
+}
+
 pub(crate) fn register_passthrough<S: WeightSource>(
     residency: &WeightResidency<S>,
     id: &WeightId,

@@ -250,6 +250,7 @@ pub async fn run(
 
     Ok(JobSummary {
         text: None,
+        audio: None,
         session: None,
         tool_calls: Vec::new(),
         output: req.output.clone(),
@@ -386,9 +387,14 @@ fn write_encoded(w: &mut Writer<'_>, e: &Conditioned) {
                 w.usize(latent_height);
                 w.usize(latent_width);
             }
+            packing::Condition::AudioReference { latents } => {
+                w.u64(3);
+                w.usize(latents);
+            }
         }
     }
     w.f32s(&e.cond.cond_rows);
+    w.f32s(&e.cond.cond_audio);
 }
 
 fn write_latents(w: &mut Writer<'_>, l: &Latents) {
@@ -409,17 +415,22 @@ fn read_encoded(r: &mut Reader<'_>) -> Result<Conditioned, String> {
                     latent_height: r.usize()?,
                     latent_width: r.usize()?,
                 },
+                3 => packing::Condition::AudioReference {
+                    latents: r.usize()?,
+                },
                 _ => return Err(PAUSED_MISMATCH.to_string()),
             })
         })
         .collect::<Result<_, String>>()?;
     let cond_rows = r.f32s()?;
+    let cond_audio = r.f32s()?;
     Ok(Conditioned {
         text,
         cond: Conditioning {
             text_tags,
             conditions,
             cond_rows,
+            cond_audio,
         },
         rows,
     })
@@ -992,20 +1003,26 @@ async fn encode_clip(
         Some(k) => (vec![k], Some(KeyframeAnchor::First)),
         None => (prepare_refs(backend, req).await?, None),
     };
+    // Reference audio (a voice, a sound), cut to this clip's length.
+    let audios = minimax_ref::prepare_audio(&req.ref_audios, frames as f64 / FPS as f64)?;
     let ref_tokens: Vec<usize> = refs
         .iter()
         .map(|r| (r.height / 32) * (r.width / 32))
         .collect();
-    let prompt_in = minimax_ref::assemble(&tokenizer, prompt, &ref_tokens)?;
-    let ids = prompt_in.ids;
-    if ids.len() == ref_tokens.iter().map(|n| n + 2).sum::<usize>() {
+    let prompt_in = minimax_ref::assemble(&tokenizer, prompt, &ref_tokens, audios.len())?;
+    if prompt_in.prompt_tokens == 0 {
         return Err("empty prompt produced no tokens".into());
     }
+    let ids = prompt_in.ids;
     let num_text = ids.len();
 
     // Refuse a canvas we cannot run BEFORE loading 13.6 GiB of conditioner.
     let rows = packing::sequence_rows(cfg, num_text, latent_frames, lat_h, lat_w, audio_latents)
-        + ref_tokens.iter().sum::<usize>();
+        + ref_tokens.iter().sum::<usize>()
+        + audios
+            .iter()
+            .map(|a| a.latents() * packing::AUDIO_CHANNELS)
+            .sum::<usize>();
     if rows > row_limit {
         return Err(format!(
             "{width}x{height} at {frames} frames packs {rows} rows, over the {row_limit}-row \
@@ -1087,7 +1104,7 @@ async fn encode_clip(
         .unwrap_or_else(|_| Err("dit pipeline compile thread panicked".to_string()))?;
     drop(images);
     drop(vision);
-    let (conditions, cond_rows) = if refs.is_empty() {
+    let (mut conditions, cond_rows) = if refs.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         minimax_ref::latent_conditions(
@@ -1102,10 +1119,26 @@ async fn encode_clip(
         .await?
     };
     drop(refs);
+    // After the images: the reference's request order (labels, time slots).
+    let cond_audio = if audios.is_empty() {
+        Vec::new()
+    } else {
+        sink.note(&format!(
+            "Encoding {} reference audio clip(s)",
+            audios.len()
+        ));
+        let audio_vae_path = resolve_role(manifest, role::AUDIO_VAE)?;
+        let (c, rows) =
+            minimax_ref::audio_conditions(backend, &audio_vae_path, budget, &audios).await?;
+        conditions.extend(c);
+        rows
+    };
+    drop(audios);
     let cond = Conditioning {
         text_tags: prompt_in.tags,
         conditions,
         cond_rows,
+        cond_audio,
     };
     Ok((Conditioned { text, cond, rows }, dit_pipelines))
 }
@@ -1335,7 +1368,10 @@ struct PlanDims {
 struct Conditioning {
     text_tags: Vec<i32>,
     conditions: Vec<packing::Condition>,
+    /// Patchified video rows of the image conditions, in order.
     cond_rows: Vec<f32>,
+    /// Audio rows of the audio conditions, in order (clean).
+    cond_audio: Vec<f32>,
 }
 
 /// [`run_dit`] for a distill (no turbo adapter), with the request's vault
@@ -1484,6 +1520,7 @@ where
         &table,
         &plan,
         &cond.cond_rows,
+        &cond.cond_audio,
         text,
         seed,
         start,
@@ -1625,8 +1662,10 @@ mod tests {
                         latent_height: 24,
                         latent_width: 40,
                     },
+                    packing::Condition::AudioReference { latents: 9 },
                 ],
                 cond_rows: vec![7.0; 5],
+                cond_audio: vec![-0.5; 3],
             },
             rows: 1234,
         }
@@ -1685,6 +1724,7 @@ mod tests {
                     && a.cond.text_tags == b.cond.text_tags
                     && a.cond.conditions == b.cond.conditions
                     && bits(&a.cond.cond_rows) == bits(&b.cond.cond_rows)
+                    && bits(&a.cond.cond_audio) == bits(&b.cond.cond_audio)
             };
             let same_latents = |a: &Latents, b: &Latents| {
                 bits(&a.video) == bits(&b.video) && bits(&a.audio) == bits(&b.audio)

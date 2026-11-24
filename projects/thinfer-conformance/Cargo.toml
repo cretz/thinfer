@@ -37,6 +37,12 @@ conformance = []
 # Opt-in LLM parity (Qwen3.6 / Gemma 4 / Flash-Next). Touches the local HF
 # cache (unsloth GGUFs + official config/tokenizer); skips when uncached.
 llm-e2e = []
+# Opt-in Qwen3-TTS parity (talker, codec, speaker encoder) vs reference tensors in
+# THINFER_TTS_PARITY; touches the local HF cache, skips cleanly when absent.
+tts-e2e = []
+# Opt-in MOSS-SoundEffect parity (text encoder, DiT, DAC) vs reference tensors in
+# THINFER_SFX_PARITY; touches the local HF cache, skips cleanly when absent.
+sfx-e2e = []
 # Opt-in Z-Image end-to-end tests that touch the local HF cache. Skip
 # cleanly if the relevant files aren't cached; never trigger a download.
 zimage-e2e = []

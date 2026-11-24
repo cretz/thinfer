@@ -100,6 +100,11 @@ pub struct ServeConfig {
     /// discarded), and any failed job discards it. Default 0: opt-in, an
     /// idle server holds no GPU memory unless the operator asks it to.
     pub warm_text_secs: u64,
+    /// The same for the last speech (audio) model: kept loaded until this
+    /// many seconds after an audio job last used it; `0` = load per job.
+    /// Any non-audio job frees it first. Default 0 (opt-in). Image and video
+    /// models are never kept.
+    pub warm_audio_secs: u64,
     /// Keep the warm text model's host side (parsed tokenizer, compiled
     /// pipelines, page-locked expert cache) through image/video jobs, which
     /// still get all of its VRAM, so the next text job skips that work.
@@ -137,6 +142,7 @@ impl Default for ServeConfig {
             session_ram_budget: "4G".into(),
             session_ttl_secs: 1800,
             warm_text_secs: 0,
+            warm_audio_secs: 0,
             keep_text_host: false,
         }
     }

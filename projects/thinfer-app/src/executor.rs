@@ -85,6 +85,8 @@ fn image_budget(
 pub struct LocalExecutor {
     backend: Arc<WgpuBackend>,
     warm_llm: std::sync::Mutex<Option<crate::llm::WarmLlm>>,
+    /// The last audio model, between audio jobs (any other job frees it).
+    warm_audio: std::sync::Mutex<Option<crate::audio::WarmAudio>>,
     keep_text_host: bool,
 }
 
@@ -93,6 +95,7 @@ impl LocalExecutor {
         Ok(Self {
             backend: init_backend(cfg).await?,
             warm_llm: std::sync::Mutex::new(None),
+            warm_audio: std::sync::Mutex::new(None),
             keep_text_host: false,
         })
     }
@@ -106,12 +109,13 @@ impl LocalExecutor {
         self
     }
 
-    /// A text model is kept between jobs (loaded, or its host side).
+    /// A text or speech model is kept between jobs (loaded, or a text
+    /// model's host side).
     pub fn holds_warm_model(&self) -> bool {
-        self.warm_llm.lock().unwrap().is_some()
+        self.warm_llm.lock().unwrap().is_some() || self.warm_audio.lock().unwrap().is_some()
     }
 
-    /// A kept text model has weights on the device (buffers of
+    /// A kept model has weights on the device (buffers of
     /// [`thinfer_core::mem::VramCategory::Weights`] stay between jobs).
     pub fn holds_warm_weights(&self) -> bool {
         self.warm_llm
@@ -119,6 +123,39 @@ impl LocalExecutor {
             .unwrap()
             .as_ref()
             .is_some_and(|w| w.is_loaded())
+            || self.warm_audio.lock().unwrap().is_some()
+    }
+
+    /// Release each kept model idle for at least its TTL (text, audio).
+    pub fn expire_warm(&self, text_ttl: std::time::Duration, audio_ttl: std::time::Duration) {
+        if self.warm_model_idle().is_some_and(|idle| idle >= text_ttl) {
+            self.release_warm_model();
+        }
+        let mut audio = self.warm_audio.lock().unwrap();
+        if audio.as_ref().is_some_and(|w| w.idle() >= audio_ttl)
+            && let Some(w) = audio.take()
+        {
+            tracing::info!(model = %w.model(), idle_secs = w.idle().as_secs(), "warm audio model released");
+        }
+    }
+
+    /// Time until the first kept model's TTL runs out (`None`: none kept).
+    pub fn warm_time_left(
+        &self,
+        text_ttl: std::time::Duration,
+        audio_ttl: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        let text = self.warm_model_idle().map(|i| text_ttl.saturating_sub(i));
+        let audio = self
+            .warm_audio
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|w| audio_ttl.saturating_sub(w.idle()));
+        match (text, audio) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Time since a text job last used the kept text model.
@@ -149,6 +186,15 @@ impl LocalExecutor {
         req: &JobRequest,
         sink: &dyn ProgressSink,
     ) -> Result<JobSummary, String> {
+        // An audio job keeps only an audio model warm; anything else frees it.
+        if let JobRequest::Audio(r) = req {
+            self.release_text_device();
+            let mut warm = self.warm_audio.lock().unwrap().take();
+            let out = crate::audio::run(&self.backend, r, sink, &mut warm).await;
+            *self.warm_audio.lock().unwrap() = warm;
+            return out;
+        }
+        self.warm_audio.lock().unwrap().take();
         if let JobRequest::Text(r) = req {
             let mut warm = self.warm_llm.lock().unwrap().take();
             let out = crate::llm::run(&self.backend, r, sink, &mut warm).await;
@@ -157,18 +203,24 @@ impl LocalExecutor {
         }
         // Any other job needs the room: the loaded text model goes first
         // (its VRAM at least).
+        self.release_text_device();
+        match req {
+            JobRequest::Image(r) => self.run_image(r, sink).await,
+            JobRequest::Text(_) | JobRequest::Audio(_) => unreachable!("handled above"),
+            JobRequest::Video(r) => self.run_video(r, sink).await,
+            JobRequest::FaceSwap(r) => self.run_faceswap(r, sink).await,
+        }
+    }
+
+    /// Free the kept text model's VRAM (all of it, or with
+    /// [`Self::keep_text_host`] its device side only).
+    fn release_text_device(&self) {
         if self.keep_text_host {
             if let Some(w) = self.warm_llm.lock().unwrap().as_mut() {
                 w.release_device();
             }
         } else {
             self.release_warm_model();
-        }
-        match req {
-            JobRequest::Image(r) => self.run_image(r, sink).await,
-            JobRequest::Text(_) => unreachable!("handled above"),
-            JobRequest::Video(r) => self.run_video(r, sink).await,
-            JobRequest::FaceSwap(r) => self.run_faceswap(r, sink).await,
         }
     }
 
@@ -291,6 +343,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),
@@ -407,6 +460,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),
@@ -612,6 +666,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),
@@ -765,6 +820,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),
@@ -916,6 +972,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),
@@ -1229,6 +1286,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),
@@ -1373,6 +1431,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),
@@ -1636,6 +1695,7 @@ impl LocalExecutor {
 
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),

@@ -818,6 +818,7 @@ Tool calling: a text job with `tools` may end with `TextResult.finishReason` = `
         thinfer_app::wire::ModelKind,
         thinfer_app::wire::InputSlot,
         thinfer_app::wire::InputUse,
+        thinfer_app::wire::Media,
         thinfer_app::wire::SizeRules,
         thinfer_app::wire::VideoInfo,
         JobList,

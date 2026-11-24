@@ -12,8 +12,9 @@ use thinfer_core::quant::QuantKind;
 use thinfer_core::workspace::{BatchBuf, BatchScope};
 
 /// Every weight format the LLM matmuls read in place.
-pub const FORMATS: [LlmWeight; 8] = [
+pub const FORMATS: [LlmWeight; 9] = [
     LlmWeight::F32,
+    LlmWeight::Bf16,
     LlmWeight::Quant(QuantKind::Q8_0),
     LlmWeight::Quant(QuantKind::Q4_0),
     LlmWeight::Quant(QuantKind::Q5_0),
@@ -693,6 +694,54 @@ impl LlmPipelines {
         let u: [u32; 4] = [n, if gelu { k::GLU_GELU_TANH } else { 0 }, 0, 0];
         let ub = self.uniform(s, &u)?;
         s.dispatch(&self.glu, &[a, b, y, ub], k::grid_1d(n))
+    }
+
+    /// Sample an id from `logits[..n]` into the u32 at `out` with the
+    /// draw at `uniform` (see [`LlmOp::SampleTopK`]). Accelerator scopes
+    /// only: on the backend the caller samples on the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_topk<'s>(
+        &self,
+        s: &Scope<'s>,
+        logits: Buf<'s>,
+        n: u32,
+        k: u32,
+        temperature: f32,
+        uniform: Buf<'s>,
+        out: Buf<'s>,
+    ) -> Result<(), WgpuError> {
+        accel(
+            s,
+            LlmOp::SampleTopK {
+                logits: addr(s, logits)?,
+                n,
+                k,
+                temperature,
+                uniform: addr(s, uniform)?,
+                out: addr(s, out)?,
+            },
+        )
+    }
+
+    /// `out[..dim]` = row `idx[0]` of a bf16 table (see
+    /// [`LlmOp::GatherRowBf16`]). Accelerator scopes only.
+    pub fn gather_row_bf16<'s>(
+        &self,
+        s: &Scope<'s>,
+        table: Buf<'s>,
+        idx: Buf<'s>,
+        dim: u32,
+        out: Buf<'s>,
+    ) -> Result<(), WgpuError> {
+        accel(
+            s,
+            LlmOp::GatherRowBf16 {
+                table: addr(s, table)?,
+                idx: addr(s, idx)?,
+                dim,
+                out: addr(s, out)?,
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

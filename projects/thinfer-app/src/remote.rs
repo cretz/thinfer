@@ -132,6 +132,10 @@ impl RemoteExecutor {
             frames: result.frames,
             fps: result.fps,
             seed: result.seed,
+            audio: result.audio.map(|a| crate::request::AudioStats {
+                seconds: a.seconds,
+                sample_rate: a.sample_rate,
+            }),
             session: None,
         })
     }

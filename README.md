@@ -51,6 +51,9 @@ nvfp4-fast`: faster, softer).
     thinfer generate video --model fasth3-omni --ref-image me.png --prompt "the man from <Picture 1> walks on a beach" --output beach.mp4
 
 Name each `--ref-image` in the prompt as `<Picture 1>`, `<Picture 2>`, ... (up to 9).
+Add `--ref-audio voice.wav` (WAV, FLAC, MP3, M4A, Ogg; up to 3) for a voice or a sound,
+named `<Audio 1>`, ...: "<Audio 1> is the voice-timbre reference for <Subject 1> (S1)."
+`GET /models` lists each model's inputs and how to name them.
 
 ## Use a LoRA
 

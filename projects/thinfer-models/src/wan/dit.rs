@@ -43,7 +43,7 @@ use crate::wan::condition_embedder::{
 };
 use crate::wan::dit_block::{
     WanDitBlock, WanDitBlockBufs, WanDitBlockHandles, WanDitBlockShape, WanDitBlockTaps,
-    WanDitConfig, WanDitPipelines, WanMod, config,
+    WanDitConfig, WanDitPipelines, WanGeometry, WanMod, config,
 };
 use crate::wan::patchify::{self, PatchGrid};
 use crate::wan::rope3d::WanRope3d;
@@ -153,8 +153,15 @@ pub struct WanDitShape {
 }
 
 impl WanDitShape {
-    pub fn new(c: usize, f: usize, h: usize, w: usize, text_seq: usize) -> Self {
-        let grid = PatchGrid::new(c, f, h, w);
+    pub fn new(
+        geometry: WanGeometry,
+        c: usize,
+        f: usize,
+        h: usize,
+        w: usize,
+        text_seq: usize,
+    ) -> Self {
+        let grid = PatchGrid::new(c, f, h, w, geometry.patch());
         Self {
             n_tok: grid.n_tok(),
             grid,
@@ -317,7 +324,7 @@ impl WanDit {
             handles,
             block,
             condition_embedder: ConditionEmbedder::from_cfg(&cfg),
-            rope: WanRope3d::new(),
+            rope: WanRope3d::new(cfg.geometry),
         }
     }
 
@@ -434,7 +441,8 @@ impl WanDit {
             let img_ref = inputs
                 .img_ref
                 .expect("DreamID-V forward requires img_ref when ref_conv is set");
-            let ref_grid = PatchGrid::new(self.cfg.out_channels, 1, s.grid.h, s.grid.w);
+            let ref_grid =
+                PatchGrid::new(self.cfg.out_channels, 1, s.grid.h, s.grid.w, s.grid.patch);
             let ref_tokens = patchify::patchify(img_ref, &ref_grid);
             let ref_in = ref_grid.patch_in() as u32;
             let ref_bytes = act_upload_bytes(bp.act_dtype, &ref_tokens);
@@ -576,7 +584,7 @@ impl WanDit {
         // and `head_rows == rows`, so `x_head` is the whole stream (bit-identical).
         let head_rows = n_tok;
         let x_head = act_slice(x_cur.as_act_ref(), ref_rows, head_rows, inner, bp);
-        let proj_w = self.cfg.out_channels * config::PATCH_T * config::PATCH_H * config::PATCH_W;
+        let proj_w = self.cfg.out_channels * s.grid.patch_voxels();
         let proj_out = ResStream::alloc(scratch, bp, head_rows, proj_w as u32)?;
         // Persist the post-modulation activation when a tap wants it (readback
         // after submit; scope-local buffers do not survive the submit).
@@ -932,7 +940,8 @@ impl WanDit {
     /// image-CFG forwards). Per input it is exactly [`Self::forward`]'s
     /// dispatch sequence: bit-identical outputs. Untiled models only
     /// (DreamID-V; RelayVSR's keyframe forward, one input, for the deferred
-    /// accelerator block).
+    /// accelerator block; MOSS-SoundEffect's 1500-row audio latent, whose
+    /// CFG pair shares each block and whose untiled FFN is small).
     pub async fn forward_many<S: WeightSource>(
         &self,
         backend: &WgpuBackend,
@@ -942,8 +951,11 @@ impl WanDit {
         inputs: &[WanDitInputs<'_>],
     ) -> Result<Vec<WanDitOutput>, WanDitError<S::Error>> {
         assert!(
-            (self.cfg.ref_conv || self.cfg.relay.is_some()) && !self.cfg.rehyat,
-            "forward_many runs the untiled block path (DreamID-V, RelayVSR)"
+            (self.cfg.ref_conv
+                || self.cfg.relay.is_some()
+                || self.cfg.geometry == WanGeometry::Audio)
+                && !self.cfg.rehyat,
+            "forward_many runs the untiled block path (DreamID-V, RelayVSR, MOSS)"
         );
         let bp = &pipelines.block;
         let inner = self.cfg.inner() as u32;
@@ -1724,7 +1736,7 @@ mod tests {
 
     #[test]
     fn shape_derives_grid() {
-        let sh = WanDitShape::new(16, 5, 16, 16, 512);
+        let sh = WanDitShape::new(WanGeometry::Video, 16, 5, 16, 16, 512);
         assert_eq!((sh.grid.ppf, sh.grid.pph, sh.grid.ppw), (5, 8, 8));
         assert_eq!(sh.n_tok, 5 * 8 * 8);
     }

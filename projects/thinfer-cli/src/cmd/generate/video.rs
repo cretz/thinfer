@@ -10,7 +10,7 @@ use thinfer_app::model::{
     AttnPrecision, EncoderQuant, RefCrop, RefImageSize, RewriteQuality, SuperRes, VaeChoice,
     VideoModelId, VideoSampler,
 };
-use thinfer_app::request::{ImageBytes, VideoFormat, VideoRequest};
+use thinfer_app::request::{AudioBytes, ImageBytes, VideoFormat, VideoRequest};
 use thinfer_app::wire::{JobSpec, VideoSpec};
 use thinfer_app::{JobRequest, parse_budget, resolve_output_format};
 
@@ -34,6 +34,14 @@ pub struct GenerateVideo {
     /// Repeat for several, up to 9.
     #[arg(long = "ref-image")]
     pub ref_images: Vec<PathBuf>,
+    /// Reference-to-video models only: a reference audio clip (WAV, FLAC,
+    /// MP3, M4A/AAC, Ogg), e.g. a voice for a character to speak in. The
+    /// prompt names it `<Audio N>` (N = its position among the --ref-audio
+    /// flags, from 1, counted apart from the pictures): "<Audio 1> is the
+    /// voice-timbre reference for <Subject 1> (S1)." Cut to the clip's
+    /// length. Repeat for several, up to 3; needs at least one --ref-image.
+    #[arg(long = "ref-audio")]
+    pub ref_audios: Vec<PathBuf>,
     /// fasth3-omni only: how each reference image is sized. `match` (default,
     /// as in ComfyUI: the canvas's pixel area, never upscaled), `max` (short
     /// edge capped at 2048) or `diffusers` (short edge exactly 2048, the
@@ -254,6 +262,13 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
                     .collect::<Result<Vec<_>, String>>()?,
             )
             .filter(|v| !v.is_empty()),
+            ref_audios: Some(
+                args.ref_audios
+                    .iter()
+                    .map(|p| Ok(base64_of(Some(p))?.unwrap_or_default()))
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+            .filter(|v| !v.is_empty()),
             ref_image_size: Some(args.ref_image_size),
             ref_crop: Some(args.ref_crop),
             encoder: Some(args.encoder),
@@ -310,6 +325,15 @@ pub async fn run_video(args: GenerateVideo) -> Result<(), String> {
             .map(|p| {
                 std::fs::read(p)
                     .map(ImageBytes)
+                    .map_err(|e| format!("read {}: {e}", p.display()))
+            })
+            .collect::<Result<_, _>>()?,
+        ref_audios: args
+            .ref_audios
+            .iter()
+            .map(|p| {
+                std::fs::read(p)
+                    .map(AudioBytes)
                     .map_err(|e| format!("read {}: {e}", p.display()))
             })
             .collect::<Result<_, _>>()?,

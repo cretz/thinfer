@@ -1619,6 +1619,45 @@ impl<'wsp, B: Backend> BatchScope<'wsp, B> {
         }
     }
 
+    /// f32-act 1D (transposed) convolution on the accelerator (see
+    /// [`crate::backend::Conv1dAddrs`]). `false` = not covered: run the
+    /// backend op. Deferred-aware.
+    pub fn try_conv1d(
+        &self,
+        shape: &crate::backend::Conv1dShape,
+        x: BatchBuf<'wsp>,
+        w: BatchBuf<'wsp>,
+        bias: BatchBuf<'wsp>,
+        out: BatchBuf<'wsp>,
+    ) -> Result<bool, B::Error> {
+        let Some(acc) = self.backend.accelerator() else {
+            return Ok(false);
+        };
+        let addr = |b: BatchBuf<'wsp>| self.backend.device_address(&self.resolve(b));
+        let (Some(x), Some(w), Some(bias), Some(out)) = (addr(x), addr(w), addr(bias), addr(out))
+        else {
+            return Ok(false);
+        };
+        self.accel_drain()?;
+        let addrs = crate::backend::Conv1dAddrs {
+            x,
+            w,
+            bias,
+            out,
+            shape: *shape,
+        };
+        match acc
+            .conv1d(&addrs)
+            .and_then(|ran| self.accel_settle(acc).map(|()| ran))
+        {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                tracing::warn!(target: crate::trace::ADAPTER, error = %e, "accelerator conv1d failed; wgpu op");
+                Ok(false)
+            }
+        }
+    }
+
     /// f16-act 3D convolution on the accelerator (see
     /// [`crate::backend::Conv3dAddrs`]). `false` = not covered: run the
     /// backend op. Deferred-aware.

@@ -571,7 +571,14 @@ impl<S: WeightSource> RelayVsrPipeline<S> {
             }
             None => gaussian_noise(n_lat, inputs.seed),
         };
-        let shape = WanDitShape::new(ch, kfs.len(), lh, lw, dit_config::TEXT_SEQ);
+        let shape = WanDitShape::new(
+            self.cfg.geometry,
+            ch,
+            kfs.len(),
+            lh,
+            lw,
+            dit_config::TEXT_SEQ,
+        );
         let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
         lap("lq_proj", &mut phase_ms);
         let v = {

@@ -466,6 +466,18 @@ impl OwnedBuf {
         })
     }
 
+    /// Raw bytes (e.g. a bf16 table read whole).
+    pub fn bytes(backend: &Arc<WgpuBackend>, b: &[u8]) -> Result<Self, LlmError> {
+        let len = b.len() as u64;
+        let id = backend.allocate_in(len, thinfer_core::mem::VramCategory::Weights)?;
+        backend.write_buffer(id, 0, b)?;
+        Ok(Self {
+            backend: backend.clone(),
+            id,
+            len,
+        })
+    }
+
     pub fn buf_ref(&self) -> BufRef {
         BufRef::new(self.id, self.len)
     }
@@ -544,6 +556,7 @@ impl<S: WeightSource> Registry<'_, S> {
 fn fmt_of(enc: Option<StorageEncoding>, id: &WeightId) -> Result<LlmWeight, LlmError> {
     match enc {
         Some(StorageEncoding::F32) => Ok(LlmWeight::F32),
+        Some(StorageEncoding::Bf16) => Ok(LlmWeight::Bf16),
         Some(StorageEncoding::Quant(q)) => Ok(LlmWeight::Quant(q)),
         other => Err(LlmError::Weights(format!(
             "{}: unsupported encoding {other:?}",

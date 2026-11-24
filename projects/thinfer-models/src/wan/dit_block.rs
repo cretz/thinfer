@@ -75,13 +75,6 @@ pub mod config {
     /// Text context length the DiT cross-attends to (umT5 output rows).
     pub const TEXT_SEQ: usize = 512;
 
-    /// 3D patch (`p_t, p_h, p_w`) the `patch_embedding` Conv3d folds latent
-    /// voxels into tokens with. Kernel == stride == patch, so the conv is an
-    /// affine patchify (see `wan/patchify.rs`).
-    pub const PATCH_T: usize = 1;
-    pub const PATCH_H: usize = 2;
-    pub const PATCH_W: usize = 2;
-
     /// RoPE3D theta and the per-axis (t, h, w) sub-dimensions of `HEAD_DIM`.
     /// `h = w = 2 * (head_dim / 6)`, `t = head_dim - h - w` (diffusers
     /// `WanRotaryPosEmbed`). At head_dim 128: t=44, h=w=42.
@@ -94,11 +87,39 @@ pub mod config {
     pub const ROPE_MAX_SEQ_LEN: usize = 1024;
 }
 
+/// How a latent becomes tokens and where they sit for RoPE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WanGeometry {
+    /// `[C, F, H, W]` video latents: `(1, 2, 2)` patches, RoPE3D with the head
+    /// dim split `t/h/w = 44/42/42`.
+    Video,
+    /// `[C, F, 1, 1]` audio latents (MOSS-SoundEffect `WanAudioModel`): one
+    /// token per latent frame (a k=1 Conv1d patch embed), 1D RoPE over the
+    /// WHOLE head dim (`precompute_freqs_cis_1d`: the three chunks of one
+    /// 128-dim table, concatenated back).
+    Audio,
+}
+
+impl WanGeometry {
+    /// The `patch_embedding` kernel == stride `(p_t, p_h, p_w)`: the conv is an
+    /// affine patchify (see `wan/patchify.rs`).
+    pub const fn patch(self) -> [usize; 3] {
+        match self {
+            Self::Video => [1, 2, 2],
+            Self::Audio => [1, 1, 1],
+        }
+    }
+}
+
 /// Per-variant Wan DiT geometry. Threaded through the driver / block / loader /
 /// condition embedder so a new variant (e.g. Wan2.2-14B) is a new constructor,
 /// not a code fork. Family-invariant numbers stay in [`config`].
 #[derive(Clone, Copy, Debug)]
 pub struct WanDitConfig {
+    /// Width of the text states the DiT cross-attends to (`text_embedder`
+    /// input): umT5-XXL 4096 on every video Wan, Qwen3-1.7B 2048 on MOSS.
+    pub text_dim: usize,
+    pub geometry: WanGeometry,
     pub num_heads: usize,
     pub ffn_dim: usize,
     pub num_layers: usize,
@@ -151,6 +172,8 @@ impl WanDitConfig {
     /// in/out_channels 48.
     pub fn fastwan_ti2v_5b() -> Self {
         Self {
+            text_dim: config::TEXT_DIM,
+            geometry: WanGeometry::Video,
             num_heads: 24,
             ffn_dim: 14336,
             num_layers: 30,
@@ -202,6 +225,8 @@ impl WanDitConfig {
     /// `to_gate_compress` (sparse-attention gate) is unused by dense attention.
     pub fn wan21_t2v_1_3b() -> Self {
         Self {
+            text_dim: config::TEXT_DIM,
+            geometry: WanGeometry::Video,
             num_heads: 12,
             ffn_dim: 8960,
             num_layers: 30,
@@ -239,6 +264,8 @@ impl WanDitConfig {
     /// the Wan2.1 VAE instead of the TI2V high-compression one).
     pub fn wan22_14b() -> Self {
         Self {
+            text_dim: config::TEXT_DIM,
+            geometry: WanGeometry::Video,
             num_heads: 40,
             ffn_dim: 13824,
             num_layers: 40,
@@ -262,6 +289,20 @@ impl WanDitConfig {
         Self {
             delta_embedder: true,
             ..Self::wan22_14b()
+        }
+    }
+
+    /// MOSS-SoundEffect v2.0 `WanAudioModel` (`transformer/config.json`): the
+    /// Wan2.1-1.3B block stack (dim 1536 = 12 x 128, ffn 8960, 30 layers) over
+    /// 128-channel DAC latents, one token per 20 ms frame, cross-attending to
+    /// Qwen3-1.7B states (text_dim 2048).
+    pub fn moss_sfx() -> Self {
+        Self {
+            text_dim: 2048,
+            geometry: WanGeometry::Audio,
+            in_channels: 128,
+            out_channels: 128,
+            ..Self::wan21_t2v_1_3b()
         }
     }
 

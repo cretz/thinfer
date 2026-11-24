@@ -138,10 +138,15 @@ pub enum Condition {
         latent_height: usize,
         latent_width: usize,
     },
+    /// Ref2VA: a clean audio clip (`latents` audio-VAE frames per stereo
+    /// channel) holding `latents` rotary time slots, one per frame, like the
+    /// target audio. Its rows are audio rows; it adds no video rows.
+    AudioReference { latents: usize },
 }
 
 impl Condition {
-    /// Packed rows this block adds at `patch`, given the target's latent size.
+    /// Packed VIDEO rows this block adds at `patch`, given the target's latent
+    /// size.
     pub fn rows(&self, patch: (usize, usize, usize), target: (usize, usize)) -> usize {
         let (h, w) = match *self {
             Condition::Keyframe(_) => target,
@@ -149,8 +154,26 @@ impl Condition {
                 latent_height,
                 latent_width,
             } => (latent_height, latent_width),
+            Condition::AudioReference { .. } => return 0,
         };
         (h / patch.1) * (w / patch.2)
+    }
+
+    /// Packed AUDIO rows this block adds (both stereo channels).
+    pub fn audio_rows(&self) -> usize {
+        match *self {
+            Condition::AudioReference { latents } => latents * AUDIO_CHANNELS,
+            _ => 0,
+        }
+    }
+
+    /// Rotary time slots a reference holds before the target starts.
+    fn slots(&self) -> usize {
+        match *self {
+            Condition::Keyframe(_) => 0,
+            Condition::Reference { .. } => 1,
+            Condition::AudioReference { latents } => latents,
+        }
     }
 }
 
@@ -283,12 +306,15 @@ fn temporal_position_span(num_latent_frames: usize) -> f64 {
         .sum()
 }
 
-/// Build the `[text | target audio | conditions | target video]` layout.
+/// Build the `[text | audio conditions | target audio | video conditions |
+/// target video]` layout.
 ///
-/// The reference orders conditions before the target audio; attention is
-/// full and every row carries its own rotary position, tag and timestep, so
-/// the row ORDER is free, and this one keeps all video rows (conditions then
-/// target) contiguous for the video input projection.
+/// The reference interleaves the conditions in request order before the
+/// target audio; attention is full and every row carries its own rotary
+/// position, tag and timestep, so the row ORDER is free, and this one keeps
+/// each modality (conditions then target) contiguous for its input
+/// projection. The rotary time slots DO follow the request order: each image
+/// reference takes one, each audio reference one per latent frame.
 ///
 /// `text_token_tags` is the modality tag of every text row: text is tagged
 /// [`TAG_TEXT`], except the rows of an image's vision block, which H3 tags
@@ -307,32 +333,45 @@ pub fn build_packed_sequence(
     let num_text = text_token_tags.len();
     let target = (latent_height, latent_width);
     let num_condition_rows: usize = conditions.iter().map(|c| c.rows(patch, target)).sum();
+    let num_condition_audio_rows: usize = conditions.iter().map(Condition::audio_rows).sum();
     let num_audio_rows = num_audio_latents * AUDIO_CHANNELS;
     let num_video_rows = num_latent_frames * rows_per_frame;
-    let seq_len = num_text + num_condition_rows + num_audio_rows + num_video_rows;
+    let seq_len =
+        num_text + num_condition_audio_rows + num_audio_rows + num_condition_rows + num_video_rows;
 
-    let audio_start = num_text;
+    let audio_start = num_text + num_condition_audio_rows;
     let condition_start = audio_start + num_audio_rows;
     let video_start = condition_start + num_condition_rows;
 
     let mut pos = vec![[0.0f64; 3]; seq_len];
 
     // Text rows sit on the time axis at their row index, so text length shifts
-    // the whole media clock: media time starts at `num_text`, plus one slot
-    // per reference image.
+    // the whole media clock: media time starts at `num_text`, plus the slots
+    // the references hold.
     for (i, p) in pos.iter_mut().take(num_text).enumerate() {
         p[0] = i as f64;
     }
-    let references = conditions
-        .iter()
-        .filter(|c| matches!(c, Condition::Reference { .. }))
-        .count();
-    let origin = (num_text + references) as f64;
+    let origin = (num_text + conditions.iter().map(Condition::slots).sum::<usize>()) as f64;
 
     let frame_grid = frame_position_grid(latent_height, latent_width, patch);
     debug_assert_eq!(frame_grid.len(), rows_per_frame);
 
-    let (mut lo, mut slot) = (condition_start, num_text as f64);
+    // Audio rows are channel-major and share the video's rotary clock: one unit
+    // per latent at 40 latents/s equals 24 fps * 5/3. They carry no height
+    // coordinate and are pinned to the two extremes of the target's width
+    // grid (audio references too).
+    let w_first = frame_grid.first().map_or(0.0, |g| g[1]);
+    let w_last = frame_grid.last().map_or(0.0, |g| g[1]);
+    let audio_block = |pos: &mut [[f64; 3]], start: usize, latents: usize, time: f64| {
+        for ch in 0..AUDIO_CHANNELS {
+            let w = if ch == 0 { w_first } else { w_last };
+            for l in 0..latents {
+                pos[start + ch * latents + l] = [time + l as f64, 0.0, w];
+            }
+        }
+    };
+
+    let (mut lo, mut alo, mut slot) = (condition_start, num_text, num_text as f64);
     for condition in conditions {
         let (time, grid) = match *condition {
             Condition::Keyframe(KeyframeAnchor::First) => (origin, frame_grid.clone()),
@@ -343,34 +382,25 @@ pub fn build_packed_sequence(
             Condition::Reference {
                 latent_height,
                 latent_width,
-            } => {
-                slot += 1.0;
-                (
-                    slot - 1.0,
-                    frame_position_grid(latent_height, latent_width, patch),
-                )
+            } => (
+                slot,
+                frame_position_grid(latent_height, latent_width, patch),
+            ),
+            Condition::AudioReference { latents } => {
+                audio_block(&mut pos, alo, latents, slot);
+                alo += condition.audio_rows();
+                slot += condition.slots() as f64;
+                continue;
             }
         };
+        slot += condition.slots() as f64;
         for (row, g) in grid.iter().enumerate() {
             pos[lo + row] = [time, g[0], g[1]];
         }
         lo += grid.len();
     }
-
-    // Audio rows are channel-major and share the video's rotary clock: one unit
-    // per latent at 40 latents/s equals 24 fps * 5/3. They carry no height
-    // coordinate and are pinned to the two extremes of the width grid.
-    let w_first = frame_grid.first().map_or(0.0, |g| g[1]);
-    let w_last = frame_grid.last().map_or(0.0, |g| g[1]);
-    for i in 0..num_audio_rows {
-        let latent = i % num_audio_latents.max(1);
-        let w = if i < num_audio_latents {
-            w_first
-        } else {
-            w_last
-        };
-        pos[audio_start + i] = [origin + latent as f64, 0.0, w];
-    }
+    debug_assert_eq!(alo, audio_start);
+    audio_block(&mut pos, audio_start, num_audio_latents, origin);
 
     let time_grid = temporal_position_grid(num_latent_frames, origin);
     for (f, &t) in time_grid.iter().enumerate() {
@@ -381,7 +411,7 @@ pub fn build_packed_sequence(
     }
 
     let video_indices: Vec<u32> = (condition_start as u32..seq_len as u32).collect();
-    let audio_indices: Vec<u32> = (audio_start as u32..condition_start as u32).collect();
+    let audio_indices: Vec<u32> = (num_text as u32..condition_start as u32).collect();
     let text_indices: Vec<u32> = (0..num_text as u32).collect();
 
     let mut token_tags = vec![TAG_VIDEO; seq_len];
@@ -404,7 +434,7 @@ pub fn build_packed_sequence(
         audio_indices,
         text_indices,
         num_condition_video_rows: num_condition_rows,
-        num_condition_audio_rows: 0,
+        num_condition_audio_rows,
     }
 }
 
@@ -799,5 +829,47 @@ mod tests {
         assert_eq!(round_half_even(-0.5), -0.0);
         assert_eq!(round_half_even(2.4), 2.0);
         assert_eq!(round_half_even(2.6), 3.0);
+    }
+
+    /// Image then audio reference, as upstream's `build_ref2va_packed_sequence`
+    /// walks them: the image holds slot 3 (after 3 text rows), the audio clip
+    /// slots 4..6 on both channels, and the target starts at 6.
+    #[test]
+    fn audio_reference_takes_one_slot_per_latent_in_request_order() {
+        let patch = (1, 2, 2);
+        let conditions = [
+            Condition::Reference {
+                latent_height: 4,
+                latent_width: 4,
+            },
+            Condition::AudioReference { latents: 2 },
+        ];
+        let p = build_packed_sequence(&[TAG_TEXT; 3], 2, 4, 4, 3, patch, &conditions);
+        // text 3 | ref audio 4 | target audio 6 | ref image 4 | target video 8
+        assert_eq!(p.seq_len, 3 + 4 + 6 + 4 + 8);
+        assert_eq!(p.num_condition_audio_rows, 4);
+        assert_eq!(p.num_condition_video_rows, 4);
+        assert_eq!(p.audio_indices, (3..13).collect::<Vec<u32>>());
+        assert_eq!(p.video_indices, (13..25).collect::<Vec<u32>>());
+        let t = |i: usize| p.position_ids[i][0];
+        // Reference audio: channel 0 then 1, each at slots 4, 5.
+        assert_eq!([t(3), t(4), t(5), t(6)], [4.0, 5.0, 4.0, 5.0]);
+        assert_eq!(p.position_ids[3][2], p.position_ids[7][2], "ch 0 width");
+        assert_eq!(p.position_ids[5][2], p.position_ids[10][2], "ch 1 width");
+        // Target audio from the origin.
+        assert_eq!([t(7), t(8), t(9)], [6.0, 7.0, 8.0]);
+        // The image reference at its one slot; the target video at the origin.
+        assert_eq!(t(13), 3.0);
+        assert_eq!(t(17), 6.0);
+        for &i in &p.audio_indices {
+            assert_eq!(p.token_tags[i as usize], TAG_AUDIO);
+        }
+
+        // Reference audio stays at the clean timestep every step.
+        let key = TimeKey::single;
+        let (distinct, index) = build_row_timesteps(&p, key(0.5), key(0.25), key(0.999), key(1.0));
+        let at = |i: usize| distinct[index[i] as usize].t;
+        assert_eq!([at(3), at(6), at(7), at(12)], [1.0, 1.0, 0.25, 0.25]);
+        assert_eq!([at(13), at(17)], [0.999, 0.5]);
     }
 }

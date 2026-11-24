@@ -393,6 +393,18 @@ pub trait Accelerator: Send + Sync {
         Ok(false)
     }
 
+    /// An f32-act 1D convolution or transposed convolution (see
+    /// [`Conv1dAddrs`]). Enqueued only. `Ok(false)` = not covered.
+    fn conv1d(&self, _a: &Conv1dAddrs) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::conv1d`] covers every groups-1 shape (kernels
+    /// compiled), so a caller may enqueue a whole conv tower deferred.
+    fn accepts_conv1d(&self) -> bool {
+        false
+    }
+
     /// Whether [`Self::elementwise`] is available at all (kernels compiled).
     fn accepts_elementwise(&self) -> bool {
         false
@@ -514,6 +526,38 @@ pub struct Conv2dAddrs {
     pub bias: u64,
     pub out: u64,
     pub shape: Conv2dShape,
+}
+
+/// [`Accelerator::conv1d`] over one batch, f32 `x` `[cin, lin]` / `out`
+/// `[cout, lout]`, weights + bias f32 or bf16 (`w_bf16`). Plain:
+/// `out[co, lo] = bias[co] + sum over (ci, t) of w[co, ci, t] *
+/// x[ci, lo * stride + t * dilation - pad]` (`w` `[cout, cin, k]`).
+/// Transposed (`ConvTranspose1d`, `w` `[cin, cout, k]`, dilation 1):
+/// `out[co, lo] = bias[co] + sum over (ci, t) with (lo + pad - t) a
+/// non-negative multiple of `stride` of `w[ci, co, t] * x[ci, (lo + pad - t) /
+/// stride]`. Out-of-range inputs are zero; `lout` may include an
+/// `output_padding`. f32 accumulate, not the WGSL op's summation order.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv1dAddrs {
+    pub x: u64,
+    pub w: u64,
+    pub bias: u64,
+    pub out: u64,
+    pub shape: Conv1dShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv1dShape {
+    pub cin: u32,
+    pub cout: u32,
+    pub lin: u32,
+    pub lout: u32,
+    pub k: u32,
+    pub stride: u32,
+    pub dilation: u32,
+    pub pad: u32,
+    pub transposed: bool,
+    pub w_bf16: bool,
 }
 
 /// [`Accelerator::conv3d_f16`]: `out[b, co, to, ho, wo] = bias[co] + sum over
@@ -669,6 +713,20 @@ pub enum ElementwiseOp {
     },
     /// `out = x + y` over `n` f32.
     AddF32 { x: u64, y: u64, out: u64, n: u32 },
+    /// Snake over f32 `[channels, inner]`: `out = x + 1 / (b + eps) *
+    /// sin(a * x)^2` with `a`, `b` = `exp(alpha[c])`, `exp(beta[c])` when
+    /// `log_scale` (the WGSL `snake_beta` op), else `alpha[c]`, `beta[c]`
+    /// (the WGSL `snake` op), f32 `[channels]`.
+    SnakeF32 {
+        x: u64,
+        alpha: u64,
+        beta: u64,
+        out: u64,
+        channels: u32,
+        inner: u32,
+        eps: f32,
+        log_scale: bool,
+    },
     /// The Wan DiT's f16 norm + AdaLN: `n = f16(layernorm(x))` (no affine,
     /// biased variance) then `out = f16(n * (1 + scale[c]) + shift[c])`, over
     /// `[rows, dim]`; `scale` / `shift` f16 `[dim]` activations.

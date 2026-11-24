@@ -410,7 +410,14 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
         y[..z * plane].copy_from_slice(&video_lat);
         y[z * plane..].copy_from_slice(&mask_lat);
 
-        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let shape = WanDitShape::new(
+            self.cfg.geometry,
+            self.cfg.in_channels,
+            f_lat,
+            h_lat,
+            w_lat,
+            TEXT_SEQ,
+        );
         let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
         let zeros_ref = vec![0.0_f32; image_lat.len()];
 
@@ -598,7 +605,14 @@ impl<S: WeightSource> DreamIdvPipeline<S> {
             Arc::clone(&self.backend),
             Arc::clone(self.residency.arbiter()),
         );
-        let shape = WanDitShape::new(self.cfg.in_channels, f_lat, h_lat, w_lat, TEXT_SEQ);
+        let shape = WanDitShape::new(
+            self.cfg.geometry,
+            self.cfg.in_channels,
+            f_lat,
+            h_lat,
+            w_lat,
+            TEXT_SEQ,
+        );
         let dit = WanDit::assemble(self.dit_handles.clone(), shape, self.cfg);
         let inputs = WanDitInputs {
             image,

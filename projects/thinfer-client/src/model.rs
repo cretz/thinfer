@@ -1482,3 +1482,98 @@ impl std::fmt::Display for TextModelId {
         })
     }
 }
+
+/// Default VRAM budget of an audio job (the 1.7B speech models keep every
+/// weight resident: ~3.4 GB talker + codec + activations).
+pub const AUDIO_DEFAULT_VRAM: &str = "5G";
+pub const AUDIO_DEFAULT_RAM: &str = "4G";
+
+/// Audio-generation models: speech (text to a voice) and sound effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum AudioModelId {
+    /// Qwen3-TTS 1.7B Base: speaks in the voice of a reference clip (with
+    /// its transcript, the clip's delivery carries over too).
+    #[cfg_attr(feature = "clap", value(name = "qwen3-tts"))]
+    #[serde(rename = "qwen3-tts")]
+    Qwen3Tts,
+    /// Qwen3-TTS 1.7B VoiceDesign: a voice (and delivery) from a written
+    /// description.
+    #[cfg_attr(feature = "clap", value(name = "qwen3-tts-design"))]
+    #[serde(rename = "qwen3-tts-design")]
+    Qwen3TtsDesign,
+    /// MOSS-SoundEffect v2.0 (1.3B DiT): a sound effect from a description,
+    /// up to 30 s at 48 kHz.
+    #[cfg_attr(feature = "clap", value(name = "moss-sfx"))]
+    #[serde(rename = "moss-sfx")]
+    MossSfx,
+}
+
+/// What kind of audio a model makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioKind {
+    Speech,
+    Sound,
+}
+
+impl AudioModelId {
+    pub const DEFAULT: AudioModelId = AudioModelId::Qwen3TtsDesign;
+    pub const ALL: [AudioModelId; 3] = [
+        AudioModelId::Qwen3TtsDesign,
+        AudioModelId::Qwen3Tts,
+        AudioModelId::MossSfx,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Qwen3Tts => "Qwen3-TTS 1.7B, speech in a reference clip's voice",
+            Self::Qwen3TtsDesign => "Qwen3-TTS 1.7B VoiceDesign, speech in a described voice",
+            Self::MossSfx => "MOSS-SoundEffect v2.0, sound effects from a description",
+        }
+    }
+
+    pub fn kind(self) -> AudioKind {
+        match self {
+            Self::Qwen3Tts | Self::Qwen3TtsDesign => AudioKind::Speech,
+            Self::MossSfx => AudioKind::Sound,
+        }
+    }
+
+    /// Output sample rate (Hz).
+    pub fn sample_rate(self) -> u32 {
+        match self {
+            Self::Qwen3Tts | Self::Qwen3TtsDesign => 24_000,
+            Self::MossSfx => 48_000,
+        }
+    }
+
+    /// Longest clip one job makes (seconds).
+    pub fn max_seconds(self) -> f32 {
+        match self {
+            Self::Qwen3Tts | Self::Qwen3TtsDesign => 120.0,
+            Self::MossSfx => 30.0,
+        }
+    }
+
+    /// Takes a style / voice description (`instruct`).
+    pub fn takes_instruct(self) -> bool {
+        matches!(self, Self::Qwen3TtsDesign)
+    }
+
+    /// Takes (requires) a reference voice clip.
+    pub fn takes_voice(self) -> bool {
+        matches!(self, Self::Qwen3Tts)
+    }
+}
+
+impl std::fmt::Display for AudioModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AudioModelId::Qwen3Tts => "qwen3-tts",
+            AudioModelId::Qwen3TtsDesign => "qwen3-tts-design",
+            AudioModelId::MossSfx => "moss-sfx",
+        })
+    }
+}

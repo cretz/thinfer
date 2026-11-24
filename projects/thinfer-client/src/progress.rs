@@ -23,4 +23,7 @@ pub enum Stage {
     VaeDecode,
     /// Face-swap streamed `done` of `total` frames swapped.
     FrameSwapped { done: u32, total: u32 },
+    /// Audio generated so far (milliseconds; speech has no known length
+    /// until it ends).
+    Audio { ms: u32 },
 }

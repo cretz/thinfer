@@ -20,6 +20,7 @@ pub mod rope_embedder;
 pub mod seq;
 pub mod vae_taehv;
 pub mod vae_tiling;
+pub mod weight_norm;
 
 /// Cooperative cancellation hook. Returns `true` when the caller wants the
 /// in-flight generate to stop; the denoise loops poll it at step (and, where a

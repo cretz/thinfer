@@ -311,7 +311,8 @@ where
             && ts_exp
                 .iter()
                 .zip(&plan.modulation.timesteps)
-                .all(|(a, b)| (a - b).abs() <= 1e-6),
+                // The base checkpoint is single-time: every key's `r` is its `t`.
+                .all(|(a, b)| (a - b.t).abs() <= 1e-6 && b.r == b.t),
         "distinct timesteps differ".into(),
     );
     gate.check(

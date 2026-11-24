@@ -21,11 +21,13 @@ use thinfer_core::backend::PowerPreference;
 use thinfer_core::manifest::FileRef;
 use thinfer_native::cache::DownloadProgress;
 
+mod audio;
 mod faceswap;
 mod image;
 mod text;
 mod video;
 
+use audio::GenerateAudio;
 use faceswap::GenerateFaceSwap;
 use image::GenerateImage;
 use text::GenerateText;
@@ -39,6 +41,8 @@ pub enum GenerateCmd {
     Video(GenerateVideo),
     /// Generate a chat reply with an LLM (streamed to stdout).
     Text(GenerateText),
+    /// Generate speech: text in a described voice or a reference clip's voice.
+    Audio(GenerateAudio),
     /// Swap a face from a source image into every frame of an input video.
     #[command(name = "face-swap")]
     FaceSwap(GenerateFaceSwap),
@@ -49,6 +53,7 @@ pub async fn run(cmd: GenerateCmd) -> ExitCode {
         GenerateCmd::Image(args) => image::run_image(args).await,
         GenerateCmd::Video(args) => video::run_video(args).await,
         GenerateCmd::Text(args) => text::run_text(args).await,
+        GenerateCmd::Audio(args) => audio::run_audio(args).await,
         GenerateCmd::FaceSwap(args) => faceswap::run_faceswap(args).await,
     };
     match result {
@@ -260,6 +265,16 @@ impl CliSink {
             return;
         }
         let out = s.output.display();
+        if let Some(a) = &s.audio {
+            eprintln!(
+                "{} Wrote {out} ({:.1} s at {} Hz{}) in {elapsed:.1}s",
+                self.stamp(),
+                a.seconds,
+                a.sample_rate,
+                s.seed.map(|v| format!(", seed {v}")).unwrap_or_default(),
+            );
+            return;
+        }
         match (s.fps, s.seed) {
             (None, seed) => eprintln!(
                 "{} Wrote {out} ({}x{}{}) in {elapsed:.1}s",
@@ -306,6 +321,12 @@ impl ProgressSink for CliSink {
             Stage::FrameSwapped { done, total } => {
                 if done.is_multiple_of(10) {
                     eprintln!("{} Swapped frame {done}/{total}", self.stamp());
+                }
+            }
+            // Frames are 80 ms: this lands every 2 s of audio.
+            Stage::Audio { ms } => {
+                if ms.is_multiple_of(1000) {
+                    eprintln!("{} Generated {} s of audio", self.stamp(), ms / 1000);
                 }
             }
         }

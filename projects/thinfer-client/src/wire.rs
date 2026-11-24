@@ -116,6 +116,7 @@ pub struct JobKeyDelivery {
 pub enum JobSpec {
     Image(ImageSpec),
     Text(TextSpec),
+    Audio(AudioSpec),
     Video(VideoSpec),
     FaceSwap(FaceSwapSpec),
 }
@@ -125,7 +126,7 @@ impl JobSpec {
     /// the sealed spec; see [`SealedJob::uploads`]).
     pub fn upload_ids(&self) -> Vec<String> {
         let id = match self {
-            JobSpec::Image(_) | JobSpec::Text(_) | JobSpec::Video(_) => None,
+            JobSpec::Image(_) | JobSpec::Text(_) | JobSpec::Audio(_) | JobSpec::Video(_) => None,
             JobSpec::FaceSwap(s) => s.input_video_upload.as_ref(),
         };
         id.into_iter().cloned().collect()
@@ -138,11 +139,63 @@ impl JobSpec {
     pub fn disable_coopmat(&self) -> Option<bool> {
         match self {
             JobSpec::Image(s) => s.disable_coopmat,
-            JobSpec::Text(_) => None,
+            JobSpec::Text(_) | JobSpec::Audio(_) => None,
             JobSpec::Video(s) => s.disable_coopmat,
             JobSpec::FaceSwap(s) => s.disable_coopmat,
         }
     }
+}
+
+/// A speech request: `text` spoken in a described voice (`instruct`, voice
+/// design models) or in a reference clip's voice (`refAudios`, voice clone
+/// models; with `refText`, its transcript, the clip's delivery carries over
+/// too). `GET /models` lists what each model takes. No `Debug`: text and
+/// clips are never logged.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AudioSpec {
+    pub model: Option<crate::model::AudioModelId>,
+    /// What to say.
+    pub text: String,
+    /// The voice and delivery, in words: "a warm young woman, out of breath
+    /// and whispering". Voice design models only.
+    #[serde(default)]
+    pub instruct: Option<String>,
+    /// Base64 reference clip (WAV, FLAC, MP3, M4A/AAC, Ogg): the voice to
+    /// speak in. Voice clone models only; one clip. Held in RAM.
+    #[serde(default)]
+    pub ref_audios: Option<Vec<String>>,
+    /// The reference clip's transcript (in-context cloning: its pace, tone
+    /// and emotion carry over as well as its voice).
+    #[serde(default)]
+    pub ref_text: Option<String>,
+    /// `auto` (default) or a language the model lists.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Speech: longest output in seconds (default 60).
+    #[serde(default)]
+    pub max_seconds: Option<f32>,
+    pub seed: Option<u64>,
+    /// Speech sampling overrides (default: the model's).
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Sound: the clip's length in seconds (default 10, rounded to 0.1).
+    #[serde(default)]
+    pub seconds: Option<f32>,
+    /// Sound: a seamless loop (its end runs into its start). Off by default.
+    #[serde(default, rename = "loop")]
+    pub looped: Option<bool>,
+    /// Sound: denoising steps (default 100; fewer is faster and rougher).
+    #[serde(default)]
+    pub steps: Option<u32>,
+    /// Sound: classifier-free guidance (default 4).
+    #[serde(default)]
+    pub guidance: Option<f32>,
 }
 
 /// One chat turn of a [`TextSpec`]. No `Debug`: content is never logged.
@@ -444,20 +497,28 @@ pub struct VideoSpec {
     /// drift. Used only with `input_image` on ltx2-rapid; ignored otherwise.
     #[serde(default)]
     pub strength: Option<f32>,
-    /// Base64-encoded reference images (PNG/JPEG). FastH3-Omni only (at most
-    /// 9): the prompt names them `<Picture 1>`, `<Picture 2>`, ... in order.
-    /// Held in RAM by the server, never written to disk.
+    /// Base64-encoded reference images (PNG/JPEG). Reference-to-video models
+    /// only (at most 9): the prompt names them `<Picture 1>`, `<Picture 2>`,
+    /// ... in order. Held in RAM by the server, never written to disk.
     #[serde(default)]
     pub ref_images: Option<Vec<String>>,
+    /// Base64-encoded reference audio clips (WAV, FLAC, MP3, M4A/AAC, Ogg):
+    /// a voice to speak in, a sound to use. Reference-to-video models only,
+    /// at most 3, and only alongside at least one `ref_images` entry. The
+    /// prompt names them `<Audio 1>`, `<Audio 2>`, ... in order (counted
+    /// apart from the pictures), e.g. "<Picture 1> says hello in the voice of
+    /// <Audio 1>". Each is cut to the clip's length. Held in RAM.
+    #[serde(default)]
+    pub ref_audios: Option<Vec<String>>,
     /// FastH3-Omni: how each reference image is sized. `match` (default, as in
     /// ComfyUI: the canvas's pixel area, never upscaled), `max` (short edge
     /// capped at 2048) or `diffusers` (short edge exactly 2048, the reference;
     /// ~2.4x slower with one reference).
     #[serde(default)]
     pub ref_image_size: Option<RefImageSize>,
-    /// FastH3-Omni: `auto` (default) crops each reference in on its faces
-    /// when they would come out small (a person photographed from afar);
-    /// `off` always keeps the whole image, as the reference does.
+    /// FastH3-Omni: `off` (default) always keeps the whole image, as the
+    /// reference does; `auto` crops each reference in on its faces when they
+    /// would come out small (a person photographed from afar).
     #[serde(default)]
     pub ref_crop: Option<RefCrop>,
     /// LTX-2.3 text-encoder quantization: `q8` (default, conditioning-quality
@@ -690,6 +751,9 @@ pub enum ProgressStage {
         done: u32,
         total: u32,
     },
+    Audio {
+        ms: u32,
+    },
 }
 
 impl From<Stage> for ProgressStage {
@@ -711,6 +775,7 @@ impl From<Stage> for ProgressStage {
             },
             Stage::VaeDecode => ProgressStage::VaeDecode,
             Stage::FrameSwapped { done, total } => ProgressStage::FrameSwapped { done, total },
+            Stage::Audio { ms } => ProgressStage::Audio { ms },
         }
     }
 }
@@ -734,6 +799,7 @@ impl From<ProgressStage> for Stage {
             },
             ProgressStage::VaeDecode => Stage::VaeDecode,
             ProgressStage::FrameSwapped { done, total } => Stage::FrameSwapped { done, total },
+            ProgressStage::Audio { ms } => Stage::Audio { ms },
         }
     }
 }
@@ -753,6 +819,18 @@ pub struct JobResult {
     /// Text jobs: token counts and speed (the reply itself is the artifact).
     #[serde(default)]
     pub text: Option<TextResult>,
+    /// Audio jobs: the clip's length and rate (the WAV is the artifact).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioResult>,
+}
+
+/// A finished audio clip.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AudioResult {
+    pub seconds: f32,
+    pub sample_rate: u32,
 }
 
 /// Token counts and timings of a finished text job.
@@ -913,12 +991,47 @@ pub struct ModelInfo {
     pub downloaded: bool,
     /// Its jobs can pause (`POST /jobs/{id}/pause`).
     pub pausable: bool,
-    /// The images it takes; empty: none.
+    /// The media it takes (images, audio clips, a video); empty: only the
+    /// prompt.
     pub inputs: Vec<InputSlot>,
+    /// The media a result carries: `[text]`, `[image]`, `[video]` or
+    /// `[video, audio]` (a soundtrack: generated, or for face swap the input
+    /// video's own, copied).
+    pub outputs: Vec<Media>,
     /// Image / video models: what sets the output size, and its rules.
     pub size: Option<SizeRules>,
     /// Video models.
     pub video: Option<VideoInfo>,
+    /// Audio models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioInfo>,
+}
+
+/// What an audio model takes and makes besides its media inputs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInfo {
+    /// `speech` (says `text`) or `sound` (makes the sound `text` describes).
+    pub kind: AudioKindInfo,
+    /// Output sample rate (Hz); the artifact is a mono 16-bit WAV.
+    pub sample_rate: u32,
+    /// Longest output (seconds).
+    pub max_seconds: f32,
+    /// Takes `instruct` (a written voice / delivery description).
+    pub instruct: bool,
+    /// `language` values it takes (`auto` = detect).
+    pub languages: Vec<String>,
+    /// How to use it well (prompting, cloning).
+    pub notes: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum AudioKindInfo {
+    Speech,
+    Sound,
 }
 
 /// A model family, as a job spec's `kind` names it.
@@ -928,6 +1041,7 @@ pub struct ModelInfo {
 pub enum ModelKind {
     Text,
     Image,
+    Audio,
     Video,
     FaceSwap,
 }
@@ -938,16 +1052,36 @@ pub enum ModelKind {
 #[serde(rename_all = "camelCase")]
 pub struct InputSlot {
     /// The spec field that carries it (`inputImages`, `inputImage`,
-    /// `refImages`, `sourceImage`).
+    /// `refImages`, `refAudios`, `sourceImageB64`, `inputVideoUpload`).
     pub field: String,
+    /// What the field holds: base64 file bytes (or an upload id) of this
+    /// medium.
+    pub media: Media,
+    /// File types it decodes (lowercase extensions).
+    pub formats: Vec<String>,
     pub used_as: InputUse,
     pub min: u32,
     pub max: u32,
-    /// How a prompt names the n-th image (`{n}` from 1), when it can.
+    /// How a prompt names the n-th item of this slot (`{n}` from 1, in the
+    /// field's order), when it can. Each slot counts on its own: with two
+    /// images and one clip, `<Picture 1>`, `<Picture 2>` and `<Audio 1>`.
     pub prompt_tag: Option<String>,
+    /// How the model uses it and any rule beyond `min` / `max`.
+    pub notes: String,
 }
 
-/// What a model does with an input image.
+/// A medium a model takes or makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum Media {
+    Text,
+    Image,
+    Video,
+    Audio,
+}
+
+/// What a model does with an input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -958,10 +1092,15 @@ pub enum InputUse {
     Edit,
     /// The video's first frame.
     FirstFrame,
-    /// Named references (people, objects, styles) the video draws on.
+    /// Named references the video draws on: people, objects, styles
+    /// (images), a voice or a sound (audio).
     Reference,
     /// The face to swap in.
     Face,
+    /// The video a face swap edits.
+    Target,
+    /// The voice speech is spoken in.
+    Voice,
 }
 
 /// What decides the output size, and the sizes allowed.
@@ -1000,6 +1139,4 @@ pub struct VideoInfo {
     /// Several prompts render as chained clips (each starts on the previous
     /// one's last frame).
     pub chained_clips: bool,
-    /// It renders an audio track.
-    pub audio: bool,
 }

@@ -436,6 +436,7 @@ impl Job<'_> {
         tracing::info!(target: thinfer_core::trace::DIAG, path = %req.output.display(), bytes, "wrote output");
         Ok(JobSummary {
             text: None,
+            audio: None,
             session: None,
             tool_calls: Vec::new(),
             output: req.output.clone(),

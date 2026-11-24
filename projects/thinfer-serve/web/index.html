@@ -41,6 +41,7 @@
                   <option value="video">Video</option>
                   <option value="face-swap">Face swap</option>
                   <option value="text">Text (chat)</option>
+                  <option value="audio">Audio</option>
                 </select>
               </div>
               <div class="field">
@@ -87,6 +88,23 @@
                   </button>
                 </div>
                 <div id="ref-images-order" class="chosen"></div>
+              </div>
+              <!-- Ordered reference audio (reference-to-video models, up to 3,
+                   alongside at least one reference image): the prompt names
+                   them <Audio 1>, ..., numbered apart from the pictures. -->
+              <div class="field span-all" id="ref-audios-row" hidden>
+                <label for="ref-audios">Reference audio (a voice, a sound)</label>
+                <input
+                  id="ref-audios"
+                  type="file"
+                  accept="audio/*,.wav,.flac,.mp3,.m4a,.aac,.ogg"
+                  multiple
+                />
+                <div id="ref-audios-order" class="chosen"></div>
+                <small
+                  >e.g. "&lt;Audio 1&gt; is the voice-timbre reference for &lt;Subject 1&gt; (S1)."
+                  Each clip is cut to the video's length.</small
+                >
               </div>
               <div class="field span-all" id="ref-image-size-row" hidden>
                 <label for="ref-image-size">Reference size</label>
@@ -387,6 +405,78 @@
             </div>
           </section>
 
+          <section class="group audio-only">
+            <h2>Audio</h2>
+            <div class="grid">
+              <!-- Voice design: the voice and delivery in words. -->
+              <div class="field span-all" id="instruct-row">
+                <label for="instruct">Voice and delivery</label>
+                <textarea
+                  id="instruct"
+                  rows="2"
+                  placeholder="e.g. a warm young woman, out of breath and whispering"
+                ></textarea>
+              </div>
+              <!-- Voice clone: one reference clip (+ its transcript). -->
+              <div class="field span-all" id="voice-row" hidden>
+                <label for="voice">Voice clip (the voice to speak in)</label>
+                <input id="voice" type="file" accept="audio/*,.wav,.flac,.mp3,.m4a,.aac,.ogg" />
+                <small>3 to 20 s of one speaker, little background noise.</small>
+              </div>
+              <div class="field span-all" id="ref-text-row" hidden>
+                <label for="ref-text">What the clip says</label>
+                <textarea
+                  id="ref-text"
+                  rows="2"
+                  placeholder="(recommended: with it, the clip's pace, tone and emotion carry over too)"
+                ></textarea>
+              </div>
+              <div class="field speech-only">
+                <label for="language">Language</label>
+                <select id="language"></select>
+              </div>
+              <div class="field speech-only">
+                <label for="max-seconds">Max seconds</label>
+                <input id="max-seconds" type="number" min="1" max="120" value="60" />
+              </div>
+              <!-- Sound effects: the clip's length, loop, sampling. -->
+              <div class="field sound-only">
+                <label for="sound-seconds">Seconds</label>
+                <input id="sound-seconds" type="number" min="0.1" max="30" step="0.1" value="10" />
+              </div>
+              <div class="field sound-only">
+                <label for="sound-steps">Steps</label>
+                <input id="sound-steps" type="number" min="1" max="1000" value="100" title="100 is the model's recommended count; fewer is faster and rougher." />
+              </div>
+              <div class="field sound-only">
+                <label for="sound-guidance">Guidance</label>
+                <input id="sound-guidance" type="text" inputmode="decimal" placeholder="4 (model default)" />
+              </div>
+              <div class="field">
+                <label for="audio-seed">Seed</label>
+                <input id="audio-seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="(random)" />
+              </div>
+              <div class="field speech-only">
+                <label for="audio-temperature">Temperature</label>
+                <input id="audio-temperature" type="text" inputmode="decimal" placeholder="(model default)" />
+              </div>
+              <div class="field speech-only">
+                <label for="audio-top-k">Top-k</label>
+                <input id="audio-top-k" type="text" inputmode="numeric" placeholder="(model default)" />
+              </div>
+              <div class="field speech-only">
+                <label for="audio-top-p">Top-p</label>
+                <input id="audio-top-p" type="text" inputmode="decimal" placeholder="(model default)" />
+              </div>
+            </div>
+            <div class="checks sound-only">
+              <div class="check">
+                <input id="sound-loop" type="checkbox" />
+                <label for="sound-loop" title="The clip's end runs straight into its start, for ambience on repeat.">Seamless loop</label>
+              </div>
+            </div>
+          </section>
+
           <details class="group panel" id="advanced">
             <summary>Advanced</summary>
             <div class="grid">
@@ -429,6 +519,7 @@
         <div class="media">
           <img id="image-out" alt="Generated image" hidden />
           <video id="video-out" controls playsinline hidden></video>
+          <audio id="audio-out" controls hidden></audio>
         </div>
         <p><a id="download" class="download" hidden download>Download</a></p>
         <details class="log-panel" open>

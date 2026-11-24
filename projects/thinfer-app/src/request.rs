@@ -10,9 +10,10 @@ use thinfer_core::manifest::FileRef;
 use thinfer_core::policy::ResidencyBudget;
 
 use crate::model::{
-    AttnPrecision, EncoderQuant, ImageModelEngine, ImageModelId, RefCrop, RefImageSize,
-    RewriteQuality, RewriteQualityEngine, SuperRes, SwapModel, SwapModelEngine, TextModelEngine,
-    VaeChoice, VaeChoiceEngine, VideoModelEngine, VideoModelId, VideoSampler,
+    AttnPrecision, AudioKind, AudioModelEngine, AudioModelId, EncoderQuant, ImageModelEngine,
+    ImageModelId, RefCrop, RefImageSize, RewriteQuality, RewriteQualityEngine, SuperRes, SwapModel,
+    SwapModelEngine, TextModelEngine, VaeChoice, VaeChoiceEngine, VideoModelEngine, VideoModelId,
+    VideoSampler,
 };
 
 /// Both image and video models narrow dims by `vae_scale = vae_factor*2 = 16`.
@@ -199,6 +200,24 @@ impl Drop for ImageBytes {
     }
 }
 
+/// A complete encoded audio file (WAV, FLAC, MP3, M4A/AAC, Ogg) held in RAM
+/// under the same rules as [`ImageBytes`]: never on disk, never logged, wiped
+/// on drop.
+#[derive(Clone)]
+pub struct AudioBytes(pub Vec<u8>);
+
+impl std::fmt::Debug for AudioBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AudioBytes({} bytes)", self.0.len())
+    }
+}
+
+impl Drop for AudioBytes {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 impl Drop for VideoInput {
     fn drop(&mut self) {
         match self {
@@ -347,10 +366,15 @@ pub struct VideoRequest {
     /// anchor); lower values let it drift toward the model's own frame-0. Only
     /// used when `input_image` is set on an LTX i2v model; ignored otherwise.
     pub strength: f32,
-    /// FastH3-Omni only: reference images (PNG/JPEG, at most 9) the prompt can
-    /// name as `<Picture 1>`, `<Picture 2>`, ... in order. Held in RAM
-    /// ([`ImageBytes`]); a decrypted image never touches disk.
+    /// Reference-to-video models only: reference images (PNG/JPEG, at most 9)
+    /// the prompt can name as `<Picture 1>`, `<Picture 2>`, ... in order. Held
+    /// in RAM ([`ImageBytes`]); a decrypted image never touches disk.
     pub ref_images: Vec<ImageBytes>,
+    /// Reference-to-video models only: reference audio clips (a voice, a
+    /// sound; at most 3, and only alongside at least one reference image) the
+    /// prompt can name as `<Audio 1>`, `<Audio 2>`, ... in order. Each is cut
+    /// to the clip's length. Held in RAM ([`AudioBytes`]).
+    pub ref_audios: Vec<AudioBytes>,
     /// FastH3-Omni only: how each reference image is sized (rejected for every
     /// other model when not the default).
     pub ref_image_size: RefImageSize,
@@ -801,6 +825,24 @@ impl VideoRequest {
         }
         if self.ref_images.len() > max_refs {
             return Err(format!("at most {max_refs} reference images"));
+        }
+        if !self.ref_audios.is_empty() {
+            if !self.model.takes_refs() {
+                return Err(format!(
+                    "{} does not take reference audio (fasth3-omni, hyperflow-flash-ref, \
+                     minimax-h3-turbo-ref do)",
+                    self.model
+                ));
+            }
+            let max = crate::minimax_ref::MAX_REFERENCE_AUDIOS;
+            if self.ref_audios.len() > max {
+                return Err(format!("at most {max} reference audio clips"));
+            }
+            if self.ref_images.is_empty() {
+                return Err(
+                    "reference audio needs at least one reference image alongside it".into(),
+                );
+            }
         }
         let mult = self.model.dim_multiple();
         for (name, v) in [("height", self.height), ("width", self.width)] {
@@ -1276,6 +1318,7 @@ impl FaceSwapRequest {
 pub enum JobRequest {
     Image(ImageRequest),
     Text(TextRequest),
+    Audio(AudioRequest),
     /// Boxed: the video request is several times the others' size.
     Video(Box<VideoRequest>),
     FaceSwap(FaceSwapRequest),
@@ -1300,9 +1343,192 @@ impl JobRequest {
         match self {
             JobRequest::Image(r) => Ok(r.required_files()),
             JobRequest::Text(r) => Ok(r.required_files()),
+            JobRequest::Audio(r) => Ok(r.required_files()),
             JobRequest::Video(r) => r.required_files(),
             JobRequest::FaceSwap(r) => Ok(r.required_files()),
         }
+    }
+}
+
+/// Generate audio: speech in a voice (a reference clip's, or a described
+/// one).
+#[derive(Clone)]
+pub struct AudioRequest {
+    pub model: AudioModelId,
+    /// What to say. Never logged.
+    pub text: String,
+    /// How to say it and in what voice (VoiceDesign): "a warm young woman,
+    /// whispering". Never logged.
+    pub instruct: Option<String>,
+    /// The voice to speak in (voice-clone models).
+    pub ref_audio: Option<AudioBytes>,
+    /// The clip's transcript: with it the clip's delivery carries over too
+    /// (in-context cloning); without, only its voice embedding is used.
+    /// Never logged.
+    pub ref_text: Option<String>,
+    /// `auto` or one of [`thinfer_models::qwen3_tts::LANGUAGES`].
+    pub language: String,
+    /// `None` -> randomized at run time; the resolved value is reported back.
+    pub seed: Option<u64>,
+    /// Sampling overrides (`None` = the model's defaults).
+    pub temperature: Option<f32>,
+    pub top_k: Option<u32>,
+    pub top_p: Option<f32>,
+    /// Speech: longest output (seconds).
+    pub max_seconds: f32,
+    /// Sound: the clip's settings (`None` for speech).
+    pub sound: Option<SoundParams>,
+    pub budget: ResidencyBudget,
+    pub output: PathBuf,
+}
+
+/// What a sound effect run takes besides its description.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoundParams {
+    /// Clip length (seconds, rounded to 0.1).
+    pub seconds: f32,
+    /// Seamless loop.
+    pub looped: bool,
+    pub steps: u32,
+    pub guidance: f32,
+}
+
+impl SoundParams {
+    /// The wire's optional fields over the model's defaults.
+    pub fn resolve(
+        seconds: Option<f32>,
+        looped: Option<bool>,
+        steps: Option<u32>,
+        guidance: Option<f32>,
+    ) -> Self {
+        use thinfer_models::moss_sfx as m;
+        Self {
+            seconds: m::round_seconds(seconds.unwrap_or(m::DEFAULT_SECONDS)),
+            looped: looped.unwrap_or(false),
+            steps: steps.unwrap_or(m::DEFAULT_STEPS),
+            guidance: guidance.unwrap_or(m::DEFAULT_GUIDANCE),
+        }
+    }
+}
+
+impl std::fmt::Debug for AudioRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioRequest")
+            .field("model", &self.model)
+            .field("ref_audio", &self.ref_audio)
+            .field("language", &self.language)
+            .field("max_seconds", &self.max_seconds)
+            .field("sound", &self.sound)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AudioRequest {
+    pub fn required_files(&self) -> Vec<FileRef> {
+        Self::files_of(self.model)
+    }
+
+    pub fn files_of(model: AudioModelId) -> Vec<FileRef> {
+        let m = model.manifest();
+        model
+            .required_roles()
+            .iter()
+            .map(|r| *m.get(r).expect("audio role in manifest"))
+            .collect()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.kind() == AudioKind::Sound {
+            return self.validate_sound();
+        }
+        if self.text.trim().is_empty() {
+            return Err("text to speak is required".into());
+        }
+        if self.sound.is_some() {
+            return Err(format!(
+                "{} makes speech: seconds, loop, steps and guidance are for sound models",
+                self.model
+            ));
+        }
+        if thinfer_models::qwen3_tts::language_id(&self.language).is_none() {
+            return Err(format!(
+                "unknown language {:?} (one of {})",
+                self.language,
+                thinfer_models::qwen3_tts::LANGUAGES.join(", ")
+            ));
+        }
+        if self.model.takes_voice() != self.ref_audio.is_some() {
+            return Err(if self.model.takes_voice() {
+                format!("{} needs a reference voice clip", self.model)
+            } else {
+                format!(
+                    "{} takes no reference clip (describe the voice instead)",
+                    self.model
+                )
+            });
+        }
+        if self.ref_text.is_some() && self.ref_audio.is_none() {
+            return Err("a reference transcript needs its reference clip".into());
+        }
+        if self.instruct.is_some() && !self.model.takes_instruct() {
+            return Err(format!(
+                "{} takes no instruction (its delivery follows the reference clip)",
+                self.model
+            ));
+        }
+        if !(0.5..=self.model.max_seconds()).contains(&self.max_seconds) {
+            return Err(format!(
+                "max seconds must be 0.5..={}",
+                self.model.max_seconds()
+            ));
+        }
+        if let Some(t) = self.temperature
+            && !(t.is_finite() && t >= 0.0)
+        {
+            return Err("temperature must be >= 0".into());
+        }
+        if let Some(p) = self.top_p
+            && !(p > 0.0 && p <= 1.0)
+        {
+            return Err("top-p must be in (0, 1]".into());
+        }
+        Ok(())
+    }
+
+    fn validate_sound(&self) -> Result<(), String> {
+        if self.text.trim().is_empty() {
+            return Err("describe the sound".into());
+        }
+        let Some(s) = self.sound else {
+            return Err(format!("{} needs its sound settings", self.model));
+        };
+        let speech_only = self.instruct.is_some()
+            || self.ref_audio.is_some()
+            || self.ref_text.is_some()
+            || self.temperature.is_some()
+            || self.top_k.is_some()
+            || self.top_p.is_some()
+            || self.language != "auto";
+        if speech_only {
+            return Err(format!(
+                "{} makes sound effects: instruct, reference clips, language and speech \
+                 sampling do not apply",
+                self.model
+            ));
+        }
+        if !(0.1..=self.model.max_seconds()).contains(&s.seconds) {
+            return Err(format!(
+                "seconds must be 0.1..={}",
+                self.model.max_seconds()
+            ));
+        }
+        if !(1..=1000).contains(&s.steps) {
+            return Err("steps must be 1..=1000".into());
+        }
+        if !(s.guidance.is_finite() && s.guidance >= 1.0) {
+            return Err("guidance must be >= 1".into());
+        }
+        Ok(())
     }
 }
 
@@ -1480,11 +1706,20 @@ pub struct JobSummary {
     pub seed: Option<u64>,
     /// Text generation stats (`None` for media jobs).
     pub text: Option<TextStats>,
+    /// Audio jobs: what the clip is.
+    pub audio: Option<AudioStats>,
     /// A session text request's new state chunk (shared, never copied).
     pub session: Option<std::sync::Arc<SessionSave>>,
     /// The tool calls a text reply ended with (job data; see
     /// [`crate::tools::FinishReason::ToolCalls`]).
     pub tool_calls: Vec<crate::tools::ToolCall>,
+}
+
+/// A finished audio clip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioStats {
+    pub seconds: f32,
+    pub sample_rate: u32,
 }
 
 /// Resolve frames/durations into the clip's frame count. These models take one
@@ -1673,6 +1908,7 @@ mod tests {
             input_image: None,
             strength: 1.0,
             ref_images: Vec::new(),
+            ref_audios: Vec::new(),
             ref_image_size: Default::default(),
             ref_crop: Default::default(),
             sampler: VideoSampler::UniPc,
@@ -1802,6 +2038,7 @@ mod tests {
             input_image: None,
             strength: 1.0,
             ref_images: Vec::new(),
+            ref_audios: Vec::new(),
             ref_image_size: Default::default(),
             ref_crop: Default::default(),
             sampler: VideoSampler::UniPc,

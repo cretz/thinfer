@@ -416,7 +416,9 @@ details.panel[open] > summary {
 body:not(.kind-image) .image-only,
 body:not(.kind-video) .video-only,
 body:not(.kind-text) .text-only,
-body.kind-text .media-only {
+body:not(.kind-audio) .audio-only,
+body.kind-text .media-only,
+body.kind-audio .media-only {
   display: none;
 }
 

@@ -1,4 +1,5 @@
-//! MiniMax-H3 audio VAE, DECODER only.
+//! MiniMax-H3 audio VAE DECODER (the encoder, for audio references, is
+//! [`super::audio_encoder`]).
 //!
 //! This is a BigVGAN v2 generator and we already ship one: it is the same
 //! family as the LTX-2.3 vocoder, with IDENTICAL `resblock_kernel_sizes

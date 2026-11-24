@@ -185,6 +185,7 @@ pub struct DenoisePlan {
     pub modulation: ModulationPlan,
     /// `[seq, rotary_dim]` rotary frequencies for the packed grid.
     pub freqs: Vec<f32>,
+    /// Every row of the modality, conditioning blocks included.
     pub num_video_rows: usize,
     pub num_audio_rows: usize,
     pub num_text_rows: usize,
@@ -514,10 +515,11 @@ async fn forward_impl<'r, S: WeightSource>(
     let seq_len = plan.packed.seq_len;
     let hidden = cfg.hidden;
     let [(text_at, n_text), (audio_at, n_audio), (video_at, n_video)] = plan.contiguous_spans()?;
-    // The video span leads with the clean conditioning blocks; only the rows
-    // after them are generated.
+    // The video and audio spans lead with their clean conditioning blocks;
+    // only the rows after them are generated.
     let n_cond = plan.packed.num_condition_video_rows;
     let (target_at, n_target) = (video_at + n_cond, n_video - n_cond);
+    let n_cond_audio = plan.packed.num_condition_audio_rows;
 
     let shape = DitShape {
         cfg: *cfg,
@@ -952,8 +954,8 @@ async fn forward_impl<'r, S: WeightSource>(
         heads.audio_out_bias,
         seq_len,
         cfg.audio_latents_dim,
-        audio_at,
-        n_audio,
+        audio_at + n_cond_audio,
+        n_audio - n_cond_audio,
     )
     .await?;
     Ok(Velocity { video, audio })
@@ -1128,6 +1130,7 @@ pub async fn denoise<S: WeightSource>(
     table: &ModulationTable,
     plan: &DenoisePlan,
     cond_video: &[f32],
+    cond_audio: &[f32],
     text: &[f32],
     seed: u64,
     start: Option<DenoiseState>,
@@ -1135,16 +1138,19 @@ pub async fn denoise<S: WeightSource>(
     stop_here: Cancel<'_>,
     cancel: Cancel<'_>,
 ) -> Result<Denoised, PipelineError<S::Error>> {
-    // Conditioning rows (clean, patchified) are noise-augmented ONCE to the
-    // 0.999 level and then held fixed; their noise comes first off the seed,
-    // as the reference draws it before the target's.
+    // Conditioning video rows (clean, patchified) are noise-augmented ONCE to
+    // the 0.999 level and then held fixed; their noise comes first off the
+    // seed, as the reference draws it before the target's. Conditioning audio
+    // (reference clips) stays clean and draws no noise.
     let n_cond = plan.packed.num_condition_video_rows;
+    let n_cond_audio = plan.packed.num_condition_audio_rows;
     assert_eq!(cond_video.len(), n_cond * cfg.video_patch_dim());
+    assert_eq!(cond_audio.len(), n_cond_audio * cfg.audio_latents_dim);
     let (cond_noise, mut video, mut audio) = initial_noise(
         cfg,
         n_cond,
         plan.num_video_rows - n_cond,
-        plan.num_audio_rows,
+        plan.num_audio_rows - n_cond_audio,
         seed,
     );
     let aug = packing::KEYFRAME_NOISE_AUG;
@@ -1188,6 +1194,11 @@ pub async fn denoise<S: WeightSource>(
         } else {
             Cow::Owned([cond.as_slice(), &video].concat())
         };
+        let audio_rows: Cow<[f32]> = if cond_audio.is_empty() {
+            Cow::Borrowed(&audio)
+        } else {
+            Cow::Owned([cond_audio, &audio].concat())
+        };
         let v = match forward_impl(
             cfg,
             backend,
@@ -1199,7 +1210,7 @@ pub async fn denoise<S: WeightSource>(
             plan,
             step,
             &rows,
-            &audio,
+            &audio_rows,
             text,
             None,
             Some(&mut carry),

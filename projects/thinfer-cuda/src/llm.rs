@@ -56,6 +56,18 @@ template <> __device__ __forceinline__ u32 row_bytes<4>(u32 k) { return k / 256 
 template <> __device__ __forceinline__ u32 row_bytes<5>(u32 k) { return k / 256 * 210; }
 template <> __device__ __forceinline__ u32 row_bytes<6>(u32 k) { return k / 32 * 24; }
 template <> __device__ __forceinline__ u32 row_bytes<7>(u32 k) { return k / 32 * 22; }
+template <> __device__ __forceinline__ u32 row_bytes<8>(u32 k) { return k * 2; }
+
+// Eight bf16 weights (16-byte aligned) widened to f32.
+__device__ __forceinline__ void bf16x8(const u8* p, float* w) {
+    uint4 v = *(const uint4*)p;
+    u32 q[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        w[2 * i] = __uint_as_float(q[i] << 16);
+        w[2 * i + 1] = __uint_as_float(q[i] & 0xFFFF0000u);
+    }
+}
 
 // dot of elements [c*256 + l*8, +8) of the row at `r` with x[0..8).
 template <int F> __device__ __forceinline__ float dot8(const u8* r, u32 c, u32 l, const float* x);
@@ -176,6 +188,14 @@ template <> __device__ __forceinline__ float dot8<7>(const u8* r, u32 c, u32 l, 
         a += (float)((int)(((b[6 + byte0 + i] >> sh) & 15) | (((qh >> i) & 1) << 4)) - 16) * x[i];
     return d * a;
 }
+template <> __device__ __forceinline__ float dot8<8>(const u8* r, u32 c, u32 l, const float* x) {
+    float w[8];
+    bf16x8(r + (c * 256 + l * 8) * 2, w);
+    float a = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) a += w[i] * x[i];
+    return a;
+}
 
 // Lanes covering the trailing partial 256-chunk of a k % 256 != 0 row
 // (32-element block formats only; K-quant rows are whole super-blocks).
@@ -271,6 +291,7 @@ GEMV(q5_k, 4)
 GEMV(q6_k, 5)
 GEMV(q5_1, 6)
 GEMV(q5_0, 7)
+GEMV(bf16, 8)
 
 __device__ float block_sum(float v, float* sh) {
     v = warp_sum(v);
@@ -597,6 +618,9 @@ template <> __device__ __forceinline__ void deq8<5>(const u8* r, u32 c, u32 l, f
     for (int i = 0; i < 8; i++)
         w[i] = sc * (float)((int)(((ql[i] >> nsh) & 15) | (((qh[i] >> hsh) & 3) << 4)) - 32);
 }
+template <> __device__ __forceinline__ void deq8<8>(const u8* r, u32 c, u32 l, float* w) {
+    bf16x8(r + (c * 256 + l * 8) * 2, w);
+}
 
 // One warp: `row` against `nr <= MR` activation rows `xs` (16-byte aligned),
 // each lane's partial sums in `acc`.
@@ -683,6 +707,7 @@ GEMM(q5_k, 4)
 GEMM(q6_k, 5)
 GEMM(q5_1, 6)
 GEMM(q5_0, 7)
+GEMM(bf16, 8)
 
 // ---- prefill on tensor cores: MT rows x NT outputs per 128-thread block ----
 // Weights are dequantized to f16 in shared memory once per (row tile, K
@@ -844,6 +869,7 @@ MMA(q5_k, 4)
 MMA(q6_k, 5)
 MMA(q5_1, 6)
 MMA(q5_0, 7)
+MMA(bf16, 8)
 
 // Group `pairs` routed ids by expert into tiles of <= mt pairs (one block).
 // Pair order inside an expert is arbitrary; every output is computed alone,
@@ -879,6 +905,86 @@ extern "C" __global__ void __launch_bounds__(256) expert_tiles(const u32* ids, u
     }
 }
 
+// One id from logits[..n] (LlmOp::SampleTopK): k rounds of a block argmax
+// (ties: the highest id) pick the candidates in rank order, then thread 0
+// replays the host sampler's arithmetic over them in that order.
+#define SAMPLE_THREADS 1024
+#define SAMPLE_MAX_K 64
+extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_topk(
+    const float* logits, u32 n, u32 k, float temp, const float* uniform, u32* out)
+{
+    __shared__ float bv[SAMPLE_THREADS];
+    __shared__ u32 bi[SAMPLE_THREADS];
+    __shared__ u32 cand[SAMPLE_MAX_K];
+    const u32 t = threadIdx.x;
+    const u32 rounds = temp <= 0.f ? 1 : k;
+    for (u32 r = 0; r < rounds; ++r) {
+        float best = __int_as_float(0xff800000);
+        u32 bid = 0xffffffffu;
+        for (u32 i = t; i < n; i += SAMPLE_THREADS) {
+            bool taken = false;
+            for (u32 j = 0; j < r; ++j) taken |= cand[j] == i;
+            const float v = logits[i];
+            if (!taken && (bid == 0xffffffffu || v > best || (v == best && i > bid))) {
+                best = v;
+                bid = i;
+            }
+        }
+        bv[t] = best;
+        bi[t] = bid;
+        __syncthreads();
+        for (u32 s = SAMPLE_THREADS / 2; s > 0; s >>= 1) {
+            if (t < s) {
+                const float ov = bv[t + s];
+                const u32 oi = bi[t + s];
+                const bool better = oi != 0xffffffffu
+                    && (bi[t] == 0xffffffffu || ov > bv[t] || (ov == bv[t] && oi > bi[t]));
+                if (better) {
+                    bv[t] = ov;
+                    bi[t] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        if (t == 0) cand[r] = bi[0];
+        __syncthreads();
+    }
+    if (t != 0) return;
+    if (temp <= 0.f) {
+        out[0] = cand[0];
+        return;
+    }
+    const float mx = logits[cand[0]] / temp;
+    float p[SAMPLE_MAX_K];
+    float sum = 0.f;
+    for (u32 i = 0; i < k; ++i) {
+        p[i] = expf(logits[cand[i]] / temp - mx);
+        sum += p[i];
+    }
+    float total = 0.f;
+    for (u32 i = 0; i < k; ++i) {
+        p[i] /= sum;
+        total += p[i];
+    }
+    float rem = uniform[0] * total;
+    for (u32 i = 0; i < k; ++i) {
+        rem -= p[i];
+        if (rem <= 0.f) {
+            out[0] = cand[i];
+            return;
+        }
+    }
+    out[0] = cand[k - 1];
+}
+
+extern "C" __global__ void gather_row_bf16(
+    const unsigned short* table, const u32* idx, u32 dim, float* out)
+{
+    const u32 d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+    out[d] = __uint_as_float((u32)table[(size_t)idx[0] * dim + d] << 16);
+}
+
 extern "C" __global__ void glu(const float* a, const float* b, float* y, u32 n, u32 gelu) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -902,9 +1008,9 @@ extern "C" __global__ void moe_combine(const float* ex, const float* wts, const 
 "#;
 
 /// Weight formats with kernels, in [`fmt_index`] order.
-const FORMATS: usize = 8;
+const FORMATS: usize = 9;
 const FORMAT_NAMES: [&str; FORMATS] = [
-    "f32", "q8_0", "q4_0", "q4_k", "q5_k", "q6_k", "q5_1", "q5_0",
+    "f32", "q8_0", "q4_0", "q4_k", "q5_k", "q6_k", "q5_1", "q5_0", "bf16",
 ];
 
 fn fmt_index(f: LlmWeight) -> usize {
@@ -917,6 +1023,7 @@ fn fmt_index(f: LlmWeight) -> usize {
         LlmWeight::Quant(QuantKind::Q6_K) => 5,
         LlmWeight::Quant(QuantKind::Q5_1) => 6,
         LlmWeight::Quant(QuantKind::Q5_0) => 7,
+        LlmWeight::Bf16 => 8,
     }
 }
 
@@ -967,6 +1074,8 @@ pub struct LlmKernels {
     router: sys::CUfunction,
     glu: sys::CUfunction,
     moe_combine: sys::CUfunction,
+    sample_topk: sys::CUfunction,
+    gather_row_bf16: sys::CUfunction,
 }
 
 // SAFETY: CUfunction handles are plain driver handles, valid for the module's
@@ -1049,6 +1158,8 @@ impl LlmKernels {
             router: module.function(c"router_topk", 0)?,
             glu: module.function(c"glu", 0)?,
             moe_combine: module.function(c"moe_combine", 0)?,
+            sample_topk: module.function(c"sample_topk", 0)?,
+            gather_row_bf16: module.function(c"gather_row_bf16", 0)?,
             module,
         })
     }
@@ -1302,6 +1413,38 @@ impl LlmKernels {
                 let count = n;
                 let mut ar = args!(a, b, y, n, g);
                 m.launch(self.glu, grid1(count), 256, 0, &mut ar, "llm glu")?;
+            }
+            LlmOp::SampleTopK {
+                mut logits,
+                mut n,
+                mut k,
+                temperature,
+                mut uniform,
+                mut out,
+            } => {
+                if k == 0 || k > 64 {
+                    return Ok(false);
+                }
+                let mut tp = temperature;
+                let mut ar = args!(logits, n, k, tp, uniform, out);
+                m.launch(self.sample_topk, (1, 1, 1), 1024, 0, &mut ar, "llm sample")?;
+            }
+            LlmOp::GatherRowBf16 {
+                mut table,
+                mut idx,
+                mut dim,
+                mut out,
+            } => {
+                let count = dim;
+                let mut ar = args!(table, idx, dim, out);
+                m.launch(
+                    self.gather_row_bf16,
+                    grid1(count),
+                    256,
+                    0,
+                    &mut ar,
+                    "llm gather",
+                )?;
             }
             LlmOp::MoeCombine {
                 mut u,

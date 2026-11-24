@@ -27,6 +27,8 @@ use thinfer_core::tokenizer::Tokenizer;
 use thinfer_core::weight::{WeightId, WeightReader, WeightSource, decode_into};
 use thinfer_core::workspace::Workspace;
 use thinfer_models::common::block::BlockPipelines;
+use thinfer_models::minimax::audio_encoder::AudioEncoder;
+use thinfer_models::minimax::audio_vae::{AudioVae, AudioVaeConfig};
 use thinfer_models::minimax::manifest::role;
 use thinfer_models::minimax::packing::{self, Condition, KeyframeAnchor};
 use thinfer_models::minimax::vae_encoder::{
@@ -45,6 +47,8 @@ const SIDE_MULTIPLE: usize = 32;
 const MAX_ASPECT: usize = 4;
 /// At most this many images per request (the reference's limit).
 pub const MAX_REFERENCES: usize = 9;
+/// At most this many audio clips per request (the reference's limit).
+pub const MAX_REFERENCE_AUDIOS: usize = 3;
 
 /// Qwen2 tokenizer special tokens (verified against the tokenizer at run time).
 const VISION_START: (&str, u32) = ("<|vision_start|>", 151_652);
@@ -296,14 +300,20 @@ pub struct RefPrompt {
     pub tags: Vec<i32>,
     /// Each image's first `<|image_pad|>` row.
     pub image_starts: Vec<usize>,
+    /// Rows the prompt itself tokenized to (the labels and vision blocks
+    /// excluded).
+    pub prompt_tokens: usize,
 }
 
-/// `"<Picture i>: " <|vision_start|> pads <|vision_end|>` per image, then the
-/// prompt, each segment tokenized on its own with no special tokens.
+/// `"<Picture i>: " <|vision_start|> pads <|vision_end|>` per image, then
+/// `"<Audio j>: "` per audio clip (a label only: the clip reaches the DiT as
+/// audio rows), then the prompt, each segment tokenized on its own with no
+/// special tokens. Images then audio is the reference's request order.
 pub fn assemble(
     tok: &impl Tokenizer,
     prompt: &str,
     tokens_per_image: &[usize],
+    audios: usize,
 ) -> Result<RefPrompt, String> {
     for (text, id) in [VISION_START, VISION_END, IMAGE_PAD] {
         let got = tok
@@ -325,13 +335,20 @@ pub fn assemble(
         ids.push(VISION_END.1);
         tags.extend(std::iter::repeat_n(TAG_VIDEO, n + 2));
     }
+    for j in 0..audios {
+        let label = encode(&format!("<Audio {}>: ", j + 1))?;
+        tags.extend(std::iter::repeat_n(TAG_TEXT, label.len()));
+        ids.extend(label);
+    }
     let text = encode(prompt)?;
+    let prompt_tokens = text.len();
     tags.extend(std::iter::repeat_n(TAG_TEXT, text.len()));
     ids.extend(text);
     Ok(RefPrompt {
         ids,
         tags,
         image_starts,
+        prompt_tokens,
     })
 }
 
@@ -434,6 +451,78 @@ pub async fn latent_conditions(
                 latent_width: frame.width,
             },
         });
+    }
+    residency.evict_all_and_free(&**backend);
+    Ok((conditions, rows))
+}
+
+/// One reference clip, prepared: `[2, samples]` planar at the audio VAE's
+/// rate. User media, so page-locked on a server and zeroed on drop.
+pub struct PreparedAudio {
+    pub wave: thinfer_core::secmem::Locked<f32>,
+    pub samples: usize,
+}
+
+impl PreparedAudio {
+    /// Audio-VAE latent frames per channel (the hop-padded length).
+    pub fn latents(&self) -> usize {
+        self.samples.div_ceil(AudioVaeConfig::h3().hop_length())
+    }
+}
+
+/// Decode every reference clip and cut it to `seconds` (the clip's length,
+/// as the reference does), stereo at the audio VAE's rate.
+pub fn prepare_audio(
+    audios: &[crate::request::AudioBytes],
+    seconds: f64,
+) -> Result<Vec<PreparedAudio>, String> {
+    let rate = AudioVaeConfig::h3().sample_rate;
+    audios
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let decoded =
+                crate::audio_in::decode(&a.0).map_err(|e| format!("{e} (audio {})", i + 1))?;
+            let (wave, samples) = crate::audio_in::prepare(decoded, rate, seconds);
+            Ok(PreparedAudio {
+                wave: wave.into(),
+                samples,
+            })
+        })
+        .collect()
+}
+
+/// Audio-VAE-encode every prepared clip into clean DiT conditioning: one
+/// [`Condition::AudioReference`] per clip and its channel-major latent rows.
+pub async fn audio_conditions(
+    backend: &Arc<WgpuBackend>,
+    audio_vae_path: &std::path::Path,
+    budget: ResidencyBudget,
+    audios: &[PreparedAudio],
+) -> Result<(Vec<Condition>, Vec<f32>), String> {
+    let residency = WeightResidency::new(open_st(audio_vae_path).await?, budget);
+    let enc = AudioEncoder::new(&residency, AudioVaeConfig::h3())
+        .await
+        .map_err(|e| format!("build audio encoder: {e:?}"))?;
+    let pl = AudioVae::compile(backend)
+        .await
+        .map_err(|e| format!("compile audio encoder: {e:?}"))?;
+    let ws = Workspace::new(Arc::clone(backend), Arc::clone(residency.arbiter()));
+    let (mut conditions, mut rows) = (Vec::new(), Vec::new());
+    for (i, a) in audios.iter().enumerate() {
+        let (latents, t) = enc
+            .encode(backend, &residency, &ws, &pl, &a.wave, a.samples)
+            .await
+            .map_err(|e| format!("encode reference audio {}: {e:?}", i + 1))?;
+        debug_assert_eq!(t, a.latents());
+        if !latents.iter().all(|v| v.is_finite()) {
+            return Err(format!(
+                "reference audio {} encoded to non-finite latents",
+                i + 1
+            ));
+        }
+        rows.extend(latents);
+        conditions.push(Condition::AudioReference { latents: t });
     }
     residency.evict_all_and_free(&**backend);
     Ok((conditions, rows))

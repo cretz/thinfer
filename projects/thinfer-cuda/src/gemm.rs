@@ -20,7 +20,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, sys};
-use thinfer_core::backend::{Conv2dAddrs, Conv3dAddrs, GemmAddrs};
+use thinfer_core::backend::{Conv1dAddrs, Conv2dAddrs, Conv3dAddrs, GemmAddrs};
 use thinfer_core::ops::{GemmDesc, GemmType};
 
 use crate::nvrtc::Module;
@@ -685,6 +685,141 @@ extern "C" __global__ void __launch_bounds__(256) conv2d_f32_small(
     const float* x, const unsigned short* w, const unsigned short* bias, float* out, const ConvP p)
 { conv2d_impl<64, 64, 4, 4>(x, w, bias, out, p); }
 
+// One-batch 1D convolution with f32 activations as an implicit GEMM (see
+// `Conv1dAddrs`): out[co, lo] = bias[co] + sum over k = (ci, t) of
+// w[co, ci, t] * x[ci, lo * stride + t * dil - pad], zero outside x. The
+// transposed form (w `[cin, cout, k]`) runs one GEMM per output phase r =
+// lo % stride (grid z): only the taps t = t0 + j * stride with
+// t0 = (r + pad) % stride reach phase r, each reading x[ci, q + base - j]
+// for lo = q * stride + r and base = (r + pad) / stride, so no zero tap is
+// multiplied. Weights f32 or bf16 (`wbf16`). conv2d_impl's tiling.
+struct Conv1P { unsigned cin, cout, lin, lout, k, stride, dil, pad, transposed, wbf16; };
+__device__ __forceinline__ float wload(const void* w, size_t i, unsigned bf16) {
+    return bf16 ? __uint_as_float((unsigned)((const unsigned short*)w)[i] << 16)
+                : ((const float*)w)[i];
+}
+template <int CM, int CN, int CTM, int CTN>
+__device__ __forceinline__ void conv1d_impl(
+    const float* __restrict__ x, const void* __restrict__ w,
+    const void* __restrict__ bias, float* __restrict__ out, const Conv1P p)
+{
+    static_assert((CM / CTM) * (CN / CTN) == 256, "256 threads");
+    constexpr int AL = CM * CBK / 256, BL = CN * CBK / 256;
+    constexpr int RS = CM * 4 / CTM, CS = CN * 4 / CTN;
+    __shared__ __align__(16) float as[2][CBK][CM];
+    __shared__ __align__(16) float bs[2][CBK][CN];
+    const int tid = threadIdx.x, tx = tid % (CN / CTN), ty = tid / (CN / CTN);
+    const unsigned r = blockIdx.z;
+    // This GEMM's taps, output columns, and where its column q lands.
+    unsigned taps, ncol, t0 = 0, base = 0, ostep = 1, ooff = 0;
+    if (p.transposed) {
+        t0 = (r + p.pad) % p.stride;
+        base = (r + p.pad) / p.stride;
+        taps = t0 < p.k ? (p.k - t0 + p.stride - 1) / p.stride : 0;
+        ncol = p.lout > r ? (p.lout - r + p.stride - 1) / p.stride : 0;
+        ostep = p.stride;
+        ooff = r;
+    } else {
+        taps = p.k;
+        ncol = p.lout;
+    }
+    const unsigned kdim = p.cin * taps;
+    const unsigned m0 = blockIdx.x * CN, co0 = blockIdx.y * CM;
+    if (m0 >= ncol) return;
+    const unsigned ar = tid % CM, ak0 = tid / CM * AL;
+    const unsigned bc = tid % CN, br0 = tid / CN;
+    const unsigned gm = m0 + bc;
+    const bool col_ok = gm < ncol;
+    const bool row_ok = co0 + ar < p.cout;
+    const unsigned co_a = co0 + ar;
+    float ra[AL], rb[BL];
+    auto load = [&](unsigned k0) {
+        #pragma unroll
+        for (int s = 0; s < AL; ++s) {
+            const unsigned gk = k0 + ak0 + s;
+            float v = 0.f;
+            if (row_ok && gk < kdim) {
+                const unsigned ci = gk / taps, j = gk - ci * taps;
+                const size_t wi = p.transposed
+                    ? ((size_t)ci * p.cout + co_a) * p.k + t0 + j * p.stride
+                    : ((size_t)co_a * p.cin + ci) * p.k + j;
+                v = wload(w, wi, p.wbf16);
+            }
+            ra[s] = v;
+        }
+        #pragma unroll
+        for (int s = 0; s < BL; ++s) {
+            const unsigned gk = k0 + br0 + (256 / CN) * s;
+            float v = 0.f;
+            if (col_ok && gk < kdim) {
+                const unsigned ci = gk / taps, j = gk - ci * taps;
+                const int li = p.transposed
+                    ? (int)(gm + base) - (int)j
+                    : (int)(gm * p.stride + j * p.dil) - (int)p.pad;
+                if (li >= 0 && li < (int)p.lin) v = x[(size_t)ci * p.lin + li];
+            }
+            rb[s] = v;
+        }
+    };
+    auto stash = [&](int buf) {
+        #pragma unroll
+        for (int s = 0; s < AL; ++s) as[buf][ak0 + s][ar] = ra[s];
+        #pragma unroll
+        for (int s = 0; s < BL; ++s) bs[buf][br0 + (256 / CN) * s][bc] = rb[s];
+    };
+    float acc[CTM][CTN];
+    #pragma unroll
+    for (int i = 0; i < CTM; ++i)
+        #pragma unroll
+        for (int j = 0; j < CTN; ++j) acc[i][j] = 0.f;
+    load(0);
+    stash(0);
+    __syncthreads();
+    int buf = 0;
+    for (unsigned k0 = 0; k0 < kdim; k0 += CBK) {
+        const bool more = k0 + CBK < kdim;
+        if (more) load(k0 + CBK);
+        #pragma unroll
+        for (int kk = 0; kk < CBK; ++kk) {
+            float a[CTM], b[CTN];
+            #pragma unroll
+            for (int q = 0; q < CTM / 4; ++q) {
+                const float4 v = *reinterpret_cast<const float4*>(&as[buf][kk][q * RS + ty * 4]);
+                a[4 * q] = v.x; a[4 * q + 1] = v.y; a[4 * q + 2] = v.z; a[4 * q + 3] = v.w;
+            }
+            #pragma unroll
+            for (int q = 0; q < CTN / 4; ++q) {
+                const float4 v = *reinterpret_cast<const float4*>(&bs[buf][kk][q * CS + tx * 4]);
+                b[4 * q] = v.x; b[4 * q + 1] = v.y; b[4 * q + 2] = v.z; b[4 * q + 3] = v.w;
+            }
+            #pragma unroll
+            for (int i = 0; i < CTM; ++i)
+                #pragma unroll
+                for (int j = 0; j < CTN; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        if (more) stash(buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+    #pragma unroll
+    for (int i = 0; i < CTM; ++i) {
+        const unsigned co = co0 + i / 4 * RS + ty * 4 + i % 4;
+        if (co >= p.cout) continue;
+        const float bv = wload(bias, co, p.wbf16);
+        #pragma unroll
+        for (int j = 0; j < CTN; ++j) {
+            const unsigned m = m0 + j / 4 * CS + tx * 4 + j % 4;
+            if (m < ncol) out[(size_t)co * p.lout + m * ostep + ooff] = acc[i][j] + bv;
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) conv1d_f32(
+    const float* x, const void* w, const void* bias, float* out, const Conv1P p)
+{ conv1d_impl<128, 128, 8, 8>(x, w, bias, out, p); }
+extern "C" __global__ void __launch_bounds__(256) conv1d_f32_small(
+    const float* x, const void* w, const void* bias, float* out, const Conv1P p)
+{ conv1d_impl<64, 64, 4, 4>(x, w, bias, out, p); }
+
 // A 3D convolution with f16 activations, the f16-act conv3d op (see
 // `Conv3dAddrs`): conv2d_impl's implicit GEMM with k = (ci, dt, dh, dw) and m
 // = (to, ho, wo), zero padding, batch on grid z. Same per-output fmaf order
@@ -1101,6 +1236,8 @@ pub struct GemmKernels {
     conv2d: sys::CUfunction,
     conv2d_small: sys::CUfunction,
     conv2d_bf16: sys::CUfunction,
+    conv1d: sys::CUfunction,
+    conv1d_small: sys::CUfunction,
     conv3d_f16: sys::CUfunction,
     conv3d_f16_small: sys::CUfunction,
     conv3d_f16tc: sys::CUfunction,
@@ -1226,6 +1363,8 @@ impl GemmKernels {
         let conv2d = module.function(c"conv2d_f32", 0)?;
         let conv2d_small = module.function(c"conv2d_f32_small", 0)?;
         let conv2d_bf16 = module.function(c"conv2d_bf16", 0)?;
+        let conv1d = module.function(c"conv1d_f32", 0)?;
+        let conv1d_small = module.function(c"conv1d_f32_small", 0)?;
         let conv3d_f16 = module.function(c"conv3d_f16", 0)?;
         let conv3d_f16_small = module.function(c"conv3d_f16_small", 0)?;
         let conv3d_f16tc = module.function(c"conv3d_f16tc", 0)?;
@@ -1248,6 +1387,8 @@ impl GemmKernels {
             conv2d,
             conv2d_small,
             conv2d_bf16,
+            conv1d,
+            conv1d_small,
             conv3d_f16,
             conv3d_f16_small,
             conv3d_f16tc,
@@ -1327,6 +1468,63 @@ impl GemmKernels {
     /// `cin * k * k` that is a multiple of 8, bf16 tensor cores). Enqueued only.
     ///
     /// [`Conv2dShape::bf16`]: thinfer_core::backend::Conv2dShape::bf16
+    pub fn run_conv1d(&self, a: &Conv1dAddrs) -> Result<bool, String> {
+        let s = a.shape;
+        let ok = s.k > 0
+            && s.stride > 0
+            && s.dilation > 0
+            && s.lout > 0
+            && s.cout > 0
+            && s.cin > 0
+            && (!s.transposed || s.dilation == 1);
+        if !ok {
+            return Ok(false);
+        }
+        let mut p: [u32; 10] = [
+            s.cin,
+            s.cout,
+            s.lin,
+            s.lout,
+            s.k,
+            s.stride,
+            s.dilation,
+            s.pad,
+            s.transposed as u32,
+            s.w_bf16 as u32,
+        ];
+        let (mut x, mut w, mut bias, mut out) = (a.x, a.w, a.bias, a.out);
+        let mut args: [*mut c_void; 5] = [
+            (&raw mut x).cast(),
+            (&raw mut w).cast(),
+            (&raw mut bias).cast(),
+            (&raw mut out).cast(),
+            (&raw mut p).cast(),
+        ];
+        // One GEMM per output phase for the transposed form; its widest
+        // phase (0) sizes the grid.
+        let (phases, cols) = if s.transposed {
+            (s.stride, s.lout.div_ceil(s.stride))
+        } else {
+            (1, s.lout)
+        };
+        let big = cols.div_ceil(CONV_TILE) * s.cout.div_ceil(CONV_TILE) * phases;
+        let (f, tile) = if big < CONV_MIN_BIG_TILES {
+            (self.conv1d_small, CONV_TILE / 2)
+        } else {
+            (self.conv1d, CONV_TILE)
+        };
+        self.module.bind()?;
+        self.module.launch(
+            f,
+            (cols.div_ceil(tile), s.cout.div_ceil(tile), phases),
+            THREADS,
+            0,
+            &mut args,
+            "conv1d",
+        )?;
+        Ok(true)
+    }
+
     pub fn run_conv2d(&self, a: &Conv2dAddrs) -> Result<bool, String> {
         let s = a.shape;
         if s.k == 0 || s.stride == 0 || s.h_out == 0 || s.w_out == 0 || s.cout == 0 {

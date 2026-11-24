@@ -163,7 +163,9 @@ pub use silu_mul::SiluMulF32;
 pub(crate) use silu_mul_fused::dispatch_silu_mul_fused;
 pub use silu_mul_fused::{SiluMulFusedBufs, SiluMulFusedF32, SiluMulFusedOp};
 pub(crate) use snake_beta::dispatch_snake_beta;
-pub use snake_beta::{SnakeBetaBufs, SnakeBetaF32, SnakeBetaOp, snake_beta_uniform_bytes};
+pub use snake_beta::{
+    SnakeBetaBufs, SnakeBetaF32, SnakeBetaOp, SnakeF32, snake_beta_uniform_bytes,
+};
 #[cfg(feature = "conformance")]
 pub(crate) use softmax::dispatch_softmax;
 pub use softmax::{SoftmaxBufs, SoftmaxF32, SoftmaxOp};

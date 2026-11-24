@@ -4,6 +4,7 @@
 //! weights are not there and never triggers a download.
 
 mod adaln_precompute;
+mod audio_encoder_parity;
 mod audio_vae_health;
 mod dit_health;
 mod dit_parity;

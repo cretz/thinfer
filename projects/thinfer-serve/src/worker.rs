@@ -4,15 +4,16 @@
 //! worker pulls jobs from the shared [`JobStore`] and reports progress into the
 //! job's event log.
 //!
-//! ## A warm text model between jobs (no job data, no poison)
+//! ## A warm text / audio model between jobs (no job data, no poison)
 //!
 //! A text job's fixed costs (tokenizer, kernels: the CUDA LLM set takes ~3 s
 //! to build per device, weights, the expert cache) dwarf a short reply, so a
 //! worker keeps its [`LocalExecutor`], with the last text model on it, until
-//! `warm_text_secs` after a text job last used it. Opt-in (default 0: every
-//! job's device goes when it ends, so an idle server holds no GPU memory).
-//! Only text gains enough to
-//! pay for it: a device holding no warm text model goes after its job. What
+//! `warm_text_secs` after a text job last used it; likewise the last speech
+//! model with `warm_audio_secs` (its load is most of a short line's time).
+//! Opt-in (default 0: every job's device goes when it ends, so an idle server
+//! holds no GPU memory). Image and video models are never kept: a device
+//! holding no warm text / audio model goes after its job. What
 //! a long-lived device used to risk is excluded by rule:
 //! - Poison: a device-OOM / device-lost poisons a wgpu device, which then
 //!   holds its VRAM for good. Any job that does not finish cleanly discards
@@ -97,8 +98,16 @@ struct Warm {
     disable_coopmat: bool,
 }
 
+/// The warm-model TTLs (text, audio).
+fn ttls(config: &ServeConfig) -> (Duration, Duration) {
+    (
+        Duration::from_secs(config.warm_text_secs),
+        Duration::from_secs(config.warm_audio_secs),
+    )
+}
+
 async fn worker_loop(ctx: WorkerCtx) {
-    let ttl = Duration::from_secs(ctx.config.warm_text_secs);
+    let (text_ttl, audio_ttl) = ttls(&ctx.config);
     let mut warm: Option<Warm> = None;
     loop {
         match ctx.store.take_next() {
@@ -120,20 +129,23 @@ async fn worker_loop(ctx: WorkerCtx) {
                 ctx.store.notify.notify_one();
             }
             None => {
-                // Idle with a warm text model: it (and the device) goes when
-                // its time since last use reaches the TTL.
+                // Idle with a warm model: each goes when its time since last
+                // use reaches its TTL, the device with the last one.
                 let left = warm
                     .as_ref()
-                    .and_then(|w| w.executor.warm_model_idle())
-                    .map(|idle| ttl.saturating_sub(idle));
+                    .and_then(|w| w.executor.warm_time_left(text_ttl, audio_ttl));
                 match left {
                     Some(left) => {
                         if tokio::time::timeout(left, ctx.store.notify.notified())
                             .await
                             .is_err()
+                            && let Some(w) = &warm
                         {
-                            warm = None;
-                            tracing::info!("warm text model and device released (idle)");
+                            w.executor.expire_warm(text_ttl, audio_ttl);
+                            if !w.executor.holds_warm_model() {
+                                warm = None;
+                                tracing::info!("warm models and device released (idle)");
+                            }
                         }
                     }
                     None => ctx.store.notify.notified().await,
@@ -159,14 +171,6 @@ impl<F: std::future::Future> std::future::Future for CatchPanic<F> {
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Err(_) => std::task::Poll::Ready(Err(())),
         }
-    }
-}
-
-/// Release the warm text model once `ttl` has passed since a text job last
-/// used it (checked at every job boundary, whatever the job).
-fn expire_warm_model(executor: &LocalExecutor, ttl: Duration) {
-    if executor.warm_model_idle().is_some_and(|idle| idle >= ttl) {
-        executor.release_warm_model();
     }
 }
 
@@ -249,8 +253,8 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>, warm: &mut Option<Warm>)
             }
         }
     };
-    let ttl = Duration::from_secs(ctx.config.warm_text_secs);
-    expire_warm_model(&executor, ttl);
+    let (text_ttl, audio_ttl) = ttls(&ctx.config);
+    executor.expire_warm(text_ttl, audio_ttl);
     let ran = process(
         &executor,
         job,
@@ -268,17 +272,19 @@ async fn run_job(ctx: &WorkerCtx, job: &Arc<JobHandle>, warm: &mut Option<Warm>)
         job.restore_sealed(sealed);
         ctx.store.requeue(job, job.take_pause().unwrap_or_default());
     }
+    // A model whose TTL is 0 goes now, before the buffer check (its
+    // weights must not count as kept).
+    executor.expire_warm(text_ttl, audio_ttl);
     // Keep the device only after a clean job that left no buffer behind
-    // (a loaded text model's weights aside).
+    // (a kept model's weights aside).
     let except: &[VramCategory] = if executor.holds_warm_weights() {
         &[VramCategory::Weights]
     } else {
         &[]
     };
     let (left, bytes) = executor.backend().live_buffers(except);
-    expire_warm_model(&executor, ttl);
-    // Kept for a warm text model only (nothing else gains enough).
-    if ttl > Duration::ZERO && clean && left == 0 && executor.holds_warm_model() {
+    // Kept for a warm text / audio model only (image and video never).
+    if clean && left == 0 && executor.holds_warm_model() {
         *warm = Some(Warm {
             executor,
             disable_coopmat: cfg.disable_coopmat,
@@ -512,6 +518,10 @@ fn to_result(id: &str, s: &JobSummary, session_node: Option<String>, key: &JobKe
             session_node,
             finish_reason: t.finish_reason,
             tool_calls,
+        }),
+        audio: s.audio.map(|a| thinfer_app::wire::AudioResult {
+            seconds: a.seconds,
+            sample_rate: a.sample_rate,
         }),
     }
 }

@@ -1019,6 +1019,7 @@ pub async fn run(
 
     Ok(JobSummary {
         text: None,
+        audio: None,
         session: None,
         tool_calls: Vec::new(),
         output: req.output.clone(),

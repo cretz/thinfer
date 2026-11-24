@@ -36,6 +36,10 @@ mp4 = "0.14"
 # from bundled source via `cc` (same source-build pattern as openh264); no
 # system lib. Only the native binaries need it; web uses WebCodecs.
 fdk-aac = "0.8"
+# Reference audio decode (H3 Ref2VA voice/sound references): pure Rust, no
+# system codecs. WAV/FLAC/Vorbis come with the defaults; MP3 and AAC in MP4/M4A
+# are the formats phones and editors export.
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4"] }
 # Source-image decode for face-swap (PNG/JPEG only; no extra codecs).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Optional adapter derives, gated so non-consumers stay dep-clean.

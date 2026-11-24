@@ -46,7 +46,38 @@ const MODELS = {
   "face-swap": ["hyperswap-1a", "hyperswap-1b", "hyperswap-1c", "alphaface", "dreamid-v"],
   // Text (TextSpec): chat with an LLM; the reply streams in sealed pieces.
   text: ["gemma-4-26b-a4b", "qwen3.6-35b-a3b"],
+  // Audio (AudioSpec): speech in a described voice (design) or a clip's voice
+  // (clone), and sound effects from a description.
+  audio: ["qwen3-tts-design", "qwen3-tts", "moss-sfx"],
 };
+
+// Audio models: speech that takes a written voice (`instruct`) vs a voice
+// clip, sound models (a description -> a clip of `seconds`), and the
+// `language` values speech accepts (`auto` = detect from the text).
+const VOICE_CLONE_MODELS = new Set(["qwen3-tts"]);
+const SOUND_MODELS = new Set(["moss-sfx"]);
+const isSound = (kind, model) => kind === "audio" && SOUND_MODELS.has(model);
+const TTS_LANGUAGES = [
+  "auto",
+  "english",
+  "chinese",
+  "japanese",
+  "korean",
+  "german",
+  "french",
+  "russian",
+  "portuguese",
+  "spanish",
+  "italian",
+];
+$("language").replaceChildren(
+  ...TTS_LANGUAGES.map((l) => {
+    const o = document.createElement("option");
+    o.value = l;
+    o.textContent = l;
+    return o;
+  }),
+);
 
 // The text kind's reply constraint (wire `TextFormat`), or undefined for free text.
 function textFormat() {
@@ -703,8 +734,8 @@ function applyKind() {
   const kind = $("kind").value;
   document.body.className = `kind-${kind}`;
   // Text chats send a message (the image placeholder prompt would be odd).
-  $("prompt-label").textContent = kind === "text" ? "Message" : "Prompt";
-  if (kind === "text" && $("prompt").value === DEFAULT_PROMPT) $("prompt").value = "";
+  $("prompt-label").textContent = { text: "Message", audio: "Text to speak" }[kind] ?? "Prompt";
+  if ((kind === "text" || kind === "audio") && $("prompt").value === DEFAULT_PROMPT) $("prompt").value = "";
   const model = $("model");
   model.replaceChildren(
     ...MODELS[kind].map((m, i) => {
@@ -769,12 +800,42 @@ $("ref-images").addEventListener("change", () => {
   renderRefImages();
 });
 
+// Reference audio clips (reference-to-video models): the prompt names them
+// <Audio N>, counted apart from the pictures.
+const MAX_REF_AUDIOS = 3;
+const refAudios = [];
+function renderRefAudios() {
+  renderChosen(
+    $("ref-audios-order"),
+    refAudios,
+    (f, i) => `<Audio ${i + 1}> = ${f.name}`,
+    (i) => {
+      refAudios.splice(i, 1);
+      renderRefAudios();
+    },
+  );
+}
+$("ref-audios").addEventListener("change", () => {
+  const input = $("ref-audios");
+  refAudios.push(...[...input.files].slice(0, MAX_REF_AUDIOS - refAudios.length));
+  input.value = "";
+  renderRefAudios();
+});
+
 // Re-grid the size controls + reference-image picker + steps for the selected
 // model. LTX switches to its /64 preset grid; edit models reveal the image
 // picker.
 function applyModel() {
   const model = $("model").value;
   const kind = $("kind").value;
+  const clone = kind === "audio" && VOICE_CLONE_MODELS.has(model);
+  const sound = isSound(kind, model);
+  $("instruct-row").hidden = clone || sound;
+  $("voice-row").hidden = !clone;
+  $("ref-text-row").hidden = !clone;
+  for (const el of document.querySelectorAll(".speech-only")) el.hidden = sound;
+  for (const el of document.querySelectorAll(".sound-only")) el.hidden = !sound;
+  if (kind === "audio") $("prompt-label").textContent = sound ? "Sound to make" : "Text to speak";
   const edit = kind === "image" && isEditModel(model);
   const multiImage = kind === "image" && isMultiImageModel(model);
   // The causal Hunyuan TI2V optionally animates a first-frame image: same
@@ -791,6 +852,7 @@ function applyModel() {
   // them). A list over the new model's cap keeps its first images.
   const omni = kind === "video" && takesRefs(model);
   $("ref-images-row").hidden = !omni && !multiImage && !edit;
+  $("ref-audios-row").hidden = !omni;
   $("ref-image-size-row").hidden = !omni;
   $("ref-crop-row").hidden = !omni;
   refImages.splice(maxRefImages());
@@ -1306,6 +1368,42 @@ async function buildSpec(jobKey) {
       format: textFormat(),
     };
   }
+  if (isSound(kind, model)) {
+    const text = $("prompt").value.trim();
+    if (!text) throw new Error("describe the sound");
+    return {
+      kind: "audio",
+      model,
+      text,
+      seconds: floatOrNull($("sound-seconds").value),
+      loop: $("sound-loop").checked || undefined,
+      steps: intOrNull($("sound-steps").value),
+      guidance: floatOrNull($("sound-guidance").value),
+      seed: intOrNull($("audio-seed").value),
+    };
+  }
+  if (kind === "audio") {
+    const text = $("prompt").value.trim();
+    if (!text) throw new Error("type the text to speak");
+    const clone = VOICE_CLONE_MODELS.has(model);
+    const voice = $("voice").files[0];
+    if (clone && !voice) throw new Error("choose a voice clip");
+    const textOrNull = (id) => $(id).value.trim() || null;
+    return {
+      kind: "audio",
+      model,
+      text,
+      instruct: clone ? null : textOrNull("instruct"),
+      refAudios: clone ? [await fileToBase64(voice)] : null,
+      refText: clone ? textOrNull("ref-text") : null,
+      language: $("language").value,
+      maxSeconds: floatOrNull($("max-seconds").value),
+      seed: intOrNull($("audio-seed").value),
+      temperature: floatOrNull($("audio-temperature").value),
+      topK: intOrNull($("audio-top-k").value),
+      topP: floatOrNull($("audio-top-p").value),
+    };
+  }
   if (kind === "image") {
     const spec = {
       kind: "image",
@@ -1371,6 +1469,7 @@ async function buildSpec(jobKey) {
     if (isMinimaxGgufModel(model)) spec.bf16Gemm = $("bf16-gemm").checked;
     if (takesRefs(model)) {
       if (refImages.length) spec.refImages = await Promise.all(refImages.map(fileToBase64));
+      if (refAudios.length) spec.refAudios = await Promise.all(refAudios.map(fileToBase64));
       spec.refImageSize = $("ref-image-size").value;
       spec.refCrop = $("ref-crop").value;
     }
@@ -1551,6 +1650,8 @@ function progressText(stage) {
       return "Decoding latents (VAE)";
     case "frameSwapped":
       return `Swapped frame ${stage.done}/${stage.total}`;
+    case "audio":
+      return `Generated ${(stage.ms / 1000).toFixed(1)}s of audio`;
     default:
       return JSON.stringify(stage);
   }
@@ -1719,11 +1820,22 @@ async function showResult(kind, result, jobKey) {
     bytes.fill(0);
     return;
   }
-  const mime = kind === "image" ? "image/png" : "video/mp4";
+  const { mime, ext } = { image: { mime: "image/png", ext: "png" }, audio: { mime: "audio/wav", ext: "wav" } }[
+    kind
+  ] ?? { mime: "video/mp4", ext: "mp4" };
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   const img = $("image-out");
   const video = $("video-out");
-  if (kind === "image") {
+  const audio = $("audio-out");
+  for (const el of [img, video, audio]) {
+    if (el.src) URL.revokeObjectURL(el.src);
+    el.removeAttribute("src");
+    el.hidden = true;
+  }
+  if (kind === "audio") {
+    audio.src = url;
+    audio.hidden = false;
+  } else if (kind === "image") {
     if (img.src) URL.revokeObjectURL(img.src);
     img.src = url;
     img.hidden = false;
@@ -1755,7 +1867,7 @@ async function showResult(kind, result, jobKey) {
   }
   // A real download link with an explicit filename: saving the blob: URL
   // directly would drop the extension and the OS would not know it is an mp4.
-  const filename = downloadName(kind === "image" ? "png" : "mp4");
+  const filename = downloadName(ext);
   const dl = $("download");
   dl.href = url;
   dl.download = filename;
@@ -1976,7 +2088,9 @@ async function generate() {
     const speed = t
       ? `${t.promptTokens} prompt tokens (${t.prefillSecs.toFixed(1)}s), ${t.generatedTokens} generated at ${(Math.max(t.generatedTokens - 1, 0) / Math.max(t.decodeSecs, 1e-9)).toFixed(1)} tok/s, `
       : "";
-    setStatus(`Done: ${speed}${seed}${secs}s.`);
+    const a = result.audio;
+    const clip = a ? `${a.seconds.toFixed(1)}s of audio at ${a.sampleRate / 1000} kHz, ` : "";
+    setStatus(`Done: ${speed}${clip}${seed}${secs}s.`);
   } catch (e) {
     streamGaveUp = e instanceof StreamDropped;
     // A failed session turn (node evicted, session expired): start over from
@@ -1989,6 +2103,10 @@ async function generate() {
     if (kind === "text" && chat.at(-1)?.role === "assistant") {
       chat.splice(-2, 2);
       renderChat();
+    }
+    // A failed job leaves no earlier result on show as if it were this one's.
+    if (kind !== "text") {
+      for (const id of ["image-out", "video-out", "audio-out", "download"]) $(id).hidden = true;
     }
     setStatus(`Failed: ${e.message ?? e}`);
     log(`Failed: ${e.message ?? e}`);

@@ -21,12 +21,13 @@
 
 use std::collections::HashMap;
 
-use thinfer_core::backend::{Backend, BufRef, WgpuBackend, WgpuError};
+use thinfer_core::backend::{Backend, BufRef, Conv1dShape, ElementwiseOp, WgpuBackend, WgpuError};
 use thinfer_core::ops::{
     ActDtype, AddF32, Conv1dF32, Conv1dOp, ConvTranspose1dF32, ConvTranspose1dOp, Op,
-    ReplicatePad1dF32, ReplicatePad1dOp, ScaleF32, ScaleOp, SnakeBetaF32, SnakeBetaOp, WeightDtype,
-    WgslConfig, conv_transpose1d_lout, conv1d_lout, conv1d_uniform_bytes, crop1d_uniform_bytes,
-    replicate_pad1d_uniform_bytes, scale_uniform_bytes, snake_beta_uniform_bytes,
+    ReplicatePad1dF32, ReplicatePad1dOp, ScaleF32, ScaleOp, SnakeBetaF32, SnakeBetaOp, SnakeF32,
+    WeightDtype, WgslConfig, conv_transpose1d_lout, conv1d_lout, conv1d_uniform_bytes,
+    crop1d_uniform_bytes, replicate_pad1d_uniform_bytes, scale_uniform_bytes,
+    snake_beta_uniform_bytes,
 };
 use thinfer_core::residency::{GpuView, ResidencyError, WeightHandle, WeightResidency};
 use thinfer_core::weight::{WeightId, WeightSource};
@@ -122,23 +123,37 @@ impl BigVganCfg {
 // ============================================================================
 
 pub struct BigVganPipelines {
+    /// Conv weight storage (the accelerator's conv1d reads it too).
+    weight: WeightDtype,
     conv1d: thinfer_core::backend::WgpuPipeline,
     convt1d: thinfer_core::backend::WgpuPipeline,
     snake: thinfer_core::backend::WgpuPipeline,
+    snake_raw: thinfer_core::backend::WgpuPipeline,
     pad: thinfer_core::backend::WgpuPipeline,
     scale: thinfer_core::backend::WgpuPipeline,
     add: thinfer_core::backend::WgpuPipeline,
 }
 
 impl BigVganPipelines {
+    /// f32 acts; bf16 weights (learned convs + tiled filters all dequant to f32).
     pub async fn compile(backend: &WgpuBackend, label: &str) -> Result<Self, WgpuError> {
-        // f32 acts; bf16 weights (learned convs + tiled filters all dequant to f32).
+        Self::compile_with(backend, label, WeightDtype::Bf16).await
+    }
+
+    /// f32 acts with conv weights stored as `weight_dtype` (`F32` for
+    /// checkpoints trained and shipped in f32).
+    pub async fn compile_with(
+        backend: &WgpuBackend,
+        label: &str,
+        weight_dtype: WeightDtype,
+    ) -> Result<Self, WgpuError> {
         let cfg = &WgslConfig {
             bf16_quant_writes: false,
             act_dtype: ActDtype::F32,
-            weight_dtype: WeightDtype::Bf16,
+            weight_dtype,
         };
         Ok(Self {
+            weight: weight_dtype,
             conv1d: backend
                 .create_pipeline(
                     &format!("{label}_conv1d"),
@@ -161,6 +176,14 @@ impl BigVganPipelines {
                     &<SnakeBetaF32 as SnakeBetaOp>::wgsl(cfg),
                     "main",
                     <SnakeBetaF32 as SnakeBetaOp>::layout(),
+                )
+                .await?,
+            snake_raw: backend
+                .create_pipeline(
+                    &format!("{label}_snake_raw"),
+                    &<SnakeF32 as SnakeBetaOp>::wgsl(cfg),
+                    "main",
+                    <SnakeF32 as SnakeBetaOp>::layout(),
                 )
                 .await?,
             pad: backend
@@ -220,6 +243,13 @@ pub struct Persisted {
 }
 
 impl Persisted {
+    /// The activation, read back to host f32 (after its scope's submit).
+    pub async fn read(&self, backend: &WgpuBackend) -> Result<Vec<f32>, WgpuError> {
+        let n = (self.c * self.l) as usize;
+        let bytes = backend.read_buffer(self.buf.id(), 0, n as u64 * 4).await?;
+        Ok(act_readback_to_f32(ActDtype::F32, &bytes, n))
+    }
+
     pub fn import<'w>(&self, scope: &BatchScope<'w, WgpuBackend>) -> Cl<'w> {
         Cl {
             buf: scope.import_copy(self.buf.as_buf_ref()),
@@ -237,7 +267,17 @@ pub fn persist_cl<'w>(
 ) -> Result<Persisted, WgpuError> {
     let ws = workspace.alloc(x.bytes())?;
     let dst = scope.import_copy(ws.as_buf_ref());
-    scope.copy_buffer_to_buffer(x.buf, 0, dst, 0, x.bytes())?;
+    if scope.is_deferred() {
+        accel_op(scope, "copy", |a| {
+            Some(ElementwiseOp::Copy {
+                src: a(x.buf)?,
+                dst: a(dst)?,
+                bytes: x.bytes(),
+            })
+        })?;
+    } else {
+        scope.copy_buffer_to_buffer(x.buf, 0, dst, 0, x.bytes())?;
+    }
     Ok(Persisted {
         buf: ws,
         c: x.c,
@@ -247,7 +287,52 @@ pub fn persist_cl<'w>(
 
 // ============================================================================
 // GPU op helpers (operate on Cl within a BatchScope)
+//
+// In a deferred accelerator scope (the caller's `accel_begin`, taken only
+// when [`accel_covers`] holds) conv1d / conv_transpose1d (groups 1),
+// snake_beta, add and persist_cl enqueue the accelerator's ops; a decline
+// there is an error, never a silent backend op. Elsewhere they run the
+// backend's ops unchanged.
 // ============================================================================
+
+/// The accelerator runs every op the deferred path enqueues.
+pub fn accel_covers(scope: &BatchScope<'_, WgpuBackend>) -> bool {
+    scope
+        .accelerator()
+        .is_some_and(|a| a.accepts_conv1d() && a.accepts_elementwise())
+}
+
+fn declined(op: &str) -> WgpuError {
+    WgpuError::AcceleratorDeclined { op: op.into() }
+}
+
+fn accel_op<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    what: &str,
+    op: impl FnOnce(&dyn Fn(BatchBuf<'w>) -> Option<u64>) -> Option<ElementwiseOp>,
+) -> Result<(), WgpuError> {
+    let op = op(&|b| scope.accel_addr(b)).ok_or_else(|| declined(what))?;
+    match scope.accel_elementwise(&op) {
+        true => Ok(()),
+        false => Err(declined(what)),
+    }
+}
+
+/// The accelerator conv of `shape` (deferred scopes).
+fn accel_conv<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    shape: Conv1dShape,
+    x: BatchBuf<'w>,
+    w: BufRef,
+    bias: BufRef,
+    out: BatchBuf<'w>,
+) -> Result<(), WgpuError> {
+    let (w, bias) = (scope.import_copy(w), scope.import_copy(bias));
+    match scope.try_conv1d(&shape, x, w, bias, out)? {
+        true => Ok(()),
+        false => Err(declined("conv1d")),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d<'w>(
@@ -265,6 +350,26 @@ pub fn conv1d<'w>(
 ) -> Result<Cl<'w>, WgpuError> {
     let lout = conv1d_lout(x.l, k, stride, dilation, pad);
     let out = scope.alloc((cout * lout) as u64 * 4)?;
+    if scope.is_deferred() && groups == 1 {
+        let shape = Conv1dShape {
+            cin: x.c,
+            cout,
+            lin: x.l,
+            lout,
+            k,
+            stride,
+            dilation,
+            pad,
+            transposed: false,
+            w_bf16: pl.weight == WeightDtype::Bf16,
+        };
+        accel_conv(scope, shape, x.buf, w, bias, out)?;
+        return Ok(Cl {
+            buf: out,
+            c: cout,
+            l: lout,
+        });
+    }
     let u = scope.write_uniform(&conv1d_uniform_bytes(
         1, x.c, cout, x.l, lout, k, stride, dilation, pad, groups,
     ))?;
@@ -295,10 +400,33 @@ pub fn conv_transpose1d<'w>(
     k: u32,
     stride: u32,
     pad: u32,
+    output_padding: u32,
     groups: u32,
 ) -> Result<Cl<'w>, WgpuError> {
-    let lout = conv_transpose1d_lout(x.l, k, stride, 1, pad);
+    // `output_padding` only extends the output: the extra samples gather the
+    // input taps that reach them (none past the last), like torch.
+    let lout = conv_transpose1d_lout(x.l, k, stride, 1, pad) + output_padding;
     let out = scope.alloc((cout * lout) as u64 * 4)?;
+    if scope.is_deferred() && groups == 1 {
+        let shape = Conv1dShape {
+            cin: x.c,
+            cout,
+            lin: x.l,
+            lout,
+            k,
+            stride,
+            dilation: 1,
+            pad,
+            transposed: true,
+            w_bf16: pl.weight == WeightDtype::Bf16,
+        };
+        accel_conv(scope, shape, x.buf, w, bias, out)?;
+        return Ok(Cl {
+            buf: out,
+            c: cout,
+            l: lout,
+        });
+    }
     let u = scope.write_uniform(&conv1d_uniform_bytes(
         1, x.c, cout, x.l, lout, k, stride, 1, pad, groups,
     ))?;
@@ -318,6 +446,91 @@ pub fn conv_transpose1d<'w>(
     })
 }
 
+/// The first `keep` outputs of [`conv1d`] (a causal conv: left padding,
+/// the padded right edge dropped). Deferred: the accelerator computes only
+/// those; else the whole conv, then a crop.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_head<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &BigVganPipelines,
+    x: Cl<'w>,
+    w: BufRef,
+    bias: BufRef,
+    cout: u32,
+    k: u32,
+    stride: u32,
+    dilation: u32,
+    pad: u32,
+    groups: u32,
+    keep: u32,
+) -> Result<Cl<'w>, WgpuError> {
+    if scope.is_deferred() && groups == 1 {
+        let out = scope.alloc((cout * keep) as u64 * 4)?;
+        let shape = Conv1dShape {
+            cin: x.c,
+            cout,
+            lin: x.l,
+            lout: keep,
+            k,
+            stride,
+            dilation,
+            pad,
+            transposed: false,
+            w_bf16: pl.weight == WeightDtype::Bf16,
+        };
+        accel_conv(scope, shape, x.buf, w, bias, out)?;
+        return Ok(Cl {
+            buf: out,
+            c: cout,
+            l: keep,
+        });
+    }
+    let y = conv1d(
+        scope, pl, x, w, bias, cout, k, stride, dilation, pad, groups,
+    )?;
+    crop(scope, pl, y, 0, keep)
+}
+
+/// The first `keep` outputs of [`conv_transpose1d`] (no padding: a causal
+/// upsampler's trailing `k - stride` samples dropped). Deferred: only those
+/// are computed; else the whole conv, then a crop.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose1d_head<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &BigVganPipelines,
+    x: Cl<'w>,
+    w: BufRef,
+    bias: BufRef,
+    cout: u32,
+    k: u32,
+    stride: u32,
+    keep: u32,
+) -> Result<Cl<'w>, WgpuError> {
+    if scope.is_deferred() {
+        let out = scope.alloc((cout * keep) as u64 * 4)?;
+        let shape = Conv1dShape {
+            cin: x.c,
+            cout,
+            lin: x.l,
+            lout: keep,
+            k,
+            stride,
+            dilation: 1,
+            pad: 0,
+            transposed: true,
+            w_bf16: pl.weight == WeightDtype::Bf16,
+        };
+        accel_conv(scope, shape, x.buf, w, bias, out)?;
+        return Ok(Cl {
+            buf: out,
+            c: cout,
+            l: keep,
+        });
+    }
+    let y = conv_transpose1d(scope, pl, x, w, bias, cout, k, stride, 0, 0, 1)?;
+    crop(scope, pl, y, 0, keep)
+}
+
 pub fn add<'w>(
     scope: &BatchScope<'w, WgpuBackend>,
     pl: &BigVganPipelines,
@@ -325,6 +538,21 @@ pub fn add<'w>(
     b: Cl<'w>,
 ) -> Result<Cl<'w>, WgpuError> {
     let out = scope.alloc(a.bytes())?;
+    if scope.is_deferred() {
+        accel_op(scope, "add", |f| {
+            Some(ElementwiseOp::AddF32 {
+                x: f(a.buf)?,
+                y: f(b.buf)?,
+                out: f(out)?,
+                n: a.n(),
+            })
+        })?;
+        return Ok(Cl {
+            buf: out,
+            c: a.c,
+            l: a.l,
+        });
+    }
     scope.dispatch_op::<AddF32>(&pl.add, &[a.buf, b.buf], out)?;
     Ok(Cl {
         buf: out,
@@ -355,17 +583,68 @@ fn snake<'w>(
     x: Cl<'w>,
     act: &ActBufs,
 ) -> Result<Cl<'w>, WgpuError> {
+    snake_beta(scope, pl, x, act.alpha, act.beta)
+}
+
+/// `x + 1/(exp(beta) + eps) * sin(exp(alpha) * x)^2` per channel, with
+/// `alpha` / `beta` as `[C]` f32 log-scale buffers.
+pub fn snake_beta<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &BigVganPipelines,
+    x: Cl<'w>,
+    alpha: BufRef,
+    beta: BufRef,
+) -> Result<Cl<'w>, WgpuError> {
+    snake_op(scope, pl, x, alpha, beta, true)
+}
+
+/// DAC's `Snake1d`: `x + 1/(alpha + eps) * sin(alpha * x)^2` per channel,
+/// `alpha` a `[C]` f32 buffer of the RAW parameter (it may be negative).
+pub fn snake1d<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &BigVganPipelines,
+    x: Cl<'w>,
+    alpha: BufRef,
+) -> Result<Cl<'w>, WgpuError> {
+    snake_op(scope, pl, x, alpha, alpha, false)
+}
+
+fn snake_op<'w>(
+    scope: &BatchScope<'w, WgpuBackend>,
+    pl: &BigVganPipelines,
+    x: Cl<'w>,
+    alpha: BufRef,
+    beta: BufRef,
+    log_scale: bool,
+) -> Result<Cl<'w>, WgpuError> {
     let out = scope.alloc(x.bytes())?;
+    if scope.is_deferred() {
+        let (alpha, beta) = (scope.import_copy(alpha), scope.import_copy(beta));
+        accel_op(scope, "snake", |f| {
+            Some(ElementwiseOp::SnakeF32 {
+                x: f(x.buf)?,
+                alpha: f(alpha)?,
+                beta: f(beta)?,
+                out: f(out)?,
+                channels: x.c,
+                inner: x.l,
+                eps: SNAKE_EPS,
+                log_scale,
+            })
+        })?;
+        return Ok(Cl {
+            buf: out,
+            c: x.c,
+            l: x.l,
+        });
+    }
     let u = scope.write_uniform(&snake_beta_uniform_bytes(x.n(), x.c, x.l, SNAKE_EPS))?;
-    scope.snake_beta::<SnakeBetaF32>(
-        &pl.snake,
-        x.buf,
-        scope.import_copy(act.alpha),
-        scope.import_copy(act.beta),
-        u,
-        out,
-        x.n(),
-    )?;
+    let (alpha, beta) = (scope.import_copy(alpha), scope.import_copy(beta));
+    if log_scale {
+        scope.snake_beta::<SnakeBetaF32>(&pl.snake, x.buf, alpha, beta, u, out, x.n())?;
+    } else {
+        scope.snake_beta::<SnakeF32>(&pl.snake_raw, x.buf, alpha, beta, u, out, x.n())?;
+    }
     Ok(Cl {
         buf: out,
         c: x.c,
@@ -424,7 +703,19 @@ pub fn activation1d<'w>(
     let c = x.c;
     let l = x.l;
     let p = pad(scope, pl, x, 5, 5)?;
-    let up = conv_transpose1d(scope, pl, p, flt.up, zero_bias, c, FILTER_K as u32, 2, 0, c)?;
+    let up = conv_transpose1d(
+        scope,
+        pl,
+        p,
+        flt.up,
+        zero_bias,
+        c,
+        FILTER_K as u32,
+        2,
+        0,
+        0,
+        c,
+    )?;
     let up = scale(scope, pl, up, ACT_RATIO as f32)?;
     let up = crop(scope, pl, up, 15, 2 * l)?;
     let s = snake(scope, pl, up, act)?;
@@ -858,6 +1149,7 @@ impl BigVgan {
                         upk,
                         rate,
                         pad_t,
+                        0,
                         1,
                     )?;
                     let p = persist_cl(&scope, workspace, x)?;

@@ -20,6 +20,7 @@
 //!   the final norm and `lm_head` are never evaluated. See [`text_encoder`].
 
 pub mod adaln;
+pub mod audio_encoder;
 pub mod audio_vae;
 pub mod dit;
 pub mod fasth3;

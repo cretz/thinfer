@@ -7,6 +7,8 @@
 //! JSON) into a [`JobRequest`], provide a [`ProgressSink`], ensure the request's
 //! files are cached, and call [`LocalExecutor::run`].
 
+pub mod audio;
+mod audio_in;
 pub mod catalog;
 pub mod checkpoint;
 pub mod codec;
@@ -28,8 +30,10 @@ pub mod remote;
 pub mod request;
 pub mod text_format;
 pub mod tools;
+pub mod tts;
 // Always compiled: `maybe_rewrite_prompt` gates its body on the feature itself.
 pub mod rewrite;
+pub mod sfx;
 #[cfg(feature = "vault")]
 pub mod vault;
 pub mod vsr;

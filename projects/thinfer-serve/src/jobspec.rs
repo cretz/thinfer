@@ -5,10 +5,12 @@ use std::path::Path;
 
 use thinfer_app::JobRequest;
 use thinfer_app::jobkey::{JobKey, OpenLocked};
-use thinfer_app::model::{ImageModelId, SwapModel, TextModelId, VideoModelId};
+use thinfer_app::model::{
+    AudioKind, AudioModelId, ImageModelId, SwapModel, TextModelId, VideoModelId,
+};
 use thinfer_app::request::{
-    FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef, Secret, TextRequest,
-    VideoFormat, VideoInput, VideoRequest, resolve_keep_size,
+    AudioBytes, AudioRequest, FaceSwapRequest, ImageBytes, ImageFormat, ImageRequest, LoraRef,
+    Secret, SoundParams, TextRequest, VideoFormat, VideoInput, VideoRequest, resolve_keep_size,
 };
 use thinfer_app::wire::{JobSpec, TextSessionRef};
 
@@ -153,6 +155,44 @@ pub fn spec_into_request(
                 ..Built::new(JobRequest::Text(req), disable_coopmat)
             })
         }
+        JobSpec::Audio(s) => {
+            let mut clips = s
+                .ref_audios
+                .unwrap_or_default()
+                .iter()
+                .map(|b64| b64_decode("ref_audios", b64).map(AudioBytes))
+                .collect::<Result<Vec<_>, String>>()?;
+            if clips.len() > 1 {
+                return Err("one reference clip at most".into());
+            }
+            let model = s.model.unwrap_or(AudioModelId::DEFAULT);
+            // Sound settings ride only on sound models; on a speech model
+            // they are an error (validate), not silently dropped.
+            let sound_fields = s.seconds.is_some()
+                || s.looped.is_some()
+                || s.steps.is_some()
+                || s.guidance.is_some();
+            let sound = (model.kind() == AudioKind::Sound || sound_fields)
+                .then(|| SoundParams::resolve(s.seconds, s.looped, s.steps, s.guidance));
+            let req = AudioRequest {
+                model,
+                sound,
+                text: s.text,
+                instruct: s.instruct.filter(|i| !i.trim().is_empty()),
+                ref_audio: clips.pop(),
+                ref_text: s.ref_text.filter(|t| !t.trim().is_empty()),
+                language: s.language.unwrap_or_else(|| "auto".into()),
+                seed: s.seed,
+                temperature: s.temperature,
+                top_k: s.top_k,
+                top_p: s.top_p,
+                max_seconds: s.max_seconds.unwrap_or(60.0),
+                budget,
+                output: dir.join("output.wav"),
+            };
+            req.validate()?;
+            Ok(Built::new(JobRequest::Audio(req), disable_coopmat))
+        }
         JobSpec::Image(s) => {
             let model = s.model.unwrap_or(ImageModelId::DEFAULT);
             let d = model.defaults();
@@ -210,6 +250,12 @@ pub fn spec_into_request(
                 .iter()
                 .map(|b64| b64_decode("ref_images", b64).map(ImageBytes))
                 .collect::<Result<Vec<_>, String>>()?;
+            let ref_audios = s
+                .ref_audios
+                .unwrap_or_default()
+                .iter()
+                .map(|b64| b64_decode("ref_audios", b64).map(AudioBytes))
+                .collect::<Result<Vec<_>, String>>()?;
             let req = VideoRequest {
                 model,
                 prompts: s.prompts,
@@ -222,6 +268,7 @@ pub fn spec_into_request(
                 input_image,
                 strength: s.strength.unwrap_or(1.0),
                 ref_images,
+                ref_audios,
                 ref_image_size: s.ref_image_size.unwrap_or_default(),
                 ref_crop: s.ref_crop.unwrap_or_default(),
                 sampler: s.sampler.unwrap_or(model.default_sampler()),

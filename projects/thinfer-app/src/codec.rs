@@ -17,6 +17,16 @@ use crate::progress::{ProgressSink, Stage};
 // visibly smeared fine skin texture (freckles, pores) on generated faces.
 const BITS_PER_PIXEL: f64 = 0.4;
 
+/// Seconds between keyframes (IDRs). A player seeks by decoding from the
+/// keyframe before the target, so without periodic ones (openh264's default)
+/// a jump decodes from the clip's start. 2 s is the common streaming GOP.
+const KEYFRAME_SECS: u32 = 2;
+
+/// The encoder's keyframe period at `fps`.
+fn keyframe_period(fps: u32) -> openh264::encoder::IntraFramePeriod {
+    openh264::encoder::IntraFramePeriod::from_num_frames(fps.max(1) * KEYFRAME_SECS)
+}
+
 /// Decode a PNG/JPEG source image into an RGB [`Image`].
 pub fn load_image(path: &Path) -> Result<Image, String> {
     let dynimg = image::open(path).map_err(|e| format!("decode {}: {e}", path.display()))?;
@@ -158,6 +168,7 @@ impl H264Encoder {
         let cfg = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bitrate))
             .skip_frames(false)
+            .intra_frame_period(keyframe_period(fps))
             .max_frame_rate(FrameRate::from_hz(fps as f32));
         Encoder::with_api_config(OpenH264API::from_source(), cfg)
             .map_err(|e| format!("openh264 init: {e}"))
@@ -1831,6 +1842,7 @@ impl Mp4VideoSink {
             let cfg = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(bitrate))
                 .skip_frames(false)
+                .intra_frame_period(keyframe_period(self.fps))
                 .max_frame_rate(FrameRate::from_hz(self.fps as f32));
             self.enc = Some(
                 Encoder::with_api_config(OpenH264API::from_source(), cfg)
@@ -2054,6 +2066,66 @@ mod tests {
                 / src.len() as f64;
             assert!(mad < 12.0, "frame {t}: mean abs diff {mad:.1}");
         }
+    }
+
+    /// The frames an MP4's video track marks as sync samples (keyframes).
+    fn keyframes(bytes: &[u8]) -> Vec<u32> {
+        let mut mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), bytes.len() as u64)
+            .expect("read mp4");
+        let (id, n) = mp4
+            .tracks()
+            .values()
+            .find(|t| matches!(t.track_type(), Ok(mp4::TrackType::Video)))
+            .map(|t| (t.track_id(), t.sample_count()))
+            .expect("video track");
+        (1..=n)
+            .filter(|&s| {
+                mp4.read_sample(id, s)
+                    .expect("sample")
+                    .expect("present")
+                    .is_sync
+            })
+            .map(|s| s - 1)
+            .collect()
+    }
+
+    /// Seekable output: both encoders (generation's segmented one and the
+    /// face-swap sink) put a keyframe at the start and at least every
+    /// `KEYFRAME_SECS`, so a seek never decodes from the clip's start.
+    #[test]
+    fn keyframes_recur_every_keyframe_secs() {
+        let check = |bytes: &[u8], n: u32, fps: u32| {
+            let keys = keyframes(bytes);
+            assert_eq!(keys.first(), Some(&0), "starts on a keyframe: {keys:?}");
+            let mut edges = keys.clone();
+            edges.push(n);
+            let gap = edges.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+            assert!(
+                gap <= fps * KEYFRAME_SECS,
+                "keyframe gap {gap} at {fps} fps: {keys:?}"
+            );
+        };
+        let v = BarVideo {
+            w: 64,
+            h: 48,
+            n: 150,
+        };
+        let mut enc = H264Encoder::new(v.w, v.h, 24).expect("encoder");
+        enc.push(&v, 0..150).expect("segmented push");
+        let bytes = enc.finish().expect("finish").mux(None).expect("mux");
+        check(&bytes, 150, 24);
+
+        let fps = 15;
+        let mut sink = Mp4VideoSink::new(fps, None);
+        let mut rgb = vec![0u8; v.w * v.h * 3];
+        for t in 0..100 {
+            v.rgb8(t, &mut rgb);
+            sink.push(&Image::from_rgb8(v.w, v.h, &rgb))
+                .expect("encode frame");
+        }
+        let (ow, oh, _, sps, pps, samples) = sink.finish().expect("finish encode");
+        let bytes = mux_mp4(ow, oh, fps, &sps, &pps, &samples, None).expect("mux");
+        check(&bytes, 100, fps);
     }
 
     // ftyp|mdat|moov (moov last) -> ftyp|moov|mdat, with the single stco chunk

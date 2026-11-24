@@ -40,6 +40,11 @@ fn random_rows(fmt: LlmWeight, n: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
                 c.copy_from_slice(&rng.f().to_le_bytes());
             }
         }
+        LlmWeight::Bf16 => {
+            for c in v.chunks_mut(2) {
+                c.copy_from_slice(&half::bf16::from_f32(rng.f()).to_le_bytes());
+            }
+        }
         LlmWeight::Quant(q) => {
             let bb = q.bytes_per_block() as usize;
             for blk in v.chunks_mut(bb) {
@@ -63,6 +68,10 @@ fn random_rows(fmt: LlmWeight, n: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
 fn dequant(fmt: LlmWeight, row: &[u8], k: usize) -> Vec<f32> {
     match fmt {
         LlmWeight::F32 => bytemuck::cast_slice::<u8, f32>(row).to_vec(),
+        LlmWeight::Bf16 => row
+            .chunks(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
         LlmWeight::Quant(q) => {
             let mut out = vec![0f32; k];
             dequantize_row(q, row, &mut out);
@@ -83,7 +92,7 @@ async fn gemv_formats() {
         // formats only; K-quant rows are whole 256 super-blocks).
         let block = match fmt {
             LlmWeight::Quant(q) => q.block_size() as usize,
-            LlmWeight::F32 => 32,
+            LlmWeight::F32 | LlmWeight::Bf16 => 32,
         };
         for (n, k) in [(37usize, 512usize), (64, 2048), (19, 704)] {
             if k % block != 0 {
@@ -198,7 +207,7 @@ async fn gemv_formats_cuda() {
     for fmt in thinfer_models::llm::kernels::FORMATS {
         let block = match fmt {
             LlmWeight::Quant(q) => q.block_size() as usize,
-            LlmWeight::F32 => 32,
+            LlmWeight::F32 | LlmWeight::Bf16 => 32,
         };
         for (n, k) in [(37usize, 512usize), (64, 2048), (19, 704)] {
             if k % block != 0 {

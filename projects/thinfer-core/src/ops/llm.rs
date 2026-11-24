@@ -18,6 +18,8 @@ use crate::quant::QuantKind;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LlmWeight {
     F32,
+    /// Raw bf16 (safetensors checkpoints), widened in-register.
+    Bf16,
     Quant(QuantKind),
 }
 
@@ -26,6 +28,7 @@ impl LlmWeight {
     pub fn row_bytes(self, k: u64) -> u64 {
         match self {
             Self::F32 => k * 4,
+            Self::Bf16 => k * 2,
             Self::Quant(q) => q.bytes_for_elements(k),
         }
     }
@@ -33,6 +36,7 @@ impl LlmWeight {
     fn label(self) -> &'static str {
         match self {
             Self::F32 => "f32",
+            Self::Bf16 => "bf16",
             Self::Quant(QuantKind::Q8_0) => "q8_0",
             Self::Quant(QuantKind::Q4_0) => "q4_0",
             Self::Quant(QuantKind::Q5_0) => "q5_0",
@@ -94,6 +98,19 @@ fn dot8(base: u32, c: u32, l: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
     let o = (base >> 2u) + c * 256u + l * 8u;
     let wa = vec4<f32>(bitcast<f32>(w[o]), bitcast<f32>(w[o + 1u]), bitcast<f32>(w[o + 2u]), bitcast<f32>(w[o + 3u]));
     let wb = vec4<f32>(bitcast<f32>(w[o + 4u]), bitcast<f32>(w[o + 5u]), bitcast<f32>(w[o + 6u]), bitcast<f32>(w[o + 7u]));
+    return dot(wa, xa) + dot(wb, xb);
+}
+"#
+        }
+        LlmWeight::Bf16 => {
+            r#"
+fn bf2(v: u32) -> vec2<f32> {
+    return vec2<f32>(bitcast<f32>(v << 16u), bitcast<f32>(v & 0xFFFF0000u));
+}
+fn dot8(base: u32, c: u32, l: u32, xa: vec4<f32>, xb: vec4<f32>) -> f32 {
+    let o = (base >> 2u) + c * 128u + l * 4u;
+    let wa = vec4<f32>(bf2(w[o]), bf2(w[o + 1u]));
+    let wb = vec4<f32>(bf2(w[o + 2u]), bf2(w[o + 3u]));
     return dot(wa, xa) + dot(wb, xb);
 }
 "#
@@ -322,6 +339,7 @@ pub const GEMV_LAYOUT: [BindingLayout; 6] = layout([R, R, W, U, R, R]);
 pub fn gemv_wgsl(fmt: LlmWeight) -> String {
     let rb = match fmt {
         LlmWeight::F32 => "u.k * 4u".to_string(),
+        LlmWeight::Bf16 => "u.k * 2u".to_string(),
         LlmWeight::Quant(q) => format!("(u.k / {}u) * {}u", q.block_size(), q.bytes_per_block()),
     };
     format!(
@@ -1116,6 +1134,27 @@ pub enum LlmOp {
         a: u64,
         b: u64,
         y: u64,
+    },
+    /// Sample one id from f32 `logits[..n]` as the host `Sampler` does with
+    /// top-p 1 and no penalties: the `k` (<= 64) largest by logit, `p_i =
+    /// exp(l_i / t - l_max / t)` normalized and summed in rank order, the
+    /// first rank where `uniform[0] * total` runs out. `t <= 0`: argmax
+    /// (ties: the highest id, like the host). Writes the id (u32) to `out`.
+    SampleTopK {
+        logits: u64,
+        n: u32,
+        k: u32,
+        temperature: f32,
+        uniform: u64,
+        out: u64,
+    },
+    /// `out[..dim] = f32(table[idx[0] * dim ..])`, a bf16 `[rows, dim]` table
+    /// and a u32 index read on the device.
+    GatherRowBf16 {
+        table: u64,
+        idx: u64,
+        dim: u32,
+        out: u64,
     },
     MoeCombine {
         u: MoeCombineUniform,

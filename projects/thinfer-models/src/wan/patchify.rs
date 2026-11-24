@@ -18,15 +18,15 @@
 //! `[ppf, pph, ppw, p_t, p_h, p_w, out_ch]`, permutes to `[out_ch, ppf, p_t,
 //! pph, p_h, ppw, p_w]`, and flattens back to `[out_ch, F, H, W]`).
 
-use crate::wan::dit_block::config;
-
-/// Latent voxel grid `[C, F, H, W]` and its patch grid `(ppf, pph, ppw)`.
+/// Latent voxel grid `[C, F, H, W]`, the patch `(p_t, p_h, p_w)` it is cut
+/// with, and the resulting patch grid `(ppf, pph, ppw)`.
 #[derive(Clone, Copy, Debug)]
 pub struct PatchGrid {
     pub c: usize,
     pub f: usize,
     pub h: usize,
     pub w: usize,
+    pub patch: [usize; 3],
     pub ppf: usize,
     pub pph: usize,
     pub ppw: usize,
@@ -34,8 +34,8 @@ pub struct PatchGrid {
 
 impl PatchGrid {
     /// Build from latent dims, validating divisibility by the patch.
-    pub fn new(c: usize, f: usize, h: usize, w: usize) -> Self {
-        let (pt, ph, pw) = (config::PATCH_T, config::PATCH_H, config::PATCH_W);
+    pub fn new(c: usize, f: usize, h: usize, w: usize, patch: [usize; 3]) -> Self {
+        let [pt, ph, pw] = patch;
         assert!(
             f.is_multiple_of(pt) && h.is_multiple_of(ph) && w.is_multiple_of(pw),
             "latent dims ({f},{h},{w}) not divisible by patch ({pt},{ph},{pw})"
@@ -45,6 +45,7 @@ impl PatchGrid {
             f,
             h,
             w,
+            patch,
             ppf: f / pt,
             pph: h / ph,
             ppw: w / pw,
@@ -56,21 +57,26 @@ impl PatchGrid {
         self.ppf * self.pph * self.ppw
     }
 
+    /// Voxels per patch `p_t * p_h * p_w`.
+    pub fn patch_voxels(&self) -> usize {
+        self.patch.iter().product()
+    }
+
     /// Patch-vector width `C * p_t * p_h * p_w` (the front-door linear's K).
     pub fn patch_in(&self) -> usize {
-        self.c * config::PATCH_T * config::PATCH_H * config::PATCH_W
+        self.c * self.patch_voxels()
     }
 }
 
 /// Patchify `[C, F, H, W]` row-major into tokens `[n_tok, patch_in]`, token
 /// order `(f, h, w)` row-major, patch-vector order `(ic, kt, kh, kw)`.
 pub fn patchify(image: &[f32], grid: &PatchGrid) -> Vec<f32> {
-    let (pt, ph, pw) = (config::PATCH_T, config::PATCH_H, config::PATCH_W);
     let PatchGrid {
         c,
         f,
         h,
         w,
+        patch: [pt, ph, pw],
         ppf,
         pph,
         ppw,
@@ -107,11 +113,11 @@ pub fn patchify(image: &[f32], grid: &PatchGrid) -> Vec<f32> {
 /// `(f, h, w)`, vec order `(p_t, p_h, p_w, out_ch)`) back to `[out_ch, F, H, W]`
 /// row-major.
 pub fn unpatchify(tokens: &[f32], grid: &PatchGrid, out_ch: usize) -> Vec<f32> {
-    let (pt, ph, pw) = (config::PATCH_T, config::PATCH_H, config::PATCH_W);
     let PatchGrid {
         f,
         h,
         w,
+        patch: [pt, ph, pw],
         ppf,
         pph,
         ppw,
@@ -147,24 +153,34 @@ pub fn unpatchify(tokens: &[f32], grid: &PatchGrid, out_ch: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wan::dit_block::WanGeometry;
+
+    const VIDEO: [usize; 3] = WanGeometry::Video.patch();
 
     #[test]
     fn patch_grid_shapes() {
         // patch (1,2,2): latent 16x2x4x6 -> grid 2x2x3, n_tok=12.
-        let g = PatchGrid::new(16, 2, 4, 6);
+        let g = PatchGrid::new(16, 2, 4, 6, VIDEO);
         assert_eq!((g.ppf, g.pph, g.ppw), (2, 2, 3));
         assert_eq!(g.n_tok(), 12);
-        assert_eq!(
-            g.patch_in(),
-            16 * config::PATCH_T * config::PATCH_H * config::PATCH_W
-        );
+        assert_eq!(g.patch_in(), 16 * 4);
+    }
+
+    #[test]
+    fn audio_patch_is_one_token_per_frame() {
+        // patch (1,1,1) over [C, F, 1, 1]: token f is column f of the latent.
+        let g = PatchGrid::new(2, 3, 1, 1, WanGeometry::Audio.patch());
+        let img = vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0];
+        let tok = patchify(&img, &g);
+        assert_eq!(tok, vec![0.0, 10.0, 1.0, 11.0, 2.0, 12.0]);
+        assert_eq!(unpatchify(&tok, &g, 2), img);
     }
 
     #[test]
     fn patchify_gathers_patch_voxels() {
         // C=1, F=1, H=2, W=2, patch (1,2,2) -> 1 token, vec=(kh,kw) row-major.
         let img = vec![10.0, 11.0, 12.0, 13.0]; // [h,w] row-major
-        let g = PatchGrid::new(1, 1, 2, 2);
+        let g = PatchGrid::new(1, 1, 2, 2, VIDEO);
         let tok = patchify(&img, &g);
         // patch vec order (ic, kt, kh, kw): (0,0,0,0),(0,0,0,1),(0,0,1,0),(0,0,1,1)
         assert_eq!(tok, vec![10.0, 11.0, 12.0, 13.0]);
@@ -178,7 +194,7 @@ mod tests {
             0.0, 1.0, 2.0, 3.0, // c0
             100.0, 101.0, 102.0, 103.0, // c1
         ];
-        let g = PatchGrid::new(2, 1, 2, 2);
+        let g = PatchGrid::new(2, 1, 2, 2, VIDEO);
         let tok = patchify(&img, &g);
         assert_eq!(tok, vec![0.0, 1.0, 2.0, 3.0, 100.0, 101.0, 102.0, 103.0]);
     }
@@ -186,7 +202,7 @@ mod tests {
     #[test]
     fn unpatchify_scatters_voxels() {
         // out_ch=1, patch (1,2,2), grid 1x1x1 -> token vec (pt,ph,pw,oc).
-        let g = PatchGrid::new(1, 1, 2, 2);
+        let g = PatchGrid::new(1, 1, 2, 2, VIDEO);
         let tokens = vec![20.0, 21.0, 22.0, 23.0]; // (ph,pw) order, oc=1
         let img = unpatchify(&tokens, &g, 1);
         assert_eq!(img, vec![20.0, 21.0, 22.0, 23.0]);
@@ -196,7 +212,7 @@ mod tests {
     fn unpatchify_two_out_channels() {
         // out_ch=2, patch (1,2,2), single token (latent 1x2x2). Vec order
         // (p_h, p_w, oc): voxels (0,0),(0,1),(1,0),(1,1), each with oc0,oc1.
-        let g = PatchGrid::new(2, 1, 2, 2);
+        let g = PatchGrid::new(2, 1, 2, 2, VIDEO);
         let tokens = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let img = unpatchify(&tokens, &g, 2);
         // out [oc, h, w] (f=1): oc0 -> [1,3,5,7]; oc1 -> [2,4,6,8].

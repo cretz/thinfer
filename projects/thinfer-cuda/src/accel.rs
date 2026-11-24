@@ -9,8 +9,9 @@ use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys;
 use thinfer_core::backend::{
-    AccelFence, Accelerator, Conv2dAddrs, Conv3dAddrs, ElementwiseOp, GemmAddrs, GemmNvfp4Addrs,
-    SdpaAddrs, TileAttnAddrs, TileAttnShape, VsaAddrs, VsaPart, VsaScratch, VsaShape,
+    AccelFence, Accelerator, Conv1dAddrs, Conv2dAddrs, Conv3dAddrs, ElementwiseOp, GemmAddrs,
+    GemmNvfp4Addrs, SdpaAddrs, TileAttnAddrs, TileAttnShape, VsaAddrs, VsaPart, VsaScratch,
+    VsaShape,
 };
 use thinfer_core::ops::GemmDesc;
 
@@ -321,6 +322,17 @@ impl Accelerator for CudaAccel {
 
     fn accepts_conv2d(&self) -> bool {
         self.gemm_kernels().is_some()
+    }
+
+    fn conv1d(&self, a: &Conv1dAddrs) -> Result<bool, String> {
+        match self.gemm_kernels() {
+            Some(k) => k.run_conv1d(a),
+            None => Ok(false),
+        }
+    }
+
+    fn accepts_conv1d(&self) -> bool {
+        self.gemm_kernels().is_some() && self.accepts_elementwise()
     }
 
     fn conv3d_f16(&self, a: &Conv3dAddrs) -> Result<bool, String> {
